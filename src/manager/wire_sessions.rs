@@ -2,7 +2,6 @@
 //! `mod.rs`, mirroring `usage.rs`/`snapshot.rs`'s split.
 
 use std::path::Path;
-use std::sync::atomic::Ordering;
 
 use super::*;
 use crate::session_wire::{CodexToolCall, ToolResultEvent, ToolUseEvent};
@@ -71,27 +70,22 @@ impl Manager {
     }
 
     /// Add token counts learned from a response's usage to the wire-session table. Called
-    /// beside [`Self::record_usage`] (the per-account ledger) at both of its call sites in
-    /// `proxy.rs` — streamed and non-streamed — with the SAME [`crate::usage::UsageRecord`]
-    /// fields, so the account ledger, the per-model tally and the wire session's quota totals
-    /// never disagree about what a response carried.
+    /// beside [`Self::record_usage`] (the per-account ledger) by
+    /// `proxy::served::ServedTurn::finish`, for streamed and non-streamed turns alike, with the SAME
+    /// [`crate::usage::UsageRecord`], so the account ledger, the per-model tally and the wire
+    /// session's quota totals never disagree about what a response carried.
     ///
-    /// `base_input`, `cache_5m` and `cache_1h` (`UsageRecord::input`/`cache_5m`/`cache_1h`) fold
-    /// into the session's `input_tokens`/`cache_creation_tokens` totals and into the per-model
-    /// pricing tally kept in [`crate::session_wire::WireSession::by_model`] — wire 2. The QUOTA
-    /// figure (`UsageRecord::input_total()`) is deliberately NOT passed here: it already folds
-    /// cache reads in, and folding it into `input_tokens` too was the 2026-09-14 double-count
+    /// The record's base input and both cache-creation tiers (`UsageRecord::input`/`cache_5m`/
+    /// `cache_1h`) fold into the session's `input_tokens`/`cache_creation_tokens` totals and
+    /// into the per-model pricing tally kept in
+    /// [`crate::session_wire::WireSession::by_model`] — wire 2. The QUOTA figure
+    /// (`UsageRecord::input_total()`) is deliberately NOT read there: it already folds cache
+    /// reads in, and folding it into `input_tokens` too was the 2026-09-14 double-count
     /// incident (see [`crate::session_wire::WireSession::input_tokens`]).
-    #[allow(clippy::too_many_arguments)]
     pub fn record_wire_session_usage(
         &self,
         session_id: Option<&str>,
-        model: Option<&str>,
-        base_input: u64,
-        cache_5m: u64,
-        cache_1h: u64,
-        cache_read_tokens: u64,
-        output_tokens: u64,
+        record: &crate::usage::UsageRecord,
     ) {
         let Some(session_id) = session_id else {
             return;
@@ -100,15 +94,7 @@ impl Manager {
             .wire_sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tracker.record_usage(
-            session_id,
-            model,
-            base_input,
-            cache_5m,
-            cache_1h,
-            cache_read_tokens,
-            output_tokens,
-        );
+        tracker.record_usage(session_id, record);
         drop(tracker);
         self.mark_wire_sessions_dirty();
     }
@@ -183,24 +169,16 @@ impl Manager {
         self.mark_wire_sessions_dirty();
     }
 
-    /// Add a Codex response's usage to its wire session. The arguments are the same
-    /// [`crate::usage::UsageRecord`] fields [`Self::record_wire_session_usage`] takes, plus the
-    /// turn's reasoning tokens and the record's own stamp (`ts_ms`), so the account ledger and
+    /// Add a Codex response's usage to its wire session: the same
+    /// [`crate::usage::UsageRecord`] [`Self::record_wire_session_usage`] takes, whose reasoning
+    /// tokens and own stamp (`ts_ms`) the Codex session also keeps, so the account ledger and
     /// the session never disagree about what a response carried, or when. Unlike its Claude
     /// twin it stamps no Anthropic cache TTL, and the usage's model names the session — see
     /// [`crate::session_wire::WireSessionTracker::record_codex_usage`].
-    #[allow(clippy::too_many_arguments)]
     pub fn record_codex_wire_session_usage(
         &self,
         session_id: Option<&str>,
-        model: Option<&str>,
-        base_input: u64,
-        cache_5m: u64,
-        cache_1h: u64,
-        cache_read_tokens: u64,
-        output_tokens: u64,
-        reasoning_tokens: u64,
-        ts_ms: i64,
+        record: &crate::usage::UsageRecord,
     ) {
         let Some(session_id) = session_id else {
             return;
@@ -209,17 +187,7 @@ impl Manager {
             .wire_sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tracker.record_codex_usage(
-            session_id,
-            model,
-            base_input,
-            cache_5m,
-            cache_1h,
-            cache_read_tokens,
-            output_tokens,
-            reasoning_tokens,
-            ts_ms,
-        );
+        tracker.record_codex_usage(session_id, record);
         drop(tracker);
         self.mark_wire_sessions_dirty();
     }
@@ -425,19 +393,18 @@ impl Manager {
     /// [`Self::mark_affinity_dirty`]: a single relaxed store on the request path, with the
     /// actual write done off it by a debounced flusher.
     pub fn mark_wire_sessions_dirty(&self) {
-        self.wire_sessions_dirty.store(true, Ordering::Relaxed);
-        self.wire_sessions_wake.notify_one();
+        self.wire_sessions_file.mark();
     }
 
     /// Resolves once the wire-session table has changed since the last time this resolved:
     /// the Sessions/Tools flusher's wake-up, as [`Self::affinity_changed`] is the pins'.
     pub async fn wire_sessions_changed(&self) {
-        self.wire_sessions_wake.notified().await;
+        self.wire_sessions_file.changed().await;
     }
 
     /// Consume the dirty flag: `true` when something changed since the last call.
     pub fn take_wire_sessions_dirty(&self) -> bool {
-        self.wire_sessions_dirty.swap(false, Ordering::Relaxed)
+        self.wire_sessions_file.take()
     }
 
     /// Write the wire-session table to `path`, atomically. Returns how many sessions
@@ -448,11 +415,10 @@ impl Manager {
     pub fn flush_wire_sessions(&self, path: &Path) -> Result<usize, crate::config::ConfigError> {
         let now_ms = crate::now_ms();
         let sessions = self.wire_sessions_to_save(now_ms);
-        let count = session_wire_persist::save(path, &sessions, now_ms)?;
-        let (shape, content) = session_wire_persist::save_hashes(&sessions)?;
-        self.wire_sessions_save
-            .wrote(shape, content, std::time::Instant::now());
-        Ok(count)
+        self.wire_sessions_file
+            .save(session_wire_persist::save_hashes(&sessions)?, || {
+                session_wire_persist::save(path, &sessions, now_ms)
+            })
     }
 
     /// The flusher's save: [`Self::flush_wire_sessions`] when the table differs from what the
@@ -465,14 +431,10 @@ impl Manager {
     ) -> Result<crate::save_gate::SaveOutcome, crate::config::ConfigError> {
         let now_ms = crate::now_ms();
         let sessions = self.wire_sessions_to_save(now_ms);
-        let (shape, content) = session_wire_persist::save_hashes(&sessions)?;
-        let now = std::time::Instant::now();
-        if let Some(skipped) = self.wire_sessions_save.skip(shape, content, now) {
-            return Ok(skipped);
-        }
-        let count = session_wire_persist::save(path, &sessions, now_ms)?;
-        self.wire_sessions_save.wrote(shape, content, now);
-        Ok(crate::save_gate::SaveOutcome::Wrote(count))
+        self.wire_sessions_file
+            .save_if_changed(session_wire_persist::save_hashes(&sessions)?, || {
+                session_wire_persist::save(path, &sessions, now_ms)
+            })
     }
 
     /// The live table as the cache file holds it: a copy taken under the lock, written
@@ -515,6 +477,8 @@ mod tests {
     use time::Duration;
 
     use super::*;
+    use crate::session_wire::wire_usage;
+    use crate::usage::UsageRecord;
 
     /// `WireSessionTracker` itself is unit-tested in `session_wire.rs` with canned bodies;
     /// these tests prove the `Manager` GLUE — the lock, the projection to `SessionRow`, and
@@ -534,12 +498,7 @@ mod tests {
         );
         manager.record_wire_session_usage(
             Some("sess-glue"),
-            Some("claude-fable-5"),
-            10,
-            0,
-            0,
-            5,
-            20,
+            &wire_usage(Some("claude-fable-5"), 10, 0, 0, 5, 20),
         );
 
         let snap = manager.snapshot(now);
@@ -566,12 +525,7 @@ mod tests {
         // wrongly in `input_tokens`.
         manager.record_wire_session_usage(
             Some("sess-ratio"),
-            Some("claude-sonnet-5"),
-            100,
-            20,
-            30,
-            850,
-            0,
+            &wire_usage(Some("claude-sonnet-5"), 100, 20, 30, 850, 0),
         );
 
         let row = &manager.snapshot(now).wire_sessions[0];
@@ -732,7 +686,8 @@ mod tests {
             &[],
             &[],
         );
-        manager.record_wire_session_usage(None, Some("claude-fable-5"), 10, 0, 0, 5, 20);
+        manager
+            .record_wire_session_usage(None, &wire_usage(Some("claude-fable-5"), 10, 0, 0, 5, 20));
         assert!(manager.snapshot(now).wire_sessions.is_empty());
     }
 
@@ -748,22 +703,12 @@ mod tests {
         // 1,000,000 base input tokens on Opus 5 ($5.00/MTok) = $5.00 exactly.
         manager.record_wire_session_usage(
             Some("sess-cost"),
-            Some("claude-opus-5"),
-            1_000_000,
-            0,
-            0,
-            0,
-            0,
+            &wire_usage(Some("claude-opus-5"), 1_000_000, 0, 0, 0, 0),
         );
         // 1,000,000 output tokens on Sonnet 5 ($10.00/MTok output) = $10.00 exactly.
         manager.record_wire_session_usage(
             Some("sess-cost"),
-            Some("claude-sonnet-5"),
-            0,
-            0,
-            0,
-            0,
-            1_000_000,
+            &wire_usage(Some("claude-sonnet-5"), 0, 0, 0, 0, 1_000_000),
         );
 
         let snap = manager.snapshot(now);
@@ -1004,7 +949,7 @@ mod tests {
         );
         assert!(!path.exists(), "an unchanged save wrote the file");
 
-        manager.record_wire_session_usage(Some("sess-a"), None, 10, 0, 0, 0, 20);
+        manager.record_wire_session_usage(Some("sess-a"), &wire_usage(None, 10, 0, 0, 0, 20));
         assert!(matches!(
             manager.flush_wire_sessions_if_changed(&path).expect("save"),
             SaveOutcome::Deferred(_)
@@ -1061,14 +1006,11 @@ mod tests {
         for _ in 0..3 {
             manager.record_codex_wire_session_usage(
                 Some("sess-codex"),
-                Some("gpt-5.1-codex"),
-                1_000,
-                0,
-                0,
-                0,
-                10,
-                2,
-                odt_to_ms(now),
+                &UsageRecord {
+                    reasoning: 2,
+                    ts_ms: odt_to_ms(now),
+                    ..wire_usage(Some("gpt-5.1-codex"), 1_000, 0, 0, 0, 10)
+                },
             );
         }
         manager.record_wire_session(
@@ -1081,12 +1023,7 @@ mod tests {
         );
         manager.record_wire_session_usage(
             Some("sess-claude"),
-            Some("claude-opus-4-5"),
-            1_000,
-            0,
-            0,
-            0,
-            10,
+            &wire_usage(Some("claude-opus-4-5"), 1_000, 0, 0, 0, 10),
         );
         let rows: std::collections::HashMap<String, tcr_status_wire::SessionRow> = manager
             .snapshot(now)
@@ -1117,14 +1054,11 @@ mod tests {
         for model in ["gpt-5.1-codex", "gpt-5.1-codex", "codex-mini-latest"] {
             priced.record_codex_wire_session_usage(
                 Some("sess-mixed"),
-                Some(model),
-                1_000_000,
-                0,
-                0,
-                0,
-                0,
-                0,
-                odt_to_ms(now),
+                &UsageRecord {
+                    reasoning: 0,
+                    ts_ms: odt_to_ms(now),
+                    ..wire_usage(Some(model), 1_000_000, 0, 0, 0, 0)
+                },
             );
         }
         let row = priced.snapshot(now).wire_sessions.remove(0);
@@ -1177,14 +1111,11 @@ mod tests {
         // The first turn's usage lands; the second turn streams, or ends with no usage.
         manager.record_codex_wire_session_usage(
             Some("sess-streaming"),
-            Some("gpt-5.1-codex"),
-            1_000,
-            0,
-            0,
-            0,
-            10,
-            0,
-            odt_to_ms(now),
+            &UsageRecord {
+                reasoning: 0,
+                ts_ms: odt_to_ms(now),
+                ..wire_usage(Some("gpt-5.1-codex"), 1_000, 0, 0, 0, 10)
+            },
         );
         manager.record_codex_wire_session(Some("sess-streaming"), None, now);
         let second = row(&manager, "sess-streaming");
@@ -1201,14 +1132,11 @@ mod tests {
         priced.record_codex_wire_session(Some("sess-priced"), None, now);
         priced.record_codex_wire_session_usage(
             Some("sess-priced"),
-            Some("gpt-5.1-codex"),
-            1_000_000,
-            0,
-            0,
-            0,
-            0,
-            0,
-            odt_to_ms(now),
+            &UsageRecord {
+                reasoning: 0,
+                ts_ms: odt_to_ms(now),
+                ..wire_usage(Some("gpt-5.1-codex"), 1_000_000, 0, 0, 0, 0)
+            },
         );
         priced.record_codex_wire_session(Some("sess-priced"), None, now);
         let partial = row(&priced, "sess-priced");
@@ -1332,14 +1260,11 @@ mod tests {
             }
             manager.record_codex_wire_session_usage(
                 Some(ID),
-                Some("gpt-5.1-codex"),
-                input,
-                0,
-                0,
-                cache_read,
-                output,
-                reasoning,
-                requested,
+                &UsageRecord {
+                    reasoning,
+                    ts_ms: requested,
+                    ..wire_usage(Some("gpt-5.1-codex"), input, 0, 0, cache_read, output)
+                },
             );
         }
         let row = manager

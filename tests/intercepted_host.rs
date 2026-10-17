@@ -158,16 +158,7 @@ async fn spawn_origin(origin: Origin) -> String {
                 .expect("build the origin's answer")
         }
     }));
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind a fake origin");
-    let addr = listener.local_addr().expect("the origin's address");
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .log_debug("serving a test server");
-    });
-    format!("http://{addr}")
+    tcr::test_support::stub_upstream::http(app).url()
 }
 
 /// A running tcr: the real listener, over a leaf minted into its own temp dir, in front of an

@@ -28,66 +28,22 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tcr::log_err::LogErr as _;
 
-use tcr::peer::config::{self as peer_config, PeerFile, PeerRow};
+use crate::peer_support::DuplexTarget as Target;
 use tcr::peer::id::NodeKey;
-use tcr::peer::listener::{self, SessionContext};
+use tcr::peer::listener;
 use tcr::peer::noise::{self, Handshake};
 use tcr::peer::reach;
 use tcr::peer::serve;
 use tcr_peer_wire::{Caps, Control, Hello, PeerId, StreamHeader, StreamKind};
 
-/// A scratch directory named after this process, thread and a caller tag, so
-/// two tests in this binary never collide on one path.
-fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tcr-peer-carried-control-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
-    std::fs::create_dir_all(&dir).expect("create the scratch dir");
-    dir
-}
-
 /// The target: a pinned row for `peer` already on its file, so the ordinary
 /// CONTROL gate admits the frame this test sends.
-struct Target {
-    peers: std::path::PathBuf,
-    state: std::path::PathBuf,
-    key: NodeKey,
+fn target(tag: &str, peer: PeerId) -> Target {
+    Target::new(&scratch(tag), peer)
 }
 
-impl Target {
-    fn new(tag: &str, peer: PeerId) -> Self {
-        let dir = scratch(tag);
-        let peers = dir.join("tcr-peers.json");
-        let state = dir.join("peer-state.json");
-        let row = PeerRow {
-            node: peer,
-            label: "the-far-side".to_string(),
-            endpoints: Vec::new(),
-            added_at: 0,
-            allow: peer_config::Allow::default(),
-            lend: Vec::new(),
-            rendezvous_secret: None,
-            sees_us_at: None,
-        };
-        let file = PeerFile {
-            peers: vec![row],
-            ..PeerFile::default()
-        };
-        peer_config::save(&peers, &file).expect("write the peers file");
-        let key = NodeKey::load_or_mint(&dir).expect("mint a node key");
-        Self { peers, state, key }
-    }
-
-    fn context(&self) -> SessionContext {
-        SessionContext::new(&self.key, &self.peers, &self.state)
-    }
-
-    fn file(&self) -> PeerFile {
-        peer_config::read_or_default(&self.peers).expect("the peers file reads")
-    }
+fn scratch(tag: &str) -> std::path::PathBuf {
+    crate::peer_support::scratch_dir("carried-control", tag)
 }
 
 /// Drive one CONTROL `Hello` at `target` over a duplex, as if it had been
@@ -190,7 +146,7 @@ async fn hello_from(
 async fn carried_hello_teaches_no_address() {
     let peer = NodeKey::load_or_mint(&scratch("carried-peer")).expect("mint the peer's key");
     let carrier = PeerId([0x77_u8; 32]);
-    let target = Target::new("carried-target", peer.id());
+    let target = target("carried-target", peer.id());
 
     let carrier_socket: SocketAddr = "203.0.113.9:41000".parse().expect("the literal parses");
     // A wildcard bind: not itself dialable, so a correct combine adds nothing
@@ -240,7 +196,7 @@ async fn carried_hello_teaches_no_address() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_direct_hello_still_teaches_the_address() {
     let peer = NodeKey::load_or_mint(&scratch("direct-peer")).expect("mint the peer's key");
-    let target = Target::new("direct-target", peer.id());
+    let target = target("direct-target", peer.id());
 
     let direct_socket: SocketAddr = "203.0.113.11:41000".parse().expect("the literal parses");
     // The same wildcard-bind announcement the carried test uses, so the two

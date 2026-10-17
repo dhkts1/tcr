@@ -17,10 +17,8 @@ use std::process::Command;
 /// The port the scratch config names: one the kernel just handed out and
 /// nothing listens on, never the default, so `tcr doctor` below cannot reach
 /// the live proxy and a leaked default would show up as a mismatch.
-static PORT: std::sync::LazyLock<u16> = std::sync::LazyLock::new(|| {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
-    listener.local_addr().expect("local addr").port()
-});
+static PORT: std::sync::LazyLock<u16> =
+    std::sync::LazyLock::new(tcr::test_support::loopback::unused_port);
 
 struct Scratch {
     _dir: tempfile::TempDir,
@@ -51,14 +49,10 @@ fn scratch() -> Scratch {
 
 /// Run `tcr <args…>` with the scratch HOME and `SHELL` set to `shell`.
 fn tcr(scratch: &Scratch, shell: &str, args: &[&str]) -> (i32, String, String) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut command = crate::tcr_env::tcr(&scratch.home);
     command
         .args(args)
-        .env("HOME", &scratch.home)
         .env("SHELL", shell)
-        .env_remove("ZDOTDIR")
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("ANTHROPIC_BASE_URL")
         .current_dir(&scratch.home);
     let output = command.output().expect("run the built tcr");
     (

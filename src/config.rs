@@ -473,6 +473,43 @@ pub struct Account {
 }
 
 impl Account {
+    /// An OAuth account holding only what it cannot exist without: a name, the
+    /// upstream it belongs to and an access token. Every other field is unset,
+    /// so a caller names the ones it knows with struct update syntax
+    /// (`Account { refresh_token, ..Account::new(..) }`), and a field added to
+    /// [`Account`] costs one edit here.
+    ///
+    /// Not `Default`: an account with an empty name and token is not a valid
+    /// account, and must not be what a forgotten field silently gets.
+    pub fn new(
+        name: impl Into<String>,
+        provider: crate::provider::Provider,
+        access_token: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            account_type: AccountType::OAuth,
+            provider,
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: access_token.into(),
+            refresh_token: None,
+            expires_at: None,
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+            egress: Egress::Local,
+            egress_strict: false,
+            codex_home: None,
+            extra: Map::new(),
+        }
+    }
+
     /// A strict peer exit cannot be honoured for Codex. Keep the row readable so
     /// the CLI can clear its pin, but never select it for a pooled request.
     pub(crate) fn has_unsupported_strict_peer_exit(&self) -> bool {
@@ -3370,6 +3407,85 @@ fn plan_merge(entries: &[Value], memory: &[Account]) -> Vec<(Option<String>, Ent
         .collect()
 }
 
+/// What a targeted write did to the on-disk document when its target cannot be
+/// missing (a group name rather than an `accounts` entry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocEdit {
+    /// The document changed and the file was rewritten.
+    Updated,
+    /// The document already said exactly this, so nothing was written and the
+    /// file is byte-identical. A file holding single-use refresh tokens is
+    /// rewritten only when it must be.
+    Unchanged,
+}
+
+/// The outcome of one targeted read-modify-write, read the two ways its
+/// callers need: [`edit_document`] asks whether to write the file, and the
+/// manager's write-through asks whether memory may follow it.
+pub trait Edit {
+    /// The document changed, so the file must be rewritten.
+    fn wrote(&self) -> bool;
+    /// The file now carries the requested state: it was written, or it
+    /// already said exactly this. Every other outcome left the file without it.
+    fn landed(&self) -> bool;
+}
+
+/// Why no single `accounts` entry can take a targeted write. Converted into
+/// each writer's own outcome enum, which carries the same two arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryRefusal {
+    /// No usable `accounts` array, or nothing in it carries that identity.
+    NoEntry,
+    /// More than one entry carries that identity and nothing breaks the tie.
+    Ambiguous,
+}
+
+/// `Edit` for the outcome enums whose success arms are `Updated` and
+/// `Unchanged`; with `refusable`, also `From<EntryRefusal>` for the ones that
+/// carry `NoEntry` and `Ambiguous`.
+macro_rules! doc_outcome {
+    (refusable $($outcome:ident),+) => {$(
+        doc_outcome!($outcome);
+        impl From<EntryRefusal> for $outcome {
+            fn from(refusal: EntryRefusal) -> Self {
+                match refusal {
+                    EntryRefusal::NoEntry => Self::NoEntry,
+                    EntryRefusal::Ambiguous => Self::Ambiguous,
+                }
+            }
+        }
+    )+};
+    ($($outcome:ident),+) => {$(
+        impl Edit for $outcome {
+            fn wrote(&self) -> bool {
+                matches!(self, Self::Updated)
+            }
+            fn landed(&self) -> bool {
+                matches!(self, Self::Updated | Self::Unchanged)
+            }
+        }
+    )+};
+}
+
+doc_outcome!(DocEdit, ControlWrite);
+doc_outcome!(refusable DisabledWrite, PlanWrite, GroupWrite);
+
+/// Read the raw document at `path`, apply `edit` to it, and rewrite the file
+/// atomically only when the outcome says the document changed. The frame of
+/// every targeted writer: the edit runs on the file's RAW JSON, never on a
+/// `Config` round-trip, so a key the user edited while the proxy ran survives.
+fn edit_document<E: Edit>(
+    path: &Path,
+    edit: impl FnOnce(&mut Map<String, Value>) -> Result<E, ConfigError>,
+) -> Result<E, ConfigError> {
+    let mut doc = read_document(path)?;
+    let outcome = edit(&mut doc)?;
+    if outcome.wrote() {
+        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    }
+    Ok(outcome)
+}
+
 /// What a targeted [`save_disabled`] did to the on-disk document. Reported
 /// rather than swallowed so the caller can say, in one line, whether a benched
 /// account will actually still be benched after a restart.
@@ -3447,12 +3563,7 @@ pub fn save_disabled(
     target: &Account,
     disabled: bool,
 ) -> Result<DisabledWrite, ConfigError> {
-    let mut doc = read_document(path)?;
-    let outcome = merge_disabled(&mut doc, target, disabled);
-    if outcome == DisabledWrite::Updated {
-        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
-    }
-    Ok(outcome)
+    edit_document(path, |doc| Ok(merge_disabled(doc, target, disabled)))
 }
 
 /// Set or remove `disabled` on the one entry in `doc` matching `target`. Reports
@@ -3462,7 +3573,7 @@ fn merge_disabled(doc: &mut Map<String, Value>, target: &Account, disabled: bool
     let entry = match find_account_entry(doc, target) {
         Ok(entry) => entry,
         // No entry, or too many to choose between — either way nothing is written.
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into(),
     };
     // `true` writes the key; `false` DROPS it (never a `false` literal).
     let desired = disabled.then_some(Value::Bool(true));
@@ -3536,18 +3647,15 @@ pub fn save_plan(
     rate_limit_tier: Option<&str>,
     seat_tier: Option<&str>,
 ) -> Result<PlanWrite, ConfigError> {
-    let mut doc = read_document(path)?;
-    let outcome = merge_plan(
-        &mut doc,
-        target,
-        organization_type,
-        rate_limit_tier,
-        seat_tier,
-    );
-    if outcome == PlanWrite::Updated {
-        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
-    }
-    Ok(outcome)
+    edit_document(path, |doc| {
+        Ok(merge_plan(
+            doc,
+            target,
+            organization_type,
+            rate_limit_tier,
+            seat_tier,
+        ))
+    })
 }
 
 /// Set the plan fields on the one entry in `doc` matching `target`. Reports
@@ -3562,10 +3670,7 @@ fn merge_plan(
 ) -> PlanWrite {
     let entry = match find_account_entry(doc, target) {
         Ok(entry) => entry,
-        Err(DisabledWrite::Ambiguous) => return PlanWrite::Ambiguous,
-        // `find_account_entry` returns only `NoEntry`/`Ambiguous` on the error
-        // side; the remaining arms are the total-function tail.
-        Err(_) => return PlanWrite::NoEntry,
+        Err(refusal) => return refusal.into(),
     };
     let mut changed = false;
     for (key, value) in [
@@ -3643,12 +3748,7 @@ pub fn save_control_account(
     path: &Path,
     target: Option<&Account>,
 ) -> Result<ControlWrite, ConfigError> {
-    let mut doc = read_document(path)?;
-    let outcome = merge_control_account(&mut doc, target);
-    if outcome == ControlWrite::Updated {
-        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
-    }
-    Ok(outcome)
+    edit_document(path, |doc| Ok(merge_control_account(doc, target)))
 }
 
 /// What a targeted [`save_group_membership`] did to the on-disk document. Same
@@ -3708,12 +3808,9 @@ pub fn save_group_membership(
     group: &str,
     member: bool,
 ) -> Result<GroupWrite, ConfigError> {
-    let mut doc = read_document(path)?;
-    let outcome = merge_group_membership(&mut doc, target, group, member);
-    if outcome == GroupWrite::Updated {
-        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
-    }
-    Ok(outcome)
+    edit_document(path, |doc| {
+        Ok(merge_group_membership(doc, target, group, member))
+    })
 }
 
 /// Add or remove `group` on the one entry in `doc` matching `target`. Reports
@@ -3727,18 +3824,7 @@ fn merge_group_membership(
 ) -> GroupWrite {
     let entry = match find_account_entry(doc, target) {
         Ok(entry) => entry,
-        Err(refusal) => {
-            return match refusal {
-                DisabledWrite::NoEntry => GroupWrite::NoEntry,
-                DisabledWrite::Ambiguous => GroupWrite::Ambiguous,
-                // `find_account_entry` only ever returns these two on `Err` —
-                // `Updated`/`Unchanged` are `DisabledWrite`'s success arms and
-                // never reach a caller through this path.
-                DisabledWrite::Updated | DisabledWrite::Unchanged => {
-                    unreachable!("find_account_entry only returns NoEntry/Ambiguous on Err")
-                }
-            };
-        }
+        Err(refusal) => return refusal.into(),
     };
     let mut groups: Vec<String> = entry
         .get("groups")
@@ -3769,59 +3855,95 @@ fn merge_group_membership(
     GroupWrite::Updated
 }
 
-/// What a targeted [`save_group_reserved`] did to the on-disk document. Same
-/// two-arm shape as [`GroupWrite`]'s success cases — this write can never fail
-/// on an identity mismatch (it targets a GROUP NAME, not an `accounts` entry),
-/// so it has no `NoEntry`/`Ambiguous` counterpart.
+/// What a targeted [`save_group_reserved`] did to the on-disk document.
+pub type GroupReserveWrite = DocEdit;
+/// What a targeted [`save_group_parked`] did to the on-disk document.
+pub type GroupParkWrite = DocEdit;
+/// What a targeted [`save_group_allow_control`] did to the on-disk document.
+pub type GroupControlWrite = DocEdit;
+/// What a targeted [`save_group_color`] did to the on-disk document.
+pub type GroupColorWrite = DocEdit;
+
+/// One key under `groupSettings.<group>` that a writer sets. A group write
+/// targets a GROUP NAME, not an `accounts` entry, so it can never miss or be
+/// ambiguous: its outcome is a plain [`DocEdit`].
+///
+/// `spillToPool` ([`GroupSettings::spill_to_pool`]) has no variant because
+/// neither the CLI nor TcrBar sets it; it is set by editing the file by hand.
+/// A writer for it is one variant here and one line in [`GroupKey::wire`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupReserveWrite {
-    /// `groupSettings.<group>.reserved` was set (or its whole entry removed)
-    /// and the file rewritten.
-    Updated,
-    /// The group already carried (or already lacked) `reserved`, so nothing
-    /// was written and the file is byte-identical.
-    Unchanged,
+enum GroupKey {
+    Reserved,
+    Parked,
+    AllowControl,
+    Color,
 }
 
-/// Persist ONLY `groupSettings.<group>.reserved` into the file at `path`,
-/// leaving every other key — every account, every other group's settings —
-/// exactly as the user left it. Same read-modify-write shape as
-/// [`save_group_membership`] and for the same reason: `Config` is a boot-time
-/// snapshot, and a whole-file [`save`] would revert any out-of-band edit.
-///
-/// Setting `reserved` to `false` drops the `reserved` key rather than writing
-/// `false`, and drops the group's whole `groupSettings` entry once it is
-/// empty — mirroring the drops-the-key contract [`merge_group_membership`]
-/// uses for an account's last label, so a group that has ever been reserved
-/// and then unreserved carries no permanent litter.
-pub fn save_group_reserved(
+impl GroupKey {
+    /// The key's spelling in the file.
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Parked => "parked",
+            Self::AllowControl => "allowControlAccount",
+            Self::Color => "color",
+        }
+    }
+
+    /// What the key carries on disk, read the way the writer would write it: a
+    /// flag counts only as a literal `true`, a color only as a string. Anything
+    /// else reads as unset, so asking for "unset" over a hand-written `false`
+    /// (or a value of the wrong type) is `Unchanged` and leaves it on disk.
+    fn current(self, raw: Option<&Value>) -> Option<Value> {
+        match self {
+            Self::Reserved | Self::Parked | Self::AllowControl => raw
+                .and_then(Value::as_bool)
+                .filter(|set| *set)
+                .map(Value::Bool),
+            Self::Color => raw
+                .and_then(Value::as_str)
+                .map(|hex| Value::String(hex.to_string())),
+        }
+    }
+}
+
+/// Persist ONLY `groupSettings.<group>.<key>` into the file at `path`, leaving
+/// every other key (every account, every other group's settings) exactly as
+/// the user left it. Same read-modify-write shape as [`save_group_membership`]
+/// and for the same reason: `Config` is a boot-time snapshot, and a whole-file
+/// [`save`] would revert any out-of-band edit.
+fn save_group_setting(
     path: &Path,
     group: &str,
-    reserved: bool,
-) -> Result<GroupReserveWrite, ConfigError> {
-    let mut doc = read_document(path)?;
-    let outcome = merge_group_reserved(&mut doc, group, reserved);
-    if outcome == GroupReserveWrite::Updated {
-        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
-    }
-    Ok(outcome)
+    key: GroupKey,
+    desired: Option<Value>,
+) -> Result<DocEdit, ConfigError> {
+    edit_document(path, |doc| Ok(set_group_setting(doc, group, key, desired)))
 }
 
-fn merge_group_reserved(
+/// Set `groupSettings.<group>.<key>` to `desired`, or remove it on `None`.
+///
+/// Clearing drops the key rather than writing `false` or `null`, and drops the
+/// group's whole `groupSettings` entry once it is empty, and `groupSettings`
+/// itself once that is empty. This mirrors the drops-the-key contract
+/// [`merge_group_membership`] uses for an account's last label, so a group
+/// that has ever had a setting set and then cleared carries no permanent
+/// litter.
+fn set_group_setting(
     doc: &mut Map<String, Value>,
     group: &str,
-    reserved: bool,
-) -> GroupReserveWrite {
-    let already = doc
-        .get("groupSettings")
-        .and_then(Value::as_object)
-        .and_then(|settings| settings.get(group))
-        .and_then(Value::as_object)
-        .and_then(|entry| entry.get("reserved"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if already == reserved {
-        return GroupReserveWrite::Unchanged;
+    key: GroupKey,
+    desired: Option<Value>,
+) -> DocEdit {
+    let already = key.current(
+        doc.get("groupSettings")
+            .and_then(Value::as_object)
+            .and_then(|settings| settings.get(group))
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get(key.wire())),
+    );
+    if already == desired {
+        return DocEdit::Unchanged;
     }
 
     let settings = doc
@@ -3830,282 +3952,17 @@ fn merge_group_reserved(
     // A hand-edited `groupSettings` that is not an object is corrupt input we
     // must not silently coerce — replace it with a fresh object rather than
     // panicking, since `already` above already proved it carried no usable
-    // `reserved` value for this group either way.
+    // value for this group either way.
     if !settings.is_object() {
         *settings = Value::Object(Map::new());
     }
     let Some(settings_obj) = settings.as_object_mut() else {
         // Unreachable: the guard above just made it an object.
-        return GroupReserveWrite::Unchanged;
+        return DocEdit::Unchanged;
     };
 
-    if reserved {
-        let entry = settings_obj
-            .entry(group.to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if !entry.is_object() {
-            *entry = Value::Object(Map::new());
-        }
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert("reserved".to_string(), Value::Bool(true));
-        }
-    } else if let Some(entry) = settings_obj.get_mut(group)
-        && let Some(obj) = entry.as_object_mut()
-    {
-        obj.remove("reserved");
-        if obj.is_empty() {
-            settings_obj.remove(group);
-        }
-    }
-    if settings_obj.is_empty() {
-        doc.remove("groupSettings");
-    }
-    GroupReserveWrite::Updated
-}
-
-/// What a targeted [`save_group_parked`] did to the on-disk document. Same
-/// shape as [`GroupReserveWrite`] and for the same reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupParkWrite {
-    /// `groupSettings.<group>.parked` was set (or its whole entry removed) and
-    /// the file rewritten.
-    Updated,
-    /// The group already carried (or already lacked) `parked`, so nothing was
-    /// written and the file is byte-identical.
-    Unchanged,
-}
-
-/// Persist ONLY `groupSettings.<group>.parked` into the file at `path`,
-/// leaving every other key — every account, every other group's settings —
-/// exactly as the user left it. Same read-modify-write shape as
-/// [`save_group_reserved`] and for the same reason.
-///
-/// Setting `parked` to `false` drops the `parked` key rather than writing
-/// `false`, and drops the group's whole `groupSettings` entry once it is empty
-/// — same drops-the-key contract [`merge_group_reserved`] uses, so a group that
-/// has ever been parked and then unparked carries no permanent litter.
-pub fn save_group_parked(
-    path: &Path,
-    group: &str,
-    parked: bool,
-) -> Result<GroupParkWrite, ConfigError> {
-    let mut doc = read_document(path)?;
-    let outcome = merge_group_parked(&mut doc, group, parked);
-    if outcome == GroupParkWrite::Updated {
-        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
-    }
-    Ok(outcome)
-}
-
-fn merge_group_parked(doc: &mut Map<String, Value>, group: &str, parked: bool) -> GroupParkWrite {
-    let already = doc
-        .get("groupSettings")
-        .and_then(Value::as_object)
-        .and_then(|settings| settings.get(group))
-        .and_then(Value::as_object)
-        .and_then(|entry| entry.get("parked"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if already == parked {
-        return GroupParkWrite::Unchanged;
-    }
-
-    let settings = doc
-        .entry("groupSettings".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    // Same corrupt-hand-edit guard as `merge_group_reserved`: `already` above
-    // already proved a non-object carried no usable `parked` value.
-    if !settings.is_object() {
-        *settings = Value::Object(Map::new());
-    }
-    let Some(settings_obj) = settings.as_object_mut() else {
-        // Unreachable: the guard above just made it an object.
-        return GroupParkWrite::Unchanged;
-    };
-
-    if parked {
-        let entry = settings_obj
-            .entry(group.to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if !entry.is_object() {
-            *entry = Value::Object(Map::new());
-        }
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert("parked".to_string(), Value::Bool(true));
-        }
-    } else if let Some(entry) = settings_obj.get_mut(group)
-        && let Some(obj) = entry.as_object_mut()
-    {
-        obj.remove("parked");
-        if obj.is_empty() {
-            settings_obj.remove(group);
-        }
-    }
-    if settings_obj.is_empty() {
-        doc.remove("groupSettings");
-    }
-    GroupParkWrite::Updated
-}
-
-/// What a targeted [`save_group_allow_control`] did to the on-disk document.
-/// Same shape as [`GroupReserveWrite`] and for the same reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupControlWrite {
-    /// `groupSettings.<group>.allowControlAccount` was set (or its whole
-    /// entry removed) and the file rewritten.
-    Updated,
-    /// The group already carried (or already lacked) `allowControlAccount`,
-    /// so nothing was written and the file is byte-identical.
-    Unchanged,
-}
-
-/// Persist ONLY `groupSettings.<group>.allowControlAccount` into the file at
-/// `path`, leaving every other key — every account, every other group's
-/// settings — exactly as the user left it. Same read-modify-write shape as
-/// [`save_group_reserved`] and for the same reason.
-///
-/// Setting `allow` to `false` drops the `allowControlAccount` key rather than
-/// writing `false`, and drops the group's whole `groupSettings` entry once it
-/// is empty — same drops-the-key contract [`merge_group_reserved`] uses, so a
-/// group that has ever opted in and then opted out carries no permanent
-/// litter.
-pub fn save_group_allow_control(
-    path: &Path,
-    group: &str,
-    allow: bool,
-) -> Result<GroupControlWrite, ConfigError> {
-    let mut doc = read_document(path)?;
-    let outcome = merge_group_allow_control(&mut doc, group, allow);
-    if outcome == GroupControlWrite::Updated {
-        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
-    }
-    Ok(outcome)
-}
-
-fn merge_group_allow_control(
-    doc: &mut Map<String, Value>,
-    group: &str,
-    allow: bool,
-) -> GroupControlWrite {
-    let already = doc
-        .get("groupSettings")
-        .and_then(Value::as_object)
-        .and_then(|settings| settings.get(group))
-        .and_then(Value::as_object)
-        .and_then(|entry| entry.get("allowControlAccount"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if already == allow {
-        return GroupControlWrite::Unchanged;
-    }
-
-    let settings = doc
-        .entry("groupSettings".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    // Same corrupt-hand-edit guard as `merge_group_reserved`: `already` above
-    // already proved this was not a usable object for this group either way.
-    if !settings.is_object() {
-        *settings = Value::Object(Map::new());
-    }
-    let Some(settings_obj) = settings.as_object_mut() else {
-        // Unreachable: the guard above just made it an object.
-        return GroupControlWrite::Unchanged;
-    };
-
-    if allow {
-        let entry = settings_obj
-            .entry(group.to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if !entry.is_object() {
-            *entry = Value::Object(Map::new());
-        }
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert("allowControlAccount".to_string(), Value::Bool(true));
-        }
-    } else if let Some(entry) = settings_obj.get_mut(group)
-        && let Some(obj) = entry.as_object_mut()
-    {
-        obj.remove("allowControlAccount");
-        if obj.is_empty() {
-            settings_obj.remove(group);
-        }
-    }
-    if settings_obj.is_empty() {
-        doc.remove("groupSettings");
-    }
-    GroupControlWrite::Updated
-}
-
-/// What a targeted [`save_group_color`] did to the on-disk document. Same
-/// shape as [`GroupReserveWrite`] and for the same reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupColorWrite {
-    /// `groupSettings.<group>.color` was set (or its whole entry removed)
-    /// and the file rewritten.
-    Updated,
-    /// The group already carried (or already lacked) that exact color, so
-    /// nothing was written and the file is byte-identical.
-    Unchanged,
-}
-
-/// Persist ONLY `groupSettings.<group>.color` into the file at `path`,
-/// leaving every other key — every account, every other group's settings —
-/// exactly as the user left it. Same read-modify-write shape as
-/// [`save_group_reserved`] and for the same reason.
-///
-/// `color = None` (`tcr group color --clear`) drops the `color` key rather
-/// than writing anything, and drops the group's whole `groupSettings` entry
-/// once it is empty — same drops-the-key contract [`merge_group_reserved`]
-/// uses, so a group that has ever had a color set and then cleared carries
-/// no permanent litter and reverts to [`Config::group_color`]'s derived
-/// value on the very next read.
-///
-/// `color`, when `Some`, is trusted as already validated/normalized — call
-/// through [`validate_hex_color`] first; this function does not re-check it.
-pub fn save_group_color(
-    path: &Path,
-    group: &str,
-    color: Option<&str>,
-) -> Result<GroupColorWrite, ConfigError> {
-    let mut doc = read_document(path)?;
-    let outcome = merge_group_color(&mut doc, group, color);
-    if outcome == GroupColorWrite::Updated {
-        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
-    }
-    Ok(outcome)
-}
-
-fn merge_group_color(
-    doc: &mut Map<String, Value>,
-    group: &str,
-    color: Option<&str>,
-) -> GroupColorWrite {
-    let already = doc
-        .get("groupSettings")
-        .and_then(Value::as_object)
-        .and_then(|settings| settings.get(group))
-        .and_then(Value::as_object)
-        .and_then(|entry| entry.get("color"))
-        .and_then(Value::as_str);
-    if already == color {
-        return GroupColorWrite::Unchanged;
-    }
-
-    let settings = doc
-        .entry("groupSettings".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    // Same corrupt-hand-edit guard as `merge_group_reserved`: `already` above
-    // already proved this was not a usable object for this group either way.
-    if !settings.is_object() {
-        *settings = Value::Object(Map::new());
-    }
-    let Some(settings_obj) = settings.as_object_mut() else {
-        // Unreachable: the guard above just made it an object.
-        return GroupColorWrite::Unchanged;
-    };
-
-    match color {
-        Some(hex) => {
+    match desired {
+        Some(value) => {
             let entry = settings_obj
                 .entry(group.to_string())
                 .or_insert_with(|| Value::Object(Map::new()));
@@ -4113,14 +3970,14 @@ fn merge_group_color(
                 *entry = Value::Object(Map::new());
             }
             if let Some(obj) = entry.as_object_mut() {
-                obj.insert("color".to_string(), Value::String(hex.to_string()));
+                obj.insert(key.wire().to_string(), value);
             }
         }
         None => {
             if let Some(entry) = settings_obj.get_mut(group)
                 && let Some(obj) = entry.as_object_mut()
             {
-                obj.remove("color");
+                obj.remove(key.wire());
                 if obj.is_empty() {
                     settings_obj.remove(group);
                 }
@@ -4130,7 +3987,73 @@ fn merge_group_color(
     if settings_obj.is_empty() {
         doc.remove("groupSettings");
     }
-    GroupColorWrite::Updated
+    DocEdit::Updated
+}
+
+/// Persist ONLY `groupSettings.<group>.reserved`. `false` drops the key; see
+/// [`set_group_setting`].
+pub fn save_group_reserved(
+    path: &Path,
+    group: &str,
+    reserved: bool,
+) -> Result<GroupReserveWrite, ConfigError> {
+    save_group_setting(
+        path,
+        group,
+        GroupKey::Reserved,
+        reserved.then_some(Value::Bool(true)),
+    )
+}
+
+/// Persist ONLY `groupSettings.<group>.parked`. `false` drops the key; see
+/// [`set_group_setting`].
+pub fn save_group_parked(
+    path: &Path,
+    group: &str,
+    parked: bool,
+) -> Result<GroupParkWrite, ConfigError> {
+    save_group_setting(
+        path,
+        group,
+        GroupKey::Parked,
+        parked.then_some(Value::Bool(true)),
+    )
+}
+
+/// Persist ONLY `groupSettings.<group>.allowControlAccount`. `false` drops the
+/// key; see [`set_group_setting`].
+pub fn save_group_allow_control(
+    path: &Path,
+    group: &str,
+    allow: bool,
+) -> Result<GroupControlWrite, ConfigError> {
+    save_group_setting(
+        path,
+        group,
+        GroupKey::AllowControl,
+        allow.then_some(Value::Bool(true)),
+    )
+}
+
+/// Persist ONLY `groupSettings.<group>.color`.
+///
+/// `color = None` (`tcr group color --clear`) drops the key (see
+/// [`set_group_setting`]), so the group reverts to [`Config::group_color`]'s
+/// derived value on the very next read.
+///
+/// `color`, when `Some`, is trusted as already validated/normalized — call
+/// through [`validate_hex_color`] first; this function does not re-check it.
+pub fn save_group_color(
+    path: &Path,
+    group: &str,
+    color: Option<&str>,
+) -> Result<GroupColorWrite, ConfigError> {
+    save_group_setting(
+        path,
+        group,
+        GroupKey::Color,
+        color.map(|hex| Value::String(hex.to_string())),
+    )
 }
 
 /// Set or remove the top-level `controlAccount` key in `doc`. Reports whether
@@ -4249,7 +4172,7 @@ fn provider_of_entry(entry: &Map<String, Value>) -> Option<crate::provider::Prov
 }
 
 /// The on-disk `accounts` entry whose identity matches `target`, or the
-/// [`DisabledWrite`] refusal explaining why there is no single entry to write.
+/// [`EntryRefusal`] explaining why there is no single entry to write.
 ///
 /// Matching reuses the [`DiskIdentity`] probe + [`crate::identity::resolve`]
 /// pairing that [`merge_tokens`] uses, so a rotated credential and a disabled flag
@@ -4272,11 +4195,11 @@ fn provider_of_entry(entry: &Map<String, Value>) -> Option<crate::provider::Prov
 fn find_account_entry<'a>(
     doc: &'a mut Map<String, Value>,
     target: &Account,
-) -> Result<&'a mut Map<String, Value>, DisabledWrite> {
+) -> Result<&'a mut Map<String, Value>, EntryRefusal> {
     let index = match locate_account_entry(doc, target) {
         EntryMatch::One(index) => index,
-        EntryMatch::None => return Err(DisabledWrite::NoEntry),
-        EntryMatch::Many => return Err(DisabledWrite::Ambiguous),
+        EntryMatch::None => return Err(EntryRefusal::NoEntry),
+        EntryMatch::Many => return Err(EntryRefusal::Ambiguous),
     };
     // The immutable scan above proved this path resolves; `NoEntry` here is the
     // total-function tail, not a reachable outcome.
@@ -4284,7 +4207,7 @@ fn find_account_entry<'a>(
         .and_then(Value::as_array_mut)
         .and_then(|entries| entries.get_mut(index))
         .and_then(Value::as_object_mut)
-        .ok_or(DisabledWrite::NoEntry)
+        .ok_or(EntryRefusal::NoEntry)
 }
 
 /// The top-level key that tells the empty-fleet Claude Code import to leave
@@ -4427,7 +4350,7 @@ impl std::fmt::Display for AccountWrite {
 /// either a brand-new login or an existing account's own identity with fresh
 /// credentials merged in (`Manager::persist_replaced`) — so a miss is filled in
 /// rather than refused. That is also why `find_account_entry` (which returns
-/// only the refuse-on-miss `DisabledWrite`) is not reused directly here; this
+/// a refusal on a miss) is not reused directly here; this
 /// calls the lower-level [`locate_account_entry`] it is itself built on, so both
 /// functions still run the identical resolution scan.
 ///
@@ -4436,12 +4359,16 @@ impl std::fmt::Display for AccountWrite {
 /// account's single-use refresh token — exactly the failure `find_account_entry`
 /// exists to rule out.
 pub fn save_account(path: &Path, account: &Account) -> Result<AccountWrite, ConfigError> {
-    let mut doc = read_document(path)?;
-    let outcome = merge_account(&mut doc, account)?;
-    if matches!(outcome, AccountWrite::Added | AccountWrite::Updated) {
-        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    edit_document(path, |doc| merge_account(doc, account))
+}
+
+impl Edit for AccountWrite {
+    fn wrote(&self) -> bool {
+        matches!(self, Self::Added | Self::Updated)
     }
-    Ok(outcome)
+    fn landed(&self) -> bool {
+        self.wrote()
+    }
 }
 
 /// Insert-or-replace `account` by identity in `doc`. See [`save_account`].
@@ -5208,15 +5135,7 @@ mod tests {
     /// permanently erase the entry.
     #[test]
     fn load_reports_quarantined_account_names() {
-        let path = tmp_path("load-quarantine-names");
-        fs::write(
-            &path,
-            r#"{ "accounts": [
-                 { "name": "acct-good", "accessToken": "at-good" },
-                 { "name": "acct-import", "importFrom": "/some/other/file.json" }
-               ] }"#,
-        )
-        .unwrap();
+        let path = tmp_file("load-quarantine-names", GOOD_ROW_AND_IMPORT_ROW);
 
         let config = load(&path).unwrap();
         assert_eq!(config.quarantined_accounts, vec!["acct-import".to_string()]);
@@ -5230,17 +5149,13 @@ mod tests {
     /// unusable row and the rest of the config loads.
     #[test]
     fn load_quarantines_an_api_key_account() {
-        let path = tmp_path("load-quarantine-apikey");
-        fs::write(
-            &path,
+        let path = tmp_file(
+            "load-quarantine-apikey",
             r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"key","type":"apikey","apiKey":"sk-ant-api-fake"}]}"#,
-        )
-        .unwrap();
+        );
 
         let config = load(&path).expect("one API-key row must not fail the whole load");
-        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["ok"], "only `ok` may be usable");
-        assert_eq!(config.quarantined_accounts, vec!["key".to_string()]);
+        assert_only_ok_loads_and_quarantined_is(&config, "key");
         fs::remove_file(&path).ok();
     }
 
@@ -5249,17 +5164,13 @@ mod tests {
     /// an API key authenticates.
     #[test]
     fn load_quarantines_an_api_key_account_that_also_has_an_access_token() {
-        let path = tmp_path("load-quarantine-apikey-token");
-        fs::write(
-            &path,
+        let path = tmp_file(
+            "load-quarantine-apikey-token",
             r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"key","type":"apikey","accessToken":"sk-ant-api-fake"}]}"#,
-        )
-        .unwrap();
+        );
 
         let config = load(&path).unwrap();
-        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["ok"]);
-        assert_eq!(config.quarantined_accounts, vec!["key".to_string()]);
+        assert_only_ok_loads_and_quarantined_is(&config, "key");
         fs::remove_file(&path).ok();
     }
 
@@ -5267,17 +5178,13 @@ mod tests {
     /// fail the whole load; now only that row is set aside.
     #[test]
     fn load_quarantines_an_account_whose_type_is_not_a_string() {
-        let path = tmp_path("load-quarantine-type-number");
-        fs::write(
-            &path,
+        let path = tmp_file(
+            "load-quarantine-type-number",
             r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"odd","type":5,"accessToken":"b"}]}"#,
-        )
-        .unwrap();
+        );
 
         let config = load(&path).unwrap();
-        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["ok"]);
-        assert_eq!(config.quarantined_accounts, vec!["odd".to_string()]);
+        assert_only_ok_loads_and_quarantined_is(&config, "odd");
         fs::remove_file(&path).ok();
     }
 
@@ -5539,15 +5446,7 @@ mod tests {
     /// exists purely for the in-process caller, never the file.
     #[test]
     fn quarantined_accounts_do_not_serialize() {
-        let path = tmp_path("load-quarantine-serialize");
-        fs::write(
-            &path,
-            r#"{ "accounts": [
-                 { "name": "acct-good", "accessToken": "at-good" },
-                 { "name": "acct-import", "importFrom": "/some/other/file.json" }
-               ] }"#,
-        )
-        .unwrap();
+        let path = tmp_file("load-quarantine-serialize", GOOD_ROW_AND_IMPORT_ROW);
         let config = load(&path).unwrap();
         assert_eq!(config.quarantined_accounts, vec!["acct-import".to_string()]);
 
@@ -5981,6 +5880,103 @@ mod tests {
         fs::remove_file(&tmp).ok();
     }
 
+    /// Every group key writes its own spelling, and a clear over a value the
+    /// writer would never have written (a hand-typed `false`, a color that is
+    /// not a string) is `Unchanged`: the file is left byte for byte.
+    #[test]
+    fn group_settings_write_their_own_keys_and_leave_hand_written_unset_values() {
+        let tmp = std::env::temp_dir().join(format!(
+            "tcr-cfg-group-keys-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        let original = r#"{
+  "accounts": [],
+  "groupSettings": {
+    "g": {
+      "parked": false,
+      "color": 5
+    }
+  }
+}"#;
+        fs::write(&tmp, original).unwrap();
+
+        assert_eq!(
+            save_group_parked(&tmp, "g", false).unwrap(),
+            DocEdit::Unchanged
+        );
+        assert_eq!(
+            save_group_color(&tmp, "g", None).unwrap(),
+            DocEdit::Unchanged
+        );
+        assert_eq!(
+            save_group_reserved(&tmp, "g", false).unwrap(),
+            DocEdit::Unchanged
+        );
+        assert_eq!(fs::read_to_string(&tmp).unwrap(), original);
+
+        assert_eq!(
+            save_group_parked(&tmp, "g", true).unwrap(),
+            DocEdit::Updated
+        );
+        assert_eq!(
+            save_group_reserved(&tmp, "g", true).unwrap(),
+            DocEdit::Updated
+        );
+        assert_eq!(
+            save_group_allow_control(&tmp, "g", true).unwrap(),
+            DocEdit::Updated
+        );
+        assert_eq!(
+            save_group_color(&tmp, "h", Some("#32d74b")).unwrap(),
+            DocEdit::Updated
+        );
+        assert_eq!(
+            fs::read_to_string(&tmp).unwrap(),
+            r##"{
+  "accounts": [],
+  "groupSettings": {
+    "g": {
+      "allowControlAccount": true,
+      "color": 5,
+      "parked": true,
+      "reserved": true
+    },
+    "h": {
+      "color": "#32d74b"
+    }
+  }
+}"##
+        );
+
+        assert_eq!(save_group_color(&tmp, "h", None).unwrap(), DocEdit::Updated);
+        assert_eq!(
+            save_group_parked(&tmp, "g", false).unwrap(),
+            DocEdit::Updated
+        );
+        assert_eq!(
+            save_group_reserved(&tmp, "g", false).unwrap(),
+            DocEdit::Updated
+        );
+        assert_eq!(
+            save_group_allow_control(&tmp, "g", false).unwrap(),
+            DocEdit::Updated
+        );
+        assert_eq!(
+            fs::read_to_string(&tmp).unwrap(),
+            r#"{
+  "accounts": [],
+  "groupSettings": {
+    "g": {
+      "color": 5
+    }
+  }
+}"#
+        );
+
+        fs::remove_file(&tmp).ok();
+    }
+
     #[test]
     fn save_group_allow_control_round_trips_and_false_drops_the_key() {
         let tmp =
@@ -6370,6 +6366,27 @@ mod tests {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("tcr-{tag}-{}-{seq}.json", std::process::id()))
+    }
+
+    /// `json` written to a fresh [`tmp_path`] tagged `tag`, and that path.
+    fn tmp_file(tag: &str, json: &str) -> PathBuf {
+        let path = tmp_path(tag);
+        fs::write(&path, json).unwrap();
+        path
+    }
+
+    /// A usable row, `acct-good`, beside `acct-import`, which only names another file to
+    /// import from and so is quarantined.
+    const GOOD_ROW_AND_IMPORT_ROW: &str = r#"{ "accounts": [
+                 { "name": "acct-good", "accessToken": "at-good" },
+                 { "name": "acct-import", "importFrom": "/some/other/file.json" }
+               ] }"#;
+
+    /// Only the row named `ok` loaded, and the one row set aside is `quarantined`.
+    fn assert_only_ok_loads_and_quarantined_is(config: &Config, quarantined: &str) {
+        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["ok"], "only `ok` may be usable");
+        assert_eq!(config.quarantined_accounts, vec![quarantined.to_string()]);
     }
 
     fn read_json(path: &Path) -> Value {
@@ -7502,34 +7519,37 @@ mod tests {
         fs::remove_file(&malformed).ok();
     }
 
+    /// `me@example.com` logged into two orgs, A and B, as one person (`uuid-person`).
+    const ONE_EMAIL_IN_TWO_ORGS: &str = r#"{ "accounts": [
+                { "name": "me@example.com", "accessToken": "at-a", "accountUuid": "uuid-person",
+                  "orgUuid": "org-a", "orgName": "Org A" },
+                { "name": "me@example.com", "accessToken": "at-b", "accountUuid": "uuid-person",
+                  "orgUuid": "org-b", "orgName": "Org B" }
+            ] }"#;
+
+    /// Disable `me@example.com` in the org `org_uuid` (named `org_name`) in the file at `path`,
+    /// and assert the write updated a row.
+    fn disable_me_in(org_uuid: &str, org_name: &str, path: &Path) {
+        let target = crate::identity::probe(
+            crate::provider::Provider::Anthropic,
+            "me@example.com",
+            Some("uuid-person".to_string()),
+            Some(org_uuid.to_string()),
+            Some(org_name.to_string()),
+        );
+        assert_eq!(
+            save_disabled(path, &target, true).unwrap(),
+            DisabledWrite::Updated
+        );
+    }
+
     /// The flag lands on the right ORG when one email is logged into two — the
     /// same identity matching `merge_tokens` uses, so a rotated credential and a
     /// disabled flag can never land on two different entries.
     #[test]
     fn disable_picks_the_right_entry_when_one_email_has_two_orgs() {
-        let path = tmp_path("disable-two-orgs");
-        fs::write(
-            &path,
-            r#"{ "accounts": [
-                { "name": "me@example.com", "accessToken": "at-a", "accountUuid": "uuid-person",
-                  "orgUuid": "org-a", "orgName": "Org A" },
-                { "name": "me@example.com", "accessToken": "at-b", "accountUuid": "uuid-person",
-                  "orgUuid": "org-b", "orgName": "Org B" }
-            ] }"#,
-        )
-        .unwrap();
-
-        let target = crate::identity::probe(
-            crate::provider::Provider::Anthropic,
-            "me@example.com",
-            Some("uuid-person".to_string()),
-            Some("org-b".to_string()),
-            Some("Org B".to_string()),
-        );
-        assert_eq!(
-            save_disabled(&path, &target, true).unwrap(),
-            DisabledWrite::Updated
-        );
+        let path = tmp_file("disable-two-orgs", ONE_EMAIL_IN_TWO_ORGS);
+        disable_me_in("org-b", "Org B", &path);
 
         let after = read_json(&path);
         assert!(
@@ -7604,29 +7624,8 @@ mod tests {
     /// identity work exists to support would stop being writable.
     #[test]
     fn two_orgs_under_one_name_are_not_ambiguous() {
-        let path = tmp_path("disable-two-orgs-unambiguous");
-        fs::write(
-            &path,
-            r#"{ "accounts": [
-                { "name": "me@example.com", "accessToken": "at-a", "accountUuid": "uuid-person",
-                  "orgUuid": "org-a", "orgName": "Org A" },
-                { "name": "me@example.com", "accessToken": "at-b", "accountUuid": "uuid-person",
-                  "orgUuid": "org-b", "orgName": "Org B" }
-            ] }"#,
-        )
-        .unwrap();
-
-        let target = crate::identity::probe(
-            crate::provider::Provider::Anthropic,
-            "me@example.com",
-            Some("uuid-person".to_string()),
-            Some("org-a".to_string()),
-            Some("Org A".to_string()),
-        );
-        assert_eq!(
-            save_disabled(&path, &target, true).unwrap(),
-            DisabledWrite::Updated
-        );
+        let path = tmp_file("disable-two-orgs-unambiguous", ONE_EMAIL_IN_TWO_ORGS);
+        disable_me_in("org-a", "Org A", &path);
         let after = read_json(&path);
         assert_eq!(after["accounts"][0]["disabled"], json!(true));
         assert!(after["accounts"][1].get("disabled").is_none());
@@ -7949,26 +7948,11 @@ mod tests {
     /// existing account's own identity with fresh credentials merged in.
     fn full_account(name: &str, access_token: &str) -> Account {
         Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: access_token.to_string(),
             refresh_token: Some(format!("rt-{access_token}")),
             expires_at: Some(1_800_000_000_000),
             priority: Some(2),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture(name)
         }
     }
 
@@ -8170,26 +8154,11 @@ mod tests {
     /// test spells out only the fields it is about.
     fn account_fixture(name: &str) -> Account {
         Account {
-            name: name.to_string(),
-            account_type: AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-fixture".to_string(),
             refresh_token: Some("rt-fixture".to_string()),
             expires_at: Some(1_800_000_000_000),
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: Map::new(),
+            ..Account::fixture(name)
         }
     }
 
@@ -8329,12 +8298,10 @@ mod tests {
         );
     }
 
-    /// A Codex row's folder loads into its field, not into `extra`, and survives a save and a
-    /// reload unchanged.
-    ///
-    /// Watched red: without the field, the key lives in `extra` and the struct reads `None`.
-    #[test]
-    fn codex_home_round_trips_on_codex_rows() {
+    /// A config file in a fresh temp dir holding one Codex row, bob's, imported from
+    /// `/Users/example/.codex`; the dir (kept alive by the caller), the path and the loaded
+    /// config.
+    fn bob_codex_row_with_a_codex_home() -> (tempfile::TempDir, PathBuf, Config) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(
@@ -8349,6 +8316,16 @@ mod tests {
         )
         .unwrap();
         let (config, _) = load_or_init(&path).expect("loads");
+        (dir, path, config)
+    }
+
+    /// A Codex row's folder loads into its field, not into `extra`, and survives a save and a
+    /// reload unchanged.
+    ///
+    /// Watched red: without the field, the key lives in `extra` and the struct reads `None`.
+    #[test]
+    fn codex_home_round_trips_on_codex_rows() {
+        let (_dir, path, config) = bob_codex_row_with_a_codex_home();
         let row = &config.accounts[0];
         assert_eq!(row.codex_home.as_deref(), Some("/Users/example/.codex"));
         assert!(
@@ -8370,20 +8347,7 @@ mod tests {
     /// `/Users/example/.codex` in place.
     #[test]
     fn a_codex_save_without_codex_home_removes_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(crate::paths::CONFIG_FILE);
-        std::fs::write(
-            &path,
-            r#"{ "accounts": [
-                { "name": "bob@example.com", "type": "oauth", "provider": "codex",
-                  "accountUuid": "55555555-5555-4555-8555-555555555555",
-                  "orgUuid": "66666666-6666-4666-8666-666666666666",
-                  "accessToken": "at-b", "refreshToken": "rt-b", "expiresAt": 1789000000000,
-                  "credentialVersion": 2, "codexHome": "/Users/example/.codex" }
-            ] }"#,
-        )
-        .unwrap();
-        let (config, _) = load_or_init(&path).expect("loads");
+        let (_dir, path, config) = bob_codex_row_with_a_codex_home();
         let codex_home_on_disk = |path: &Path| -> Value {
             let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
             doc["accounts"][0]

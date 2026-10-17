@@ -321,71 +321,42 @@ impl ServeOutcome {
     }
 }
 
-/// What the final session-affinity pin write did.
+/// What one cache file's final write on a clean shutdown did. One type for all three
+/// ([`SavedCache`]), because the three had each grown their own copy of these arms.
 ///
-/// Three states, not `Option<usize>`. "Affinity is off" and "the write FAILED
-/// and every pin is lost" are the same value in an `Option`, and the only place
-/// the difference survived was a `tracing::warn!` — which a library embedder,
-/// having installed no subscriber, never sees. A caller reading a clean report
-/// while the next boot cold-starts every session's prompt cache is exactly the
-/// silence this type exists to break.
+/// Not an `Option<usize>`: "this cache is off" and "the write FAILED and the entries are lost"
+/// are the same value in an `Option`, and the only place the difference survived was a
+/// `tracing::warn!`, which a library embedder, having installed no subscriber, never sees. A
+/// caller reading a clean report while the next boot starts cold is exactly the silence this
+/// type exists to break.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AffinityFlush {
-    /// Nothing to write: session affinity is off in the config, or no pin cache
-    /// path was configured ([`ServeOptions::affinity_path`] was `None`).
+pub enum CacheFlush {
+    /// Nothing to write: the cache is off in the config, or no path was configured for it
+    /// ([`ServeOptions::affinity_path`] or [`ServeOptions::wire_sessions_path`] was `None`).
     Disabled,
-    /// The pins were written for the next boot. Zero is a normal count.
+    /// Nothing had changed since the last save, so nothing was written. Only the bound-token
+    /// map reports this: its file can be megabytes, so its final write is skipped when clean.
+    Unchanged,
+    /// The entries were written for the next boot. Zero is a normal count.
     Written(usize),
-    /// The write failed and the pins are **lost**. Carries the rendered error
-    /// because the caller may have no tracing subscriber to read the warning in.
+    /// The write failed and the entries are **lost**. Carries the rendered error because the
+    /// caller may have no tracing subscriber to read the warning in.
     Failed(String),
 }
 
-impl AffinityFlush {
-    /// The pin count when one was actually written, else `None`.
-    pub fn pins_written(&self) -> Option<usize> {
+impl CacheFlush {
+    /// The entry count when one was actually written, else `None`.
+    pub fn written(&self) -> Option<usize> {
         match self {
-            AffinityFlush::Written(count) => Some(*count),
+            CacheFlush::Written(count) => Some(*count),
             _ => None,
         }
     }
 
-    /// Did a write that was supposed to happen fail? The one condition a caller
-    /// should surface even though shutdown is not fallible.
+    /// Did a write that was supposed to happen fail? The one condition a caller should
+    /// surface even though shutdown is not fallible.
     pub fn failed(&self) -> bool {
-        matches!(self, AffinityFlush::Failed(_))
-    }
-}
-
-/// What the final Sessions/Tools cache write did on shutdown — mirrors
-/// [`AffinityFlush`] exactly, for exactly the same reason: a caller that only
-/// ever sees this on a clean quit has no other way to know the panel's data
-/// will or will not be there at the next boot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WireSessionsFlush {
-    /// Nothing to write: no cache path was configured
-    /// ([`ServeOptions::wire_sessions_path`] was `None`).
-    Disabled,
-    /// The sessions were written for the next boot. Zero is a normal count.
-    Written(usize),
-    /// The write failed and the sessions are **lost**. Carries the rendered
-    /// error because the caller may have no tracing subscriber to read the
-    /// warning in.
-    Failed(String),
-}
-
-impl WireSessionsFlush {
-    /// The session count when one was actually written, else `None`.
-    pub fn sessions_written(&self) -> Option<usize> {
-        match self {
-            WireSessionsFlush::Written(count) => Some(*count),
-            _ => None,
-        }
-    }
-
-    /// Did a write that was supposed to happen fail?
-    pub fn failed(&self) -> bool {
-        matches!(self, WireSessionsFlush::Failed(_))
+        matches!(self, CacheFlush::Failed(_))
     }
 }
 
@@ -400,10 +371,12 @@ pub struct ShutdownReport {
     /// Non-zero means a loop was wedged — the flush below still ran, which is
     /// the whole reason the grace exists.
     pub tasks_aborted: usize,
+    /// What the final bound-token map write did.
+    pub bound_tokens: CacheFlush,
     /// What the final pin write did.
-    pub affinity: AffinityFlush,
+    pub affinity: CacheFlush,
     /// What the final Sessions/Tools cache write did.
-    pub wire_sessions: WireSessionsFlush,
+    pub wire_sessions: CacheFlush,
     /// What the usage ledger's drain-and-join did: `Flushed` means every line
     /// this process queued is on disk, `Abandoned` means the writer outlasted
     /// the grace and its tail is gone.
@@ -596,14 +569,15 @@ impl ServerHandle {
 
         self.manager.persist_now();
 
-        // Final pin flush on a CLEAN shutdown, capturing whatever changed inside
-        // the last flusher interval. Belt-and-braces only — the 5s timer is what
-        // makes the pins survive a SIGKILL, which is the case that matters.
-        let affinity = self.flush_affinity_finally();
-
-        // Same belt-and-braces reasoning as the pin flush just above, for the
-        // Sessions/Tools cache.
-        let wire_sessions = self.flush_wire_sessions_finally();
+        // The three cache files' final write, one path, in the order they have always been
+        // written: bound tokens, pins, Sessions/Tools. Belt-and-braces for the changes inside the
+        // last flusher interval; the flusher's own timer is what survives a SIGKILL, which is the
+        // case that matters. Done here, after every task is joined or aborted, and not inside
+        // the bound-token flusher task as it was: a flusher aborted at the grace deadline lost
+        // that write, and its failure was logged and reported nowhere.
+        let bound_tokens = self.flush_cache_finally(SavedCache::BoundTokens);
+        let affinity = self.flush_cache_finally(SavedCache::Affinity);
+        let wire_sessions = self.flush_cache_finally(SavedCache::WireSessions);
 
         // Then the usage ledger, LAST, because it is the one flush whose input
         // is still arriving: an in-flight request that finishes during the joins
@@ -633,6 +607,7 @@ impl ServerHandle {
         ShutdownReport {
             tasks_joined: self.tasks_joined,
             tasks_aborted: self.tasks_aborted,
+            bound_tokens,
             affinity,
             wire_sessions,
             ledger,
@@ -680,59 +655,29 @@ impl ServerHandle {
         }
     }
 
-    /// The shutdown pin write, as a value. Logs as before for the binary's
-    /// operator, and returns the same fact for a caller with no subscriber.
-    fn flush_affinity_finally(&self) -> AffinityFlush {
-        let Some(path) = self.affinity_path.as_ref() else {
-            return AffinityFlush::Disabled;
+    /// The shutdown write of one cache file, as a value. Logs for the binary's operator, and
+    /// returns the same fact for a caller with no subscriber.
+    fn flush_cache_finally(&self, cache: SavedCache) -> CacheFlush {
+        let Some(path) = cache.path(
+            self.affinity_path.as_deref(),
+            self.wire_sessions_path.as_deref(),
+        ) else {
+            return CacheFlush::Disabled;
         };
-        if !self.manager.session_affinity_enabled() {
-            return AffinityFlush::Disabled;
-        }
-        match self.manager.flush_affinity(path) {
-            Ok(count) => {
+        match cache.save_finally(&self.manager, &path) {
+            Ok(Some(count)) => {
                 tracing::info!(
                     path = %path.display(),
-                    pins = count,
-                    "session-affinity pins written for the next boot"
+                    entries = count,
+                    "{} written for the next boot",
+                    cache.name()
                 );
-                AffinityFlush::Written(count)
+                CacheFlush::Written(count)
             }
+            Ok(None) => CacheFlush::Unchanged,
             Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "final session-affinity pin write failed; pins will not survive this restart"
-                );
-                AffinityFlush::Failed(err.to_string())
-            }
-        }
-    }
-
-    /// The shutdown Sessions/Tools cache write, as a value — mirrors
-    /// [`Self::flush_affinity_finally`] exactly, including why it exists: the
-    /// 5-second debounced flusher is what survives a SIGKILL, this is belt-
-    /// and-braces for a clean quit that landed inside the last interval.
-    fn flush_wire_sessions_finally(&self) -> WireSessionsFlush {
-        let Some(path) = self.wire_sessions_path.as_ref() else {
-            return WireSessionsFlush::Disabled;
-        };
-        match self.manager.flush_wire_sessions(path) {
-            Ok(count) => {
-                tracing::info!(
-                    path = %path.display(),
-                    sessions = count,
-                    "Sessions/Tools cache written for the next boot"
-                );
-                WireSessionsFlush::Written(count)
-            }
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "final Sessions/Tools cache write failed; the panel will start empty next boot"
-                );
-                WireSessionsFlush::Failed(err.to_string())
+                cache.warn(&path, &err);
+                CacheFlush::Failed(err.to_string())
             }
         }
     }
@@ -822,6 +767,45 @@ impl SavedCache {
         }
     }
 
+    /// What the cache is called in a log line.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Affinity => "session-affinity pins",
+            Self::BoundTokens => "bound-token map",
+            Self::WireSessions => "Sessions/Tools cache",
+        }
+    }
+
+    /// Where the cache lives. The bound-token file is a sibling of the affinity file, keyed on
+    /// its path, so `None` for the affinity path is `None` for both.
+    fn path(
+        self,
+        affinity_path: Option<&std::path::Path>,
+        wire_sessions_path: Option<&std::path::Path>,
+    ) -> Option<PathBuf> {
+        match self {
+            Self::Affinity => affinity_path.map(std::path::Path::to_path_buf),
+            Self::BoundTokens => affinity_path.map(crate::bound_tokens::path_beside),
+            Self::WireSessions => wire_sessions_path.map(std::path::Path::to_path_buf),
+        }
+    }
+
+    /// The shutdown write: `Some(count)` when written, `None` when there was nothing to write
+    /// (affinity off in the config, or a clean bound-token map).
+    fn save_finally(
+        self,
+        manager: &Manager,
+        path: &std::path::Path,
+    ) -> Result<Option<usize>, crate::config::ConfigError> {
+        match self {
+            Self::Affinity if !manager.session_affinity_enabled() => Ok(None),
+            Self::Affinity => manager.flush_affinity(path).map(Some),
+            Self::BoundTokens if !manager.take_bound_tokens_dirty() => Ok(None),
+            Self::BoundTokens => manager.flush_bound_tokens(path).map(Some),
+            Self::WireSessions => manager.flush_wire_sessions(path).map(Some),
+        }
+    }
+
     /// The warning a failed save logs, naming what the failure costs.
     fn warn(self, path: &std::path::Path, err: &crate::config::ConfigError) {
         match self {
@@ -842,6 +826,27 @@ impl SavedCache {
             ),
         }
     }
+}
+
+/// Spawn the loop that keeps `cache` saved on `path` until the shutdown signal. The final write
+/// is not here: [`ServerHandle::shutdown_within`] makes it for all three caches after the join.
+/// Cancelling the loop cannot tear a file, because every write is synchronous, so the loss is at
+/// most one interval and that final write recovers it.
+fn spawn_flusher(
+    task: &'static str,
+    cache: SavedCache,
+    manager: &Arc<Manager>,
+    path: PathBuf,
+    mut stop: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    let manager = manager.clone();
+    tokio::spawn(supervise(task, async move {
+        let flush = save_on_change(cache, &manager, &path);
+        tokio::select! {
+            _ = flush => {}
+            _ = stop.changed() => {}
+        }
+    }))
 }
 
 /// Save `cache` to `path` for as long as the future runs: wait for a change, let
@@ -2200,19 +2205,13 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         // by that delay while an idle proxy wakes for nothing. The write is gated
         // on content (`flush_affinity_if_changed`): a new or moved pin is written
         // at once, a touch time within `AFFINITY_TOUCH_REFRESH`.
-        let flusher = manager.clone();
-        let flush_path = affinity_path.clone();
-        let mut stop = shutdown_tx.subscribe();
-        background.push(tokio::spawn(supervise("affinity-flusher", async move {
-            let flush = save_on_change(SavedCache::Affinity, &flusher, &flush_path);
-            // The write itself is synchronous, so cancelling here can never tear
-            // a half-written pin file; the loss is at most one interval, which
-            // `ServerHandle::shutdown`'s final flush then recovers.
-            tokio::select! {
-                _ = flush => {}
-                _ = stop.changed() => {}
-            }
-        })));
+        background.push(spawn_flusher(
+            "affinity-flusher",
+            SavedCache::Affinity,
+            &manager,
+            affinity_path.clone(),
+            shutdown_tx.subscribe(),
+        ));
     }
 
     // The account-bound-token map (see `tcr::bound_tokens`) survives a restart the
@@ -2264,29 +2263,15 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         // the last minute of mints, which are the live conversations' newest tokens; the first
         // requests after the boot then found bound history with no minted token known.
         //
-        // The final write is inside this task on purpose: `ServerHandle::shutdown_within` sends
-        // the signal and then JOINS each background task, so the task, write included, finishes
-        // before `shutdown` returns. Only a task still running at the grace deadline is aborted,
-        // and a write already under way is synchronous, so the abort cannot cut it in half.
-        let flusher = manager.clone();
-        let flush_path = bound_token_path.clone();
-        let mut stop = shutdown_tx.subscribe();
-        background.push(tokio::spawn(supervise("bound-token-flusher", async move {
-            {
-                let flush = save_on_change(SavedCache::BoundTokens, &flusher, &flush_path);
-                tokio::select! {
-                    _ = flush => {}
-                    _ = stop.changed() => {}
-                }
-            }
-            // The save loop never ends, so reaching here means the shutdown signal (or the
-            // sender's drop) arrived: write whatever changed since the last save.
-            if flusher.take_bound_tokens_dirty()
-                && let Err(err) = flusher.flush_bound_tokens(&flush_path)
-            {
-                SavedCache::BoundTokens.warn(&flush_path, &err);
-            }
-        })));
+        // The final write is `ServerHandle::shutdown_within`'s, after the joins, the same as for the
+        // other two caches; it is not made by this task.
+        background.push(spawn_flusher(
+            "bound-token-flusher",
+            SavedCache::BoundTokens,
+            &manager,
+            bound_token_path,
+            shutdown_tx.subscribe(),
+        ));
     }
 
     // The Sessions/Tools panel cache (F1, `docs/design/panel-tabs.md`) survives a
@@ -2323,22 +2308,13 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         // survive one. A new or departed session is written `WIRE_SESSIONS_SAVE_DELAY`
         // after it appears; the counters of sessions already on disk within
         // `WIRE_SESSIONS_REFRESH`.
-        let flusher = manager.clone();
-        let flush_path = wire_sessions_path.clone();
-        let mut stop = shutdown_tx.subscribe();
-        background.push(tokio::spawn(supervise(
+        background.push(spawn_flusher(
             "wire-sessions-flusher",
-            async move {
-                let flush = save_on_change(SavedCache::WireSessions, &flusher, &flush_path);
-                // The write itself is synchronous, so cancelling here can never tear
-                // a half-written file; the loss is at most one interval, which
-                // `ServerHandle::shutdown`'s final flush then recovers.
-                tokio::select! {
-                    _ = flush => {}
-                    _ = stop.changed() => {}
-                }
-            },
-        )));
+            SavedCache::WireSessions,
+            &manager,
+            wire_sessions_path.clone(),
+            shutdown_tx.subscribe(),
+        ));
     }
 
     // Background probe: refresh every account's quota around the configured
@@ -3054,13 +3030,13 @@ mod tests {
             report.affinity
         );
         assert_eq!(
-            report.affinity.pins_written(),
+            report.affinity.written(),
             None,
             "a failed write wrote no pins"
         );
         assert_ne!(
             report.affinity,
-            AffinityFlush::Disabled,
+            CacheFlush::Disabled,
             "a failed write must not read as 'affinity is off'"
         );
     }
@@ -3078,7 +3054,7 @@ mod tests {
             manager_with(r#"{"sessionAffinity": true, "accounts": []}"#),
             None,
         );
-        assert_eq!(handle.shutdown().await.affinity, AffinityFlush::Disabled);
+        assert_eq!(handle.shutdown().await.affinity, CacheFlush::Disabled);
     }
 
     /// A token minted inside the bound-token flusher's minute must reach the disk on a CLEAN
@@ -3143,6 +3119,52 @@ mod tests {
         );
     }
 
+    /// The bound-token final write belongs to the handle, not to the flusher task. A handle with
+    /// NO background task (a flusher aborted at the grace deadline looks the same from here) used
+    /// to lose it; and a clean map is reported as untouched, not rewritten.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_handle_writes_the_bound_token_map_without_a_flusher_task() {
+        let dir = std::env::temp_dir().join(format!(
+            "tcr-server-bound-final-{}-{}",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("creating the test's temp dir");
+        let affinity_path = dir.join("session-affinity.json");
+        let bound_path = crate::bound_tokens::path_beside(&affinity_path);
+        let (shutdown, _rx) = watch::channel(false);
+        let mut handle = handle_full(
+            shutdown,
+            tokio::spawn(std::future::ready(())),
+            Vec::new(),
+            manager_with(r#"{"sessionAffinity": false, "accounts": []}"#),
+            Some(affinity_path),
+        );
+
+        let clean = handle.shutdown().await;
+        assert_eq!(clean.bound_tokens, CacheFlush::Unchanged);
+        assert!(!bound_path.exists(), "a clean map writes no file");
+
+        handle.manager().record_bound_tokens(
+            &[(
+                crate::bound_tokens::BoundTokenKind::MessageId,
+                "msg_fake_2".to_string(),
+            )],
+            0,
+            crate::now_ms(),
+        );
+        let report = handle.shutdown().await;
+        let on_disk = bound_path.exists();
+        std::fs::remove_dir_all(&dir).expect("removing the test's temp dir");
+        // No account is configured here, so the entry count is not the point: a write happened.
+        assert!(
+            report.bound_tokens.written().is_some(),
+            "a dirty map must be written, got {:?}",
+            report.bound_tokens
+        );
+        assert!(on_disk, "the final write put the file on disk");
+    }
+
     /// `Drop` must also SIGNAL — the accept loop and every background loop stop
     /// on `stop.changed()`, and the sender-close that currently masks this is
     /// removed here by holding a `Sender` clone.
@@ -3186,43 +3208,7 @@ mod tests {
 
     // --- background task supervision (part 1) --------------------------------
 
-    /// A `MakeWriter` that keeps what was written, so a test can inspect
-    /// tracing output without capturing the process's real stdout. Same shape
-    /// as `main.rs`'s/`proxy.rs`'s `SharedBuf` — duplicated locally because
-    /// those are private to their own test modules.
-    #[derive(Clone, Default)]
-    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl SharedBuf {
-        fn contents(&self) -> String {
-            let bytes = self.0.lock().expect("shared buffer poisoned").clone();
-            String::from_utf8_lossy(&bytes).into_owned()
-        }
-
-        fn clear(&self) {
-            self.0.lock().expect("shared buffer poisoned").clear();
-        }
-    }
-
-    impl std::io::Write for SharedBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("shared buffer poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-        type Writer = SharedBuf;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
+    use crate::test_support::log_capture::SharedBuf;
 
     /// THE catch: `supervise` must swallow a panic from the wrapped future so
     /// the spawned task's own `JoinHandle` completes **normally** (this is

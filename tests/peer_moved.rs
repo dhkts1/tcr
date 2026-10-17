@@ -793,7 +793,7 @@ fn run_moved(
 ) -> (String, String, bool) {
     use std::io::Write as _;
 
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut command = crate::tcr_env::tcr(peers.parent().expect("a fixture file has a directory"));
     command
         .args(["peer", "moved"])
         .args(extra)

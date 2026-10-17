@@ -13,7 +13,7 @@
 //!
 //! # Isolation
 //!
-//! Pinned on every spawned [`Command`] ([`isolate`]), never on this test process: `HOME` is a
+//! Pinned on every spawned [`Command`] ([`scratch_tcr`], over `tests/support/tcr_env.rs`), never on this test process: `HOME` is a
 //! fresh [`tempfile::TempDir`] with the XDG overrides removed, so the config, the MITM material,
 //! the usage ledger and the affinity pins all land in it; every proxy variable (`HTTPS_PROXY`,
 //! `HTTP_PROXY`, `ALL_PROXY`, either case) is removed so no ambient proxy can carry a loopback
@@ -30,10 +30,11 @@
 //! since their offline probe goes to the loopback `codexUpstream`. The server's stdout and stderr
 //! go to a log in the scratch HOME, printed when a test fails.
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tcr::log_err::LogErr as _;
+use tcr::test_support::child::KillOnDrop;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -186,10 +187,7 @@ async fn spawn_stub(origin: &'static str, ledger: Ledger) -> String {
     let app = Router::new()
         .fallback(any(stub_handler))
         .with_state(Stub { ledger, origin });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    base
+    tcr::test_support::stub_upstream::http(app).url()
 }
 
 /// The two stub origins on one ledger, as `(upstream, codexUpstream, ledger)`.
@@ -200,53 +198,26 @@ async fn spawn_origins() -> (String, String, Ledger) {
     (anthropic, codex, ledger)
 }
 
-/// A port nothing is listening on: bound to learn the number, then released. Copied from
-/// `tests/claude_code_import.rs`: each file under `tests/` is its own crate, so it cannot be
-/// imported.
-fn dead_port() -> u16 {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port must work");
-    let port = listener
-        .local_addr()
-        .expect("a bound listener has an address")
-        .port();
-    drop(listener);
-    port
-}
+use tcr::test_support::loopback::unused_port as dead_port;
 
 /// A client that never sends a loopback request through an ambient proxy.
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .unwrap()
+    tcr::test_support::loopback::client_with_timeout(REQUEST_TIMEOUT)
 }
 
 /// Point a `tcr` child at the scratch `home` and nothing else: see the module doc.
-fn isolate(command: &mut Command, home: &Path) {
+fn scratch_tcr(home: &Path) -> Command {
+    let mut command = crate::tcr_env::tcr(home);
     command
         .current_dir(home)
-        .env("HOME", home)
-        .env_remove("XDG_CACHE_HOME")
-        // The route line reads the shell's startup files for `tcr setup
-        // shell`'s block; keep that read inside the scratch HOME.
-        .env_remove("ZDOTDIR")
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("https_proxy")
-        .env_remove("HTTP_PROXY")
-        .env_remove("http_proxy")
-        .env_remove("ALL_PROXY")
-        .env_remove("all_proxy")
-        .env("TCR_CLAUDE_CODE_CREDENTIALS", home.join("no-claude-login"))
         .env("TCR_CODEX_AUTH", home.join("no-codex-login"));
+    command
 }
 
 /// A running `tcr server` on its own scratch HOME. Dropping it kills the process, prints its log
 /// if the test is failing, and removes the HOME.
 struct Server {
-    child: Child,
+    child: KillOnDrop,
     port: u16,
     home: tempfile::TempDir,
     config: PathBuf,
@@ -264,9 +235,8 @@ impl Server {
     /// Run `tcr <args…> --config <this server's config>` under the server's isolation, so the
     /// verb reads this server's port from the file and talks to this server alone.
     async fn tcr(&self, args: &[&str]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = scratch_tcr(self.home.path());
         command.args(args).arg("--config").arg(&self.config);
-        isolate(&mut command, self.home.path());
         tokio::task::spawn_blocking(move || command.output())
             .await
             .expect("the blocking task ran")
@@ -369,7 +339,7 @@ async fn start_server_with_first_port(
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         write_config(&config, port, upstream, codex_upstream);
         let log = std::fs::File::create(home.path().join(SERVER_LOG)).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = scratch_tcr(home.path());
         command
             .args(["server", "--headless", "--config"])
             .arg(&config)
@@ -377,8 +347,7 @@ async fn start_server_with_first_port(
             .env("RUST_LOG", "info")
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log));
-        isolate(&mut command, home.path());
-        let child = command.spawn().unwrap();
+        let child = KillOnDrop::spawn(&mut command).unwrap();
         let mut server = Server {
             child,
             port,
@@ -713,10 +682,7 @@ async fn spawn_weekly_refusing_codex_origin(weekly_reset: u64) -> String {
         )
             .into_response()
     });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    base
+    tcr::test_support::stub_upstream::http(app).url()
 }
 
 /// Both Codex accounts at their weekly limit, through the real binary: `tcr status --json`

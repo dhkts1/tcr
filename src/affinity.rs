@@ -30,7 +30,7 @@
 //! 3. **It is written incrementally, atomically, and can never take the proxy
 //!    down.** Shutdown-only persistence would miss exactly the case this exists
 //!    to survive: `--replace` follows SIGTERM with SIGKILL, and no shutdown hook
-//!    runs for a SIGKILL. The write goes through [`crate::config::write_atomic`]
+//!    runs for a SIGKILL. The write goes through [`crate::cache_file::write_cache`]
 //!    (same-dir temp + `rename`), so a crash mid-write leaves the previous file
 //!    intact rather than a truncated one. And every read failure — missing,
 //!    truncated, corrupt, wrong version — degrades to "no pins" plus a log line.
@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cache_file::{CacheRead, Layout, read_cache, write_cache};
 use crate::config::{Account, ConfigError};
 use crate::identity::{self, Resolved};
 use crate::provider::Provider;
@@ -270,13 +271,7 @@ pub fn save(path: &Path, pins: &[StoredPin], now_ms: i64) -> Result<usize, Confi
         saved_at_ms: now_ms,
         pins,
     };
-    // A cache rewritten every few seconds, which the loader below reads as empty when it is
-    // missing or damaged: atomic, but not flushed to the disk (see `Durability::Cache`).
-    crate::config::write_atomic_with(
-        path,
-        &serde_json::to_string_pretty(&file)?,
-        crate::config::Durability::Cache,
-    )?;
+    write_cache(path, &file, Layout::Pretty)?;
     Ok(count)
 }
 
@@ -297,15 +292,10 @@ pub fn rename_pins(path: &Path, renames: &[(String, String)]) -> usize {
     if renames.is_empty() {
         return 0;
     }
-    let Ok(data) = std::fs::read_to_string(path) else {
+    // A missing, unreadable, corrupt or foreign file is left for `load` to report.
+    let CacheRead::Read(mut file) = read_cache::<PinFile>(path, FORMAT_VERSION) else {
         return 0;
     };
-    let Ok(mut file) = serde_json::from_str::<PinFile>(&data) else {
-        return 0;
-    };
-    if file.version != FORMAT_VERSION {
-        return 0;
-    }
     let mut rewritten = 0;
     for pin in &mut file.pins {
         if let Some((_, to)) = renames.iter().find(|(from, _)| *from == pin.name) {
@@ -314,10 +304,7 @@ pub fn rename_pins(path: &Path, renames: &[(String, String)]) -> usize {
         }
     }
     if rewritten > 0
-        && let Err(err) = crate::config::write_atomic(
-            path,
-            &serde_json::to_string_pretty(&file).unwrap_or_default(),
-        )
+        && let Err(err) = write_cache(path, &file, Layout::Pretty)
     {
         tracing::warn!(error = %err, "could not carry session-affinity pins across the account rename");
         return 0;
@@ -332,41 +319,16 @@ pub fn rename_pins(path: &Path, renames: &[(String, String)]) -> usize {
 /// `degraded` set. See the module docs for why this must never propagate an
 /// error, let alone panic.
 pub fn load(path: &Path, accounts: &[Account], now_ms: i64, ttl_ms: i64) -> LoadReport {
-    let data = match std::fs::read_to_string(path) {
-        Ok(data) => data,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // The ordinary first-boot case, and the case right after this feature
-            // ships. Not a degradation.
-            return LoadReport::default();
-        }
-        Err(err) => {
+    let file: PinFile = match read_cache(path, FORMAT_VERSION) {
+        CacheRead::Read(file) => file,
+        CacheRead::Missing => return LoadReport::default(),
+        CacheRead::Degraded(reason) => {
             return LoadReport {
-                degraded: Some(format!("unreadable: {err}")),
+                degraded: Some(reason),
                 ..LoadReport::default()
             };
         }
     };
-
-    let file: PinFile = match serde_json::from_str(&data) {
-        Ok(file) => file,
-        Err(err) => {
-            // Truncated (a SIGKILL between `write` and `rename` cannot produce
-            // this, but a full disk or a hand-edit can) or otherwise corrupt.
-            return LoadReport {
-                degraded: Some(format!("corrupt: {err}")),
-                ..LoadReport::default()
-            };
-        }
-    };
-    if file.version != FORMAT_VERSION {
-        return LoadReport {
-            degraded: Some(format!(
-                "format version {} is not {FORMAT_VERSION}",
-                file.version
-            )),
-            ..LoadReport::default()
-        };
-    }
 
     let mut report = LoadReport::default();
     for pin in file.pins {
@@ -722,6 +684,22 @@ mod tests {
                 .contains("version"),
             "{:?}",
             report.degraded
+        );
+    }
+
+    /// A file of another format version that lacks this version's `pins` is refused for its
+    /// version, not as "corrupt: missing field": the reason is what tells an operator whether
+    /// the cache is damaged or merely old.
+    #[test]
+    fn a_foreign_version_without_pins_is_refused_for_its_version() {
+        let path = tmp("foreign-shape");
+        std::fs::write(&path, r#"{"version":2,"savedAtMs":0,"sessions":[]}"#).expect("write v2");
+        let report = load(&path, &[], 0, PIN_TTL_MS);
+        assert!(report.pins.is_empty());
+        assert_eq!(
+            report.degraded.as_deref(),
+            Some("format version 2 is not 1"),
+            "the reason must name the version"
         );
     }
 

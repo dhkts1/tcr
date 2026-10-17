@@ -11,7 +11,6 @@
 //! config with no port means 3456, which is the live proxy on a working Mac.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 struct Scratch {
     _dir: tempfile::TempDir,
@@ -31,11 +30,8 @@ fn scratch(config_json: &str) -> Scratch {
     }
 }
 
-/// A loopback port that was free a moment ago: bound, read, and released.
-fn dead_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
-    listener.local_addr().expect("its address").port()
-}
+/// A loopback port that was free a moment ago.
+use tcr::test_support::loopback::unused_port as dead_port;
 
 /// `{"proxy": {"port": <dead>}, "accounts": [], <rest>}`.
 fn config_on_a_dead_port(rest: &str) -> String {
@@ -48,13 +44,10 @@ fn config_on_a_dead_port(rest: &str) -> String {
 }
 
 fn tcr(scratch: &Scratch, args: &[&str]) -> (i32, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = crate::tcr_env::tcr(&scratch.home)
         .args(args)
         .arg("--config")
         .arg(&scratch.config)
-        .env("HOME", &scratch.home)
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_CACHE_HOME")
         .current_dir(&scratch.home)
         .output()
         .expect("run the built tcr");

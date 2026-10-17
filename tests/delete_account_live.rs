@@ -29,7 +29,7 @@ use crate::connect_guard;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -123,15 +123,13 @@ async fn tcr(fleet: &Fleet, args: &[&str]) -> Run {
     let config = fleet.config.clone();
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     tokio::task::spawn_blocking(move || {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = crate::tcr_env::tcr(&home);
         command
             .args(&args)
             .arg("--config")
             .arg(&config)
-            .env("HOME", &home)
             .env("CODEX_HOME", home.join(".codex"))
             .env("TCR_CODEX_AUTH", home.join("no-such-codex-auth.json"))
-            .env_remove("XDG_CACHE_HOME")
             .env("TCR_CLAUDE_CODE_CREDENTIALS", claude_code_login(&home))
             .env("NO_COLOR", "1")
             .current_dir(&home);
@@ -769,9 +767,7 @@ async fn a_plain_label_and_an_email_label_both_delete() {
 #[tokio::test]
 async fn with_no_server_running_the_file_edit_is_the_delete() {
     let home = tempfile::tempdir().expect("scratch home");
-    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = dead.local_addr().unwrap().port();
-    drop(dead);
+    let port = tcr::test_support::loopback::unused_port();
     let dir = home.path().join(".config");
     std::fs::create_dir_all(&dir).unwrap();
     let config = dir.join("teamclaude.json");
@@ -783,15 +779,9 @@ async fn with_no_server_running_the_file_edit_is_the_delete() {
         ),
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let out = crate::tcr_env::tcr(home.path())
         .args(["remove", "alice@example.com", "--config"])
         .arg(&config)
-        .env("HOME", home.path())
-        .env_remove("XDG_CACHE_HOME")
-        .env(
-            "TCR_CLAUDE_CODE_CREDENTIALS",
-            home.path().join("no-credentials.json"),
-        )
         .output()
         .unwrap();
     assert_eq!(

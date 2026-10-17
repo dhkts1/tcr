@@ -21,6 +21,15 @@
 #[path = "../support/connect_guard.rs"]
 mod connect_guard;
 
+/// The environment every launch of the built `tcr` starts from; used by most modules below.
+#[path = "../support/tcr_env.rs"]
+mod tcr_env;
+
+/// The harness pieces the `peer_*` modules share (and compiled into the separate `peer_*`
+/// targets that use them too).
+#[path = "../support/peer.rs"]
+mod peer_support;
+
 /// Shared by `codex_e2e` and `peer_e2e` (and compiled into the separate `peer_lease` too).
 #[path = "../tools/api_contract.rs"]
 mod api_contract;

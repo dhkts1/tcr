@@ -30,7 +30,7 @@
 //!   `offline_unavailable` (DNS/name-resolution failure — a fact about this
 //!   machine, not any account) is unaffected and stays a `503`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -59,7 +59,15 @@ use crate::manager::{
 };
 use crate::provider::Provider;
 use crate::quota::{UnifiedRejectionKind, quota_rejections};
-use crate::stats::{GateReason, RequestLogEntry, SessionKind};
+use crate::stats::{GateReason, SessionKind};
+
+mod client_error;
+mod ladder;
+pub(crate) mod served;
+
+use client_error::{ClientError, ErrorKind};
+use ladder::{Ladder, Step};
+use served::{ServedRequest, ServedTurn, WireFold, record_served_request};
 
 /// Cap on a buffered request body (256 MiB) — a single-user localhost proxy has
 /// no legitimate payload near this, but an unbounded read is a DoS surface. The
@@ -1003,7 +1011,7 @@ pub const ADD_ACCOUNT_ENDPOINT: &str = "accounts-add";
 /// Response header naming, comma-separated, every provider whose accounts this
 /// server can store: [`crate::provider::Provider::as_str`] over
 /// [`crate::provider::Provider::ALL`], so `anthropic,codex`. Set by
-/// `stamp_add_endpoint`, so it rides on every answer the account-add route
+/// `stamp` (for `ADD_ACCOUNT_ROUTE`), so it rides on every answer the account-add route
 /// stamps — the blank-probe 400 `oauth::probe_add_route` provokes, a 405, a
 /// 409, a 200 — and never on the unstamped gate refusal, which must not confirm
 /// the route exists to a caller that failed the gate.
@@ -1592,17 +1600,20 @@ async fn refuse_foreign_client(manager: &Manager, bearer: &str) -> Option<Respon
     if mode == ControlIdentityMode::Warn {
         return None;
     }
-    Some(error_response(
-        StatusCode::FORBIDDEN,
-        "permission_error",
-        &format!(
-            "tcr: this client is signed in as {client_shown}, but controlAccount is {control_email}, \
-             so its connectors, plugins and settings would come from the wrong account. \
-             Run /logout, then /login as {control_email} — or set \"controlIdentity\": \"warn\" \
-             (or \"off\") in the tcr config to serve it anyway."
-        ),
-        None,
-    ))
+    // Anthropic requests only: see the call site in `handle_request`.
+    Some(
+        ClientError::new(
+            StatusCode::FORBIDDEN,
+            ErrorKind::Permission,
+            format!(
+                "tcr: this client is signed in as {client_shown}, but controlAccount is {control_email}, \
+                 so its connectors, plugins and settings would come from the wrong account. \
+                 Run /logout, then /login as {control_email} — or set \"controlIdentity\": \"warn\" \
+                 (or \"off\") in the tcr config to serve it anyway."
+            ),
+        )
+        .respond(Provider::Anthropic),
+    )
 }
 
 /// Build the proxy router. Every method and path funnels through the single
@@ -1636,25 +1647,29 @@ pub fn app(manager: Arc<Manager>) -> Router {
         // 405, never fall through to `handle` and be forwarded upstream.
         .route(
             DISABLED_PATH,
-            axum::routing::post(set_disabled_handler).fallback(disabled_method_not_allowed),
+            axum::routing::post(set_disabled_handler)
+                .fallback(|| async { method_not_allowed(&DISABLED_ROUTE) }),
         )
         .route(
             ADD_ACCOUNT_PATH,
-            axum::routing::post(add_account_handler).fallback(add_account_method_not_allowed),
+            axum::routing::post(add_account_handler)
+                .fallback(|| async { method_not_allowed(&ADD_ACCOUNT_ROUTE) }),
         )
         .route(
             CONTROL_PATH,
-            axum::routing::post(set_control_handler).fallback(control_method_not_allowed),
+            axum::routing::post(set_control_handler)
+                .fallback(|| async { method_not_allowed(&CONTROL_ROUTE) }),
         )
         .route(
             PRIORITY_PATH,
-            axum::routing::post(set_priority_handler).fallback(priority_method_not_allowed),
+            axum::routing::post(set_priority_handler)
+                .fallback(|| async { method_not_allowed(&PRIORITY_ROUTE) }),
         )
         .route(
             CONFIG_PATH,
             axum::routing::get(config_get_handler)
                 .post(config_set_handler)
-                .fallback(config_method_not_allowed),
+                .fallback(|| async { method_not_allowed(&CONFIG_ROUTE) }),
         )
         .fallback(handle)
         .with_state(manager)
@@ -1713,23 +1728,27 @@ fn local_endpoint_gate(
         .get::<ClientAddr>()
         .is_some_and(|a| a.0.ip().is_loopback());
     if !client_is_loopback {
-        return Some(error_response(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            &format!("The tcr {endpoint} endpoint is loopback-only."),
-            None,
-        ));
+        return Some(
+            ClientError::new(
+                StatusCode::FORBIDDEN,
+                ErrorKind::Permission,
+                format!("The tcr {endpoint} endpoint is loopback-only."),
+            )
+            .respond_local(),
+        );
     }
 
     if let Some(expected) = manager.proxy_api_key() {
         let provided = parts.headers.get("x-api-key").and_then(|v| v.to_str().ok());
         if !key_matches(provided, expected) {
-            return Some(error_response(
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                "Missing or invalid x-api-key.",
-                None,
-            ));
+            return Some(
+                ClientError::new(
+                    StatusCode::UNAUTHORIZED,
+                    ErrorKind::Authentication,
+                    "Missing or invalid x-api-key.",
+                )
+                .respond_local(),
+            );
         }
     }
 
@@ -1741,24 +1760,28 @@ fn local_endpoint_gate(
             endpoint,
             "refused a tcr endpoint request addressed to a non-loopback host"
         );
-        return Some(error_response(
-            StatusCode::MISDIRECTED_REQUEST,
-            "invalid_request_error",
-            &format!(
-                "The tcr {endpoint} endpoint answers only to a loopback host, \
+        return Some(
+            ClientError::new(
+                StatusCode::MISDIRECTED_REQUEST,
+                ErrorKind::InvalidRequest,
+                format!(
+                    "The tcr {endpoint} endpoint answers only to a loopback host, \
                      not to '{host}'."
-            ),
-            None,
-        ));
+                ),
+            )
+            .respond_local(),
+        );
     }
 
     if is_cross_site_request(&parts.headers) {
-        return Some(error_response(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            &format!("The tcr {endpoint} endpoint does not serve cross-site requests."),
-            None,
-        ));
+        return Some(
+            ClientError::new(
+                StatusCode::FORBIDDEN,
+                ErrorKind::Permission,
+                format!("The tcr {endpoint} endpoint does not serve cross-site requests."),
+            )
+            .respond_local(),
+        );
     }
 
     None
@@ -1768,12 +1791,12 @@ fn local_endpoint_gate(
 /// neither forwarded upstream nor able to mutate anything — the endpoint is a
 /// pure read, and there is no verb on it that is not.
 async fn status_method_not_allowed() -> Response {
-    error_response(
+    ClientError::new(
         StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
+        ErrorKind::InvalidRequest,
         "The tcr status endpoint is read-only: GET.",
-        None,
     )
+    .respond_local()
 }
 
 /// `GET /_tcr/status` — the live fleet snapshot, for `tcr status`.
@@ -1849,12 +1872,12 @@ async fn status_handler(
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a
         // proxy never panics on a client request — surface it as a 500 instead.
-        return error_response(
+        return ClientError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
+            ErrorKind::Api,
             "Could not serialize the status snapshot.",
-            None,
-        );
+        )
+        .respond_local();
     };
     let mut response = Response::new(Body::from(body));
     let headers = response.headers_mut();
@@ -1868,12 +1891,12 @@ async fn status_handler(
 /// A non-`GET` on [`QUOTA_PATH`]. A local 405, for the reasons
 /// [`status_method_not_allowed`] gives.
 async fn quota_method_not_allowed() -> Response {
-    error_response(
+    ClientError::new(
         StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
+        ErrorKind::InvalidRequest,
         "The tcr quota endpoint is read-only: GET.",
-        None,
     )
+    .respond_local()
 }
 
 /// `GET /_tcr/quota`: per account its gate and its 5-hour and weekly
@@ -1896,12 +1919,12 @@ async fn quota_handler(
     let payload =
         crate::status::QuotaPayload::from_snapshot(&manager.snapshot(OffsetDateTime::now_utc()));
     let Ok(body) = serde_json::to_string(&payload) else {
-        return error_response(
+        return ClientError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
+            ErrorKind::Api,
             "Could not serialize the quota snapshot.",
-            None,
-        );
+        )
+        .respond_local();
     };
     let mut response = Response::new(Body::from(body));
     let headers = response.headers_mut();
@@ -1910,45 +1933,161 @@ async fn quota_handler(
     response
 }
 
-/// A non-`POST` on [`DISABLED_PATH`]. Answered locally with 405 — the route is a
-/// command, and a command has exactly one verb. Stamped with [`ENDPOINT_HEADER`]
-/// so a caller can tell this 405 (the route exists, wrong verb) from the local 404
-/// a tcr without the route returns.
-async fn disabled_method_not_allowed() -> Response {
-    stamp_endpoint(error_response(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
-        "The tcr account-control endpoint takes POST.",
-        None,
-    ))
+/// One local `/_tcr/*` route that takes commands: the name its gate and its
+/// messages use, the [`ENDPOINT_HEADER`] value it stamps, and the verbs it
+/// takes. One const per route, so the name a person reads and the stamp the CLI
+/// reads come from one place and cannot drift apart.
+struct LocalRoute {
+    /// The route in the words of its messages: "The tcr {name} endpoint ...".
+    name: &'static str,
+    /// The [`ENDPOINT_HEADER`] value, a wire contract the CLI matches.
+    stamp: &'static str,
+    /// The verbs the 405 names: `POST`, or `GET or POST`.
+    verbs: &'static str,
+    /// Whether every stamped answer also carries [`PROVIDERS_HEADER`].
+    advertises_providers: bool,
 }
 
-/// Add [`ENDPOINT_HEADER`] to a response, naming which local mutating route
-/// produced it. ONE implementation shared by both stampers below, so the two
-/// routes cannot drift on how the header is set — only on which value they set
-/// it to.
-fn stamp_endpoint_as(mut response: Response, endpoint: &'static str) -> Response {
+const DISABLED_ROUTE: LocalRoute = LocalRoute {
+    name: "disable-account",
+    stamp: DISABLED_ENDPOINT,
+    verbs: "POST",
+    advertises_providers: false,
+};
+
+const ADD_ACCOUNT_ROUTE: LocalRoute = LocalRoute {
+    name: "account-add",
+    stamp: ADD_ACCOUNT_ENDPOINT,
+    verbs: "POST",
+    advertises_providers: true,
+};
+
+const CONTROL_ROUTE: LocalRoute = LocalRoute {
+    name: "control-account",
+    stamp: CONTROL_ENDPOINT,
+    verbs: "POST",
+    advertises_providers: false,
+};
+
+const PRIORITY_ROUTE: LocalRoute = LocalRoute {
+    name: "priority",
+    stamp: PRIORITY_ENDPOINT,
+    verbs: "POST",
+    advertises_providers: false,
+};
+
+const CONFIG_ROUTE: LocalRoute = LocalRoute {
+    name: "settings",
+    stamp: CONFIG_ENDPOINT,
+    verbs: "GET or POST",
+    advertises_providers: false,
+};
+
+/// Add [`ENDPOINT_HEADER`] to a response, naming which local route produced it
+/// (and [`PROVIDERS_HEADER`] beside it where the route advertises them): the one
+/// place they are set, so no stamped answer can carry one without the other.
+fn stamp(route: &LocalRoute, mut response: Response) -> Response {
     response
         .headers_mut()
-        .insert(ENDPOINT_HEADER, HeaderValue::from_static(endpoint));
-    response
-}
-
-/// Add [`ENDPOINT_HEADER`] to a response the account-control (disable) route
-/// produced.
-fn stamp_endpoint(response: Response) -> Response {
-    stamp_endpoint_as(response, DISABLED_ENDPOINT)
-}
-
-/// Add [`ENDPOINT_HEADER`] to a response the account-add route produced, and
-/// [`PROVIDERS_HEADER`] beside it: the one place both are set, so no stamped
-/// answer can carry the stamp without the providers.
-fn stamp_add_endpoint(response: Response) -> Response {
-    let mut response = stamp_endpoint_as(response, ADD_ACCOUNT_ENDPOINT);
-    if let Ok(providers) = HeaderValue::from_str(&advertised_providers()) {
+        .insert(ENDPOINT_HEADER, HeaderValue::from_static(route.stamp));
+    if route.advertises_providers
+        && let Ok(providers) = HeaderValue::from_str(&advertised_providers())
+    {
         response.headers_mut().insert(PROVIDERS_HEADER, providers);
     }
     response
+}
+
+/// A stamped error answer from `route`.
+fn route_error(route: &LocalRoute, status: StatusCode, kind: ErrorKind, message: &str) -> Response {
+    stamp(
+        route,
+        ClientError::new(status, kind, message).respond_local(),
+    )
+}
+
+/// A stamped JSON 200 from `route`, marked `no-store`.
+fn json_ok<T: serde::Serialize>(route: &LocalRoute, payload: &T) -> Response {
+    let Ok(body) = serde_json::to_string(payload) else {
+        return route_error(
+            route,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorKind::Api,
+            &format!("Could not serialize the {} result.", route.name),
+        );
+    };
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
+    stamp(route, response)
+}
+
+/// A wrong verb on `route`: a local 405, never forwarded upstream and never able
+/// to mutate anything. Stamped, so a caller can tell this 405 (the route exists,
+/// wrong verb) from the local 404 a tcr without the route returns.
+fn method_not_allowed(route: &LocalRoute) -> Response {
+    route_error(
+        route,
+        StatusCode::METHOD_NOT_ALLOWED,
+        ErrorKind::InvalidRequest,
+        &format!("The tcr {} endpoint takes {}.", route.name, route.verbs),
+    )
+}
+
+/// Run the checks every mutating `/_tcr/*` route shares, in this order, and
+/// return the parsed command body or the answer to send instead.
+///
+/// 1. [`local_endpoint_gate`]. Its refusal is NOT stamped: a refusal must not
+///    confirm the route exists to a caller that failed the gate, and the CLI
+///    never needs the discriminator on a 401/403, both terminal for it.
+/// 2. `application/json`. It is not a CORS simple media type, so requiring it
+///    forces a preflight this process never answers; see
+///    [`is_json_content_type`] for the four shapes that reached a handler and
+///    parked a live account before the check existed.
+/// 3. The body, read to [`CONTROL_BODY_LIMIT`].
+/// 4. A JSON OBJECT of type `T` ([`parse_object`]); `shape` is the 400 text.
+///
+/// From step 2 on the answer is stamped, because it is a request-shape error and
+/// the CLI reads the stamp to tell a route that answered from a tcr too old to
+/// have one.
+async fn read_command<T: serde::de::DeserializeOwned>(
+    route: &LocalRoute,
+    manager: &Manager,
+    req: Request,
+    shape: &str,
+) -> Result<T, Box<Response>> {
+    let (parts, body) = req.into_parts();
+    if let Some(refusal) = local_endpoint_gate(&parts, manager, route.name) {
+        return Err(Box::new(refusal));
+    }
+    if !is_json_content_type(&parts.headers) {
+        return Err(Box::new(route_error(
+            route,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ErrorKind::InvalidRequest,
+            &format!(
+                "The tcr {} endpoint requires Content-Type: application/json.",
+                route.name
+            ),
+        )));
+    }
+    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
+        return Err(Box::new(route_error(
+            route,
+            StatusCode::BAD_REQUEST,
+            ErrorKind::InvalidRequest,
+            "Could not read the request body.",
+        )));
+    };
+    parse_object::<T>(&bytes).ok_or_else(|| {
+        Box::new(route_error(
+            route,
+            StatusCode::BAD_REQUEST,
+            ErrorKind::InvalidRequest,
+            shape,
+        ))
+    })
 }
 
 /// Deserialize `bytes` into `T`, but ONLY from a JSON object — `None` for
@@ -2021,115 +2160,57 @@ pub struct SetDisabledResponse {
 /// change that is in force right now and will vanish on restart, which is
 /// precisely the state the old code left the operator in silently.
 async fn set_disabled_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "account-control") {
-        // NOT stamped: a refusal must not confirm the route exists to a caller
-        // that failed the gate, and the CLI never needs the discriminator on a
-        // 401/403 — both are terminal for it.
-        return refusal;
-    }
-
-    // The browser gate. `application/json` is not a CORS simple media type, so
-    // requiring it forces a preflight this process never answers — see
-    // [`is_json_content_type`] for the four shapes that reached this handler and
-    // parked a live account before the check existed. Stamped, unlike the gate's
-    // refusals above: this is a request-shape error like the 400s below it, and the
-    // CLI reads the stamp to tell a route that answered from a tcr too old to have
-    // one.
-    if !is_json_content_type(&parts.headers) {
-        return stamp_endpoint(error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "invalid_request_error",
-            "The tcr account-control endpoint requires Content-Type: application/json.",
-            None,
-        ));
-    }
-
-    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
-        return stamp_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Could not read the request body.",
-            None,
-        ));
-    };
-    let Some(parsed) = parse_object::<SetDisabledRequest>(&bytes) else {
-        return stamp_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Expected a JSON object: {\"query\": \"<account>\", \"disabled\": true}.",
-            None,
-        ));
+    let parsed: SetDisabledRequest = match read_command(
+        &DISABLED_ROUTE,
+        &manager,
+        req,
+        "Expected a JSON object: {\"query\": \"<account>\", \"disabled\": true}.",
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(refusal) => return *refusal,
     };
     let (Some(query), Some(disabled)) = (parsed.query, parsed.disabled) else {
-        return stamp_endpoint(error_response(
+        return route_error(
+            &DISABLED_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Both \"query\" (string) and \"disabled\" (bool) are required.",
-            None,
-        ));
+        );
     };
     if query.trim().is_empty() {
-        return stamp_endpoint(error_response(
+        return route_error(
+            &DISABLED_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "\"query\" must not be empty.",
-            None,
-        ));
+        );
     }
 
     match manager.set_disabled_by_query(&query, disabled) {
-        SetDisabledOutcome::NoMatch => stamp_endpoint(error_response(
+        SetDisabledOutcome::NoMatch => route_error(
+            &DISABLED_ROUTE,
             StatusCode::NOT_FOUND,
-            "not_found_error",
+            ErrorKind::NotFound,
             &format!("No account in the live rotation matches '{query}'."),
-            None,
-        )),
-        SetDisabledOutcome::Ambiguous(names) => stamp_endpoint(error_response(
+        ),
+        SetDisabledOutcome::Ambiguous(names) => route_error(
+            &DISABLED_ROUTE,
             StatusCode::CONFLICT,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             &crate::cli::ambiguous_query_message(&query, &names),
-            None,
-        )),
-        SetDisabledOutcome::Applied { name, persist } => {
-            let payload = SetDisabledResponse {
+        ),
+        SetDisabledOutcome::Applied { name, persist } => json_ok(
+            &DISABLED_ROUTE,
+            &SetDisabledResponse {
                 name,
                 disabled,
                 persisted: matches!(persist, DisablePersist::Persisted),
                 warning: persist.warning(disabled).map(str::to_string),
-            };
-            let Ok(body) = serde_json::to_string(&payload) else {
-                return stamp_endpoint(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    "Could not serialize the account-control result.",
-                    None,
-                ));
-            };
-            let mut response = Response::new(Body::from(body));
-            let headers = response.headers_mut();
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            headers.insert("cache-control", HeaderValue::from_static("no-store"));
-            stamp_endpoint(response)
-        }
+            },
+        ),
     }
-}
-
-/// A non-`POST` on [`CONTROL_PATH`]. Answered locally with 405, same reasoning
-/// as [`disabled_method_not_allowed`] — the route is a command with exactly
-/// one verb.
-async fn control_method_not_allowed() -> Response {
-    stamp_control_endpoint(error_response(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
-        "The tcr control-account endpoint takes POST.",
-        None,
-    ))
-}
-
-/// Add [`ENDPOINT_HEADER`] to a response the control-account route produced.
-fn stamp_control_endpoint(response: Response) -> Response {
-    stamp_endpoint_as(response, CONTROL_ENDPOINT)
 }
 
 /// The request body of [`CONTROL_PATH`].
@@ -2191,106 +2272,56 @@ struct SetPriorityRequest {
     priority: Option<i64>,
 }
 
-/// Add [`ENDPOINT_HEADER`] to a response the priority route produced.
-fn stamp_priority_endpoint(response: Response) -> Response {
-    stamp_endpoint_as(response, PRIORITY_ENDPOINT)
-}
-
-/// A non-`POST` on [`PRIORITY_PATH`]. Answered locally with 405, same
-/// reasoning as [`disabled_method_not_allowed`].
-async fn priority_method_not_allowed() -> Response {
-    stamp_priority_endpoint(error_response(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
-        "The tcr priority endpoint takes POST.",
-        None,
-    ))
-}
-
 /// `POST /_tcr/accounts/priority`: set one account's priority IN THE LIVE
 /// ROTATION, for `tcr priority`.
 ///
-/// Cloned from [`set_disabled_handler`], same gate order: [`local_endpoint_gate`]
-/// first (refusal NOT stamped), then [`is_json_content_type`] (stamped). The
+/// Gated by [`read_command`]. The
 /// work is [`Manager::set_priority_by_query`], which changes memory only; the
 /// CLI writes the config file, because `--first`/`--last` are computed from it.
 async fn set_priority_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "account-priority") {
-        // NOT stamped: see `set_disabled_handler`'s identical comment.
-        return refusal;
-    }
-
-    if !is_json_content_type(&parts.headers) {
-        return stamp_priority_endpoint(error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "invalid_request_error",
-            "The tcr priority endpoint requires Content-Type: application/json.",
-            None,
-        ));
-    }
-
-    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
-        return stamp_priority_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Could not read the request body.",
-            None,
-        ));
-    };
-    let Some(parsed) = parse_object::<SetPriorityRequest>(&bytes) else {
-        return stamp_priority_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Expected a JSON object: {\"query\": \"<account>\", \"priority\": 0}.",
-            None,
-        ));
+    let parsed: SetPriorityRequest = match read_command(
+        &PRIORITY_ROUTE,
+        &manager,
+        req,
+        "Expected a JSON object: {\"query\": \"<account>\", \"priority\": 0}.",
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(refusal) => return *refusal,
     };
     let (Some(query), Some(priority)) = (parsed.query, parsed.priority) else {
-        return stamp_priority_endpoint(error_response(
+        return route_error(
+            &PRIORITY_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Both \"query\" (string) and \"priority\" (integer) are required.",
-            None,
-        ));
+        );
     };
     if query.trim().is_empty() {
-        return stamp_priority_endpoint(error_response(
+        return route_error(
+            &PRIORITY_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "\"query\" must not be empty.",
-            None,
-        ));
+        );
     }
 
     match manager.set_priority_by_query(&query, priority) {
-        SetPriorityOutcome::NoMatch => stamp_priority_endpoint(error_response(
+        SetPriorityOutcome::NoMatch => route_error(
+            &PRIORITY_ROUTE,
             StatusCode::NOT_FOUND,
-            "not_found_error",
+            ErrorKind::NotFound,
             &format!("No account in the live rotation matches '{query}'."),
-            None,
-        )),
-        SetPriorityOutcome::Ambiguous(names) => stamp_priority_endpoint(error_response(
+        ),
+        SetPriorityOutcome::Ambiguous(names) => route_error(
+            &PRIORITY_ROUTE,
             StatusCode::CONFLICT,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             &crate::cli::ambiguous_query_message(&query, &names),
-            None,
-        )),
+        ),
         SetPriorityOutcome::Applied { name } => {
-            let payload = SetPriorityResponse { name, priority };
-            let Ok(body) = serde_json::to_string(&payload) else {
-                return stamp_priority_endpoint(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    "Could not serialize the priority result.",
-                    None,
-                ));
-            };
-            let mut response = Response::new(Body::from(body));
-            let headers = response.headers_mut();
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            headers.insert("cache-control", HeaderValue::from_static("no-store"));
-            stamp_priority_endpoint(response)
+            json_ok(&PRIORITY_ROUTE, &SetPriorityResponse { name, priority })
         }
     }
 }
@@ -2300,8 +2331,8 @@ async fn set_priority_handler(State(manager): State<Arc<Manager>>, req: Request)
 /// ([`crate::config_set::Setting::parse`]).
 #[derive(serde::Deserialize)]
 struct SetConfigRequest {
-    key: Option<String>,
-    value: Option<String>,
+    key: String,
+    value: String,
 }
 
 /// The 200 body of a `POST` to [`CONFIG_PATH`]. Deserializable too, because
@@ -2316,38 +2347,6 @@ pub struct SetConfigResponse {
     pub changed: bool,
 }
 
-/// Add [`ENDPOINT_HEADER`] to a response the settings route produced.
-fn stamp_config_endpoint(response: Response) -> Response {
-    stamp_endpoint_as(response, CONFIG_ENDPOINT)
-}
-
-/// A method other than `GET` or `POST` on [`CONFIG_PATH`]: a local 405.
-async fn config_method_not_allowed() -> Response {
-    stamp_config_endpoint(error_response(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
-        "The tcr settings endpoint takes GET or POST.",
-        None,
-    ))
-}
-
-/// A JSON 200, stamped as the settings route's.
-fn config_json_response<T: serde::Serialize>(payload: &T) -> Response {
-    let Ok(body) = serde_json::to_string(payload) else {
-        return stamp_config_endpoint(error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
-            "Could not serialize the settings result.",
-            None,
-        ));
-    };
-    let mut response = Response::new(Body::from(body));
-    let headers = response.headers_mut();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert("cache-control", HeaderValue::from_static("no-store"));
-    stamp_config_endpoint(response)
-}
-
 /// `GET /_tcr/config`: the settings this process is running
 /// ([`Manager::running_settings`]), the `running` half of `tcr config show`.
 /// A read, gated like [`quota_handler`]; the refusal is not stamped, so a
@@ -2356,14 +2355,14 @@ async fn config_get_handler(
     State(manager): State<Arc<Manager>>,
     parts: axum::http::request::Parts,
 ) -> Response {
-    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "config") {
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, CONFIG_ROUTE.name) {
         return refusal;
     }
-    config_json_response(&manager.running_settings())
+    json_ok(&CONFIG_ROUTE, &manager.running_settings())
 }
 
 /// `POST /_tcr/config`: save one setting to the config file, for `tcr config
-/// set`. Cloned from [`set_priority_handler`]'s gate order. The value is parsed
+/// set`, gated by [`read_command`]. The value is parsed
 /// here again by the same [`crate::config_set::Setting::parse`] the CLI ran,
 /// so this route refuses what the CLI refuses, in the same words, whoever
 /// calls it. The work is [`Manager::persist_setting`], which writes the file
@@ -2372,188 +2371,117 @@ async fn config_get_handler(
 /// Every refusal is a stamped 400 or 409, which `tcr config set` reads as
 /// "the proxy said no" and writes nothing.
 async fn config_set_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "config") {
-        // NOT stamped: see `set_disabled_handler`'s identical comment.
-        return refusal;
-    }
-    if !is_json_content_type(&parts.headers) {
-        return stamp_config_endpoint(error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "invalid_request_error",
-            "The tcr settings endpoint requires Content-Type: application/json.",
-            None,
-        ));
-    }
-    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
-        return stamp_config_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Could not read the request body.",
-            None,
-        ));
-    };
-    let Some(SetConfigRequest {
-        key: Some(key),
-        value: Some(value),
-    }) = parse_object::<SetConfigRequest>(&bytes)
-    else {
-        return stamp_config_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Expected a JSON object: {\"key\": \"switchThreshold\", \"value\": \"0.9\"}.",
-            None,
-        ));
+    let SetConfigRequest { key, value } = match read_command(
+        &CONFIG_ROUTE,
+        &manager,
+        req,
+        "Expected a JSON object: {\"key\": \"switchThreshold\", \"value\": \"0.9\"}.",
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(refusal) => return *refusal,
     };
     let setting = match crate::config_set::Setting::parse(&key, &value) {
         Ok(setting) => setting,
         Err(refusal) => {
-            return stamp_config_endpoint(error_response(
+            return route_error(
+                &CONFIG_ROUTE,
                 StatusCode::BAD_REQUEST,
-                "invalid_request_error",
+                ErrorKind::InvalidRequest,
                 &refusal.to_string(),
-                None,
-            ));
+            );
         }
     };
     match manager.persist_setting(&setting) {
-        Ok(write) => config_json_response(&SetConfigResponse {
-            key: setting.key().as_str().to_string(),
-            value: setting.value_text(),
-            changed: write == crate::config_set::SettingWrite::Updated,
-        }),
-        Err(crate::manager::SettingPersistError::NoConfigFile) => {
-            stamp_config_endpoint(error_response(
-                StatusCode::CONFLICT,
-                "invalid_request_error",
-                "This proxy was started without a config file, so it has nowhere to save a setting. Nothing was changed.",
-                None,
-            ))
-        }
-        Err(crate::manager::SettingPersistError::WriteFailed(why)) => {
-            stamp_config_endpoint(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "api_error",
-                &format!("The proxy could not write its config file: {why}"),
-                None,
-            ))
-        }
+        Ok(write) => json_ok(
+            &CONFIG_ROUTE,
+            &SetConfigResponse {
+                key: setting.key().as_str().to_string(),
+                value: setting.value_text(),
+                changed: write == crate::config_set::SettingWrite::Updated,
+            },
+        ),
+        Err(crate::manager::SettingPersistError::NoConfigFile) => route_error(
+            &CONFIG_ROUTE,
+            StatusCode::CONFLICT,
+            ErrorKind::InvalidRequest,
+            "This proxy was started without a config file, so it has nowhere to save a setting. Nothing was changed.",
+        ),
+        Err(crate::manager::SettingPersistError::WriteFailed(why)) => route_error(
+            &CONFIG_ROUTE,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorKind::Api,
+            &format!("The proxy could not write its config file: {why}"),
+        ),
     }
 }
 
 /// `POST /_tcr/accounts/control` — set or clear the identity-bound CONTROL
 /// account IN THE LIVE ROTATION, for `tcr control`.
 ///
-/// Cloned from [`set_disabled_handler`], same gate order: [`local_endpoint_gate`]
-/// first (refusal NOT stamped — a caller that failed the gate gets no
-/// confirmation the route exists), then [`is_json_content_type`] (stamped —
-/// a request-shape error like the 400s below it). Does the work through
+/// Gated by [`read_command`]. Does the work through
 /// [`Manager::set_control_by_query`], the same call `tcr control` makes.
 ///
 /// Unlike [`set_disabled_handler`], a missing/`null` `query` is not a 400 — it
 /// is the CLEAR request, a complete operation on its own.
 async fn set_control_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "control-account") {
-        // NOT stamped — see `set_disabled_handler`'s identical comment.
-        return refusal;
-    }
-
-    if !is_json_content_type(&parts.headers) {
-        return stamp_control_endpoint(error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "invalid_request_error",
-            "The tcr control-account endpoint requires Content-Type: application/json.",
-            None,
-        ));
-    }
-
-    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
-        return stamp_control_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Could not read the request body.",
-            None,
-        ));
-    };
-    let Some(parsed) = parse_object::<SetControlRequest>(&bytes) else {
-        return stamp_control_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Expected a JSON object: {\"query\": \"<account>\" | null}.",
-            None,
-        ));
+    let parsed: SetControlRequest = match read_command(
+        &CONTROL_ROUTE,
+        &manager,
+        req,
+        "Expected a JSON object: {\"query\": \"<account>\" | null}.",
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(refusal) => return *refusal,
     };
     if matches!(&parsed.query, Some(q) if q.trim().is_empty()) {
-        return stamp_control_endpoint(error_response(
+        return route_error(
+            &CONTROL_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "\"query\" must not be empty; omit it or send null to clear.",
-            None,
-        ));
+        );
     }
     let cleared = parsed.query.is_none();
 
     match manager.set_control_by_query(parsed.query.as_deref()) {
-        SetControlOutcome::NoMatch => stamp_control_endpoint(error_response(
+        SetControlOutcome::NoMatch => route_error(
+            &CONTROL_ROUTE,
             StatusCode::NOT_FOUND,
-            "not_found_error",
+            ErrorKind::NotFound,
             &format!(
                 "No account in the live rotation matches '{}'.",
                 parsed.query.unwrap_or_default()
             ),
-            None,
-        )),
-        SetControlOutcome::Ambiguous(names) => stamp_control_endpoint(error_response(
+        ),
+        SetControlOutcome::Ambiguous(names) => route_error(
+            &CONTROL_ROUTE,
             StatusCode::CONFLICT,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             &crate::cli::ambiguous_query_message(&parsed.query.unwrap_or_default(), &names),
-            None,
-        )),
+        ),
         // 409, like the tie above: every `tcr control` client reads a stamped 404 or 409
         // from this route as a refusal of the query and writes nothing, where any other
         // status would send it to the file instead.
-        SetControlOutcome::CodexAccount(name) => stamp_control_endpoint(error_response(
+        SetControlOutcome::CodexAccount(name) => route_error(
+            &CONTROL_ROUTE,
             StatusCode::CONFLICT,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             &crate::manager::codex_control_refusal(&name),
-            None,
-        )),
-        SetControlOutcome::Applied { name, persist } => {
-            let payload = SetControlResponse {
+        ),
+        SetControlOutcome::Applied { name, persist } => json_ok(
+            &CONTROL_ROUTE,
+            &SetControlResponse {
                 name,
                 cleared,
                 persisted: matches!(persist, ControlPersist::Persisted),
                 warning: persist.warning().map(str::to_string),
-            };
-            let Ok(body) = serde_json::to_string(&payload) else {
-                return stamp_control_endpoint(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    "Could not serialize the control-account result.",
-                    None,
-                ));
-            };
-            let mut response = Response::new(Body::from(body));
-            let headers = response.headers_mut();
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            headers.insert("cache-control", HeaderValue::from_static("no-store"));
-            stamp_control_endpoint(response)
-        }
+            },
+        ),
     }
-}
-
-/// A non-`POST` on [`ADD_ACCOUNT_PATH`]. Answered locally with 405, same
-/// reasoning as [`disabled_method_not_allowed`] — the route is a command with
-/// exactly one verb, and it is stamped so a caller can tell this 405 (route
-/// exists, wrong verb) from the local 404 a tcr without the route returns.
-async fn add_account_method_not_allowed() -> Response {
-    stamp_add_endpoint(error_response(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
-        "The tcr account-add endpoint takes POST.",
-        None,
-    ))
 }
 
 /// The request body of [`ADD_ACCOUNT_PATH`].
@@ -2632,7 +2560,7 @@ struct AddAccountRequest {
 /// maps a deserialize failure on a 2xx to `LiveControlError::Unusable`, and
 /// `oauth::probe_add_route` reads that as `AddCapability::Unusable` — a
 /// *successful* live add would then look indistinguishable from a wedged or
-/// route-less proxy, and `login_route` REFUSES outright (bridge item D)
+/// route-less proxy, and `oauth::admit_login` REFUSES outright (bridge item D)
 /// instead of silently falling back to the file beside a server that just
 /// handled the request correctly. Field ADDITIONS are already safe on their
 /// own (an older CLI just ignores a key it doesn't know); this attribute is
@@ -2708,35 +2636,24 @@ fn add_account_response(
     warning: Option<String>,
     provider: Option<crate::provider::Provider>,
 ) -> Response {
-    let payload = AddAccountResponse {
-        name,
-        added,
-        index,
-        persisted: matches!(persist, AddPersist::Persisted),
-        warning,
-        provider,
-    };
-    let Ok(body) = serde_json::to_string(&payload) else {
-        return stamp_add_endpoint(error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
-            "Could not serialize the account-add result.",
-            None,
-        ));
-    };
-    let mut response = Response::new(Body::from(body));
-    let headers = response.headers_mut();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert("cache-control", HeaderValue::from_static("no-store"));
-    stamp_add_endpoint(response)
+    json_ok(
+        &ADD_ACCOUNT_ROUTE,
+        &AddAccountResponse {
+            name,
+            added,
+            index,
+            persisted: matches!(persist, AddPersist::Persisted),
+            warning,
+            provider,
+        },
+    )
 }
 
 /// `POST /_tcr/accounts` — add an account to the LIVE rotation with no proxy
 /// restart, for a `tcr login` that should not have to stop and restart the
 /// process to take effect.
 ///
-/// Gated exactly as [`set_disabled_handler`] is — [`local_endpoint_gate`], the
-/// `application/json` requirement, the same [`CONTROL_BODY_LIMIT`] — because this
+/// Gated by [`read_command`] like every other mutating route — because this
 /// route carries an OAuth access token and refresh token in its body and is a
 /// write, so it is authorized no more weakly than the read routes.
 ///
@@ -2749,79 +2666,57 @@ fn add_account_response(
 /// naming the candidates, via [`crate::cli::ambiguous_query_message`] — never
 /// guessed.
 async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "account-add") {
-        // NOT stamped — see [`set_disabled_handler`]'s identical comment: a
-        // refusal must not confirm the route exists to a caller that failed
-        // the gate.
-        return refusal;
-    }
-
-    if !is_json_content_type(&parts.headers) {
-        return stamp_add_endpoint(error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "invalid_request_error",
-            "The tcr account-add endpoint requires Content-Type: application/json.",
-            None,
-        ));
-    }
-
-    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
-        return stamp_add_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Could not read the request body.",
-            None,
-        ));
-    };
-    let Ok(parsed) = serde_json::from_slice::<AddAccountRequest>(&bytes) else {
-        return stamp_add_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Expected a JSON object: {\"name\": \"<account>\", \"accessToken\": \"<token>\", …}.",
-            None,
-        ));
+    let parsed: AddAccountRequest = match read_command(
+        &ADD_ACCOUNT_ROUTE,
+        &manager,
+        req,
+        "Expected a JSON object: {\"name\": \"<account>\", \"accessToken\": \"<token>\", …}.",
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(refusal) => return *refusal,
     };
     // LOAD-BEARING CAPABILITY SIGNAL: `oauth::probe_add_route` deliberately
     // POSTs a blank name to trigger exactly this branch, and reads a STAMPED
     // 400 back as proof this route exists. Changing the status (e.g. to 422),
-    // or answering without `stamp_add_endpoint`, silently turns that read into
-    // `AddCapability::Unusable` — `login_route` then REFUSES outright (bridge
+    // or answering without the route's stamp, silently turns that read into
+    // `AddCapability::Unusable` — `oauth::admit_login` then REFUSES outright (bridge
     // item D) rather than falling back to the file, so this degrades to a
     // needless refusal beside a server that actually has the route, not the
     // whole-file clobber this feature exists to remove. See the seam test
     // `probe_add_capabilitys_blank_body_is_a_stamped_400_and_mutates_nothing`.
     let Some(name) = parsed.name.filter(|n| !n.trim().is_empty()) else {
-        return stamp_add_endpoint(error_response(
+        return route_error(
+            &ADD_ACCOUNT_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "\"name\" (string) is required and must not be empty.",
-            None,
-        ));
+        );
     };
     // Same load-bearing signal as the blank-name branch above — the probe's
     // body is ALSO blank on `accessToken`, so whichever of the two checks
     // fires first is the one the probe actually exercises. Keep this one a
     // stamped 400 too.
     let Some(access_token) = parsed.access_token.filter(|t| !t.trim().is_empty()) else {
-        return stamp_add_endpoint(error_response(
+        return route_error(
+            &ADD_ACCOUNT_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "\"accessToken\" (string) is required and must not be empty.",
-            None,
-        ));
+        );
     };
     // The same rule `config::load` applies to a file row: tcr does not serve
     // API-key accounts. Without this, one added here would serve, and only
     // the next load would set it aside.
     let account_type = parsed.account_type.unwrap_or_default();
     if matches!(account_type, config::AccountType::ApiKey) {
-        return stamp_add_endpoint(error_response(
+        return route_error(
+            &ADD_ACCOUNT_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "tcr does not serve API-key accounts; add a Claude login instead.",
-            None,
-        ));
+        );
     }
     let refresh_token = parsed.refresh_token.filter(|t| !t.trim().is_empty());
     let no_refresh_token_warning = refresh_token.is_none().then_some(NO_REFRESH_TOKEN_WARNING);
@@ -2853,12 +2748,12 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
     let query_name = account.name.clone();
 
     match manager.add_or_update_account(account) {
-        AddAccountOutcome::Ambiguous(names) => stamp_add_endpoint(error_response(
+        AddAccountOutcome::Ambiguous(names) => route_error(
+            &ADD_ACCOUNT_ROUTE,
             StatusCode::CONFLICT,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             &crate::cli::ambiguous_query_message(&query_name, &names),
-            None,
-        )),
+        ),
         // The provider comes off the stored row, not the request: the echo is the
         // server's account of what it holds, which is what a client checks.
         AddAccountOutcome::Added { idx, name, persist } => {
@@ -3321,12 +3216,12 @@ async fn handle_request(
     {
         let provided = req_headers.get("x-api-key").and_then(|v| v.to_str().ok());
         if !key_matches(provided, expected) {
-            return error_response(
+            return ClientError::new(
                 StatusCode::UNAUTHORIZED,
-                "authentication_error",
+                ErrorKind::Authentication,
                 "Missing or invalid x-api-key.",
-                None,
-            );
+            )
+            .respond(provider);
         }
     }
 
@@ -3359,12 +3254,12 @@ async fn handle_request(
     //     Placed AFTER the api-key gate, like the guards below it: a request that
     //     cannot authenticate learns nothing here it would not learn anywhere else.
     if path_is_ambiguous(&path) {
-        return error_response(
+        return ClientError::new(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Request path must not contain a dot segment or a backslash.",
-            None,
-        );
+        )
+        .respond(provider);
     }
 
     // 1b. Everything under `/_tcr/` is OURS. The router matches the registered
@@ -3379,12 +3274,12 @@ async fn handle_request(
     //     miss it and are forwarded (measured). See [`LOCAL_PREFIX`] for why that is
     //     a forwarded 404 rather than a hole, and why it is left as it is.
     if path_is_under(&path, LOCAL_PREFIX) {
-        return error_response(
+        return ClientError::new(
             StatusCode::NOT_FOUND,
-            "not_found_error",
+            ErrorKind::NotFound,
             "Unknown tcr endpoint.",
-            None,
-        );
+        )
+        .respond(provider);
     }
 
     // 1c. Host guard: tcr is a credential-injecting reverse proxy for
@@ -3418,12 +3313,12 @@ async fn handle_request(
         // mean", on both paths.
         if !host_is_loopback(host) && !crate::mitm::host_allowed(host) {
             tracing::debug!(target_host = %host, "rejected misrouted forward-proxy request");
-            return error_response(
+            return ClientError::new(
                 StatusCode::MISDIRECTED_REQUEST,
-                "invalid_request_error",
+                ErrorKind::InvalidRequest,
                 "This proxy only serves its configured upstream hosts (Anthropic and Codex); refusing to forward a request for a different host.",
-                None,
-            );
+            )
+            .respond(provider);
         }
     }
     // A decrypted request stays on its CONNECT host. Marked ChatGPT connections may
@@ -3451,12 +3346,12 @@ async fn handle_request(
             .map(|host| host_path_disagreement(host, &path, provider)),
     };
     if let Some(message) = refusal {
-        return error_response(
+        return ClientError::new(
             StatusCode::MISDIRECTED_REQUEST,
-            "invalid_request_error",
-            &message,
-            None,
-        );
+            ErrorKind::InvalidRequest,
+            message,
+        )
+        .respond(provider);
     }
 
     // 1c'. A WebSocket upgrade on the Codex inference path is answered here, never forwarded.
@@ -3564,15 +3459,15 @@ async fn handle_request(
 
     // 2. Buffer the body once so it can be re-sent verbatim on every rotation.
     let Ok(body_bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error_response(
+        return ClientError::new(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Failed to read request body.",
-            None,
-        );
+        )
+        .respond(provider);
     };
 
-    // The body is parsed ONCE, here, into every answer the rest of the handler reads
+    //The body is parsed ONCE, here, into every answer the rest of the handler reads
     // from it: the model, the wire session and its tool events, the account-bound
     // tokens, the affinity key's inputs, the extended-cache-window answer and the
     // account-uuid splice point. See `crate::request_body` for why one walk, and how
@@ -3591,10 +3486,7 @@ async fn handle_request(
     //
     // A body that fails to parse yields "no model, no session, no tool events" rather
     // than rejecting the request: these are peeks, never a validation gate.
-    let rewrite_ttl = match provider {
-        crate::provider::Provider::Anthropic => manager.cache_ttl_rewrite_enabled(),
-        crate::provider::Provider::Codex => false,
-    };
+    let rewrite_ttl = provider.rewrites_cache_ttl() && manager.cache_ttl_rewrite_enabled();
     let request = crate::request_body::RequestBody::parse(body_bytes, rewrite_ttl);
     if let Some(before) = request.rewritten_from() {
         tracing::debug!(
@@ -3663,12 +3555,10 @@ async fn handle_request(
     // weekly bucket is an Anthropic fact, so a Codex request whose model id merely
     // contains "fable" never consults it, here (the bound hold, `select_bound`,
     // every 429 hint) any more than in selection.
-    let request_is_fable = match provider {
-        crate::provider::Provider::Anthropic => request_model
+    let request_is_fable = provider.has_fable_bucket()
+        && request_model
             .as_deref()
-            .is_some_and(crate::model::is_fable_model),
-        crate::provider::Provider::Codex => false,
-    };
+            .is_some_and(crate::model::is_fable_model);
 
     // `tcr run --group <name>` (Phase 1, PREFER semantics only). Read once,
     // constant across the rotation loop — same shape as `request_model` above.
@@ -3744,7 +3634,8 @@ async fn handle_request(
     // fleet-wide count: in a mixed fleet the other provider's accounts are never tried for
     // this request, so counting them would read a spent Anthropic rotation as unspent.
     let provider_account_count = manager.provider_account_count(provider);
-    let mut tried: HashSet<usize> = HashSet::new();
+    // Every piece of per-request rotation state, changed only through its methods.
+    let mut ladder = Ladder::default();
     // THE BORROWED-REQUEST PATH, and nothing else reaches it: a lease's
     // account-set scope, as the header the lender's own serving leg wrote onto
     // this loopback request (see [`ACCOUNTS_HEADER_NAME`]).
@@ -3795,12 +3686,12 @@ async fn handle_request(
                 tcr_peer_wire::sanitize_label(&name).is_ok_and(|label| labels.contains(&label))
             });
             if !inside {
-                tried.insert(idx);
+                ladder.bench(idx);
             }
         }
         tracing::debug!(
             accounts = %labels.join(","),
-            benched = tried.len(),
+            benched = ladder.tried().len(),
             of = account_count,
             "account-set scope: this request may be served only by the accounts it names"
         );
@@ -3894,14 +3785,8 @@ async fn handle_request(
         same_provider
     });
     let mut bound_to: Option<usize> = None;
-    // The accounts the hold benched, and only those, so a release mid-request can re-admit
-    // them without re-admitting what another rule benched: `tried` already carries the
-    // account-set scope of a borrowed request (above), and that bench is the lease's only
-    // enforcement on this path. Clearing `tried` wholesale served a lease scoped to one
-    // account on another (found in review, 2026-09-24).
-    let mut benched_for_hold: Vec<usize> = Vec::new();
     // A same-organization sibling a released conversation is sent to first (`same_org_release`),
-    // already selected, so it seeds `next_idx` below.
+    // already selected, so it seeds the ladder's next attempt below.
     let mut released_to: Option<usize> = None;
     if let Some((bound_idx, via)) = bound_candidate {
         let now = OffsetDateTime::now_utc();
@@ -3920,8 +3805,8 @@ async fn handle_request(
         {
             bound_to = Some(bound_idx);
             for idx in 0..account_count {
-                if idx != bound_idx && tried.insert(idx) {
-                    benched_for_hold.push(idx);
+                if idx != bound_idx {
+                    ladder.bench_for_hold(idx);
                 }
             }
             if via == "session-pin" {
@@ -3942,6 +3827,7 @@ async fn handle_request(
             // Told first, once: the client's retry of this 429 is the request that moves.
             if let Some(warning) = switch_warning(
                 &manager,
+                provider,
                 session_key,
                 bound_idx,
                 now,
@@ -3961,7 +3847,7 @@ async fn handle_request(
             released_to = same_org_release(
                 &manager,
                 bound_idx,
-                &tried,
+                ladder.tried(),
                 request_model.as_deref(),
                 |narrowed| {
                     manager.select_with_group(
@@ -3977,115 +3863,11 @@ async fn handle_request(
             );
         }
     }
-    // Accounts that already got their one force-refresh on a 401.
-    let mut forced_401: HashSet<usize> = HashSet::new();
-    // Per-account inline-429 retry counters.
-    let mut retried_429: HashMap<usize, u32> = HashMap::new();
-    // Per-account in-place 529 retry counters. Separate from `retried_429`: a 429
-    // is "this account is over quota" and may rotate, a 529 is "the upstream is
-    // busy" and must not — sharing one counter would let one status spend the
-    // other's budget.
-    let mut retried_529: HashMap<usize, u32> = HashMap::new();
-    // How many times THIS request has failed over to a DIFFERENT account on a 529.
-    // Per-REQUEST, deliberately not per-account like the counter above: what needs
-    // bounding is how much of the fleet one client request may walk, so it must not
-    // reset when the account changes.
-    let mut failovers_529 = 0u32;
-    // Distinguishes "no account available" (429) from "every attempt hit a
-    // transport failure" once the loop can no longer make progress. The latter is
-    // a 502 — EXCEPT when `offline_failures` below says the transport failures
-    // were this machine's resolver, which is a 503.
-    //
-    // These were ONE BOOL, and that was the bug: any single `send()` failure
-    // latched it for the rest of the request, and the check sits BEFORE both the
-    // soft-wait and the revalidation-serve — so one transport blip on one account
-    // disabled the entire recovery ladder and returned a 502 whose message ("every
-    // account transport-failed") was simply false. Observed live 09:16:46: the 502
-    // fired while two accounts had already answered with honest 429s and a third
-    // served a 200 1.6s later. Counting BOTH outcomes keeps the 502 for the only
-    // case it actually describes — nothing ever reached an upstream at all.
-    let mut transport_failures = 0usize;
-    let mut upstream_responses = 0usize;
-    // Set the moment any transport failure fails PAST the connect phase
-    // (`!err.is_connect()`, offline/DNS excluded — that is machine-level, not
-    // this). A connect-phase failure never left this box, so replaying it is
-    // free; a non-connect failure means a connection existed and the request
-    // may already have been written to it, so whether the upstream received or
-    // acted on it is unknown. One such attempt anywhere in the ladder taints the
-    // terminal answer for the whole request — see [`bad_gateway`]'s two shapes.
-    let mut unknown_outcome_transport_failure = false;
-    // Blind peer egress is offered ONCE per request, and this is the bound.
-    //
-    // It sits beside `unknown_outcome_transport_failure` because it is the same
-    // fact read the other way round: a carry is only ever offered while that
-    // flag is still false, nothing this request sent has left this box, so a
-    // resend down another path cannot double-send a POST. `src/peer/egress.rs`
-    // documents the seam; the offer itself is in the transport-failure arm
-    // below, above both the resolver arm's sleep and the exhausted-transport
-    // terminal, so both entry points the design names are one call site rather
-    // than two that can drift.
-    let mut peer_egress_tried = false;
-    // Accounts upstream refused with a 403 on OUR pooled credential, in the order
-    // seen. Every entry here is also an `upstream_responses` and a `tried` — a 403
-    // is a real answer, not a transport gap, and there is nothing to retry on the
-    // same account (unlike 401, a fresh token does not change WHICH account this
-    // is). Kept as `(idx, name)` rather than folded into a bare counter because the
-    // fast-fail response below must name the refused account(s), not just count
-    // them.
-    let mut refused_403: Vec<(usize, Option<String>)> = Vec::new();
-    // Model access can differ between ChatGPT plans. A rejection benches the account
-    // for this request only: it may still serve another model on the very next turn.
-    let mut model_refusals: Vec<(Option<String>, String)> = Vec::new();
-    let mut account_access_blocks = 0;
-    let mut codex_access_read_failures = 0;
-    let mut last_account_access_block: Option<(HeaderMap, Bytes)> = None;
     // Bound the total attempts so per-account 401/429 retries can never loop.
     let max_attempts = max_attempts_for(account_count);
-    // The account the NEXT iteration must use, bypassing select(). Three producers:
-    //
-    //  - A genuine SAME-account retry (401 force-refresh, transient-429 inline wait,
-    //    529 in-place backoff), which select() would otherwise rotate AWAY from the
-    //    very account the retry means to keep.
-    //  - The 529 FAILOVER below, which parks the DIFFERENT account its availability
-    //    probe already chose. That probe IS this iteration's selection: re-running
-    //    select() next iteration would double its side effects (LRU stamp, divert
-    //    log) and could race to a `None` after we already benched the 529'd account
-    //    in `tried` — turning a forwardable 529 into a synthesized 429.
-    //  - A released conversation's same-organization sibling (`same_org_release`, here
-    //    and at the mid-request release), selected for the same reason as the failover.
-    let mut next_idx: Option<usize> = released_to;
-    // One-shot guard: at most one transient-fleet-park soft-wait per client request.
-    let mut soft_waited_exhaustion = false;
-    // The subset of `tried` that is held out by a TRANSIENT 429 park and nothing
-    // else — the only entries the soft-wait below is allowed to re-admit.
-    //
-    // `tried` alone cannot answer that question: it also carries accounts benched
-    // by a 401, a transport blip, a dead token, and a durable quota rejection.
-    // Only the transient park is a TIMER, so only it un-does itself when the clock
-    // runs out; re-admitting any of the others would re-send this request to an
-    // account that already failed it, in a loop. An account leaves this set the
-    // moment it is re-admitted, so membership always means "currently parked".
-    // A Codex 429 that is not a quota refusal parks the same way: its hold is a
-    // timer on the 429's own `retry-after` (the Codex arm below).
-    let mut parked_transient: HashSet<usize> = HashSet::new();
-    // Same-account transport retries this request has spent, per account. The
-    // failing resource in a transport error is the CONNECTION, not the account:
-    // reqwest pools by `(scheme, authority)` and the account is only a Bearer
-    // header, so it is not in the pool key at all. Benching the account for
-    // the whole request therefore fails over on the wrong axis — and with a small
-    // eligible pool a single blip walks it to empty and answers a 502 (measured:
-    // 42 of 205 client-visible 502s fired at `transport_failures == 1`). A dead
-    // connection is evicted from the pool by the error itself, so the retry gets a
-    // fresh one.
-    //
-    // Bounded by `MAX_SAME_ACCOUNT_TRANSPORT_RETRIES`, not by one. This used to
-    // stop after a single retry because "the second failure IS evidence about the
-    // account"; a day's live log says otherwise — the first retry succeeds 94.7%
-    // of the time, so a second failure is overwhelmingly the SAME aging-connection
-    // fault recurring, not a sick account. Rotating instead costs a cold prompt
-    // cache, which is the expensive outcome this whole arm exists to avoid.
-    //
-    // Gated on the error KIND. The transport-failure branch below is THREE arms,
+    ladder.set_next(released_to);
+    // The same-account transport retry (`Ladder::spend_transport_retry`) is gated on the
+    // error KIND. The transport-failure branch below is THREE arms,
     // evaluated in this order — read them as narrowing scope, machine → connection
     // → account:
     //
@@ -4093,37 +3875,22 @@ async fn handle_request(
     //     the MACHINE. Every account resolves the same hostname, so there is
     //     nothing to bench and nowhere to rotate to. Holds the pin, waits, retries
     //     the same account, and after `MAX_OFFLINE_WAITS_PER_REQUEST` answers 503.
-    //  2. SAME-ACCOUNT RETRY (this map): a non-CONNECT failure, i.e. a pooled
+    //  2. SAME-ACCOUNT RETRY: a non-CONNECT failure, i.e. a pooled
     //     CONNECTION died. Up to `MAX_SAME_ACCOUNT_TRANSPORT_RETRIES` per account
-    //     per request, per the rationale above. Deliberately not taken for a
+    //     per request (the rationale is on `Ladder`'s field). Deliberately not taken for a
     //     CONNECT failure — there was no connection to evict, nothing is
     //     refreshed by trying again, and the retry only buys a second connect
     //     timeout on a route already not answering.
     //  3. ROTATE: everything else — a route to a resolvable host that is refused,
     //     blackholed or timing out. That IS evidence about this route, so bench the
     //     account and let the rotation do its job.
-    let mut transport_retried: HashMap<usize, u32> = HashMap::new();
-    // Accounts whose client has already been recycled for a stream reset THIS
-    // request. An h2 stream reset leaves the connection pooled (unlike a
-    // connection-level death), so the same-account retry above would otherwise
-    // check out the identical broken connection every time, this recycles it
-    // once before the retry, not on every retry, so a burst of resets on one
-    // account rebuilds the client a single time rather than once per attempt.
-    let mut reset_recycled: HashSet<usize> = HashSet::new();
-    // In-place waits this request has spent on a name-resolution failure, and how
-    // many such failures it saw at all. Per-REQUEST: an offline machine is one
-    // condition shared by every account, so there is nothing to count per account.
-    // `offline_failures` outlives the waits so the terminal answer can be the
-    // honest 503 even if the request later rotates for an unrelated reason.
-    let mut offline_waits = 0u32;
-    let mut offline_failures = 0usize;
 
     for _ in 0..max_attempts {
         let now = OffsetDateTime::now_utc();
-        let idx = match next_idx.take() {
+        let idx = match ladder.take_next() {
             Some(i) => i,
             None => match manager.select_with_group(
-                &tried,
+                ladder.tried(),
                 now,
                 request_model.as_deref(),
                 session_key,
@@ -4209,106 +3976,19 @@ async fn handle_request(
                         model: request_model.as_deref(),
                         group: request_group.as_deref(),
                         affinity: session_key,
-                        tried_local: tried.len(),
+                        tried_local: ladder.tried().len(),
                         body: body_bytes.clone(),
                         headers: fallback::Ask::scrubbed(&req_headers),
                     });
-                    if every_attempt_transport_failed(transport_failures, upstream_responses) {
-                        // Nothing reached an upstream — but WHY decides the status.
-                        // If any attempt died in the resolver, the honest answer is
-                        // the recoverable 503, not a 502 asserting the upstream is
-                        // unreachable when it is this machine that is off the
-                        // network. Reachable here only if the offline arm's own
-                        // bound was not what ended the walk (a mixed request that
-                        // rotated for another reason first).
-                        if offline_failures > 0 {
-                            return offline_unavailable(offline_failures);
-                        }
-                        return bad_gateway(transport_failures, unknown_outcome_transport_failure);
-                    }
-                    // Every upstream answer this request got was a 403 refusing OUR
-                    // credential — refusals are the WHOLE story, not one dead
-                    // account among others still worth a 429/quota wait. Fast-fail
-                    // here, before the soft-wait and revalidation-serve below: those
-                    // exist to ride out a transient PARK, and a 403'd credential is
-                    // not coming back on a timer. Gated on `upstream_responses`
-                    // (mirroring `every_attempt_transport_failed` above), not on
-                    // `account_count`, so this fires equally for a pinned request
-                    // that only ever tried its one pin. Mixed outcomes — some
-                    // accounts refused, others merely exhausted — fall through
-                    // unchanged to the existing exhaustion handling, which can still
-                    // recover on the accounts that were not refused.
-                    if !model_refusals.is_empty() {
-                        return codex_model_unavailable_response(
-                            &manager,
-                            request_model.as_deref(),
-                            &model_refusals,
-                            &refused_403,
-                        );
-                    }
-                    if codex_access_read_failures > 0
-                        && codex_access_read_failures == upstream_responses
-                    {
-                        return error_response(
-                            StatusCode::BAD_GATEWAY,
-                            "proxy_error",
-                            "Could not read the upstream access-denied responses. The affected Codex accounts are held briefly; retry shortly.",
-                            None,
-                        );
-                    }
-                    if account_access_blocks > 0
-                        && account_access_blocks + refused_403.len() == upstream_responses
-                        && let Some((headers, body)) = last_account_access_block.take()
-                    {
-                        if !refused_403.is_empty() {
-                            let mut combined: Value =
-                                serde_json::from_slice(&body).unwrap_or_else(|_| {
-                                    codex_error_body(
-                                        CodexRefusalKind::CredentialRefused,
-                                        "ChatGPT refused workspace access.",
-                                    )
-                                });
-                            let message = combined
-                                .pointer("/error/message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("ChatGPT refused workspace access.");
-                            let message = format!(
-                                "{message} {}",
-                                codex_credential_refused_message(&refused_403)
-                            );
-                            if !combined.get("error").is_some_and(Value::is_object) {
-                                combined["error"] = serde_json::json!({});
-                            }
-                            combined["error"]["message"] = message.into();
-                            return codex_error_response(
-                                StatusCode::FORBIDDEN,
-                                combined.to_string(),
-                                None,
-                            );
-                        }
-                        return build_response(
-                            StatusCode::FORBIDDEN,
-                            &headers,
-                            Body::from(body),
-                            ServedBy::PooledAccount,
-                        );
-                    }
-                    if !refused_403.is_empty() && refused_403.len() == upstream_responses {
-                        return credential_refused_response(provider, &refused_403);
-                    }
-                    // A refused pool is an access problem, not a rate-limit retry. Keep
-                    // that status throughout the short revalidation hold, even near its end.
-                    match provider {
-                        Provider::Codex => {
-                            if manager.codex_pool_is_refused(now, bound_to, strict_group) {
-                                manager.note_codex_refusal(
-                                    CodexRefusalKind::CredentialRefused,
-                                    crate::now_ms(),
-                                );
-                                return codex_refused_pool_response();
-                            }
-                        }
-                        Provider::Anthropic => {}
+                    if let Some(answer) = ladder.verdict(
+                        &manager,
+                        provider,
+                        request_model.as_deref(),
+                        now,
+                        bound_to,
+                        strict_group,
+                    ) {
+                        return answer;
                     }
                     // A cold shared-limiter burst parks the whole fleet for ~15-20s.
                     // Rather than telling the client "all exhausted" for a transient
@@ -4344,10 +4024,10 @@ async fn handle_request(
                                 manager.retry_after_hint(now, request_is_fable, provider)
                             }
                         },
-                        soft_waited_exhaustion,
+                        ladder.soft_waited_exhaustion(),
                     ) {
                         Some(secs) => {
-                            soft_waited_exhaustion = true;
+                            ladder.spend_soft_wait();
                             // Desync concurrent waiters: without this, every request
                             // sleeping the same integer-ceil `secs` wakes on the SAME
                             // second and races for the single earliest-freeing account,
@@ -4381,19 +4061,11 @@ async fn handle_request(
                             // whose hold is still running stays parked, and one
                             // benched for any NON-hold reason was never in
                             // `parked_transient` to begin with.
-                            let now_ms = crate::now_ms();
-                            let freed: Vec<usize> = parked_transient
-                                .iter()
-                                .copied()
-                                .filter(|&i| manager.hold_expired(i, now_ms))
-                                .collect();
-                            for i in &freed {
-                                tried.remove(i);
-                                parked_transient.remove(i);
-                            }
+                            let (readmitted, still_parked) =
+                                ladder.readmit_expired_parks(&manager, crate::now_ms());
                             tracing::info!(
-                                readmitted = freed.len(),
-                                still_parked = parked_transient.len(),
+                                readmitted,
+                                still_parked,
                                 "soft-wait over — re-admitted the accounts whose hold expired"
                             );
                             continue; // re-run select(); the re-admitted accounts are eligible again
@@ -4477,6 +4149,7 @@ async fn handle_request(
                             {
                                 if let Some(warning) = switch_warning(
                                     &manager,
+                                    provider,
                                     session_key,
                                     bound,
                                     now,
@@ -4492,16 +4165,14 @@ async fn handle_request(
                                 );
                                 // Re-admit only what the hold benched: a lease's
                                 // account-set scope stays benched (see
-                                // `benched_for_hold`), and so does `bound`, which
+                                // `Ladder::release_hold`), and so does `bound`, which
                                 // failed this request.
-                                for idx in benched_for_hold.drain(..) {
-                                    tried.remove(&idx);
-                                }
+                                ladder.release_hold();
                                 bound_to = None;
-                                next_idx = same_org_release(
+                                let released = same_org_release(
                                     &manager,
                                     bound,
-                                    &tried,
+                                    ladder.tried(),
                                     request_model.as_deref(),
                                     |narrowed| {
                                         manager.select_with_group(
@@ -4515,12 +4186,13 @@ async fn handle_request(
                                         )
                                     },
                                 );
+                                ladder.set_next(released);
                                 continue;
                             }
                             let served = match bound_to {
                                 Some(bound) => manager.select_bound(
                                     bound,
-                                    &tried,
+                                    ladder.tried(),
                                     now,
                                     request_is_fable,
                                     request_group.as_deref(),
@@ -4531,7 +4203,7 @@ async fn handle_request(
                                     && manager.revalidation_serve_enabled() =>
                                 {
                                     manager.select_revalidation(
-                                        &tried,
+                                        ladder.tried(),
                                         now,
                                         request_model.as_deref(),
                                         session_key,
@@ -4575,11 +4247,11 @@ async fn handle_request(
         // requests). If the refresh proved the credential dead, skip now.
         manager.ensure_fresh(idx).await;
         if manager.account_status(idx) == Some(AccountStatus::Error) {
-            tried.insert(idx);
+            ladder.bench(idx);
             continue;
         }
         let Some(token) = manager.access_token(idx) else {
-            tried.insert(idx);
+            ladder.bench(idx);
             continue;
         };
         // The upstream headers for THIS account, built once and handed to every route this
@@ -4598,6 +4270,27 @@ async fn handle_request(
                 build_codex_upstream_headers(&req_headers, &token, id.as_deref())
             }
         };
+        // The body THIS account sends, built once beside its headers and for the same reason:
+        // the exit lock, the direct send and the blind carry all take this one value, so a
+        // carried request is the same request the direct path would have sent.
+        //
+        // `None` for a GET or a HEAD, which carry no body. Anthropic: the body's
+        // `metadata.user_id.account_uuid` is rewritten to the serving account's own UUID
+        // (rotation changes the account each attempt, so this is recomputed from the pristine
+        // `body_bytes` per attempt), at the splice point the one parse found; the patch is
+        // same-length, so content-length is unaffected, and `build_upstream_headers` strips
+        // content-length regardless. Absent a configured 36-char UUID, the body is sent
+        // unchanged. Codex: the identity is the header set above; the body is opaque (usually
+        // zstd). Every no-change path forwards the buffered `Bytes` handle by O(1) refcount
+        // clone; only a genuine differing-UUID rewrite allocates.
+        let upstream_body: Option<Bytes> =
+            (method != Method::GET && method != Method::HEAD).then(|| match provider {
+                crate::provider::Provider::Anthropic => match manager.account_uuid(idx) {
+                    Some(uuid) if uuid.len() == 36 => request.for_account(&uuid),
+                    _ => body_bytes.clone(),
+                },
+                crate::provider::Provider::Codex => body_bytes.clone(),
+            });
         // **The exit lock, before the direct attempt and not inside its failure
         // arm.** An account the operator locked to one Mac leaves from that Mac
         // on EVERY request, working direct path or not: the whole point is that
@@ -4622,7 +4315,7 @@ async fn handle_request(
                 method: &method,
                 path_and_query: &path_and_query,
                 headers: upstream_headers.clone(),
-                body: body_bytes.clone(),
+                body: upstream_body.clone(),
                 peers_path: &crate::peer::egress::peers_path(),
                 session_key,
                 session_kind,
@@ -4648,7 +4341,7 @@ async fn handle_request(
         // `AccountRuntime::http` exists to fix: every account collapsing onto
         // one shared connection pool regardless of which one is serving.
         let Some(http) = manager.http_client(idx) else {
-            tried.insert(idx);
+            ladder.bench(idx);
             continue;
         };
 
@@ -4660,29 +4353,9 @@ async fn handle_request(
         let mut builder = http
             .request(method.clone(), &url)
             .headers(upstream_headers.clone());
-        if method != Method::GET && method != Method::HEAD {
-            // Rewrite the body's metadata.user_id.account_uuid to the serving
-            // account's own UUID (rotation changes the account each attempt, so
-            // this is recomputed from the pristine `body_bytes` per attempt). The
-            // patch is same-length, so content-length is unaffected — and
-            // `build_upstream_headers` strips content-length regardless. Absent a
-            // configured 36-char UUID, the body is sent unchanged.
-            // Forward the buffered `Bytes` handle by O(1) refcount clone on every
-            // no-change path; only a genuine differing-UUID rewrite allocates (it
-            // already owns a fresh Vec). `body_bytes` is immutable and re-read
-            // pristine each rotation attempt, so cloning the handle is correct, and
-            // reqwest's `Body: From<Bytes>` is O(1) — no full-body copy per request.
-            let out_body: bytes::Bytes = match provider {
-                // Anthropic: the existing metadata.user_id.account_uuid splice, unchanged.
-                crate::provider::Provider::Anthropic => match manager.account_uuid(idx) {
-                    // The splice point was found by the one parse; nothing re-reads the body.
-                    Some(uuid) if uuid.len() == 36 => request.for_account(&uuid),
-                    _ => body_bytes.clone(),
-                },
-                // Codex: the identity is the header set above; the body is opaque (usually zstd).
-                crate::provider::Provider::Codex => body_bytes.clone(),
-            };
-            builder = builder.body(out_body);
+        // reqwest's `Body: From<Bytes>` is O(1): no full-body copy per attempt.
+        if let Some(body) = upstream_body.clone() {
+            builder = builder.body(body);
         }
 
         // Fetch the serving account's name once per iteration — reused by the
@@ -4706,835 +4379,880 @@ async fn handle_request(
         }
 
         timing.note_send(idx, account_name.as_deref());
-        let resp = match builder.send().await {
-            Ok(resp) => {
-                timing.headers_at = Some(Instant::now());
-                resp
-            }
-            Err(err) => {
-                // Transport failure is not proof of a bad credential, so nothing
-                // here ever disables an account — the three arms differ only in
-                // whether this request retries in place, rotates, or gives up.
-                // Their order and rationale are at `transport_retried` above. The
-                // `reqwest::Error` used to be discarded by a `let Ok(..) else`,
-                // so a 502 assembled out of these failures had no line anywhere to
-                // attribute it to; `is_connect` / `is_timeout` separate "never
-                // reached the host" from "the host went quiet mid-request".
-                transport_failures += 1;
-                // **Blind peer egress, the one offer per request.**
-                //
-                // Four conjuncts, and the first two are what stop a carry
-                // RESENDING a request an upstream may already have acted on.
-                // `err.is_connect()` alone was not enough, and that was the
-                // CRITICAL a measurement found: it describes only THIS
-                // attempt, so a request whose earlier attempt died past the
-                // connect phase (`unknown_outcome_transport_failure`, set
-                // below) and whose next one failed to connect satisfied it and
-                // carried a POST that may have been received. So:
-                //
-                //  - `!unknown_outcome_transport_failure`: no attempt in this
-                //    request has ever been written onto a live connection.
-                //  - `every_attempt_transport_failed(..)`: no attempt ever
-                //    reached an upstream at all. An upstream answer, a 429, a
-                //    403, anything, is proof the request left this box, and it
-                //    is a fact about the REQUEST, not about this attempt.
-                //  - `err.is_connect() || is_offline_error(&err)`: this attempt
-                //    died before or at connect.
-                //  - `rotation_is_spent`: the ladder has no untried account
-                //    left to rotate to, OR the failure is machine-level
-                //    (the resolver), where rotating cannot help because every
-                //    account resolves the same name. Offering on the FIRST
-                //    connect failure of a multi-account fleet is what let a
-                //    carry run while an account that would have answered had
-                //    not been tried yet.
-                //
-                // Position follows from that last conjunct: after rotation,
-                // and still ABOVE the resolver arm's fixed six-second wait, so
-                // an offline machine is offered a carry before it sleeps
-                // rather than after. One call site, bounded once per request by
-                // `peer_egress_tried`.
-                //
-                // Inert by construction when the mesh is not set up: no peers
-                // file, `via off`, or no pinned Mac with an address all answer
-                // `None` before anything is dialled, and then this arm carries
-                // on to exactly the behaviour it had before. Nothing about
-                // `is_offline_error`, `every_attempt_transport_failed` or
-                // either terminal status is widened.
-                let machine_level = is_offline_error(&err);
-                let nothing_ever_left_this_box = !unknown_outcome_transport_failure
-                    && (err.is_connect() || machine_level)
-                    && every_attempt_transport_failed(transport_failures, upstream_responses);
-                // `tried` never contains `idx` yet (it is inserted on the way
-                // out of this arm), so this account plus the benched ones is
-                // the whole of this request's provider's accounts exactly when
-                // the ladder is out of moves. A request narrowed by the
-                // account-set scope header counts its own benched accounts here
-                // too, which is right: they are not rotatable for this request
-                // either.
-                //
-                // Both sides count only the REQUEST's provider: the other
-                // provider's accounts are never rotatable for it, so with the
-                // fleet-wide count a mixed fleet read one Anthropic ladder short
-                // of spent per Codex account, and an Anthropic request was never
-                // offered the carry it gets on the same fleet without them. They
-                // are filtered out of `tried` too, because the scope header
-                // benches every account outside its set, whatever its provider.
-                let tried_of_provider = tried
-                    .iter()
-                    .filter(|&&i| manager.live_provider(i) == Some(provider))
-                    .count();
-                let rotation_is_spent =
-                    machine_level || tried_of_provider + 1 >= provider_account_count;
-                // Anthropic only: Codex stays off the peer mesh in this version (it is
-                // neither lent nor carried), and a carry offers the request to a
-                // peer's gateway as surely as a lease does. A Codex request keeps the
-                // answer it had before the mesh existed.
-                if !peer_egress_tried
-                    && nothing_ever_left_this_box
-                    && rotation_is_spent
-                    && match provider {
-                        crate::provider::Provider::Anthropic => true,
-                        crate::provider::Provider::Codex => false,
-                    }
-                {
-                    peer_egress_tried = true;
-                    // The body is rebuilt here rather than shared with the
-                    // direct attempt's `out_body` above, because the two hunks
-                    // are built separately. The
-                    // two must agree: a carried request is the SAME request,
-                    // and the account-uuid patch is part of what the upstream
-                    // sees.
-                    let carried_body =
-                        (method != Method::GET && method != Method::HEAD).then(|| {
-                            match manager.account_uuid(idx) {
-                                Some(uuid) if uuid.len() == 36 => request.for_account(&uuid),
-                                _ => body_bytes.clone(),
-                            }
-                        });
-                    let peers_path = crate::peer::egress::peers_path();
-                    let carry = crate::peer::egress::retry_through_peer(
-                        crate::peer::egress::CarriedRequest {
-                            url: &url,
-                            method: &method,
-                            headers: upstream_headers.clone(),
-                            body: carried_body,
-                            peers_path: &peers_path,
-                        },
-                    )
-                    .await;
-                    // A GATEWAY THAT TOOK THE CARRY AND FAILED IS AN ANSWER,
-                    // never a fall-through. The ladder below this arm sleeps
-                    // and retries the same account, or benches it and rotates,
-                    // and either way sends a request the splice may already
-                    // have put on the wire a second time. Nothing else on this
-                    // path can say so: `unknown_outcome_transport_failure` is
-                    // written by the direct attempt's own error arm, which a
-                    // carry never reaches, so the terminal answer was a 503
-                    // the client is built to retry. Same typed outcome as the
-                    // pinned sibling, same 502 with `x-should-retry: false`.
-                    if let crate::peer::egress::ViaCarry::TakenAndFailed(gap) = &carry {
-                        return crate::peer::egress::delivered_unknown_response(gap);
-                    }
-                    if let crate::peer::egress::ViaCarry::Carried(carried) = carry {
-                        // A carried request is a served request, and it is
-                        // recorded exactly like one, the counter, the
-                        // wire-session table and the ring buffer, in the order
-                        // the terminal outcome below uses. The account and the
-                        // credential were ours; only the route out belonged to
-                        // a peer, so a carry that did not count would make all
-                        // three under-report this fleet's own traffic.
-                        // `egress::record_carried` documents which figure it
-                        // cannot record and why.
-                        //
-                        // The headers it folds into the quota are the ORIGIN's
-                        // own, carried out of the peer path unfiltered
-                        // alongside the client's response, because the client's
-                        // copy no longer has them, `is_account_scoped` strips
-                        // them there exactly as `build_response` does here.
-                        crate::peer::egress::record_carried(
-                            &manager,
-                            crate::peer::egress::CarriedRecord {
-                                account_idx: idx,
-                                account: account_name.clone(),
-                                session_key,
-                                session_kind,
-                                wire_session_id: wire_session_id.as_deref(),
-                                model: request_model.clone(),
-                                method: method.to_string(),
-                                path: path_and_query.clone(),
-                                status: carried.response.status().as_u16(),
-                                tool_uses: &wire_tool_uses,
-                                tool_results: &wire_tool_results,
-                                upstream_headers: &carried.upstream_headers,
+        // The attempt, from the send to the last status arm, evaluates to the one `Step` it
+        // decided, and the `match` after it is the only place the ladder moves. An arm that
+        // changed the ladder and jumped by itself is how a park once forgot its second set.
+        let step = 'attempt: {
+            let resp = match builder.send().await {
+                Ok(resp) => {
+                    timing.headers_at = Some(Instant::now());
+                    resp
+                }
+                Err(err) => {
+                    // Transport failure is not proof of a bad credential, so nothing
+                    // here ever disables an account — the three arms differ only in
+                    // whether this request retries in place, rotates, or gives up.
+                    // Their order and rationale are at `transport_retried` above. The
+                    // `reqwest::Error` used to be discarded by a `let Ok(..) else`,
+                    // so a 502 assembled out of these failures had no line anywhere to
+                    // attribute it to; `is_connect` / `is_timeout` separate "never
+                    // reached the host" from "the host went quiet mid-request".
+                    ladder.transport_failed();
+                    // **Blind peer egress, the one offer per request.**
+                    //
+                    // Four conjuncts, and the first two are what stop a carry
+                    // RESENDING a request an upstream may already have acted on.
+                    // `err.is_connect()` alone was not enough, and that was the
+                    // CRITICAL a measurement found: it describes only THIS
+                    // attempt, so a request whose earlier attempt died past the
+                    // connect phase (`unknown_outcome_transport_failure`, set
+                    // below) and whose next one failed to connect satisfied it and
+                    // carried a POST that may have been received. So:
+                    //
+                    //  - `!unknown_outcome_transport_failure`: no attempt in this
+                    //    request has ever been written onto a live connection.
+                    //  - `every_attempt_transport_failed(..)`: no attempt ever
+                    //    reached an upstream at all. An upstream answer, a 429, a
+                    //    403, anything, is proof the request left this box, and it
+                    //    is a fact about the REQUEST, not about this attempt.
+                    //  - `err.is_connect() || is_offline_error(&err)`: this attempt
+                    //    died before or at connect.
+                    //  - `rotation_is_spent`: the ladder has no untried account
+                    //    left to rotate to, OR the failure is machine-level
+                    //    (the resolver), where rotating cannot help because every
+                    //    account resolves the same name. Offering on the FIRST
+                    //    connect failure of a multi-account fleet is what let a
+                    //    carry run while an account that would have answered had
+                    //    not been tried yet.
+                    //
+                    // Position follows from that last conjunct: after rotation,
+                    // and still ABOVE the resolver arm's fixed six-second wait, so
+                    // an offline machine is offered a carry before it sleeps
+                    // rather than after. One call site, bounded once per request by
+                    // `peer_egress_tried`.
+                    //
+                    // Inert by construction when the mesh is not set up: no peers
+                    // file, `via off`, or no pinned Mac with an address all answer
+                    // `None` before anything is dialled, and then this arm carries
+                    // on to exactly the behaviour it had before. Nothing about
+                    // `is_offline_error`, `every_attempt_transport_failed` or
+                    // either terminal status is widened.
+                    let machine_level = is_offline_error(&err);
+                    let nothing_ever_left_this_box =
+                        !ladder.tally().unknown_outcome_transport_failure
+                            && (err.is_connect() || machine_level)
+                            && every_attempt_transport_failed(
+                                ladder.tally().transport_failures,
+                                ladder.tally().upstream_responses,
+                            );
+                    // `tried` never contains `idx` yet (it is inserted on the way
+                    // out of this arm), so this account plus the benched ones is
+                    // the whole of this request's provider's accounts exactly when
+                    // the ladder is out of moves. A request narrowed by the
+                    // account-set scope header counts its own benched accounts here
+                    // too, which is right: they are not rotatable for this request
+                    // either.
+                    //
+                    // Both sides count only the REQUEST's provider: the other
+                    // provider's accounts are never rotatable for it, so with the
+                    // fleet-wide count a mixed fleet read one Anthropic ladder short
+                    // of spent per Codex account, and an Anthropic request was never
+                    // offered the carry it gets on the same fleet without them. They
+                    // are filtered out of `tried` too, because the scope header
+                    // benches every account outside its set, whatever its provider.
+                    let tried_of_provider = ladder
+                        .tried()
+                        .iter()
+                        .filter(|&&i| manager.live_provider(i) == Some(provider))
+                        .count();
+                    let rotation_is_spent =
+                        machine_level || tried_of_provider + 1 >= provider_account_count;
+                    // Anthropic only: Codex stays off the peer mesh in this version (it is
+                    // neither lent nor carried), and a carry offers the request to a
+                    // peer's gateway as surely as a lease does. A Codex request keeps the
+                    // answer it had before the mesh existed.
+                    if !ladder.peer_egress_tried()
+                        && nothing_ever_left_this_box
+                        && rotation_is_spent
+                        && provider.on_peer_mesh()
+                    {
+                        ladder.spend_peer_egress();
+                        let peers_path = crate::peer::egress::peers_path();
+                        let carry = crate::peer::egress::retry_through_peer(
+                            crate::peer::egress::CarriedRequest {
+                                url: &url,
+                                method: &method,
+                                headers: upstream_headers.clone(),
+                                body: upstream_body.clone(),
+                                peers_path: &peers_path,
                             },
                         )
                         .await;
-                        return carried.response;
+                        // A GATEWAY THAT TOOK THE CARRY AND FAILED IS AN ANSWER,
+                        // never a fall-through. The ladder below this arm sleeps
+                        // and retries the same account, or benches it and rotates,
+                        // and either way sends a request the splice may already
+                        // have put on the wire a second time. Nothing else on this
+                        // path can say so: `unknown_outcome_transport_failure` is
+                        // written by the direct attempt's own error arm, which a
+                        // carry never reaches, so the terminal answer was a 503
+                        // the client is built to retry. Same typed outcome as the
+                        // pinned sibling, same 502 with `x-should-retry: false`.
+                        if let crate::peer::egress::ViaCarry::TakenAndFailed(gap) = &carry {
+                            break 'attempt Step::Answer(
+                                crate::peer::egress::delivered_unknown_response(gap),
+                            );
+                        }
+                        if let crate::peer::egress::ViaCarry::Carried(carried) = carry {
+                            // A carried request is a served request, and it is
+                            // recorded exactly like one, the counter, the
+                            // wire-session table and the ring buffer, in the order
+                            // the terminal outcome below uses. The account and the
+                            // credential were ours; only the route out belonged to
+                            // a peer, so a carry that did not count would make all
+                            // three under-report this fleet's own traffic.
+                            // `egress::record_carried` documents which figure it
+                            // cannot record and why.
+                            //
+                            // The headers it folds into the quota are the ORIGIN's
+                            // own, carried out of the peer path unfiltered
+                            // alongside the client's response, because the client's
+                            // copy no longer has them, `is_account_scoped` strips
+                            // them there exactly as `build_response` does here.
+                            crate::peer::egress::record_carried(
+                                &manager,
+                                crate::peer::egress::CarriedRecord {
+                                    account_idx: idx,
+                                    account: account_name.clone(),
+                                    session_key,
+                                    session_kind,
+                                    wire_session_id: wire_session_id.as_deref(),
+                                    model: request_model.clone(),
+                                    method: method.to_string(),
+                                    path: path_and_query.clone(),
+                                    status: carried.response.status().as_u16(),
+                                    tool_uses: &wire_tool_uses,
+                                    tool_results: &wire_tool_results,
+                                    upstream_headers: &carried.upstream_headers,
+                                },
+                            )
+                            .await;
+                            break 'attempt Step::Answer(carried.response);
+                        }
                     }
-                }
-                // `?err`, NOT `%err`. reqwest's `Display` prints only its own top
-                // frame and never walks `source()`, so the h2 sub-kind
-                // (`SendRequest` / `Canceled` / `ChannelClosed`) and its reason code
-                // — the only things that say WHY the connection died — are
-                // structurally unreachable from a `%` rendering. `Debug` carries the
-                // whole chain. Do not "tidy" this back to `%err`.
-                // A CONNECT-phase failure is not a blip on a pooled connection —
-                // there was no connection. Nothing was evicted, nothing is
-                // refreshed by trying again, and the retry is the identical
-                // operation with no new information; all it buys is a second full
-                // `connect_timeout` (10s, `manager/mod.rs`) on a route that is
-                // already not answering. On a blackholed upstream (VPN drop,
-                // captive portal, edge unreachable — no RST, no reply) that
-                // doubles every request's time-to-502 — ~80s to ~160s on an
-                // 8-account fleet — while each request holds its per-account
-                // in-flight slot for the whole of it. Bench the account and let
-                // the rotation do its job.
-                // FIRST arm, ahead of both of the account-level ones: a resolver
-                // failure is a fact about this MACHINE, not about the account that
-                // happened to be selected. Every account resolves the same
-                // hostname, so neither benching this one nor moving to the next can
-                // possibly help — it only unpins the session and burns the fleet.
-                // Hold the pin, wait briefly, retry the SAME account.
-                if is_offline_error(&err) {
-                    offline_failures += 1;
-                    if offline_waits < MAX_OFFLINE_WAITS_PER_REQUEST {
-                        offline_waits += 1;
+                    // `?err`, NOT `%err`. reqwest's `Display` prints only its own top
+                    // frame and never walks `source()`, so the h2 sub-kind
+                    // (`SendRequest` / `Canceled` / `ChannelClosed`) and its reason code
+                    // — the only things that say WHY the connection died — are
+                    // structurally unreachable from a `%` rendering. `Debug` carries the
+                    // whole chain. Do not "tidy" this back to `%err`.
+                    // A CONNECT-phase failure is not a blip on a pooled connection —
+                    // there was no connection. Nothing was evicted, nothing is
+                    // refreshed by trying again, and the retry is the identical
+                    // operation with no new information; all it buys is a second full
+                    // `connect_timeout` (10s, `manager/mod.rs`) on a route that is
+                    // already not answering. On a blackholed upstream (VPN drop,
+                    // captive portal, edge unreachable — no RST, no reply) that
+                    // doubles every request's time-to-502 — ~80s to ~160s on an
+                    // 8-account fleet — while each request holds its per-account
+                    // in-flight slot for the whole of it. Bench the account and let
+                    // the rotation do its job.
+                    // FIRST arm, ahead of both of the account-level ones: a resolver
+                    // failure is a fact about this MACHINE, not about the account that
+                    // happened to be selected. Every account resolves the same
+                    // hostname, so neither benching this one nor moving to the next can
+                    // possibly help — it only unpins the session and burns the fleet.
+                    // Hold the pin, wait briefly, retry the SAME account.
+                    if is_offline_error(&err) {
+                        let offline_failures = ladder.offline_failed();
+                        if let Some(offline_wait) =
+                            ladder.take_offline_wait(MAX_OFFLINE_WAITS_PER_REQUEST)
+                        {
+                            tracing::warn!(
+                                account_index = idx,
+                                account = account_name.as_deref().unwrap_or("?"),
+                                offline_wait,
+                                max_offline_waits = MAX_OFFLINE_WAITS_PER_REQUEST,
+                                error = ?err,
+                                "name resolution failed — this machine is offline; \
+                                 holding the pinned account and waiting"
+                            );
+                            tokio::time::sleep(Duration::from_secs(OFFLINE_WAIT_SECS)).await;
+                            break 'attempt Step::RetrySame;
+                        }
+                        break 'attempt Step::Answer(offline_unavailable(
+                            provider,
+                            offline_failures,
+                        ));
+                    }
+                    // Past the connect phase: a connection existed and the request may
+                    // already be in flight on the wire, so this attempt's outcome upstream
+                    // is unknown regardless of whether it now gets retried in place or the
+                    // ladder rotates away from it. See `unknown_outcome_transport_failure`.
+                    if !err.is_connect() {
+                        ladder.unknown_outcome();
+                    }
+                    // Classified ONCE per attempt, see `TransportFailureReason`'s own
+                    // doc for why a stream reset needs different handling than a
+                    // connection-level death even though both are `!is_connect()`.
+                    let transport_reason = classify_transport_failure(&err);
+                    if transport_reason == TransportFailureReason::StreamReset
+                        && ladder.first_reset_recycle(idx)
+                    {
+                        // The h2 connection survives a stream reset (unlike a
+                        // connection-level death, which reqwest's own error already
+                        // evicted from the pool), so without this the retry below
+                        // would check out the SAME broken connection. Recycle once per
+                        // account per request, a second reset here finds `idx`
+                        // already recycled and goes straight to the retry,
+                        // which by then really is on the fresh connection.
+                        manager.recycle_client_after_reset(idx);
+                    }
+                    if !err.is_connect()
+                        && ladder.transport_retries(idx) < MAX_SAME_ACCOUNT_TRANSPORT_RETRIES
+                    {
+                        // A blip on this account this request: retry it on a fresh
+                        // connection rather than benching an account that is probably fine.
+                        // A connection-level death is already evicted from the pool by
+                        // the error itself; a stream reset was just recycled above ,
+                        // either way each retry genuinely gets a new connection, which
+                        // is why repeating is worth more than rotating (94.7% land a
+                        // 200).
+                        let transport_retry = ladder.spend_transport_retry(idx);
+                        // Message text unchanged — `scripts/` parses it. The attempt
+                        // fields are ADDED alongside, never a replacement, so an existing
+                        // grep keeps matching while a new one can see the ladder.
                         tracing::warn!(
                             account_index = idx,
                             account = account_name.as_deref().unwrap_or("?"),
-                            offline_wait = offline_waits,
-                            max_offline_waits = MAX_OFFLINE_WAITS_PER_REQUEST,
+                            is_connect = err.is_connect(),
+                            is_timeout = err.is_timeout(),
+                            transport_retry,
+                            max_transport_retries = MAX_SAME_ACCOUNT_TRANSPORT_RETRIES,
                             error = ?err,
-                            "name resolution failed — this machine is offline; \
-                             holding the pinned account and waiting"
+                            "upstream transport failure — retrying the SAME account on a fresh connection"
                         );
-                        next_idx = Some(idx);
-                        tokio::time::sleep(Duration::from_secs(OFFLINE_WAIT_SECS)).await;
-                        continue;
+                        break 'attempt Step::RetrySame;
                     }
-                    return offline_unavailable(offline_failures);
-                }
-                // Past the connect phase: a connection existed and the request may
-                // already be in flight on the wire, so this attempt's outcome upstream
-                // is unknown regardless of whether it now gets retried in place or the
-                // ladder rotates away from it. See `unknown_outcome_transport_failure`.
-                if !err.is_connect() {
-                    unknown_outcome_transport_failure = true;
-                }
-                // Classified ONCE per attempt, see `TransportFailureReason`'s own
-                // doc for why a stream reset needs different handling than a
-                // connection-level death even though both are `!is_connect()`.
-                let transport_reason = classify_transport_failure(&err);
-                if transport_reason == TransportFailureReason::StreamReset
-                    && reset_recycled.insert(idx)
-                {
-                    // The h2 connection survives a stream reset (unlike a
-                    // connection-level death, which reqwest's own error already
-                    // evicted from the pool), so without this the retry below
-                    // would check out the SAME broken connection. Recycle once per
-                    // account per request, a second reset here finds `idx`
-                    // already in `reset_recycled` and goes straight to the retry,
-                    // which by then really is on the fresh connection.
-                    manager.recycle_client_after_reset(idx);
-                }
-                let transport_attempt = transport_retried.entry(idx).or_insert(0);
-                if !err.is_connect() && *transport_attempt < MAX_SAME_ACCOUNT_TRANSPORT_RETRIES {
-                    // A blip on this account this request: retry it on a fresh
-                    // connection rather than benching an account that is probably fine.
-                    // A connection-level death is already evicted from the pool by
-                    // the error itself; a stream reset was just recycled above ,
-                    // either way each retry genuinely gets a new connection, which
-                    // is why repeating is worth more than rotating (94.7% land a
-                    // 200).
-                    *transport_attempt += 1;
-                    // Message text unchanged — `scripts/` parses it. The attempt
-                    // fields are ADDED alongside, never a replacement, so an existing
-                    // grep keeps matching while a new one can see the ladder.
                     tracing::warn!(
                         account_index = idx,
                         account = account_name.as_deref().unwrap_or("?"),
                         is_connect = err.is_connect(),
                         is_timeout = err.is_timeout(),
-                        transport_retry = *transport_attempt,
-                        max_transport_retries = MAX_SAME_ACCOUNT_TRANSPORT_RETRIES,
                         error = ?err,
-                        "upstream transport failure — retrying the SAME account on a fresh connection"
+                        "upstream transport failure — rotating to another account"
                     );
-                    next_idx = Some(idx);
-                    continue;
+                    break 'attempt Step::Rotate;
                 }
-                tracing::warn!(
-                    account_index = idx,
-                    account = account_name.as_deref().unwrap_or("?"),
-                    is_connect = err.is_connect(),
-                    is_timeout = err.is_timeout(),
-                    error = ?err,
-                    "upstream transport failure — rotating to another account"
-                );
-                tried.insert(idx);
-                continue;
-            }
-        };
-        // This attempt reached an upstream and got an HTTP status back, whatever it
-        // was. That fact alone disproves "every account transport-failed".
-        upstream_responses += 1;
-
-        let status = resp.status();
-        // One greppable line per upstream response, tagged with the true serving
-        // account, the PATH and the outcome status. "serving request" logs BEFORE the
-        // outcome, so without this the logs are status-blind — the gap that hid the
-        // 401 storm. The path is here because without it a status is undiagnosable:
-        // the only other record of which path produced a 404 is the in-memory TUI
-        // ring (`push_log` below), which is lost on every restart.
-        //
-        // INFO only when the answer was not a success. A 2xx is the common case, and
-        // a served one is already on its `request usage` line with the same account,
-        // path and status; an INFO line for it too would be a second line per request
-        // in a log that runs to tens of megabytes a day. The statuses that diagnose
-        // something (a 401 storm, a 429, a 404 on an unknown path) stay at INFO.
-        if status.is_success() {
-            tracing::debug!(
-                account_index = idx,
-                account = account_name.as_deref().unwrap_or("?"),
-                path = %path_and_query,
-                status = status.as_u16(),
-                "upstream response"
-            );
-        } else {
-            tracing::info!(
-                account_index = idx,
-                account = account_name.as_deref().unwrap_or("?"),
-                path = %path_and_query,
-                status = status.as_u16(),
-                "upstream response"
-            );
-        }
-        let up_headers = resp.headers().clone();
-        let rejections = quota_rejections(&up_headers);
-        match provider {
-            Provider::Codex if status == StatusCode::TOO_MANY_REQUESTS => {}
-            Provider::Codex | Provider::Anthropic => {
-                manager.update_quota(idx, &up_headers, status.as_u16());
-            }
-        }
-        // Any non-429 is live proof a rate-limit hold no longer binds.
-        if status.as_u16() != 429 {
-            manager.clear_rate_limited(idx);
-        }
-
-        // 401 → force-refresh once, then retry the SAME account with the fresh
-        // token. Neither arm may set the terminal `Error` status — see below.
-        if status == StatusCode::UNAUTHORIZED {
-            // A 401 on an account with NO refresh token is not churn — there is no
-            // refresh that could have rotated the token out from under this
-            // request, and none that could ever revive it. The credential is dead
-            // and only a re-login cures it, so `Error` (terminal, skipped by
-            // selection) is the truthful state. Without this arm a `tcr login
-            // --token` account whose token was rejected sat Active forever: never
-            // probed (`probeable_indices` wants a refresh token), never refreshed
-            // (`refresh_plan` has nothing to send), and rotated away from on every
-            // request while `tcr status` reported it healthy.
-            if !manager.has_refresh_token(idx) {
-                tracing::error!(
-                    account = account_name.as_deref().unwrap_or("?"),
-                    account_index = idx,
-                    "upstream 401 on an account with no refresh token — credential rejected, re-login needed"
-                );
-                manager.mark_error(idx);
-                tried.insert(idx);
-                continue;
-            }
-            if forced_401.insert(idx) {
-                if manager.ensure_fresh_force(idx).await {
-                    next_idx = Some(idx);
-                    continue; // retry the same account with the fresh token
-                }
-                // The forced refresh produced no new token — it was coalesced /
-                // cooldown-suppressed by the refresh-storm throttle, or the upstream
-                // refresh failed. Retrying would just 401 again on the same dead
-                // token. Rotate away; the account stays Active and the cooldown
-                // self-clears for the next request.
-                tried.insert(idx);
-                continue;
-            }
-            // A SECOND 401: the retry with a freshly-minted token ALSO 401'd. That is
-            // almost always ROTATION CHURN — a concurrent request's force-refresh
-            // superseded the very token we retried with — and is NOT evidence the
-            // credential is dead. So it must never set `Error`.
-            //
-            // `Error` means "refresh token rejected, re-login needed" and is
-            // deliberately TERMINAL: the prober (`probeable_indices`), selection
-            // (`Manager::select`) and warming all skip errored rows by design, and the
-            // only thing that clears it is a successful refresh — which can never run
-            // on a row nobody probes or selects. So condemning a HEALTHY account here
-            // is permanent: left unchecked it walks every account to `error` one
-            // transient 401 at a time until the proxy goes dark holding a full set of
-            // perfectly good tokens (observed live 2026-07-17: 7/7 `error` while every
-            // token still probed 200).
-            //
-            // A genuinely dead credential is still caught at the source: its refresh
-            // 400s and the AuthRejected arm sets `Error` there. Here we just rotate —
-            // this request fails over and the account stays eligible for the next one.
-            tried.insert(idx);
-            continue;
-        }
-
-        // A JSON auth 403 → upstream refuses the credential WE injected. The client never saw
-        // it and can do nothing about it, so this must never reach them as-is:
-        // Claude Code reads a 403 as "your own session is dead" and drops the
-        // user's login over an account problem that is not theirs. Rotate away, as
-        // the 401 branch above does — this account may simply be disabled while its
-        // siblings are fine. Codex account access failures rotate without asking for a
-        // re-login. Challenges, region blocks and unknown errors pass through without
-        // holding healthy accounts: another credential cannot fix a shared IP block.
-        //
-        // Deliberately does NOT set the terminal `Error` account status, for the
-        // same reason the 401 branch above does not: `Error` is permanent, skipped
-        // by the prober and by selection, and the only thing that clears it is a
-        // successful refresh, which can never run on a row nobody selects again.
-        // A 403 here is evidence about THIS request's account access, not proof the
-        // refresh token itself is dead — that is still caught at the source, where
-        // a rejected refresh sets `Error` directly.
-        //
-        // It does arm a SHORT hold (`Manager::mark_refused`), which self-frees and
-        // keeps the status `Active`. Without one, rotation brought the account
-        // straight back and the next request paid the same refused round trip,
-        // while `tcr status` read the row as `gate: ok`; the hold's gate reads
-        // `refused` instead.
-        // Refusal diagnostics use response-header allowlists only, never a whole map or
-        // request credentials, cookies or body content.
-        let header_str = |name: &str| {
-            up_headers
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("<absent>")
-        };
-        if status == StatusCode::FORBIDDEN {
-            tracing::info!(
-                account = account_name.as_deref().unwrap_or("?"),
-                account_index = idx,
-                provider = provider.as_str(),
-                content_type = header_str("content-type"),
-                cf_mitigated = header_str("cf-mitigated"),
-                cf_ray = header_str("cf-ray"),
-                server = header_str("server"),
-                request_id = header_str("request-id"),
-                x_request_id = header_str("x-request-id"),
-                retry_after_raw = header_str("retry-after"),
-                "403 diagnostic"
-            );
-            // Upstream's own words for the refusal, read capped in size and time
-            // exactly as the 429 arm reads its body, so a body that never
-            // completes cannot become a hang. A Codex body can also be forwarded, so it gets
-            // the ordinary response cap rather than the smaller diagnostic-only cap.
-            let body_cap = match provider {
-                Provider::Anthropic => RATE_LIMIT_BODY_CAP,
-                Provider::Codex => MAX_BODY_BYTES,
             };
-            let body = match tokio::time::timeout(
-                Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
-                read_capped_body(resp.bytes_stream(), body_cap),
-            )
-            .await
-            {
-                Ok(Ok(body)) => {
-                    log_upstream_error_body(idx, account_name.as_deref(), status, &body);
-                    Some(body)
+            // This attempt reached an upstream and got an HTTP status back, whatever it
+            // was. That fact alone disproves "every account transport-failed".
+            ladder.upstream_answered();
+
+            let status = resp.status();
+            // One greppable line per upstream response, tagged with the true serving
+            // account, the PATH and the outcome status. "serving request" logs BEFORE the
+            // outcome, so without this the logs are status-blind — the gap that hid the
+            // 401 storm. The path is here because without it a status is undiagnosable:
+            // the only other record of which path produced a 404 is the in-memory TUI
+            // ring (`push_log` below), which is lost on every restart.
+            //
+            // INFO only when the answer was not a success. A 2xx is the common case, and
+            // a served one is already on its `request usage` line with the same account,
+            // path and status; an INFO line for it too would be a second line per request
+            // in a log that runs to tens of megabytes a day. The statuses that diagnose
+            // something (a 401 storm, a 429, a 404 on an unknown path) stay at INFO.
+            if status.is_success() {
+                tracing::debug!(
+                    account_index = idx,
+                    account = account_name.as_deref().unwrap_or("?"),
+                    path = %path_and_query,
+                    status = status.as_u16(),
+                    "upstream response"
+                );
+            } else {
+                tracing::info!(
+                    account_index = idx,
+                    account = account_name.as_deref().unwrap_or("?"),
+                    path = %path_and_query,
+                    status = status.as_u16(),
+                    "upstream response"
+                );
+            }
+            let up_headers = resp.headers().clone();
+            let rejections = quota_rejections(&up_headers);
+            match provider {
+                Provider::Codex if status == StatusCode::TOO_MANY_REQUESTS => {}
+                Provider::Codex | Provider::Anthropic => {
+                    manager.update_quota(idx, &up_headers, status.as_u16());
                 }
-                Ok(Err(_)) | Err(_) => {
-                    tracing::warn!(
+            }
+            // Any non-429 is live proof a rate-limit hold no longer binds.
+            if status.as_u16() != 429 {
+                manager.clear_rate_limited(idx);
+            }
+
+            // 401 → force-refresh once, then retry the SAME account with the fresh
+            // token. Neither arm may set the terminal `Error` status — see below.
+            if status == StatusCode::UNAUTHORIZED {
+                // A 401 on an account with NO refresh token is not churn — there is no
+                // refresh that could have rotated the token out from under this
+                // request, and none that could ever revive it. The credential is dead
+                // and only a re-login cures it, so `Error` (terminal, skipped by
+                // selection) is the truthful state. Without this arm a `tcr login
+                // --token` account whose token was rejected sat Active forever: never
+                // probed (`probeable_indices` wants a refresh token), never refreshed
+                // (`refresh_plan` has nothing to send), and rotated away from on every
+                // request while `tcr status` reported it healthy.
+                if !manager.has_refresh_token(idx) {
+                    tracing::error!(
                         account = account_name.as_deref().unwrap_or("?"),
                         account_index = idx,
-                        "upstream 403 body could not be read within the cap"
+                        "upstream 401 on an account with no refresh token — credential rejected, re-login needed"
                     );
-                    None
+                    manager.mark_error(idx);
+                    break 'attempt Step::Rotate;
                 }
-            };
-            match provider {
-                Provider::Codex => {
-                    if body.is_none() {
-                        let hold = NO_GUIDANCE_HOLD_SECS
-                            + i64::from(now.nanosecond()) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
-                        manager.mark_rate_limited(idx, hold);
-                        codex_access_read_failures += 1;
-                        tried.insert(idx);
-                        continue;
+                if ladder.first_forced_refresh(idx) {
+                    if manager.ensure_fresh_force(idx).await {
+                        break 'attempt Step::RetrySame; // the same account, with the fresh token
                     }
-                    let auth_error = body
-                        .as_deref()
-                        .is_some_and(|body| codex_forbidden_is_auth_error(&up_headers, body));
-                    if !auth_error {
-                        if body
-                            .as_deref()
-                            .is_some_and(|body| codex_forbidden_is_account_error(&up_headers, body))
-                        {
-                            manager.mark_refused(idx);
-                            account_access_blocks += 1;
-                            last_account_access_block = body.map(|body| (up_headers, body));
-                            tried.insert(idx);
-                            continue;
-                        }
-                        tracing::warn!(
-                            account_index = idx,
-                            "upstream Codex request blocked without an account failure; forwarding unchanged"
-                        );
-                        return match body {
-                            Some(body) => build_response(
-                                status,
-                                &up_headers,
-                                Body::from(body),
-                                ServedBy::PooledAccount,
-                            ),
-                            None => error_response(
-                                StatusCode::BAD_GATEWAY,
-                                "proxy_error",
-                                "Failed to read the upstream access-denied response.",
-                                None,
-                            ),
-                        };
-                    }
+                    // The forced refresh produced no new token — it was coalesced /
+                    // cooldown-suppressed by the refresh-storm throttle, or the upstream
+                    // refresh failed. Retrying would just 401 again on the same dead
+                    // token. Rotate away; the account stays Active and the cooldown
+                    // self-clears for the next request.
+                    break 'attempt Step::Rotate;
                 }
-                Provider::Anthropic => {}
+                // A SECOND 401: the retry with a freshly-minted token ALSO 401'd. That is
+                // almost always ROTATION CHURN — a concurrent request's force-refresh
+                // superseded the very token we retried with — and is NOT evidence the
+                // credential is dead. So it must never set `Error`.
+                //
+                // `Error` means "refresh token rejected, re-login needed" and is
+                // deliberately TERMINAL: the prober (`probeable_indices`), selection
+                // (`Manager::select`) and warming all skip errored rows by design, and the
+                // only thing that clears it is a successful refresh — which can never run
+                // on a row nobody probes or selects. So condemning a HEALTHY account here
+                // is permanent: left unchecked it walks every account to `error` one
+                // transient 401 at a time until the proxy goes dark holding a full set of
+                // perfectly good tokens (observed live 2026-07-17: 7/7 `error` while every
+                // token still probed 200).
+                //
+                // A genuinely dead credential is still caught at the source: its refresh
+                // 400s and the AuthRejected arm sets `Error` there. Here we just rotate —
+                // this request fails over and the account stays eligible for the next one.
+                break 'attempt Step::Rotate;
             }
-            tracing::warn!(
-                account = account_name.as_deref().unwrap_or("?"),
-                account_index = idx,
-                "upstream 403 Forbidden — credential refused, rotating to another account"
-            );
-            manager.mark_refused(idx);
-            refused_403.push((idx, account_name.clone()));
-            tried.insert(idx);
-            continue;
-        }
 
-        // 429 → durable quota rejection rotates; a transient limit waits/rotates.
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            tracing::info!(
-                account = account_name.as_deref().unwrap_or("?"),
-                account_index = idx,
-                retry_after_raw = header_str("retry-after"),
-                retry_after_parsed = format!("{:?}", parse_retry_after(&up_headers)),
-                unified_status = header_str("anthropic-ratelimit-unified-status"),
-                // The MODEL-SCOPED twin of `unified_status`. Logged to make one
-                // specific class observable: a Fable-weekly-only rejection, which
-                // upstream also reports in the aggregate `unified_status`. Reading
-                // the aggregate alone benched the whole account and re-keyed the
-                // session (issue #178); `quota_rejections` now separates the two,
-                // and this line is how a live response is checked against it —
-                // diagnostic only, no routing reads it.
-                unified_7d_oi_status = header_str("anthropic-ratelimit-unified-7d_oi-status"),
-                unified_5h_reset = header_str("anthropic-ratelimit-unified-5h-reset"),
-                unified_7d_reset = header_str("anthropic-ratelimit-unified-7d-reset"),
-                quota_rejected = !rejections.is_empty(),
-                provider = provider.as_str(),
-                codex_primary_used_percent = header_str("x-codex-primary-used-percent"),
-                codex_primary_window_minutes = header_str("x-codex-primary-window-minutes"),
-                codex_primary_reset_at = header_str("x-codex-primary-reset-at"),
-                codex_secondary_used_percent = header_str("x-codex-secondary-used-percent"),
-                codex_secondary_window_minutes = header_str("x-codex-secondary-window-minutes"),
-                codex_secondary_reset_at = header_str("x-codex-secondary-reset-at"),
-                codex_rate_limit_reached_type = header_str("x-codex-rate-limit-reached-type"),
-                codex_credits_has_credits = header_str("x-codex-credits-has-credits"),
-                codex_credits_unlimited = header_str("x-codex-credits-unlimited"),
-                codex_credits_balance = header_str("x-codex-credits-balance"),
-                content_type = header_str("content-type"),
-                cf_mitigated = header_str("cf-mitigated"),
-                cf_ray = header_str("cf-ray"),
-                server = header_str("server"),
-                request_id = header_str("request-id"),
-                x_request_id = header_str("x-request-id"),
-                // WHO asked, so a 429 that follows one client around can be told
-                // from one that follows an account. Measured 2026-09-24: 143 of 145
-                // requests to `/v1/messages` WITHOUT `?beta=true` got a 429 with no
-                // quota headers, on accounts at 0% used, while 10,575 of 10,575 on
-                // `?beta=true` got a 200, and nothing in the log named the client.
-                user_agent = req_headers
-                    .get(USER_AGENT)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("<absent>"),
-                model = request_model.as_deref().unwrap_or("?"),
-                "429 diagnostic"
-            );
-            let retry_after_raw = parse_retry_after(&up_headers);
-            // A 429 about the REQUEST, not the account: no quota guidance at all, on
-            // a request that did not come through Claude Code's own client. Parking
-            // the account for it is wrong and rotating is wasted, so it is forwarded
-            // as-is and every account stays in rotation. See
-            // [`is_request_scoped_429`] for the measurements that draw this line.
-            // Those measurements are Anthropic's (`?beta=true`, `unified-status`), and no
-            // Codex request or 429 carries either, so a Codex 429 never takes this branch:
-            // it would forward every one with no account held. Codex's arm is below.
-            match provider {
-                crate::provider::Provider::Anthropic
-                    if is_request_scoped_429(
-                        &path_and_query,
-                        &up_headers,
-                        !rejections.is_empty(),
-                    ) =>
+            // A JSON auth 403 → upstream refuses the credential WE injected. The client never saw
+            // it and can do nothing about it, so this must never reach them as-is:
+            // Claude Code reads a 403 as "your own session is dead" and drops the
+            // user's login over an account problem that is not theirs. Rotate away, as
+            // the 401 branch above does — this account may simply be disabled while its
+            // siblings are fine. Codex account access failures rotate without asking for a
+            // re-login. Challenges, region blocks and unknown errors pass through without
+            // holding healthy accounts: another credential cannot fix a shared IP block.
+            //
+            // Deliberately does NOT set the terminal `Error` account status, for the
+            // same reason the 401 branch above does not: `Error` is permanent, skipped
+            // by the prober and by selection, and the only thing that clears it is a
+            // successful refresh, which can never run on a row nobody selects again.
+            // A 403 here is evidence about THIS request's account access, not proof the
+            // refresh token itself is dead — that is still caught at the source, where
+            // a rejected refresh sets `Error` directly.
+            //
+            // It does arm a SHORT hold (`Manager::mark_refused`), which self-frees and
+            // keeps the status `Active`. Without one, rotation brought the account
+            // straight back and the next request paid the same refused round trip,
+            // while `tcr status` read the row as `gate: ok`; the hold's gate reads
+            // `refused` instead.
+            // Refusal diagnostics use response-header allowlists only, never a whole map or
+            // request credentials, cookies or body content.
+            let header_str = |name: &str| {
+                up_headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("<absent>")
+            };
+            if status == StatusCode::FORBIDDEN {
+                tracing::info!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    provider = provider.as_str(),
+                    content_type = header_str("content-type"),
+                    cf_mitigated = header_str("cf-mitigated"),
+                    cf_ray = header_str("cf-ray"),
+                    server = header_str("server"),
+                    request_id = header_str("request-id"),
+                    x_request_id = header_str("x-request-id"),
+                    retry_after_raw = header_str("retry-after"),
+                    "403 diagnostic"
+                );
+                // Upstream's own words for the refusal, read capped in size and time
+                // exactly as the 429 arm reads its body, so a body that never
+                // completes cannot become a hang. A Codex body can also be forwarded, so it gets
+                // the ordinary response cap rather than the smaller diagnostic-only cap.
+                let body_cap = match provider {
+                    Provider::Anthropic => RATE_LIMIT_BODY_CAP,
+                    Provider::Codex => MAX_BODY_BYTES,
+                };
+                let body = match tokio::time::timeout(
+                    Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
+                    read_capped_body(resp.bytes_stream(), body_cap),
+                )
+                .await
                 {
-                    tracing::warn!(
-                        account = account_name.as_deref().unwrap_or("?"),
-                        account_index = idx,
-                        path = %path_and_query,
-                        "upstream 429 with no quota guidance on a request without ?beta=true: \
-                         refused for the request, not the account, so it is forwarded and no \
-                         account is parked"
-                    );
-                    // Falls through to the terminal outcome below, which counts the
-                    // request, logs the body (`log_upstream_error_body`) and forwards it
-                    // verbatim, the same path a 400 or a spent 529 takes.
-                }
-                crate::provider::Provider::Anthropic | crate::provider::Provider::Codex => {
-                    // Read the bounded body before deciding whether Codex refused quota. Some
-                    // quota errors carry no reached-type header at all.
-                    let refusal_body = match tokio::time::timeout(
-                        Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
-                        read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
-                    )
-                    .await
-                    {
-                        Ok(Ok(body)) => {
-                            log_upstream_error_body(idx, account_name.as_deref(), status, &body);
-                            body
+                    Ok(Ok(body)) => {
+                        log_upstream_error_body(idx, account_name.as_deref(), status, &body);
+                        Some(body)
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::warn!(
+                            account = account_name.as_deref().unwrap_or("?"),
+                            account_index = idx,
+                            "upstream 403 body could not be read within the cap"
+                        );
+                        None
+                    }
+                };
+                match provider {
+                    Provider::Codex => {
+                        if body.is_none() {
+                            let hold = NO_GUIDANCE_HOLD_SECS
+                                + i64::from(now.nanosecond()) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
+                            manager.mark_rate_limited(idx, hold);
+                            ladder.codex_access_unread();
+                            break 'attempt Step::Rotate;
                         }
-                        Ok(Err(_)) | Err(_) => {
+                        let auth_error = body
+                            .as_deref()
+                            .is_some_and(|body| codex_forbidden_is_auth_error(&up_headers, body));
+                        if !auth_error {
+                            if body.as_deref().is_some_and(|body| {
+                                codex_forbidden_is_account_error(&up_headers, body)
+                            }) {
+                                manager.mark_refused(idx);
+                                ladder.account_access_blocked(body.map(|body| (up_headers, body)));
+                                break 'attempt Step::Rotate;
+                            }
                             tracing::warn!(
                                 account_index = idx,
-                                "upstream 429 body could not be read within the cap"
+                                "upstream Codex request blocked without an account failure; forwarding unchanged"
                             );
-                            Bytes::new()
-                        }
-                    };
-                    let retry_after = retry_after_raw.unwrap_or(60);
-                    // Codex quota bodies name the reset in Unix seconds; prefer it to header
-                    // windows, then retry-after, then the short default. Plain rate limits keep
-                    // their retry-after even when a response also carries window readings.
-                    match provider {
-                        crate::provider::Provider::Codex => {
-                            let clock = OffsetDateTime::now_utc();
-                            let refusal = crate::quota::CodexQuotaRefusal::parse(
-                                &up_headers,
-                                &refusal_body,
-                                clock,
-                            );
-                            manager.update_quota_with_codex_refusal(
-                                idx,
-                                &up_headers,
-                                429,
-                                refusal.as_ref(),
-                            );
-                            let quota_refusal = refusal.is_some();
-                            let hold = refusal.as_ref().and_then(|refusal| refusal.reset).map_or(
-                                retry_after,
-                                |reset| {
-                                    reset
-                                        .unix_timestamp()
-                                        .saturating_sub(clock.unix_timestamp())
-                                },
-                            );
-                            if quota_refusal {
-                                manager.mark_codex_quota_limited(idx, hold);
-                            } else {
-                                let count = retried_429.entry(idx).or_insert(0);
-                                let jitter = i64::from(clock.nanosecond())
-                                    % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
-                                match classify_transient_429(retry_after_raw, *count, jitter) {
-                                    Transient429::InlineWait(wait) => {
-                                        *count += 1;
-                                        tokio::time::sleep(Duration::from_secs(wait as u64)).await;
-                                        next_idx = Some(idx);
-                                        continue;
-                                    }
-                                    Transient429::Park(wait) => {
-                                        manager.mark_rate_limited(idx, wait);
-                                        parked_transient.insert(idx);
-                                    }
-                                }
-                            }
-                            tracing::info!(
-                                account_index = idx,
-                                quota_refusal,
-                                "Codex 429: holding the account and rotating"
-                            );
-                            tried.insert(idx);
-                            continue;
-                        }
-                        crate::provider::Provider::Anthropic => {}
-                    }
-                    if !rejections.is_empty() {
-                        // A model-scoped rejection is recorded in the window the selector
-                        // already gates that model class on, NOT as an account-wide hold:
-                        // the account still serves every other model class, and the window
-                        // self-frees at its own reset (issue #178). A rejection any shared
-                        // scope reports is account-wide and still arms the hold — clamped
-                        // to `MAX_RATE_LIMIT_HOLD_SECONDS` by `mark_rate_limited`, whose
-                        // doc-comment explains why durable exhaustion must be carried by
-                        // the learned quota rather than by an unbounded hold.
-                        if rejections.contains(&UnifiedRejectionKind::FableWeekly) {
-                            manager.mark_model_weekly_rejected(idx, &up_headers);
-                        }
-                        if rejections
-                            .iter()
-                            .any(|kind| !matches!(kind, UnifiedRejectionKind::FableWeekly))
-                        {
-                            manager.mark_rate_limited(
-                                idx,
-                                jittered_quota_hold(retry_after, now.nanosecond()),
-                            );
-                        }
-                        tried.insert(idx);
-                        continue;
-                    }
-                    let count = retried_429.entry(idx).or_insert(0);
-                    // Desync the no-guidance un-park across accounts that tripped together;
-                    // derive the jitter from the loop clock so no `rand` dependency is needed.
-                    let jitter = (now.nanosecond() as i64) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
-                    match classify_transient_429(retry_after_raw, *count, jitter) {
-                        Transient429::InlineWait(wait) => {
-                            *count += 1;
-                            tokio::time::sleep(Duration::from_secs(wait as u64)).await;
-                            next_idx = Some(idx);
-                            continue; // retry the same account after the bounded wait
-                        }
-                        Transient429::Park(wait) => {
-                            manager.mark_rate_limited(idx, wait);
-                            tried.insert(idx);
-                            // Record WHY this entry is in `tried`: a timer that expires on
-                            // its own, so the soft-wait above may take it back. The Codex
-                            // arm above records its non-quota hold the same way; every other
-                            // `tried.insert` in this loop deliberately omits this.
-                            parked_transient.insert(idx);
-                            continue;
+                            break 'attempt Step::Answer(match body {
+                                Some(body) => build_response(
+                                    status,
+                                    &up_headers,
+                                    Body::from(body),
+                                    ServedBy::PooledAccount,
+                                ),
+                                None => ClientError::new(
+                                    StatusCode::BAD_GATEWAY,
+                                    ErrorKind::Proxy,
+                                    "Failed to read the upstream access-denied response.",
+                                )
+                                .respond(provider),
+                            });
                         }
                     }
+                    Provider::Anthropic => {}
                 }
-            }
-        }
-
-        // 529 Overloaded → this SEND was refused, and the ladder below spends two
-        // budgets before the client ever sees it. Measured live 2026-07-26: 256 of
-        // the last 4,963 upstream responses were 529 (5.2%), every one of them
-        // surfaced in Claude Code as a failed request the user re-sent by hand.
-        //
-        // FIRST the SAME account, after a short escalating backoff: its prompt cache
-        // is warm and a brief overload usually clears within a second or two.
-        //
-        // THEN — and this is what the arm originally refused to do — a bounded
-        // FAILOVER to a different account. The original premise was that a 529 means
-        // the SERVER is saturated, so a sibling would be equally overloaded and the
-        // rotation would buy a cold prompt cache for nothing. The live log falsifies
-        // it: the overload is ACCOUNT-scoped and time-varying (one account answered
-        // 136 529s over 8 minutes while its siblings served 200s; a session diverted
-        // off it got a 200 from a sibling 2s later). See
-        // [`MAX_529_FAILOVERS_PER_REQUEST`].
-        //
-        // The failover mechanism is exactly one line — `tried.insert(idx)` — because
-        // `select` already has the branch for it: a PINNED session whose pin is in
-        // `tried` takes the documented "pin-tried" path, which diverts THIS REQUEST
-        // and KEEPS THE PIN (`src/manager/select.rs`). So the session comes home to
-        // its warm account on its next request; nothing re-keys, and `tried` is
-        // per-request so the 529'd account is fully eligible again immediately.
-        // `mark_rate_limited` is still NEVER called here — an overloaded account is
-        // not over quota, and arming a hold would bench it for OTHER requests.
-        //
-        // The failover is gated on `select` actually offering another account, and
-        // that gate is load-bearing rather than defensive: benching the account
-        // FIRST and discovering the fleet is empty AFTERWARDS would drop this
-        // request into the exhausted path and answer a synthesized 429 — replacing
-        // the upstream's own 529 with a status that means something else entirely.
-        // With no account to move to, the arm degrades exactly into its pre-failover
-        // self. (Under a hard account lock `select` returns `None` for a tried
-        // account by construction, so the lock's "no failover to the pool" contract
-        // holds here for free.)
-        //
-        // Latency: the in-flight guard taken at the top of this iteration is HELD
-        // across every backoff, so a retrying request keeps its per-account
-        // concurrency slot. Per account that is MAX_SAME_ACCOUNT_529_RETRIES waits
-        // each clamped to RETRY_529_MAX_BACKOFF_SECS (3s on the no-`retry-after`
-        // ladder the live captures actually carry, 8s if the upstream asks for
-        // more); per REQUEST it is that times `1 + MAX_529_FAILOVERS_PER_REQUEST`,
-        // i.e. 9s and 24s. Both are asserted, not assumed —
-        // `overloaded_529_failover_worst_case_latency_is_bounded`.
-        //
-        // On BOTH budgets being spent this does NOT return. Control falls through to
-        // the terminal-outcome arm below, so the client sees the 529 forwarded
-        // verbatim — byte-identical to the behaviour before this arm existed.
-        if status.as_u16() == STATUS_OVERLOADED {
-            let retried = retried_529.entry(idx).or_insert(0);
-            if *retried < MAX_SAME_ACCOUNT_529_RETRIES {
-                let backoff = backoff_529_secs(*retried, parse_retry_after(&up_headers));
-                *retried += 1;
                 tracing::warn!(
                     account = account_name.as_deref().unwrap_or("?"),
                     account_index = idx,
-                    retry = *retried,
-                    max_retries = MAX_SAME_ACCOUNT_529_RETRIES,
-                    backoff_secs = backoff,
-                    "upstream 529 Overloaded — backing off and retrying the SAME account"
+                    "upstream 403 Forbidden — credential refused, rotating to another account"
                 );
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                next_idx = Some(idx);
-                continue; // retry the same account after the bounded backoff
+                manager.mark_refused(idx);
+                ladder.refused_403(idx, account_name.clone());
+                break 'attempt Step::Rotate;
             }
-            // This account's in-place budget is spent. Fail the request over while
-            // the per-request failover budget lasts AND another account is free.
-            let attempts = *retried + 1;
-            if failovers_529 < MAX_529_FAILOVERS_PER_REQUEST {
-                // Ask for the replacement BEFORE benching this account, and pass the
-                // `tried` set the next iteration WOULD have passed. A fresh clock,
-                // not the loop's `now`: the backoffs above have made that value up to
-                // several seconds stale, and an account whose hold expired during
-                // them is a legitimate target.
-                let mut with_this_one = tried.clone();
-                with_this_one.insert(idx);
-                let failover_now = OffsetDateTime::now_utc();
-                if let Some(other) = manager.select_with_group(
-                    &with_this_one,
-                    failover_now,
-                    request_model.as_deref(),
-                    session_key,
-                    &path,
-                    conn_key,
-                    request_group.as_deref(),
-                ) {
-                    debug_assert_ne!(
-                        other, idx,
-                        "select must honour `tried`, or the failover re-sends to the overloaded account"
-                    );
-                    tried.insert(idx);
-                    failovers_529 += 1;
+
+            // 429 → durable quota rejection rotates; a transient limit waits/rotates.
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                tracing::info!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    retry_after_raw = header_str("retry-after"),
+                    retry_after_parsed = format!("{:?}", parse_retry_after(&up_headers)),
+                    unified_status = header_str("anthropic-ratelimit-unified-status"),
+                    // The MODEL-SCOPED twin of `unified_status`. Logged to make one
+                    // specific class observable: a Fable-weekly-only rejection, which
+                    // upstream also reports in the aggregate `unified_status`. Reading
+                    // the aggregate alone benched the whole account and re-keyed the
+                    // session (issue #178); `quota_rejections` now separates the two,
+                    // and this line is how a live response is checked against it —
+                    // diagnostic only, no routing reads it.
+                    unified_7d_oi_status = header_str("anthropic-ratelimit-unified-7d_oi-status"),
+                    unified_5h_reset = header_str("anthropic-ratelimit-unified-5h-reset"),
+                    unified_7d_reset = header_str("anthropic-ratelimit-unified-7d-reset"),
+                    quota_rejected = !rejections.is_empty(),
+                    provider = provider.as_str(),
+                    codex_primary_used_percent = header_str("x-codex-primary-used-percent"),
+                    codex_primary_window_minutes = header_str("x-codex-primary-window-minutes"),
+                    codex_primary_reset_at = header_str("x-codex-primary-reset-at"),
+                    codex_secondary_used_percent = header_str("x-codex-secondary-used-percent"),
+                    codex_secondary_window_minutes = header_str("x-codex-secondary-window-minutes"),
+                    codex_secondary_reset_at = header_str("x-codex-secondary-reset-at"),
+                    codex_rate_limit_reached_type = header_str("x-codex-rate-limit-reached-type"),
+                    codex_credits_has_credits = header_str("x-codex-credits-has-credits"),
+                    codex_credits_unlimited = header_str("x-codex-credits-unlimited"),
+                    codex_credits_balance = header_str("x-codex-credits-balance"),
+                    content_type = header_str("content-type"),
+                    cf_mitigated = header_str("cf-mitigated"),
+                    cf_ray = header_str("cf-ray"),
+                    server = header_str("server"),
+                    request_id = header_str("request-id"),
+                    x_request_id = header_str("x-request-id"),
+                    // WHO asked, so a 429 that follows one client around can be told
+                    // from one that follows an account. Measured 2026-09-24: 143 of 145
+                    // requests to `/v1/messages` WITHOUT `?beta=true` got a 429 with no
+                    // quota headers, on accounts at 0% used, while 10,575 of 10,575 on
+                    // `?beta=true` got a 200, and nothing in the log named the client.
+                    user_agent = req_headers
+                        .get(USER_AGENT)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("<absent>"),
+                    model = request_model.as_deref().unwrap_or("?"),
+                    "429 diagnostic"
+                );
+                let retry_after_raw = parse_retry_after(&up_headers);
+                // A 429 about the REQUEST, not the account: no quota guidance at all, on
+                // a request that did not come through Claude Code's own client. Parking
+                // the account for it is wrong and rotating is wasted, so it is forwarded
+                // as-is and every account stays in rotation. See
+                // [`is_request_scoped_429`] for the measurements that draw this line.
+                // Those measurements are Anthropic's (`?beta=true`, `unified-status`), and no
+                // Codex request or 429 carries either, so a Codex 429 never takes this branch:
+                // it would forward every one with no account held. Codex's arm is below.
+                match provider {
+                    crate::provider::Provider::Anthropic
+                        if is_request_scoped_429(
+                            &path_and_query,
+                            &up_headers,
+                            !rejections.is_empty(),
+                        ) =>
+                    {
+                        tracing::warn!(
+                            account = account_name.as_deref().unwrap_or("?"),
+                            account_index = idx,
+                            path = %path_and_query,
+                            "upstream 429 with no quota guidance on a request without ?beta=true: \
+                             refused for the request, not the account, so it is forwarded and no \
+                             account is parked"
+                        );
+                        // Falls through to the terminal outcome below, which counts the
+                        // request, logs the body (`log_upstream_error_body`) and forwards it
+                        // verbatim, the same path a 400 or a spent 529 takes.
+                    }
+                    crate::provider::Provider::Anthropic | crate::provider::Provider::Codex => {
+                        // Read the bounded body before deciding whether Codex refused quota. Some
+                        // quota errors carry no reached-type header at all.
+                        let refusal_body = match tokio::time::timeout(
+                            Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
+                            read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
+                        )
+                        .await
+                        {
+                            Ok(Ok(body)) => {
+                                log_upstream_error_body(
+                                    idx,
+                                    account_name.as_deref(),
+                                    status,
+                                    &body,
+                                );
+                                body
+                            }
+                            Ok(Err(_)) | Err(_) => {
+                                tracing::warn!(
+                                    account_index = idx,
+                                    "upstream 429 body could not be read within the cap"
+                                );
+                                Bytes::new()
+                            }
+                        };
+                        let retry_after = retry_after_raw.unwrap_or(60);
+                        // Codex quota bodies name the reset in Unix seconds; prefer it to header
+                        // windows, then retry-after, then the short default. Plain rate limits keep
+                        // their retry-after even when a response also carries window readings.
+                        match provider {
+                            crate::provider::Provider::Codex => {
+                                let clock = OffsetDateTime::now_utc();
+                                let refusal = crate::quota::CodexQuotaRefusal::parse(
+                                    &up_headers,
+                                    &refusal_body,
+                                    clock,
+                                );
+                                manager.update_quota_with_codex_refusal(
+                                    idx,
+                                    &up_headers,
+                                    429,
+                                    refusal.as_ref(),
+                                );
+                                let quota_refusal = refusal.is_some();
+                                let hold = refusal
+                                    .as_ref()
+                                    .and_then(|refusal| refusal.reset)
+                                    .map_or(retry_after, |reset| {
+                                        reset
+                                            .unix_timestamp()
+                                            .saturating_sub(clock.unix_timestamp())
+                                    });
+                                // A quota refusal is held and benched; a plain rate limit parks
+                                // on its timer, exactly as the Anthropic arm below parks one.
+                                let step = if quota_refusal {
+                                    manager.mark_codex_quota_limited(idx, hold);
+                                    Step::Rotate
+                                } else {
+                                    let count = ladder.retries_429(idx);
+                                    let jitter = i64::from(clock.nanosecond())
+                                        % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
+                                    match classify_transient_429(retry_after_raw, count, jitter) {
+                                        Transient429::InlineWait(wait) => {
+                                            ladder.spend_429_retry(idx);
+                                            tokio::time::sleep(Duration::from_secs(wait as u64))
+                                                .await;
+                                            break 'attempt Step::RetrySame;
+                                        }
+                                        Transient429::Park(wait) => {
+                                            manager.mark_rate_limited(idx, wait);
+                                            Step::Park
+                                        }
+                                    }
+                                };
+                                tracing::info!(
+                                    account_index = idx,
+                                    quota_refusal,
+                                    "Codex 429: holding the account and rotating"
+                                );
+                                break 'attempt step;
+                            }
+                            crate::provider::Provider::Anthropic => {}
+                        }
+                        if !rejections.is_empty() {
+                            // A model-scoped rejection is recorded in the window the selector
+                            // already gates that model class on, NOT as an account-wide hold:
+                            // the account still serves every other model class, and the window
+                            // self-frees at its own reset (issue #178). A rejection any shared
+                            // scope reports is account-wide and still arms the hold — clamped
+                            // to `MAX_RATE_LIMIT_HOLD_SECONDS` by `mark_rate_limited`, whose
+                            // doc-comment explains why durable exhaustion must be carried by
+                            // the learned quota rather than by an unbounded hold.
+                            if rejections.contains(&UnifiedRejectionKind::FableWeekly) {
+                                manager.mark_model_weekly_rejected(idx, &up_headers);
+                            }
+                            if rejections
+                                .iter()
+                                .any(|kind| !matches!(kind, UnifiedRejectionKind::FableWeekly))
+                            {
+                                manager.mark_rate_limited(
+                                    idx,
+                                    jittered_quota_hold(retry_after, now.nanosecond()),
+                                );
+                            }
+                            break 'attempt Step::Rotate;
+                        }
+                        let count = ladder.retries_429(idx);
+                        // Desync the no-guidance un-park across accounts that tripped together;
+                        // derive the jitter from the loop clock so no `rand` dependency is needed.
+                        let jitter = (now.nanosecond() as i64) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
+                        match classify_transient_429(retry_after_raw, count, jitter) {
+                            Transient429::InlineWait(wait) => {
+                                ladder.spend_429_retry(idx);
+                                tokio::time::sleep(Duration::from_secs(wait as u64)).await;
+                                break 'attempt Step::RetrySame; // after the bounded wait
+                            }
+                            Transient429::Park(wait) => {
+                                manager.mark_rate_limited(idx, wait);
+                                // Benched AND re-admittable: a timer that expires on its own, so
+                                // the soft-wait above may take it back. The Codex arm above parks
+                                // its non-quota hold the same way; every other bench in this loop
+                                // is `Step::Rotate`, which is not re-admitted.
+                                break 'attempt Step::Park;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 529 Overloaded → this SEND was refused, and the ladder below spends two
+            // budgets before the client ever sees it. Measured live 2026-07-26: 256 of
+            // the last 4,963 upstream responses were 529 (5.2%), every one of them
+            // surfaced in Claude Code as a failed request the user re-sent by hand.
+            //
+            // FIRST the SAME account, after a short escalating backoff: its prompt cache
+            // is warm and a brief overload usually clears within a second or two.
+            //
+            // THEN — and this is what the arm originally refused to do — a bounded
+            // FAILOVER to a different account. The original premise was that a 529 means
+            // the SERVER is saturated, so a sibling would be equally overloaded and the
+            // rotation would buy a cold prompt cache for nothing. The live log falsifies
+            // it: the overload is ACCOUNT-scoped and time-varying (one account answered
+            // 136 529s over 8 minutes while its siblings served 200s; a session diverted
+            // off it got a 200 from a sibling 2s later). See
+            // [`MAX_529_FAILOVERS_PER_REQUEST`].
+            //
+            // The failover mechanism is benching `idx` in `tried` (`Ladder::fail_over_529`), because
+            // `select` already has the branch for it: a PINNED session whose pin is in
+            // `tried` takes the documented "pin-tried" path, which diverts THIS REQUEST
+            // and KEEPS THE PIN (`src/manager/select.rs`). So the session comes home to
+            // its warm account on its next request; nothing re-keys, and `tried` is
+            // per-request so the 529'd account is fully eligible again immediately.
+            // `mark_rate_limited` is still NEVER called here — an overloaded account is
+            // not over quota, and arming a hold would bench it for OTHER requests.
+            //
+            // The failover is gated on `select` actually offering another account, and
+            // that gate is load-bearing rather than defensive: benching the account
+            // FIRST and discovering the fleet is empty AFTERWARDS would drop this
+            // request into the exhausted path and answer a synthesized 429 — replacing
+            // the upstream's own 529 with a status that means something else entirely.
+            // With no account to move to, the arm degrades exactly into its pre-failover
+            // self. (Under a hard account lock `select` returns `None` for a tried
+            // account by construction, so the lock's "no failover to the pool" contract
+            // holds here for free.)
+            //
+            // Latency: the in-flight guard taken at the top of this iteration is HELD
+            // across every backoff, so a retrying request keeps its per-account
+            // concurrency slot. Per account that is MAX_SAME_ACCOUNT_529_RETRIES waits
+            // each clamped to RETRY_529_MAX_BACKOFF_SECS (3s on the no-`retry-after`
+            // ladder the live captures actually carry, 8s if the upstream asks for
+            // more); per REQUEST it is that times `1 + MAX_529_FAILOVERS_PER_REQUEST`,
+            // i.e. 9s and 24s. Both are asserted, not assumed —
+            // `overloaded_529_failover_worst_case_latency_is_bounded`.
+            //
+            // On BOTH budgets being spent this does NOT return. Control falls through to
+            // the terminal-outcome arm below, so the client sees the 529 forwarded
+            // verbatim — byte-identical to the behaviour before this arm existed.
+            if status.as_u16() == STATUS_OVERLOADED {
+                let retried = ladder.retries_529(idx);
+                if retried < MAX_SAME_ACCOUNT_529_RETRIES {
+                    let backoff = backoff_529_secs(retried, parse_retry_after(&up_headers));
+                    let retry = ladder.spend_529_retry(idx);
                     tracing::warn!(
                         account = account_name.as_deref().unwrap_or("?"),
                         account_index = idx,
-                        attempts,
-                        failover = failovers_529,
-                        max_failovers = MAX_529_FAILOVERS_PER_REQUEST,
-                        next_account = manager.account_name(other).as_deref().unwrap_or("?"),
-                        next_account_index = other,
-                        "upstream 529 Overloaded — in-place budget spent, failing this request over to another account"
+                        retry,
+                        max_retries = MAX_SAME_ACCOUNT_529_RETRIES,
+                        backoff_secs = backoff,
+                        "upstream 529 Overloaded — backing off and retrying the SAME account"
                     );
-                    // The probe above IS this failover's selection; consume it rather
-                    // than re-selecting (see `next_idx`).
-                    next_idx = Some(other);
-                    continue;
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    break 'attempt Step::RetrySame; // after the bounded backoff
                 }
+                // This account's in-place budget is spent. Fail the request over while
+                // the per-request failover budget lasts AND another account is free.
+                let attempts = retried + 1;
+                if ladder.failovers_529() < MAX_529_FAILOVERS_PER_REQUEST {
+                    // Ask for the replacement BEFORE benching this account, and pass the
+                    // `tried` set the next iteration WOULD have passed. A fresh clock,
+                    // not the loop's `now`: the backoffs above have made that value up to
+                    // several seconds stale, and an account whose hold expired during
+                    // them is a legitimate target.
+                    let mut with_this_one = ladder.tried().clone();
+                    with_this_one.insert(idx);
+                    let failover_now = OffsetDateTime::now_utc();
+                    if let Some(other) = manager.select_with_group(
+                        &with_this_one,
+                        failover_now,
+                        request_model.as_deref(),
+                        session_key,
+                        &path,
+                        conn_key,
+                        request_group.as_deref(),
+                    ) {
+                        debug_assert_ne!(
+                            other, idx,
+                            "select must honour `tried`, or the failover re-sends to the overloaded account"
+                        );
+                        // The probe above IS this failover's selection; `Step::FailOver`
+                        // consumes it rather than re-selecting (see `Ladder`'s `next_idx`).
+                        tracing::warn!(
+                            account = account_name.as_deref().unwrap_or("?"),
+                            account_index = idx,
+                            attempts,
+                            // The failover this step spends, counted before
+                            // `Ladder::fail_over_529` applies it.
+                            failover = ladder.failovers_529() + 1,
+                            max_failovers = MAX_529_FAILOVERS_PER_REQUEST,
+                            next_account = manager.account_name(other).as_deref().unwrap_or("?"),
+                            next_account_index = other,
+                            "upstream 529 Overloaded — in-place budget spent, failing this request over to another account"
+                        );
+                        break 'attempt Step::FailOver(other);
+                    }
+                }
+                tracing::warn!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    attempts,
+                    // Distinguishes the two give-up shapes in the log: 0 means nothing
+                    // else was eligible to fail over to, `MAX_529_FAILOVERS_PER_REQUEST`
+                    // means the fleet was walked and every account was overloaded too.
+                    failovers = ladder.failovers_529(),
+                    "upstream 529 Overloaded — retry and failover budgets spent, forwarding 529 to the client"
+                );
             }
-            tracing::warn!(
-                account = account_name.as_deref().unwrap_or("?"),
-                account_index = idx,
-                attempts,
-                // Distinguishes the two give-up shapes in the log: 0 means nothing
-                // else was eligible to fail over to, `MAX_529_FAILOVERS_PER_REQUEST`
-                // means the fleet was walked and every account was overloaded too.
-                failovers = failovers_529,
-                "upstream 529 Overloaded — retry and failover budgets spent, forwarding 529 to the client"
-            );
-        }
+
+            Step::Forward {
+                resp,
+                status,
+                up_headers,
+            }
+        };
+        // The one place the ladder moves for an attempt.
+        let (resp, status, up_headers) = match step {
+            Step::RetrySame => {
+                ladder.retry_same(idx);
+                continue;
+            }
+            Step::Rotate => {
+                ladder.bench(idx);
+                continue;
+            }
+            Step::Park => {
+                ladder.park(idx);
+                continue;
+            }
+            Step::FailOver(other) => {
+                ladder.fail_over_529(idx, other);
+                continue;
+            }
+            Step::Answer(response) => return response,
+            Step::Forward {
+                resp,
+                status,
+                up_headers,
+            } => (resp, status, up_headers),
+        };
 
         // Terminal outcome (2xx, or a 3xx/4xx/5xx forwarded verbatim). Count the
         // request once against the true serving account and log it.
-        let served_at = OffsetDateTime::now_utc();
-        manager.record_served(idx, served_at, session_key, session_kind);
+        // F1: the wire-session table (`tcr status --json`'s `sessions` array) gets this
+        // request's session id, model and tool events. Cloned, not moved: the usage-recording
+        // arms below (streamed and non-streamed) still need `account_name`/`request_model`.
+        record_served_request(
+            &manager,
+            ServedRequest {
+                idx,
+                served_at: OffsetDateTime::now_utc(),
+                session_key,
+                session_kind,
+                wire_session_id: wire_session_id.as_deref(),
+                account: account_name.clone(),
+                method: method.to_string(),
+                path_and_query: path_and_query.clone(),
+                status: status.as_u16(),
+                // The provider this request was routed on, decided once from its path.
+                wire: match provider {
+                    crate::provider::Provider::Codex => WireFold::Codex { path: &path },
+                    crate::provider::Provider::Anthropic => WireFold::Anthropic {
+                        model: request_model.clone(),
+                        tool_uses: &wire_tool_uses,
+                        tool_results: &wire_tool_results,
+                    },
+                },
+            },
+        );
         // A history bound elsewhere and answered here has moved here: re-bind its tokens, or the
         // next full-history request is held back to the old account's cold cache once it
         // recovers (`Manager::rebind_served_history`).
@@ -5546,43 +5264,6 @@ async fn handle_request(
                 crate::now_ms(),
             );
         }
-        // F1: fold this request's session id, model and tool events into the wire-session
-        // table (`tcr status --json`'s `sessions` array) — a no-op when `wire_session_id` is
-        // `None`. Cloned, not moved: the usage-recording arms below (streamed and
-        // non-streamed) still need `account_name`/`request_model`/`wire_session_id`.
-        // Codex request bodies carry no tool events here. Only a Responses turn closes
-        // calls started by the previous response; auxiliary model calls leave them running.
-        match provider {
-            crate::provider::Provider::Codex => {
-                manager.record_codex_wire_request(
-                    wire_session_id.as_deref(),
-                    account_name.clone(),
-                    &path,
-                    served_at,
-                );
-            }
-            crate::provider::Provider::Anthropic => {
-                manager.record_wire_session(
-                    wire_session_id.as_deref(),
-                    account_name.clone(),
-                    request_model.clone(),
-                    served_at,
-                    &wire_tool_uses,
-                    &wire_tool_results,
-                );
-            }
-        }
-        manager.push_log(RequestLogEntry {
-            time: served_at,
-            method: method.to_string(),
-            path: path_and_query.clone(),
-            status: status.as_u16(),
-            // Cloned, not moved: the streaming arm below still needs
-            // `account_name` to log a mid-stream transport failure by name.
-            account: account_name.clone().unwrap_or_default(),
-            // The provider this request was routed on, decided once from its path.
-            provider,
-        });
 
         let is_stream = up_headers
             .get(CONTENT_TYPE)
@@ -5622,23 +5303,20 @@ async fn handle_request(
             let evidence_dropped_reader = Arc::clone(&evidence_dropped);
             let manager_side = manager.clone();
             let status_is_success = status.is_success();
-            // Cloned, not moved: `account_name` (the original) is still moved
-            // into `TeeState` further below, in this same iteration — see the
-            // comment there. This clone is ONLY for the per-request usage log
-            // line inside the spawned parser task.
-            let account_name_for_log = account_name.clone();
-            // Cloned for the same reason and in the same place as
-            // `account_name_for_log` above: the model this request targeted is
-            // parsed once per request (`request_model`) and the spawned parser
-            // task below outlives this iteration. A `String` clone per streamed
-            // request, so the ledger can attribute tokens to a model at all.
-            let request_model_for_usage = request_model.clone();
-            // Same reasoning, for F1's wire-session token counts: the spawned parser task
-            // outlives this iteration, so it needs its own clone of the session id.
-            let wire_session_id_for_usage = wire_session_id.clone();
-            // The answer, a `bool`: the spawned task never holds the body.
-            let extended_ttl_for_usage = extended_ttl;
-            let stream_path = path.clone();
+            // Cloned, not moved: the spawned parser task below outlives this iteration, and
+            // `account_name` (the original) is still moved into `TeeState` further below, in
+            // this same iteration (see the comment there). `extended_ttl` is the answer, a
+            // `bool`: the spawned task never holds the body.
+            let turn = ServedTurn {
+                provider,
+                idx,
+                account_name: account_name.clone(),
+                path: path.clone(),
+                session_key,
+                wire_session_id: wire_session_id.clone(),
+                request_model: request_model.clone(),
+                extended_ttl,
+            };
             // The request's clock moves into the passthrough body (`StreamTiming`),
             // which finishes it when the body ends and sends the fields here, to
             // the task that owns the `request usage` line.
@@ -5666,7 +5344,7 @@ async fn handle_request(
                     bound_tokens,
                     codex_tool_calls,
                     codex_stream_limit,
-                } = parse_sse_usage(byte_stream, provider, &stream_path).await;
+                } = parse_sse_usage(byte_stream, provider, &turn.path).await;
                 // A 200 can carry a quota refusal in its SSE body. The client has
                 // already received that stream, so never replay it here; bench the
                 // serving account before its next pinned turn is selected.
@@ -5694,7 +5372,7 @@ async fn handle_request(
                 // no usage still has tools running.
                 let stream_ended = OffsetDateTime::now_utc();
                 manager_side.record_wire_session_tool_uses(
-                    wire_session_id_for_usage.as_deref(),
+                    turn.wire_session_id.as_deref(),
                     stream_ended,
                     &response_tool_uses,
                 );
@@ -5702,7 +5380,7 @@ async fn handle_request(
                 // running from the same instant with their own timeouts. Empty on an
                 // Anthropic stream.
                 manager_side.record_codex_wire_session_calls(
-                    wire_session_id_for_usage.as_deref(),
+                    turn.wire_session_id.as_deref(),
                     stream_ended,
                     &codex_tool_calls,
                 );
@@ -5723,80 +5401,13 @@ async fn handle_request(
                     }
                 };
                 if parsed.input_total > 0 || parsed.output > 0 {
-                    // The REQUEST's model whenever its body named one. `response_model` is set
-                    // only on a Codex stream, so an Anthropic record is exactly what it was; a
-                    // Codex body is usually zstd and then does not parse, so its turn is filed
-                    // under the model its own terminal event named instead of under "unknown".
-                    let record = usage_record(
+                    turn.finish(
+                        &manager_side,
+                        status,
                         &parsed,
-                        request_model_for_usage.or(response_model),
-                        session_key,
-                        || extended_ttl_for_usage,
+                        response_model,
+                        timing.as_ref(),
                     );
-                    // One line per terminal request, never per SSE event — a
-                    // per-event log here would be the same flood vector the
-                    // stream-error path above is careful to avoid on a long
-                    // erroring stream. It carries the request's timing too,
-                    // rather than a second INFO line per request.
-                    let t = timing.as_ref();
-                    // `account_index`, `path` and `status` are the fields the DEBUG
-                    // `serving request` and `upstream response` lines carry, so this one
-                    // line is a served request's whole INFO record.
-                    tracing::info!(
-                        account = account_name_for_log.as_deref().unwrap_or("?"),
-                        account_index = idx,
-                        path = %stream_path,
-                        status = status.as_u16(),
-                        session = ?session_key,
-                        model = record.model.as_deref().unwrap_or("?"),
-                        cache_read_tokens = parsed.cache_read,
-                        cache_creation_tokens = parsed.cache_creation,
-                        cache_creation_1h_tokens = record.cache_1h,
-                        input_tokens = parsed.input_total,
-                        output_tokens = parsed.output,
-                        wait_ms = t.and_then(|t| t.wait_ms),
-                        throttle_ms = t.map(|t| t.throttle_ms),
-                        upstream_ms = t.and_then(|t| t.upstream_ms),
-                        first_byte_ms = t.and_then(|t| t.first_byte_ms),
-                        total_ms = t.map(|t| t.total_ms),
-                        attempts = t.map(|t| t.attempts),
-                        switched = t.map(|t| t.switched),
-                        completed = t.map(|t| t.completed),
-                        "request usage"
-                    );
-                    if let Some(t) = t {
-                        t.log_if_held();
-                    }
-                    // A Codex session also keeps the turn's reasoning tokens, and its model is
-                    // the one the ledger files the turn under: the stream's, in practice, since
-                    // a Codex body is usually zstd and names none tcr can read.
-                    match provider {
-                        crate::provider::Provider::Codex => {
-                            manager_side.record_codex_wire_session_usage(
-                                wire_session_id_for_usage.as_deref(),
-                                record.model.as_deref(),
-                                record.input,
-                                record.cache_5m,
-                                record.cache_1h,
-                                record.cache_read,
-                                record.output,
-                                parsed.reasoning,
-                                record.ts_ms,
-                            );
-                        }
-                        crate::provider::Provider::Anthropic => {
-                            manager_side.record_wire_session_usage(
-                                wire_session_id_for_usage.as_deref(),
-                                record.model.as_deref(),
-                                record.input,
-                                record.cache_5m,
-                                record.cache_1h,
-                                record.cache_read,
-                                record.output,
-                            );
-                        }
-                    }
-                    manager_side.record_usage(idx, record);
                 } else if let Some(t) = &timing {
                     // No usage, so no `request usage` line to ride on.
                     t.log_alone();
@@ -5978,20 +5589,20 @@ async fn handle_request(
         let bytes = match read_capped_body(resp.bytes_stream(), MAX_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(BodyReadError::Transport) => {
-                return error_response(
+                return ClientError::new(
                     StatusCode::BAD_GATEWAY,
-                    "proxy_error",
+                    ErrorKind::Proxy,
                     "Failed to read upstream response body.",
-                    None,
-                );
+                )
+                .respond(provider);
             }
             Err(BodyReadError::TooLarge) => {
-                return error_response(
+                return ClientError::new(
                     StatusCode::BAD_GATEWAY,
-                    "proxy_error",
+                    ErrorKind::Proxy,
                     "Upstream response body exceeded the size cap.",
-                    None,
-                );
+                )
+                .respond(provider);
             }
         };
         let buffered_at = Instant::now();
@@ -6001,8 +5612,8 @@ async fn handle_request(
                     && let Some(detail) = codex_model_refusal_detail(&bytes)
                 {
                     log_upstream_error_body(idx, account_name.as_deref(), status, &bytes);
-                    model_refusals.push((account_name.clone(), detail));
-                    tried.insert(idx);
+                    ladder.model_refused(account_name.clone(), detail);
+                    ladder.bench(idx);
                     continue;
                 }
             }
@@ -6026,71 +5637,23 @@ async fn handle_request(
             let parsed = response.usage;
             let response_model = response.model;
             if parsed.input_total > 0 || parsed.output > 0 {
-                // As on the streaming arm: the REQUEST's model whenever its body named one,
-                // else, for a Codex body only, the model its Responses object names.
-                let record = usage_record(
-                    &parsed,
-                    request_model.clone().or(response_model),
-                    session_key,
-                    || extended_ttl,
-                );
-                // One line per terminal (non-streamed) request — see the
-                // matching log line on the streaming arm above. It carries the
-                // timing, so `handle` must not log it a second time: disarmed.
+                // The `request usage` line carries the timing, so `handle` must not log it a
+                // second time: disarmed. No Codex tool calls are read here: codex streams its
+                // turns, so a non-streamed Responses object comes only from a client that is
+                // not codex.
                 let t = timing.finish(status.as_u16(), Instant::now(), true);
                 timing.armed = false;
-                tracing::info!(
-                    account = account_name.as_deref().unwrap_or("?"),
-                    account_index = idx,
-                    path = %path,
-                    status = status.as_u16(),
-                    session = ?session_key,
-                    model = record.model.as_deref().unwrap_or("?"),
-                    cache_read_tokens = parsed.cache_read,
-                    cache_creation_tokens = parsed.cache_creation,
-                    cache_creation_1h_tokens = record.cache_1h,
-                    input_tokens = parsed.input_total,
-                    output_tokens = parsed.output,
-                    wait_ms = t.wait_ms,
-                    throttle_ms = t.throttle_ms,
-                    upstream_ms = t.upstream_ms,
-                    first_byte_ms = t.first_byte_ms,
-                    total_ms = t.total_ms,
-                    attempts = t.attempts,
-                    switched = t.switched,
-                    completed = t.completed,
-                    "request usage"
-                );
-                t.log_if_held();
-                // No Codex tool calls are read here: codex streams its turns, so a
-                // non-streamed Responses object comes only from a client that is not codex.
-                match provider {
-                    crate::provider::Provider::Codex => {
-                        manager.record_codex_wire_session_usage(
-                            wire_session_id.as_deref(),
-                            record.model.as_deref(),
-                            record.input,
-                            record.cache_5m,
-                            record.cache_1h,
-                            record.cache_read,
-                            record.output,
-                            parsed.reasoning,
-                            record.ts_ms,
-                        );
-                    }
-                    crate::provider::Provider::Anthropic => {
-                        manager.record_wire_session_usage(
-                            wire_session_id.as_deref(),
-                            record.model.as_deref(),
-                            record.input,
-                            record.cache_5m,
-                            record.cache_1h,
-                            record.cache_read,
-                            record.output,
-                        );
-                    }
+                ServedTurn {
+                    provider,
+                    idx,
+                    account_name: account_name.clone(),
+                    path: path.clone(),
+                    session_key,
+                    wire_session_id: wire_session_id.clone(),
+                    request_model: request_model.clone(),
+                    extended_ttl,
                 }
-                manager.record_usage(idx, record);
+                .finish(&manager, status, &parsed, response_model, Some(&t));
             }
         } else {
             // The "upstream response" line above (:2587) has never carried a
@@ -6110,36 +5673,35 @@ async fn handle_request(
         );
     }
 
-    if !model_refusals.is_empty() {
-        return codex_model_unavailable_response(
-            &manager,
-            request_model.as_deref(),
-            &model_refusals,
-            &refused_403,
-        );
+    // Ran out of attempts while still rotating: the same verdict the select-found-nothing
+    // arm reads off the tallies, and otherwise an upstream did answer us and the honest
+    // verdict is exhausted quota.
+    let now = OffsetDateTime::now_utc();
+    // The MIRROR of the refusal arm above, and the same fix: a strict ask is
+    // `reserved || !spill`, so this terminal's own scoping has to ask the same
+    // question the picker did.
+    let strict_group = request_group
+        .as_deref()
+        .filter(|g| manager.is_group_strict(g));
+    if let Some(answer) = ladder.verdict(
+        &manager,
+        provider,
+        request_model.as_deref(),
+        now,
+        bound_to,
+        strict_group,
+    ) {
+        return answer;
     }
-
-    // Ran out of attempts while still rotating — a bad gateway only if transport
-    // failure was the WHOLE story (same rule as the mid-loop check above);
-    // otherwise an upstream did answer us and the honest verdict is exhausted quota.
-    if every_attempt_transport_failed(transport_failures, upstream_responses) {
-        bad_gateway(transport_failures, unknown_outcome_transport_failure)
-    } else {
-        exhausted_response(
-            &manager,
-            OffsetDateTime::now_utc(),
-            provider_account_count,
-            request_is_fable,
-            provider,
-            // The MIRROR of the refusal arm above, and the same fix: a
-            // strict ask is `reserved || !spill`, so this terminal's own
-            // scoping has to ask the same question the picker did.
-            request_group
-                .as_deref()
-                .filter(|g| manager.is_group_strict(g)),
-            bound_to,
-        )
-    }
+    exhausted_response(
+        &manager,
+        now,
+        provider_account_count,
+        request_is_fable,
+        provider,
+        strict_group,
+        bound_to,
+    )
 }
 
 /// Length-independent comparison of the presented key against the configured
@@ -6290,12 +5852,12 @@ pub(crate) fn wants_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Built QUIETLY ([`quiet_error_response`]): every Codex session opens with an upgrade, so a
 /// warn here would be one false alarm per session. `handle` logs it at debug.
 pub(crate) fn upgrade_required_response() -> Response {
-    quiet_error_response(
+    ClientError::new(
         StatusCode::UPGRADE_REQUIRED,
-        "upgrade_required",
+        ErrorKind::UpgradeRequired,
         "tcr relays Codex over HTTP streaming only; the client falls back to SSE for this session.",
-        None,
     )
+    .respond_quiet(Provider::Codex)
 }
 
 /// Does this Codex request name a workspace routing of its own
@@ -6661,26 +6223,39 @@ fn build_raw_relay_headers(req_headers: &HeaderMap) -> HeaderMap {
 /// `None` only if the TLS backend fails to initialise, which the caller answers with
 /// a 502 — a proxy never panics on a client request. The next relay tries the build
 /// again.
+///
+/// In a test build only, a test whose upstream is a stub gets a fresh client with the same
+/// settings that sends over the stubs' Unix socket (`test_support::stub_upstream`, § The Unix
+/// socket); every other caller gets the shared one.
 fn relay_client() -> Option<Arc<reqwest::Client>> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(socket) = crate::test_support::stub_upstream::client_socket() {
+        return build_relay_client(relay_client_builder().unix_socket(socket)).map(Arc::new);
+    }
     RELAY_CLIENT.get()
+}
+
+/// [`RELAY_CLIENT`]'s settings, before `build`.
+fn relay_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+fn build_relay_client(builder: reqwest::ClientBuilder) -> Option<reqwest::Client> {
+    match builder.build() {
+        Ok(client) => Some(client),
+        Err(err) => {
+            tracing::error!(error = %err, "could not build the relay HTTP client");
+            None
+        }
+    }
 }
 
 static RELAY_CLIENT: std::sync::LazyLock<crate::wake::SleepAwareClient<reqwest::Client>> =
     std::sync::LazyLock::new(|| {
-        crate::wake::SleepAwareClient::new("relay", || {
-            match reqwest::Client::builder()
-                .no_proxy()
-                .connect_timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-            {
-                Ok(client) => Some(client),
-                Err(err) => {
-                    tracing::error!(error = %err, "could not build the relay HTTP client");
-                    None
-                }
-            }
-        })
+        crate::wake::SleepAwareClient::new("relay", || build_relay_client(relay_client_builder()))
     });
 
 /// Forward a request upstream WITHOUT touching account rotation — see the `1c`
@@ -6752,20 +6327,20 @@ async fn relay_request(
     timing: &mut Option<RelayTiming>,
 ) -> Response {
     let Some(client) = relay_client() else {
-        return error_response(
+        return ClientError::new(
             StatusCode::BAD_GATEWAY,
-            "proxy_error",
+            ErrorKind::Proxy,
             "Could not build the relay HTTP client.",
-            None,
-        );
+        )
+        .respond(provider);
     };
     let Ok(body_bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error_response(
+        return ClientError::new(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Failed to read request body.",
-            None,
-        );
+        )
+        .respond(provider);
     };
 
     let headers = match mode {
@@ -6813,17 +6388,17 @@ async fn relay_request(
             // 502 with no `x-should-retry`: telling a client to retry it is a
             // decision about relayed paths this arm does not make.
             if is_offline_error(&err) {
-                return offline_unavailable(1);
+                return offline_unavailable(provider, 1);
             }
             if err.is_connect() {
-                return bad_gateway(1, false);
+                return bad_gateway(provider, 1, false);
             }
-            return error_response(
+            return ClientError::new(
                 StatusCode::BAD_GATEWAY,
-                "proxy_error",
+                ErrorKind::Proxy,
                 "Upstream unreachable.",
-                None,
-            );
+            )
+            .respond(provider);
         }
     };
 
@@ -6890,18 +6465,18 @@ async fn relay_request(
         }
         RelayMode::Raw => match read_capped_body(resp.bytes_stream(), MAX_BODY_BYTES).await {
             Ok(bytes) => build_response(status, &up_headers, Body::from(bytes), ServedBy::Caller),
-            Err(BodyReadError::Transport) => error_response(
+            Err(BodyReadError::Transport) => ClientError::new(
                 StatusCode::BAD_GATEWAY,
-                "proxy_error",
+                ErrorKind::Proxy,
                 "Failed to read upstream response body.",
-                None,
-            ),
-            Err(BodyReadError::TooLarge) => error_response(
+            )
+            .respond(provider),
+            Err(BodyReadError::TooLarge) => ClientError::new(
                 StatusCode::BAD_GATEWAY,
-                "proxy_error",
+                ErrorKind::Proxy,
                 "Upstream response body exceeded the size cap.",
-                None,
-            ),
+            )
+            .respond(provider),
         },
     }
 }
@@ -8068,12 +7643,7 @@ fn error_response(
     message: &str,
     retry_after: Option<i64>,
 ) -> Response {
-    tracing::warn!(
-        status = status.as_u16(),
-        error.r#type = err_type,
-        error.message = message,
-        "proxy-generated error response"
-    );
+    client_error::warn_refusal(status, err_type, message);
     quiet_error_response(status, err_type, message, retry_after)
 }
 
@@ -8371,12 +7941,10 @@ fn exhausted_response(
         bound_to = bound_name.as_deref().unwrap_or("-"),
         "returning exhausted 429 to client"
     );
-    let mut response = error_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        "rate_limit_error",
-        &detail,
-        Some(advertised_retry_after),
-    );
+    let mut response =
+        ClientError::new(StatusCode::TOO_MANY_REQUESTS, ErrorKind::RateLimit, detail)
+            .retry_after(advertised_retry_after)
+            .respond(provider);
     // Held history never carries a claim. The held account's window is not this user's limit:
     // an account that is really out releases the conversation to the fleet
     // (`Manager::bound_account_holds`), so a 429 that reaches here for held history is a wait
@@ -8511,6 +8079,7 @@ const SWITCH_WARNING_RETRY_AFTER_SECS: i64 = 3;
 /// Names no account, because the body can travel to a borrowing peer.
 fn switch_warning(
     manager: &Manager,
+    provider: Provider,
     session_key: Option<u64>,
     bound_idx: usize,
     now: OffsetDateTime,
@@ -8548,15 +8117,18 @@ fn switch_warning(
         retry_after = SWITCH_WARNING_RETRY_AFTER_SECS,
         "held conversation's account is out; warning the client once before moving it"
     );
-    Some(error_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        "rate_limit_error",
-        &format!(
-            "tcr: the account holding this conversation is out ({why}{until}); the retry moves \
-             it to another account, where its prompt cache starts cold."
-        ),
-        Some(SWITCH_WARNING_RETRY_AFTER_SECS),
-    ))
+    Some(
+        ClientError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorKind::RateLimit,
+            format!(
+                "tcr: the account holding this conversation is out ({why}{until}); the retry moves \
+                 it to another account, where its prompt cache starts cold."
+            ),
+        )
+        .retry_after(SWITCH_WARNING_RETRY_AFTER_SECS)
+        .respond(provider),
+    )
 }
 
 /// What a gate means, in words a person reads after an account count or after "out".
@@ -8664,7 +8236,7 @@ fn every_attempt_transport_failed(transport_failures: usize, upstream_responses:
 /// both are "a network hiccup, not a durable fault, come back in a few
 /// seconds", and that number is already the one a live measurement
 /// (2026-08-10, see its doc-comment) established for exactly that recommendation.
-fn bad_gateway(transport_failures: usize, unknown_outcome: bool) -> Response {
+fn bad_gateway(provider: Provider, transport_failures: usize, unknown_outcome: bool) -> Response {
     if unknown_outcome {
         tracing::warn!(
             transport_failures,
@@ -8672,20 +8244,17 @@ fn bad_gateway(transport_failures: usize, unknown_outcome: bool) -> Response {
              got past the connect phase, so its outcome upstream is unknown; telling the \
              client not to retry automatically"
         );
-        let mut response = error_response(
+        ClientError::new(
             StatusCode::BAD_GATEWAY,
-            "proxy_error",
-            &format!(
+            ErrorKind::Proxy,
+            format!(
                 "Upstream unreachable: all {transport_failures} attempt(s) failed in transport, \
                  and at least one may have reached the upstream before failing. Its outcome is \
                  unknown — do not retry this request automatically."
             ),
-            None,
-        );
-        response
-            .headers_mut()
-            .insert("x-should-retry", HeaderValue::from_static("false"));
-        response
+        )
+        .should_retry(false)
+        .respond(provider)
     } else {
         tracing::warn!(
             transport_failures,
@@ -8693,19 +8262,17 @@ fn bad_gateway(transport_failures: usize, unknown_outcome: bool) -> Response {
             "returning 503 to client — every attempt failed at the connect phase; nothing \
              reached an upstream, so retrying is safe"
         );
-        let mut response = error_response(
+        ClientError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "proxy_error",
-            &format!(
+            ErrorKind::Proxy,
+            format!(
                 "Upstream unreachable: all {transport_failures} attempt(s) failed before a \
                  connection was made. Safe to retry in {OFFLINE_RETRY_AFTER_SECS}s."
             ),
-            Some(OFFLINE_RETRY_AFTER_SECS),
-        );
-        response
-            .headers_mut()
-            .insert("x-should-retry", HeaderValue::from_static("true"));
-        response
+        )
+        .retry_after(OFFLINE_RETRY_AFTER_SECS)
+        .should_retry(true)
+        .respond(provider)
     }
 }
 
@@ -8717,22 +8284,23 @@ fn bad_gateway(transport_failures: usize, unknown_outcome: bool) -> Response {
 /// upstream when the fault is local, and it carries no `retry-after`, so a client
 /// has no guidance beyond "give up". The account pool is NOT rotated on this path
 /// and the session keeps its pin.
-fn offline_unavailable(dns_failures: usize) -> Response {
+fn offline_unavailable(provider: Provider, dns_failures: usize) -> Response {
     tracing::warn!(
         dns_failures,
         retry_after = OFFLINE_RETRY_AFTER_SECS,
         "returning 503 to client — name resolution is failing, this machine is offline; \
          the account pool was NOT rotated"
     );
-    error_response(
+    ClientError::new(
         StatusCode::SERVICE_UNAVAILABLE,
-        "proxy_error",
-        &format!(
+        ErrorKind::Proxy,
+        format!(
             "Name resolution failed on {dns_failures} attempt(s) — this machine appears to be \
              offline. No account was rotated. Retry in {OFFLINE_RETRY_AFTER_SECS}s."
         ),
-        Some(OFFLINE_RETRY_AFTER_SECS),
     )
+    .retry_after(OFFLINE_RETRY_AFTER_SECS)
+    .respond(provider)
 }
 
 /// The answer when every upstream answer this request got was a 403 refusing OUR pooled
@@ -8784,16 +8352,16 @@ fn credential_refused_response(
         "returning 502 to client — every account tried was refused with a 403; \
          re-login is likely required"
     );
-    error_response(
+    ClientError::new(
         StatusCode::BAD_GATEWAY,
-        "proxy_error",
-        &format!(
+        ErrorKind::Proxy,
+        format!(
             "Account credential(s) refused by upstream: {}. Re-login to the account \
              (`tcr login` or the TcrBar UI) — retrying will not help.",
             account_list.join(", ")
         ),
-        None,
     )
+    .respond(provider)
 }
 
 /// While every eligible account remains refused, preserve the access-denied status.
@@ -8845,6 +8413,47 @@ mod tests {
     use super::*;
     use crate::config::{Account, Config, ProxyConfig};
     use crate::log_err::LogErr;
+    use crate::test_support::stub_upstream::{self as stub, StubAddr};
+
+    /// A request to the proxy as reqwest puts it on the wire: a loopback `host`, `accept: */*`,
+    /// and a `content-length` when there is a body. For a test that wants the proxy's answer
+    /// and not its listener, so it is driven in-process by [`send_to_proxy`]: no port, no
+    /// connection. A test whose subject IS the socket (hyper's request-line parser, the
+    /// production `mitm::serve` stack) keeps a real listener and says so.
+    fn client_request(method: Method, path: &str, body: impl Into<Bytes>) -> Request {
+        let body: Bytes = body.into();
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(HOST, "127.0.0.1")
+            .header(ACCEPT, "*/*");
+        if !body.is_empty() {
+            builder = builder.header(axum::http::header::CONTENT_LENGTH, body.len());
+        }
+        builder.body(Body::from(body)).expect("build request")
+    }
+
+    /// [`client_request`] carrying a JSON body, as reqwest's `.json(..)` sends it.
+    fn client_json(path: &str, value: &serde_json::Value) -> Request {
+        let mut req = client_request(Method::POST, path, value.to_string());
+        req.headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        req
+    }
+
+    /// Answer `req` with `router` in-process.
+    async fn send_to_proxy(router: Router, req: Request) -> Response {
+        use tower::ServiceExt as _;
+        router.oneshot(req).await.expect("router response")
+    }
+
+    /// The whole body of `response`, as text.
+    async fn body_text(response: Response) -> String {
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 
     /// **This Mac's own routing marker never leaves it.**
     ///
@@ -9054,26 +8663,14 @@ mod tests {
     #[test]
     fn add_account_request_carries_the_plan_fields() {
         let mut account = Account {
-            name: "alice@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-a".to_string(),
             refresh_token: None,
             expires_at: None,
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
             organization_type: Some("claude_team".to_string()),
             rate_limit_tier: Some("default_raven".to_string()),
             seat_tier: Some("team_standard".to_string()),
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("alice@example.com")
         };
         let body = serde_json::to_string(&account).expect("serialize the account login sends");
         let parsed: AddAccountRequest =
@@ -9103,26 +8700,14 @@ mod tests {
     #[test]
     fn add_account_request_carries_the_provider() {
         let mut account = Account {
-            name: "alice@example.com/codex".to_string(),
-            account_type: crate::config::AccountType::OAuth,
             provider: crate::provider::Provider::Codex,
             account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
-            org_uuid: None,
-            org_name: None,
             access_token: "at-codex".to_string(),
             refresh_token: Some("rt-codex".to_string()),
             expires_at: None,
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
             organization_type: Some("pro".to_string()),
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("alice@example.com/codex")
         };
         let body = serde_json::to_string(&account).expect("serialize the account an import sends");
         let parsed: AddAccountRequest =
@@ -9139,10 +8724,6 @@ mod tests {
 
     fn dummy_config(api_key: Option<&str>, upstream: &str) -> Config {
         Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
             proxy: ProxyConfig {
                 port: 0,
                 api_key: api_key.map(str::to_string),
@@ -9151,45 +8732,7 @@ mod tests {
             },
             upstream: upstream.to_string(),
             codex_upstream: "http://127.0.0.1:0".to_string(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: crate::config::PacingConfig::default(),
-            account_throttle: crate::config::ThrottleConfig::default(),
-            fleet_throttle: crate::config::ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts: vec![Account {
-                name: "dummy".to_string(),
-                account_type: crate::config::AccountType::OAuth,
-                provider: Default::default(),
-                account_uuid: None,
-                org_uuid: None,
-                org_name: None,
-                access_token: "at-dummy".to_string(),
-                refresh_token: Some("rt-dummy".to_string()),
-                // Not expired, so booting the proxy triggers no token refresh.
-                expires_at: Some(crate::now_ms() + 3_600_000),
-                priority: Some(0),
-                switch_threshold: None,
-                disabled: None,
-                groups: None,
-                organization_type: None,
-                rate_limit_tier: None,
-                seat_tier: None,
-                egress: crate::config::Egress::Local,
-                egress_strict: false,
-                codex_home: None,
-                extra: serde_json::Map::new(),
-            }],
-            group_settings: std::collections::HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
+            ..Config::fixture(vec![Account::fixture("dummy")])
         }
     }
 
@@ -9909,7 +9452,6 @@ mod tests {
     /// attached is what actually pins the wiring, not just the function.
     #[tokio::test]
     async fn real_request_through_app_pins_on_prefix_for_loopback_v1_messages() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tower::ServiceExt as _;
 
         struct NoRefresh;
@@ -9923,28 +9465,9 @@ mod tests {
             }
         }
 
-        // Fake upstream: one connection, one 200 with a minimal usage body.
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            if let Ok((mut sock, _)) = upstream.accept().await {
-                let mut buf = [0u8; 4096];
-                sock.read(&mut buf)
-                    .await
-                    .log_debug("reading a test request");
-                let body = br#"{"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}"#;
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
-                );
-                sock.write_all(head.as_bytes())
-                    .await
-                    .log_debug("writing a test response");
-                sock.write_all(body)
-                    .await
-                    .log_debug("writing a test response");
-            }
-        });
+        // Fake upstream: one 200 with a minimal usage body (the test sends one request).
+        let body = r#"{"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}"#;
+        let up_addr = stub::canned(stub::reply("200 OK", "application/json", body));
 
         let config = dummy_config(None, &format!("http://{up_addr}"));
         let manager = Manager::new(
@@ -10846,11 +10369,7 @@ mod tests {
     async fn a_codex_request_tcr_answers_itself_closes_no_call() {
         let anthropic_echo = CapturingUpstream::spawn().await;
         let auth_body = r#"{"error":{"type":"authentication_error","code":"invalid_api_key"}}"#;
-        let auth_response = format!(
-            "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            auth_body.len(),
-            auth_body
-        );
+        let auth_response = stub::reply("403 Forbidden", "application/json", auth_body);
         let (codex_origin, attempts) = spawn_counted_upstream(vec![Some(auth_response)]).await;
         let manager = Manager::with_live_refresher(
             codex_fleet(&anthropic_echo.url, &format!("http://{codex_origin}")),
@@ -11632,8 +11151,8 @@ mod tests {
         );
     }
 
-    /// Boot smoke test on a FREE port (never 3456): driven through `axum::serve`
-    /// directly, so no `ClientAddr` extension is injected and the client is
+    /// Boot smoke test, driven at `app()` in-process (as plain `axum::serve` would
+    /// serve it), so no `ClientAddr` extension is injected and the client is
     /// treated as remote (fail-closed) — a keyless request is 401, a keyed one
     /// proceeds upstream. The loopback exemption (the production path via
     /// `mitm::serve`) is covered separately by `loopback_client_is_exempt`.
@@ -11648,29 +11167,19 @@ mod tests {
             dummy_config(Some("test-key"), "http://127.0.0.1:1"),
             None,
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app(manager))
-                .await
-                .log_debug("serving a test server");
-        });
-
-        let client = reqwest::Client::new();
-
-        let no_key = client.get(format!("http://{addr}/")).send().await.unwrap();
+        let router = app(manager);
+        let no_key = send_to_proxy(router.clone(), client_request(Method::GET, "/", "")).await;
         assert_eq!(
             no_key.status().as_u16(),
             401,
             "keyless request must be rejected"
         );
 
-        let with_key = client
-            .get(format!("http://{addr}/"))
-            .header("x-api-key", "test-key")
-            .send()
-            .await
-            .unwrap();
+        let mut keyed = client_request(Method::GET, "/", "");
+        keyed
+            .headers_mut()
+            .insert("x-api-key", HeaderValue::from_static("test-key"));
+        let with_key = send_to_proxy(router, keyed).await;
         assert_eq!(
             with_key.status().as_u16(),
             503,
@@ -11695,7 +11204,7 @@ mod tests {
         // The hybrid server injects ClientAddr; base-URL (non-CONNECT) needs no TLS.
         tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = crate::test_support::loopback::client();
         // NO x-api-key — but the client is loopback, so it must be exempt.
         let resp = client.get(format!("http://{addr}/")).send().await.unwrap();
         assert_ne!(
@@ -12300,28 +11809,15 @@ mod tests {
     ///
     /// Obviously-fake identities only: this repository is public.
     fn two_account_config(api_key: Option<&str>) -> Config {
+        // The fixture's expiry is an hour out, so booting triggers no token refresh.
         let account = |name: &str, org: &str, uuid: &str, priority: i64| Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
             account_uuid: Some(uuid.to_string()),
             org_uuid: Some(format!("11111111-1111-1111-1111-{org}")),
             org_name: Some(format!("Org {org}")),
             access_token: format!("at-{org}"),
             refresh_token: Some(format!("rt-{org}")),
-            // Not expired, so booting triggers no token refresh.
-            expires_at: Some(crate::now_ms() + 3_600_000),
             priority: Some(priority),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture(name)
         };
         Config {
             accounts: vec![
@@ -14634,10 +14130,7 @@ mod tests {
         let serving = Arc::clone(&manager);
         tokio::spawn(async move { crate::mitm::serve(listener, serving, None).await });
 
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("build client");
+        let client = crate::test_support::loopback::client();
         // The EXACT `Account` `oauth::probe_add_route` builds:
         // a blank name, a blank access token, everything else absent.
         // DERIVED, not a restated literal — a future edit to the probe's body
@@ -14755,16 +14248,7 @@ mod tests {
                 })
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind echo upstream");
-        let addr = listener.local_addr().expect("echo upstream addr");
-        tokio::spawn(async move {
-            axum::serve(listener, upstream)
-                .await
-                .log_debug("serving a test server");
-        });
-        (format!("http://{addr}"), hits)
+        (stub::http(upstream).url(), hits)
     }
 
     /// Drive the proxy router with a peer we control, as `mitm::serve_http` would,
@@ -15057,18 +14541,13 @@ mod tests {
         }
 
         let seen = Seen::default();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = listener.local_addr().unwrap();
-        let fake = Router::new()
-            .route("/api/oauth/profile", get(profile))
-            .route("/v1/messages", post(messages))
-            .route("/api/claude_cli/bootstrap", get(bootstrap))
-            .with_state(seen.clone());
-        tokio::spawn(async move {
-            axum::serve(listener, fake)
-                .await
-                .log_debug("serving a test server");
-        });
+        let up_addr = stub::http(
+            Router::new()
+                .route("/api/oauth/profile", get(profile))
+                .route("/v1/messages", post(messages))
+                .route("/api/claude_cli/bootstrap", get(bootstrap))
+                .with_state(seen.clone()),
+        );
 
         let manager_with = |mode: crate::config::ControlIdentityMode| {
             let mut config = dummy_config(None, &format!("http://{up_addr}"));
@@ -15928,16 +15407,7 @@ mod tests {
                 ([(CONTENT_TYPE, "application/json")], body)
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind advisor upstream");
-        let addr = listener.local_addr().expect("advisor upstream addr");
-        tokio::spawn(async move {
-            axum::serve(listener, upstream)
-                .await
-                .log_debug("serving a test server");
-        });
-        (format!("http://{addr}"), hits, seen)
+        (stub::http(upstream).url(), hits, seen)
     }
 
     /// Two accounts over `upstream`, `disabled` applied by position.
@@ -16423,16 +15893,7 @@ mod tests {
                     .expect("200 response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind upstream");
-        let addr = listener.local_addr().expect("upstream addr");
-        tokio::spawn(async move {
-            axum::serve(listener, upstream)
-                .await
-                .log_debug("serving a test server");
-        });
-        (format!("http://{addr}"), hits_first, hits_other)
+        (stub::http(upstream).url(), hits_first, hits_other)
     }
 
     /// `/v1/messages` with NO `SessionKey` extension, so the request has no session key: the
@@ -16876,15 +16337,7 @@ mod tests {
                     .expect("200 response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind upstream");
-        let addr = listener.local_addr().expect("upstream addr");
-        tokio::spawn(async move {
-            axum::serve(listener, upstream)
-                .await
-                .log_debug("serving a test server");
-        });
+        let addr = stub::http(upstream);
         let manager =
             Manager::with_live_refresher(two_orgs_over(&format!("http://{addr}"), false), None);
         manager.record_bound_tokens(
@@ -17428,23 +16881,7 @@ mod tests {
         }
 
         // A canned upstream that answers every connection with a bare 401.
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    sock.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",).await.log_debug("writing a test response");
-                });
-            }
-        });
+        let up_addr = stub::canned(raw_401());
 
         // No proxy api-key configured → the keyless test request is accepted.
         let manager = Manager::new(
@@ -17455,22 +16892,13 @@ mod tests {
             None,
         );
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = manager.clone();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
-
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let _ = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        drop(
+            send_to_proxy(
+                app(manager.clone()),
+                client_request(Method::POST, "/v1/messages", "{}"),
+            )
+            .await,
+        );
 
         assert_eq!(
             manager.account_status(0),
@@ -17500,23 +16928,7 @@ mod tests {
             }
         }
 
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    sock.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",).await.log_debug("writing a test response");
-                });
-            }
-        });
+        let up_addr = stub::canned(raw_401());
 
         let mut config = dummy_config(None, &format!("http://{up_addr}"));
         config.accounts[0].refresh_token = None;
@@ -17528,22 +16940,13 @@ mod tests {
             None,
         );
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = manager.clone();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
-
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let _ = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        drop(
+            send_to_proxy(
+                app(manager.clone()),
+                client_request(Method::POST, "/v1/messages", "{}"),
+            )
+            .await,
+        );
 
         assert_eq!(
             manager.account_status(0),
@@ -17585,23 +16988,7 @@ mod tests {
         }
 
         // A canned upstream that answers every connection with a bare 401.
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    sock.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",).await.log_debug("writing a test response");
-                });
-            }
-        });
+        let up_addr = stub::canned(raw_401());
 
         let manager = Manager::new(
             dummy_config(None, &format!("http://{up_addr}")),
@@ -17611,22 +16998,13 @@ mod tests {
             None,
         );
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = manager.clone();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
-
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let _ = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        drop(
+            send_to_proxy(
+                app(manager.clone()),
+                client_request(Method::POST, "/v1/messages", "{}"),
+            )
+            .await,
+        );
 
         assert_eq!(
             manager.account_status(0),
@@ -17663,57 +17041,21 @@ mod tests {
     /// `_ => {}` and nothing was recorded.
     #[tokio::test]
     async fn sse_error_event_is_observed_not_counted_as_clean_serve() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = concat!(
-                        "event: error\n",
-                        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
-                    );
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let body = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+        );
+        let up_addr = stub::canned(stub::reply("200 OK", "text/event-stream", body));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         // Read the body to completion FIRST — the client can see EOF before the
         // detached tee task has finished parsing (see `poll_stream_error_count`).
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let (seen, polls) = poll_stream_error_count(&manager, 1).await;
         assert_eq!(
@@ -17778,45 +17120,13 @@ mod tests {
     /// point in the request, including the buffered-arm log call in `handle`.
     #[tokio::test]
     async fn buffered_request_logs_usage_line_with_real_token_counts() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = br#"{"usage":{"input_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":90,"output_tokens":11}}"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    sock.write_all(body)
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let body = r#"{"usage":{"input_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":90,"output_tokens":11}}"#;
+        let up_addr = stub::canned(stub::reply("200 OK", "application/json", body));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
         let sink = SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
@@ -17825,15 +17135,9 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status().as_u16(), 200);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let log = sink.contents();
         assert!(
@@ -17861,45 +17165,13 @@ mod tests {
     /// own greppable fields.
     #[tokio::test]
     async fn buffered_request_logs_upstream_error_type_and_message_on_non_2xx() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content: unexpected field wombat"}}"#;
-                    let response = format!(
-                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    sock.write_all(body)
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content: unexpected field wombat"}}"#;
+        let up_addr = stub::canned(stub::reply("400 Bad Request", "application/json", body));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
         let sink = SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
@@ -17908,15 +17180,9 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status().as_u16(), 400);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let log = sink.contents();
         assert!(
@@ -17936,42 +17202,15 @@ mod tests {
 
     /// A fake upstream that reads the request, waits [`HEADER_DELAY_MS`], then
     /// writes `response` (status line, headers and body) and closes.
-    async fn spawn_header_delayed_upstream(response: String) -> SocketAddr {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                let response = response.clone();
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 4096];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    tokio::time::sleep(Duration::from_millis(HEADER_DELAY_MS)).await;
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
-        up_addr
+    async fn spawn_header_delayed_upstream(response: String) -> StubAddr {
+        stub::delayed(response, Duration::from_millis(HEADER_DELAY_MS))
     }
 
-    /// Serves `manager` on a fresh loopback port, as the usage-line tests above do.
-    async fn serve_on_loopback(manager: &Arc<Manager>) -> SocketAddr {
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
-        proxy_addr
+    /// Sends one `method path` (a `{}` body on a POST) to `manager`'s router, as the usage-line
+    /// tests above do, in-process.
+    async fn send_one(manager: &Arc<Manager>, method: Method, path: &str) -> Response {
+        let body = if method == Method::POST { "{}" } else { "" };
+        send_to_proxy(app(Arc::clone(manager)), client_request(method, path, body)).await
     }
 
     /// Every line of `log` whose message is `message`.
@@ -18042,25 +17281,16 @@ mod tests {
             "event: message_stop\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );
-        let up_addr = spawn_header_delayed_upstream(format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        ))
-        .await;
+        let up_addr =
+            spawn_header_delayed_upstream(stub::reply("200 OK", "text/event-stream", body)).await;
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
-        let proxy_addr = serve_on_loopback(&manager).await;
+        let proxy = app(Arc::clone(&manager));
         let (sink, _guard) = debug_sink();
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status().as_u16(), 200);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let log = wait_for_line(&sink, "request usage").await;
         let usage = lines_with(&log, "request usage");
@@ -18115,25 +17345,16 @@ mod tests {
     #[tokio::test]
     async fn buffered_request_usage_line_carries_timing() {
         let body = r#"{"usage":{"input_tokens":7,"output_tokens":11}}"#;
-        let up_addr = spawn_header_delayed_upstream(format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        ))
-        .await;
+        let up_addr =
+            spawn_header_delayed_upstream(stub::reply("200 OK", "application/json", body)).await;
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
-        let proxy_addr = serve_on_loopback(&manager).await;
+        let proxy = app(Arc::clone(&manager));
         let (sink, _guard) = debug_sink();
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status().as_u16(), 200);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let log = sink.contents();
         let usage = lines_with(&log, "request usage");
@@ -18184,27 +17405,17 @@ mod tests {
             ("text/event-stream", stream_body),
             ("application/json", buffered_body),
         ] {
-            let up_addr = spawn_header_delayed_upstream(format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            ))
-            .await;
+            let up_addr =
+                spawn_header_delayed_upstream(stub::reply("200 OK", content_type, body)).await;
             let manager = Manager::with_live_refresher(
                 dummy_config(None, &format!("http://{up_addr}")),
                 None,
             );
-            let proxy_addr = serve_on_loopback(&manager).await;
             let (sink, _guard) = info_sink();
 
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
-            let resp = client
-                .post(format!("http://{proxy_addr}/v1/messages"))
-                .body("{}")
-                .send()
-                .await
-                .unwrap();
+            let resp = send_one(&manager, Method::POST, "/v1/messages").await;
             assert_eq!(resp.status().as_u16(), 200);
-            let _ = resp.bytes().await.unwrap();
+            let _ = body_text(resp).await;
 
             let log = wait_for_line(&sink, "request usage").await;
             let info = info_lines(&log);
@@ -18246,25 +17457,21 @@ mod tests {
                 true,
             ),
         ] {
-            let up_addr = spawn_header_delayed_upstream(format!(
-                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            ))
-            .await;
+            let up_addr =
+                spawn_header_delayed_upstream(stub::reply(status_line, "application/json", body))
+                    .await;
             let manager = Manager::with_live_refresher(
                 dummy_config(None, &format!("http://{up_addr}")),
                 None,
             );
-            let proxy_addr = serve_on_loopback(&manager).await;
             let (sink, _guard) = info_sink();
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
-            let request = if path == "/v1/messages" {
-                client.post(format!("http://{proxy_addr}{path}")).body("{}")
+            let method = if path == "/v1/messages" {
+                Method::POST
             } else {
-                client.get(format!("http://{proxy_addr}{path}"))
+                Method::GET
             };
-            let resp = request.send().await.unwrap();
-            let _ = resp.bytes().await.unwrap();
+            let resp = send_one(&manager, method, path).await;
+            let _ = body_text(resp).await;
             // The relayed body logs its timing on drop; give that a moment to land.
             tokio::time::sleep(Duration::from_millis(50)).await;
             let log = sink.contents();
@@ -18283,32 +17490,22 @@ mod tests {
     #[tokio::test]
     async fn request_without_usage_logs_timing_at_debug_only() {
         let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"no"}}"#;
-        let response = format!(
-            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
+        let response = stub::reply("400 Bad Request", "application/json", body);
         for level in [tracing::Level::DEBUG, tracing::Level::INFO] {
             let up_addr = spawn_header_delayed_upstream(response.clone()).await;
             let manager = Manager::with_live_refresher(
                 dummy_config(None, &format!("http://{up_addr}")),
                 None,
             );
-            let proxy_addr = serve_on_loopback(&manager).await;
             let (sink, _guard) = if level == tracing::Level::DEBUG {
                 debug_sink()
             } else {
                 info_sink()
             };
 
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
-            let resp = client
-                .post(format!("http://{proxy_addr}/v1/messages"))
-                .body("{}")
-                .send()
-                .await
-                .unwrap();
+            let resp = send_one(&manager, Method::POST, "/v1/messages").await;
             assert_eq!(resp.status().as_u16(), 400);
-            let _ = resp.bytes().await.unwrap();
+            let _ = body_text(resp).await;
 
             let log = sink.contents();
             let timing = lines_with(&log, "request timing");
@@ -18333,35 +17530,14 @@ mod tests {
     /// counts), with `total_ms` at the walk-away rather than never.
     #[tokio::test]
     async fn abandoned_stream_reports_completed_false() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let event = concat!(
-                        "event: message_start\n",
-                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
-                    );
-                    let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
-                    let chunk = format!("{:x}\r\n{event}\r\n", event.len());
-                    sock.write_all(headers.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    sock.write_all(chunk.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                });
-            }
-        });
+        let event = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+        );
+        let up_addr = stub::stalled(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n",
+            event.len()
+        ));
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
         let (sink, _guard) = info_sink();
@@ -18400,24 +17576,15 @@ mod tests {
     #[tokio::test]
     async fn relayed_request_logs_relay_timing_at_debug() {
         let body = "{}";
-        let up_addr = spawn_header_delayed_upstream(format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        ))
-        .await;
+        let up_addr =
+            spawn_header_delayed_upstream(stub::reply("200 OK", "application/json", body)).await;
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
-        let proxy_addr = serve_on_loopback(&manager).await;
         let (sink, _guard) = debug_sink();
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .get(format!("http://{proxy_addr}/v1/code/sessions"))
-            .send()
-            .await
-            .unwrap();
+        let resp = send_one(&manager, Method::GET, "/v1/code/sessions").await;
         assert_eq!(resp.status().as_u16(), 200);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let log = wait_for_line(&sink, "relay timing").await;
         let relay = lines_with(&log, "relay timing");
@@ -18517,57 +17684,21 @@ mod tests {
     /// assert the truncation IS detected.
     #[tokio::test]
     async fn sse_stream_without_message_stop_is_recorded_as_truncated() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = concat!(
-                        "event: message_start\n",
-                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
-                        "event: message_delta\n",
-                        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n",
-                    );
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n",
+        );
+        let up_addr = stub::canned(stub::reply("200 OK", "text/event-stream", body));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
-        let _ = resp.bytes().await.unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
+        let _ = body_text(resp).await;
 
         let (seen, polls) = poll_stream_error_count(&manager, 1).await;
         assert_eq!(
@@ -18596,59 +17727,26 @@ mod tests {
     /// terminator rather than on the mere absence of an in-band `error` event.
     #[tokio::test]
     async fn sse_stream_with_message_stop_records_no_stream_error() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = concat!(
-                        "event: message_start\n",
-                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
-                        "event: message_delta\n",
-                        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n",
-                        "event: message_stop\n",
-                        "data: {\"type\":\"message_stop\"}\n\n",
-                    );
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let up_addr = stub::canned(stub::reply(
+            "200 OK",
+            "text/event-stream",
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            ),
+        ));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
-        let _ = resp.bytes().await.unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
+        let _ = body_text(resp).await;
 
         // Poll for the USAGE to land (a positive, waitable signal that the tee
         // task has finished), then assert the error count is absent — never a
@@ -18692,42 +17790,21 @@ mod tests {
     /// erased real evidence of the account being `overloaded_error`.
     #[tokio::test]
     async fn client_abort_mid_stream_records_no_stream_error() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let event = concat!(
-                        "event: message_start\n",
-                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
-                    );
-                    // Chunked, not content-length: a real Messages turn's
-                    // length isn't known up front. One chunk, then HANG —
-                    // never a terminating "0\r\n\r\n" chunk, never a close.
-                    // If the client does not abandon this connection, this
-                    // handler simply blocks forever and the test times out —
-                    // which is the point: nothing here ever produces
-                    // `message_stop` or EOF on its own.
-                    let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
-                    let chunk = format!("{:x}\r\n{event}\r\n", event.len());
-                    sock.write_all(headers.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    sock.write_all(chunk.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                });
-            }
-        });
+        let event = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+        );
+        // Chunked, not content-length: a real Messages turn's
+        // length isn't known up front. One chunk, then HANG —
+        // never a terminating "0\r\n\r\n" chunk, never a close.
+        // If the client does not abandon this connection, this
+        // handler simply blocks forever and the test times out —
+        // which is the point: nothing here ever produces
+        // `message_stop` or EOF on its own.
+        let up_addr = stub::stalled(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n",
+            event.len()
+        ));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
@@ -18735,24 +17812,12 @@ mod tests {
         // overwrite-on-abandonment bug would clobber this.
         manager.record_stream_error(0, "overloaded_error");
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
         tokio::time::timeout(Duration::from_secs(10), async {
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
-            let resp = client
-                .post(format!("http://{proxy_addr}/v1/messages"))
-                .body("{}")
-                .send()
-                .await
-                .unwrap();
-            let mut body = resp.bytes_stream();
+            let resp =
+                send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
+            let mut body = resp.into_body().into_data_stream();
             // Read the ONE chunk the fake upstream ever sends, proving the
             // tee actually started, THEN abandon — mirrors a client that
             // received partial output before the user hit Esc.
@@ -18810,56 +17875,23 @@ mod tests {
     /// — not the message_start gate above — is what suppresses it here.
     #[tokio::test]
     async fn non_2xx_sse_body_records_no_stream_error() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = concat!(
-                        "event: message_start\n",
-                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
-                    );
-                    let response = format!(
-                        "HTTP/1.1 400 Bad Request\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let up_addr = stub::canned(stub::reply(
+            "400 Bad Request",
+            "text/event-stream",
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+            ),
+        ));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         // record_served fires on the terminal outcome regardless of status
         // (same as the in-band-error test above) — a waitable positive
@@ -18900,51 +17932,21 @@ mod tests {
     /// the account looked perfectly healthy.
     #[tokio::test]
     async fn sse_stream_severed_before_message_start_is_recorded_as_truncated_e2e() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    // Headers claim an SSE body, then the connection closes
-                    // having sent NOT ONE byte of it — severed before the
-                    // stream could ever produce its first parseable event.
-                    let response = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        // Headers claim an SSE body, then the connection closes
+        // having sent NOT ONE byte of it — severed before the
+        // stream could ever produce its first parseable event.
+        let up_addr = stub::canned(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        );
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let (seen, polls) = poll_stream_error_count(&manager, 1).await;
         assert_eq!(
@@ -18972,56 +17974,23 @@ mod tests {
     /// case.
     #[tokio::test]
     async fn in_band_error_on_non_2xx_is_recorded_regardless_of_status() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = concat!(
-                        "event: error\n",
-                        "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad\"}}\n\n",
-                    );
-                    let response = format!(
-                        "HTTP/1.1 400 Bad Request\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let up_addr = stub::canned(stub::reply(
+            "400 Bad Request",
+            "text/event-stream",
+            concat!(
+                "event: error\n",
+                "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad\"}}\n\n",
+            ),
+        ));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let (seen, polls) = poll_stream_error_count(&manager, 1).await;
         assert_eq!(
@@ -19069,19 +18038,16 @@ mod tests {
 
         // Echo upstream: capture the full forwarded request (headers + Content-Length
         // body), then answer 200.
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
         let captured = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let cap = captured.clone();
-        tokio::spawn(async move {
-            if let Ok((mut sock, _)) = upstream.accept().await {
-                let mut buf = Vec::new();
+        let up_addr = stub::raw(move |conn| {
+            let cap = cap.clone();
+            async move {
+                let mut sock = conn.stream;
+                // What the shared listener already read to route the request.
+                let mut buf = conn.head;
                 let mut tmp = [0u8; 4096];
                 loop {
-                    match sock.read(&mut tmp).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                    }
                     if let Some(h) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                         let headers = String::from_utf8_lossy(&buf[..h]).to_lowercase();
                         let cl = headers
@@ -19092,6 +18058,10 @@ mod tests {
                         if buf.len() >= h + 4 + cl {
                             break;
                         }
+                    }
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
                     }
                 }
                 *cap.lock().await = buf;
@@ -19112,31 +18082,22 @@ mod tests {
             Arc::new(crate::warmer::LiveWarmer::new()),
             None,
         );
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = manager.clone();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
-
         let inner = format!(r#"{{"account_uuid":"{CLIENT_UUID}","subscriptionType":"pro"}}"#);
-        let body = serde_json::to_vec(&serde_json::json!({
+        let body = serde_json::json!({
             "model": "claude-x",
             "metadata": { "user_id": inner },
             "messages": [],
-        }))
-        .unwrap();
+        })
+        .to_string();
         let sent_len = body.len();
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let _ = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body(body)
-            .send()
-            .await
-            .unwrap();
+        drop(
+            send_to_proxy(
+                app(manager.clone()),
+                client_request(Method::POST, "/v1/messages", body),
+            )
+            .await,
+        );
 
         let received = captured.lock().await.clone();
         assert!(
@@ -19174,8 +18135,6 @@ mod tests {
     /// connection — `app()` alone injects none, so without it affinity is inert.
     #[tokio::test]
     async fn same_user_id_pins_one_account_and_surfaces_cache_read() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
             fn refresh(
@@ -19190,32 +18149,8 @@ mod tests {
         // Fake upstream: every connection gets a 200 whose JSON `usage` carries a
         // non-zero `cache_read_input_tokens` (a warm-cache turn). Loops so BOTH
         // forwarded requests are answered.
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = br#"{"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":500,"output_tokens":20}}"#;
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    sock.write_all(head.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    sock.write_all(body)
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let body = r#"{"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":500,"output_tokens":20}}"#;
+        let up_addr = stub::canned(stub::reply("200 OK", "application/json", body));
 
         // A 2-account fleet pointed at the one fake upstream.
         let mut config = dummy_config(None, &format!("http://{up_addr}"));
@@ -19251,29 +18186,21 @@ mod tests {
                 }
             },
         ));
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(proxy, affinity_app)
-                .await
-                .log_debug("serving a test server");
-        });
-
-        let body = serde_json::to_vec(&serde_json::json!({
+        let body = serde_json::json!({
             "model": "claude-x",
             "metadata": { "user_id": "cache-affinity-user" },
             "messages": [],
-        }))
-        .unwrap();
+        })
+        .to_string();
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
         for _ in 0..2 {
-            let _ = client
-                .post(format!("http://{proxy_addr}/v1/messages"))
-                .body(body.clone())
-                .send()
-                .await
-                .unwrap();
+            drop(
+                send_to_proxy(
+                    affinity_app.clone(),
+                    client_request(Method::POST, "/v1/messages", body.clone()),
+                )
+                .await,
+            );
         }
 
         let snap = manager.snapshot(OffsetDateTime::now_utc());
@@ -19311,61 +18238,28 @@ mod tests {
     /// Connections past the end of the script reuse the last entry. Every scripted
     /// reply must send `connection: close` so the client pool cannot reuse a socket
     /// and attempt N is always connection N.
-    async fn spawn_scripted_upstream(script: Vec<Option<String>>) -> SocketAddr {
-        spawn_counted_upstream(script).await.0
+    ///
+    /// A route on the binary's shared raw listener ([`stub::scripted`]), not a port of its own.
+    async fn spawn_scripted_upstream(script: Vec<Option<String>>) -> StubAddr {
+        stub::scripted(script).0
     }
 
-    /// [`spawn_scripted_upstream`] plus a live count of accepted connections —
+    /// [`spawn_scripted_upstream`] plus a live count of the connections it was handed —
     /// i.e. of upstream ATTEMPTS. Retries are invisible in the account stats (only
     /// the terminal outcome is recorded), so a test that must pin the exact number
     /// of sends reads it here instead of inferring it from the client's status.
     async fn spawn_counted_upstream(
         script: Vec<Option<String>>,
-    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = attempts.clone();
-        tokio::spawn(async move {
-            let mut n = 0usize;
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                // Ordinal is assigned in ACCEPT order, before the per-connection task
-                // is spawned, so it cannot race with a concurrent handler.
-                let reply = script.get(n).or_else(|| script.last()).cloned().flatten();
-                n += 1;
-                counter.store(n, std::sync::atomic::Ordering::SeqCst);
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    match reply {
-                        Some(raw) => {
-                            sock.write_all(raw.as_bytes())
-                                .await
-                                .log_debug("writing a test response");
-                        }
-                        // Drop with no reply: "connection closed before message
-                        // completed" on the client side — a transport error.
-                        None => drop(sock),
-                    }
-                });
-            }
-        });
-        (addr, attempts)
+    ) -> (StubAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        stub::scripted(script)
     }
 
     /// A `200 OK` with a minimal JSON usage body.
     fn raw_200() -> String {
-        let body = br#"{"usage":{"input_tokens":1,"output_tokens":1}}"#;
-        format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            String::from_utf8_lossy(body)
+        stub::reply(
+            "200 OK",
+            "application/json",
+            r#"{"usage":{"input_tokens":1,"output_tokens":1}}"#,
         )
     }
 
@@ -19484,24 +18378,22 @@ mod tests {
     /// exists for. Carries NO `retry-after` (the live captures do not), so the
     /// backoff comes from the ladder alone and the test's timing is deterministic.
     fn raw_529() -> String {
-        let body =
-            br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
-        format!(
-            "HTTP/1.1 529 \r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            String::from_utf8_lossy(body)
+        stub::reply(
+            "529 ",
+            "application/json",
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
         )
     }
 
     /// Boot an N-account fleet (all cloned from `dummy`) pointed at `upstream`.
-    fn fleet(upstream: SocketAddr, names: &[&str]) -> Arc<Manager> {
+    fn fleet(upstream: impl std::fmt::Display, names: &[&str]) -> Arc<Manager> {
         fleet_configured(upstream, names, |_| {})
     }
 
     /// [`fleet`] with a hook to edit the config before the manager boots — for a
     /// test that needs an unmodelled top-level key (`revalidationServe`) set.
     fn fleet_configured(
-        upstream: SocketAddr,
+        upstream: impl std::fmt::Display,
         names: &[&str],
         configure: impl FnOnce(&mut Config),
     ) -> Arc<Manager> {
@@ -19535,71 +18427,35 @@ mod tests {
     /// [`post_one`] plus the client-visible BODY — for asserting that a status the
     /// proxy gives up on is forwarded verbatim, not replaced by a synthesized one.
     async fn post_one_with_body(manager: Arc<Manager>) -> (u16, String) {
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(manager))
-                .await
-                .log_debug("serving a test server");
-        });
-        let body = serde_json::to_vec(&serde_json::json!({ "model": "claude-x", "messages": [] }))
-            .unwrap();
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body(body)
-            .send()
-            .await
-            .unwrap();
-        let status = resp.status().as_u16();
-        (status, resp.text().await.unwrap())
+        let (status, _, body) = post_one_full(manager).await;
+        (status, body)
     }
 
     /// [`post_one_with_body`] plus the response HEADERS — for asserting what a
     /// synthesized 429 tells a client that reads headers, not only its body.
     async fn post_one_full(manager: Arc<Manager>) -> (u16, HeaderMap, String) {
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(manager))
-                .await
-                .log_debug("serving a test server");
-        });
-        let body = serde_json::to_vec(&serde_json::json!({ "model": "claude-x", "messages": [] }))
-            .unwrap();
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body(body)
-            .send()
-            .await
-            .unwrap();
+        let body = serde_json::json!({ "model": "claude-x", "messages": [] }).to_string();
+        let resp = send_to_proxy(
+            app(manager),
+            client_request(Method::POST, "/v1/messages", body),
+        )
+        .await;
         let status = resp.status().as_u16();
         let headers = resp.headers().clone();
-        (status, headers, resp.text().await.unwrap())
+        (status, headers, body_text(resp).await)
     }
 
-    /// Serve `manager` on a fresh loopback listener and POST one `/v1/messages`,
-    /// returning the client-visible status.
+    /// POST one `/v1/messages` naming `model` to `manager`'s router, returning the
+    /// client-visible status.
     async fn post_model(manager: Arc<Manager>, model: &str) -> u16 {
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(manager))
-                .await
-                .log_debug("serving a test server");
-        });
-        let body =
-            serde_json::to_vec(&serde_json::json!({ "model": model, "messages": [] })).unwrap();
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body(body)
-            .send()
-            .await
-            .unwrap()
-            .status()
-            .as_u16()
+        let body = serde_json::json!({ "model": model, "messages": [] }).to_string();
+        send_to_proxy(
+            app(manager),
+            client_request(Method::POST, "/v1/messages", body),
+        )
+        .await
+        .status()
+        .as_u16()
     }
 
     async fn post_one(manager: Arc<Manager>) -> u16 {
@@ -19615,7 +18471,7 @@ mod tests {
     /// request must carry a stable identity for [`stable_session_key`] to hash —
     /// hence `metadata.user_id` in the body. The pin lives in the MANAGER, so two
     /// calls with the same `user_id` are two requests of ONE session even though each
-    /// call serves the app on a fresh listener.
+    /// call drives a fresh router.
     async fn post_one_pinned(manager: Arc<Manager>, user_id: &str) -> u16 {
         let affinity_app = app(manager).layer(axum::middleware::from_fn(
             move |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
@@ -19626,28 +18482,19 @@ mod tests {
                 next.run(req).await
             },
         ));
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(proxy, affinity_app)
-                .await
-                .log_debug("serving a test server");
-        });
-        let body = serde_json::to_vec(&serde_json::json!({
+        let body = serde_json::json!({
             "model": "claude-x",
             "metadata": { "user_id": user_id },
             "messages": [],
-        }))
-        .unwrap();
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body(body)
-            .send()
-            .await
-            .unwrap()
-            .status()
-            .as_u16()
+        })
+        .to_string();
+        send_to_proxy(
+            affinity_app,
+            client_request(Method::POST, "/v1/messages", body),
+        )
+        .await
+        .status()
+        .as_u16()
     }
 
     /// The every-account-scoped header block the upstream in these tests sends, by
@@ -20066,11 +18913,10 @@ mod tests {
     /// header) and upstream's own error body. A direct API client draws this shape
     /// on `/v1/messages` without `?beta=true`.
     fn raw_429_no_guidance() -> String {
-        let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"upstream-own-words"}}"#;
-        format!(
-            "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\n\
-             content-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
+        stub::reply(
+            "429 Too Many Requests",
+            "application/json",
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"upstream-own-words"}}"#,
         )
     }
 
@@ -20720,10 +19566,7 @@ mod tests {
         // Bind then drop: the address is guaranteed to have been free, and now
         // refuses. `spawn_counted_upstream`'s no-reply script cannot produce this
         // — dropping an ACCEPTED socket is a mid-request error, not a connect one.
-        let dead = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap()
-        };
+        let dead = format!("127.0.0.1:{}", closed_loopback_port());
         let manager = fleet(dead, &["a", "b"]);
 
         let (status, headers, body) = post_one_full(manager).await;
@@ -21725,6 +20568,97 @@ mod tests {
         );
     }
 
+    /// Both terminals (select finding nothing, and the attempt budget running out) read one
+    /// verdict off the tallies. The budget terminal used to answer a transport-only walk with a
+    /// 502 whatever the resolver said, and an all-refused walk with the exhausted 429.
+    #[tokio::test]
+    async fn the_terminal_verdict_reads_every_arm_off_the_tallies() {
+        use super::ladder::Tally;
+
+        struct NoRefresh;
+        impl crate::oauth::TokenRefresher for NoRefresh {
+            fn refresh(
+                &self,
+                _provider: crate::provider::Provider,
+                _t: String,
+            ) -> crate::oauth::RefreshFuture {
+                Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+            }
+        }
+        let manager = Manager::new(
+            dummy_config(None, "http://127.0.0.1:9"),
+            Arc::new(NoRefresh),
+            Arc::new(crate::probe::LiveUsageProber::new()),
+            Arc::new(crate::warmer::LiveWarmer::new()),
+            None,
+        );
+        let now = OffsetDateTime::now_utc();
+        // The status and `x-should-retry`, which tell the four shapes apart: the offline 503
+        // carries none, `bad_gateway`'s 503 says `true`, its 502 says `false`, and the
+        // credential-refused 502 carries none.
+        let verdict = |mut tally: Tally| {
+            tally
+                .verdict(&manager, Provider::Anthropic, None, now, None, None)
+                .map(|response| {
+                    let should_retry = response
+                        .headers()
+                        .get("x-should-retry")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    (response.status(), should_retry)
+                })
+        };
+
+        let offline = Tally {
+            transport_failures: 2,
+            offline_failures: 1,
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(offline),
+            Some((StatusCode::SERVICE_UNAVAILABLE, None)),
+            "a resolver failure in a transport-only walk is the offline 503"
+        );
+        let connect_only = Tally {
+            transport_failures: 2,
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(connect_only),
+            Some((StatusCode::SERVICE_UNAVAILABLE, Some("true".into())))
+        );
+        let unknown_outcome = Tally {
+            transport_failures: 1,
+            unknown_outcome_transport_failure: true,
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(unknown_outcome),
+            Some((StatusCode::BAD_GATEWAY, Some("false".into())))
+        );
+        let all_refused = Tally {
+            upstream_responses: 2,
+            refused_403: vec![(0, Some("a".into())), (1, Some("b".into()))],
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(all_refused),
+            Some((StatusCode::BAD_GATEWAY, None)),
+            "every answer a refused 403 is the credential-refused 502"
+        );
+        let answered = Tally {
+            transport_failures: 1,
+            upstream_responses: 2,
+            refused_403: vec![(0, None)],
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(answered),
+            None,
+            "an upstream that answered other than with a refusal leaves the caller's last resort"
+        );
+    }
+
     /// Issue a real request that cannot succeed and hand back the real
     /// `reqwest::Error`. A hand-built stub would prove nothing here: the whole
     /// question is what the LIVE error's `source()` chain looks like.
@@ -21741,10 +20675,7 @@ mod tests {
 
     /// A port nothing is listening on: bind it, read it back, release it.
     fn closed_loopback_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let port = listener.local_addr().expect("local addr").port();
-        drop(listener);
-        port
+        crate::test_support::loopback::unused_port()
     }
 
     /// The two-sided gate on [`is_offline_error`]. One side alone is worthless —
@@ -21797,20 +20728,14 @@ mod tests {
     async fn an_unresolvable_upstream_answers_503_with_retry_after_not_502() {
         let manager =
             Manager::with_live_refresher(dummy_config(None, "http://offline-probe.invalid"), None);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app(manager))
-                .await
-                .log_debug("serving a test server");
-        });
-
-        let resp = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/messages"))
-            .json(&serde_json::json!({"model": "claude-3-5-sonnet", "messages": []}))
-            .send()
-            .await
-            .expect("the proxy itself is reachable");
+        let resp = send_to_proxy(
+            app(manager),
+            client_json(
+                "/v1/messages",
+                &serde_json::json!({"model": "claude-3-5-sonnet", "messages": []}),
+            ),
+        )
+        .await;
         assert_eq!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -21897,22 +20822,9 @@ mod tests {
     /// decided here.
     #[tokio::test]
     async fn a_relay_dropped_after_connect_still_answers_502() {
-        use tokio::io::AsyncReadExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                // Read the request so it has provably left the client, then
-                // hang up without answering.
-                let mut buf = [0u8; 1024];
-                if sock.read(&mut buf).await.is_err() {
-                    continue;
-                }
-                drop(sock);
-            }
-        });
+        // Read the request so it has provably left the client, then hang up
+        // without answering.
+        let addr = spawn_scripted_upstream(vec![None]).await;
 
         let resp = relay_to(&format!("http://{addr}")).await;
         assert_eq!(
@@ -21939,6 +20851,17 @@ mod tests {
         );
     }
 
+    /// A manager over a DEAD upstream (127.0.0.1:1, reliably connection-refused) and
+    /// no proxy key: what [`spawn_dead_upstream_proxy`] serves.
+    fn dead_upstream_manager() -> Arc<Manager> {
+        let config = dummy_config(None, "http://127.0.0.1:1");
+        assert_eq!(
+            config.codex_upstream, "http://127.0.0.1:0",
+            "an unspecified test origin must fail closed"
+        );
+        Manager::with_live_refresher(config, None)
+    }
+
     /// Boot the proxy over a fresh loopback listener with a DEAD upstream
     /// (127.0.0.1:1, reliably connection-refused) and no proxy key, returning its
     /// address. A request the host guard lets THROUGH reaches the rotation loop
@@ -21946,13 +20869,12 @@ mod tests {
     /// failure — see [`bad_gateway`] — so it is the safe-to-retry shape, not a
     /// 502); a request the guard REJECTS returns its local status (421) with no
     /// egress. The 421-vs-503 split is what proves whether the guard fired.
+    ///
+    /// Keeps a real listener on purpose: these tests write the request line byte for
+    /// byte, and what they prove is that hyper's own request-line parser hands the
+    /// guard the shapes they name.
     async fn spawn_dead_upstream_proxy() -> SocketAddr {
-        let config = dummy_config(None, "http://127.0.0.1:1");
-        assert_eq!(
-            config.codex_upstream, "http://127.0.0.1:0",
-            "an unspecified test origin must fail closed"
-        );
-        let manager = Manager::with_live_refresher(config, None);
+        let manager = dead_upstream_manager();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -22041,14 +20963,11 @@ mod tests {
     /// Anthropic traffic.
     #[tokio::test]
     async fn base_url_loopback_proceeds_not_rejected_503() {
-        let addr = spawn_dead_upstream_proxy().await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(
+            app(dead_upstream_manager()),
+            client_request(Method::POST, "/v1/messages", "{}"),
+        )
+        .await;
         assert_eq!(
             resp.status().as_u16(),
             503,
@@ -22398,17 +21317,8 @@ mod tests {
                     ([(CONTENT_TYPE, "application/json")], "{}")
                 }
             });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind capturing upstream");
-            let addr = listener.local_addr().expect("capturing upstream addr");
-            tokio::spawn(async move {
-                axum::serve(listener, upstream)
-                    .await
-                    .log_debug("serving a test server");
-            });
             Self {
-                url: format!("http://{addr}"),
+                url: stub::http(upstream).url(),
                 seen,
             }
         }
@@ -23240,16 +22150,7 @@ mod tests {
     async fn spawn_fixed_origin(content_type: &'static str, body: &'static str) -> String {
         let origin =
             Router::new().fallback(move || async move { ([(CONTENT_TYPE, content_type)], body) });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind fixed origin");
-        let addr = listener.local_addr().expect("fixed origin addr");
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
-        format!("http://{addr}")
+        stub::http(origin).url()
     }
 
     /// **A streamed turn is filed under the model its REQUEST named, and a Codex turn whose
@@ -23597,15 +22498,7 @@ mod tests {
                     .expect("200 response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let addr = listener.local_addr().expect("Codex origin addr");
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let addr = stub::http(origin);
         (format!("http://{addr}"), refused, served)
     }
 
@@ -23780,15 +22673,7 @@ mod tests {
                     .expect("200 response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let addr = listener.local_addr().expect("Codex origin addr");
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let addr = stub::http(origin);
         (format!("http://{addr}"), refused, served)
     }
 
@@ -24031,9 +22916,7 @@ mod tests {
                 }
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let base = stub::http(origin).url();
         let manager =
             Manager::with_live_refresher(codex_fleet_with_carol(&anthropic.url, &base), None);
         let started = tokio::time::Instant::now();
@@ -24083,18 +22966,7 @@ mod tests {
                     .expect("200 response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let codex_url = format!(
-            "http://{}",
-            listener.local_addr().expect("Codex origin addr")
-        );
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let codex_url = stub::http(origin).url();
         let manager =
             Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_url), None);
 
@@ -24171,18 +23043,7 @@ mod tests {
                     .expect("Codex response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let codex_url = format!(
-            "http://{}",
-            listener.local_addr().expect("Codex origin addr")
-        );
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let codex_url = stub::http(origin).url();
         let manager =
             Manager::with_live_refresher(codex_fleet("http://127.0.0.1:9", &codex_url), None);
         let header = |response: &Response, name: &str| {
@@ -24284,18 +23145,7 @@ mod tests {
                 response.body(Body::from("{}")).expect("Codex response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let codex_url = format!(
-            "http://{}",
-            listener.local_addr().expect("Codex origin addr")
-        );
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let codex_url = stub::http(origin).url();
         let manager =
             Manager::with_live_refresher(codex_fleet("http://127.0.0.1:9", &codex_url), None);
 
@@ -25447,15 +24297,7 @@ mod tests {
             }
             response.body(Body::from(body)).expect("403 response")
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let addr = listener.local_addr().expect("Codex origin addr");
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let addr = stub::http(origin);
         let anthropic_echo = CapturingUpstream::spawn().await;
         let manager = Manager::with_live_refresher(
             codex_fleet(&anthropic_echo.url, &format!("http://{addr}")),
@@ -25541,9 +24383,7 @@ mod tests {
             Response::builder().header(CONTENT_TYPE, "text/event-stream")
                 .body(Body::from("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-6.1-sol\",\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}\n\n")).unwrap()
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let upstream = stub::http(origin).url();
         let mut config = codex_fleet_with_carol("http://127.0.0.1:0", &upstream);
         config.accounts[1].priority = Some(0);
         config.accounts[2].priority = Some(1);
@@ -25572,7 +24412,6 @@ mod tests {
             ms_field(line, "first_byte_ms") >= HEADER_DELAY_MS,
             "first byte must come from the served stream, not the rejected body: {line}"
         );
-        server.abort();
     }
 
     #[tokio::test]
@@ -25598,9 +24437,7 @@ mod tests {
                     } else { Response::new(Body::from("{}")) }
                 }
             });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let upstream = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+            let upstream = stub::http(origin).url();
             let mut config = codex_fleet_with_carol("http://127.0.0.1:0", &upstream);
             config.accounts[1].priority = Some(0);
             config.accounts[2].priority = Some(1);
@@ -25633,7 +24470,6 @@ mod tests {
             assert_eq!(snapshot.accounts[1].gate, GateReason::Ok);
             assert_eq!(snapshot.accounts[1].codex.login_error, None);
             assert_eq!(snapshot.accounts[1].rate_limited_until, None);
-            server.abort();
         }
     }
 
@@ -25654,9 +24490,7 @@ mod tests {
                     Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(Body::from(body)).unwrap()
                 }
             });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let upstream = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+            let upstream = stub::http(origin).url();
             let mut config = codex_fleet_with_carol("http://127.0.0.1:0", &upstream);
             config.accounts[1].priority = Some(0);
             config.accounts[2].priority = Some(1);
@@ -25700,7 +24534,6 @@ mod tests {
                 manager.snapshot(OffsetDateTime::now_utc()).accounts[1].gate,
                 GateReason::Ok
             );
-            server.abort();
         }
     }
 
@@ -25715,9 +24548,7 @@ mod tests {
                 .body(Body::from(body))
                 .unwrap()
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let upstream = stub::http(origin).url();
         let manager = Manager::with_live_refresher(
             codex_fleet_with_carol("http://127.0.0.1:0", &upstream),
             None,
@@ -25738,7 +24569,6 @@ mod tests {
                 .iter()
                 .all(|row| row.gate == GateReason::Ok)
         );
-        server.abort();
     }
 
     #[tokio::test]
@@ -25778,9 +24608,7 @@ mod tests {
                         .unwrap()
                 }
             });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let upstream = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+            let upstream = stub::http(origin).url();
             let manager = Manager::with_live_refresher(
                 codex_fleet_with_carol("http://127.0.0.1:0", &upstream),
                 None,
@@ -25802,7 +24630,6 @@ mod tests {
             );
             assert_ne!(row.gate, GateReason::Refused);
             assert_eq!(row.codex.login_error, None);
-            server.abort();
         }
     }
 
@@ -25817,9 +24644,7 @@ mod tests {
             Response::builder().status(StatusCode::FORBIDDEN).header(CONTENT_TYPE, "application/json")
                 .body(Body::from(body)).unwrap()
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let upstream = stub::http(origin).url();
         let manager = Manager::with_live_refresher(
             codex_fleet_with_carol("http://127.0.0.1:0", &upstream),
             None,
@@ -25835,7 +24660,6 @@ mod tests {
             message.contains("tcr login --codex --account bob@example.com"),
             "{message}"
         );
-        server.abort();
     }
 
     #[tokio::test]
@@ -25853,9 +24677,7 @@ mod tests {
                 } else { Response::new(Body::from("{}")) }
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let url = stub::http(origin).url();
         let manager =
             Manager::with_live_refresher(codex_fleet_with_carol("http://127.0.0.1:9", &url), None);
         assert_eq!(send_codex_turn(&manager).await.status(), StatusCode::OK);
@@ -25863,7 +24685,6 @@ mod tests {
         let snap = manager.snapshot(OffsetDateTime::now_utc());
         assert_eq!(snap.accounts[blocked].codex.login_error, None);
         assert_eq!(snap.accounts[blocked].gate, GateReason::Refused);
-        server.abort();
     }
 
     #[test]
@@ -25890,9 +24711,7 @@ mod tests {
             Response::builder().status(StatusCode::FORBIDDEN).header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"error":{"code":"workspace_deactivated","message":"Workspace deactivated"}}"#)).unwrap()
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let url = stub::http(origin).url();
         let manager =
             Manager::with_live_refresher(codex_fleet_with_carol("http://127.0.0.1:9", &url), None);
         for attempt in 0..2 {
@@ -25919,7 +24738,6 @@ mod tests {
             assert_eq!(account.gate, GateReason::Refused);
             assert_eq!(account.codex.login_error, None);
         }
-        server.abort();
     }
 
     #[tokio::test]
@@ -25941,9 +24759,7 @@ mod tests {
                         .unwrap()
                 }
             });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+            let url = stub::http(origin).url();
             let mut config = codex_fleet_with_carol("http://127.0.0.1:9", &url);
             config.accounts[2].disabled = Some(true);
             let manager = Manager::with_live_refresher(config, None);
@@ -25999,7 +24815,6 @@ mod tests {
                 1,
                 "requests during the refusal hold never reach the origin"
             );
-            server.abort();
         }
     }
 
@@ -26009,9 +24824,7 @@ mod tests {
             Response::builder().status(StatusCode::FORBIDDEN).header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"error":{"code":"workspace_deactivated","message":"Workspace deactivated"}}"#)).unwrap()
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let url = stub::http(origin).url();
         let mut config = codex_fleet_with_carol("http://127.0.0.1:9", &url);
         config.accounts[2].disabled = Some(true);
         let manager = Manager::with_live_refresher(config, None);
@@ -26041,7 +24854,6 @@ mod tests {
             assert_eq!(account.gate, GateReason::Refused);
             assert_eq!(account.codex.login_error, None);
         }
-        server.abort();
     }
 
     /// A Codex origin that refuses EVERY request with a 403, recording each bearer in order.
@@ -26070,15 +24882,7 @@ mod tests {
                     .expect("403 response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let addr = listener.local_addr().expect("Codex origin addr");
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let addr = stub::http(origin);
         (format!("http://{addr}"), refused)
     }
 
@@ -26240,10 +25044,7 @@ mod tests {
                             .body(Body::from(body)).unwrap()
                     }
                 });
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let url = format!("http://{}", listener.local_addr().unwrap());
-                let server =
-                    tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+                let url = stub::http(origin).url();
                 let manager = Manager::with_live_refresher(
                     codex_fleet_with_carol("http://127.0.0.1:9", &url),
                     None,
@@ -26326,7 +25127,6 @@ mod tests {
                         "{event}/{code} must move a pinned conversation"
                     );
                 }
-                server.abort();
             }
         }
     }
@@ -26445,9 +25245,7 @@ mod tests {
                 .body(Body::from(r#"{"error":{"type":"insufficient_quota"}}"#))
                 .unwrap()
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let url = stub::http(origin).url();
         let manager = Manager::with_live_refresher(codex_fleet("http://127.0.0.1:9", &url), None);
         assert_eq!(
             send_codex_turn(&manager).await.status(),
@@ -26461,7 +25259,6 @@ mod tests {
             (1..=3600).contains(&remaining.whole_seconds()),
             "hold is {remaining}"
         );
-        server.abort();
     }
 
     #[tokio::test]
@@ -26547,9 +25344,7 @@ mod tests {
                 response.body(Body::from(reply)).unwrap()
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let url = stub::http(origin).url();
         let mut config = codex_fleet("http://127.0.0.1:9", &url);
         config
             .extra
@@ -26585,7 +25380,6 @@ mod tests {
                 "{body}"
             );
         }
-        server.abort();
     }
 
     #[tokio::test]
@@ -26681,9 +25475,7 @@ mod tests {
                     .unwrap()
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let url = stub::http(origin).url();
         let mut config = codex_fleet_with_carol("http://127.0.0.1:9", &url);
         // Bob is refused first; Carol, refused second, has the earlier reset.
         config.accounts[1].priority = Some(0);
@@ -26708,6 +25500,5 @@ mod tests {
             (body["error"]["resets_at"].as_i64().unwrap() - earliest).abs() <= 2,
             "{body}"
         );
-        server.abort();
     }
 }

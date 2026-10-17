@@ -11,6 +11,17 @@
     reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
 )]
 
+/// The environment every launch of the built `tcr` starts from.
+#[path = "support/tcr_env.rs"]
+mod tcr_env;
+
+/// The harness pieces the `peer_*` test files share. Its capture layer keeps
+/// each event's level, which is what the quiet-second-answer test reads.
+#[path = "support/peer.rs"]
+mod peer_support;
+
+use peer_support::CaptureLayer;
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -850,14 +861,7 @@ fn the_address_a_peer_sees_this_mac_at_survives_a_restart() {
 /// A scratch directory of this test's own, so a sibling test binary running at
 /// the same instant cannot read or write this one's peers file.
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tcr-peer-reach-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
-    std::fs::create_dir_all(&dir).expect("create the scratch dir");
-    dir
+    peer_support::scratch_dir("reach", tag)
 }
 
 /// A peers file with one pinned peer and a listener port, written as JSON text
@@ -889,9 +893,15 @@ fn peers_file_with_one_peer(dir: &std::path::Path, listen_port: u16) -> std::pat
     path
 }
 
+/// The built `tcr` with its `HOME` the directory holding `file`, so no call reaches the
+/// operator's files.
+fn tcr_beside(file: &std::path::Path) -> std::process::Command {
+    tcr_env::tcr(file.parent().expect("a fixture file has a directory"))
+}
+
 /// Run `tcr peer reach` against a temp peers file: `(stdout, stderr, ok)`.
 fn run_reach(peers: &std::path::Path, extra: &[&str]) -> (String, String, bool) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_beside(peers)
         .args(["peer", "reach"])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
         .args(extra)
@@ -1987,7 +1997,7 @@ async fn a_dial_that_races_two_live_endpoints_does_not_cool_the_one_it_did_not_u
 
 /// Run `tcr peer internet on|off` against a temp peers file: `(stdout, stderr, ok)`.
 fn run_internet(peers: &std::path::Path, state: &str) -> (String, String, bool) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_beside(peers)
         .args(["peer", "internet", state])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
         .output()
@@ -2943,68 +2953,6 @@ async fn the_internet_switch_starts_a_keeper_again_on_a_running_server() {
         1,
         "exactly one keeper, not one per wake"
     );
-}
-
-/// One captured tracing event: its level and its message.
-///
-/// The level is the point of this copy. The capture layer in
-/// `tests/peer_refusal_log.rs` keeps the fields and the message, and what is
-/// asserted here is that the second identical answer is written quietly.
-#[derive(Debug, Clone)]
-struct CapturedEvent {
-    level: tracing::Level,
-    message: String,
-}
-
-#[derive(Clone, Default)]
-struct CaptureLayer {
-    events: Arc<Mutex<Vec<CapturedEvent>>>,
-}
-
-struct MessageVisitor(Option<String>);
-
-impl tracing::field::Visit for MessageVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.0 = Some(format!("{value:?}"));
-        }
-    }
-
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.0 = Some(value.to_string());
-        }
-    }
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut visitor = MessageVisitor(None);
-        event.record(&mut visitor);
-        self.events
-            .lock()
-            .expect("capture lock")
-            .push(CapturedEvent {
-                level: *event.metadata().level(),
-                message: visitor.0.unwrap_or_else(|| "<no message>".to_string()),
-            });
-    }
-}
-
-impl CaptureLayer {
-    fn matching(&self, needle: &str) -> Vec<CapturedEvent> {
-        self.events
-            .lock()
-            .expect("capture lock")
-            .iter()
-            .filter(|event| event.message.contains(needle))
-            .cloned()
-            .collect()
-    }
 }
 
 /// **A router that would not map is not asked again at every single wake.**

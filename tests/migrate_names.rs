@@ -21,9 +21,10 @@ use crate::connect_guard;
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
+use tcr::test_support::child::KillOnDrop;
 
 use serde_json::Value;
 use tcr::{legacy_names, paths, singleton::owner_path_in};
@@ -31,13 +32,8 @@ use tcr::{legacy_names, paths, singleton::owner_path_in};
 const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A port nothing holds right now: the kernel hands one out and it is released.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
-    let port = listener.local_addr().expect("local addr").port();
-    assert_ne!(port, 3456, "never the live proxy's port");
-    port
-}
+/// A port nothing holds right now, for the child `tcr server` to bind itself.
+use tcr::test_support::loopback::unused_port as free_port;
 
 /// A HOME holding only the old names: the config (on `port`, one invented
 /// account) and a cache directory with a marker file and an old-prefix log.
@@ -82,18 +78,14 @@ fn new_cache(home: &Path) -> PathBuf {
     home.join(".cache").join(paths::CACHE_DIR)
 }
 
-/// `cmd` isolated to `home`: no real config, cache, Keychain login or Codex home.
-fn isolate(cmd: &mut Command, home: &Path) {
-    cmd.env("HOME", home)
-        .env("CODEX_HOME", home.join(".codex"))
+/// The built `tcr` isolated to `home`: no real config, cache, Keychain login or Codex home.
+fn isolated_tcr(home: &Path) -> Command {
+    let mut cmd = crate::tcr_env::tcr(home);
+    cmd.env("CODEX_HOME", home.join(".codex"))
         .env("TCR_CODEX_AUTH", home.join("no-such-codex-auth.json"))
-        .env_remove("XDG_CACHE_HOME")
-        .env(
-            "TCR_CLAUDE_CODE_CREDENTIALS",
-            home.join("no-such-claude-code-credentials.json"),
-        )
         .env("NO_COLOR", "1")
         .current_dir(home);
+    cmd
 }
 
 struct Out {
@@ -119,9 +111,8 @@ impl Out {
 /// Run the built `tcr` under `home` and the network guard, and require that it
 /// tried no connection the guard forbids (3456, or anything off loopback).
 fn tcr(home: &Path, args: &[&str]) -> Out {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut cmd = isolated_tcr(home);
     cmd.args(args);
-    isolate(&mut cmd, home);
     let guard = connect_guard::ConnectGuard::attach(&mut cmd, home);
     let out = cmd.output().expect("run the built tcr");
     guard.assert_no_connections();
@@ -134,21 +125,17 @@ fn tcr(home: &Path, args: &[&str]) -> Out {
 
 /// A scratch server on the port its config names, stopped on drop.
 struct Server {
-    child: Child,
+    child: KillOnDrop,
     _guard: connect_guard::ConnectGuard,
 }
 
 impl Server {
     /// Boot `tcr server --headless` under `home` and wait for its listening line.
     fn boot(home: &Path, port: u16) -> Self {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut cmd = isolated_tcr(home);
         cmd.args(["server", "--headless", "--no-replace"]);
-        isolate(&mut cmd, home);
         let guard = connect_guard::ConnectGuard::attach(&mut cmd, home);
-        let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+        let mut child = KillOnDrop::spawn(cmd.stdout(Stdio::piped()).stderr(Stdio::null()))
             .expect("spawn the built tcr server");
         let stdout = child.stdout.take().expect("stdout was piped");
         let (tx, rx) = mpsc::channel();

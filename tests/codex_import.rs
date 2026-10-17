@@ -34,12 +34,10 @@
 //! The fixture's JWTs are put together at run time from a header and a payload, as the unit tests
 //! in `src/codex_oauth.rs` put theirs together: the dotted form written out whole is what a secret
 //! scanner's JWT rule matches.
-use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tcr::log_err::LogErr as _;
 
 /// `{"alg":"none","typ":"JWT"}`.
 const JWT_HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
@@ -61,44 +59,11 @@ fn fake_codex_auth_json() -> String {
 /// chatgpt.com, with no routing override.
 const UNCONSTRAINED_WORKSPACE: &str = r#"{"accounts":{"11111111-1111-4111-8111-111111111111":{"workspace_backend_origin":"NO_CONSTRAINT","account_routing_override":"NO_CONSTRAINT","plan_type":"pro"}},"account_ordering":["11111111-1111-4111-8111-111111111111"]}"#;
 
-/// A stub `codexUpstream` on `127.0.0.1:0` that answers every request `200` with `answer`, on a
-/// thread of its own for the rest of the test process. Returns its base URL and how many
-/// requests it has answered.
+/// A stub `codexUpstream` that answers every request `200` with `answer`. Returns its base URL
+/// and how many requests it has answered.
 fn spawn_codex_upstream(answer: &'static str) -> (String, Arc<AtomicUsize>) {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("binding the stub upstream must work");
-    serve_codex_upstream(listener, answer)
-}
-
-fn serve_codex_upstream(
-    listener: std::net::TcpListener,
-    answer: &'static str,
-) -> (String, Arc<AtomicUsize>) {
-    let addr = listener
-        .local_addr()
-        .expect("a bound listener has an address");
-    let answered = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&answered);
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            // Every request the import sends is a GET with no body: read its head, then answer.
-            let mut reader = BufReader::new(&mut stream);
-            let mut line = String::new();
-            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
-                line.clear();
-            }
-            counter.fetch_add(1, Ordering::SeqCst);
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
-                 connection: close\r\n\r\n{answer}",
-                answer.len()
-            )
-            .log_debug("writing a test response");
-        }
-    });
-    (format!("http://{addr}"), answered)
+    let (addr, answered) = tcr::test_support::stub_upstream::json_answering(answer, || {});
+    (addr.url(), answered)
 }
 
 /// A scratch `HOME` holding an offline config whose `accounts` array is `accounts` (JSON)
@@ -134,10 +99,9 @@ fn scratch_home_answering(
 /// credential stores pinned as the module doc says. `auth` is offered as `TCR_CODEX_AUTH`; `None`
 /// removes it, so the login can only come from a `--codex-home` in `extra` or the scratch `HOME`.
 fn login_from_codex(home: &Path, config: &Path, auth: Option<&Path>, extra: &[&str]) -> Output {
-    let bin = env!("CARGO_BIN_EXE_tcr");
     codex_command(home, config, auth, extra)
         .output()
-        .unwrap_or_else(|err| panic!("spawning the built tcr binary ({bin}) failed: {err}"))
+        .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"))
 }
 
 /// The built `tcr`, pinned as the module doc says: `HOME` the scratch dir; the Claude Code
@@ -150,19 +114,11 @@ fn pinned_tcr(home: &Path) -> Command {
     for dir in [&empty_path, &empty_search] {
         std::fs::create_dir_all(dir).expect("creating an empty directory in the scratch HOME");
     }
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut command = crate::tcr_env::tcr(home);
     command
-        .env("HOME", home)
-        .env(
-            "TCR_CLAUDE_CODE_CREDENTIALS",
-            home.join("no-claude-code-login.json"),
-        )
         .env("PATH", &empty_path)
         .env("TCR_CODEX_SEARCH_DIRS", &empty_search)
-        .env("TCR_BUNDLED_TCR", home.join("no-bundled-tcr"))
-        .env_remove("CODEX_HOME")
-        .env_remove("XDG_CACHE_HOME")
-        .env_remove("TCR_CODEX_AUTH");
+        .env("TCR_BUNDLED_TCR", home.join("no-bundled-tcr"));
     command
 }
 

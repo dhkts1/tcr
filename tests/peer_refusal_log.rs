@@ -20,113 +20,27 @@
     reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
 )]
 
-use std::collections::BTreeMap;
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tcr::log_err::LogErr as _;
+/// The harness pieces the `peer_*` test files share.
+#[path = "support/peer.rs"]
+mod peer_support;
 
+use std::time::Duration;
+
+use peer_support::{CaptureLayer, serve_shipped as serve};
 use tcr::peer::config::{self, PeerFile};
 use tcr::peer::id::NodeKey;
-use tcr::peer::listener::{self, SessionContext};
+use tcr::peer::listener::SessionContext;
 use tcr::peer::noise::{self, Handshake};
 use tcr_peer_wire::PeerId;
 use tokio::net::TcpStream;
 
-/// A scratch directory named after this process and thread, so five lanes
-/// running at once never collide on one path.
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tcr-peer-refusal-log-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
-    std::fs::create_dir_all(&dir).expect("create the scratch dir");
-    dir
-}
-
-/// Bind `127.0.0.1:0` and start the SHIPPED accept loop on it.
-async fn serve(context: SessionContext) -> SocketAddr {
-    let listener = listener::bind("127.0.0.1:0".parse().expect("a loopback address"))
-        .await
-        .expect("bind a kernel-chosen port on loopback");
-    let addr = listener.local_addr().expect("the bound address");
-    tokio::spawn(async move {
-        listener::serve_on_with(listener, context)
-            .await
-            .log_debug("serving a test peer listener");
-    });
-    addr
+    peer_support::scratch_dir("refusal-log", tag)
 }
 
 // ---------------------------------------------------------------------------
 // Item 5: the authenticated refusal log is bounded too
 // ---------------------------------------------------------------------------
-
-/// One captured tracing event.
-#[derive(Debug, Clone)]
-struct CapturedEvent {
-    message: String,
-    fields: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Default)]
-struct CaptureLayer {
-    events: Arc<Mutex<Vec<CapturedEvent>>>,
-}
-
-struct FieldVisitor(BTreeMap<String, String>);
-
-impl tracing::field::Visit for FieldVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0
-            .insert(field.name().to_string(), format!("{value:?}"));
-    }
-
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.0.insert(field.name().to_string(), value.to_string());
-    }
-
-    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.0.insert(field.name().to_string(), value.to_string());
-    }
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut visitor = FieldVisitor(BTreeMap::new());
-        event.record(&mut visitor);
-        let message = visitor
-            .0
-            .get("message")
-            .cloned()
-            .unwrap_or_else(|| "<no message field>".to_string());
-        self.events
-            .lock()
-            .expect("capture lock")
-            .push(CapturedEvent {
-                message,
-                fields: visitor.0,
-            });
-    }
-}
-
-impl CaptureLayer {
-    fn matching(&self, needle: &str) -> Vec<CapturedEvent> {
-        self.events
-            .lock()
-            .expect("capture lock")
-            .iter()
-            .filter(|event| event.message.contains(needle))
-            .cloned()
-            .collect()
-    }
-}
 
 /// **A pinned peer in a reconnect loop writes ONE log line, not one per
 /// attempt.**

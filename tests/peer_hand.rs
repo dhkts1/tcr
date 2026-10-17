@@ -1270,6 +1270,93 @@ async fn owner_lending_expiring(
 /// The second element is `None` when nothing arrived inside a LAN round trip,
 /// which is what a serve-mode grant answers: the read waits for the close.
 async fn ask_for_a_lease(owner: &Owner, secret: &[u8; 32]) -> (Lease, Option<Control>) {
+    let (mut stream, mut session) = ask_owner_for_a_lease(owner, secret).await;
+    let minted = read_the_grant(&mut stream, &mut session).await;
+    // Whatever comes next, it must not take longer than a LAN round trip: with
+    // nothing to hand over, nothing comes at all and this read waits for the
+    // close.
+    let next = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tcr::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
+    )
+    .await;
+    let next = match next {
+        Err(_elapsed) => None,
+        Ok(read) => read.ok(),
+    };
+    (minted, next)
+}
+
+/// A borrower that asks through `lease::request_lease`, and the owner it asks.
+///
+/// The home is a field because the borrower's node key lives in it, beside the
+/// peers file: `request_lease` mints the key there, so the id the owner pins is
+/// read from it and not invented.
+struct HandBorrower {
+    _home: tempfile::TempDir,
+    store: tcr::peer::config::PeerStore,
+    owner: Owner,
+}
+
+/// Stand up an owner lending to a fresh borrower in `mode`, and write the
+/// borrower's own row for it: `disclose` on, because the borrower's half of the
+/// two opt-ins is checked before it asks.
+async fn hand_borrower(mode: &str) -> HandBorrower {
+    let home = tempfile::tempdir().expect("the borrower's temp home");
+    let borrower_peers = home.path().join("tcr-peers.json");
+    let borrower = tcr::peer::id::NodeKey::load_or_mint(home.path())
+        .expect("the borrower's node key")
+        .id();
+    let owner = owner_serving(borrower, mode).await;
+
+    std::fs::write(
+        &borrower_peers,
+        format!(
+            r#"{{
+      "peers": [
+        {{
+          "node": "{node}",
+          "label": "lending-mac",
+          "addedAt": 1,
+          "allow": {{ "allowDisclose": true }},
+          "endpoints": [
+            {{
+              "kind": "direct",
+              "addr": "{addr}",
+              "source": "paired",
+              "observedAtMs": 1
+            }}
+          ]
+        }}
+      ]
+    }}"#,
+            node = tcr_peer_wire::PeerId(owner.public).to_wire(),
+            addr = owner.addr,
+        ),
+    )
+    .expect("write the borrower's peers file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&borrower_peers, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 on the peers file");
+    }
+    let store = tcr::peer::config::PeerStore::open(&borrower_peers)
+        .expect("the borrower's peers file reads");
+    HandBorrower {
+        _home: home,
+        store,
+        owner,
+    }
+}
+
+/// Open a CONTROL stream to `owner` as the borrower holding `secret`, over a
+/// pinned `Return` handshake, and send it one ask: a seven-day lease of 0.2,
+/// two at a time, for 300 seconds. The stream and session come back unread.
+async fn ask_owner_for_a_lease(
+    owner: &Owner,
+    secret: &[u8; 32],
+) -> (tokio::net::TcpStream, tcr::peer::noise::PeerSession) {
     let mut stream = tokio::net::TcpStream::connect(owner.addr)
         .await
         .expect("connect to the owner");
@@ -1302,29 +1389,24 @@ async fn ask_for_a_lease(owner: &Owner, secret: &[u8; 32]) -> (Lease, Option<Con
     tcr::peer::serve::send_control(&mut stream, &mut session, &Control::LeaseRequest(ask))
         .await
         .expect("the ask goes");
+    (stream, session)
+}
 
-    let granted: Control = tcr::peer::serve::recv_control(&mut stream, &mut session)
+/// The owner's first answer on an ask stream, which must be a grant that
+/// minted a lease.
+async fn read_the_grant(
+    stream: &mut tokio::net::TcpStream,
+    session: &mut tcr::peer::noise::PeerSession,
+) -> Lease {
+    let granted: Control = tcr::peer::serve::recv_control(stream, session)
         .await
         .expect("the owner answers the ask");
     let Control::LeaseGrant(grant) = granted else {
         panic!("the first answer is the grant, not {granted:?}");
     };
-    let minted = grant
+    grant
         .lease
-        .unwrap_or_else(|| panic!("the owner granted a lease, refusal: {:?}", grant.refusal));
-    // Whatever comes next, it must not take longer than a LAN round trip: with
-    // nothing to hand over, nothing comes at all and this read waits for the
-    // close.
-    let next = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        tcr::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
-    )
-    .await;
-    let next = match next {
-        Err(_elapsed) => None,
-        Ok(read) => read.ok(),
-    };
-    (minted, next)
+        .unwrap_or_else(|| panic!("the owner granted a lease, refusal: {:?}", grant.refusal))
 }
 
 /// **The gate for the review's first HIGH**: the mode is the FUNDING grant's,
@@ -1424,37 +1506,7 @@ async fn a_poisoned_lease_ledger_hands_nothing_over() {
         "the ledger is poisoned, or this gate is asserting about a healthy one"
     );
 
-    let mut stream = tokio::net::TcpStream::connect(owner.addr)
-        .await
-        .expect("connect to the owner");
-    let mut session = tcr::peer::noise::dial_handshake(
-        &mut stream,
-        &borrower_secret,
-        tcr::peer::noise::Handshake::Return,
-        Some(&owner.public),
-        None,
-    )
-    .await
-    .expect("the borrower is pinned, so the return visit completes");
-    let header = tcr_peer_wire::StreamHeader {
-        kind: tcr_peer_wire::StreamKind::Control,
-        target: None,
-        via: Vec::new(),
-        hops_remaining: 1,
-        request_id: tcr::peer::lease::random_id().expect("a request id"),
-    };
-    tcr::peer::serve::send_control(&mut stream, &mut session, &header)
-        .await
-        .expect("the header goes");
-    let ask = tcr_peer_wire::LeaseRequest {
-        window: Window::SevenDay,
-        unit: LeaseUnit::Fraction(0.2),
-        ttl_s: 300,
-        max_inflight: 2,
-    };
-    tcr::peer::serve::send_control(&mut stream, &mut session, &Control::LeaseRequest(ask))
-        .await
-        .expect("the ask goes");
+    let (mut stream, mut session) = ask_owner_for_a_lease(&owner, &borrower_secret).await;
 
     // Every frame this session can still read, and there must be none: the
     // refusal closes the stream. Two reads, because the defect answered with a
@@ -1518,48 +1570,8 @@ async fn a_hand_grant_is_followed_by_the_owners_bearer_on_the_same_session() {
         // difference the two legs rest on.
         let owner = owner_serving(borrower, mode).await;
 
-        let mut stream = tokio::net::TcpStream::connect(owner.addr)
-            .await
-            .expect("connect to the owner");
-        let mut session = tcr::peer::noise::dial_handshake(
-            &mut stream,
-            &borrower_secret,
-            tcr::peer::noise::Handshake::Return,
-            Some(&owner.public),
-            None,
-        )
-        .await
-        .expect("the borrower is pinned, so the return visit completes");
-
-        let header = tcr_peer_wire::StreamHeader {
-            kind: tcr_peer_wire::StreamKind::Control,
-            target: None,
-            via: Vec::new(),
-            hops_remaining: 1,
-            request_id: tcr::peer::lease::random_id().expect("a request id"),
-        };
-        tcr::peer::serve::send_control(&mut stream, &mut session, &header)
-            .await
-            .expect("the header goes");
-        let ask = tcr_peer_wire::LeaseRequest {
-            window: Window::SevenDay,
-            unit: LeaseUnit::Fraction(0.2),
-            ttl_s: 300,
-            max_inflight: 2,
-        };
-        tcr::peer::serve::send_control(&mut stream, &mut session, &Control::LeaseRequest(ask))
-            .await
-            .expect("the ask goes");
-
-        let granted: Control = tcr::peer::serve::recv_control(&mut stream, &mut session)
-            .await
-            .expect("the owner answers the ask");
-        let Control::LeaseGrant(grant) = granted else {
-            panic!("the first answer is the grant, not {granted:?}");
-        };
-        let minted = grant
-            .lease
-            .unwrap_or_else(|| panic!("the owner granted a lease, refusal: {:?}", grant.refusal));
+        let (mut stream, mut session) = ask_owner_for_a_lease(&owner, &borrower_secret).await;
+        let minted = read_the_grant(&mut stream, &mut session).await;
 
         // Whatever comes next, it must not take longer than a LAN round trip:
         // in serve mode nothing comes at all and the read waits for the close.
@@ -1647,51 +1659,11 @@ async fn a_hand_grant_is_followed_by_the_owners_bearer_on_the_same_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_borrowed_hand_lease_leaves_the_owners_bearer_in_this_process() {
     for (mode, expect_bearer) in [("hand", true), ("serve", false)] {
-        let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
-        let borrower_peers = borrower_home.path().join("tcr-peers.json");
-        // `request_lease` mints the borrower's key beside its peers file, so
-        // the id the owner has to pin is read from there and not invented.
-        let borrower = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
-            .expect("the borrower's node key")
-            .id();
-        let owner = owner_serving(borrower, mode).await;
-
-        // The borrower's own row for the owner: `disclose` on, because the
-        // borrower's half of the two opt-ins is checked here before it asks.
-        std::fs::write(
-            &borrower_peers,
-            format!(
-                r#"{{
-          "peers": [
-            {{
-              "node": "{node}",
-              "label": "lending-mac",
-              "addedAt": 1,
-              "allow": {{ "allowDisclose": true }},
-              "endpoints": [
-                {{
-                  "kind": "direct",
-                  "addr": "{addr}",
-                  "source": "paired",
-                  "observedAtMs": 1
-                }}
-              ]
-            }}
-          ]
-        }}"#,
-                node = tcr_peer_wire::PeerId(owner.public).to_wire(),
-                addr = owner.addr,
-            ),
-        )
-        .expect("write the borrower's peers file");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&borrower_peers, std::fs::Permissions::from_mode(0o600))
-                .expect("0600 on the peers file");
-        }
-        let store = tcr::peer::config::PeerStore::open(&borrower_peers)
-            .expect("the borrower's peers file reads");
+        let HandBorrower {
+            _home,
+            store,
+            owner,
+        } = hand_borrower(mode).await;
 
         let ask = tcr_peer_wire::LeaseRequest {
             window: Window::SevenDay,
@@ -1768,47 +1740,11 @@ async fn a_borrowed_hand_lease_leaves_the_owners_bearer_in_this_process() {
 /// second answer's rise alone, and the first answer's 0.10 is never charged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hand_mode_borrow_reports_its_spend_to_the_owner() {
-    let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
-    let borrower_peers = borrower_home.path().join("tcr-peers.json");
-    let borrower = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
-        .expect("the borrower's node key")
-        .id();
-    let owner = owner_serving(borrower, "hand").await;
-
-    std::fs::write(
-        &borrower_peers,
-        format!(
-            r#"{{
-      "peers": [
-        {{
-          "node": "{node}",
-          "label": "lending-mac",
-          "addedAt": 1,
-          "allow": {{ "allowDisclose": true }},
-          "endpoints": [
-            {{
-              "kind": "direct",
-              "addr": "{addr}",
-              "source": "paired",
-              "observedAtMs": 1
-            }}
-          ]
-        }}
-      ]
-    }}"#,
-            node = tcr_peer_wire::PeerId(owner.public).to_wire(),
-            addr = owner.addr,
-        ),
-    )
-    .expect("write the borrower's peers file");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&borrower_peers, std::fs::Permissions::from_mode(0o600))
-            .expect("0600 on the peers file");
-    }
-    let store = tcr::peer::config::PeerStore::open(&borrower_peers)
-        .expect("the borrower's peers file reads");
+    let HandBorrower {
+        _home,
+        store,
+        owner,
+    } = hand_borrower("hand").await;
 
     let lease = tcr::peer::lease::request_lease(
         &store,
@@ -1929,51 +1865,8 @@ async fn the_owner_hands_a_bearer_once_and_stops_at_revoke() {
     )
     .await;
 
-    let mut stream = tokio::net::TcpStream::connect(owner.addr)
-        .await
-        .expect("connect to the owner");
-    let mut session = tcr::peer::noise::dial_handshake(
-        &mut stream,
-        &borrower_secret,
-        tcr::peer::noise::Handshake::Return,
-        Some(&owner.public),
-        None,
-    )
-    .await
-    .expect("the borrower is pinned, so the return visit completes");
-
-    let header = tcr_peer_wire::StreamHeader {
-        kind: tcr_peer_wire::StreamKind::Control,
-        target: None,
-        via: Vec::new(),
-        hops_remaining: 1,
-        request_id: tcr::peer::lease::random_id().expect("a request id"),
-    };
-    tcr::peer::serve::send_control(&mut stream, &mut session, &header)
-        .await
-        .expect("the header goes");
-    tcr::peer::serve::send_control(
-        &mut stream,
-        &mut session,
-        &Control::LeaseRequest(tcr_peer_wire::LeaseRequest {
-            window: Window::SevenDay,
-            unit: LeaseUnit::Fraction(0.2),
-            ttl_s: 300,
-            max_inflight: 2,
-        }),
-    )
-    .await
-    .expect("the ask goes");
-
-    let granted: Control = tcr::peer::serve::recv_control(&mut stream, &mut session)
-        .await
-        .expect("the owner answers the ask");
-    let Control::LeaseGrant(grant) = granted else {
-        panic!("the first answer is the grant, not {granted:?}");
-    };
-    let minted = grant
-        .lease
-        .unwrap_or_else(|| panic!("the owner granted a lease, refusal: {:?}", grant.refusal));
+    let (mut stream, mut session) = ask_owner_for_a_lease(&owner, &borrower_secret).await;
+    let minted = read_the_grant(&mut stream, &mut session).await;
 
     // The bearer that rides the grant, and then nothing while it is unchanged.
     //
@@ -2047,7 +1940,7 @@ fn run_tcr_peer(
     config: &std::path::Path,
     args: &[&str],
 ) -> (String, bool) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = crate::tcr_env::tcr(peers.parent().expect("a fixture file has a directory"))
         .arg("peer")
         .args(args)
         .args(["--peers", peers.to_str().expect("a utf-8 path")])

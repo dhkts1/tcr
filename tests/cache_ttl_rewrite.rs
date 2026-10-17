@@ -4,7 +4,6 @@
 //! account data anywhere here: this repository is public.
 
 use std::sync::{Arc, Mutex};
-use tcr::log_err::LogErr as _;
 
 use axum::Router;
 use axum::body::Body;
@@ -31,16 +30,7 @@ async fn spawn_upstream_recording(seen: Bodies) -> String {
                 .expect("build the canned answer")
         }
     }));
-    let listening = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind the fake upstream");
-    let addr = listening.local_addr().expect("upstream addr");
-    tokio::spawn(async move {
-        axum::serve(listening, app)
-            .await
-            .log_debug("serving a test server");
-    });
-    format!("http://{addr}")
+    tcr::test_support::stub_upstream::http(app).url()
 }
 
 /// A manager with ONE fake account pointed at `upstream`; `extra` is spliced
@@ -83,19 +73,7 @@ async fn spawn_proxy(manager: Arc<tcr::manager::Manager>) -> String {
 const CLIENT_BODY: &str = r#"{"model":"claude-opus-5-5","max_tokens":1,"system":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}],"tools":[{"name":"t","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"5m"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#;
 
 async fn send_through(proxy: &str) -> u16 {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("the local client builds");
-    client
-        .post(format!("{proxy}/v1/messages"))
-        .header("content-type", "application/json")
-        .body(CLIENT_BODY)
-        .send()
-        .await
-        .expect("the proxy answered")
-        .status()
-        .as_u16()
+    send_body(proxy, CLIENT_BODY.as_bytes().to_vec()).await
 }
 
 fn only_body(seen: &Bodies) -> serde_json::Value {
@@ -151,11 +129,7 @@ async fn rewrite_off_forwards_the_body_byte_for_byte() {
 }
 
 async fn send_body(proxy: &str, body: Vec<u8>) -> u16 {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("the local client builds");
-    client
+    tcr::test_support::loopback::client()
         .post(format!("{proxy}/v1/messages"))
         .header("content-type", "application/json")
         .body(body)

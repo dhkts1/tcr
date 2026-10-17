@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tcr::log_err::LogErr as _;
+use tcr::test_support::child::KillOnDrop;
 
 /// `{"alg":"none","typ":"JWT"}`.
 const JWT_HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
@@ -127,36 +128,14 @@ fn fixture() -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// A stub `codexUpstream` on loopback that answers every request `200` with `answer`, calling
+/// A stub `codexUpstream` that answers every request `200` with `answer`, calling
 /// `seen` first. Returns its base URL and how many requests it answered.
 fn spawn_upstream(
     answer: &'static str,
     seen: impl Fn() + Send + 'static,
 ) -> (String, Arc<AtomicUsize>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding the stub upstream");
-    let addr = listener.local_addr().expect("an address");
-    let answered = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&answered);
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut reader = BufReader::new(&mut stream);
-            let mut line = String::new();
-            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
-                line.clear();
-            }
-            seen();
-            counter.fetch_add(1, Ordering::SeqCst);
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
-                 connection: close\r\n\r\n{answer}",
-                answer.len()
-            )
-            .log_debug("writing a test response");
-        }
-    });
-    (format!("http://{addr}"), answered)
+    let (addr, answered) = tcr::test_support::stub_upstream::json_answering(answer, seen);
+    (addr.url(), answered)
 }
 
 /// One scratch machine: a `HOME`, its config, a fake `codex`, and the files that drive it.
@@ -232,23 +211,14 @@ impl Scratch {
 
     /// The built `tcr`, pinned as the module doc says.
     fn tcr(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = crate::tcr_env::tcr(self.home.path());
         command
-            .env("HOME", self.home.path())
             // Parallel tests spawn many children; bound each child's runtime threads.
             .env("TOKIO_WORKER_THREADS", "2")
             .env("TCR_CODEX_BIN", &self.codex)
-            .env_remove("CODEX_BIN")
             .env("PATH", self.path("empty-path"))
             .env("TCR_CODEX_SEARCH_DIRS", self.path("empty-search"))
             .env("TCR_BUNDLED_TCR", self.path("no-bundled-tcr"))
-            .env(
-                "TCR_CLAUDE_CODE_CREDENTIALS",
-                self.path("no-claude-code-login.json"),
-            )
-            .env_remove("CODEX_HOME")
-            .env_remove("TCR_CODEX_AUTH")
-            .env_remove("XDG_CACHE_HOME")
             .stdin(Stdio::null());
         command
     }
@@ -913,7 +883,7 @@ fn login_codex_stops_codex_and_removes_its_folder_when_cancelled() {
         if group {
             std::os::unix::process::CommandExt::process_group(&mut command, 0);
         }
-        let mut child = command.spawn().expect("spawning the built tcr binary");
+        let mut child = KillOnDrop::spawn(&mut command).expect("spawning the built tcr binary");
         let tcr = child.id();
         let stdout = child.stdout.take().expect("piped stdout");
         let (lines, received) = std::sync::mpsc::channel::<String>();
@@ -1028,14 +998,15 @@ fn cancelling_codex_login_reports_a_throwaway_folder_it_could_not_delete() {
     );
     let error_log = scratch.path("cancel.stderr");
     let event_log = scratch.path("cancel.stdout");
-    let mut child = scratch
-        .tcr()
-        .args(["login", "--codex", "--non-interactive", "--config"])
-        .arg(&scratch.config)
-        .stdout(std::fs::File::create(&event_log).unwrap())
-        .stderr(std::fs::File::create(&error_log).unwrap())
-        .spawn()
-        .unwrap();
+    let mut child = KillOnDrop::spawn(
+        scratch
+            .tcr()
+            .args(["login", "--codex", "--non-interactive", "--config"])
+            .arg(&scratch.config)
+            .stdout(std::fs::File::create(&event_log).unwrap())
+            .stderr(std::fs::File::create(&error_log).unwrap()),
+    )
+    .unwrap();
     let mut cleanup = TestProcessCleanup::new(child.id());
     // Allow both freshly built tcr and the fresh shell fixture to finish loader startup.
     let ready = within(Duration::from_secs(20), || {

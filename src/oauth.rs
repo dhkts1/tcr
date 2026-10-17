@@ -1361,26 +1361,8 @@ pub fn upsert_account(
                 .map_or(0, |max| max + 1);
 
             config.accounts.push(Account {
-                name: name.to_string(),
-                account_type: crate::config::AccountType::OAuth,
-                provider: Default::default(),
-                account_uuid,
-                org_uuid,
-                org_name,
-                access_token: tokens.access_token.clone(),
-                refresh_token: tokens.refresh_token.clone(),
-                expires_at: Some(tokens.expires_at_ms),
                 priority: Some(next_priority),
-                switch_threshold: None,
-                disabled: None,
-                groups: None,
-                organization_type: profile.organization_type.clone(),
-                rate_limit_tier: profile.rate_limit_tier.clone(),
-                seat_tier: profile.seat_tier.clone(),
-                egress: crate::config::Egress::Local,
-                egress_strict: false,
-                codex_home: None,
-                extra: serde_json::Map::new(),
+                ..claude_login_row(name, tokens, profile)
             });
             Ok(())
         }
@@ -1400,15 +1382,16 @@ pub fn upsert_account(
     }
 }
 
-/// The proxy port a login must guard against — the port the running server binds.
-/// Reads `proxy.port` from the config (falling back to the serde default when the
-/// file is missing or unreadable), so the guard checks the SAME port `tcr server`
-/// takes over.
-fn login_target_port(config_path: &Path) -> u16 {
-    config::load(config_path).map_or_else(
-        |_| config::ProxyConfig::default().port,
-        |config| config.proxy.port,
-    )
+/// Where an admitted login writes its finished credential. The two routes the
+/// guard lets through; a refusal is not one of them (it is [`LoginRoute::Refuse`],
+/// which [`admit_login_against`] turns into an error), so code after admission
+/// cannot match on a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteRoute {
+    /// Write the config file ([`LoginRoute::File`]).
+    File,
+    /// Post to the live proxy's add route ([`LoginRoute::Live`]).
+    Live,
 }
 
 /// What `login()` should do with the finished credential, decided purely from
@@ -1425,7 +1408,7 @@ enum LoginRoute {
     /// api-key rejection (`AddCapability::Unauthorized`) never resolves to
     /// this, under `--force` or otherwise: that is positive evidence the
     /// proxy is alive, so there is no unsafe file write for `--force` to
-    /// rescue — see `login_route`'s `Unauthorized` arm.
+    /// rescue — see `admit_login_against`'s `Unauthorized` arm.
     File,
     /// A live proxy is there and its add route is confirmed: route the
     /// finished credential through it instead of the file. Wins even against
@@ -1564,28 +1547,7 @@ async fn probe_add_capability(config: &Config) -> AddCapability {
 /// header) learns it with no second request. Empty when the server named none,
 /// which is how a server that predates the header, and every non-answer, reads.
 async fn probe_add_route(config: &Config) -> (AddCapability, Vec<crate::provider::Provider>) {
-    let probe = Account {
-        name: String::new(),
-        account_type: crate::config::AccountType::OAuth,
-        provider: Default::default(),
-        account_uuid: None,
-        org_uuid: None,
-        org_name: None,
-        access_token: String::new(),
-        refresh_token: None,
-        expires_at: None,
-        priority: None,
-        switch_threshold: None,
-        disabled: None,
-        groups: None,
-        organization_type: None,
-        rate_limit_tier: None,
-        seat_tier: None,
-        egress: crate::config::Egress::Local,
-        egress_strict: false,
-        codex_home: None,
-        extra: serde_json::Map::new(),
-    };
+    let probe = Account::new("", crate::provider::Provider::default(), "");
     let (answer, providers) = crate::cli::post_add_account_with_providers(config, &probe).await;
     let capability = match answer {
         // A blank name/token can never be added, so `Ok` cannot happen in
@@ -1606,32 +1568,73 @@ async fn probe_add_route(config: &Config) -> (AddCapability, Vec<crate::provider
     (capability, providers)
 }
 
-/// Resolve which [`LoginRoute`] `login()` should take. Runs the impure HTTP
-/// capability probe UNCONDITIONALLY — including under `--force` — deliberately
-/// never gated on whether [`crate::singleton::live_proxy_server`]
-/// (`incumbent`) noticed anything on the port first, NOR on `force`: skipping
-/// the probe under `--force` is exactly the bug bridge item C removed, since
-/// it is what let `--force` take the file path even when the live route was
-/// confirmed and safe. `force` only changes what happens when the probe
-/// itself produced an UNUSABLE answer (something holds the port but is not
-/// confirmed safe) — that case falls back to `LoginRoute::File` under
-/// `--force` instead of erroring out, mirroring the historical "force always
-/// succeeds via the file" behaviour. An api-key rejection (`Unauthorized`) is
-/// a DIFFERENT case, and `--force` never rescues it: it is positive evidence
-/// of a live, healthy proxy — it answered, parsed our request, and rejected
-/// the key — which makes it the worst-informed moment to whole-file-write
-/// beside it, since a live server rotating tokens is exactly what makes that
-/// write destructive. Fully resolves before `login()` starts the OAuth
-/// dance, so a user is never told to stop a server AFTER completing a full
-/// browser round-trip, and never silently falls back to the file when a live
-/// proxy answered but rejected our api-key.
-async fn login_route(
-    config_path: &Path,
-    incumbent: Option<singleton::Incumbent>,
+/// The login a refusal tells the user to run again ([`login_guard_refusal_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginCommand {
+    /// `tcr login`
+    Browser,
+    /// `tcr login --from-claude-code`
+    FromClaudeCode,
+    /// `tcr login --from-codex`
+    FromCodex,
+    /// `tcr login --codex`
+    Codex,
+}
+
+impl LoginCommand {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Browser => LOGIN_COMMAND,
+            Self::FromClaudeCode => LOGIN_FROM_CLAUDE_CODE_COMMAND,
+            Self::FromCodex => LOGIN_FROM_CODEX_COMMAND,
+            Self::Codex => LOGIN_CODEX_COMMAND,
+        }
+    }
+}
+
+/// A login the guard let through: the route to write by, the port and incumbent it was decided against, and
+/// the providers the probe's answer advertised ([`probe_add_route`]).
+#[derive(Debug)]
+struct Admitted {
+    route: WriteRoute,
     port: u16,
+    pid: Option<u32>,
+    providers: Vec<crate::provider::Provider>,
+}
+
+impl Admitted {
+    /// Refuse a live server that cannot store a Codex login, naming `command`
+    /// as the login to run again ([`codex_live_route_refusal`]).
+    fn require_codex(&self, command: LoginCommand) -> anyhow::Result<()> {
+        if self.route == WriteRoute::Live
+            && !self.providers.contains(&crate::provider::Provider::Codex)
+        {
+            bail!(
+                "{}",
+                codex_live_route_refusal(self.port, self.pid, command.as_str())
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The admission every login starts with: find the port the server binds, look
+/// for an incumbent on it, and resolve which route the finished credential
+/// takes ([`admit_login_against`]). A refusal comes back as the error, so an
+/// [`Admitted`] carries a [`WriteRoute`], which has no refusal.
+///
+/// Reads the config once: its `proxy.port` is the port the running server
+/// binds, so the guard checks the SAME port `tcr server` takes over, and the
+/// same value feeds the probe.
+async fn admit_login(
+    config_path: &Path,
     force: bool,
-) -> anyhow::Result<LoginRoute> {
-    login_route_for(config_path, incumbent, port, force, LOGIN_COMMAND).await
+    command: LoginCommand,
+) -> anyhow::Result<Admitted> {
+    let config = load_or_default(config_path)?;
+    let port = config.proxy.port;
+    let incumbent = singleton::live_proxy_server(port);
+    admit_login_against(config_path, &config, incumbent, port, force, command).await
 }
 
 /// [`login_guard_refusal_for`] for plain `tcr login`, whose refusal says `run 'tcr login'`. The
@@ -1646,35 +1649,40 @@ fn login_guard_refusal(
     login_guard_refusal_for(incumbent, has_add_route, port, force, LOGIN_COMMAND)
 }
 
-/// [`login_route`] for the login `command` names (`tcr login --from-claude-code`, …), which a
-/// refusal tells the user to run again ([`login_guard_refusal_for`]).
-async fn login_route_for(
+/// [`admit_login`] against a given `incumbent` and `port`, which is the seam a
+/// test uses to say what process detection saw. `command` is the login that
+/// was run, which a refusal names ([`login_guard_refusal_for`]).
+///
+/// Runs the impure HTTP
+/// capability probe UNCONDITIONALLY — including under `--force` — deliberately
+/// never gated on whether [`crate::singleton::live_proxy_server`]
+/// (`incumbent`) noticed anything on the port first, NOR on `force`: skipping
+/// the probe under `--force` is exactly the bug bridge item C removed, since
+/// it is what let `--force` take the file path even when the live route was
+/// confirmed and safe. `force` only changes what happens when the probe
+/// itself produced an UNUSABLE answer (something holds the port but is not
+/// confirmed safe) — that case falls back to `LoginRoute::File` under
+/// `--force` instead of erroring out, mirroring the historical "force always
+/// succeeds via the file" behaviour. An api-key rejection (`Unauthorized`) is
+/// a DIFFERENT case, and `--force` never rescues it: it is positive evidence
+/// of a live, healthy proxy — it answered, parsed our request, and rejected
+/// the key — which makes it the worst-informed moment to whole-file-write
+/// beside it, since a live server rotating tokens is exactly what makes that
+/// write destructive. Fully resolves before a login starts the OAuth
+/// dance, so a user is never told to stop a server AFTER completing a full
+/// browser round-trip, and never silently falls back to the file when a live
+/// proxy answered but rejected our api-key.
+async fn admit_login_against(
     config_path: &Path,
+    config: &Config,
     incumbent: Option<singleton::Incumbent>,
     port: u16,
     force: bool,
-    command: &str,
-) -> anyhow::Result<LoginRoute> {
-    login_route_with_providers(config_path, incumbent, port, force, command)
-        .await
-        .map(|(route, _)| route)
-}
-
-/// [`login_route`], plus the providers the probe's answer advertised
-/// ([`probe_add_route`]). Every decision is `login_route`'s; the list rides
-/// along for the callers that must refuse a live server unable to store their
-/// provider: `import_codex_login`, and `tcr login --codex` before codex runs
-/// ([`codex_login_route_check`]). `command` is the login that was run, which a
-/// refusal names ([`login_guard_refusal_for`]).
-async fn login_route_with_providers(
-    config_path: &Path,
-    incumbent: Option<singleton::Incumbent>,
-    port: u16,
-    force: bool,
-    command: &str,
-) -> anyhow::Result<(LoginRoute, Vec<crate::provider::Provider>)> {
-    let config = load_or_default(config_path)?;
-    let (capability, providers) = probe_add_route(&config).await;
+    command: LoginCommand,
+) -> anyhow::Result<Admitted> {
+    let pid = incumbent.map(|incumbent| incumbent.pid);
+    let command = command.as_str();
+    let (capability, providers) = probe_add_route(config).await;
     let route = match capability {
         // Positive evidence the proxy is alive: it answered, parsed our
         // request, and rejected the key. Refuses regardless of `--force` —
@@ -1699,20 +1707,30 @@ async fn login_route_with_providers(
         // falling through to `LoginRoute::File` the way folding this into
         // `Absent` used to when `incumbent` was `None`.
         AddCapability::Unusable(why) => {
-            if force {
-                return Ok((LoginRoute::File, providers));
+            if !force {
+                bail!(
+                    "the proxy on :{port} answered but not usably ({why}) while checking whether \
+                     it could take a live login — no browser was opened and nothing was changed. \
+                     This is first-hand evidence something holds the port even though process \
+                     detection may have missed it, so the historical whole-file-write hazard still \
+                     applies. Re-run with --force to log in via the file instead (this still risks \
+                     the running server overwriting it on its next token refresh)."
+                );
             }
-            bail!(
-                "the proxy on :{port} answered but not usably ({why}) while checking whether \
-                 it could take a live login — no browser was opened and nothing was changed. \
-                 This is first-hand evidence something holds the port even though process \
-                 detection may have missed it, so the historical whole-file-write hazard still \
-                 applies. Re-run with --force to log in via the file instead (this still risks \
-                 the running server overwriting it on its next token refresh)."
-            );
+            LoginRoute::File
         }
     };
-    Ok((route, providers))
+    let route = match route {
+        LoginRoute::Refuse(msg) => bail!("{}", msg),
+        LoginRoute::File => WriteRoute::File,
+        LoginRoute::Live => WriteRoute::Live,
+    };
+    Ok(Admitted {
+        route,
+        port,
+        pid,
+        providers,
+    })
 }
 
 /// What the browser half of a login produced: the PKCE/CSRF material, the
@@ -1792,12 +1810,9 @@ pub async fn login(
     ui: LoginUi,
 ) -> anyhow::Result<String> {
     ui.install();
-    let port = login_target_port(config_path);
-    let incumbent = singleton::live_proxy_server(port);
-    let route = login_route(config_path, incumbent, port, force).await?;
-    if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
-    }
+    let route = admit_login(config_path, force, LoginCommand::Browser)
+        .await?
+        .route;
 
     // Resolve --account early, ONLY to compute the login_hint (ergonomics —
     // see build_login_flow's doc-comment). Fail fast here on a typo'd or
@@ -1964,7 +1979,7 @@ fn read_setup_token() -> anyhow::Result<String> {
 
 /// Add an account from a `claude setup-token` credential instead of the
 /// browser flow. Reuses every downstream layer [`login`] does — the same
-/// [`login_route`] guard against a live server, the same [`fetch_profile`] /
+/// [`admit_login`] guard against a live server, the same [`fetch_profile`] /
 /// [`finish_login`] pipeline — and replaces only the browser half: instead of
 /// a PKCE round trip, the access token is read from stdin
 /// ([`read_setup_token`]) and wrapped in a [`Tokens`] with `refresh_token:
@@ -2085,12 +2100,9 @@ pub async fn login_with_token(
         );
     }
 
-    let port = login_target_port(config_path);
-    let incumbent = singleton::live_proxy_server(port);
-    let route = login_route(config_path, incumbent, port, force).await?;
-    if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
-    }
+    let route = admit_login(config_path, force, LoginCommand::Browser)
+        .await?
+        .route;
 
     let access_token = read_setup_token()?;
     let tokens = Tokens {
@@ -2416,7 +2428,7 @@ pub fn first_codex_account_notice(
 /// Existence checks, never a read of either file.
 ///
 /// It follows a save that already happened, so it cannot fail the login: a config it cannot read
-/// is read as the default one, as [`login_target_port`] reads it.
+/// is read as the default one, by falling back to the serde default.
 pub(crate) async fn read_first_codex_account_notice(config_path: &Path) -> String {
     let Ok(config) = config::load(config_path).or_else(|_| serde_json::from_str::<Config>("{}"))
     else {
@@ -2449,27 +2461,14 @@ pub(crate) fn say_codex_notices(ui: LoginUi, notices: &[crate::codex_local::Code
 /// checks it, and on the live route the provider gate [`import_codex_login`] applies, naming
 /// `tcr login --codex` as the command to run again.
 pub(crate) async fn codex_login_route_check(config_path: &Path, force: bool) -> anyhow::Result<()> {
-    let port = login_target_port(config_path);
-    let incumbent = singleton::live_proxy_server(port);
-    let pid = incumbent.map(|incumbent| incumbent.pid);
-    let (route, providers) =
-        login_route_with_providers(config_path, incumbent, port, force, LOGIN_CODEX_COMMAND)
-            .await?;
-    if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
-    }
-    if route == LoginRoute::Live && !providers.contains(&crate::provider::Provider::Codex) {
-        bail!(
-            "{}",
-            codex_live_route_refusal(port, pid, LOGIN_CODEX_COMMAND)
-        );
-    }
-    Ok(())
+    admit_login(config_path, force, LoginCommand::Codex)
+        .await?
+        .require_codex(LoginCommand::Codex)
 }
 
 /// The write half of `tcr login --from-codex`: everything after the read, given
 /// the login. The Codex twin of [`import_claude_code_login`]: the same route
-/// probe and persist path every other login takes ([`login_route`],
+/// probe and persist path every other login takes ([`admit_login`],
 /// [`finish_login_account`]), so a running proxy, `--force` and a corrupt config
 /// behave as they do for `tcr login`. The row is [`codex_account_row`]'s, with
 /// `provider: codex`.
@@ -2522,7 +2521,7 @@ pub(crate) async fn import_codex_login(
     codex_home: Option<&Path>,
 ) -> anyhow::Result<String> {
     import_codex_login_as(
-        LOGIN_FROM_CODEX_COMMAND,
+        LoginCommand::FromCodex,
         config_path,
         force,
         name,
@@ -2536,7 +2535,7 @@ pub(crate) async fn import_codex_login(
 /// [`import_codex_login`], for the login `command` names, which a refusal tells the user to run
 /// again: `tcr login --codex` writes through here too.
 pub(crate) async fn import_codex_login_as(
-    command: &str,
+    command: LoginCommand,
     config_path: &Path,
     force: bool,
     name: Option<&str>,
@@ -2576,17 +2575,9 @@ pub(crate) async fn import_codex_login_as(
             bail!("the Codex login on this machine is not '{wanted}'; nothing was written.");
         }
     }
-    let port = login_target_port(config_path);
-    let incumbent = singleton::live_proxy_server(port);
-    let pid = incumbent.map(|incumbent| incumbent.pid);
-    let (route, providers) =
-        login_route_with_providers(config_path, incumbent, port, force, command).await?;
-    if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
-    }
-    if route == LoginRoute::Live && !providers.contains(&crate::provider::Provider::Codex) {
-        bail!("{}", codex_live_route_refusal(port, pid, command));
-    }
+    let admitted = admit_login(config_path, force, command).await?;
+    admitted.require_codex(command)?;
+    let route = admitted.route;
     let config = load_or_default(config_path)?;
     let resolved_name = match existing_codex_row(&config, &login) {
         Some(row) => {
@@ -2729,26 +2720,13 @@ fn codex_account_row(
     codex_home: Option<&Path>,
 ) -> Account {
     Account {
-        name,
-        account_type: crate::config::AccountType::OAuth,
-        provider: crate::provider::Provider::Codex,
         account_uuid: login.user_id,
         org_uuid: login.account_id,
-        org_name: None,
-        access_token: login.access_token,
         refresh_token: Some(login.refresh_token),
         expires_at: login.expires_at_ms,
-        priority: None,
-        switch_threshold: None,
-        disabled: None,
-        groups: None,
         organization_type: login.plan_type,
-        rate_limit_tier: None,
-        seat_tier: None,
-        egress: crate::config::Egress::Local,
-        egress_strict: false,
         codex_home: codex_home.map(|folder| folder.display().to_string()),
-        extra: serde_json::Map::new(),
+        ..Account::new(name, crate::provider::Provider::Codex, login.access_token)
     }
 }
 
@@ -2925,19 +2903,9 @@ async fn import_claude_code_login(
     ui: LoginUi,
 ) -> anyhow::Result<Option<String>> {
     ui.install();
-    let port = login_target_port(config_path);
-    let incumbent = singleton::live_proxy_server(port);
-    let route = login_route_for(
-        config_path,
-        incumbent,
-        port,
-        force,
-        LOGIN_FROM_CLAUDE_CODE_COMMAND,
-    )
-    .await?;
-    if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
-    }
+    let route = admit_login(config_path, force, LoginCommand::FromClaudeCode)
+        .await?
+        .route;
 
     let tokens = tokens_from_claude_code_login(login);
 
@@ -3116,7 +3084,7 @@ fn looks_like_email(s: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn finish_login_checked(
     config_path: &Path,
-    route: LoginRoute,
+    route: WriteRoute,
     config: &mut Config,
     name: &str,
     tokens: &Tokens,
@@ -3366,8 +3334,8 @@ fn persist_via_account_or_file(config_path: &Path, account: &Account) -> anyhow:
 }
 
 /// Persist a finished login's `account` row per `route`, and return the name
-/// it was saved under: through the live proxy when it is [`LoginRoute::Live`],
-/// via [`persist_via_file`] when it is [`LoginRoute::File`]. Split out of
+/// it was saved under: through the live proxy when it is [`WriteRoute::Live`],
+/// via [`persist_via_file`] when it is [`WriteRoute::File`]. Split out of
 /// [`login`] so WHERE the credential lands is testable without driving a real
 /// browser.
 ///
@@ -3399,16 +3367,13 @@ fn persist_via_account_or_file(config_path: &Path, account: &Account) -> anyhow:
 /// are.
 async fn finish_login_account(
     config_path: &Path,
-    route: LoginRoute,
+    route: WriteRoute,
     config: &Config,
     account: Account,
 ) -> anyhow::Result<String> {
     match route {
-        LoginRoute::Refuse(_) => {
-            unreachable!("every login bails on a refusal before it has a credential to persist")
-        }
-        LoginRoute::File => persist_via_file(config_path, account),
-        LoginRoute::Live => {
+        WriteRoute::File => persist_via_file(config_path, account),
+        WriteRoute::Live => {
             match crate::cli::post_add_account(config, &account).await {
                 // Behind the provider gate, and checked anyway: a non-Anthropic
                 // row the server did not confirm storing AS that provider is a
@@ -3548,40 +3513,40 @@ fn misstored_provider_refusal(
 /// login authenticated as, plus the tokens it produced.
 async fn finish_login(
     config_path: &Path,
-    route: LoginRoute,
+    route: WriteRoute,
     config: &mut Config,
     name: &str,
     tokens: &Tokens,
     profile: Profile,
 ) -> anyhow::Result<String> {
-    let account = Account {
-        name: name.to_string(),
-        account_type: crate::config::AccountType::OAuth,
-        provider: Default::default(),
-        account_uuid: profile.account_uuid,
-        org_uuid: profile.org_uuid,
-        org_name: profile.org_name,
-        access_token: tokens.access_token.clone(),
+    let account = claude_login_row(name, tokens, &profile);
+    finish_login_account(config_path, route, config, account).await
+}
+
+/// The Anthropic row a login becomes: the profile it authenticated as, plus the
+/// tokens it produced, with no priority (the caller sets one or leaves the
+/// server to).
+///
+/// The plan fields ride the SERVER route too, and for free: the request body
+/// `finish_login_account` posts is a serialized `config::Account`, so the two
+/// serde fields put the plan on the wire without a second payload shape to
+/// keep in step. Pinned by `add_account_request_carries_the_plan_fields`.
+fn claude_login_row(name: &str, tokens: &Tokens, profile: &Profile) -> Account {
+    Account {
+        account_uuid: profile.account_uuid.clone(),
+        org_uuid: profile.org_uuid.clone(),
+        org_name: profile.org_name.clone(),
         refresh_token: tokens.refresh_token.clone(),
         expires_at: Some(tokens.expires_at_ms),
-        priority: None,
-        switch_threshold: None,
-        disabled: None,
-        groups: None,
-        // Carried on the SERVER route too, and for free: the request body
-        // `finish_login_account` posts is a serialized `config::Account`, so the
-        // two serde fields put the plan on the wire without a second payload
-        // shape to keep in step. Pinned by
-        // `add_account_request_carries_the_plan_fields`.
-        organization_type: profile.organization_type,
-        rate_limit_tier: profile.rate_limit_tier,
-        seat_tier: profile.seat_tier,
-        egress: crate::config::Egress::Local,
-        egress_strict: false,
-        codex_home: None,
-        extra: serde_json::Map::new(),
-    };
-    finish_login_account(config_path, route, config, account).await
+        organization_type: profile.organization_type.clone(),
+        rate_limit_tier: profile.rate_limit_tier.clone(),
+        seat_tier: profile.seat_tier.clone(),
+        ..Account::new(
+            name,
+            crate::provider::Provider::Anthropic,
+            tokens.access_token.clone(),
+        )
+    }
 }
 
 /// Load the config for a login, creating the file with defaults when it does
@@ -4183,26 +4148,19 @@ mod tests {
     /// with `left: None, right: Some("rt-original")`. Restored, it passes.
     #[tokio::test]
     async fn refresh_access_token_at_preserves_stored_refresh_token_when_response_omits_one() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let endpoint = format!("http://127.0.0.1:{port}/");
-        tokio::spawn(async move {
-            let app = axum::Router::new().route(
-                "/",
-                axum::routing::post(|| async {
-                    // A real rotation response that omits `refresh_token` —
-                    // exactly the shape Anthropic's endpoint sends when it
-                    // does not rotate the refresh token on this call.
-                    axum::Json(serde_json::json!({
-                        "access_token": "at-fresh",
-                        "expires_at": 1_893_456_000_000i64
-                    }))
-                }),
-            );
-            axum::serve(listener, app)
-                .await
-                .log_debug("serving a test server");
-        });
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async {
+                // A real rotation response that omits `refresh_token` —
+                // exactly the shape Anthropic's endpoint sends when it
+                // does not rotate the refresh token on this call.
+                axum::Json(serde_json::json!({
+                    "access_token": "at-fresh",
+                    "expires_at": 1_893_456_000_000i64
+                }))
+            }),
+        );
+        let endpoint = format!("{}/", crate::test_support::stub_upstream::http(app).url());
 
         let client = reqwest::Client::new();
         let tokens = refresh_access_token_at(&client, "rt-original", &endpoint)
@@ -4251,9 +4209,7 @@ mod tests {
                 "/codex",
                 axum::routing::post(recorder("codex", seen.clone())),
             );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let addr = crate::test_support::stub_upstream::http(app);
 
         let mut refresher =
             LiveRefresher::new().with_codex_endpoint(format!("http://{addr}/codex"));
@@ -4731,6 +4687,11 @@ mod tests {
         Some(singleton::Incumbent { pid: 4242, kind })
     }
 
+    /// The config at `path`, read once, as `admit_login` hands it to the guard.
+    fn cfg(path: &Path) -> Config {
+        load_or_default(path).expect("test config loads")
+    }
+
     /// Unwrap a [`LoginRoute::Refuse`]'s message, or panic naming what came back
     /// instead — every existing refusal test still wants the bare message
     /// string, and this is the one place that unwrap lives now that the guard
@@ -4933,29 +4894,114 @@ mod tests {
         );
     }
 
-    #[test]
-    fn login_target_port_reads_config_and_defaults_when_missing() {
-        // Reads proxy.port so the guard checks the SAME port the server binds.
-        let path =
-            std::env::temp_dir().join(format!("tcr-oauth-login-port-{}.json", std::process::id()));
-        std::fs::write(&path, r#"{ "proxy": { "port": 4999 } }"#).unwrap();
-        assert_eq!(login_target_port(&path), 4999);
-        std::fs::remove_file(&path).ok();
-        // A missing/unreadable config falls back to the serde default (3456).
-        let missing = std::env::temp_dir().join("tcr-oauth-login-port-does-not-exist.json");
-        assert_eq!(login_target_port(&missing), 3456);
+    // --- loopback helpers: the only places this module's tests open a socket -------------
+
+    /// A port nothing listens on, so a connect to it is refused outright. Port 1 (tcpmux) is
+    /// never bound on a dev machine or CI, so no socket is opened to find one; this replaces a
+    /// bind-read-drop of a port-0 listener in each test that wanted a refusal.
+    const DEAD_PORT: u16 = 1;
+
+    /// Serve `app` on its own ephemeral loopback port for the rest of the test, and return the
+    /// address. Only for code that dials a bare PORT (a live proxy's `proxy.port`); a stub reached
+    /// by a base URL is a route on `test_support::stub_upstream` instead, with no port of its own.
+    async fn serve_router(app: axum::Router) -> std::net::SocketAddr {
+        let (listener, port) = crate::test_support::loopback::listener().await;
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .log_debug("serving a test server");
+        });
+        std::net::SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// [`crate::test_support::live_proxy::serve`] for the config the JSON `seed` holds.
+    fn serve_live_proxy(
+        listener: TcpListener,
+        seed: &str,
+        config_path: Option<std::path::PathBuf>,
+    ) -> std::sync::Arc<crate::manager::Manager> {
+        crate::test_support::live_proxy::serve(
+            listener,
+            serde_json::from_str(seed).unwrap(),
+            config_path,
+        )
+    }
+
+    /// A live proxy, with no config file, that admits only requests carrying `api_key`.
+    /// Answers its port.
+    async fn live_proxy_requiring_the_api_key(api_key: &str) -> u16 {
+        let (listener, port) = crate::test_support::loopback::listener().await;
+        let seed = format!(r#"{{ "proxy": {{ "port": {port}, "apiKey": "{api_key}" }} }}"#);
+        serve_live_proxy(listener, &seed, None);
+        port
+    }
+
+    /// A live proxy, and a temp config file tagged `tag` that names its port and nothing else.
+    /// The proxy itself runs with no config file behind it. Answers the file's path and the port.
+    async fn a_live_proxy_and_its_config_file(tag: &str) -> (std::path::PathBuf, u16) {
+        let (listener, port) = crate::test_support::loopback::listener().await;
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-route-{tag}-{}-{port}.json",
+            std::process::id()
+        ));
+        let seed = format!(r#"{{ "proxy": {{ "port": {port} }} }}"#);
+        std::fs::write(&path, &seed).unwrap();
+        serve_live_proxy(listener, &seed, None);
+        (path, port)
+    }
+
+    /// Serve `app` on a loopback port for the life of the test binary, from a thread and runtime
+    /// of its own (each `#[tokio::test]` has a runtime that dies with it, so a server spawned
+    /// from one test would die under the others). For a stub whose answer never varies, one
+    /// listener then does for every test that wants it.
+    fn serve_for_the_binary(app: axum::Router) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = TcpListener::from_std(listener).unwrap();
+                axum::serve(listener, app)
+                    .await
+                    .log_debug("serving a shared test server");
+            });
+        });
+        port
+    }
+
+    /// The port of one shared server whose router has no routes: it answers every path with a
+    /// 404 carrying no `ENDPOINT_HEADER`, the shape of an older tcr.
+    fn empty_router_port() -> u16 {
+        static PORT: std::sync::LazyLock<u16> =
+            std::sync::LazyLock::new(|| serve_for_the_binary(axum::Router::new()));
+        *PORT
+    }
+
+    /// The port of one shared listener that accepts nothing: a connect succeeds off the kernel
+    /// backlog and nothing is ever written back, the wedged shape. Held in a static, so it
+    /// outlives every test and a connect to it never closes under one.
+    fn wedged_port() -> u16 {
+        static WEDGED: std::sync::LazyLock<(std::net::TcpListener, u16)> =
+            std::sync::LazyLock::new(|| {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                (listener, port)
+            });
+        WEDGED.1
     }
 
     // --- probe_add_capability -----------------------------------------------
 
     #[tokio::test]
     async fn probe_add_capability_reads_a_stamped_400_as_present() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let config: Config =
-            serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
-        let manager = crate::manager::Manager::with_live_refresher(config.clone(), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let (listener, port) = crate::test_support::loopback::listener().await;
+        let seed = format!(r#"{{ "proxy": {{ "port": {port} }} }}"#);
+        serve_live_proxy(listener, &seed, None);
+        let config: Config = serde_json::from_str(&seed).unwrap();
 
         assert_eq!(probe_add_capability(&config).await, AddCapability::Present);
     }
@@ -4965,17 +5011,11 @@ mod tests {
     /// own router produces, even its 404s and 405s) — is first-hand evidence
     /// a live process holds the port. It must NOT collapse into `Absent`
     /// (renamed from this test's old expectation): folding it in there is
-    /// exactly what let `login_route` silently choose `File` beside a real,
+    /// exactly what let the login guard silently choose `File` beside a real,
     /// answering-but-old server whenever pid detection missed it.
     #[tokio::test]
     async fn probe_add_capability_unstamped_404_is_unusable_not_absent() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            axum::serve(listener, axum::Router::new())
-                .await
-                .log_debug("serving a test server");
-        });
+        let port = empty_router_port();
         let config: Config =
             serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
         assert!(matches!(
@@ -4991,10 +5031,7 @@ mod tests {
     /// server.
     #[tokio::test]
     async fn probe_add_capability_connection_refused_is_absent() {
-        let dead_port = {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        let dead_port = DEAD_PORT;
         let config: Config =
             serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {dead_port} }} }}"#)).unwrap();
         assert_eq!(probe_add_capability(&config).await, AddCapability::Absent);
@@ -5006,8 +5043,7 @@ mod tests {
     /// ever written back. Costs the probe's own 5s deadline by construction.
     #[tokio::test]
     async fn probe_add_capability_wedged_port_is_unusable() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let port = wedged_port();
         let config: Config =
             serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
 
@@ -5015,19 +5051,11 @@ mod tests {
             probe_add_capability(&config).await,
             AddCapability::Unusable(_)
         ));
-        drop(listener);
     }
 
     #[tokio::test]
     async fn probe_add_capability_wrong_api_key_is_unauthorized_not_absent() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server_config: Config = serde_json::from_str(&format!(
-            r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#
-        ))
-        .unwrap();
-        let manager = crate::manager::Manager::with_live_refresher(server_config, None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let port = live_proxy_requiring_the_api_key("correct-key").await;
 
         // The caller's config carries the WRONG key.
         let client_config: Config = serde_json::from_str(&format!(
@@ -5041,137 +5069,154 @@ mod tests {
         );
     }
 
-    // --- login_route ----------------------------------------------------------
+    // --- admit_login_against ----------------------------------------------------------
 
     /// THE INTEGRATION-LEVEL VERSION of
     /// `login_guard_proceeds_live_on_a_confirmed_route_even_when_incumbent_detection_missed_it`:
     /// a real live server answering the real route, called with `incumbent:
     /// None` (simulating a pid/argv/owner-file detection MISS — the TcrBar
     /// case, where `argv[0]` ends in `/TcrBar` and
-    /// `singleton::classify_proxy_server` recognizes nothing). `login_route`
+    /// `singleton::classify_proxy_server` recognizes nothing). `admit_login_against`
     /// must still probe and proceed live — it must never gate the probe
     /// itself on `incumbent.is_some()`, which is exactly the shape of bug
     /// this test catches: skipping the probe here would fall through to
-    /// `LoginRoute::File` beside a real, answering server.
+    /// `WriteRoute::File` beside a real, answering server.
     #[tokio::test]
-    async fn login_route_proceeds_live_even_when_incumbent_detection_missed_a_real_server() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-route-missed-incumbent-{}-{port}.json",
-            std::process::id()
-        ));
-        let seed = format!(r#"{{ "proxy": {{ "port": {port} }} }}"#);
-        std::fs::write(&path, &seed).unwrap();
+    async fn admit_login_proceeds_live_even_when_incumbent_detection_missed_a_real_server() {
+        let (path, port) = a_live_proxy_and_its_config_file("missed-incumbent").await;
 
-        let server_config: Config = serde_json::from_str(&seed).unwrap();
-        let manager = crate::manager::Manager::with_live_refresher(server_config, None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
-
-        let route = login_route(&path, None, port, false)
-            .await
-            .expect("a confirmed route must not error");
+        let route =
+            admit_login_against(&path, &cfg(&path), None, port, false, LoginCommand::Browser)
+                .await
+                .expect("a confirmed route must not error")
+                .route;
         assert_eq!(
             route,
-            LoginRoute::Live,
+            WriteRoute::Live,
             "the probe must decide this on its own, independent of incumbent detection"
         );
         std::fs::remove_file(&path).ok();
     }
 
-    /// Bridge item C, at the `login_route` level: `--force` must still probe
+    /// Bridge item C, at the `admit_login_against` level: `--force` must still probe
     /// and still prefer `Live` when a real server confirms the route — never
     /// skip straight to `File` the way the pre-fix early-return did.
     #[tokio::test]
-    async fn login_route_prefers_live_over_force_when_a_real_server_confirms_the_route() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-route-force-live-{}-{port}.json",
-            std::process::id()
-        ));
-        let seed = format!(r#"{{ "proxy": {{ "port": {port} }} }}"#);
-        std::fs::write(&path, &seed).unwrap();
+    async fn admit_login_prefers_live_over_force_when_a_real_server_confirms_the_route() {
+        let (path, port) = a_live_proxy_and_its_config_file("force-live").await;
 
-        let server_config: Config = serde_json::from_str(&seed).unwrap();
-        let manager = crate::manager::Manager::with_live_refresher(server_config, None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
-
-        let route = login_route(&path, None, port, true)
-            .await
-            .expect("a confirmed route under --force must not error");
+        let route =
+            admit_login_against(&path, &cfg(&path), None, port, true, LoginCommand::Browser)
+                .await
+                .expect("a confirmed route under --force must not error")
+                .route;
         assert_eq!(
             route,
-            LoginRoute::Live,
+            WriteRoute::Live,
             "--force must still probe and prefer Live when the route is confirmed"
         );
         std::fs::remove_file(&path).ok();
     }
 
-    /// Bridge item D, at the `login_route` level: a wedged port — something
+    /// Bridge item D, at the `admit_login_against` level: a wedged port — something
     /// answers the TCP connect and then never responds — must refuse even
     /// when `incumbent` is `None` (pid/argv detection missed it entirely, the
     /// TcrBar shape). Before this fix, `AddCapability::Absent` covered this
-    /// case too, and `login_guard_refusal`'s `None => LoginRoute::File` arm
+    /// case too, and `login_guard_refusal`'s `None => WriteRoute::File` arm
     /// let it through with no `--force` needed at all.
     #[tokio::test]
-    async fn login_route_refuses_a_wedged_port_even_when_incumbent_detection_missed_it() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+    async fn admit_login_refuses_a_wedged_port_even_when_incumbent_detection_missed_it() {
+        let port = wedged_port();
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-route-wedged-{}-{port}.json",
             std::process::id()
         ));
         std::fs::write(&path, format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
 
-        let err = login_route(&path, None, port, false)
+        let err = admit_login_against(&path, &cfg(&path), None, port, false, LoginCommand::Browser)
             .await
             .expect_err("a wedged port must refuse, not silently choose File");
         assert!(err.to_string().contains("--force"), "{err}");
 
         std::fs::remove_file(&path).ok();
-        drop(listener);
     }
 
     /// The escape hatch still works past a wedged-port refusal: `--force`
     /// resolves to `File` rather than erroring out.
     #[tokio::test]
-    async fn login_route_force_resolves_to_file_past_a_wedged_port_refusal() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+    async fn admit_login_force_resolves_to_file_past_a_wedged_port_refusal() {
+        let port = wedged_port();
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-route-wedged-force-{}-{port}.json",
             std::process::id()
         ));
         std::fs::write(&path, format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
 
-        let route = login_route(&path, None, port, true)
-            .await
-            .expect("--force must still resolve past a wedged-port refusal");
-        assert_eq!(route, LoginRoute::File);
+        let route =
+            admit_login_against(&path, &cfg(&path), None, port, true, LoginCommand::Browser)
+                .await
+                .expect("--force must still resolve past a wedged-port refusal")
+                .route;
+        assert_eq!(route, WriteRoute::File);
 
         std::fs::remove_file(&path).ok();
-        drop(listener);
+    }
+
+    /// A refusal comes back as the error, naming the login that was run, and
+    /// `--force` turns the same refusal into an admitted file route: an
+    /// `Admitted` is never `Refuse`.
+    #[tokio::test]
+    async fn admit_login_bails_on_a_refusal_naming_the_command_and_force_admits_the_file() {
+        let port = DEAD_PORT;
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-admit-refusal-{}-{port}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
+
+        let err = admit_login_against(
+            &path,
+            &cfg(&path),
+            incumbent(singleton::ProxyKind::Tcr),
+            port,
+            false,
+            LoginCommand::FromClaudeCode,
+        )
+        .await
+        .expect_err("an incumbent with no add route must refuse");
+        assert!(
+            err.to_string().contains(LOGIN_FROM_CLAUDE_CODE_COMMAND),
+            "{err}"
+        );
+
+        let admitted = admit_login_against(
+            &path,
+            &cfg(&path),
+            incumbent(singleton::ProxyKind::Tcr),
+            port,
+            true,
+            LoginCommand::FromClaudeCode,
+        )
+        .await
+        .expect("--force admits the file route past that refusal");
+        assert_eq!(admitted.route, WriteRoute::File);
+        assert_eq!(admitted.pid, Some(4242));
+        assert!(admitted.require_codex(LoginCommand::Codex).is_ok());
+
+        std::fs::remove_file(&path).ok();
     }
 
     /// THE OVERRULE: `--force` is the escape hatch past a wedged-port
     /// refusal (above), but it must NOT be one past `AddCapability::
     /// Unauthorized`. A rejected api-key is positive evidence the proxy is
     /// alive and healthy — the worst-informed moment to fall back to a
-    /// whole-file write beside it — so `login_route` must keep refusing even
+    /// whole-file write beside it — so `admit_login_against` must keep refusing even
     /// under `--force`, and nothing along the way may touch the config file.
     #[tokio::test]
-    async fn login_route_refuses_unauthorized_even_under_force() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server_config: Config = serde_json::from_str(&format!(
-            r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#
-        ))
-        .unwrap();
-        let manager = crate::manager::Manager::with_live_refresher(server_config, None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+    async fn admit_login_refuses_unauthorized_even_under_force() {
+        let port = live_proxy_requiring_the_api_key("correct-key").await;
 
-        // The file `login_route` reads carries the WRONG key.
+        // The file `admit_login_against` reads carries the WRONG key.
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-route-unauthorized-force-{}-{port}.json",
             std::process::id()
@@ -5180,7 +5225,7 @@ mod tests {
         std::fs::write(&path, &seed).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let err = login_route(&path, None, port, true)
+        let err = admit_login_against(&path, &cfg(&path), None, port, true, LoginCommand::Browser)
             .await
             .expect_err("--force must not rescue a rejected api-key");
         assert!(err.to_string().contains("api-key"), "{err}");
@@ -5256,24 +5301,38 @@ mod tests {
             .to_string()
     }
 
+    /// One person (`uuid-person`) in two orgs, Corp and Personal, one row each.
+    const ONE_PERSON_IN_TWO_ORGS: &str = r#"{ "accounts": [
+            { "name": "me@example.com (Corp)", "type": "oauth", "accessToken": "at-corp",
+              "refreshToken": "rt-corp-DEAD", "expiresAt": 1893456000000, "priority": 0,
+              "accountUuid": "uuid-person", "orgUuid": "org-corp", "orgName": "Corp" },
+            { "name": "me@example.com (Personal)", "type": "oauth", "accessToken": "at-pers",
+              "refreshToken": "rt-personal-ALIVE", "expiresAt": 1893456000000, "priority": 1,
+              "accountUuid": "uuid-person", "orgUuid": "org-personal", "orgName": "Personal" }
+        ] }"#;
+
+    /// `seed` written to a fresh temp config file tagged `tag`, and its path.
+    fn login_file(tag: &str, seed: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("tcr-oauth-{tag}-{}-{seq}.json", std::process::id()));
+        std::fs::write(&path, seed).unwrap();
+        path
+    }
+
     /// A mismatch between the requested account and the identity that came
     /// back writes NOTHING — the config file is byte-identical afterwards —
     /// and the error names both sides.
     #[tokio::test]
     async fn finish_login_checked_mismatch_writes_nothing() {
-        let seed = two_account_seed();
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-mismatch-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, &seed).unwrap();
+        let path = login_file("account-mismatch", &two_account_seed());
         let mut config = load_or_default(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
         let err = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "alice@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
@@ -5297,18 +5356,12 @@ mod tests {
     /// today's no-`--account` flow.
     #[tokio::test]
     async fn finish_login_checked_match_writes_normally() {
-        let seed = two_account_seed();
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-match-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, &seed).unwrap();
+        let path = login_file("account-match", &two_account_seed());
         let mut config = load_or_default(&path).unwrap();
 
         let name = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "alice@example.com",
             &tokens("at-fresh", "rt-fresh", 1_893_456_000_000),
@@ -5333,13 +5386,7 @@ mod tests {
     /// evaluated is not evidence of a match.
     #[tokio::test]
     async fn finish_login_checked_all_none_profile_refuses() {
-        let seed = two_account_seed();
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-allnone-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, &seed).unwrap();
+        let path = login_file("account-allnone", &two_account_seed());
         let mut config = load_or_default(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
@@ -5354,7 +5401,7 @@ mod tests {
         };
         let err = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "alice@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
@@ -5393,12 +5440,7 @@ mod tests {
               "refreshToken": "rt-2", "expiresAt": 1893456000000, "priority": 1,
               "orgUuid": "org-b", "orgName": "Corp B" }
         ] }"#;
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-ambiguous-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, seed).unwrap();
+        let path = login_file("account-ambiguous", seed);
         // Migrates: the two rows become `dup@example.com` and
         // `dup@example.com/corp-b`. `corp-b` on its own names neither.
         let mut config = load_or_default(&path).unwrap();
@@ -5407,7 +5449,7 @@ mod tests {
 
         let err = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "dup@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
@@ -5445,12 +5487,7 @@ mod tests {
               "refreshToken": "rt-2", "expiresAt": 1893456000000, "priority": 1,
               "accountUuid": "uuid-dup", "orgUuid": "org-b", "orgName": "Corp B" }
         ] }"#;
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-org-disambig-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, seed).unwrap();
+        let path = login_file("account-org-disambig", seed);
         // Loading migrates the duplicate: Corp A keeps the bare email (lower
         // priority number), Corp B takes its org's slug.
         let mut config = load_or_default(&path).unwrap();
@@ -5459,7 +5496,7 @@ mod tests {
 
         let name = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "dup@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
@@ -5527,20 +5564,7 @@ mod tests {
     /// before erroring would also produce.
     #[tokio::test]
     async fn finish_login_checked_same_uuid_different_org_is_a_mismatch() {
-        let seed = r#"{ "accounts": [
-            { "name": "me@example.com (Corp)", "type": "oauth", "accessToken": "at-corp",
-              "refreshToken": "rt-corp-DEAD", "expiresAt": 1893456000000, "priority": 0,
-              "accountUuid": "uuid-person", "orgUuid": "org-corp", "orgName": "Corp" },
-            { "name": "me@example.com (Personal)", "type": "oauth", "accessToken": "at-pers",
-              "refreshToken": "rt-personal-ALIVE", "expiresAt": 1893456000000, "priority": 1,
-              "accountUuid": "uuid-person", "orgUuid": "org-personal", "orgName": "Personal" }
-        ] }"#;
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-same-uuid-diff-org-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, seed).unwrap();
+        let path = login_file("account-same-uuid-diff-org", ONE_PERSON_IN_TWO_ORGS);
         let mut config = load_or_default(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
@@ -5554,7 +5578,7 @@ mod tests {
 
         let err = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "me@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
@@ -5587,12 +5611,7 @@ mod tests {
     /// A fleet of one Claude row and one Codex row, `bob@example.com/codex`, whose proxy is on
     /// a port nothing listens on, written to a fresh tempdir.
     async fn claude_and_codex_rows() -> (tempfile::TempDir, std::path::PathBuf) {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = DEAD_PORT;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(
@@ -5712,20 +5731,7 @@ mod tests {
     /// exactly as permissive as `upsert_account`'s own write-time resolution.
     #[tokio::test]
     async fn finish_login_checked_same_uuid_same_org_matches() {
-        let seed = r#"{ "accounts": [
-            { "name": "me@example.com (Corp)", "type": "oauth", "accessToken": "at-corp",
-              "refreshToken": "rt-corp-DEAD", "expiresAt": 1893456000000, "priority": 0,
-              "accountUuid": "uuid-person", "orgUuid": "org-corp", "orgName": "Corp" },
-            { "name": "me@example.com (Personal)", "type": "oauth", "accessToken": "at-pers",
-              "refreshToken": "rt-personal-ALIVE", "expiresAt": 1893456000000, "priority": 1,
-              "accountUuid": "uuid-person", "orgUuid": "org-personal", "orgName": "Personal" }
-        ] }"#;
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-same-uuid-same-org-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, seed).unwrap();
+        let path = login_file("account-same-uuid-same-org", ONE_PERSON_IN_TWO_ORGS);
         let mut config = load_or_default(&path).unwrap();
 
         let right_profile = profile_with_identity(
@@ -5737,7 +5743,7 @@ mod tests {
 
         let name = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "me@example.com (Corp)",
             &tokens("at-fresh-corp", "rt-fresh-corp", 1_893_456_000_000),
@@ -5784,18 +5790,13 @@ mod tests {
             { "name": "work", "type": "oauth", "accessToken": "at-work",
               "refreshToken": "rt-work-DEAD", "expiresAt": 1893456000000, "priority": 0 }
         ] }"#;
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-non-email-name-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, seed).unwrap();
+        let path = login_file("account-non-email-name", seed);
         let mut config = load_or_default(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
         let err = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "work",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
@@ -5827,18 +5828,12 @@ mod tests {
     /// cannot satisfy).
     #[tokio::test]
     async fn finish_login_checked_no_account_skips_the_check() {
-        let seed = two_account_seed();
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-none-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, &seed).unwrap();
+        let path = login_file("account-none", &two_account_seed());
         let mut config = load_or_default(&path).unwrap();
 
         let name = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
@@ -5873,8 +5868,7 @@ mod tests {
     /// be reverted. It must not be.
     #[tokio::test]
     async fn finish_login_live_path_does_not_clobber_a_concurrent_rotation() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-live-clobber-{}-{port}.json",
             std::process::id()
@@ -5888,11 +5882,7 @@ mod tests {
             ] }}"#
         );
         std::fs::write(&path, &seed).unwrap();
-
-        let server_config: Config = serde_json::from_str(&seed).unwrap();
-        let manager =
-            crate::manager::Manager::with_live_refresher(server_config, Some(path.clone()));
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        serve_live_proxy(listener, &seed, Some(path.clone()));
 
         // The stale snapshot: what `login()` would have loaded before its own
         // async window (profile fetch / stdin prompt) opened.
@@ -5902,26 +5892,11 @@ mod tests {
         // held — a real re-login through the same route this unit adds,
         // exactly the race `login()`'s doc-comment describes.
         let rotated_bob = Account {
-            name: "bob@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-bob-ROTATED".to_string(),
             refresh_token: Some("rt-bob-ROTATED".to_string()),
             expires_at: Some(1_893_456_000_000),
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("bob@example.com")
         };
         let rotate_config = load_or_default(&path).unwrap();
         crate::cli::post_add_account(&rotate_config, &rotated_bob)
@@ -5939,7 +5914,7 @@ mod tests {
         // Now finish a THIRD account's login, live, using the STALE snapshot.
         let name = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut client_config,
             "charlie@example.com",
             &tokens("at-charlie", "rt-charlie", 1_893_456_000_000),
@@ -5980,19 +5955,14 @@ mod tests {
     /// how the two halves end up disagreeing about an account's credentials.
     #[tokio::test]
     async fn finish_login_live_unauthorized_does_not_fall_back_to_file() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let seed = format!(r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#);
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-live-unauthorized-{}-{port}.json",
             std::process::id()
         ));
         std::fs::write(&path, &seed).unwrap();
-
-        let server_config: Config = serde_json::from_str(&seed).unwrap();
-        let manager =
-            crate::manager::Manager::with_live_refresher(server_config, Some(path.clone()));
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        serve_live_proxy(listener, &seed, Some(path.clone()));
 
         // The caller's config carries the WRONG key.
         let mut client_config: Config = serde_json::from_str(&format!(
@@ -6003,7 +5973,7 @@ mod tests {
 
         let err = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut client_config,
             "dave@example.com",
             &tokens("at-dave", "rt-dave", 1_893_456_000_000),
@@ -6026,10 +5996,7 @@ mod tests {
     /// as the historical file-only path always has.
     #[tokio::test]
     async fn finish_login_no_server_falls_back_to_file_quietly() {
-        let dead_port = {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        let dead_port = DEAD_PORT;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-live-noserver-{}-{dead_port}.json",
             std::process::id()
@@ -6043,7 +6010,7 @@ mod tests {
 
         let name = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut config,
             "erin@example.com",
             &tokens("at-erin", "rt-erin", 1_893_456_000_000),
@@ -6060,6 +6027,72 @@ mod tests {
             serde_json::json!("erin@example.com")
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A temp config file tagged `tag` holding alice on a proxy at `port`, and the stale
+    /// snapshot of it: what `login()` would have loaded before its own async window (profile
+    /// fetch / stdin prompt) opened.
+    fn alice_on_a_proxy_port(tag: &str, port: u16) -> (std::path::PathBuf, Config) {
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-{tag}-{}-{port}.json",
+            std::process::id()
+        ));
+        let seed = format!(
+            r#"{{ "proxy": {{ "port": {port} }}, "accounts": [
+                {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
+                  "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 }}
+            ] }}"#
+        );
+        std::fs::write(&path, &seed).unwrap();
+        let snapshot = load_or_default(&path).unwrap();
+        (path, snapshot)
+    }
+
+    /// Rotate alice's tokens on disk through `config::save_account`, the live server's own
+    /// surgical persist path, and check the rotation landed.
+    fn rotate_alice_on_disk(path: &std::path::Path) {
+        let rotated_alice = Account {
+            access_token: "at-alice-ROTATED".to_string(),
+            refresh_token: Some("rt-alice-ROTATED".to_string()),
+            expires_at: Some(1_893_456_000_000),
+            priority: None,
+            ..Account::fixture("alice@example.com")
+        };
+        config::save_account(path, &rotated_alice).expect("the rotation must land on disk");
+        let after_rotation = std::fs::read_to_string(path).unwrap();
+        assert!(
+            after_rotation.contains("rt-alice-ROTATED"),
+            "setup: the rotation must be on disk first: {after_rotation}"
+        );
+    }
+
+    /// The file at `path` still holds alice's rotated refresh token, so `route` did not
+    /// whole-file-write a stale snapshot back over `rotation`, and `<added>@example.com`
+    /// was added.
+    fn assert_the_rotation_survived_and_one_was_added(
+        path: &std::path::Path,
+        route: &str,
+        rotation: &str,
+        added: &str,
+    ) {
+        let final_doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let accounts = final_doc["accounts"].as_array().unwrap();
+        let alice = accounts
+            .iter()
+            .find(|a| a["name"] == "alice@example.com")
+            .expect("alice must still be on disk");
+        assert_eq!(
+            alice["refreshToken"],
+            serde_json::json!("rt-alice-ROTATED"),
+            "{route} must NOT whole-file-write a stale snapshot back over {rotation}: {final_doc}"
+        );
+        assert!(
+            accounts
+                .iter()
+                .any(|a| a["name"] == format!("{added}@example.com").as_str()),
+            "{added} was added: {final_doc}"
+        );
     }
 
     /// THE σ5 EXPERIMENT bridge item A calls for. The WEDGED shape
@@ -6089,59 +6122,17 @@ mod tests {
         // Bound and never accepted: connections queue in the kernel backlog
         // and the connect succeeds, but nothing is ever written back —
         // `post_add_account` times out at its own 5s deadline.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-live-timeout-{}-{port}.json",
-            std::process::id()
-        ));
-        let seed = format!(
-            r#"{{ "proxy": {{ "port": {port} }}, "accounts": [
-                {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
-                  "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 }}
-            ] }}"#
-        );
-        std::fs::write(&path, &seed).unwrap();
-
-        // The stale snapshot: what `login()` would have loaded before its own
-        // async window (profile fetch / stdin prompt) opened.
-        let mut client_config = load_or_default(&path).unwrap();
+        let port = wedged_port();
+        let (path, mut client_config) = alice_on_a_proxy_port("live-timeout", port);
 
         // A rotation lands on disk AFTER that snapshot was taken — the live
         // server's own persist path, used directly since the port itself is
         // silent in this scenario and cannot carry a real round-trip.
-        let rotated_alice = Account {
-            name: "alice@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: "at-alice-ROTATED".to_string(),
-            refresh_token: Some("rt-alice-ROTATED".to_string()),
-            expires_at: Some(1_893_456_000_000),
-            priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        };
-        config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
-        let after_rotation = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            after_rotation.contains("rt-alice-ROTATED"),
-            "setup: the rotation must be on disk first: {after_rotation}"
-        );
+        rotate_alice_on_disk(&path);
 
         let name = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut client_config,
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
@@ -6150,27 +6141,14 @@ mod tests {
         .await
         .expect("a timed-out live add must still fall back to a file write");
         assert_eq!(name, "carol@example.com");
-
-        let final_doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let accounts = final_doc["accounts"].as_array().unwrap();
-        let alice = accounts
-            .iter()
-            .find(|a| a["name"] == "alice@example.com")
-            .expect("alice must still be on disk");
-        assert_eq!(
-            alice["refreshToken"],
-            serde_json::json!("rt-alice-ROTATED"),
-            "the timed-out live add must NOT whole-file-write a stale snapshot back over \
-             alice's rotation: {final_doc}"
-        );
-        assert!(
-            accounts.iter().any(|a| a["name"] == "carol@example.com"),
-            "carol was added: {final_doc}"
+        assert_the_rotation_survived_and_one_was_added(
+            &path,
+            "the timed-out live add",
+            "alice's rotation",
+            "carol",
         );
 
         std::fs::remove_file(&path).ok();
-        drop(listener);
     }
 
     /// THE σ5 EXPERIMENT for the `NoServer` arm specifically — same shape as
@@ -6192,61 +6170,16 @@ mod tests {
         // was live a moment ago (mirroring the capability probe having
         // confirmed it), but by the time `finish_login` runs, nothing is
         // listening and a connect is refused outright.
-        let dead_port = {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-live-noserver-clobber-{}-{dead_port}.json",
-            std::process::id()
-        ));
-        let seed = format!(
-            r#"{{ "proxy": {{ "port": {dead_port} }}, "accounts": [
-                {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
-                  "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 }}
-            ] }}"#
-        );
-        std::fs::write(&path, &seed).unwrap();
-
-        // The stale snapshot: what `login()` would have loaded before its own
-        // async window (profile fetch / stdin prompt) opened.
-        let mut client_config = load_or_default(&path).unwrap();
+        let (path, mut client_config) = alice_on_a_proxy_port("live-noserver-clobber", DEAD_PORT);
 
         // A rotation lands on disk AFTER that snapshot was taken — the
         // (now-gone) server's own persist path, used directly since the port
         // is silent for the whole test and cannot carry a real round-trip.
-        let rotated_alice = Account {
-            name: "alice@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: "at-alice-ROTATED".to_string(),
-            refresh_token: Some("rt-alice-ROTATED".to_string()),
-            expires_at: Some(1_893_456_000_000),
-            priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        };
-        config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
-        let after_rotation = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            after_rotation.contains("rt-alice-ROTATED"),
-            "setup: the rotation must be on disk first: {after_rotation}"
-        );
+        rotate_alice_on_disk(&path);
 
         let name = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut client_config,
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
@@ -6255,29 +6188,17 @@ mod tests {
         .await
         .expect("a NoServer live add must still fall back to a surgical write");
         assert_eq!(name, "carol@example.com");
-
-        let final_doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let accounts = final_doc["accounts"].as_array().unwrap();
-        let alice = accounts
-            .iter()
-            .find(|a| a["name"] == "alice@example.com")
-            .expect("alice must still be on disk");
-        assert_eq!(
-            alice["refreshToken"],
-            serde_json::json!("rt-alice-ROTATED"),
-            "the NoServer live add must NOT whole-file-write a stale snapshot back over \
-             alice's rotation: {final_doc}"
-        );
-        assert!(
-            accounts.iter().any(|a| a["name"] == "carol@example.com"),
-            "carol was added: {final_doc}"
+        assert_the_rotation_survived_and_one_was_added(
+            &path,
+            "the NoServer live add",
+            "alice's rotation",
+            "carol",
         );
 
         std::fs::remove_file(&path).ok();
     }
 
-    /// THE σ5 EXPERIMENT for `LoginRoute::File` itself — the arm
+    /// THE σ5 EXPERIMENT for `WriteRoute::File` itself — the arm
     /// `persist_via_file` serves directly, not one of its live-path
     /// fallbacks. Reproduces the 2026-08-14 incident: a `tcr login` lands on
     /// `File` (no live proxy answers on the guarded port — the exact
@@ -6331,7 +6252,7 @@ mod tests {
 
         let name = finish_login(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut client_config,
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
@@ -6349,20 +6270,11 @@ mod tests {
             "the File route must NOT whole-file-write a stale snapshot back over an \
              out-of-band top-level key: {final_doc}"
         );
-        let accounts = final_doc["accounts"].as_array().unwrap();
-        let alice = accounts
-            .iter()
-            .find(|a| a["name"] == "alice@example.com")
-            .expect("alice must still be on disk");
-        assert_eq!(
-            alice["refreshToken"],
-            serde_json::json!("rt-alice-ROTATED"),
-            "the File route must NOT whole-file-write a stale snapshot back over an \
-             out-of-band rotation: {final_doc}"
-        );
-        assert!(
-            accounts.iter().any(|a| a["name"] == "carol@example.com"),
-            "carol was added: {final_doc}"
+        assert_the_rotation_survived_and_one_was_added(
+            &path,
+            "the File route",
+            "an out-of-band rotation",
+            "carol",
         );
 
         std::fs::remove_file(&path).ok();
@@ -6379,61 +6291,18 @@ mod tests {
     /// rather than `Unusable`.
     #[tokio::test]
     async fn finish_login_no_route_does_not_clobber_other_accounts() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            axum::serve(listener, axum::Router::new())
-                .await
-                .log_debug("serving a test server");
-        });
-
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-live-noroute-{}-{port}.json",
-            std::process::id()
-        ));
-        let seed = format!(
-            r#"{{ "proxy": {{ "port": {port} }}, "accounts": [
-                {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
-                  "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 }}
-            ] }}"#
-        );
-        std::fs::write(&path, &seed).unwrap();
-
-        // The stale snapshot: what `login()` would have loaded before its own
-        // async window (profile fetch / stdin prompt) opened.
-        let mut client_config = load_or_default(&path).unwrap();
+        let port = empty_router_port();
+        let (path, mut client_config) = alice_on_a_proxy_port("live-noroute", port);
 
         // A rotation lands on disk AFTER that snapshot was taken — this
         // "older tcr" has no add-account route to have produced it, standing
         // in for any other writer that touched the file in the window, same
         // as every sibling clobber test in this file.
-        let rotated_alice = Account {
-            name: "alice@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: "at-alice-ROTATED".to_string(),
-            refresh_token: Some("rt-alice-ROTATED".to_string()),
-            expires_at: Some(1_893_456_000_000),
-            priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        };
-        config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
+        rotate_alice_on_disk(&path);
 
         let name = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut client_config,
             "dana@example.com",
             &tokens("at-dana", "rt-dana", 1_893_456_000_000),
@@ -6442,23 +6311,11 @@ mod tests {
         .await
         .expect("a NoRoute live add must still fall back to a surgical write");
         assert_eq!(name, "dana@example.com");
-
-        let final_doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let accounts = final_doc["accounts"].as_array().unwrap();
-        let alice = accounts
-            .iter()
-            .find(|a| a["name"] == "alice@example.com")
-            .expect("alice must still be on disk");
-        assert_eq!(
-            alice["refreshToken"],
-            serde_json::json!("rt-alice-ROTATED"),
-            "the NoRoute live add must NOT whole-file-write a stale snapshot back over \
-             alice's rotation: {final_doc}"
-        );
-        assert!(
-            accounts.iter().any(|a| a["name"] == "dana@example.com"),
-            "dana was added: {final_doc}"
+        assert_the_rotation_survived_and_one_was_added(
+            &path,
+            "the NoRoute live add",
+            "alice's rotation",
+            "dana",
         );
 
         std::fs::remove_file(&path).ok();
@@ -6468,15 +6325,12 @@ mod tests {
     /// `read_document` opens the file with `fs::read_to_string`, which cannot
     /// create one that is not there — so a `NoServer` result reached with NO
     /// config file on disk at all must still fall back to `persist_via_file`
-    /// (the same whole-file write `LoginRoute::File` always used) instead of
+    /// (the same whole-file write `WriteRoute::File` always used) instead of
     /// bailing on the read error. A first-ever login must be able to create
     /// the file exactly as it always has.
     #[tokio::test]
     async fn finish_login_no_server_creates_the_file_when_none_exists() {
-        let dead_port = {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        let dead_port = DEAD_PORT;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-live-noserver-nofile-{}-{dead_port}.json",
             std::process::id()
@@ -6493,7 +6347,7 @@ mod tests {
 
         let name = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut client_config,
             "frank@example.com",
             &tokens("at-frank", "rt-frank", 1_893_456_000_000),
@@ -6543,12 +6397,7 @@ mod tests {
     /// Restored, it passes.
     #[tokio::test]
     async fn setup_token_account_writes_with_refresh_token_absent_and_expires_at_set() {
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-setup-token-write-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, r#"{ "accounts": [] }"#).unwrap();
+        let path = login_file("setup-token-write", r#"{ "accounts": [] }"#);
         let mut config = load_or_default(&path).unwrap();
 
         let setup_tokens = Tokens {
@@ -6560,7 +6409,7 @@ mod tests {
 
         let name = finish_login(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "gina",
             &setup_tokens,
@@ -6731,8 +6580,7 @@ mod tests {
     /// A canned upstream that answers every connection with `status_line` and an
     /// empty body, for [`verify_setup_token`]. Returns its base URL.
     async fn canned_upstream(status_line: &'static str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
@@ -6754,7 +6602,7 @@ mod tests {
                 });
             }
         });
-        format!("http://{addr}")
+        format!("http://127.0.0.1:{port}")
     }
 
     /// The bug this guards: a pasted token upstream refuses with 401 must be
@@ -6800,11 +6648,8 @@ mod tests {
     /// stores it with a warning rather than refusing an offline operator.
     #[tokio::test]
     async fn verify_setup_token_reports_dead_upstream_as_unreachable() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
         assert!(matches!(
-            verify_setup_token(&format!("http://{addr}"), "any-token").await,
+            verify_setup_token(&format!("http://127.0.0.1:{DEAD_PORT}"), "any-token").await,
             SetupTokenCheck::Unreachable { .. }
         ));
     }
@@ -6851,26 +6696,11 @@ mod tests {
     /// [`unnamed_fallback`] reads.
     fn named_account(name: &str) -> Account {
         Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-placeholder".to_string(),
             refresh_token: None,
             expires_at: None,
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture(name)
         }
     }
 
@@ -6941,7 +6771,7 @@ mod tests {
 
         let name = finish_login(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "imported@example.com",
             &tokens,
@@ -7217,8 +7047,7 @@ mod tests {
     #[tokio::test]
     async fn a_codex_import_over_the_live_route_lands_as_codex_beside_the_anthropic_row() {
         use crate::provider::Provider;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-codex-live-{}-{port}.json",
             std::process::id()
@@ -7231,11 +7060,7 @@ mod tests {
             ] }}"#
         );
         std::fs::write(&path, &seed).unwrap();
-        let server_config: Config = serde_json::from_str(&seed).unwrap();
-        let manager =
-            crate::manager::Manager::with_live_refresher(server_config, Some(path.clone()));
-        let served = std::sync::Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager = serve_live_proxy(listener, &seed, Some(path.clone()));
 
         let login = crate::codex_login::CodexLogin {
             access_token: "at-codex".to_string(),
@@ -7259,7 +7084,7 @@ mod tests {
         assert_eq!(name, "alice@example.com/codex");
         let saved = finish_login_account(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &config,
             codex_account_row(name, login, None),
         )
@@ -7303,6 +7128,20 @@ mod tests {
     }
 
     // --- import_codex_login: the provider gate, the echo, the re-import rules --
+
+    /// Import alice's Codex login (bearer `at-codex`) into the config at `path` with no flags:
+    /// no `--force`, no name, no `--account`, no `CODEX_HOME`.
+    async fn import_alices_login(path: &std::path::Path) -> anyhow::Result<String> {
+        import_codex_login(
+            path,
+            false,
+            None,
+            None,
+            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+            None,
+        )
+        .await
+    }
 
     /// alice's Codex login for account A, expiring at `expires_at_ms`, with these
     /// fake tokens.
@@ -7361,12 +7200,28 @@ mod tests {
         status: u16,
         body: &str,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<SeenCheck>>>) {
+        recording_stub(
+            axum::http::StatusCode::from_u16(status).unwrap(),
+            axum::http::header::CONTENT_TYPE,
+            "application/json",
+            body,
+        )
+    }
+
+    /// A stub that answers every request `status` with the one header `name: value` and
+    /// `body`, and records each request as a [`SeenCheck`]. Returns its base URL and the record.
+    fn recording_stub(
+        status: axum::http::StatusCode,
+        name: axum::http::HeaderName,
+        value: &str,
+        body: &str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<SeenCheck>>>) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = std::sync::Arc::clone(&seen);
-        let body = body.to_string();
+        let (value, body) = (value.to_string(), body.to_string());
         let origin = axum::Router::new().fallback(move |req: axum::extract::Request| {
             let recorded = std::sync::Arc::clone(&recorded);
-            let body = body.clone();
+            let (name, value, body) = (name.clone(), value.clone(), body.clone());
             async move {
                 let header = |name: &str| {
                     req.headers()
@@ -7379,20 +7234,10 @@ mod tests {
                     bearer: header("authorization"),
                     account_id: header(crate::provider::CODEX_ACCOUNT_HEADER),
                 });
-                (
-                    axum::http::StatusCode::from_u16(status).unwrap(),
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    body,
-                )
+                (status, [(name, value)], body)
             }
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let addr = crate::test_support::stub_upstream::http(origin);
         (format!("http://{addr}"), seen)
     }
 
@@ -7471,14 +7316,7 @@ mod tests {
                 }
             }),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            axum::serve(listener, route)
-                .await
-                .log_debug("serving a test server");
-        });
-        (port, seen)
+        (serve_router(route).await.port(), seen)
     }
 
     /// THE GATE. A live proxy that answers the route but names no providers predates
@@ -7542,8 +7380,7 @@ mod tests {
     #[tokio::test]
     async fn a_codex_import_over_a_proxy_that_names_codex_lands_live_as_codex() {
         use crate::provider::Provider;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let (_dir, path) = import_config(
             port,
             &unconstrained_upstream().await,
@@ -7553,23 +7390,15 @@ mod tests {
                       "expiresAt": 1893456000000, "priority": 0 }}]"#
             ),
         );
-        let server_config: Config =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let manager =
-            crate::manager::Manager::with_live_refresher(server_config, Some(path.clone()));
-        let served = std::sync::Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager = serve_live_proxy(
+            listener,
+            &std::fs::read_to_string(&path).unwrap(),
+            Some(path.clone()),
+        );
 
-        let saved = import_codex_login(
-            &path,
-            false,
-            None,
-            None,
-            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-            None,
-        )
-        .await
-        .expect("a server that names codex takes the import live");
+        let saved = import_alices_login(&path)
+            .await
+            .expect("a server that names codex takes the import live");
         assert_eq!(saved, "alice@example.com/codex");
 
         let codex = (0..manager.account_count())
@@ -7594,16 +7423,9 @@ mod tests {
             let (port, seen) = stub_add_route(true, echo).await;
             let (_dir, path) = import_config(port, &unconstrained_upstream().await, "[]");
 
-            let err = import_codex_login(
-                &path,
-                false,
-                None,
-                None,
-                alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-                None,
-            )
-            .await
-            .expect_err("an add not confirmed as Codex must fail loudly");
+            let err = import_alices_login(&path)
+                .await
+                .expect_err("an add not confirmed as Codex must fail loudly");
             let text = err.to_string();
             assert!(
                 text.contains("live, and on disk, as a Claude account")
@@ -7728,6 +7550,34 @@ mod tests {
 
     // --- import_codex_login: `--account` ----------------------------------------
 
+    /// What a recording stub has been asked, one entry per request.
+    type Asked<T> = std::sync::Arc<std::sync::Mutex<Vec<T>>>;
+
+    /// A live add route that advertises Codex and a `codexUpstream` whose workspace check
+    /// clears account A, both recording what they are asked: the route's port and record, then
+    /// the upstream's base URL and record.
+    async fn recording_route_and_clearing_upstream()
+    -> (u16, Asked<serde_json::Value>, String, Asked<SeenCheck>) {
+        let (port, probes) = stub_add_route(true, Some(crate::provider::Provider::Codex)).await;
+        let (upstream, checks) =
+            accounts_check_stub(200, &workspace_answer("NO_CONSTRAINT", "NO_CONSTRAINT")).await;
+        (port, probes, upstream, checks)
+    }
+
+    /// Neither the add route nor `codexUpstream` was asked anything.
+    fn assert_neither_stub_was_asked(probes: &Asked<serde_json::Value>, checks: &Asked<SeenCheck>) {
+        assert!(
+            probes.lock().unwrap().is_empty(),
+            "not even the route probe: {:?}",
+            probes.lock().unwrap()
+        );
+        assert!(
+            checks.lock().unwrap().is_empty(),
+            "no workspace check: {:?}",
+            checks.lock().unwrap()
+        );
+    }
+
     /// `--account` names the login the user means to import, so a `CODEX_HOME` that holds
     /// another is refused before anything else is asked, naming the account, and nothing is
     /// written. The add route and `codexUpstream` are stubs that record what they are asked, and
@@ -7736,9 +7586,7 @@ mod tests {
     /// Watched red: without the guard, alice's login is imported over the live route.
     #[tokio::test]
     async fn an_import_for_another_account_is_refused_and_writes_nothing() {
-        let (port, probes) = stub_add_route(true, Some(crate::provider::Provider::Codex)).await;
-        let (upstream, checks) =
-            accounts_check_stub(200, &workspace_answer("NO_CONSTRAINT", "NO_CONSTRAINT")).await;
+        let (port, probes, upstream, checks) = recording_route_and_clearing_upstream().await;
         let (_dir, path) = import_config(port, &upstream, "[]");
         let before = std::fs::read(&path).unwrap();
 
@@ -7758,16 +7606,7 @@ mod tests {
             "{text}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
-        assert!(
-            probes.lock().unwrap().is_empty(),
-            "not even the route probe: {:?}",
-            probes.lock().unwrap()
-        );
-        assert!(
-            checks.lock().unwrap().is_empty(),
-            "no workspace check: {:?}",
-            checks.lock().unwrap()
-        );
+        assert_neither_stub_was_asked(&probes, &checks);
     }
 
     /// The control: `--account` naming the login's own email imports it, as any import does.
@@ -7805,9 +7644,7 @@ mod tests {
     /// row, as `carol@example.com`.
     #[tokio::test]
     async fn an_account_import_refuses_a_login_that_names_no_user_or_workspace() {
-        let (port, probes) = stub_add_route(true, Some(crate::provider::Provider::Codex)).await;
-        let (upstream, checks) =
-            accounts_check_stub(200, &workspace_answer("NO_CONSTRAINT", "NO_CONSTRAINT")).await;
+        let (port, probes, upstream, checks) = recording_route_and_clearing_upstream().await;
         let (_dir, path) = import_config(
             port,
             &upstream,
@@ -7861,16 +7698,7 @@ mod tests {
                 "{what}: nothing was written"
             );
         }
-        assert!(
-            probes.lock().unwrap().is_empty(),
-            "not even the route probe: {:?}",
-            probes.lock().unwrap()
-        );
-        assert!(
-            checks.lock().unwrap().is_empty(),
-            "no workspace check: {:?}",
-            checks.lock().unwrap()
-        );
+        assert_neither_stub_was_asked(&probes, &checks);
     }
 
     // --- import_codex_login: logins tcr must not pool -----------------------------
@@ -7884,9 +7712,7 @@ mod tests {
     /// route probe the route stub records the blank probe.
     #[tokio::test]
     async fn a_fedramp_login_is_refused_before_anything_else() {
-        let (port, probes) = stub_add_route(true, Some(crate::provider::Provider::Codex)).await;
-        let (upstream, checks) =
-            accounts_check_stub(200, &workspace_answer("NO_CONSTRAINT", "NO_CONSTRAINT")).await;
+        let (port, probes, upstream, checks) = recording_route_and_clearing_upstream().await;
         let (_dir, path) = import_config(port, &upstream, "[]");
         let before = std::fs::read(&path).unwrap();
         let mut login = alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex");
@@ -7903,16 +7729,7 @@ mod tests {
             "{text}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
-        assert!(
-            probes.lock().unwrap().is_empty(),
-            "not even the route probe: {:?}",
-            probes.lock().unwrap()
-        );
-        assert!(
-            checks.lock().unwrap().is_empty(),
-            "no workspace check: {:?}",
-            checks.lock().unwrap()
-        );
+        assert_neither_stub_was_asked(&probes, &checks);
     }
 
     /// A login whose workspace is served anywhere but chatgpt.com, by another backend origin or
@@ -7935,16 +7752,9 @@ mod tests {
             let (_dir, path) = import_config(0, &upstream, "[]");
             let before = std::fs::read(&path).unwrap();
 
-            let err = import_codex_login(
-                &path,
-                false,
-                None,
-                None,
-                alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-                None,
-            )
-            .await
-            .expect_err("a routed workspace must not be imported");
+            let err = import_alices_login(&path)
+                .await
+                .expect_err("a routed workspace must not be imported");
             let text = err.to_string();
             assert!(
                 text.contains(named)
@@ -7978,16 +7788,9 @@ mod tests {
         let (_dir, path) = import_config(port, &upstream, "[]");
         let before = std::fs::read(&path).unwrap();
 
-        let err = import_codex_login(
-            &path,
-            false,
-            None,
-            None,
-            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-            None,
-        )
-        .await
-        .expect_err("a routed workspace must not be imported over the live route");
+        let err = import_alices_login(&path)
+            .await
+            .expect_err("a routed workspace must not be imported over the live route");
         let text = err.to_string();
         assert!(
             text.contains("https://gov.chatgpt.com")
@@ -8034,16 +7837,9 @@ mod tests {
             let (_dir, path) = import_config(0, &upstream, "[]");
             let before = std::fs::read(&path).unwrap();
 
-            let err = import_codex_login(
-                &path,
-                false,
-                None,
-                None,
-                alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-                None,
-            )
-            .await
-            .expect_err("an unconfirmed workspace must not be imported");
+            let err = import_alices_login(&path)
+                .await
+                .expect_err("an unconfirmed workspace must not be imported");
             let text = err.to_string();
             assert!(
                 text.contains("could not confirm")
@@ -8064,38 +7860,12 @@ mod tests {
     async fn redirecting_stub(
         location: &str,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<SeenCheck>>>) {
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = std::sync::Arc::clone(&seen);
-        let location = location.to_string();
-        let origin = axum::Router::new().fallback(move |req: axum::extract::Request| {
-            let recorded = std::sync::Arc::clone(&recorded);
-            let location = location.clone();
-            async move {
-                let header = |name: &str| {
-                    req.headers()
-                        .get(name)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_string)
-                };
-                recorded.lock().unwrap().push(SeenCheck {
-                    path: req.uri().path().to_string(),
-                    bearer: header("authorization"),
-                    account_id: header(crate::provider::CODEX_ACCOUNT_HEADER),
-                });
-                (
-                    axum::http::StatusCode::FOUND,
-                    [(axum::http::header::LOCATION, location)],
-                )
-            }
-        });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
-        (format!("http://{addr}"), seen)
+        recording_stub(
+            axum::http::StatusCode::FOUND,
+            axum::http::header::LOCATION,
+            location,
+            "",
+        )
     }
 
     /// A workspace check answered with a redirect refuses the import, and the redirect is never
@@ -8114,16 +7884,9 @@ mod tests {
         let (_dir, path) = import_config(0, &upstream, "[]");
         let before = std::fs::read(&path).unwrap();
 
-        let err = import_codex_login(
-            &path,
-            false,
-            None,
-            None,
-            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-            None,
-        )
-        .await
-        .expect_err("a redirected workspace check must not clear the login");
+        let err = import_alices_login(&path)
+            .await
+            .expect_err("a redirected workspace check must not clear the login");
         let text = err.to_string();
         assert!(
             text.contains("answered HTTP 302") && text.contains("Nothing was written"),
@@ -8155,16 +7918,9 @@ mod tests {
         .await;
         let (_dir, path) = import_config(0, &upstream, "[]");
 
-        let saved = import_codex_login(
-            &path,
-            false,
-            None,
-            None,
-            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-            None,
-        )
-        .await
-        .expect("a workspace served at chatgpt.com is imported");
+        let saved = import_alices_login(&path)
+            .await
+            .expect("a workspace served at chatgpt.com is imported");
         assert_eq!(saved, "alice@example.com");
         let doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -8180,10 +7936,7 @@ mod tests {
     /// profile fetch, so no network.
     #[tokio::test]
     async fn first_run_import_stops_when_another_process_imported_first() {
-        let dead_port = {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        let dead_port = DEAD_PORT;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-import-race-{}-{dead_port}.json",
             std::process::id()
@@ -8258,16 +8011,7 @@ mod tests {
         )
         .await;
         let (_dir, path) = import_config(0, &upstream, "[]");
-        let err = import_codex_login(
-            &path,
-            false,
-            None,
-            None,
-            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = import_alices_login(&path).await.unwrap_err();
         assert_eq!(code_of(&err), "codex-routed");
         assert!(
             err.to_string()
@@ -8277,16 +8021,7 @@ mod tests {
 
         let (upstream, _) = accounts_check_stub(500, "{}").await;
         let (_dir, path) = import_config(0, &upstream, "[]");
-        let err = import_codex_login(
-            &path,
-            false,
-            None,
-            None,
-            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = import_alices_login(&path).await.unwrap_err();
         assert_eq!(code_of(&err), "codex-unconfirmed");
         assert!(err.to_string().contains("could not confirm"), "{err}");
     }
@@ -8360,9 +8095,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
 
-        let (port, probes) = stub_add_route(true, Some(crate::provider::Provider::Codex)).await;
-        let (upstream, checks) =
-            accounts_check_stub(200, &workspace_answer("NO_CONSTRAINT", "NO_CONSTRAINT")).await;
+        let (port, probes, upstream, checks) = recording_route_and_clearing_upstream().await;
         let (_dir, claude) = import_config(
             port,
             &upstream,

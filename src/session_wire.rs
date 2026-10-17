@@ -59,6 +59,8 @@
 use serde_json::Value;
 use serde_json::value::RawValue;
 
+use crate::usage::UsageRecord;
+
 /// A `tool_use` block found in an assistant message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolUseEvent {
@@ -2132,30 +2134,19 @@ impl WireSessionTracker {
     /// session not (yet, or no longer) present is silently ignored — there is nothing to
     /// attribute the tokens to.
     ///
-    /// `base_input` accumulates into `entry.input_tokens` — BASE input only, never the quota
-    /// figure (`UsageRecord::input_total()`), which already folds cache reads and cache
-    /// creation in; folding the quota figure in here is the 2026-09-14 double-count incident
-    /// (see [`WireSession::input_tokens`]). `model`, `cache_5m` and `cache_1h` fold into
-    /// [`WireSession::by_model`] so a session that spans two models can be priced per-model
-    /// and summed, rather than averaged.
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_usage(
-        &mut self,
-        session_id: &str,
-        model: Option<&str>,
-        base_input: u64,
-        cache_5m: u64,
-        cache_1h: u64,
-        cache_read: u64,
-        output: u64,
-    ) {
+    /// The record's BASE input (`UsageRecord::input`) accumulates into `entry.input_tokens`,
+    /// never the quota figure (`UsageRecord::input_total()`), which already folds cache reads
+    /// and cache creation in; folding the quota figure in here is the 2026-09-14 double-count
+    /// incident (see [`WireSession::input_tokens`]). Its model and both cache-creation tiers
+    /// fold into [`WireSession::by_model`] so a session that spans two models can be priced
+    /// per-model and summed, rather than averaged. The record is passed whole, never as its
+    /// adjacent `u64`s, so a swapped `cache_5m` and `cache_1h` cannot compile.
+    pub fn record_usage(&mut self, session_id: &str, record: &UsageRecord) {
         if let Some(entry) = self.sessions.get_mut(session_id) {
-            Self::add_usage(
-                entry, model, base_input, cache_5m, cache_1h, cache_read, output,
-            );
-            if cache_1h > 0 {
+            Self::add_usage(entry, record);
+            if record.cache_1h > 0 {
                 entry.cache_ttl_secs = Some(3600);
-            } else if cache_5m > 0 {
+            } else if record.cache_5m > 0 {
                 entry.cache_ttl_secs = Some(300);
             }
         }
@@ -2164,28 +2155,20 @@ impl WireSessionTracker {
     /// The token half of a response's usage, shared by [`Self::record_usage`] and
     /// [`Self::record_codex_usage`]: the session's totals and its per-model tally, which also
     /// counts Codex usage records so its session can report unpriced requests.
-    fn add_usage(
-        entry: &mut WireSession,
-        model: Option<&str>,
-        base_input: u64,
-        cache_5m: u64,
-        cache_1h: u64,
-        cache_read: u64,
-        output: u64,
-    ) {
-        entry.input_tokens += base_input;
-        entry.cache_creation_tokens += cache_5m + cache_1h;
-        entry.output_tokens += output;
-        entry.cache_read_tokens += cache_read;
+    fn add_usage(entry: &mut WireSession, record: &UsageRecord) {
+        entry.input_tokens += record.input;
+        entry.cache_creation_tokens += record.cache_5m + record.cache_1h;
+        entry.output_tokens += record.output;
+        entry.cache_read_tokens += record.cache_read;
         let tally = entry
             .by_model
-            .entry(model.unwrap_or(UNKNOWN_MODEL).to_string())
+            .entry(record.model.as_deref().unwrap_or(UNKNOWN_MODEL).to_string())
             .or_default();
-        tally.input += base_input;
-        tally.cache_5m += cache_5m;
-        tally.cache_1h += cache_1h;
-        tally.cache_read += cache_read;
-        tally.output += output;
+        tally.input += record.input;
+        tally.cache_5m += record.cache_5m;
+        tally.cache_1h += record.cache_1h;
+        tally.cache_read += record.cache_read;
+        tally.output += record.output;
         match entry.provider {
             crate::provider::Provider::Anthropic => {}
             crate::provider::Provider::Codex => tally.requests += 1,
@@ -2281,34 +2264,21 @@ impl WireSessionTracker {
         }
     }
 
-    /// Add one Codex response's usage, recorded at `ts_ms` (its usage record's own stamp). It
+    /// Add one Codex response's usage, recorded at the record's own stamp (`ts_ms`). It
     /// keeps the same totals and per-model tally as [`Self::record_usage`], with four
     /// differences. It stamps no cache TTL, because the 300 s and 3600 s tiers are Anthropic's
     /// prompt cache. It keeps the reasoning tokens, which are already inside `output`. The
     /// usage's model names the session, because a Codex request body is usually zstd, so the
     /// request named no model. And it keeps `ts_ms` as [`WireSession::last_usage_ms`], which
     /// keeps the session listed while the usage still counts in the last hour.
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_codex_usage(
-        &mut self,
-        session_id: &str,
-        model: Option<&str>,
-        base_input: u64,
-        cache_5m: u64,
-        cache_1h: u64,
-        cache_read: u64,
-        output: u64,
-        reasoning: u64,
-        ts_ms: i64,
-    ) {
+    pub fn record_codex_usage(&mut self, session_id: &str, record: &UsageRecord) {
         if let Some(entry) = self.sessions.get_mut(session_id) {
-            Self::add_usage(
-                entry, model, base_input, cache_5m, cache_1h, cache_read, output,
-            );
-            entry.reasoning_tokens += reasoning;
-            if let Some(model) = model {
-                entry.model = Some(model.to_string());
+            Self::add_usage(entry, record);
+            entry.reasoning_tokens += record.reasoning;
+            if let Some(model) = &record.model {
+                entry.model = Some(model.clone());
             }
+            let ts_ms = record.ts_ms;
             entry.last_usage_ms = Some(entry.last_usage_ms.map_or(ts_ms, |at| at.max(ts_ms)));
         }
     }
@@ -2424,6 +2394,31 @@ impl WireSessionTracker {
             self.sessions.entry(session_id).or_insert(session);
         }
     }
+}
+
+/// A usage record carrying exactly these components, stamped at 0: what a test hands
+/// [`WireSessionTracker::record_usage`] and its Codex twin, here and in
+/// `manager::wire_sessions`. The quota figure is the sum of the parts, so the record's base
+/// input is `base_input` exactly.
+#[cfg(test)]
+pub(crate) fn wire_usage(
+    model: Option<&str>,
+    base_input: u64,
+    cache_5m: u64,
+    cache_1h: u64,
+    cache_read: u64,
+    output: u64,
+) -> UsageRecord {
+    UsageRecord::from_quota_input(
+        0,
+        model.map(str::to_string),
+        None,
+        base_input + cache_5m + cache_1h + cache_read,
+        cache_5m,
+        cache_1h,
+        cache_read,
+        output,
+    )
 }
 
 #[cfg(test)]
@@ -3294,24 +3289,16 @@ mod tests {
         tracker.record_codex_request("sess-codex", None, 1_000);
         tracker.record_codex_usage(
             "sess-codex",
-            Some("gpt-5.1-codex"),
-            1_000,
-            500,
-            0,
-            2_000,
-            40,
-            12,
-            1_000,
+            &UsageRecord {
+                reasoning: 12,
+                ts_ms: 1_000,
+                ..wire_usage(Some("gpt-5.1-codex"), 1_000, 500, 0, 2_000, 40)
+            },
         );
         tracker.record_request("sess-claude", None, None, 1_000, &[], &[]);
         tracker.record_usage(
             "sess-claude",
-            Some("claude-opus-5"),
-            1_000,
-            500,
-            0,
-            2_000,
-            40,
+            &wire_usage(Some("claude-opus-5"), 1_000, 500, 0, 2_000, 40),
         );
         let sessions: std::collections::HashMap<String, WireSession> =
             tracker.snapshot(1_000).into_iter().collect();
@@ -3335,7 +3322,10 @@ mod tests {
     fn claude_session_cache_keeps_its_pre_codex_shape() {
         let mut tracker = WireSessionTracker::new();
         tracker.record_request("sess-claude", None, None, 1_000, &[], &[]);
-        tracker.record_usage("sess-claude", Some("claude-opus-5"), 100, 0, 0, 25, 10);
+        tracker.record_usage(
+            "sess-claude",
+            &wire_usage(Some("claude-opus-5"), 100, 0, 0, 25, 10),
+        );
         let (_, session) = tracker.snapshot(1_000).pop().unwrap();
         let wire = serde_json::to_value(&session).unwrap();
         assert!(wire.get("provider").is_none());
@@ -3353,14 +3343,11 @@ mod tests {
         tracker.record_codex_request("sess-codex", None, 1_000);
         tracker.record_codex_usage(
             "sess-codex",
-            Some("gpt-5.1-codex"),
-            100,
-            0,
-            0,
-            25,
-            10,
-            4,
-            1_000,
+            &UsageRecord {
+                reasoning: 4,
+                ts_ms: 1_000,
+                ..wire_usage(Some("gpt-5.1-codex"), 100, 0, 0, 25, 10)
+            },
         );
         let (_, codex) = tracker
             .snapshot(1_000)
@@ -3535,14 +3522,11 @@ mod tests {
         tracker.record_codex_request("sess-codex", Some("bob@example.com/codex".into()), T);
         tracker.record_codex_usage(
             "sess-codex",
-            Some("gpt-5.1-codex"),
-            1_000,
-            0,
-            0,
-            0,
-            10,
-            0,
-            usage_at,
+            &UsageRecord {
+                reasoning: 0,
+                ts_ms: usage_at,
+                ..wire_usage(Some("gpt-5.1-codex"), 1_000, 0, 0, 0, 10)
+            },
         );
         let usage = crate::usage::UsageTracker::new(1, crate::pricing::PricingTable::default());
         usage.record(
@@ -4208,20 +4192,20 @@ mod tests {
         assert_eq!(tracker.snapshot(1_000)[0].1.cache_ttl_secs, None);
 
         // Reads and base input alone do not name a tier.
-        tracker.record_usage("sess-ttl", None, 10, 0, 0, 500, 5);
+        tracker.record_usage("sess-ttl", &wire_usage(None, 10, 0, 0, 500, 5));
         assert_eq!(tracker.snapshot(1_000)[0].1.cache_ttl_secs, None);
 
-        tracker.record_usage("sess-ttl", None, 10, 0, 40, 0, 5);
+        tracker.record_usage("sess-ttl", &wire_usage(None, 10, 0, 40, 0, 5));
         assert_eq!(tracker.snapshot(1_000)[0].1.cache_ttl_secs, Some(3600));
 
-        tracker.record_usage("sess-ttl", None, 10, 0, 0, 900, 5);
+        tracker.record_usage("sess-ttl", &wire_usage(None, 10, 0, 0, 900, 5));
         assert_eq!(
             tracker.snapshot(1_000)[0].1.cache_ttl_secs,
             Some(3600),
             "a response with no cache write keeps the last tier"
         );
 
-        tracker.record_usage("sess-ttl", None, 10, 20, 0, 0, 5);
+        tracker.record_usage("sess-ttl", &wire_usage(None, 10, 20, 0, 0, 5));
         assert_eq!(tracker.snapshot(1_000)[0].1.cache_ttl_secs, Some(300));
     }
 

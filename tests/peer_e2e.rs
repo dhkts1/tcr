@@ -147,66 +147,22 @@ impl Upstream {
 /// A fake `api.anthropic.com`: records the credential, answers a canned body and
 /// reports a LOW utilization on all three windows, which is what gives the
 /// lender a measured window to lend a fraction of.
+///
+/// It is [`spawn_upstream_with_trip`] with the trip never armed, so the two
+/// answer every request the same way until a test arms one.
 async fn spawn_upstream() -> (String, Upstream) {
-    let upstream = Upstream::default();
-    let recorder = upstream.clone();
-    let app = Router::new().fallback(any(move |req: axum::extract::Request| {
-        let recorder = recorder.clone();
-        async move {
-            let path = req.uri().path().to_string();
-            let credential = req
-                .headers()
-                .get("authorization")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            let api_key = req
-                .headers()
-                .get("x-api-key")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            // The origin's own refusal, decided before the body is drained and
-            // answered after the arrival is recorded: see
-            // `tests/tools/api_contract.rs`.
-            let refusal = api_contract::refuse_if_incomplete(req.method(), req.headers());
-            axum::body::to_bytes(req.into_body(), 1024 * 1024)
-                .await
-                .log_debug("reading a test request body");
-            if let Ok(mut seen) = recorder.seen.lock() {
-                seen.push((path, format!("{credential}{api_key}")));
-            }
-            if let Some(refusal) = refusal {
-                return refusal;
-            }
-            Response::builder()
-                .status(200)
-                .header("content-type", "application/json")
-                .header("anthropic-ratelimit-unified-status", "allowed")
-                .header("anthropic-ratelimit-unified-5h-utilization", "0.10")
-                .header("anthropic-ratelimit-unified-7d-utilization", "0.10")
-                .header("anthropic-ratelimit-unified-7d_oi-utilization", "0.10")
-                .body(Body::from(
-                    br#"{"type":"message","id":"msg_fake"}"#.to_vec(),
-                ))
-                .expect("the canned upstream answer builds")
-        }
-    }));
-    let listening = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind the fake upstream");
-    let addr = listening.local_addr().expect("the fake upstream's address");
-    tokio::spawn(async move {
-        axum::serve(listening, app)
-            .await
-            .log_debug("serving a test server");
-    });
-    (format!("http://{addr}"), upstream)
+    let (url, upstream, _never_armed) = spawn_upstream_with_trip(String::new()).await;
+    (url, upstream)
 }
 
 // ---------------------------------------------------------------------------
 // One Mac
 // ---------------------------------------------------------------------------
+
+/// How many times one Mac may lose the peer-port race before its boot is a
+/// failure rather than a retry. See [`Mac::boot`] for why the race exists at
+/// all and why it is retried instead of removed.
+const PORT_RACE_ATTEMPTS: u32 = 5;
 
 /// A port the kernel just handed back, released before it is written into a
 /// peers file.
@@ -216,17 +172,8 @@ async fn spawn_upstream() -> (String, Upstream) {
 /// `tcr peer invite` copies that value into the token it mints: so `:0` is not
 /// usable here even though the listener itself would accept it. See gap 2 in
 /// this file's docs.
-/// How many times one Mac may lose the peer-port race before its boot is a
-/// failure rather than a retry. See [`Mac::boot`] for why the race exists at
-/// all and why it is retried instead of removed.
-const PORT_RACE_ATTEMPTS: u32 = 5;
-
 fn free_loopback_port() -> u16 {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port to borrow");
-    probe
-        .local_addr()
-        .expect("the borrowed port has an address")
-        .port()
+    tcr::test_support::loopback::unused_port()
 }
 
 /// How many draws [`loopback_port_other_than`] makes before it calls the
@@ -355,7 +302,8 @@ impl Mac {
         }
     }
 
-    fn env(&self, command: &mut Command) {
+    fn command(&self) -> Command {
+        let mut command = crate::tcr_env::tcr(self.home.path());
         command
             // Colour off at the source. A child that inherits an unset
             // `NO_COLOR` writes escape codes into its boot log even though the
@@ -365,14 +313,8 @@ impl Mac {
             // is load-bearing; this half also keeps the logs readable when a
             // failing run prints one.
             .env("NO_COLOR", "1")
-            .env("HOME", self.home.path())
-            .env("XDG_CACHE_HOME", self.home.path().join(".cache"))
-            .env(
-                "TCR_CLAUDE_CODE_CREDENTIALS",
-                self.home
-                    .path()
-                    .join("no-such-claude-code-credentials.json"),
-            );
+            .env("XDG_CACHE_HOME", self.home.path().join(".cache"));
+        command
     }
 
     /// Boot this Mac's proxy and wait until both of its sockets are up.
@@ -451,12 +393,11 @@ impl Mac {
         self.log = self.home.path().join(format!("boot-{}.log", self.boots));
         let out = std::fs::File::create(&self.log).expect("the boot log opens");
         let err = out.try_clone().expect("the boot log clones for stderr");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = self.command();
         command
             .args(["--headless", "--port", "0", "--no-replace"])
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err));
-        self.env(&mut command);
         let child = command.spawn().unwrap_or_else(|err| {
             panic!(
                 "spawning the tcr this build produced ({}) failed: {err}",
@@ -579,12 +520,11 @@ impl Mac {
     /// Run `tcr peer <args> --peers <this Mac's peers file>` and hand back
     /// (stdout, stderr, success).
     fn peer(&self, args: &[&str]) -> (String, String, bool) {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = self.command();
         command
             .arg("peer")
             .args(args)
             .args(["--peers", self.peers.to_str().expect("a utf-8 peers path")]);
-        self.env(&mut command);
         let out = command
             .output()
             .unwrap_or_else(|err| panic!("{}: spawning `tcr peer {args:?}`: {err}", self.label));
@@ -628,7 +568,7 @@ impl Mac {
         )
         .expect("the asking config writes");
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = self.command();
         command.args([
             "peer",
             "status",
@@ -636,7 +576,6 @@ impl Mac {
             "--config",
             asking.to_str().expect("a utf-8 config path"),
         ]);
-        self.env(&mut command);
         let out = command
             .output()
             .unwrap_or_else(|err| panic!("{}: spawning `tcr status --json`: {err}", self.label));
@@ -1360,14 +1299,13 @@ fn spawn_pair(mac: &Mac, addr: &str) -> PairProcess {
     let out = mac.home.path().join("pair.out");
     let file = std::fs::File::create(&out).expect("the pair log opens");
     let err = file.try_clone().expect("the pair log clones for stderr");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut command = mac.command();
     command
         .args(["peer", "pair", addr])
         .args(["--peers", mac.peers.to_str().expect("a utf-8 peers path")])
         .stdin(Stdio::piped())
         .stdout(Stdio::from(file))
         .stderr(Stdio::from(err));
-    mac.env(&mut command);
     let child = command
         .spawn()
         .unwrap_or_else(|err| panic!("{}: spawning `tcr peer pair`: {err}", mac.label));
@@ -1438,11 +1376,7 @@ async fn a_borrowed_request_reaches_the_lender_and_never_carries_the_borrowers_c
         2,
         "one ordinary request on the lender, so its 7d window is measured",
     );
-    let (warm, _) = post_messages(&lender.proxy).await;
-    assert_eq!(
-        warm, 200,
-        "the lender's own fleet must serve its own request before it can lend a fraction of it"
-    );
+    warm(&lender).await;
     assert_eq!(
         seen.credentials(),
         vec!["Bearer at-fake-lender".to_string()],
@@ -1614,14 +1548,13 @@ async fn a_borrowed_request_reaches_the_lender_and_never_carries_the_borrowers_c
 /// `tcr peer join --stdin`, which is the path the panel and the `tcr://` handler
 /// use: the key is piped, so it never enters an argument vector.
 fn join_with_stdin(mac: &Mac, key: &str) -> String {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut command = mac.command();
     command
         .args(["peer", "join", "--stdin", "--label", "borrower-mac"])
         .args(["--peers", mac.peers.to_str().expect("a utf-8 peers path")])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    mac.env(&mut command);
     let mut child = command
         .spawn()
         .unwrap_or_else(|err| panic!("{}: spawning `tcr peer join`: {err}", mac.label));
@@ -1740,16 +1673,11 @@ async fn spawn_upstream_with_trip(trip_credential: String) -> (String, Upstream,
                 .expect("the canned upstream answer builds")
         }
     }));
-    let listening = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind the fake upstream");
-    let addr = listening.local_addr().expect("the fake upstream's address");
-    tokio::spawn(async move {
-        axum::serve(listening, app)
-            .await
-            .log_debug("serving a test server");
-    });
-    (format!("http://{addr}"), upstream, armed)
+    (
+        tcr::test_support::stub_upstream::http(app).url(),
+        upstream,
+        armed,
+    )
 }
 
 /// **Chained borrow**: `root` lends to `middle`, and `middle`, separately,
@@ -1779,11 +1707,7 @@ async fn a_chained_borrow_leaf_from_middle_middle_from_root() {
         2,
         "warm root's own account, so it has a measured window to lend from",
     );
-    let (warm, _) = post_messages(&root.proxy).await;
-    assert_eq!(
-        warm, 200,
-        "root must serve its own request before it can lend a fraction of it"
-    );
+    warm(&root).await;
 
     step(3, "middle joins root and borrows from it");
     let minted = root.peer_ok(&["invite", "--label", "middle-mac", "--ttl", "300"]);
@@ -1997,11 +1921,7 @@ async fn five_concurrent_borrows_respect_max_inflight() {
     spender.boot();
 
     step(2, "warm the lender's own account");
-    let (warm, _) = post_messages(&bank1.proxy).await;
-    assert_eq!(
-        warm, 200,
-        "bank1 must serve its own request before it can lend"
-    );
+    warm(&bank1).await;
 
     step(
         3,
@@ -2054,23 +1974,7 @@ async fn five_concurrent_borrows_respect_max_inflight() {
         "five concurrent borrows against that ONE cached lease: at most 2 (its \
          max_inflight) may be served at once",
     );
-    let deadline = Instant::now() + LINE_TIMEOUT;
-    let handles: Vec<_> = (0..5)
-        .map(|_| {
-            let proxy = spender.proxy.clone();
-            tokio::spawn(async move { post_messages(&proxy).await })
-        })
-        .collect();
-    let mut statuses = Vec::new();
-    for handle in handles {
-        let (status, _) = handle.await.expect("a borrow task panicked");
-        statuses.push(status);
-    }
-    assert!(
-        Instant::now() < deadline,
-        "all five concurrent borrows must return within the borrow deadline"
-    );
-    println!("         statuses: {statuses:?}");
+    let statuses = five_concurrent_borrows(&spender.proxy).await;
 
     let served = statuses.iter().filter(|status| **status == 200).count();
     let refused = statuses.len() - served;
@@ -2148,16 +2052,7 @@ async fn spawn_slow_upstream(delay: Duration) -> (String, Upstream) {
                 .expect("the canned upstream answer builds")
         }
     }));
-    let listening = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind the fake upstream");
-    let addr = listening.local_addr().expect("the fake upstream's address");
-    tokio::spawn(async move {
-        axum::serve(listening, app)
-            .await
-            .log_debug("serving a test server");
-    });
-    (format!("http://{addr}"), upstream)
+    (tcr::test_support::stub_upstream::http(app).url(), upstream)
 }
 
 // ---------------------------------------------------------------------------
@@ -2211,11 +2106,7 @@ async fn measure_latency_local_vs_borrowed() {
     lender.boot();
     borrower.boot();
 
-    let (warm, _) = post_messages(&lender.proxy).await;
-    assert_eq!(
-        warm, 200,
-        "the lender's own fleet must serve its own request before it can lend a fraction of it"
-    );
+    warm(&lender).await;
 
     let minted = lender.peer_ok(&["invite", "--label", "borrower-mac", "--ttl", "300"]);
     let key = minted
@@ -2362,18 +2253,13 @@ fn boot_cost_once(with_peers: bool) -> f64 {
     let log = home.path().join("boot.log");
     let out = std::fs::File::create(&log).expect("the boot log opens");
     let err = out.try_clone().expect("the boot log clones for stderr");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut command = crate::tcr_env::tcr(home.path());
     command
         .args(["--headless", "--port", "0", "--no-replace"])
-        // The same colour-off contract as `Mac::env`; this sample owns no
+        // The same colour-off contract as `Mac::command`; this sample owns no
         // `Mac` to borrow it from.
         .env("NO_COLOR", "1")
-        .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join(".cache"))
-        .env(
-            "TCR_CLAUDE_CODE_CREDENTIALS",
-            home.path().join("no-such-claude-code-credentials.json"),
-        )
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
 
@@ -2447,12 +2333,7 @@ async fn five_concurrent_borrows_across_two_lenders_stop_at_four() {
         "warm both lenders' own accounts, so each has a window to lend from",
     );
     for lender in [&bank1, &bank2] {
-        let (warm, _) = post_messages(&lender.proxy).await;
-        assert_eq!(
-            warm, 200,
-            "{} must serve its own request before it can lend",
-            lender.label
-        );
+        warm(lender).await;
     }
 
     step(
@@ -2485,23 +2366,7 @@ async fn five_concurrent_borrows_across_two_lenders_stop_at_four() {
         "five concurrent borrows, no priming: two lenders times max_inflight 2 is \
          the ceiling",
     );
-    let deadline = Instant::now() + LINE_TIMEOUT;
-    let handles: Vec<_> = (0..5)
-        .map(|_| {
-            let proxy = spender.proxy.clone();
-            tokio::spawn(async move { post_messages(&proxy).await })
-        })
-        .collect();
-    let mut statuses = Vec::new();
-    for handle in handles {
-        let (status, _) = handle.await.expect("a borrow task panicked");
-        statuses.push(status);
-    }
-    assert!(
-        Instant::now() < deadline,
-        "all five concurrent borrows must return within the borrow deadline"
-    );
-    println!("         statuses: {statuses:?}");
+    let statuses = five_concurrent_borrows(&spender.proxy).await;
 
     let served = statuses.iter().filter(|status| **status == 200).count();
     let refused = statuses.len() - served;
@@ -2541,11 +2406,76 @@ async fn five_concurrent_borrows_across_two_lenders_stop_at_four() {
     bank1.shutdown();
 }
 
+/// Step 1 of every forwarded-borrow leg: three Macs on one upstream, each with
+/// its own fake account (only `borrower` may borrow), booted in that order.
+fn boot_lender_carrier_borrower(upstream: &str) -> (Mac, Mac, Mac) {
+    let mut lender = Mac::new("lender", upstream, "lender-fake", "at-fake-lender", false);
+    let mut carrier = Mac::new(
+        "carrier",
+        upstream,
+        "carrier-fake",
+        "at-fake-carrier",
+        false,
+    );
+    let mut borrower = Mac::new(
+        "borrower",
+        upstream,
+        "borrower-fake",
+        "at-fake-borrower",
+        true,
+    );
+
+    step(1, "boot three tcr processes: lender, carrier and borrower");
+    lender.boot();
+    carrier.boot();
+    borrower.boot();
+    (lender, carrier, borrower)
+}
+
+/// One ordinary request on `lender`'s own proxy, which must be served: it is
+/// what gives the lender a measured window to lend a fraction of.
+async fn warm(lender: &Mac) {
+    let (warm, _) = post_messages(&lender.proxy).await;
+    assert_eq!(
+        warm, 200,
+        "{} must serve its own request before it can lend a fraction of it",
+        lender.label
+    );
+}
+
+/// Five concurrent `POST /v1/messages` through `proxy`, every one back inside
+/// [`LINE_TIMEOUT`]. Their statuses, in task order, printed for the trace.
+async fn five_concurrent_borrows(proxy: &str) -> Vec<u16> {
+    let deadline = Instant::now() + LINE_TIMEOUT;
+    let handles: Vec<_> = (0..5)
+        .map(|_| {
+            let proxy = proxy.to_string();
+            tokio::spawn(async move { post_messages(&proxy).await })
+        })
+        .collect();
+    let mut statuses = Vec::new();
+    for handle in handles {
+        let (status, _) = handle.await.expect("a borrow task panicked");
+        statuses.push(status);
+    }
+    assert!(
+        Instant::now() < deadline,
+        "all five concurrent borrows must return within the borrow deadline"
+    );
+    println!("         statuses: {statuses:?}");
+    statuses
+}
+
 /// Invite `borrower` onto `lender`, lend it a `max_inflight: 2` lease, and let
 /// it disclose to that lender: the five CLI steps every borrowing leg in this
 /// file repeats, in one place because the two-lender test performs them twice
 /// and a second hand-written copy is a second chance to mistype a fraction.
 fn lend_to(lender: &Mac, borrower: &mut Mac, label: &str) -> String {
+    lend_to_with(lender, borrower, label, &[])
+}
+
+/// [`lend_to`]'s five steps, with `extra` appended to the `lend` verb's argv.
+fn lend_to_with(lender: &Mac, borrower: &mut Mac, label: &str, extra: &[&str]) -> String {
     let pinned_before = borrower.pinned_nodes();
     let minted = lender.peer_ok(&["invite", "--label", label, "--ttl", "300"]);
     let key = minted
@@ -2556,7 +2486,7 @@ fn lend_to(lender: &Mac, borrower: &mut Mac, label: &str) -> String {
     join_with_stdin(borrower, &key);
     let borrower_node = lender.first_pinned_node();
     lender.peer_ok(&["share", "on", "--window", "7d", "--fraction", "0.90"]);
-    lender.peer_ok(&[
+    let mut lend = vec![
         "lend",
         &borrower_node,
         "--window",
@@ -2567,7 +2497,9 @@ fn lend_to(lender: &Mac, borrower: &mut Mac, label: &str) -> String {
         "300",
         "--max-inflight",
         "2",
-    ]);
+    ];
+    lend.extend_from_slice(extra);
+    lender.peer_ok(&lend);
     // The row the join ADDED, by difference rather than by position: which end
     // of the peers file a new row lands on is not this test's to know, and an
     // `allow` aimed at the wrong lender would read as a lender that refuses.
@@ -2839,36 +2771,13 @@ fn join_to(host: &Mac, guest: &Mac, label: &str) -> (String, String) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_forwarded_borrow_reaches_the_lender_through_a_third_mac() {
     let (upstream, seen) = spawn_upstream().await;
-    let mut lender = Mac::new("lender", &upstream, "lender-fake", "at-fake-lender", false);
-    let mut carrier = Mac::new(
-        "carrier",
-        &upstream,
-        "carrier-fake",
-        "at-fake-carrier",
-        false,
-    );
-    let mut borrower = Mac::new(
-        "borrower",
-        &upstream,
-        "borrower-fake",
-        "at-fake-borrower",
-        true,
-    );
-
-    step(1, "boot three tcr processes: lender, carrier and borrower");
-    lender.boot();
-    carrier.boot();
-    borrower.boot();
+    let (mut lender, mut carrier, mut borrower) = boot_lender_carrier_borrower(&upstream);
 
     step(
         2,
         "warm the lender's own account, so it has a measured window to lend from",
     );
-    let (warm, _) = post_messages(&lender.proxy).await;
-    assert_eq!(
-        warm, 200,
-        "the lender must serve its own request before it can lend a fraction of it"
-    );
+    warm(&lender).await;
 
     step(3, "borrower joins lender and is granted a lease");
     let lender_at_borrower = lend_to(&lender, &mut borrower, "borrower-mac");
@@ -3004,37 +2913,7 @@ fn until_for(mac: &Mac, node: &str) -> Option<u64> {
 /// permanent `null` an open-ended grant produces. Otherwise identical: same
 /// five CLI steps, same fraction, same `max-inflight`.
 fn lend_to_for_a_bounded_time(lender: &Mac, borrower: &mut Mac, label: &str, for_: &str) -> String {
-    let pinned_before = borrower.pinned_nodes();
-    let minted = lender.peer_ok(&["invite", "--label", label, "--ttl", "300"]);
-    let key = minted
-        .lines()
-        .find(|line| line.starts_with("tcr-join:"))
-        .unwrap_or_else(|| panic!("no join key on stdout: {minted}"))
-        .to_string();
-    join_with_stdin(borrower, &key);
-    let borrower_node = lender.first_pinned_node();
-    lender.peer_ok(&["share", "on", "--window", "7d", "--fraction", "0.90"]);
-    lender.peer_ok(&[
-        "lend",
-        &borrower_node,
-        "--window",
-        "7d",
-        "--fraction",
-        "0.90",
-        "--ttl",
-        "300",
-        "--max-inflight",
-        "2",
-        "--for",
-        for_,
-    ]);
-    let lender_node_at_borrower = borrower
-        .pinned_nodes()
-        .into_iter()
-        .find(|node| !pinned_before.contains(node))
-        .expect("the borrower pinned the lender it just joined");
-    borrower.peer_ok(&["allow", &lender_node_at_borrower, "disclose", "on"]);
-    lender_node_at_borrower
+    lend_to_with(lender, borrower, label, &["--for", for_])
 }
 
 /// Rewrite `mac`'s row for `node` to hold exactly one endpoint: `addr`, a
@@ -3093,33 +2972,10 @@ fn set_direct_endpoint(mac: &Mac, node: &str, addr: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn no_ipv6_endpoint_falls_through_to_a_forwarder() {
     let (upstream, seen) = spawn_upstream().await;
-    let mut lender = Mac::new("lender", &upstream, "lender-fake", "at-fake-lender", false);
-    let mut carrier = Mac::new(
-        "carrier",
-        &upstream,
-        "carrier-fake",
-        "at-fake-carrier",
-        false,
-    );
-    let mut borrower = Mac::new(
-        "borrower",
-        &upstream,
-        "borrower-fake",
-        "at-fake-borrower",
-        true,
-    );
-
-    step(1, "boot three tcr processes: lender, carrier and borrower");
-    lender.boot();
-    carrier.boot();
-    borrower.boot();
+    let (mut lender, mut carrier, mut borrower) = boot_lender_carrier_borrower(&upstream);
 
     step(2, "warm the lender's own account");
-    let (warm, _) = post_messages(&lender.proxy).await;
-    assert_eq!(
-        warm, 200,
-        "the lender must serve its own request before it can lend"
-    );
+    warm(&lender).await;
 
     step(3, "borrower joins lender and is granted a lease");
     let lender_at_borrower = lend_to(&lender, &mut borrower, "borrower-mac");
@@ -3235,33 +3091,10 @@ async fn no_ipv6_endpoint_falls_through_to_a_forwarder() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn forwarder_killed_mid_borrow_releases_the_client_promptly() {
     let (upstream, _seen) = spawn_slow_upstream(Duration::from_millis(1500)).await;
-    let mut lender = Mac::new("lender", &upstream, "lender-fake", "at-fake-lender", false);
-    let mut carrier = Mac::new(
-        "carrier",
-        &upstream,
-        "carrier-fake",
-        "at-fake-carrier",
-        false,
-    );
-    let mut borrower = Mac::new(
-        "borrower",
-        &upstream,
-        "borrower-fake",
-        "at-fake-borrower",
-        true,
-    );
-
-    step(1, "boot three tcr processes: lender, carrier and borrower");
-    lender.boot();
-    carrier.boot();
-    borrower.boot();
+    let (mut lender, mut carrier, mut borrower) = boot_lender_carrier_borrower(&upstream);
 
     step(2, "warm the lender's own account against the slow upstream");
-    let (warm, _) = post_messages(&lender.proxy).await;
-    assert_eq!(
-        warm, 200,
-        "the lender must serve its own request before it can lend"
-    );
+    warm(&lender).await;
 
     step(3, "borrower joins lender and is granted a lease");
     let lender_at_borrower = lend_to(&lender, &mut borrower, "borrower-mac");
@@ -3403,11 +3236,7 @@ async fn a_vanished_lenders_next_borrow_re_asks_and_the_cap_is_not_corrupted() {
     spender.boot();
 
     step(2, "warm bank's own account");
-    let (warm, _) = post_messages(&bank.proxy).await;
-    assert_eq!(
-        warm, 200,
-        "bank must serve its own request before it can lend"
-    );
+    warm(&bank).await;
 
     step(
         3,
@@ -3606,33 +3435,13 @@ async fn a_captive_portal_reports_no_network_and_pins_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs() {
     let (upstream, _seen) = spawn_upstream().await;
-    let mut lender = Mac::new("lender", &upstream, "lender-fake", "at-fake-lender", false);
-    let mut carrier = Mac::new(
-        "carrier",
-        &upstream,
-        "carrier-fake",
-        "at-fake-carrier",
-        false,
-    );
-    let mut borrower = Mac::new(
-        "borrower",
-        &upstream,
-        "borrower-fake",
-        "at-fake-borrower",
-        true,
-    );
-
-    step(1, "boot three tcr processes: lender, carrier and borrower");
-    lender.boot();
-    carrier.boot();
-    borrower.boot();
+    let (mut lender, mut carrier, mut borrower) = boot_lender_carrier_borrower(&upstream);
 
     step(
         2,
         "warm the lender's own account, so it has a window to lend from",
     );
-    let (warm, _) = post_messages(&lender.proxy).await;
-    assert_eq!(warm, 200, "the lender serves its own request first");
+    warm(&lender).await;
 
     step(3, "borrower joins lender and is granted a lease");
     let lender_at_borrower = lend_to(&lender, &mut borrower, "borrower-mac");

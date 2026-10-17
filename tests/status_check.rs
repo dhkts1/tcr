@@ -19,7 +19,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::process::Command;
+
 use std::sync::Arc;
 
 use tcr::cli::snapshot_offline;
@@ -149,18 +149,10 @@ fn run_status(home: &Path, config: &Path, port: u16, extra: &[&str]) -> (Option<
     let config = config.display().to_string();
     let mut args = vec!["status", "--config", config.as_str()];
     args.extend_from_slice(extra);
-    let out = Command::new(env!("CARGO_BIN_EXE_tcr"))
+    // The route line reads the shell's startup files for `tcr setup shell`'s block; the
+    // helper keeps that read inside the scratch HOME.
+    let out = crate::tcr_env::tcr(home)
         .args(&args)
-        .env("HOME", home)
-        .env_remove("XDG_CACHE_HOME")
-        // The route line reads the shell's startup files for `tcr setup
-        // shell`'s block; keep that read inside the scratch HOME.
-        .env_remove("ZDOTDIR")
-        .env_remove("XDG_CONFIG_HOME")
-        .env(
-            "TCR_CLAUDE_CODE_CREDENTIALS",
-            home.join("no-credentials.json"),
-        )
         .env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{port}"))
         .current_dir(&work)
         .output()

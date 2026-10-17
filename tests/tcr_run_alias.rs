@@ -23,10 +23,7 @@ struct Scratch {
 fn scratch() -> Scratch {
     let dir = tempfile::tempdir().expect("scratch HOME");
     let home = dir.path().to_path_buf();
-    let port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
-        listener.local_addr().expect("local addr").port()
-    };
+    let port = tcr::test_support::loopback::unused_port();
     std::fs::create_dir_all(home.join(".config")).expect("config dir");
     std::fs::write(
         home.join(".config/teamclaude.json"),
@@ -53,15 +50,12 @@ fn scratch() -> Scratch {
 }
 
 fn run(s: &Scratch, program: &Path, args: &[&str]) -> (i32, String, String) {
-    let output = Command::new(program)
+    let mut command = Command::new(program);
+    crate::tcr_env::isolate(&mut command, &s.home);
+    let output = command
         .args(args)
-        .env("HOME", &s.home)
         .env("PATH", format!("{}:/usr/bin:/bin", s.bin.display()))
         .env("TCR_CLAUDE_BIN", &s.stub)
-        .env_remove("CLAUDE_BIN")
-        .env_remove("TCR_RUN_ACTIVE")
-        .env_remove("ANTHROPIC_BASE_URL")
-        .env_remove("XDG_CACHE_HOME")
         .current_dir(&s.home)
         .output()
         .expect("run");

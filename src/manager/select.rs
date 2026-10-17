@@ -2,9 +2,14 @@
 
 use super::*;
 
+/// Bound on [`Manager::affinity`] and on its side set
+/// [`Manager::affinity_extended`]. Stable pins survive reconnects, so this size
+/// cap, not a disconnect hook, is what keeps a long-lived proxy from growing
+/// the map without limit.
+pub(super) const AFFINITY_CAP: usize = 1024;
 /// Bound on [`Manager::conn_affinity`] — see its doc-comment for why the map is
 /// memory-only and never persisted.
-const CONN_AFFINITY_CAP: usize = 256;
+pub(super) const CONN_AFFINITY_CAP: usize = 256;
 /// Idle TTL for a [`Manager::conn_affinity`] entry: an entry older than this is
 /// treated as absent (the connection is presumed gone). Short on purpose — this
 /// map exists only to keep NOISE traffic (`/api/event_logging`, `/mcp-registry`)
@@ -186,14 +191,14 @@ pub(super) fn classify_request(path: &str) -> RequestClass {
     }
 }
 
-/// Bound on [`Manager::divert_ledger`] — same cap `select()`'s `AFFINITY_CAP`
-/// applies to `self.affinity` (`:664-675`). [`DivertEpisode`] carries no
+/// Bound on [`Manager::divert_ledger`] — the same figure as [`AFFINITY_CAP`].
+/// [`DivertEpisode`] carries no
 /// separate last-touch stamp (§4.1's struct is quoted verbatim from the
 /// design doc), so `until_ms` is the eviction sort key here — the closest
 /// available recency proxy, not a perfect one. A session that never diverts
 /// again after arming a short hold ages out of this bound the same way a
 /// long-idle `affinity` entry does.
-const DIVERT_LEDGER_CAP: usize = 1024;
+pub(super) const DIVERT_LEDGER_CAP: usize = 1024;
 
 /// The three-way verdict [`divert_verdict`] hands back for one divert
 /// decision. `Fresh` and `Sticky` are consulted every divert regardless of
@@ -453,14 +458,14 @@ impl Manager {
     /// hot-reloaded cache, so a `groupSettings` edit takes effect on the next
     /// request.
     pub fn is_group_spill(&self, group: &str) -> bool {
-        self.spill_groups().contains(group)
+        self.groups().spill.contains(group)
     }
 
     /// **Whether a request asking for `group` is held STRICTLY inside it**,
     /// the one answer, for every reader.
     ///
-    /// `reserved || !spill`, which is verbatim the expression
-    /// [`Self::select_with_group`] computes for its own `strict_group`. A
+    /// `reserved || !spill` ([`GroupPolicy::is_strict`]), the same call
+    /// [`Self::select_with_group`] makes for its own `strict_group`. A
     /// measurement found two readers outside the picker asking
     /// [`Self::is_group_reserved`] ALONE, `src/proxy.rs`'s refusal arm and its
     /// mirror on the exhausted path, so for a group that is neither reserved
@@ -475,7 +480,7 @@ impl Manager {
     /// rule the picker and the refusal disagree about is a request held in a
     /// group and refused about a pool.
     pub fn is_group_strict(&self, group: &str) -> bool {
-        self.is_group_reserved(group) || !self.is_group_spill(group)
+        self.groups().is_strict(group)
     }
 
     /// [`Self::select`], with an optional PREFER-semantics group (`tcr run
@@ -524,24 +529,16 @@ impl Manager {
         // file's mtime has not moved since the last check.
         self.reload_groups_if_changed();
 
-        // A single point-in-time snapshot for the whole call — see
-        // `Self::reserved_groups`'s doc for why this clones rather than holding
+        // One version of the group settings for the whole call — see
+        // `Self::groups`'s doc for why this clones an `Arc` rather than holding
         // the lock across the accounts/affinity locks taken below.
-        let reserved_groups = self.reserved_groups();
-        // Same point-in-time-snapshot reasoning as `reserved_groups` above — see
-        // `Self::parked_groups`'s and `Self::control_allowed_groups`'s docs.
-        let parked_groups = self.parked_groups();
-        let control_allowed_groups = self.control_allowed_groups();
-        // Same point-in-time-snapshot reasoning as `reserved_groups` above —
-        // see `Self::spill_groups`'s doc.
-        let spill_groups = self.spill_groups();
+        let groups = self.groups();
         // THE GROUP ASK THIS CALL WILL HOLD STRICTLY, computed once here rather
         // than at the pool pick alone, because the affinity fast-path below has
         // to ask the same question and used to have no way to. See the pool
         // pick's own comment for what strictness means and for the two
-        // carve-outs; this is the identical expression, hoisted.
-        let strict_group =
-            group.filter(|g| reserved_groups.contains(*g) || !spill_groups.contains(*g));
+        // carve-outs.
+        let strict_group = group.filter(|g| groups.is_strict(g));
         // THE PROVIDER THIS REQUEST BELONGS TO, decided by its path (see
         // `crate::provider`'s module doc for why path and not host). Computed
         // here, above the hard lock, for the same reason `strict_group` is: the
@@ -607,10 +604,8 @@ impl Manager {
         let now_ms = odt_to_ms(now);
         // Compute the Fable classification ONCE, not per-account.
         // The Fable weekly bucket is an Anthropic fact; a Codex request never consults it.
-        let is_fable = match provider {
-            crate::provider::Provider::Anthropic => model.is_some_and(crate::model::is_fable_model),
-            crate::provider::Provider::Codex => false,
-        };
+        let is_fable =
+            provider.has_fable_bucket() && model.is_some_and(crate::model::is_fable_model);
         // Compute the control-account three-way split ONCE (part 2). Consulted
         // twice below: the routing overlay (control-preferred / noise) after the
         // affinity fast-path, and the pool-pick exclusion (inference must never
@@ -769,8 +764,8 @@ impl Manager {
                             a,
                             now_ms,
                             group,
-                            &reserved_groups,
-                            &parked_groups,
+                            &groups.reserved,
+                            &groups.parked,
                             warm,
                         )
                     }) {
@@ -820,8 +815,8 @@ impl Manager {
                                 provider,
                                 None,  // no group PREFERENCE — honouring an existing pin
                                 group, // but reservation is not a preference — real ask
-                                &reserved_groups,
-                                &parked_groups,
+                                &groups.reserved,
+                                &groups.parked,
                             )
                         });
                         if !x_usable {
@@ -896,8 +891,8 @@ impl Manager {
                                     a,
                                     now_ms,
                                     group,
-                                    &reserved_groups,
-                                    &parked_groups,
+                                    &groups.reserved,
+                                    &groups.parked,
                                     warm,
                                 )
                             });
@@ -975,8 +970,8 @@ impl Manager {
                                                 provider,
                                                 None,
                                                 group,
-                                                &reserved_groups,
-                                                &parked_groups,
+                                                &groups.reserved,
+                                                &groups.parked,
                                             )
                                     });
                                 if idle_ms >= warm.ms() && has_eligible_alternative {
@@ -1008,20 +1003,12 @@ impl Manager {
                                     );
                                     None
                                 } else {
-                                    let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
-                                    let util = accounts
-                                        .get(idx)
-                                        .map(|a| a.quota.max_utilization(now, is_fable))
-                                        .unwrap_or_default();
-                                    if let Some(account) = accounts.get_mut(idx) {
-                                        account.last_selected_seq = tick;
-                                        tracing::info!(
-                                            account = %account.name,
-                                            utilization = util,
-                                            is_fable,
-                                            "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
-                                        );
-                                    }
+                                    self.serve_pinned_over_threshold(
+                                        &mut accounts,
+                                        idx,
+                                        now,
+                                        is_fable,
+                                    );
                                     // `target == idx`, so the commit section below is a
                                     // plain pin refresh: OLD index, fresh `now_ms`.
                                     Some((idx, None))
@@ -1072,8 +1059,8 @@ impl Manager {
                                         // function already is.
                                         strict_group,
                                         group, // reservation is not a preference, real ask
-                                        &reserved_groups,
-                                        &parked_groups,
+                                        &groups.reserved,
+                                        &groups.parked,
                                     ) {
                                         continue;
                                     }
@@ -1218,8 +1205,8 @@ impl Manager {
                                     // it must never be followed onto.
                                     strict_group,
                                     group, // reservation is not a preference, real ask
-                                    &reserved_groups,
-                                    &parked_groups,
+                                    &groups.reserved,
+                                    &groups.parked,
                                 )
                             })
                         };
@@ -1352,8 +1339,8 @@ impl Manager {
                             // divert later.
                             strict_group,
                             group, // reservation is not a preference, real ask
-                            &reserved_groups,
-                            &parked_groups,
+                            &groups.reserved,
+                            &groups.parked,
                         )
                     });
                     usable.then_some(sticky)
@@ -1425,7 +1412,7 @@ impl Manager {
                 if request_class == RequestClass::Inference && !self.control_pooled {
                     self.control().filter(|&idx| {
                         let opted_in = group.is_some_and(|g| {
-                            control_allowed_groups.contains(g)
+                            groups.control_allowed.contains(g)
                                 && accounts
                                     .get(idx)
                                     .is_some_and(|a| a.groups.iter().any(|gr| gr == g))
@@ -1515,8 +1502,8 @@ impl Manager {
                         is_fable,
                         provider,
                         g,
-                        &reserved_groups,
-                        &parked_groups,
+                        &groups.reserved,
+                        &groups.parked,
                     );
                     tracing::info!(
                         group = g,
@@ -1549,8 +1536,8 @@ impl Manager {
                                     is_fable,
                                     provider,
                                     g,
-                                    &reserved_groups,
-                                    &parked_groups,
+                                    &groups.reserved,
+                                    &groups.parked,
                                 );
                                 tracing::info!(
                                     account = %account.name,
@@ -1630,7 +1617,7 @@ impl Manager {
             // `tried`) diverted THIS request only: re-insert the OLD index, not the
             // account we are about to serve. The insert still has to happen — this
             // `now_ms` is one of only two writers of the last-touch stamp that the
-            // AFFINITY_CAP eviction below sorts on, so skipping it would make a
+            // AFFINITY_CAP eviction sorts on, so skipping it would make a
             // heavily-diverted session the eviction victim.
             let pin_idx = keep_pin.unwrap_or(idx);
             let moved_off = {
@@ -1639,19 +1626,10 @@ impl Manager {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let previous = pins.get(&key).map(|&(i, _)| i);
+                // Capped at AFFINITY_CAP: an insert over it evicts the oldest-last-touch
+                // entry other than this one.
                 pins.insert(key, (pin_idx, now_ms));
                 self.mark_affinity_dirty();
-                // Bound the map by size + LRU-by-last-touch: once over AFFINITY_CAP, evict
-                // the single oldest-last-touch entry (not the one we just inserted). Stable
-                // pins survive reconnects, so this size cap — not a disconnect hook — is
-                // what keeps a long-lived proxy from growing the map without limit.
-                const AFFINITY_CAP: usize = 1024;
-                if pins.len() > AFFINITY_CAP
-                    && let Some((&oldest, _)) = pins.iter().min_by_key(|&(_, &(_, touch))| touch)
-                    && oldest != key
-                {
-                    pins.remove(&oldest);
-                }
                 // Only a real change is worth a line: `None` on an initial pin, and on
                 // a soft divert (where `pin_idx` is the unchanged old index).
                 previous.filter(|&p| p != pin_idx)
@@ -1685,12 +1663,7 @@ impl Manager {
             // honest lines about one request, not a defect. The accounts lock is taken
             // only after the affinity lock dropped above — never nested.
             if let Some(reason) = divert_reason {
-                let accounts = self
-                    .accounts
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let pin_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
-                let serve_name = accounts.get(idx).map_or("?", |a| a.name.as_str());
+                let (pin_name, serve_name) = self.pin_and_serve_names(pin_idx, idx);
                 tracing::info!(
                     "affinity: divert session {} pin {} -> serving {} (reason={}, pin kept)",
                     short_session_id(key),
@@ -1790,18 +1763,15 @@ impl Manager {
         // saturates. The pin-honor path is never throttled here.
         const REVALIDATION_MIN_SPACING_MS: i64 = 2000;
 
-        let reserved_groups = self.reserved_groups();
-        let parked_groups = self.parked_groups();
+        let groups = self.groups();
         let now_ms = odt_to_ms(now);
         // Derived exactly as `select_with_group` derives them.
         let provider = crate::provider::Provider::of_path(path);
         let filtered_tried = self.exclude_unsupported_codex_exits(tried, provider);
         let tried = filtered_tried.as_ref();
         // The Fable weekly bucket is an Anthropic fact; a Codex request never consults it.
-        let is_fable = match provider {
-            crate::provider::Provider::Anthropic => model.is_some_and(crate::model::is_fable_model),
-            crate::provider::Provider::Codex => false,
-        };
+        let is_fable =
+            provider.has_fable_bucket() && model.is_some_and(crate::model::is_fable_model);
 
         // HARD-gate predicate shared by both paths: the blocks that even a
         // revalidation serve must honor (soft utilization/pacing deliberately absent).
@@ -1825,8 +1795,8 @@ impl Manager {
                     now_ms,
                     is_fable,
                     None,
-                    &reserved_groups,
-                    &parked_groups,
+                    &groups.reserved,
+                    &groups.parked,
                     warm,
                 )
         };
@@ -1863,20 +1833,7 @@ impl Manager {
                 // decided below, on ACCOUNT-level evidence alone — see the comment
                 // there.
                 if !tried.contains(&idx) && accounts.get(idx).is_some_and(hard_ok) {
-                    let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
-                    let util = accounts
-                        .get(idx)
-                        .map(|a| a.quota.max_utilization(now, is_fable))
-                        .unwrap_or_default();
-                    if let Some(account) = accounts.get_mut(idx) {
-                        account.last_selected_seq = tick;
-                        tracing::info!(
-                            account = %account.name,
-                            utilization = util,
-                            is_fable,
-                            "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
-                        );
-                    }
+                    self.serve_pinned_over_threshold(&mut accounts, idx, now, is_fable);
                     return Some(idx);
                 }
                 // The pin cannot serve THIS request → fall through to the fallback
@@ -1896,7 +1853,7 @@ impl Manager {
                 // the opposite decision on the identical fact and documents why
                 // (see its affinity fast-path); the two now agree.
                 if accounts.get(idx).is_some_and(|a| {
-                    Self::account_hard_ok(a, now_ms, None, &reserved_groups, &parked_groups, warm)
+                    Self::account_hard_ok(a, now_ms, None, &groups.reserved, &groups.parked, warm)
                 }) {
                     keep_pin = Some(idx);
                     pin_until_ms = accounts
@@ -2046,12 +2003,7 @@ impl Manager {
             // pin stayed and another account served; `keep_pin` unset means the
             // fallback account became the new pin. The accounts lock is taken only
             // after the affinity lock has dropped above — never simultaneously.
-            let accounts = self
-                .accounts
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let pin_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
-            let serve_name = accounts.get(idx).map_or("?", |a| a.name.as_str());
+            let (pin_name, serve_name) = self.pin_and_serve_names(pin_idx, idx);
             tracing::info!(
                 "affinity: revalidation session {} pin {} -> serving {} (reason=revalidation-fallback, pin {})",
                 short_session_id(key),
@@ -2065,6 +2017,44 @@ impl Manager {
             );
         }
         Some(idx)
+    }
+
+    /// Serve the session's pinned account `idx` even though it is over the soft threshold: bump
+    /// its LRU tick and log the `revalidation-serve (pin-honor)` line. The caller holds the
+    /// accounts write lock.
+    fn serve_pinned_over_threshold(
+        &self,
+        accounts: &mut [AccountRuntime],
+        idx: usize,
+        now: OffsetDateTime,
+        is_fable: bool,
+    ) {
+        let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+        let util = accounts
+            .get(idx)
+            .map(|a| a.quota.max_utilization(now, is_fable))
+            .unwrap_or_default();
+        if let Some(account) = accounts.get_mut(idx) {
+            account.last_selected_seq = tick;
+            tracing::info!(
+                account = %account.name,
+                utilization = util,
+                is_fable,
+                "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
+            );
+        }
+    }
+
+    /// The names of the pinned and the serving account for an `affinity:` log line, `?` for an
+    /// index that no longer exists. Takes the accounts read lock itself and drops it before
+    /// returning, so the caller must not hold the affinity lock.
+    fn pin_and_serve_names(&self, pin_idx: usize, idx: usize) -> (String, String) {
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let name = |i: usize| accounts.get(i).map_or("?", |a| a.name.as_str()).to_owned();
+        (name(pin_idx), name(idx))
     }
 
     /// Milliseconds still to run on a LIVE rate-limit hold, or `None` when the
@@ -2888,8 +2878,7 @@ impl Manager {
         respect_pacing: bool,
         group: Option<&str>,
     ) -> Option<usize> {
-        let reserved_groups = self.reserved_groups();
-        let parked_groups = self.parked_groups();
+        let groups = self.groups();
         let mut best: Option<usize> = None;
         let mut best_key: Option<(i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
@@ -2908,8 +2897,8 @@ impl Manager {
                 provider,
                 group,
                 group, // this pass's own real ask — see `eligible`'s `reserved_group` doc
-                &reserved_groups,
-                &parked_groups,
+                &groups.reserved,
+                &groups.parked,
             ) {
                 // Distinguish a pacing skip (healthy but capped/spaced) from a real
                 // ineligibility (disabled/error/quota) so the log names only the former.
@@ -2927,8 +2916,8 @@ impl Manager {
                         provider,
                         group,
                         group,
-                        &reserved_groups,
-                        &parked_groups,
+                        &groups.reserved,
+                        &groups.parked,
                     )
                 {
                     tracing::info!(
@@ -2983,8 +2972,7 @@ impl Manager {
         provider: crate::provider::Provider,
         group: Option<&str>,
     ) -> Option<usize> {
-        let reserved_groups = self.reserved_groups();
-        let parked_groups = self.parked_groups();
+        let groups = self.groups();
         let mut best: Option<usize> = None;
         let mut best_key: Option<(u32, i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
@@ -3003,8 +2991,8 @@ impl Manager {
                 provider,
                 group,
                 group,
-                &reserved_groups,
-                &parked_groups,
+                &groups.reserved,
+                &groups.parked,
             ) {
                 continue;
             }
@@ -3057,8 +3045,7 @@ impl Manager {
         now_ms: i64,
         provider: crate::provider::Provider,
     ) -> Option<usize> {
-        let reserved_groups = self.reserved_groups();
-        let parked_groups = self.parked_groups();
+        let groups = self.groups();
         let mut best: Option<usize> = None;
         let mut best_key: Option<(u64, i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
@@ -3078,7 +3065,7 @@ impl Manager {
             // Parked is an account-level block like `disabled` above, and this
             // last-resort pass relaxes only the Fable `7d_oi` prediction — never
             // an operator's own decision to hold a group out.
-            if Self::parked_blocks(account, &parked_groups) {
+            if Self::parked_blocks(account, &groups.parked) {
                 continue;
             }
             if let Some(until) = account.rate_limited_until_ms
@@ -3098,7 +3085,7 @@ impl Manager {
             if account.quota.model_weekly_rejected(now) {
                 continue;
             }
-            if Self::reserved_blocks(account, None, &reserved_groups) {
+            if Self::reserved_blocks(account, None, &groups.reserved) {
                 continue;
             }
             if !self.pool_pick_respects_control_reserve(idx, account, now) {
@@ -3147,9 +3134,8 @@ impl Manager {
 
     /// Write half of [`Manager::conn_affinity`]: record (or refresh) which
     /// account served connection `conn_key`, then evict the single
-    /// oldest-last-touch entry if the map grew past [`CONN_AFFINITY_CAP`] —
-    /// mirrors `select()`'s `AFFINITY_CAP` eviction for `self.affinity`, but on
-    /// this SEPARATE, never-persisted map. Never touches `self.affinity` and
+    /// oldest-last-touch entry if the map grew past [`CONN_AFFINITY_CAP`]
+    /// ([`CappedMap::insert`]), on this SEPARATE, never-persisted map. Never touches `self.affinity` and
     /// never marks it dirty.
     pub(super) fn conn_affinity_record(&self, conn_key: u64, idx: usize, now_ms: i64) {
         let mut map = self
@@ -3157,12 +3143,6 @@ impl Manager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.insert(conn_key, (idx, now_ms));
-        if map.len() > CONN_AFFINITY_CAP
-            && let Some((&oldest, _)) = map.iter().min_by_key(|&(_, &(_, touch))| touch)
-            && oldest != conn_key
-        {
-            map.remove(&oldest);
-        }
     }
 
     /// Write half of [`Manager::divert_ledger`] (§4.1/§4.2): record `dest` as
@@ -3180,9 +3160,8 @@ impl Manager {
     /// by design (§4.1: "so the sticky overlay has a single preferred index
     /// without scanning the mask").
     ///
-    /// Bounded by [`DIVERT_LEDGER_CAP`] + LRU-by-`until_ms` eviction, mirroring
-    /// `select()`'s `AFFINITY_CAP` pattern (`:664-675`) on this separate,
-    /// never-persisted map.
+    /// Bounded by [`DIVERT_LEDGER_CAP`] + LRU-by-`until_ms` eviction
+    /// ([`CappedMap::evict_sparing`]) on this separate, never-persisted map.
     pub(super) fn record_divert(
         &self,
         session_key: u64,
@@ -3226,13 +3205,7 @@ impl Manager {
             entry.sticky = dest;
         }
         entry.destinations |= bit;
-
-        if ledger.len() > DIVERT_LEDGER_CAP
-            && let Some((&oldest, _)) = ledger.iter().min_by_key(|(_, e)| e.until_ms)
-            && oldest != session_key
-        {
-            ledger.remove(&oldest);
-        }
+        ledger.evict_sparing(session_key);
     }
 }
 
@@ -3245,6 +3218,67 @@ fn gate_clear_key(at: Option<OffsetDateTime>) -> (u8, OffsetDateTime) {
     match at {
         Some(t) => (0, t),
         None => (1, OffsetDateTime::UNIX_EPOCH),
+    }
+}
+
+#[cfg(test)]
+mod select_test_support {
+    //! The setup this file's test modules share: one way to build a manager,
+    //! a healthy account, and the session-pin map read and written directly.
+    use super::*;
+    use crate::config::Account;
+    use crate::oauth::NoRefresh;
+    use crate::probe::LiveUsageProber;
+    use crate::warmer::LiveWarmer;
+
+    /// A healthy Anthropic account, the same shape every module in this file builds.
+    pub(super) fn account(name: &str) -> Account {
+        Account::fixture(name)
+    }
+
+    pub(super) fn config_with(accounts: Vec<Account>) -> Config {
+        Config::fixture(accounts)
+    }
+
+    /// A manager over `config` with the live prober and warmer and no refresher or
+    /// config file.
+    pub(super) fn live_manager(config: Config) -> Arc<Manager> {
+        live_manager_with(config, None)
+    }
+
+    /// [`live_manager`], with `path` as the config file behind it.
+    pub(super) fn live_manager_on_file(config: Config, path: std::path::PathBuf) -> Arc<Manager> {
+        live_manager_with(config, Some(path))
+    }
+
+    fn live_manager_with(config: Config, path: Option<std::path::PathBuf>) -> Arc<Manager> {
+        Manager::new(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(LiveWarmer::new()),
+            path,
+        )
+    }
+
+    /// Seed a live pin directly: session `key` on account `idx`, last touched at
+    /// `touched_ms`.
+    pub(super) fn pin(manager: &Manager, key: u64, idx: usize, touched_ms: i64) {
+        manager
+            .affinity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, (idx, touched_ms));
+    }
+
+    /// The account session `key` is pinned to, if any.
+    pub(super) fn pin_of(manager: &Manager, key: u64) -> Option<usize> {
+        manager
+            .affinity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .map(|&(idx, _)| idx)
     }
 }
 
@@ -3355,76 +3389,9 @@ mod divert_verdict_tests {
 /// cycle, not by this file, per `CLAUDE.md` § "Verifying a change".
 #[cfg(test)]
 mod revalidation_sticky_tests {
+    use super::select_test_support::{account, config_with, live_manager};
     use super::*;
-    use crate::config::{Account, ProxyConfig};
-    use crate::oauth::NoRefresh;
-    use crate::probe::LiveUsageProber;
-    use crate::warmer::LiveWarmer;
     use std::collections::HashSet;
-
-    fn account(name: &str) -> Account {
-        Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        }
-    }
-
-    fn config_with(accounts: Vec<Account>) -> Config {
-        Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts,
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
-        }
-    }
-
-    fn build_manager(config: Config) -> Arc<Manager> {
-        Manager::new(
-            config,
-            Arc::new(NoRefresh),
-            Arc::new(LiveUsageProber::new()),
-            Arc::new(LiveWarmer::new()),
-            None,
-        )
-    }
 
     /// The headline claim: after `select()` diverts and records this
     /// episode's sticky destination in `Manager::divert_ledger`, a request
@@ -3434,7 +3401,7 @@ mod revalidation_sticky_tests {
     /// anti-churn-defeating fixture) would otherwise be the OTHER alternate.
     #[test]
     fn revalidation_fallback_reuses_the_episode_sticky_destination() {
-        let manager = build_manager(config_with(vec![
+        let manager = live_manager(config_with(vec![
             account("home"),
             account("alt1"),
             account("alt2"),
@@ -3514,76 +3481,9 @@ mod revalidation_sticky_tests {
 /// (§6), which this test does not have access to.
 #[cfg(test)]
 mod sticky_divert_replay_tests {
+    use super::select_test_support::{account, config_with, live_manager};
     use super::*;
-    use crate::config::{Account, ProxyConfig};
-    use crate::oauth::NoRefresh;
-    use crate::probe::LiveUsageProber;
-    use crate::warmer::LiveWarmer;
     use std::collections::HashSet;
-
-    fn account(name: &str) -> Account {
-        Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        }
-    }
-
-    fn config_with(accounts: Vec<Account>) -> Config {
-        Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts,
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
-        }
-    }
-
-    fn build_manager(config: Config) -> Arc<Manager> {
-        Manager::new(
-            config,
-            Arc::new(NoRefresh),
-            Arc::new(LiveUsageProber::new()),
-            Arc::new(LiveWarmer::new()),
-            None,
-        )
-    }
 
     /// Four `select()` calls in a row for one pinned, rate-limited session —
     /// the exact shape of the retained trace (four diverts, `pin-tried`
@@ -3595,7 +3495,7 @@ mod sticky_divert_replay_tests {
     /// the bounce the production trace shows.
     #[test]
     fn four_diverts_in_one_episode_reuse_the_same_alternate() {
-        let manager = build_manager(config_with(vec![
+        let manager = live_manager(config_with(vec![
             account("alice"),
             account("bob"),
             account("carol"),
@@ -3687,75 +3587,23 @@ mod sticky_divert_replay_tests {
 /// somebody else's Mac.
 #[cfg(test)]
 mod strict_group_door_tests {
+    use super::select_test_support::{live_manager, pin, pin_of};
     use super::*;
-    use crate::config::{Account, ProxyConfig};
-    use crate::oauth::NoRefresh;
-    use crate::probe::LiveUsageProber;
-    use crate::warmer::LiveWarmer;
+    use crate::config::Account;
     use std::collections::HashSet;
 
     fn account(name: &str, groups: &[&str]) -> Account {
         Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
             groups: Some(groups.iter().map(|g| (*g).to_string()).collect()),
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture(name)
         }
     }
 
     fn config_with(accounts: Vec<Account>, lock_account: Option<String>) -> Config {
         Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
             lock_account,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts,
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
+            ..Config::fixture(accounts)
         }
-    }
-
-    fn build(config: Config) -> Arc<Manager> {
-        Manager::new(
-            config,
-            Arc::new(NoRefresh),
-            Arc::new(LiveUsageProber::new()),
-            Arc::new(LiveWarmer::new()),
-            None,
-        )
     }
 
     /// `config_with` plus a named control account, the door §H the
@@ -3782,7 +3630,7 @@ mod strict_group_door_tests {
     /// `Some(bob)`.
     #[test]
     fn a_hard_account_lock_is_refused_outside_a_strict_group() {
-        let manager = build(config_with(
+        let manager = live_manager(config_with(
             vec![account("alice", &["work"]), account("bob", &["home"])],
             Some("bob".to_string()),
         ));
@@ -3841,7 +3689,7 @@ mod strict_group_door_tests {
     /// later.
     #[test]
     fn a_sticky_divert_destination_is_refused_outside_a_strict_group() {
-        let manager = build(config_with(
+        let manager = live_manager(config_with(
             vec![account("alice", &["a-team"]), account("bob", &["b-team"])],
             None,
         ));
@@ -3926,7 +3774,7 @@ mod strict_group_door_tests {
     /// `proxy.rs` call sites were in.
     #[test]
     fn a_group_that_is_neither_reserved_nor_spill_is_strict() {
-        let manager = build(config_with(vec![account("alice", &["work"])], None));
+        let manager = live_manager(config_with(vec![account("alice", &["work"])], None));
         assert!(
             manager.is_group_strict("work"),
             "a plain group is strict: it is not a spill group, so the picker \
@@ -3955,29 +3803,12 @@ mod strict_group_door_tests {
         config
     }
 
-    /// Seed a LIVE pin directly, bypassing `select`, the same shape as
-    /// `stale_pin_load_tests::pin` below in this file. Used here so two
-    /// sessions can be stacked on one account deterministically: a fresh,
-    /// unpinned `select` alternates its LRU pick across every eligible
-    /// account (`Self::pick_eligible`'s `last_selected_seq` tie-break), so
-    /// two back-to-back calls do NOT reliably land on the same index the way
-    /// the migration scan's precondition (`count_x >= 2`) needs.
-    fn pin(manager: &Manager, key: u64, idx: usize, touched_ms: i64) {
-        manager
-            .affinity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key, (idx, touched_ms));
-    }
-
-    fn pin_of(manager: &Manager, key: u64) -> Option<usize> {
-        manager
-            .affinity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .map(|&(idx, _)| idx)
-    }
+    // The tests below seed LIVE pins directly with `select_test_support::pin`,
+    // bypassing `select`, so two sessions can be stacked on one account
+    // deterministically: a fresh, unpinned `select` alternates its LRU pick across
+    // every eligible account (`Self::pick_eligible`'s `last_selected_seq`
+    // tie-break), so two back-to-back calls do NOT reliably land on the same index
+    // the way the migration scan's precondition (`count_x >= 2`) needs.
 
     /// **THE FOURTH DOOR OUT OF A STRICT GROUP**, and the one that returns
     /// from inside the affinity fast path, so neither the hard-lock test above
@@ -3992,7 +3823,7 @@ mod strict_group_door_tests {
     /// argument is `strict_group`.
     #[test]
     fn a_migration_target_is_refused_outside_a_strict_group() {
-        let manager = build(config_with_migration(vec![
+        let manager = live_manager(config_with_migration(vec![
             account("at-inside", &["shared"]),
             account("at-outside", &[]),
         ]));
@@ -4039,7 +3870,7 @@ mod strict_group_door_tests {
     /// `tried.contains(&cand)`.
     #[test]
     fn a_migration_target_is_never_an_account_the_request_already_benched() {
-        let manager = build(config_with_migration(vec![
+        let manager = live_manager(config_with_migration(vec![
             account("at-a", &[]),
             account("at-b", &[]),
         ]));
@@ -4076,7 +3907,7 @@ mod strict_group_door_tests {
     /// the overlay also requires `strict_group` membership.
     #[test]
     fn control_preferred_overlay_is_refused_outside_a_strict_group() {
-        let manager = build(config_with_control(
+        let manager = live_manager(config_with_control(
             vec![
                 account("at-inside", &["shared"]),
                 account("at-control", &[]),
@@ -4124,7 +3955,7 @@ mod strict_group_door_tests {
     /// Green once that argument is `strict_group`.
     #[test]
     fn noise_connection_affinity_overlay_is_refused_outside_a_strict_group() {
-        let manager = build(config_with(
+        let manager = live_manager(config_with(
             vec![
                 account("at-inside", &["shared"]),
                 account("at-outside", &[]),
@@ -4196,26 +4027,9 @@ mod reserved_gate_agreement_tests {
     fn account_runtime(groups: &[&str]) -> AccountRuntime {
         AccountRuntime::from_config(
             &Account {
-                name: "probe".to_string(),
-                account_type: crate::config::AccountType::OAuth,
-                provider: Default::default(),
-                account_uuid: None,
-                org_uuid: None,
-                org_name: None,
-                access_token: "at-probe".to_string(),
                 refresh_token: None,
-                expires_at: Some(crate::now_ms() + 3_600_000),
-                priority: Some(0),
-                switch_threshold: None,
-                disabled: None,
                 groups: Some(groups.iter().map(|g| g.to_string()).collect()),
-                organization_type: None,
-                rate_limit_tier: None,
-                seat_tier: None,
-                egress: crate::config::Egress::Local,
-                egress_strict: false,
-                codex_home: None,
-                extra: serde_json::Map::new(),
+                ..Account::fixture("probe")
             },
             false,
         )
@@ -4368,26 +4182,10 @@ mod group_miss_tests {
     fn account(name: &str, groups: &[&str], disabled: bool) -> AccountRuntime {
         AccountRuntime::from_config(
             &Account {
-                name: name.to_string(),
-                account_type: crate::config::AccountType::OAuth,
-                provider: Default::default(),
-                account_uuid: None,
-                org_uuid: None,
-                org_name: None,
-                access_token: format!("at-{name}"),
                 refresh_token: None,
-                expires_at: Some(crate::now_ms() + 3_600_000),
-                priority: Some(0),
-                switch_threshold: None,
                 disabled: disabled.then_some(true),
                 groups: Some(groups.iter().map(|g| g.to_string()).collect()),
-                organization_type: None,
-                rate_limit_tier: None,
-                seat_tier: None,
-                egress: crate::config::Egress::Local,
-                egress_strict: false,
-                codex_home: None,
-                extra: serde_json::Map::new(),
+                ..Account::fixture(name)
             },
             false,
         )
@@ -4569,76 +4367,17 @@ mod group_miss_tests {
 /// LRU sorts last.
 #[cfg(test)]
 mod reset_urgency_tests {
+    use super::select_test_support::{account, live_manager};
     use super::*;
-    use crate::config::{Account, ProxyConfig};
-    use crate::oauth::NoRefresh;
-    use crate::probe::LiveUsageProber;
+    use crate::config::Account;
     use crate::quota::QuotaWindow;
-    use crate::warmer::LiveWarmer;
     use std::collections::HashSet;
-
-    fn account(name: &str) -> Account {
-        Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        }
-    }
 
     fn config_with(accounts: Vec<Account>, tier_hours: u32) -> Config {
         Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
             reset_urgency_tier_hours: tier_hours,
-            http1_only: false,
-            accounts,
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
+            ..Config::fixture(accounts)
         }
-    }
-
-    fn build_manager(config: Config) -> Arc<Manager> {
-        Manager::new(
-            config,
-            Arc::new(NoRefresh),
-            Arc::new(LiveUsageProber::new()),
-            Arc::new(LiveWarmer::new()),
-            None,
-        )
     }
 
     /// Give account `idx` a weekly window resetting `hours` from `now` at a
@@ -4682,7 +4421,7 @@ mod reset_urgency_tests {
     /// worth nothing a few hours later.
     #[test]
     fn a_sooner_resetting_account_outranks_a_less_recently_selected_one() {
-        let manager = build_manager(config_with(vec![account("urgent"), account("roomy")], 24));
+        let manager = live_manager(config_with(vec![account("urgent"), account("roomy")], 24));
         let now = OffsetDateTime::now_utc();
 
         set_weekly(&manager, 0, 2, now);
@@ -4709,7 +4448,7 @@ mod reset_urgency_tests {
     /// have destroyed.
     #[test]
     fn accounts_in_one_bucket_still_fan_out_by_lru() {
-        let manager = build_manager(config_with(vec![account("first"), account("second")], 24));
+        let manager = live_manager(config_with(vec![account("first"), account("second")], 24));
         let now = OffsetDateTime::now_utc();
 
         set_weekly(&manager, 0, 2, now);
@@ -4729,7 +4468,7 @@ mod reset_urgency_tests {
     /// as the discriminating test, opposite expected winner.
     #[test]
     fn tier_hours_zero_restores_the_pre_tier_lru_order() {
-        let manager = build_manager(config_with(vec![account("urgent"), account("roomy")], 0));
+        let manager = live_manager(config_with(vec![account("urgent"), account("roomy")], 0));
         let now = OffsetDateTime::now_utc();
 
         set_weekly(&manager, 0, 2, now);
@@ -4751,7 +4490,7 @@ mod reset_urgency_tests {
     /// never-selected AND resetting soon; the unmeasured account still beats it.
     #[test]
     fn an_unknown_weekly_reset_still_sorts_ahead_of_every_bucket() {
-        let manager = build_manager(config_with(
+        let manager = live_manager(config_with(
             vec![account("unmeasured"), account("soon")],
             24,
         ));
@@ -4776,7 +4515,7 @@ mod reset_urgency_tests {
     /// 0) because an off-by-one here silently re-ranks the whole fleet.
     #[test]
     fn bucket_arithmetic_floors_and_handles_both_sentinels() {
-        let manager = build_manager(config_with(vec![account("a")], 24));
+        let manager = live_manager(config_with(vec![account("a")], 24));
         let now = OffsetDateTime::now_utc();
 
         let tier = |hours: i64| {
@@ -4815,7 +4554,7 @@ mod reset_urgency_tests {
         }
 
         // Disabled → a constant tie for everyone, including the unknown arm.
-        let off = build_manager(config_with(vec![account("a")], 0));
+        let off = live_manager(config_with(vec![account("a")], 0));
         {
             let accounts = off
                 .accounts
@@ -4842,79 +4581,20 @@ mod reset_urgency_tests {
 /// writes) is never picked.
 #[cfg(test)]
 mod fable_last_resort_tests {
+    use super::select_test_support::{account, live_manager};
     use super::*;
-    use crate::config::{Account, ProxyConfig};
-    use crate::oauth::NoRefresh;
-    use crate::probe::LiveUsageProber;
+    use crate::config::Account;
     use crate::quota::QuotaWindow;
-    use crate::warmer::LiveWarmer;
     use std::collections::HashSet;
     use time::Duration;
 
     const FABLE_MODEL: &str = "claude-fable-5";
 
-    fn account(name: &str) -> Account {
-        Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        }
-    }
-
     fn config_with(accounts: Vec<Account>, switch_threshold: f64) -> Config {
         Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts,
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
+            ..Config::fixture(accounts)
         }
-    }
-
-    fn build_manager(config: Config) -> Arc<Manager> {
-        Manager::new(
-            config,
-            Arc::new(NoRefresh),
-            Arc::new(LiveUsageProber::new()),
-            Arc::new(LiveWarmer::new()),
-            None,
-        )
     }
 
     /// Set account `idx`'s `7d_oi` utilization, resetting two hours out (safely
@@ -4938,7 +4618,7 @@ mod fable_last_resort_tests {
     /// sitting at 0.95-0.98 on `7d_oi`, none of them upstream-rejected).
     #[test]
     fn absent_fable_weekly_threshold_matches_todays_switch_threshold_gate() {
-        let manager = build_manager(config_with(vec![account("acct-a")], 0.95));
+        let manager = live_manager(config_with(vec![account("acct-a")], 0.95));
         set_seven_day_oi(&manager, 0, 0.96);
         let now = OffsetDateTime::now_utc();
         let accounts = manager
@@ -4967,7 +4647,7 @@ mod fable_last_resort_tests {
     fn fable_weekly_threshold_at_one_frees_prediction_but_not_rejection() {
         let mut config = config_with(vec![account("acct-a"), account("acct-b")], 0.95);
         config.fable_weekly_threshold = Some(1.0);
-        let manager = build_manager(config);
+        let manager = live_manager(config);
         set_seven_day_oi(&manager, 0, 0.96); // predicted-over, never rejected
         set_seven_day_oi(&manager, 1, 1.0); // genuinely rejected upstream
         let now = OffsetDateTime::now_utc();
@@ -5007,7 +4687,7 @@ mod fable_last_resort_tests {
         for fable_weekly_threshold in [None, Some(1.0)] {
             let mut config = config_with(vec![account("acct-a")], 0.95);
             config.fable_weekly_threshold = fable_weekly_threshold;
-            let manager = build_manager(config);
+            let manager = live_manager(config);
             set_seven_day_oi(&manager, 0, 0.96);
             let now = OffsetDateTime::now_utc();
             let now_ms = odt_to_ms(now);
@@ -5053,7 +4733,7 @@ mod fable_last_resort_tests {
     /// 429. The new three-tier gate must still serve the request.
     #[test]
     fn fleet_all_over_predicted_threshold_is_still_served() {
-        let manager = build_manager(config_with(
+        let manager = live_manager(config_with(
             vec![account("acct-a"), account("acct-b"), account("acct-c")],
             0.95,
         ));
@@ -5083,7 +4763,7 @@ mod fable_last_resort_tests {
     /// predicted-over, so the pick must land on one of THEM.
     #[test]
     fn a_genuinely_rejected_account_is_never_the_last_resort_pick() {
-        let manager = build_manager(config_with(
+        let manager = live_manager(config_with(
             vec![account("acct-a"), account("acct-b"), account("acct-c")],
             0.95,
         ));
@@ -5115,7 +4795,7 @@ mod fable_last_resort_tests {
     /// authority-confirmed exhaustion.
     #[test]
     fn fleet_fully_rejected_upstream_still_returns_none() {
-        let manager = build_manager(config_with(
+        let manager = live_manager(config_with(
             vec![account("acct-a"), account("acct-b")],
             0.95,
         ));
@@ -5143,7 +4823,7 @@ mod fable_last_resort_tests {
     /// last-resort path (gated on `is_fable`) must never even be consulted.
     #[test]
     fn a_non_fable_request_is_unaffected() {
-        let manager = build_manager(config_with(
+        let manager = live_manager(config_with(
             vec![account("acct-a"), account("acct-b")],
             0.95,
         ));
@@ -5172,7 +4852,7 @@ mod fable_last_resort_tests {
     /// healthy fleet picks in.
     #[test]
     fn an_account_under_threshold_is_preferred_over_one_above_it() {
-        let manager = build_manager(config_with(vec![account("fresh"), account("stale")], 0.95));
+        let manager = live_manager(config_with(vec![account("fresh"), account("stale")], 0.95));
         set_seven_day_oi(&manager, 0, 0.50); // fresh: well under threshold
         set_seven_day_oi(&manager, 1, 0.96); // stale: over threshold
 
@@ -5211,7 +4891,7 @@ mod fable_last_resort_tests {
                 ..Default::default()
             },
         );
-        let manager = build_manager(config);
+        let manager = live_manager(config);
         set_seven_day_oi(&manager, 0, 0.96); // the reserved group's only member
         set_seven_day_oi(&manager, 1, 0.50); // pool-only, would serve as a last resort
 
@@ -5240,37 +4920,9 @@ mod stale_pin_load_tests {
     //! pins with one touched in the last hour made the emptiest account read as
     //! carrying eight sessions, and every session that landed on it was
     //! migrated straight back off.
+    use super::select_test_support::{account, live_manager, pin, pin_of};
     use super::*;
-    use crate::config::{Account, ProxyConfig};
-    use crate::oauth::NoRefresh;
-    use crate::probe::LiveUsageProber;
-    use crate::warmer::LiveWarmer;
     use std::collections::HashSet;
-
-    fn account(name: &str) -> Account {
-        Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        }
-    }
 
     /// Two accounts, `loadBalanceMigration` ON (the only mode that counts pins).
     fn build_manager() -> Arc<Manager> {
@@ -5280,55 +4932,13 @@ mod stale_pin_load_tests {
             serde_json::Value::Bool(true),
         );
         let config = Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts: vec![account("alice@example.com"), account("bob@example.com")],
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
             extra,
+            ..Config::fixture(vec![
+                account("alice@example.com"),
+                account("bob@example.com"),
+            ])
         };
-        Manager::new(
-            config,
-            Arc::new(NoRefresh),
-            Arc::new(LiveUsageProber::new()),
-            Arc::new(LiveWarmer::new()),
-            None,
-        )
-    }
-
-    fn pin(manager: &Manager, key: u64, idx: usize, touched_ms: i64) {
-        manager
-            .affinity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key, (idx, touched_ms));
-    }
-
-    fn pin_of(manager: &Manager, key: u64) -> Option<usize> {
-        manager
-            .affinity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .map(|&(idx, _)| idx)
+        live_manager(config)
     }
 
     /// Five days stale, the shape of the field report.
@@ -5459,45 +5069,18 @@ mod stale_pin_load_tests {
 /// Each test below names the door it guards and the line that closes it.
 #[cfg(test)]
 mod provider_filter_tests {
+    use super::select_test_support::{
+        account, config_with, live_manager, live_manager_on_file, pin, pin_of,
+    };
     use super::*;
-    use crate::config::{Account, ProxyConfig};
-    use crate::oauth::NoRefresh;
-    use crate::probe::LiveUsageProber;
+    use crate::config::Account;
     use crate::provider::Provider;
     use crate::quota::QuotaWindow;
-    use crate::warmer::LiveWarmer;
     use std::collections::HashSet;
     use time::Duration;
 
     const ANTHROPIC_PATH: &str = "/v1/messages";
     const CODEX_PATH: &str = "/backend-api/codex/responses";
-
-    /// A healthy Anthropic account, the same shape every other module in this
-    /// file builds.
-    fn account(name: &str) -> Account {
-        Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        }
-    }
 
     /// The same account, on the Codex upstream.
     fn codex(name: &str) -> Account {
@@ -5540,7 +5123,7 @@ mod provider_filter_tests {
                 "the row remains available for repair"
             );
             assert!(config.accounts[0].egress_strict);
-            let manager = build(config);
+            let manager = live_manager(config);
             let now = OffsetDateTime::now_utc();
             pin(&manager, 77, 0, odt_to_ms(now));
             let got = match door {
@@ -5589,7 +5172,7 @@ mod provider_filter_tests {
             (Provider::Codex, crate::config::Egress::Via(peer), false),
             (Provider::Codex, crate::config::Egress::Local, true),
         ] {
-            let manager = build(config_with(vec![Account {
+            let manager = live_manager(config_with(vec![Account {
                 provider,
                 egress,
                 egress_strict: strict,
@@ -5612,63 +5195,6 @@ mod provider_filter_tests {
                 "{provider:?} {egress:?}, strict={strict} remains selectable"
             );
         }
-    }
-
-    fn config_with(accounts: Vec<Account>) -> Config {
-        Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts,
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
-        }
-    }
-
-    fn build(config: Config) -> Arc<Manager> {
-        Manager::new(
-            config,
-            Arc::new(NoRefresh),
-            Arc::new(LiveUsageProber::new()),
-            Arc::new(LiveWarmer::new()),
-            None,
-        )
-    }
-
-    /// Seed a live pin directly, the same shape as `strict_group_door_tests::pin`.
-    fn pin(manager: &Manager, key: u64, idx: usize, touched_ms: i64) {
-        manager
-            .affinity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key, (idx, touched_ms));
-    }
-
-    fn pin_of(manager: &Manager, key: u64) -> Option<usize> {
-        manager
-            .affinity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .map(|&(idx, _)| idx)
     }
 
     /// Set account `idx`'s window to `utilization`, resetting two hours out.
@@ -5785,7 +5311,7 @@ mod provider_filter_tests {
             disabled: Some(true),
             ..account("bob@example.com")
         };
-        let manager = build(config_with(vec![
+        let manager = live_manager(config_with(vec![
             codex("alice@example.com"),
             disabled_anthropic,
         ]));
@@ -5822,7 +5348,7 @@ mod provider_filter_tests {
     fn a_hard_account_lock_never_serves_the_other_provider() {
         let mut config = config_with(vec![codex("alice@example.com"), account("bob@example.com")]);
         config.lock_account = Some("alice@example.com".to_string());
-        let manager = build(config);
+        let manager = live_manager(config);
         let now = OffsetDateTime::now_utc();
         assert_eq!(
             manager.select(&HashSet::new(), now, None, None, ANTHROPIC_PATH, None),
@@ -5842,7 +5368,7 @@ mod provider_filter_tests {
     fn a_hard_account_lock_on_an_anthropic_account_never_serves_a_codex_request() {
         let mut config = config_with(vec![account("alice@example.com"), codex("bob@example.com")]);
         config.lock_account = Some("alice@example.com".to_string());
-        let manager = build(config);
+        let manager = live_manager(config);
         let now = OffsetDateTime::now_utc();
         assert_eq!(
             manager.select(&HashSet::new(), now, None, None, CODEX_PATH, None),
@@ -5860,7 +5386,7 @@ mod provider_filter_tests {
     fn provider_isolation_claude_lock_does_not_hide_codex_capacity() {
         let mut config = config_with(vec![account("alice@example.com"), codex("bob@example.com")]);
         config.lock_account = Some("alice@example.com".into());
-        let manager = build(config);
+        let manager = live_manager(config);
         assert!(manager.codex_account_can_serve_eventually(None));
         assert!(manager.codex_account_can_serve_eventually(Some(1)));
         assert!(!manager.codex_account_can_serve_eventually(Some(0)));
@@ -5892,7 +5418,7 @@ mod provider_filter_tests {
             },
         ]);
         config.lock_account = Some("alice@example.com".into());
-        let manager = build(config);
+        let manager = live_manager(config);
         assert!(
             !manager.codex_account_can_serve_eventually(None),
             "a healthy same-named row is not the locked slot"
@@ -5914,7 +5440,7 @@ mod provider_filter_tests {
 
     #[test]
     fn provider_isolation_unsupported_exit_excludes_only_its_exact_slot() {
-        let manager = build(config_with(vec![
+        let manager = live_manager(config_with(vec![
             Account {
                 account_uuid: Some("11111111-1111-1111-1111-111111111111".into()),
                 egress: crate::config::Egress::Via(tcr_peer_wire::PeerId([0x55; 32])),
@@ -5951,13 +5477,7 @@ mod provider_filter_tests {
         let mut config = config_with(vec![account("alice@example.com"), codex("bob@example.com")]);
         config.proxy.port = 9;
         crate::config::save(&path, &config).unwrap();
-        let manager = Manager::new(
-            config.clone(),
-            Arc::new(NoRefresh),
-            Arc::new(LiveUsageProber::new()),
-            Arc::new(LiveWarmer::new()),
-            Some(path.clone()),
-        );
+        let manager = live_manager_on_file(config.clone(), path.clone());
         assert_eq!(manager.provider_account_count(Provider::Anthropic), 1);
         let writing = manager.config_write.lock().unwrap();
         config.accounts.remove(0);
@@ -6005,6 +5525,26 @@ mod provider_filter_tests {
         );
     }
 
+    /// Send once on account `first_idx` (0 is Anthropic, 1 is Codex), then expect the
+    /// other provider's account to send within 250 ms, failing with `why` if it is paced.
+    /// Answers the other account's index and the path each index sends on.
+    async fn send_on_one_provider_then_the_other(
+        manager: &Manager,
+        first_idx: usize,
+        why: &str,
+    ) -> (usize, [&'static str; 2]) {
+        let second_idx = 1 - first_idx;
+        let paths = [ANTHROPIC_PATH, CODEX_PATH];
+        manager.throttle_send(paths[first_idx], first_idx).await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            manager.throttle_send(paths[second_idx], second_idx),
+        )
+        .await
+        .expect(why);
+        (second_idx, paths)
+    }
+
     #[tokio::test]
     async fn provider_isolation_fleet_throttle_does_not_pace_the_other_upstream() {
         for first in [Provider::Anthropic, Provider::Codex] {
@@ -6014,20 +5554,17 @@ mod provider_filter_tests {
                 min_spacing_ms: Some(60_000),
                 burst: Some(1),
             };
-            let manager = build(config);
+            let manager = live_manager(config);
             let first_idx = match first {
                 Provider::Anthropic => 0,
                 Provider::Codex => 1,
             };
-            let second_idx = 1 - first_idx;
-            let paths = [ANTHROPIC_PATH, CODEX_PATH];
-            manager.throttle_send(paths[first_idx], first_idx).await;
-            tokio::time::timeout(
-                std::time::Duration::from_millis(250),
-                manager.throttle_send(paths[second_idx], second_idx),
+            let (second_idx, paths) = send_on_one_provider_then_the_other(
+                &manager,
+                first_idx,
+                "the other provider has its own fleet burst",
             )
-            .await
-            .expect("the other provider has its own fleet burst");
+            .await;
             for idx in [first_idx, second_idx] {
                 assert!(
                     tokio::time::timeout(
@@ -6059,16 +5596,13 @@ mod provider_filter_tests {
                 min_spacing_ms: Some(60_000),
                 burst: Some(1),
             };
-            let manager = build(config);
-            let second_idx = 1 - first_idx;
-            let paths = [ANTHROPIC_PATH, CODEX_PATH];
-            manager.throttle_send(paths[first_idx], first_idx).await;
-            tokio::time::timeout(
-                std::time::Duration::from_millis(250),
-                manager.throttle_send(paths[second_idx], second_idx),
+            let manager = live_manager(config);
+            let (second_idx, paths) = send_on_one_provider_then_the_other(
+                &manager,
+                first_idx,
+                "equal organization identities on different providers have independent bursts",
             )
-            .await
-            .expect("equal organization identities on different providers have independent bursts");
+            .await;
             for idx in [first_idx, second_idx] {
                 assert!(
                     tokio::time::timeout(
@@ -6108,7 +5642,7 @@ mod provider_filter_tests {
     /// served on the pinned Codex account (`Some(0)`) by the pin-honor serve.
     #[test]
     fn a_pin_on_the_other_providers_account_is_diverted_never_served() {
-        let manager = build(config_with(vec![
+        let manager = live_manager(config_with(vec![
             codex("alice@example.com"),
             account("bob@example.com"),
         ]));
@@ -6144,7 +5678,7 @@ mod provider_filter_tests {
         config.control_account = Some(crate::config::ControlAccountRef::Name(
             "bob@example.com".to_string(),
         ));
-        let manager = build(config);
+        let manager = live_manager(config);
         let now = OffsetDateTime::now_utc();
         assert_eq!(
             manager.select(
@@ -6176,7 +5710,7 @@ mod provider_filter_tests {
     /// is served on the Codex account (`Some(1)`).
     #[test]
     fn the_fable_last_resort_never_reaches_the_other_provider() {
-        let manager = build(config_with(vec![
+        let manager = live_manager(config_with(vec![
             account("alice@example.com"),
             codex("bob@example.com"),
         ]));
@@ -6212,7 +5746,7 @@ mod provider_filter_tests {
             [(CODEX_PATH, 1), (ANTHROPIC_PATH, 0)],
             [(ANTHROPIC_PATH, 0), (CODEX_PATH, 1)],
         ] {
-            let manager = build(config_with(vec![
+            let manager = live_manager(config_with(vec![
                 account("alice@example.com"),
                 codex("bob@example.com"),
             ]));
@@ -6240,7 +5774,7 @@ mod provider_filter_tests {
 
     #[test]
     fn revalidation_never_serves_the_other_provider() {
-        let manager = build(config_with(vec![
+        let manager = live_manager(config_with(vec![
             account("alice@example.com"),
             codex("bob@example.com"),
         ]));
@@ -6272,7 +5806,7 @@ mod provider_filter_tests {
     /// the session's pin moves to the Anthropic account.
     #[test]
     fn revalidation_diverts_a_pin_on_the_other_providers_account_and_keeps_it() {
-        let manager = build(config_with(vec![
+        let manager = live_manager(config_with(vec![
             codex("alice@example.com"),
             account("bob@example.com"),
         ]));
@@ -6307,7 +5841,7 @@ mod provider_filter_tests {
     #[test]
     fn a_codex_request_never_consults_the_fable_weekly_bucket() {
         let now = OffsetDateTime::now_utc();
-        let manager = build(config_with(vec![codex("alice@example.com")]));
+        let manager = live_manager(config_with(vec![codex("alice@example.com")]));
         set_window(&manager, 0, |q| &mut q.seven_day_oi, 1.0);
         assert_eq!(
             manager.select(
@@ -6323,7 +5857,7 @@ mod provider_filter_tests {
         );
         // A second manager: the revalidation serve spends a fleet-wide 2 s
         // window per serve, and this assertion must not depend on that.
-        let manager = build(config_with(vec![codex("alice@example.com")]));
+        let manager = live_manager(config_with(vec![codex("alice@example.com")]));
         set_window(&manager, 0, |q| &mut q.seven_day_oi, 1.0);
         assert_eq!(
             manager.select_revalidation(

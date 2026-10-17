@@ -6,7 +6,7 @@ use std::env;
 use std::sync::Arc;
 
 use proptest::prelude::*;
-use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
+use tcr::config::{Account, Config};
 use tcr::manager::Manager;
 use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
 use tcr::peer::discovery;
@@ -247,62 +247,25 @@ impl AccountWarmer for NeverWarms {
 /// scope test always has a real, non-empty partition to compare against `All`.
 fn fake_account(index: usize) -> Account {
     Account {
-        name: format!("acct{index}@example.com"),
-        account_type: tcr::config::AccountType::OAuth,
-        provider: Default::default(),
         account_uuid: Some(format!("1111111{index}-1111-1111-1111-111111111111")),
-        org_uuid: None,
-        org_name: None,
         access_token: format!("at-{index}"),
         refresh_token: Some(format!("rt-{index}")),
         expires_at: Some(4_102_444_800_000),
-        priority: Some(0),
-        switch_threshold: None,
-        disabled: None,
         groups: if index.is_multiple_of(2) {
             Some(vec!["work".to_string()])
         } else {
             None
         },
-        organization_type: None,
-        rate_limit_tier: None,
-        seat_tier: None,
-        egress: tcr::config::Egress::Local,
-        egress_strict: false,
-        codex_home: None,
-        extra: serde_json::Map::new(),
+        ..tcr::config::Account::fixture(&format!("acct{index}@example.com"))
     }
 }
 
 fn fleet(accounts: Vec<Account>) -> Arc<Manager> {
     let config = Config {
-        quarantined_accounts: Vec::new(),
-        migrated_legacy_throttle: false,
-        renamed_accounts: Vec::new(),
-        rename_write_error: None,
-        proxy: ProxyConfig::default(),
         upstream: "http://127.0.0.1:1".to_string(),
-        codex_upstream: tcr::provider::CODEX_UPSTREAM.to_string(),
         switch_threshold: SWITCH_THRESHOLD,
-        fable_weekly_threshold: None,
-        pacing: PacingConfig {
-            max_in_flight_per_account: None,
-            min_spacing_ms: None,
-        },
-        account_throttle: ThrottleConfig::default(),
-        fleet_throttle: ThrottleConfig::default(),
-        lock_account: None,
-        control_account: None,
         control_reserve: CONTROL_RESERVE,
-        control_pooled: false,
-        control_identity: Default::default(),
-        reset_urgency_tier_hours: 24,
-        http1_only: false,
-        accounts,
-        group_settings: std::collections::HashMap::new(),
-        pricing: Default::default(),
-        usage_retention_days: 90,
-        extra: serde_json::Map::new(),
+        ..tcr::config::Config::fixture(accounts)
     };
     Manager::new(
         config,

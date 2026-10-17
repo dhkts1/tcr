@@ -291,19 +291,18 @@ impl Manager {
     /// Flag the bound-token map as changed since the last flush — same relaxed-atomic debounce
     /// contract as [`Self::mark_affinity_dirty`].
     pub fn mark_bound_tokens_dirty(&self) {
-        self.bound_tokens_dirty.store(true, Ordering::Relaxed);
-        self.bound_tokens_wake.notify_one();
+        self.bound_tokens_file.mark();
     }
 
     /// Resolves once the bound-token map has changed since the last time this resolved: the
     /// bound-token flusher's wake-up, as [`Self::affinity_changed`] is the pins'.
     pub async fn bound_tokens_changed(&self) {
-        self.bound_tokens_wake.notified().await;
+        self.bound_tokens_file.changed().await;
     }
 
     /// Consume the dirty flag: `true` when something changed since the last call.
     pub fn take_bound_tokens_dirty(&self) -> bool {
-        self.bound_tokens_dirty.swap(false, Ordering::Relaxed)
+        self.bound_tokens_file.take()
     }
 
     /// Remember that the account at `account_idx` minted these tokens.
@@ -732,10 +731,8 @@ impl Manager {
     pub fn flush_bound_tokens(&self, path: &Path) -> Result<usize, ConfigError> {
         let prepared = bound_tokens::prepare(self.bound_token_snapshot())?;
         let content = prepared.content_hash()?;
-        let count = prepared.write(path, crate::now_ms())?;
-        self.bound_tokens_save
-            .wrote(content, content, std::time::Instant::now());
-        Ok(count)
+        self.bound_tokens_file
+            .save((content, content), || prepared.write(path, crate::now_ms()))
     }
 
     /// The flusher's save: [`Self::flush_bound_tokens`] unless the map is what the last write
@@ -746,13 +743,8 @@ impl Manager {
     ) -> Result<crate::save_gate::SaveOutcome, ConfigError> {
         let prepared = bound_tokens::prepare(self.bound_token_snapshot())?;
         let content = prepared.content_hash()?;
-        let now = std::time::Instant::now();
-        if let Some(skipped) = self.bound_tokens_save.skip(content, content, now) {
-            return Ok(skipped);
-        }
-        let count = prepared.write(path, crate::now_ms())?;
-        self.bound_tokens_save.wrote(content, content, now);
-        Ok(crate::save_gate::SaveOutcome::Wrote(count))
+        self.bound_tokens_file
+            .save_if_changed((content, content), || prepared.write(path, crate::now_ms()))
     }
 
     /// Restore the map from `path`, resolving each stored identity against the accounts loaded
@@ -761,25 +753,7 @@ impl Manager {
     /// Existing in-memory entries win, same as [`Self::restore_affinity`]: a token learned from
     /// a response served between boot and this call is fresher than anything on disk.
     pub fn restore_bound_tokens(&self, path: &Path, ttl_ms: i64) -> LoadReport {
-        let candidates: Vec<crate::config::Account> = {
-            let accounts = self
-                .accounts
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            accounts
-                .iter()
-                .map(|a| {
-                    identity::probe(
-                        a.provider,
-                        &a.name,
-                        a.account_uuid.clone(),
-                        a.org_uuid.clone(),
-                        a.org_name.clone(),
-                    )
-                })
-                .collect()
-        };
-        let report = bound_tokens::load(path, &candidates, crate::now_ms(), ttl_ms);
+        let report = bound_tokens::load(path, &self.restore_candidates(), crate::now_ms(), ttl_ms);
         for (hash, &value) in &report.tokens {
             self.bound_tokens.insert_if_absent(hash, value);
         }

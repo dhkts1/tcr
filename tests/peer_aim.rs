@@ -47,11 +47,10 @@
 
 use std::net::SocketAddr;
 use std::time::Duration;
-use tcr::log_err::LogErr as _;
 
-use tcr::peer::config::{self as peer_config, PeerFile, PeerRow};
+use crate::peer_support::DuplexTarget as Target;
 use tcr::peer::id::NodeKey;
-use tcr::peer::listener::{self, SessionContext};
+use tcr::peer::listener;
 use tcr::peer::noise::{self, Handshake};
 use tcr::peer::reach;
 use tcr::peer::serve;
@@ -62,54 +61,14 @@ use tcr_peer_wire::{CollapseHint, Control, PeerId, StreamHeader, StreamKind};
 /// would be this one and nothing here may ever report it.
 const CARRIER_SOCKET: &str = "203.0.113.9:41000";
 
-/// A scratch directory named after this process, thread and a caller tag, so
-/// two tests in this binary never collide on one path.
-fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tcr-peer-aim-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
-    std::fs::create_dir_all(&dir).expect("create the scratch dir");
-    dir
-}
-
 /// The Mac that receives the hint: a pinned row for `peer` already on its
 /// file, so the ordinary CONTROL gate admits the frame.
-struct Target {
-    peers: std::path::PathBuf,
-    state: std::path::PathBuf,
-    key: NodeKey,
+fn target(tag: &str, peer: PeerId) -> Target {
+    Target::new(&scratch(tag), peer)
 }
 
-impl Target {
-    fn new(tag: &str, peer: PeerId) -> Self {
-        let dir = scratch(tag);
-        let peers = dir.join("tcr-peers.json");
-        let state = dir.join("peer-state.json");
-        let row = PeerRow {
-            node: peer,
-            label: "the-far-side".to_string(),
-            endpoints: Vec::new(),
-            added_at: 0,
-            allow: peer_config::Allow::default(),
-            lend: Vec::new(),
-            rendezvous_secret: None,
-            sees_us_at: None,
-        };
-        let file = PeerFile {
-            peers: vec![row],
-            ..PeerFile::default()
-        };
-        peer_config::save(&peers, &file).expect("write the peers file");
-        let key = NodeKey::load_or_mint(&dir).expect("mint a node key");
-        Self { peers, state, key }
-    }
-
-    fn context(&self) -> SessionContext {
-        SessionContext::new(&self.key, &self.peers, &self.state)
-    }
+fn scratch(tag: &str) -> std::path::PathBuf {
+    crate::peer_support::scratch_dir("aim", tag)
 }
 
 /// What one carried hint produced: the frame the target answered with, if it
@@ -203,7 +162,7 @@ async fn hint_from(
 async fn a_relayed_hint_teaches_where_to_aim() {
     let peer = NodeKey::load_or_mint(&scratch("aim-peer")).expect("mint the peer's key");
     let carrier = PeerId([0x77_u8; 32]);
-    let target = Target::new("aim-target", peer.id());
+    let target = target("aim-target", peer.id());
 
     let stale: SocketAddr = "198.51.100.50:7755".parse().expect("the literal parses");
     let fresh: SocketAddr = "192.0.2.77:7755".parse().expect("the literal parses");
@@ -276,7 +235,7 @@ async fn a_relayed_hint_teaches_where_to_aim() {
 async fn a_hint_with_no_dialable_address_leaves_the_stale_one_in_place() {
     let peer = NodeKey::load_or_mint(&scratch("filter-peer")).expect("mint the peer's key");
     let carrier = PeerId([0x78_u8; 32]);
-    let target = Target::new("filter-target", peer.id());
+    let target = target("filter-target", peer.id());
 
     let stale: SocketAddr = "198.51.100.51:7755".parse().expect("the literal parses");
     reach::remember_observed_peer(peer.id(), stale);
@@ -329,7 +288,7 @@ async fn a_hint_about_a_third_mac_is_refused() {
     let peer = NodeKey::load_or_mint(&scratch("third-peer")).expect("mint the peer's key");
     let carrier = PeerId([0x79_u8; 32]);
     let third = PeerId([0x33_u8; 32]);
-    let target = Target::new("third-target", peer.id());
+    let target = target("third-target", peer.id());
 
     let fresh: SocketAddr = "192.0.2.90:7755".parse().expect("the literal parses");
     let exchanged = hint_from(

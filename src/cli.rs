@@ -353,48 +353,17 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
     let target = config.accounts[idx].clone();
     let name = target.name.clone();
 
-    let live = post_set_disabled(&config, &name, true).await;
-    let parked_live = live.is_ok();
-    let warning = match live {
-        Ok(_) => None,
-        // Nothing is listening: no live rotation to disagree with the file.
-        Err(LiveControlError::NoServer) => None,
-        // A server is there and refused our key. Deleting the record now
-        // would leave the running proxy still rotating an account that no
-        // longer exists on disk — worse than the disable case, because
-        // there is no record left to reconcile against on restart.
-        Err(LiveControlError::Unauthorized) => {
-            bail!(
-                "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because deleting it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
-                config.proxy.port,
-                config_path.display()
-            );
-        }
-        // The route resolved our query to nothing, or to more than one
-        // account. The file's own resolution could land on a different
-        // row than the server matched — a removal applied to the wrong
-        // account is unrecoverable, so this bails rather than falling back.
-        Err(LiveControlError::Rejected(message)) => {
-            bail!(
-                "the proxy running on :{} refused this: {message} Nothing was changed.",
-                config.proxy.port
-            );
-        }
-        // An older tcr with no account-control route. The file half is all
-        // we can do; say loudly that the proxy keeps using the account
-        // until it restarts.
-        Err(LiveControlError::NoRoute) => Some(format!(
-            "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP routing to '{name}' until it restarts. {}",
-            config.proxy.port,
-            crate::proxy::DISABLED_PATH,
-            RESTART_HINT,
-        )),
-        // It answered something we cannot use, or did not answer at all.
-        Err(other) => Some(format!(
-            "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP routing to '{name}' until it restarts.",
-            config.proxy.port,
-            other.why(),
-        )),
+    let site = LiveSite {
+        config: &config,
+        config_path,
+        words: &REMOVE_WORDS,
+    };
+    let (parked_live, warning) = match site.decide(post_set_disabled(&config, &name, true).await)? {
+        Live::Applied(_) => (true, None),
+        Live::FileOnly(stale) => (
+            false,
+            stale.map(|stale| site.warning(&stale, Some(&format!("routing to '{name}'")))),
+        ),
     };
 
     let failed = match config::remove_account_entry(config_path, &target)
@@ -511,8 +480,13 @@ pub async fn set_priority(
     let provider = config.accounts[idx].provider;
     let value = priority_value(&config, provider, priority);
 
-    match post_set_priority(&config, query, value).await {
-        Ok(applied) => {
+    let site = LiveSite {
+        config: &config,
+        config_path,
+        words: &PRIORITY_WORDS,
+    };
+    match site.decide(post_set_priority(&config, query, value).await)? {
+        Live::Applied(applied) => {
             write_priority(config_path, query, value).with_context(|| {
                 format!(
                     "the running proxy already ranks '{}' at {value}, but the config file was not updated, so a restart will undo it",
@@ -523,49 +497,15 @@ pub async fn set_priority(
                 "{}",
                 priority_message(&applied.name, value, provider, priority)
             );
-            return Ok(());
         }
-        // Nothing is listening: the file is the whole truth.
-        Err(LiveControlError::NoServer) => {}
-        Err(LiveControlError::Unauthorized) => {
-            bail!(
-                "the proxy on :{} rejected the api-key in {}, so the config was NOT changed, because writing it would leave the running proxy on the old order. Fix `proxy.apiKey` and retry.",
-                config.proxy.port,
-                config_path.display()
-            );
-        }
-        // The server matched our query to nothing or to several accounts. The
-        // file's resolution could land on a different row, so do not fall back.
-        Err(LiveControlError::Rejected(message)) => {
-            bail!(
-                "the proxy running on :{} refused this: {message} Nothing was changed.",
-                config.proxy.port
-            );
-        }
-        Err(LiveControlError::NoRoute) => {
+        Live::FileOnly(stale) => {
             let name = write_priority(config_path, query, value)?;
-            eprintln!(
-                "[tcr] WARNING: the proxy running on :{} is too old to accept a live priority change (no {} route), so only the config file was changed. It will KEEP the old order until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
-                config.proxy.port,
-                crate::proxy::PRIORITY_PATH,
-            );
+            if let Some(stale) = stale {
+                eprintln!("{}", site.warning(&stale, Some("the old order")));
+            }
             println!("{}", priority_message(&name, value, provider, priority));
-            return Ok(());
-        }
-        Err(other) => {
-            let name = write_priority(config_path, query, value)?;
-            eprintln!(
-                "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP the old order until it restarts.",
-                config.proxy.port,
-                other.why(),
-            );
-            println!("{}", priority_message(&name, value, provider, priority));
-            return Ok(());
         }
     }
-
-    let name = write_priority(config_path, query, value)?;
-    println!("{}", priority_message(&name, value, provider, priority));
     Ok(())
 }
 
@@ -1377,8 +1317,13 @@ pub async fn set_config(config_path: &Path, key: &str, value: &str) -> anyhow::R
     };
 
     if let Ok(config) = config::load(config_path) {
-        match post_set_config(&config, &setting).await {
-            Ok(applied) => {
+        let site = LiveSite {
+            config: &config,
+            config_path,
+            words: &CONFIG_SET_WORDS,
+        };
+        match site.decide(post_set_config(&config, &setting).await)? {
+            Live::Applied(applied) => {
                 println!(
                     "{} The proxy on :{} keeps its current value until it restarts.",
                     saved_line(applied.changed),
@@ -1386,37 +1331,10 @@ pub async fn set_config(config_path: &Path, key: &str, value: &str) -> anyhow::R
                 );
                 return Ok(());
             }
-            Err(LiveControlError::NoServer) => {}
-            Err(LiveControlError::Unauthorized) => bail!(
-                "the proxy on :{} rejected the api-key in {}, so nothing was changed: writing the file beside a running proxy can lose the change to its own next write. Fix `proxy.apiKey` and retry.",
-                config.proxy.port,
-                config_path.display()
-            ),
-            Err(LiveControlError::Rejected(message)) => bail!(
-                "the proxy running on :{} refused this: {message}",
-                config.proxy.port
-            ),
-            Err(LiveControlError::NoRoute) => {
+            Live::FileOnly(None) => {}
+            Live::FileOnly(Some(stale)) => {
                 let write = write_setting(config_path, &setting)?;
-                eprintln!(
-                    "[tcr] WARNING: the proxy running on :{} is too old to save settings itself (no {} route), so this process wrote the file beside it. {}",
-                    config.proxy.port,
-                    crate::proxy::CONFIG_PATH,
-                    RESTART_HINT,
-                );
-                println!(
-                    "{}",
-                    saved_line(write == crate::config_set::SettingWrite::Updated)
-                );
-                return Ok(());
-            }
-            Err(other) => {
-                let write = write_setting(config_path, &setting)?;
-                eprintln!(
-                    "[tcr] WARNING: could not hand this to the proxy running on :{} ({}), so this process wrote the file beside it.",
-                    config.proxy.port,
-                    other.why(),
-                );
+                eprintln!("{}", site.warning(&stale, None));
                 println!(
                     "{}",
                     saved_line(write == crate::config_set::SettingWrite::Updated)
@@ -1541,47 +1459,80 @@ fn group_route_block(config: &Config, group: &str, members: &[&str]) -> Option<&
     (!routes).then_some(ROUTE_BLOCK_CONTROL_ONLY)
 }
 
+/// One group as `tcr group ls` reports it. Both renderers read these rows, so
+/// the text line and the JSON object are computed once and cannot disagree.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupRow<'a> {
+    group: &'a str,
+    accounts: usize,
+    members: Vec<&'a str>,
+    reserved: bool,
+    parked: bool,
+    allows_control: bool,
+    routes: bool,
+    route_block: Option<&'static str>,
+    color: String,
+    color_source: &'static str,
+    /// Only when there is one, so a group with no Codex member, which is every
+    /// group of a fleet with no Codex account, carries no new key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_members: Option<usize>,
+}
+
+/// Every group's row, in name order, and the count of accounts in no group.
+fn group_rows(config: &Config) -> (Vec<GroupRow<'_>>, usize) {
+    let (groups, ungrouped) = group_membership(config);
+    let rows = groups
+        .into_iter()
+        .map(|(group, members)| {
+            let (color, source) = config.group_color(group);
+            let route_block = group_route_block(config, group, &members);
+            let codex_members = codex_member_count(config, &members);
+            GroupRow {
+                group,
+                accounts: members.len(),
+                reserved: config.is_group_reserved(group),
+                parked: config.is_group_parked(group),
+                allows_control: config.group_allows_control(group),
+                routes: route_block.is_none(),
+                route_block,
+                color,
+                color_source: source.as_str(),
+                codex_members: (codex_members > 0).then_some(codex_members),
+                members,
+            }
+        })
+        .collect();
+    (rows, ungrouped)
+}
+
 /// `tcr group ls` text: one greppable line per group, then `ungrouped`.
 fn render_groups_text(config: &Config) -> String {
     use std::fmt::Write as _;
-    let (groups, ungrouped) = group_membership(config);
-    let width = groups.keys().map(|g| g.len()).max().unwrap_or(0);
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    let (rows, ungrouped) = group_rows(config);
+    let width = rows.iter().map(|r| r.group.len()).max().unwrap_or(0);
     let mut out = String::new();
-    for (group, members) in &groups {
-        let (color, source) = config.group_color(group);
-        let route_block = group_route_block(config, group, members);
-        let codex_members = codex_member_count(config, members);
+    for row in &rows {
         writeln!(
             out,
-            "group {group:width$} accounts={} members={}{} reserved={} parked={} allows_control={} routes={}{} color={color} color_source={}",
-            members.len(),
-            members.join(","),
-            if codex_members > 0 {
-                format!(" codex_members={codex_members}")
-            } else {
-                String::new()
-            },
-            if config.is_group_reserved(group) {
-                "yes"
-            } else {
-                "no"
-            },
-            if config.is_group_parked(group) {
-                "yes"
-            } else {
-                "no"
-            },
-            if config.group_allows_control(group) {
-                "yes"
-            } else {
-                "no"
-            },
-            if route_block.is_none() { "yes" } else { "no" },
-            match route_block {
-                None => String::new(),
-                Some(block) => format!(" route_block={block}"),
-            },
-            source.as_str(),
+            "group {:width$} accounts={} members={}{} reserved={} parked={} allows_control={} routes={}{} color={} color_source={}",
+            row.group,
+            row.accounts,
+            row.members.join(","),
+            row.codex_members
+                .map(|n| format!(" codex_members={n}"))
+                .unwrap_or_default(),
+            yes_no(row.reserved),
+            yes_no(row.parked),
+            yes_no(row.allows_control),
+            yes_no(row.routes),
+            row.route_block
+                .map(|block| format!(" route_block={block}"))
+                .unwrap_or_default(),
+            row.color,
+            row.color_source,
         )
         .log_warn("rendering a group line");
     }
@@ -1592,37 +1543,10 @@ fn render_groups_text(config: &Config) -> String {
 /// `tcr group ls --json`: the structured equivalent of [`render_groups_text`]
 /// for the TcrBar panel.
 fn render_groups_json(config: &Config) -> anyhow::Result<String> {
-    let (groups, ungrouped) = group_membership(config);
-    let rows: Vec<serde_json::Value> = groups
-        .iter()
-        .map(|(group, members)| {
-            let (color, source) = config.group_color(group);
-            let route_block = group_route_block(config, group, members);
-            let mut row = serde_json::json!({
-                "group": group,
-                "accounts": members.len(),
-                "members": members,
-                "reserved": config.is_group_reserved(group),
-                "parked": config.is_group_parked(group),
-                "allowsControl": config.group_allows_control(group),
-                "routes": route_block.is_none(),
-                "routeBlock": match route_block {
-                    None => serde_json::Value::Null,
-                    Some(block) => serde_json::Value::String(block.to_string()),
-                },
-                "color": color,
-                "colorSource": source.as_str(),
-            });
-            // Only when there is one, so a group with no Codex member, which is
-            // every group of a fleet with no Codex account, carries no new key.
-            let codex_members = codex_member_count(config, members);
-            if codex_members > 0 {
-                row["codexMembers"] = serde_json::json!(codex_members);
-            }
-            row
-        })
-        .collect();
-    let out = serde_json::json!({ "groups": rows, "ungrouped": ungrouped });
+    let (rows, ungrouped) = group_rows(config);
+    // Through `Value`, so the keys come out in the order the JSON map keeps
+    // them, as they always have, rather than in field order.
+    let out = serde_json::json!({ "groups": serde_json::to_value(&rows)?, "ungrouped": ungrouped });
     Ok(serde_json::to_string_pretty(&out)?)
 }
 
@@ -1648,8 +1572,15 @@ pub async fn set_enabled(config_path: &Path, query: &str, disabled: bool) -> any
     // fall through to the file path, which reports the load failure as it always
     // has. Never a silent skip of the live attempt for any other reason.
     if let Ok(config) = config::load(config_path) {
-        match post_set_disabled(&config, query, disabled).await {
-            Ok(applied) => {
+        // A missing route is HALF a disable, the arm that used to be the whole
+        // function, silently; the warning says so.
+        let site = LiveSite {
+            config: &config,
+            config_path,
+            words: &ENABLE_WORDS,
+        };
+        match site.decide(post_set_disabled(&config, query, disabled).await)? {
+            Live::Applied(applied) => {
                 println!(
                     "{} account '{}'.",
                     if disabled { "Disabled" } else { "Enabled" },
@@ -1660,54 +1591,14 @@ pub async fn set_enabled(config_path: &Path, query: &str, disabled: bool) -> any
                 }
                 return Ok(());
             }
-            // Nothing is listening: the historical case, and the only quiet one.
-            // There is no live rotation to disagree with the file.
-            Err(LiveControlError::NoServer) => {}
-            // A server is there and REFUSED us. Writing the file here would be the
-            // old lie in a new place: the config would say benched while the proxy
-            // we could not talk to keeps rotating. Change nothing, exit non-zero.
-            Err(LiveControlError::Unauthorized) => {
-                bail!(
-                    "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because writing it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
-                    config.proxy.port,
-                    config_path.display()
-                );
-            }
-            // The route is missing: an older tcr is serving. The file write is all
-            // we can do, and it is HALF a disable — say so loudly. This arm is the
-            // one that used to be the whole function, silently.
-            Err(LiveControlError::NoRoute) => {
+            Live::FileOnly(None) => {}
+            Live::FileOnly(Some(stale)) => {
                 let name = write_disabled_flag(config_path, query, disabled)?;
-                eprintln!(
-                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP {} '{name}' until it restarts. {}",
-                    config.proxy.port,
-                    crate::proxy::DISABLED_PATH,
-                    if disabled { "routing to" } else { "benching" },
-                    RESTART_HINT,
+                let keeps = format!(
+                    "{} '{name}'",
+                    if disabled { "routing to" } else { "benching" }
                 );
-                return Ok(());
-            }
-            // The route ran and refused the QUERY: it matched no live account, or
-            // matched several. Do not fall back — the file's own resolution could
-            // land on a different account than the one the server was talking
-            // about, and a disable applied to the wrong row is worse than none.
-            Err(LiveControlError::Rejected(message)) => {
-                bail!(
-                    "the proxy running on :{} refused this: {message} Nothing was changed.",
-                    config.proxy.port
-                );
-            }
-            // It answered something we cannot use, or did not answer at all. Same
-            // shape of consequence as the arm above, different cause, and equally
-            // never silent.
-            Err(other) => {
-                let name = write_disabled_flag(config_path, query, disabled)?;
-                eprintln!(
-                    "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP {} '{name}' until it restarts.",
-                    config.proxy.port,
-                    other.why(),
-                    if disabled { "routing to" } else { "benching" },
-                );
+                eprintln!("{}", site.warning(&stale, Some(&keeps)));
                 return Ok(());
             }
         }
@@ -1749,6 +1640,164 @@ fn write_disabled_flag(config_path: &Path, query: &str, disabled: bool) -> anyho
 /// subcommand that never existed, and four copies is how that happened. `main.rs`'s `restart_hint_names_only_commands_that_parse` parses
 /// every backticked `tcr` command in this text with the real clap definition.
 pub const RESTART_HINT: &str = "Restart it when a cold prompt cache is acceptable: if TcrBar runs the proxy, use Restart in TcrBar's Settings > General; otherwise run `tcr server --replace`.";
+
+/// What a verb that asks the running proxy first may do with its file.
+enum Live<T> {
+    /// The running proxy applied it, and wrote the file if it owns that half.
+    Applied(T),
+    /// Write the file here. `None` when nothing is listening, the ordinary
+    /// offline case, which says nothing. `Some` when a proxy is there and the
+    /// change did not reach it, which is never silent: see [`LiveSite::warning`].
+    FileOnly(Option<Stale>),
+}
+
+/// Why a running proxy did not take a change the file is about to get.
+enum Stale {
+    /// An older tcr with no route for it.
+    NoRoute,
+    /// It answered something unusable, or nothing in time; the reason.
+    Failed(String),
+}
+
+/// The words one verb's refusals and warnings use for its own consequence.
+/// The policy around them is [`LiveSite::decide`], one copy for every verb.
+struct LiveWords {
+    /// The route the verb calls, named in the "too old" warning.
+    route_path: &'static str,
+    /// Follows "rejected the api-key in <path>": why nothing was written.
+    unauthorized: &'static str,
+    /// Follows the server's own refusal message.
+    rejected: &'static str,
+    /// Follows "is too old to".
+    too_old_to: &'static str,
+    /// Follows "could not".
+    could_not: &'static str,
+    /// Follows "so": what happened to the file.
+    file_written: &'static str,
+}
+
+/// After a refusal, on the verbs whose file half changes one account row.
+const NOTHING_CHANGED: &str = " Nothing was changed.";
+/// After a fallback write, on the same verbs.
+const ONLY_THE_FILE: &str = "only the config file was changed";
+
+/// `tcr rm`. Deleting the record beside a proxy that refused our key would
+/// leave it rotating an account that no longer exists on disk, with no record
+/// left to reconcile against on restart.
+const REMOVE_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::DISABLED_PATH,
+    unauthorized: " — the config was NOT changed, because deleting it would leave the running proxy still rotating this account.",
+    rejected: NOTHING_CHANGED,
+    too_old_to: "accept live account control",
+    could_not: "apply this to",
+    file_written: ONLY_THE_FILE,
+};
+
+/// `tcr priority`.
+const PRIORITY_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::PRIORITY_PATH,
+    unauthorized: ", so the config was NOT changed, because writing it would leave the running proxy on the old order.",
+    rejected: NOTHING_CHANGED,
+    too_old_to: "accept a live priority change",
+    could_not: "apply this to",
+    file_written: ONLY_THE_FILE,
+};
+
+/// `tcr config set`. The proxy owns the file while it runs, so a fallback
+/// write is this process writing beside it, and a refusal carries the
+/// server's message alone.
+const CONFIG_SET_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::CONFIG_PATH,
+    unauthorized: ", so nothing was changed: writing the file beside a running proxy can lose the change to its own next write.",
+    rejected: "",
+    too_old_to: "save settings itself",
+    could_not: "hand this to",
+    file_written: "this process wrote the file beside it",
+};
+
+/// `tcr enable` and `tcr disable`. Writing the file beside a proxy that
+/// refused our key would be the config saying benched while the proxy keeps
+/// rotating.
+const ENABLE_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::DISABLED_PATH,
+    unauthorized: " — the config was NOT changed, because writing it would leave the running proxy still rotating this account.",
+    rejected: NOTHING_CHANGED,
+    too_old_to: "accept live account control",
+    could_not: "apply this to",
+    file_written: ONLY_THE_FILE,
+};
+
+/// `tcr control`. The running proxy is the one that resolves identity
+/// traffic, so a file naming a new control account beside it is a lie.
+const CONTROL_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::CONTROL_PATH,
+    unauthorized: " — the config was NOT changed, because writing it would leave the running proxy still resolving identity traffic against its old control account.",
+    rejected: NOTHING_CHANGED,
+    too_old_to: "accept live account control",
+    could_not: "apply this to",
+    file_written: ONLY_THE_FILE,
+};
+
+/// One verb's "running proxy first, file second" decision, at one config.
+struct LiveSite<'a> {
+    config: &'a Config,
+    config_path: &'a Path,
+    words: &'static LiveWords,
+}
+
+impl LiveSite<'_> {
+    /// The decision table. Nothing listening writes the file quietly. A
+    /// rejected api-key or a refused query changes nothing: the file's own
+    /// resolution could land on a different row than the server matched, and a
+    /// file written beside a proxy we could not talk to says one thing while the
+    /// proxy does another. A missing route or an unusable answer writes the file
+    /// and warns.
+    fn decide<T>(&self, answer: Result<T, LiveControlError>) -> anyhow::Result<Live<T>> {
+        let port = self.config.proxy.port;
+        match answer {
+            Ok(applied) => Ok(Live::Applied(applied)),
+            Err(LiveControlError::NoServer) => Ok(Live::FileOnly(None)),
+            Err(LiveControlError::Unauthorized) => bail!(
+                "the proxy on :{port} rejected the api-key in {}{} Fix `proxy.apiKey` and retry.",
+                self.config_path.display(),
+                self.words.unauthorized,
+            ),
+            Err(LiveControlError::Rejected(message)) => bail!(
+                "the proxy running on :{port} refused this: {message}{}",
+                self.words.rejected
+            ),
+            Err(LiveControlError::NoRoute) => Ok(Live::FileOnly(Some(Stale::NoRoute))),
+            Err(other) => Ok(Live::FileOnly(Some(Stale::Failed(other.why())))),
+        }
+    }
+
+    /// The warning for a file written beside a proxy that did not take the
+    /// change. `keeps` names what the running proxy goes on using, as in "It
+    /// will KEEP <keeps> until it restarts"; `None` leaves that sentence out.
+    fn warning(&self, stale: &Stale, keeps: Option<&str>) -> String {
+        let port = self.config.proxy.port;
+        let words = self.words;
+        match stale {
+            Stale::NoRoute => format!(
+                "[tcr] WARNING: the proxy running on :{port} is too old to {} (no {} route), so {}.{} {RESTART_HINT}",
+                words.too_old_to,
+                words.route_path,
+                words.file_written,
+                keeps
+                    .map(|k| format!(" It will KEEP {k} until it restarts."))
+                    .unwrap_or_default(),
+            ),
+            Stale::Failed(why) => format!(
+                "[tcr] WARNING: could not {} the proxy running on :{port} ({why}), so {}.{}",
+                words.could_not,
+                words.file_written,
+                keeps
+                    .map(|k| format!(" It may KEEP {k} until it restarts."))
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+}
 
 /// Why a live account-control request did not apply.
 ///
@@ -1796,90 +1845,218 @@ impl LiveControlError {
     }
 }
 
-/// Ask the running proxy to park/unpark an account. Mirrors [`fetch_live_status`]:
-/// same `no_proxy()` client (`HTTP_PROXY` commonly points AT tcr, so honouring it
-/// would send this command through the proxy it is about), same timeouts, same
-/// api-key header — the control route has no loopback exemption either.
-async fn post_set_disabled(
+impl From<Unreached> for LiveControlError {
+    fn from(unreached: Unreached) -> Self {
+        match unreached {
+            Unreached::Refused => LiveControlError::NoServer,
+            Unreached::Silent(why) => LiveControlError::NoAnswer(why),
+            Unreached::Unbuilt(why) => LiveControlError::Unusable(why),
+        }
+    }
+}
+
+/// Why a call to the running proxy came back with no HTTP response at all.
+#[derive(Debug)]
+enum Unreached {
+    /// The connection was refused: nothing is listening on the port.
+    Refused,
+    /// Something holds the port and sent nothing back in time, or dropped the
+    /// connection mid-read.
+    Silent(String),
+    /// The HTTP client could not be built, so nothing was sent.
+    Unbuilt(String),
+}
+
+/// Sort a failed send. `is_timeout()` comes first: a connect TIMEOUT (a
+/// blackholed address, or a SYN dropped rather than refused) reports
+/// `is_connect() == true` as well, so asking `is_connect()` first would call a
+/// wedged proxy "nothing is listening" when the truer reading is "something is
+/// there but not answering".
+fn unreached(e: &reqwest::Error) -> Unreached {
+    if e.is_timeout() {
+        Unreached::Silent("the server did not answer within 5s".to_string())
+    } else if e.is_connect() {
+        Unreached::Refused
+    } else {
+        Unreached::Silent(e.to_string())
+    }
+}
+
+/// Send one request to the running proxy at `path` on 127.0.0.1 and the
+/// configured port. Every call to a `/_tcr/` route goes through here.
+///
+/// The client never honours a system proxy: `HTTP_PROXY` commonly points AT
+/// tcr, so honouring it would send this request through the proxy it is about.
+/// The api-key goes on every request, because no local route has a loopback
+/// exemption. 2s to connect, 5s in total.
+async fn send_loopback(
     config: &Config,
-    query: &str,
-    disabled: bool,
-) -> Result<crate::proxy::SetDisabledResponse, LiveControlError> {
+    path: &str,
+    build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, Unreached> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
         .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::DISABLED_PATH
-    );
-    let mut request = client.post(&url).json(&serde_json::json!({
-        "query": query,
-        "disabled": disabled,
-    }));
+        .map_err(|e| Unreached::Unbuilt(format!("http client: {e}")))?;
+    let url = format!("http://127.0.0.1:{}{path}", config.proxy.port);
+    let mut request = build(&client, &url);
     if let Some(key) = config.proxy.api_key.as_deref() {
         request = request.header("x-api-key", key);
     }
+    request.send().await.map_err(|e| unreached(&e))
+}
 
-    let response = match request.send().await {
-        Ok(r) => r,
-        // `is_timeout()` first: a connect TIMEOUT (a blackholed address, SYN
-        // dropped rather than refused) reports `is_connect() == true` as
-        // well, so checking `is_connect()` first would misclassify it as
-        // `NoServer` — "nothing is listening" — when the truer reading is
-        // "something is there but not answering", `NoAnswer` below.
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
+/// One local mutating route on the running proxy, as data: where it is, the
+/// [`crate::proxy::ENDPOINT_HEADER`] value it stamps on its answers, and which
+/// stamped statuses mean "the route refused this request".
+struct ControlRoute {
+    path: &'static str,
+    endpoint: &'static str,
+    /// Stamped statuses that are the route saying no, carried to the caller as
+    /// [`LiveControlError::Rejected`] with the server's own message. Per route,
+    /// because each route refuses with its own codes: 404 is "no such account"
+    /// on the account routes, 400 is request validation on the add and settings
+    /// routes, and 409 is an ambiguous match everywhere.
+    refusals: &'static [u16],
+    /// What the 2xx body is, for the error when it does not parse.
+    noun: &'static str,
+    /// Whether a 2xx counts only when the route stamped it.
+    success_needs_stamp: bool,
+}
+
+const DISABLED_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::DISABLED_PATH,
+    endpoint: crate::proxy::DISABLED_ENDPOINT,
+    refusals: &[404, 409],
+    noun: "account-control",
+    success_needs_stamp: false,
+};
+
+/// 400 is the route's own request validation (a blank name or token), the
+/// positive capability signal `oauth::probe_add_route` looks for; 409 is a
+/// submitted identity that matched more than one live account.
+const ADD_ACCOUNT_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::ADD_ACCOUNT_PATH,
+    endpoint: crate::proxy::ADD_ACCOUNT_ENDPOINT,
+    refusals: &[400, 409],
+    noun: "account-add",
+    success_needs_stamp: false,
+};
+
+const CONTROL_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::CONTROL_PATH,
+    endpoint: crate::proxy::CONTROL_ENDPOINT,
+    refusals: &[404, 409],
+    noun: "control-account",
+    success_needs_stamp: false,
+};
+
+const PRIORITY_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::PRIORITY_PATH,
+    endpoint: crate::proxy::PRIORITY_ENDPOINT,
+    refusals: &[404, 409],
+    noun: "priority",
+    success_needs_stamp: false,
+};
+
+/// Both halves of [`crate::proxy::CONFIG_PATH`], the `GET` and the `POST`.
+const CONFIG_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::CONFIG_PATH,
+    endpoint: crate::proxy::CONFIG_ENDPOINT,
+    refusals: &[400, 409],
+    noun: "settings",
+    success_needs_stamp: true,
+};
+
+/// What [`call_route`] read: the sorted answer, and the response headers when
+/// the route stamped the answer, so a caller can read a second header off the
+/// same response with no second round trip.
+struct RouteAnswer<T> {
+    result: Result<T, LiveControlError>,
+    stamped: Option<reqwest::header::HeaderMap>,
+}
+
+/// Send one request to `route` and sort the answer.
+///
+/// Whether THIS route produced the answer is decided ONLY by
+/// [`crate::proxy::ENDPOINT_HEADER`], never by status code or error text: a 404
+/// from a tcr without the route and a 404 meaning "no such account" are the same
+/// status with opposite consequences, and the header is the only difference that
+/// is not a matched error string. So an unstamped 404 or 405 is
+/// [`LiveControlError::NoRoute`], and a stamped refusal status is
+/// [`LiveControlError::Rejected`] carrying the server's message.
+async fn call_route<T: serde::de::DeserializeOwned>(
+    config: &Config,
+    route: &ControlRoute,
+    build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> RouteAnswer<T> {
+    let response = match send_loopback(config, route.path, build).await {
+        Ok(response) => response,
+        Err(unreached) => {
+            return RouteAnswer {
+                result: Err(unreached.into()),
+                stamped: None,
+            };
         }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
     };
-
     let status = response.status();
-    // Whether THIS route produced the answer, decided structurally. A 404 from a
-    // tcr without the route and a 404 meaning "no such account" are the same status
-    // code with opposite consequences, and the header is the only difference that
-    // is not a matched error string.
     let from_route = response
         .headers()
         .get(crate::proxy::ENDPOINT_HEADER)
         .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::DISABLED_ENDPOINT);
-    let body = response.text().await.unwrap_or_default();
+        == Some(route.endpoint);
+    let stamped = from_route.then(|| response.headers().clone());
+    let body = response.text().await;
+    let message = || body.as_deref().ok().and_then(error_message_of);
 
-    if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!(
-                "the response was not a tcr account-control payload ({e})"
-            ))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    if from_route && matches!(status.as_u16(), 404 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+    let result = if status.is_success() && (from_route || !route.success_needs_stamp) {
+        match &body {
+            Ok(body) => serde_json::from_str(body).map_err(|e| {
+                LiveControlError::Unusable(format!(
+                    "the response was not a tcr {} payload ({e})",
+                    route.noun
+                ))
+            }),
+            Err(e) => Err(LiveControlError::Unusable(format!(
+                "reading the answer: {e}"
+            ))),
+        }
+    } else if status.as_u16() == 401 {
+        Err(LiveControlError::Unauthorized)
+    } else if !from_route && matches!(status.as_u16(), 404 | 405) {
+        Err(LiveControlError::NoRoute)
+    } else if from_route && route.refusals.contains(&status.as_u16()) {
+        Err(LiveControlError::Rejected(
+            message().unwrap_or_else(|| format!("HTTP {status}")),
+        ))
+    } else {
+        Err(LiveControlError::Unusable(format!(
+            "HTTP {status}{}",
+            message().map(|m| format!(": {m}")).unwrap_or_default()
+        )))
+    };
+    RouteAnswer { result, stamped }
+}
+
+/// Ask the running proxy to park/unpark an account.
+async fn post_set_disabled(
+    config: &Config,
+    query: &str,
+    disabled: bool,
+) -> Result<crate::proxy::SetDisabledResponse, LiveControlError> {
+    let body = serde_json::json!({ "query": query, "disabled": disabled });
+    call_route(config, &DISABLED_ROUTE, |client, url| {
+        client.post(url).json(&body)
+    })
+    .await
+    .result
 }
 
 /// Ask the running proxy to add an account to the live rotation, or — when the
 /// submitted identity already matches one — replace its credentials in place.
-/// No restart, so no session pin is invalidated. Mirrors [`post_set_disabled`]:
-/// same `no_proxy()` client (`HTTP_PROXY` commonly points AT tcr), same
-/// timeouts, same api-key header — the control route has no loopback
-/// exemption either.
+/// No restart, so no session pin is invalidated.
 ///
 /// `account` is POSTed directly as the request body: [`config::Account`]
 /// already serializes to the exact wire shape
@@ -1888,13 +2065,9 @@ async fn post_set_disabled(
 /// for a real login, or `crate::oauth::probe_add_route`'s deliberately
 /// blank probe — and this function never re-lists its fields.
 ///
-/// Reuses [`LiveControlError`] rather than a parallel enum, extended with one
-/// more structural case [`post_set_disabled`] never needs: a `400` FROM the
-/// route (stamped) is this route's own request-validation failure — e.g. a
-/// blank name or token — and is exactly as much a "the route said no" signal
-/// as the `404`/`409` [`post_set_disabled`] already treats that way. The
-/// [`crate::proxy::ENDPOINT_HEADER`] stamp remains the only thing that
-/// decides "no such route" vs "the route said no" — never error text.
+/// A stamped `400` is this route's own request-validation failure (a blank
+/// name or token), and reads as [`LiveControlError::Rejected`] like a stamped
+/// `409`; see [`ADD_ACCOUNT_ROUTE`].
 pub(crate) async fn post_add_account(
     config: &Config,
     account: &Account,
@@ -1918,99 +2091,22 @@ pub(crate) async fn post_add_account_with_providers(
     Result<crate::proxy::AddAccountResponse, LiveControlError>,
     Vec<crate::provider::Provider>,
 ) {
-    let mut providers = Vec::new();
-    let result = post_add_account_reading(config, account, &mut providers).await;
-    (result, providers)
-}
-
-/// The request [`post_add_account_with_providers`] makes, with `providers` filled
-/// from a stamped answer's [`crate::proxy::PROVIDERS_HEADER`].
-async fn post_add_account_reading(
-    config: &Config,
-    account: &Account,
-    providers: &mut Vec<crate::provider::Provider>,
-) -> Result<crate::proxy::AddAccountResponse, LiveControlError> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::ADD_ACCOUNT_PATH
-    );
-    let mut request = client.post(&url).json(account);
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-
-    let response = match request.send().await {
-        Ok(r) => r,
-        // `is_timeout()` first: a connect TIMEOUT (a blackholed address, SYN
-        // dropped rather than refused) reports `is_connect() == true` as
-        // well, so checking `is_connect()` first would misclassify it as
-        // `NoServer` — "nothing is listening" — when the truer reading is
-        // "something is there but not answering", `NoAnswer` below.
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
-    };
-
-    let status = response.status();
-    // Same structural discriminator `post_set_disabled` uses: whether THIS
-    // route produced the answer, decided by the header, never by status code
-    // or error text alone.
-    let from_route = response
-        .headers()
-        .get(crate::proxy::ENDPOINT_HEADER)
+    let answer: RouteAnswer<crate::proxy::AddAccountResponse> =
+        call_route(config, &ADD_ACCOUNT_ROUTE, |client, url| {
+            client.post(url).json(account)
+        })
+        .await;
+    let providers = answer
+        .stamped
+        .as_ref()
+        .and_then(|headers| headers.get(crate::proxy::PROVIDERS_HEADER))
         .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::ADD_ACCOUNT_ENDPOINT);
-    if from_route
-        && let Some(advertised) = response
-            .headers()
-            .get(crate::proxy::PROVIDERS_HEADER)
-            .and_then(|v| v.to_str().ok())
-    {
-        *providers = crate::proxy::providers_in_header(advertised);
-    }
-    let body = response.text().await.unwrap_or_default();
-
-    if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!(
-                "the response was not a tcr account-add payload ({e})"
-            ))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    // 400: the route's own request validation (blank name/token) — the
-    // positive capability signal `oauth::probe_add_route` looks for. 409: the
-    // submitted identity matched more than one live account.
-    if from_route && matches!(status.as_u16(), 400 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+        .map(crate::proxy::providers_in_header)
+        .unwrap_or_default();
+    (answer.result, providers)
 }
 
 /// Ask the running proxy to set or clear the identity-bound control account.
-/// Cloned from [`post_set_disabled`]: same `no_proxy()` client, same timeouts,
-/// same api-key header, same `is_timeout()`-before-`is_connect()` ordering,
-/// and `from_route` decided ONLY by [`crate::proxy::ENDPOINT_HEADER`] ==
-/// [`crate::proxy::CONTROL_ENDPOINT`] — never by status code or error text.
 ///
 /// `query = None` is the CLEAR request; it is sent through exactly like a
 /// name, since [`crate::proxy::SetControlRequest`] treats `query: null` as a
@@ -2019,203 +2115,26 @@ async fn post_set_control(
     config: &Config,
     query: Option<&str>,
 ) -> Result<crate::proxy::SetControlResponse, LiveControlError> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::CONTROL_PATH
-    );
-    let mut request = client
-        .post(&url)
-        .json(&serde_json::json!({ "query": query }));
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-
-    let response = match request.send().await {
-        Ok(r) => r,
-        // `is_timeout()` first — see `post_set_disabled`'s identical comment
-        // on why checking `is_connect()` first would misclassify a blackholed
-        // address as `NoServer`.
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
-    };
-
-    let status = response.status();
-    let from_route = response
-        .headers()
-        .get(crate::proxy::ENDPOINT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::CONTROL_ENDPOINT);
-    let body = response.text().await.unwrap_or_default();
-
-    if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!(
-                "the response was not a tcr control-account payload ({e})"
-            ))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    if from_route && matches!(status.as_u16(), 404 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+    let body = serde_json::json!({ "query": query });
+    call_route(config, &CONTROL_ROUTE, |client, url| {
+        client.post(url).json(&body)
+    })
+    .await
+    .result
 }
 
 /// Ask the running proxy to set one account's priority in its live rotation.
-/// Cloned from [`post_set_disabled`]: same `no_proxy()` client, same timeouts,
-/// same api-key header, same `is_timeout()`-before-`is_connect()` ordering,
-/// and `from_route` decided ONLY by [`crate::proxy::ENDPOINT_HEADER`] ==
-/// [`crate::proxy::PRIORITY_ENDPOINT`].
 async fn post_set_priority(
     config: &Config,
     query: &str,
     priority: i64,
 ) -> Result<crate::proxy::SetPriorityResponse, LiveControlError> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::PRIORITY_PATH
-    );
-    let mut request = client.post(&url).json(&serde_json::json!({
-        "query": query,
-        "priority": priority,
-    }));
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-
-    let response = match request.send().await {
-        Ok(r) => r,
-        // `is_timeout()` first: see `post_set_disabled`'s identical comment.
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
-    };
-
-    let status = response.status();
-    let from_route = response
-        .headers()
-        .get(crate::proxy::ENDPOINT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::PRIORITY_ENDPOINT);
-    let body = response.text().await.unwrap_or_default();
-
-    if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!("the response was not a tcr priority payload ({e})"))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    if from_route && matches!(status.as_u16(), 404 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!("HTTP {status}")))
-}
-
-/// The client every call to [`crate::proxy::CONFIG_PATH`] uses: the same
-/// `no_proxy()` client and timeouts as [`post_set_disabled`].
-fn config_route_client() -> Result<reqwest::Client, LiveControlError> {
-    reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))
-}
-
-/// Send one request to [`crate::proxy::CONFIG_PATH`] and sort the answer the
-/// way [`post_set_priority`] does: `is_timeout()` before `is_connect()`, and
-/// "the route answered" decided ONLY by [`crate::proxy::ENDPOINT_HEADER`] ==
-/// [`crate::proxy::CONFIG_ENDPOINT`]. A stamped 400 or 409 is the route
-/// refusing; the 200 body is parsed as `T`.
-async fn config_route_call<T: serde::de::DeserializeOwned>(
-    config: &Config,
-    request: reqwest::RequestBuilder,
-) -> Result<T, LiveControlError> {
-    let mut request = request;
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-    let response = match request.send().await {
-        Ok(r) => r,
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
-    };
-    let status = response.status();
-    let from_route = response
-        .headers()
-        .get(crate::proxy::ENDPOINT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::CONFIG_ENDPOINT);
-    let body = response
-        .text()
-        .await
-        .map_err(|e| LiveControlError::Unusable(format!("reading the answer: {e}")))?;
-    if status.is_success() && from_route {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!("the response was not a tcr settings payload ({e})"))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    if from_route && matches!(status.as_u16(), 400 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!(
-        "HTTP {status}{}",
-        error_message_of(&body)
-            .map(|m| format!(": {m}"))
-            .unwrap_or_default()
-    )))
+    let body = serde_json::json!({ "query": query, "priority": priority });
+    call_route(config, &PRIORITY_ROUTE, |client, url| {
+        client.post(url).json(&body)
+    })
+    .await
+    .result
 }
 
 /// Hand one setting to the running proxy, which writes it to its config file.
@@ -2223,16 +2142,15 @@ async fn post_set_config(
     config: &Config,
     setting: &crate::config_set::Setting,
 ) -> Result<crate::proxy::SetConfigResponse, LiveControlError> {
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::CONFIG_PATH
-    );
-    let request = config_route_client()?.post(&url).json(&serde_json::json!({
+    let body = serde_json::json!({
         "key": setting.key().as_str(),
         "value": setting.value_text(),
-    }));
-    config_route_call(config, request).await
+    });
+    call_route(config, &CONFIG_ROUTE, |client, url| {
+        client.post(url).json(&body)
+    })
+    .await
+    .result
 }
 
 /// The settings the running proxy is using: its `GET` on
@@ -2240,13 +2158,9 @@ async fn post_set_config(
 async fn fetch_running_settings(
     config: &Config,
 ) -> Result<crate::config_show::ConfigSettings, LiveControlError> {
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::CONFIG_PATH
-    );
-    let request = config_route_client()?.get(&url);
-    config_route_call(config, request).await
+    call_route(config, &CONFIG_ROUTE, |client, url| client.get(url))
+        .await
+        .result
 }
 
 /// The file half of `tcr control`: resolve OFFLINE (when `query` is `Some`) →
@@ -2366,8 +2280,13 @@ pub async fn set_control(config_path: &Path, query: Option<&str>) -> anyhow::Res
     // it always has. Never a silent skip of the live attempt for any other
     // reason.
     if let Ok(config) = config::load(config_path) {
-        match post_set_control(&config, query).await {
-            Ok(applied) => {
+        let site = LiveSite {
+            config: &config,
+            config_path,
+            words: &CONTROL_WORDS,
+        };
+        match site.decide(post_set_control(&config, query).await)? {
+            Live::Applied(applied) => {
                 match &applied.name {
                     Some(name) => println!("Set control account to '{name}'."),
                     None => println!("Cleared the control account."),
@@ -2377,51 +2296,10 @@ pub async fn set_control(config_path: &Path, query: Option<&str>) -> anyhow::Res
                 }
                 return Ok(());
             }
-            // Nothing is listening: the historical case, and the only quiet
-            // one. There is no live rotation to disagree with the file.
-            Err(LiveControlError::NoServer) => {}
-            // A server is there and REFUSED us. Writing the file here would
-            // be the old lie in a new place: the config would name a new
-            // control account while the running proxy — the one that actually
-            // resolves identity traffic — keeps using its old one (or none).
-            Err(LiveControlError::Unauthorized) => {
-                bail!(
-                    "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because writing it would leave the running proxy still resolving identity traffic against its old control account. Fix `proxy.apiKey` and retry.",
-                    config.proxy.port,
-                    config_path.display()
-                );
-            }
-            // The route is missing: an older tcr is serving. The file write
-            // is all we can do, and it is HALF a control-account change — say
-            // so loudly.
-            Err(LiveControlError::NoRoute) => {
+            Live::FileOnly(None) => {}
+            Live::FileOnly(Some(stale)) => {
                 write_control_account(config_path, query)?;
-                eprintln!(
-                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP its OLD control account until it restarts. {}",
-                    config.proxy.port,
-                    crate::proxy::CONTROL_PATH,
-                    RESTART_HINT,
-                );
-                return Ok(());
-            }
-            // The route ran and refused the QUERY: it matched no live
-            // account, or matched several. Do not fall back — the file's own
-            // offline resolution could land on a different account than the
-            // one the server was talking about.
-            Err(LiveControlError::Rejected(message)) => {
-                bail!(
-                    "the proxy running on :{} refused this: {message} Nothing was changed.",
-                    config.proxy.port
-                );
-            }
-            // It answered something we cannot use, or did not answer at all.
-            Err(other) => {
-                write_control_account(config_path, query)?;
-                eprintln!(
-                    "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP its OLD control account until it restarts.",
-                    config.proxy.port,
-                    other.why(),
-                );
+                eprintln!("{}", site.warning(&stale, Some("its OLD control account")));
                 return Ok(());
             }
         }
@@ -3001,7 +2879,7 @@ impl StatusSource {
 ///
 /// It renders no Codex route or traffic: every Codex row comes out without
 /// `codexRoute` and `codexTraffic`, as from a CLI that predates them. `tcr status
-/// --json` itself renders through [`render_accounts_json_at`], with both.
+/// --json` itself renders through [`account_status_rows_at`], with both.
 #[cfg(test)]
 fn render_accounts_json(
     snapshot: &StatsSnapshot,
@@ -3012,8 +2890,7 @@ fn render_accounts_json(
     control: Option<&str>,
     group_colors: &std::collections::BTreeMap<String, String>,
 ) -> String {
-    render_accounts_json_at(
-        OffsetDateTime::now_utc(),
+    status_rows_json(account_status_rows(
         snapshot,
         thresholds,
         source,
@@ -3021,57 +2898,22 @@ fn render_accounts_json(
         http1_only,
         control,
         group_colors,
-        None,
-        None,
-    )
+    ))
 }
 
-/// [`render_accounts_json`] at a given clock, with the fleet's Codex route and
-/// traffic.
-///
-/// `now` is the clock that `held[].minutesUntilReset` and `secondsUntilFree`
-/// are computed against. Taking it as a parameter lets a test compare a fixed
-/// instant with a committed fixture, with no normalisation layer between them.
-///
-/// `codex_route` and `codex_traffic` are fleet-wide facts, repeated on every
-/// Codex row the way `serverSha` and `groupColors` are repeated on every row.
-///
-/// No Codex key ever reaches an Anthropic row — neither these two nor the
-/// account's own Codex facts — so such a row is the bytes it always was.
-#[allow(clippy::too_many_arguments)]
-fn render_accounts_json_at(
-    now: OffsetDateTime,
-    snapshot: &StatsSnapshot,
-    thresholds: &[f64],
-    source: StatusSource,
-    server: Option<&BuildInfo>,
-    http1_only: bool,
-    control: Option<&str>,
-    group_colors: &std::collections::BTreeMap<String, String>,
-    codex_route: Option<&tcr_status_wire::CodexRoute>,
-    codex_traffic: Option<&tcr_status_wire::CodexTraffic>,
-) -> String {
-    let rows: Vec<serde_json::Value> = account_status_rows_at(
-        now,
-        snapshot,
-        thresholds,
-        source,
-        server,
-        http1_only,
-        control,
-        group_colors,
-        codex_route,
-        codex_traffic,
-    )
-    .into_iter()
-    // Round-trip through `Value` rather than serializing the struct
-    // directly: `serde_json::Value`'s map is a `BTreeMap`, so keys come
-    // out alphabetically ordered. That matches this wire's output before
-    // this struct existed (the committed fixture's key order), while
-    // `AccountStatusRow`'s own field order stays whatever reads best in
-    // this source file.
-    .map(|row| serde_json::to_value(row).unwrap_or(serde_json::Value::Null))
-    .collect();
+/// The `tcr status --json` text of `rows`, as [`account_status_rows_at`] built
+/// them.
+fn status_rows_json(rows: Vec<tcr_status_wire::AccountStatusRow>) -> String {
+    let rows: Vec<serde_json::Value> = rows
+        .into_iter()
+        // Round-trip through `Value` rather than serializing the struct
+        // directly: `serde_json::Value`'s map is a `BTreeMap`, so keys come
+        // out alphabetically ordered. That matches this wire's output before
+        // this struct existed (the committed fixture's key order), while
+        // `AccountStatusRow`'s own field order stays whatever reads best in
+        // this source file.
+        .map(|row| serde_json::to_value(row).unwrap_or(serde_json::Value::Null))
+        .collect();
     serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -3105,7 +2947,18 @@ fn account_status_rows(
 }
 
 /// [`account_status_rows`] at a given clock, with the fleet's Codex route and
-/// traffic: the typed rows [`render_accounts_json_at`] prints.
+/// traffic: the typed rows `tcr status --json` prints through
+/// [`status_rows_json`].
+///
+/// `now` is the clock that `held[].minutesUntilReset` and `secondsUntilFree`
+/// are computed against. Taking it as a parameter lets a test compare a fixed
+/// instant with a committed fixture, with no normalisation layer between them.
+///
+/// `codex_route` and `codex_traffic` are fleet-wide facts, repeated on every
+/// Codex row the way `serverSha` and `groupColors` are repeated on every row.
+///
+/// No Codex key ever reaches an Anthropic row — neither these two nor the
+/// account's own Codex facts — so such a row is the bytes it always was.
 #[allow(clippy::too_many_arguments)]
 fn account_status_rows_at(
     now: OffsetDateTime,
@@ -3558,6 +3411,16 @@ pub enum LiveStatusError {
     Unusable(String),
 }
 
+impl From<Unreached> for LiveStatusError {
+    fn from(unreached: Unreached) -> Self {
+        match unreached {
+            Unreached::Refused => LiveStatusError::NoServer,
+            Unreached::Silent(why) => LiveStatusError::NoAnswer(why),
+            Unreached::Unbuilt(why) => LiveStatusError::Unusable(why),
+        }
+    }
+}
+
 impl LiveStatusError {
     /// Did an HTTP response come back at all?
     ///
@@ -3659,38 +3522,10 @@ fn parse_live_status(body: &str) -> Result<StatusPayload, LiveStatusError> {
 /// The transport half of [`fetch_live_status`]: one GET, every failure mode
 /// classified, the body handed back unparsed.
 async fn fetch_live_status_body(config: &Config) -> Result<String, LiveStatusError> {
-    let client = reqwest::Client::builder()
-        // Never route our own loopback read through a system proxy: `HTTP_PROXY`
-        // very commonly points AT tcr, so honouring it would send this query
-        // through the endpoint it is asking about.
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveStatusError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::STATUS_PATH
-    );
-    let mut request = client.get(&url);
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-
-    let response = match request.send().await {
-        Ok(r) => r,
-        Err(e) if e.is_connect() => return Err(LiveStatusError::NoServer),
-        Err(e) if e.is_timeout() => {
-            return Err(LiveStatusError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        // No response object came back, and it was neither a refused connect nor
-        // the deadline: a reset or a truncated read. Nothing was served.
-        Err(e) => return Err(LiveStatusError::NoAnswer(e.to_string())),
-    };
+    let response = send_loopback(config, crate::proxy::STATUS_PATH, |client, url| {
+        client.get(url)
+    })
+    .await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -4089,7 +3924,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
     if json {
         println!(
             "{}",
-            render_accounts_json_at(
+            status_rows_json(account_status_rows_at(
                 OffsetDateTime::now_utc(),
                 &snapshot,
                 &thresholds,
@@ -4100,7 +3935,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                 &group_colors,
                 wire_route.as_ref(),
                 wire_traffic.as_ref(),
-            )
+            ))
         );
     } else {
         // The route problem goes ABOVE the fleet, because it outranks it: a
@@ -4654,6 +4489,29 @@ mod tests {
         }
     }
 
+    /// `snapshot` as `tcr status --json` renders it from `source`, with no server build, no
+    /// `http1Only`, no control account and no group colours.
+    fn status_json(snapshot: &StatsSnapshot, thresholds: &[f64], source: StatusSource) -> String {
+        render_accounts_json(
+            snapshot,
+            thresholds,
+            source,
+            None,
+            false,
+            None,
+            &Default::default(),
+        )
+    }
+
+    /// The row named `name` in the `tcr status --json` text `json`.
+    fn status_row(json: &str, name: &str) -> serde_json::Value {
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(json).expect("json is a bare array");
+        rows.into_iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("no row named {name} in {json}"))
+    }
+
     /// A unique temp config path per call so parallel tests never collide.
     fn temp_config_path(tag: &str) -> std::path::PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -4792,20 +4650,15 @@ mod tests {
     /// also gone.
     #[tokio::test]
     async fn remove_parks_the_account_in_the_running_proxy_before_deleting() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let path = config_on_a_dead_port("live-remove").await;
         let mut config = load(&path);
         config.proxy.port = port;
 
-        let manager = Manager::with_live_refresher(config.clone(), Some(path.clone()));
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager =
+            crate::test_support::live_proxy::serve(listener, config.clone(), Some(path.clone()));
 
-        let raw = fs::read_to_string(&path).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        point_at_port(&path, port);
 
         remove_account(&path, "alice@example.com").await.unwrap();
 
@@ -4847,8 +4700,7 @@ mod tests {
     /// delete is refused as ambiguous and changes nothing.
     #[tokio::test]
     async fn remove_takes_a_codex_account_out_and_leaves_its_anthropic_twin() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let path = write_config(
             "live-remove-codex",
             &format!(
@@ -4863,9 +4715,8 @@ mod tests {
                    ] }}"#
             ),
         );
-        let manager = Manager::with_live_refresher(load(&path), Some(path.clone()));
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager =
+            crate::test_support::live_proxy::serve(listener, load(&path), Some(path.clone()));
 
         remove_account(&path, "alice@example.com/codex")
             .await
@@ -4923,14 +4774,12 @@ mod tests {
     /// alone confirm parked the account — keeps rotating it, permanently.
     #[tokio::test]
     async fn remove_refuses_on_unauthorized_without_writing() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let server_config: Config = serde_json::from_str(&format!(
             r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }}, "accounts": [] }}"#
         ))
         .unwrap();
-        let manager = Manager::with_live_refresher(server_config, None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, server_config, None);
 
         let path = config_on_a_dead_port("remove-unauth").await;
         let raw = fs::read_to_string(&path).unwrap();
@@ -4960,23 +4809,13 @@ mod tests {
     /// is unrecoverable, unlike a mis-applied disable.
     #[tokio::test]
     async fn remove_refuses_an_ambiguous_query_without_writing() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let path = config_on_a_dead_port("remove-ambiguous").await;
-        let raw = fs::read_to_string(&path).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let (path, listener) = config_on_a_scratch_port("remove-ambiguous").await;
 
         // The ambiguity is in the LIVE rotation only: the file keeps unique
         // names (the loader guarantees that), and the running fleet is broken by
         // hand afterwards. That is the split this test is about — the CLI must
         // not resolve against the file when the server refused.
-        let mut config = load(&path);
-        config.accounts[1].name = "alice@example.com".to_string();
-        let before = fs::read_to_string(&path).unwrap();
-        let manager = Manager::with_live_refresher(config, Some(path.clone()));
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let before = serve_a_fleet_with_two_alices(&path, listener);
 
         let err = remove_account(&path, "alice@example.com")
             .await
@@ -5051,17 +4890,10 @@ mod tests {
     /// the running rotation kept picking alice until a restart.
     #[tokio::test]
     async fn set_priority_reorders_the_running_proxy_and_the_file() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let path = config_on_a_dead_port("live-priority").await;
-        let raw = fs::read_to_string(&path).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let (path, listener) = config_on_a_scratch_port("live-priority").await;
 
-        let manager = Manager::with_live_refresher(load(&path), Some(path.clone()));
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager =
+            crate::test_support::live_proxy::serve(listener, load(&path), Some(path.clone()));
 
         let fresh_pick = |m: &Manager| {
             m.select(
@@ -5096,19 +4928,9 @@ mod tests {
     /// neither the file nor the running proxy's order.
     #[tokio::test]
     async fn set_priority_refuses_an_ambiguous_live_query_without_writing() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let path = config_on_a_dead_port("live-priority-ambiguous").await;
-        let raw = fs::read_to_string(&path).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let (path, listener) = config_on_a_scratch_port("live-priority-ambiguous").await;
 
-        let mut config = load(&path);
-        config.accounts[1].name = "alice@example.com".to_string();
-        let before = fs::read_to_string(&path).unwrap();
-        let manager = Manager::with_live_refresher(config, Some(path.clone()));
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let before = serve_a_fleet_with_two_alices(&path, listener);
 
         let err = set_priority(&path, "alice@example.com", PriorityArg::First)
             .await
@@ -5126,14 +4948,30 @@ mod tests {
     /// A fixture whose port is a scratch listener's, bound here and handed back
     /// for the test to serve on.
     async fn config_on_a_scratch_port(tag: &str) -> (std::path::PathBuf, tokio::net::TcpListener) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let path = config_on_a_dead_port(tag).await;
-        let mut doc: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        point_at_port(&path, port);
         (path, listener)
+    }
+
+    /// Serve the config at `path` on `listener` with its second account renamed to
+    /// `alice@example.com`, so the RUNNING fleet holds two alices while the file keeps unique
+    /// names (the loader guarantees that). Answers the file's text from before the proxy started.
+    fn serve_a_fleet_with_two_alices(path: &Path, listener: tokio::net::TcpListener) -> String {
+        let mut config = load(path);
+        config.accounts[1].name = "alice@example.com".to_string();
+        let before = fs::read_to_string(path).unwrap();
+        crate::test_support::live_proxy::serve(listener, config, Some(path.to_path_buf()));
+        before
+    }
+
+    /// Rewrite the config file at `path` so its `proxy.port` is `port`, the way a CLI pointed at a
+    /// test's live proxy finds it.
+    fn point_at_port(path: &Path, port: u16) {
+        let raw = fs::read_to_string(path).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        doc["proxy"]["port"] = serde_json::json!(port);
+        fs::write(path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
     }
 
     fn file_value(path: &Path, key: &str) -> serde_json::Value {
@@ -5156,9 +4994,8 @@ mod tests {
         let served = cli_path.with_extension("served.json");
         fs::copy(&cli_path, &served).unwrap();
         let cli_before = fs::read_to_string(&cli_path).unwrap();
-        let manager = Manager::with_live_refresher(load(&served), Some(served.clone()));
-        let serving = Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, serving, None).await });
+        let manager =
+            crate::test_support::live_proxy::serve(listener, load(&served), Some(served.clone()));
 
         set_config(&cli_path, "switchThreshold", "90%")
             .await
@@ -5224,8 +5061,7 @@ mod tests {
         let offline = config_on_a_dead_port("config-set-refused").await;
         let (live, listener) = config_on_a_scratch_port("config-set-refused-live").await;
         // A proxy with no config file behind it: its route refuses every set.
-        let manager = Manager::with_live_refresher(load(&live), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, load(&live), None);
 
         for path in [&offline, &live] {
             let before = fs::read_to_string(path).unwrap();
@@ -5265,8 +5101,8 @@ mod tests {
         assert!(shown.waiting().is_empty());
 
         let (path, listener) = config_on_a_scratch_port("config-show-live").await;
-        let manager = Manager::with_live_refresher(load(&path), Some(path.clone()));
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, load(&path), Some(path.clone()));
+
         let shown = config_show_document(&path).await.unwrap();
         assert_eq!(shown.waiting(), Vec::<&str>::new(), "nothing waits at boot");
 
@@ -5370,7 +5206,7 @@ mod tests {
     /// finds no proxy and the file is the whole truth.
     #[tokio::test]
     async fn priority_on_a_codex_row_writes_its_own_providers_value() {
-        let port = dead_port().await;
+        let port = crate::test_support::loopback::unused_port();
         let json = serde_json::json!({
             "proxy": { "port": port },
             "accounts": [
@@ -6275,22 +6111,25 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    /// The row for group `name` in `tcr group ls --json` over `config`.
+    fn group_row(config: &Config, name: &str) -> serde_json::Value {
+        let value: serde_json::Value =
+            serde_json::from_str(&render_groups_json(config).unwrap()).unwrap();
+        value["groups"]
+            .as_array()
+            .expect("groups array")
+            .iter()
+            .find(|r| r["group"] == name)
+            .expect("group row")
+            .clone()
+    }
+
     /// Same fact on the JSON surface, which the panel and scripts read.
     #[test]
     fn ls_json_carries_routes_and_route_block() {
         let path = write_config("routes-json", CONTROL_ONLY_GROUP);
         let config = load(&path);
-        let value: serde_json::Value =
-            serde_json::from_str(&render_groups_json(&config).unwrap()).unwrap();
-        let row = |name: &str| -> serde_json::Value {
-            value["groups"]
-                .as_array()
-                .expect("groups array")
-                .iter()
-                .find(|r| r["group"] == name)
-                .expect("group row")
-                .clone()
-        };
+        let row = |name: &str| group_row(&config, name);
         assert_eq!(row("research")["routes"], serde_json::json!(false));
         assert_eq!(
             row("research")["routeBlock"],
@@ -6330,7 +6169,8 @@ mod tests {
     /// refuses a Codex account the way the live route does, so `tcr control` cannot
     /// persist a `controlAccount` the next boot would ignore. The file is left as it was.
     ///
-    /// The config names a port nothing listens on ([`dead_port`]): an edit asks whether a
+    /// The config names a port nothing listens on (`test_support::loopback::unused_port`): an
+    /// edit asks whether a
     /// server is running on the config's port, and without one that is 3456, where a live
     /// tcr may be serving.
     ///
@@ -6338,7 +6178,7 @@ mod tests {
     /// names the Codex row.
     #[tokio::test]
     async fn write_control_account_refuses_a_codex_account_and_writes_nothing() {
-        let port = dead_port().await;
+        let port = crate::test_support::loopback::unused_port();
         let path = write_config(
             "control-codex",
             &serde_json::json!({
@@ -6381,7 +6221,7 @@ mod tests {
     /// whether a server is running on the config's port, and without one that is
     /// 3456, where a live tcr may be serving. `bob_extra` is merged into bob's row.
     async fn alice_and_codex_bob(tag: &str, bob_extra: serde_json::Value) -> std::path::PathBuf {
-        let port = dead_port().await;
+        let port = crate::test_support::loopback::unused_port();
         let mut bob = serde_json::json!({
             "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
             "accessToken": "at-b", "refreshToken": "rt-b", "credentialVersion": 2
@@ -6540,17 +6380,7 @@ mod tests {
         assert!(!solo.contains("codex_members"), "{solo}");
         assert!(solo.contains(" routes=yes "), "{solo}");
 
-        let value: serde_json::Value =
-            serde_json::from_str(&render_groups_json(&config).unwrap()).unwrap();
-        let row = |name: &str| -> serde_json::Value {
-            value["groups"]
-                .as_array()
-                .expect("groups array")
-                .iter()
-                .find(|r| r["group"] == name)
-                .expect("group row")
-                .clone()
-        };
+        let row = |name: &str| group_row(&config, name);
         assert_eq!(row("mixed")["codexMembers"], serde_json::json!(1));
         assert_eq!(row("mixed")["routes"], serde_json::json!(true));
         assert_eq!(row("mixed")["routeBlock"], serde_json::Value::Null);
@@ -6811,37 +6641,12 @@ mod tests {
 
     // --- enable / disable --------------------------------------------------
 
-    /// A free port nothing is listening on: bound, then dropped.
-    /// An ephemeral port nothing is listening on — and **never 3456**.
-    ///
-    /// Drawing 3456 here is not a cosmetic collision. `TWO_ACCOUNTS` names 3456
-    /// and [`config_on_a_dead_port`] substitutes it away precisely so a test can
-    /// never POST an account-control command at the REAL proxy; if the draw IS
-    /// 3456 the substitution is a no-op, and the assert that guards it fires.
-    ///
-    /// This only ever reproduces in CI, which is what made it look like a flake
-    /// and then like a regression. On a developer Mac a live tcr holds 3456, so
-    /// the OS cannot offer it; on a Linux runner the port is free and gets drawn
-    /// occasionally. Measured 2026-08-14: two consecutive runs of the same
-    /// commit failed on two DIFFERENT tests of this family, which is the
-    /// signature of a shared helper losing a dice roll rather than of a broken
-    /// assertion.
-    ///
-    /// Bounded rather than `loop`: an unbounded retry against an OS that somehow
-    /// only offers 3456 would hang the suite with no diagnosis, and a test that
-    /// hangs is strictly worse than one that fails with a reason.
-    async fn dead_port() -> u16 {
-        for _ in 0..64 {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            if port != 3456 {
-                return port;
-            }
-        }
-        panic!("could not draw an ephemeral port other than 3456 in 64 attempts");
-    }
-
     /// `TWO_ACCOUNTS` pointed at a port nothing serves, written to a temp file.
+    ///
+    /// The port is `test_support::loopback::unused_port`, which never draws 3456: `TWO_ACCOUNTS`
+    /// names 3456 and this substitutes it away precisely so a test can never POST an
+    /// account-control command at the REAL proxy, and a draw of 3456 would make the
+    /// substitution a no-op.
     ///
     /// Load-bearing safety, not tidiness: `set_enabled` is live-first now, and
     /// `TWO_ACCOUNTS` names port **3456** — the port a REAL tcr serves Gil's fleet
@@ -6849,7 +6654,7 @@ mod tests {
     /// live proxy. The substitution is asserted below because a silent no-op here
     /// would aim every one of these tests at the running server.
     async fn config_on_a_dead_port(tag: &str) -> std::path::PathBuf {
-        let port = dead_port().await;
+        let port = crate::test_support::loopback::unused_port();
         let json = TWO_ACCOUNTS.replace("\"port\": 3456 }", &format!("\"port\": {port} }}"));
         // Compare the PARSED value, not the text: a substring check for
         // `"port": 3456` also matched a drawn port of 34560–34569 and tripped
@@ -6901,23 +6706,18 @@ mod tests {
     /// defect; the in-memory one does not.
     #[tokio::test]
     async fn set_enabled_parks_the_account_in_the_running_proxy() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let path = config_on_a_dead_port("live-disable").await;
         let mut config = load(&path);
         config.proxy.port = port;
 
         // The server owns the SAME config file the CLI is pointed at, exactly as
         // the real proxy does — so the durable half lands where `tcr` looks.
-        let manager = Manager::with_live_refresher(config.clone(), Some(path.clone()));
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager =
+            crate::test_support::live_proxy::serve(listener, config.clone(), Some(path.clone()));
 
         // Point the CLI at the live port by rewriting the file it will load.
-        let raw = fs::read_to_string(&path).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        point_at_port(&path, port);
 
         set_enabled(&path, "alice@example.com", true).await.unwrap();
 
@@ -6969,19 +6769,9 @@ mod tests {
     /// makes the byte-identical assertion below mean what it says.
     #[tokio::test]
     async fn set_enabled_refuses_an_ambiguous_query_without_writing() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let path = config_on_a_dead_port("live-ambiguous").await;
-        let raw = fs::read_to_string(&path).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let (path, listener) = config_on_a_scratch_port("live-ambiguous").await;
 
-        let mut config = load(&path);
-        config.accounts[1].name = "alice@example.com".to_string();
-        let before = fs::read_to_string(&path).unwrap();
-        let manager = Manager::with_live_refresher(config, Some(path.clone()));
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let before = serve_a_fleet_with_two_alices(&path, listener);
 
         let err = set_enabled(&path, "alice@example.com", true)
             .await
@@ -7011,36 +6801,19 @@ mod tests {
     /// this can never add a real account.
     fn blank_account() -> Account {
         Account {
-            name: String::new(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: String::new(),
             refresh_token: None,
             expires_at: None,
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("")
         }
     }
 
     #[tokio::test]
     async fn post_add_account_reads_a_stamped_400_as_rejected() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let config = add_route_config(port);
-        let manager = Manager::with_live_refresher(config.clone(), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, config.clone(), None);
 
         let err = post_add_account(&config, &blank_account())
             .await
@@ -7056,11 +6829,9 @@ mod tests {
     /// tcr's catch-all, anything that is not this route — is no proof of anything and is not read.
     #[tokio::test]
     async fn post_add_account_with_providers_reads_them_off_a_stamped_answer_only() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let config = add_route_config(port);
-        let manager = Manager::with_live_refresher(config.clone(), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, config.clone(), None);
 
         let (answer, providers) = post_add_account_with_providers(&config, &blank_account()).await;
         assert!(
@@ -7075,8 +6846,7 @@ mod tests {
             ]
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         tokio::spawn(async move {
             let unstamped = axum::Router::new().fallback(|| async {
                 (
@@ -7106,8 +6876,7 @@ mod tests {
         // An "older tcr": something answers, but not on this route — no
         // `ENDPOINT_HEADER`, unlike every response this crate's own router
         // produces (even its 404s and 405s).
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         tokio::spawn(async move {
             axum::serve(listener, axum::Router::new())
                 .await
@@ -7126,14 +6895,12 @@ mod tests {
 
     #[tokio::test]
     async fn post_add_account_wrong_api_key_is_unauthorized() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let server_config: Config = serde_json::from_str(&format!(
             r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#
         ))
         .unwrap();
-        let manager = Manager::with_live_refresher(server_config, None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, server_config, None);
 
         let client_config: Config = serde_json::from_str(&format!(
             r#"{{ "proxy": {{ "port": {port}, "apiKey": "wrong-key" }} }}"#
@@ -7152,34 +6919,16 @@ mod tests {
     /// the SERVING rotation — not just in the response body.
     #[tokio::test]
     async fn post_add_account_adds_a_new_account_to_the_live_rotation() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let config = add_route_config(port);
-        let manager = Manager::with_live_refresher(config.clone(), None);
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager = crate::test_support::live_proxy::serve(listener, config.clone(), None);
 
         let account = Account {
-            name: "new@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-new".to_string(),
             refresh_token: Some("rt-new".to_string()),
             expires_at: Some(1_893_456_000_000),
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("new@example.com")
         };
         let applied = post_add_account(&config, &account)
             .await
@@ -7201,8 +6950,7 @@ mod tests {
     /// guessed onto one of the candidates.
     #[tokio::test]
     async fn post_add_account_ambiguous_identity_is_rejected_not_guessed() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         // Two live accounts share a name and neither carries an org — the
         // legacy shape `same_identity`/`match_one` cannot break a tie on.
         let seed = format!(
@@ -7214,30 +6962,14 @@ mod tests {
             ] }}"#
         );
         let config: Config = serde_json::from_str(&seed).unwrap();
-        let manager = Manager::with_live_refresher(config.clone(), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, config.clone(), None);
 
         let account = Account {
-            name: "dup@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-new".to_string(),
             refresh_token: Some("rt-new".to_string()),
             expires_at: None,
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("dup@example.com")
         };
         let err = post_add_account(&config, &account)
             .await
@@ -7338,6 +7070,21 @@ mod tests {
 
     // --- tcr list --json ----------------------------------------------------
 
+    /// `tcr list --json` over the config at `path` with a [`CountingProber`], which file is then
+    /// removed: the document, the exit code, and how many probes reached the prober.
+    async fn list_v1_counting_probes(path: &Path) -> (String, i32, Arc<AtomicU64>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let (document, code) = render_list_v1(
+            path,
+            Arc::new(CountingProber {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .await;
+        fs::remove_file(path).ok();
+        (document, code, calls)
+    }
+
     /// A prober that only counts: `tcr list` must never reach it.
     struct CountingProber {
         calls: Arc<AtomicU64>,
@@ -7360,29 +7107,18 @@ mod tests {
         }
     }
 
-    /// A loopback port nothing listens on: bound by the OS, then released.
-    fn unused_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-        listener.local_addr().expect("local addr").port()
-    }
-
     /// With no server, `tcr list --json` lists every configured account as
     /// `unavailable`, in file order, and the prober sees ZERO calls. Both
     /// accounts carry an unexpired token, so a path that probed would reach
     /// the prober twice.
     #[tokio::test]
     async fn list_v1_with_no_server_never_probes_and_lists_every_account_unavailable() {
-        let json = TWO_ACCOUNTS.replace("3456", &unused_port().to_string());
+        let json = TWO_ACCOUNTS.replace(
+            "3456",
+            &crate::test_support::loopback::unused_port().to_string(),
+        );
         let path = write_config("list-v1-no-server", &json);
-        let calls = Arc::new(AtomicU64::new(0));
-        let (document, code) = render_list_v1(
-            &path,
-            Arc::new(CountingProber {
-                calls: Arc::clone(&calls),
-            }),
-        )
-        .await;
-        fs::remove_file(&path).ok();
+        let (document, code, calls) = list_v1_counting_probes(&path).await;
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -7423,15 +7159,7 @@ mod tests {
     #[tokio::test]
     async fn list_v1_reports_an_unreadable_config_in_the_error_envelope() {
         let path = write_config("list-v1-bad", "{ not json");
-        let calls = Arc::new(AtomicU64::new(0));
-        let (document, code) = render_list_v1(
-            &path,
-            Arc::new(CountingProber {
-                calls: Arc::clone(&calls),
-            }),
-        )
-        .await;
-        fs::remove_file(&path).ok();
+        let (document, code, calls) = list_v1_counting_probes(&path).await;
 
         assert_eq!(code, 1);
         let doc: serde_json::Value = serde_json::from_str(&document).expect("one JSON document");
@@ -7466,18 +7194,10 @@ mod tests {
                  {{ "name": "bob@example.com", "type": "oauth", "accessToken": "at-b",
                     "refreshToken": "rt-b", "expiresAt": 4102444800000 }}
                ] }}"#,
-            unused_port()
+            crate::test_support::loopback::unused_port()
         );
         let path = write_config("list-v1-codex", &json);
-        let calls = Arc::new(AtomicU64::new(0));
-        let (document, code) = render_list_v1(
-            &path,
-            Arc::new(CountingProber {
-                calls: Arc::clone(&calls),
-            }),
-        )
-        .await;
-        fs::remove_file(&path).ok();
+        let (document, code, calls) = list_v1_counting_probes(&path).await;
 
         assert_eq!(code, 0, "{document}");
         assert_eq!(calls.load(Ordering::SeqCst), 0, "it still never probes");
@@ -7621,15 +7341,7 @@ mod tests {
         )
         .await;
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let json = status_json(&snapshot, &thresholds, StatusSource::Offline);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         assert_eq!(rows.len(), 2, "one row per account");
         for (i, row) in rows.iter().enumerate() {
@@ -7675,15 +7387,7 @@ mod tests {
         counted.accounts[0].requests = CACHE_SIGNAL_FLOOR_REQUESTS;
         counted.accounts[0].input_tokens = 1_000;
         counted.accounts[0].cache_read_tokens = 750;
-        let live = render_accounts_json(
-            &counted,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let live = status_json(&counted, &thresholds, StatusSource::Live);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["cacheHitRatio"], serde_json::json!(0.75));
         assert_eq!(rows[0]["source"], "live");
@@ -7742,15 +7446,7 @@ mod tests {
         sparse.accounts[0].input_tokens = 42_000;
         sparse.accounts[0].cache_read_tokens = 100;
 
-        let live = render_accounts_json(
-            &sparse,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let live = status_json(&sparse, &thresholds, StatusSource::Live);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert!(
             rows[0]["cacheHitRatio"].is_null(),
@@ -7781,15 +7477,7 @@ mod tests {
         // suppression of light accounts.
         let mut at_floor = sparse.clone();
         at_floor.accounts[0].requests = CACHE_SIGNAL_FLOOR_REQUESTS;
-        let live = render_accounts_json(
-            &at_floor,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let live = status_json(&at_floor, &thresholds, StatusSource::Live);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(
             rows[0]["cacheHitRatio"],
@@ -7816,15 +7504,7 @@ mod tests {
         )
         .await;
 
-        let offline = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let offline = status_json(&snapshot, &thresholds, StatusSource::Offline);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&offline).expect("valid json");
         for row in &rows {
             // `get`, not `row[...]`: indexing a MISSING key also yields Null, so
@@ -7843,15 +7523,7 @@ mod tests {
         }
 
         // Measured and genuinely clean is a DIFFERENT state, and renders as 0.
-        let live = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let live = status_json(&snapshot, &thresholds, StatusSource::Live);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["streamErrorCount"], serde_json::json!(0));
 
@@ -7859,15 +7531,7 @@ mod tests {
         let mut errored = snapshot.clone();
         errored.accounts[0].stream_error_count = 3;
         errored.accounts[0].last_stream_error = Some("overloaded_error".to_string());
-        let live = render_accounts_json(
-            &errored,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let live = status_json(&errored, &thresholds, StatusSource::Live);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["streamErrorCount"], serde_json::json!(3));
         assert_eq!(
@@ -7912,12 +7576,11 @@ mod tests {
     /// overrides the config's 3456, so this never touches a real running proxy.
     #[tokio::test]
     async fn live_status_reads_the_running_servers_counters() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let mut config = load_from(TWO_ACCOUNTS);
         config.proxy.port = port;
 
-        let manager = Manager::with_live_refresher(config.clone(), None);
+        let manager = crate::test_support::live_proxy::serve(listener, config.clone(), None);
         // 750 of 1000 input tokens were prompt-cache reads: a real 75% hit ratio,
         // held in this process only. `record_served` clears
         // `CACHE_SIGNAL_FLOOR_REQUESTS` so the ratio below is a reported number,
@@ -7928,7 +7591,6 @@ mod tests {
         for _ in 0..CACHE_SIGNAL_FLOOR_REQUESTS {
             manager.record_served(0, now, None, crate::stats::SessionKind::Fallback);
         }
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
         let payload = match fetch_live_status(&config).await {
             Ok(p) => p,
@@ -7987,8 +7649,7 @@ mod tests {
     /// Binds port 0, never the config's 3456.
     #[tokio::test]
     async fn live_status_shows_a_codex_accounts_provider_and_chatgpt_plan() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let mut config = load_from(
             r#"{
               "accounts": [
@@ -8003,8 +7664,7 @@ mod tests {
             }"#,
         );
         config.proxy.port = port;
-        let manager = Manager::with_live_refresher(config.clone(), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, config.clone(), None);
 
         let payload = match fetch_live_status(&config).await {
             Ok(p) => p,
@@ -8013,15 +7673,7 @@ mod tests {
         };
         let (snapshot, thresholds) = payload.into_snapshot();
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let json = status_json(&snapshot, &thresholds, StatusSource::Live);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         let (claude, codex) = (&rows[0], &rows[1]);
         assert_eq!(codex["provider"], "codex", "{codex}");
@@ -8063,15 +7715,7 @@ mod tests {
         )
         .await;
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let json = status_json(&snapshot, &thresholds, StatusSource::Offline);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         for row in &rows {
             assert!(
@@ -8361,10 +8005,7 @@ mod tests {
         let mut lost = 0;
         loop {
             // Bind and immediately drop, so the port is free and refuses.
-            let port = {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                listener.local_addr().unwrap().port()
-            };
+            let port = crate::test_support::loopback::unused_port();
             let mut config = load_from(TWO_ACCOUNTS);
             config.proxy.port = port;
 
@@ -8395,14 +8036,12 @@ mod tests {
     /// fine. The liveness verdict is what separates them.
     #[tokio::test]
     async fn a_rejected_api_key_is_an_answering_incumbent_not_a_wedged_one() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let mut served = load_from(TWO_ACCOUNTS);
         served.proxy.port = port;
         served.proxy.api_key = Some("the-real-key".to_string());
 
-        let manager = Manager::with_live_refresher(served.clone(), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, served.clone(), None);
 
         // Same port, WRONG key — what an operator with a stale config has.
         let mut probing = served.clone();
@@ -8431,8 +8070,7 @@ mod tests {
     #[tokio::test]
     async fn a_listener_that_never_answers_is_silent_not_answering() {
         // Bound and never accepted: connections queue in the backlog forever.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let mut config = load_from(TWO_ACCOUNTS);
         config.proxy.port = port;
 
@@ -8448,6 +8086,208 @@ mod tests {
             }
         }
         drop(listener);
+    }
+
+    /// The other WEDGED shape: the connect itself runs into its 2s deadline,
+    /// because the SYN is dropped rather than refused. reqwest reports that
+    /// error as BOTH `is_connect()` and `is_timeout()`, so a sort that asks
+    /// `is_connect()` first files a wedged proxy as "nothing is listening", and
+    /// `tcr status` falls back offline without a word. The status read had that
+    /// order until it shared [`send_loopback`] with the control routes.
+    ///
+    /// A loopback port cannot stage it: a full accept queue on macOS answers
+    /// with a reset, not silence. So the request goes to a TEST-NET-3 address
+    /// (RFC 5737), which nobody answers, and costs the 2s connect deadline.
+    #[tokio::test]
+    async fn a_connect_timeout_is_no_answer_not_no_server() {
+        let config = load_from(TWO_ACCOUNTS);
+        let started = std::time::Instant::now();
+        let sent = send_loopback(&config, crate::proxy::STATUS_PATH, |client, _| {
+            client.get("http://203.0.113.10:41000/_tcr/status")
+        })
+        .await;
+        let waited = started.elapsed();
+        match sent.map_err(LiveStatusError::from) {
+            Err(LiveStatusError::NoAnswer(_)) => {}
+            Err(other) => panic!(
+                "a connect that ran into its deadline must be NoAnswer, got {other:?} after \
+                 {waited:?} (well under 2s means this box has no route to TEST-NET-3, which \
+                 refuses instead of blackholing)"
+            ),
+            Ok(response) => panic!("TEST-NET-3 answered: HTTP {}", response.status()),
+        }
+    }
+
+    /// Every verb that asks the running proxy first says what it said when each
+    /// verb spelled out its own refusals and warnings, word for word. The one
+    /// planned difference is `tcr priority`'s "too old" warning, which named a
+    /// `tcr restart` subcommand that does not exist and now ends in
+    /// [`RESTART_HINT`] like the rest.
+    #[test]
+    fn each_live_verb_keeps_its_own_refusal_and_warning_words() {
+        let mut config = load_from(TWO_ACCOUNTS);
+        config.proxy.port = 3456;
+        let path = Path::new("/x/config.json");
+        let refusal = |words: &'static LiveWords, error: LiveControlError| {
+            let site = LiveSite {
+                config: &config,
+                config_path: path,
+                words,
+            };
+            match site.decide::<()>(Err(error)) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("a rejected key or a refused query must not reach the file"),
+            }
+        };
+        let warning = |words: &'static LiveWords, stale: Stale, keeps: Option<&str>| {
+            LiveSite {
+                config: &config,
+                config_path: path,
+                words,
+            }
+            .warning(&stale, keeps)
+        };
+        let message = "no account matches 'zed'.";
+        let why = "HTTP 500 Internal Server Error";
+
+        struct Case {
+            words: &'static LiveWords,
+            keeps: Option<&'static str>,
+            unauthorized: &'static str,
+            rejected: String,
+            too_old: String,
+            failed: String,
+        }
+        let cases = [
+            Case {
+                words: &REMOVE_WORDS,
+                keeps: Some("routing to 'alice'"),
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json — the config was NOT changed, because deleting it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
+                rejected: format!(
+                    "the proxy running on :3456 refused this: {message} Nothing was changed."
+                ),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to accept live account control (no /_tcr/accounts/disabled route), so only the config file was changed. It will KEEP routing to 'alice' until it restarts. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :3456 ({why}), so only the config file was changed. It may KEEP routing to 'alice' until it restarts."
+                ),
+            },
+            Case {
+                words: &PRIORITY_WORDS,
+                keeps: Some("the old order"),
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json, so the config was NOT changed, because writing it would leave the running proxy on the old order. Fix `proxy.apiKey` and retry.",
+                rejected: format!(
+                    "the proxy running on :3456 refused this: {message} Nothing was changed."
+                ),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to accept a live priority change (no /_tcr/accounts/priority route), so only the config file was changed. It will KEEP the old order until it restarts. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :3456 ({why}), so only the config file was changed. It may KEEP the old order until it restarts."
+                ),
+            },
+            Case {
+                words: &CONFIG_SET_WORDS,
+                keeps: None,
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json, so nothing was changed: writing the file beside a running proxy can lose the change to its own next write. Fix `proxy.apiKey` and retry.",
+                rejected: format!("the proxy running on :3456 refused this: {message}"),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to save settings itself (no /_tcr/config route), so this process wrote the file beside it. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not hand this to the proxy running on :3456 ({why}), so this process wrote the file beside it."
+                ),
+            },
+            Case {
+                words: &ENABLE_WORDS,
+                keeps: Some("benching 'alice'"),
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json — the config was NOT changed, because writing it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
+                rejected: format!(
+                    "the proxy running on :3456 refused this: {message} Nothing was changed."
+                ),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to accept live account control (no /_tcr/accounts/disabled route), so only the config file was changed. It will KEEP benching 'alice' until it restarts. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :3456 ({why}), so only the config file was changed. It may KEEP benching 'alice' until it restarts."
+                ),
+            },
+            Case {
+                words: &CONTROL_WORDS,
+                keeps: Some("its OLD control account"),
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json — the config was NOT changed, because writing it would leave the running proxy still resolving identity traffic against its old control account. Fix `proxy.apiKey` and retry.",
+                rejected: format!(
+                    "the proxy running on :3456 refused this: {message} Nothing was changed."
+                ),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to accept live account control (no /_tcr/accounts/control route), so only the config file was changed. It will KEEP its OLD control account until it restarts. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :3456 ({why}), so only the config file was changed. It may KEEP its OLD control account until it restarts."
+                ),
+            },
+        ];
+        for case in cases {
+            let route = case.words.route_path;
+            assert_eq!(
+                refusal(case.words, LiveControlError::Unauthorized),
+                case.unauthorized,
+                "{route}"
+            );
+            assert_eq!(
+                refusal(case.words, LiveControlError::Rejected(message.to_string())),
+                case.rejected,
+                "{route}"
+            );
+            assert_eq!(
+                warning(case.words, Stale::NoRoute, case.keeps),
+                case.too_old,
+                "{route}"
+            );
+            assert_eq!(
+                warning(case.words, Stale::Failed(why.to_string()), case.keeps),
+                case.failed,
+                "{route}"
+            );
+        }
+    }
+
+    /// The decision itself: nothing listening is a quiet file write, a missing
+    /// route and an unusable answer are a warned one, and an answer is applied.
+    #[test]
+    fn the_live_decision_writes_the_file_only_where_it_may() {
+        let config = load_from(TWO_ACCOUNTS);
+        let site = LiveSite {
+            config: &config,
+            config_path: Path::new("/x/config.json"),
+            words: &ENABLE_WORDS,
+        };
+        assert!(matches!(site.decide(Ok(7)), Ok(Live::Applied(7))));
+        assert!(matches!(
+            site.decide::<()>(Err(LiveControlError::NoServer)),
+            Ok(Live::FileOnly(None))
+        ));
+        assert!(matches!(
+            site.decide::<()>(Err(LiveControlError::NoRoute)),
+            Ok(Live::FileOnly(Some(Stale::NoRoute)))
+        ));
+        assert!(matches!(
+            site.decide::<()>(Err(LiveControlError::NoAnswer("late".into()))),
+            Ok(Live::FileOnly(Some(Stale::Failed(why)))) if why == "late"
+        ));
+        assert!(matches!(
+            site.decide::<()>(Err(LiveControlError::Unusable("HTTP 500".into()))),
+            Ok(Live::FileOnly(Some(Stale::Failed(why)))) if why == "HTTP 500"
+        ));
+        assert!(
+            site.decide::<()>(Err(LiveControlError::Unauthorized))
+                .is_err()
+        );
+        assert!(
+            site.decide::<()>(Err(LiveControlError::Rejected("no".into())))
+                .is_err()
+        );
     }
 
     /// The classification the two tests above exercise, pinned directly so a
@@ -8779,15 +8619,7 @@ mod tests {
             assert!(secs > 0, "a promised instant is in the future: {line}");
         }
         // JSON mirrors it for machine consumers, in ms like every other instant.
-        let json = render_accounts_json(
-            &gated,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let json = status_json(&gated, &thresholds, StatusSource::Live);
         assert!(
             json.contains("\"freeAtMs\""),
             "json carries freeAtMs: {json}"
@@ -8899,15 +8731,7 @@ mod tests {
         );
 
         // JSON mirrors the held fields for machine consumers.
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let json = status_json(&snapshot, &thresholds, StatusSource::Offline);
         assert!(json.contains("\"held\""), "json carries held array: {json}");
         assert!(
             json.contains("\"window\": \"5h\""),
@@ -8971,21 +8795,8 @@ mod tests {
         )
         .await;
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> =
-            serde_json::from_str(&json).expect("json is a bare array");
-        let alice_row = rows
-            .iter()
-            .find(|r| r["name"] == "alice@example.com")
-            .expect("alice row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Offline);
+        let alice_row = status_row(&json, "alice@example.com");
         // 0.3 is far under the 0.9 default threshold, so alice's 5h window is
         // never a binding hold, yet its reset must still reach the wire.
         assert!(
@@ -9020,20 +8831,8 @@ mod tests {
         )
         .await;
         let render = |snapshot: &StatsSnapshot, source: StatusSource| {
-            let json = render_accounts_json(
-                snapshot,
-                &thresholds,
-                source,
-                None,
-                false,
-                None,
-                &Default::default(),
-            );
-            let rows: Vec<serde_json::Value> =
-                serde_json::from_str(&json).expect("json is a bare array");
-            rows.into_iter()
-                .find(|r| r["name"] == "alice@example.com")
-                .expect("alice row")
+            let json = status_json(snapshot, &thresholds, source);
+            status_row(&json, "alice@example.com")
         };
 
         let offline = render(&snapshot, StatusSource::Offline);
@@ -9055,15 +8854,7 @@ mod tests {
         let wire = serde_json::to_string(&payload).expect("serialize");
         let back: crate::status::StatusPayload = serde_json::from_str(&wire).expect("deserialize");
         let (rebuilt, rebuilt_thresholds) = back.into_snapshot();
-        let live_json = render_accounts_json(
-            &rebuilt,
-            &rebuilt_thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let live_json = status_json(&rebuilt, &rebuilt_thresholds, StatusSource::Live);
         let live: Vec<serde_json::Value> = serde_json::from_str(&live_json).expect("json");
         let live = live
             .iter()
@@ -9087,21 +8878,8 @@ mod tests {
         )
         .await;
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> =
-            serde_json::from_str(&json).expect("json is a bare array");
-        let bob_row = rows
-            .iter()
-            .find(|r| r["name"] == "bob@example.com")
-            .expect("bob row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Offline);
+        let bob_row = status_row(&json, "bob@example.com");
         assert_eq!(
             bob_row["fiveHourResetAtMs"],
             serde_json::Value::Null,
@@ -9123,21 +8901,8 @@ mod tests {
         let thresholds = resolve_thresholds(&config);
         let snapshot =
             snapshot_offline(config, Arc::new(NoRefresh), Arc::new(WindowProber), true).await;
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> =
-            serde_json::from_str(&json).expect("json is a bare array");
-        let alice_row = rows
-            .iter()
-            .find(|r| r["name"] == "alice@example.com")
-            .expect("alice row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Offline);
+        let alice_row = status_row(&json, "alice@example.com");
         let held = alice_row["held"].as_array().expect("held is an array");
         assert_eq!(
             held.len(),
@@ -9836,9 +9601,8 @@ mod tests {
     /// included.
     #[test]
     fn claude_only_status_text_is_unchanged() {
-        assert_eq!(
-            claude_only_status_text(None),
-            "status source=live server_sha=abc1234 server_dirty=false \
+        /// The pinned bytes, below any verdict line.
+        const FLEET: &str = "status source=live server_sha=abc1234 server_dirty=false \
              server_built_at=2026-01-01T00:00:00Z client_sha=def5678 http1Only=false \
              groupColors=codereview:#63cbfe,dev:#0a84ff\n\
              account alice@example.com priority=0 plan=Max 20x 5h=4% wk=1% fable=0% cache=75% \
@@ -9851,29 +9615,17 @@ mod tests {
              cache=75% state=spent status=throttled probe=error stream_errors=2 \
              last_stream_error=overloaded_error\n\
              account dave@example.com priority=3 5h=n/a wk=n/a cache=n/a state=ok status=active \
-             probe=never stream_errors=0 disabled\n"
-        );
+             probe=never stream_errors=0 disabled\n";
+        assert_eq!(claude_only_status_text(None), FLEET);
         assert_eq!(
             claude_only_status_text(Some(
                 "verdict: this proxy is not on Claude's route: \
                  /Users/example/.claude/settings.json sets https://gateway.example.com"
             )),
-            "verdict: this proxy is not on Claude's route: \
-             /Users/example/.claude/settings.json sets https://gateway.example.com\n\
-             status source=live server_sha=abc1234 server_dirty=false \
-             server_built_at=2026-01-01T00:00:00Z client_sha=def5678 http1Only=false \
-             groupColors=codereview:#63cbfe,dev:#0a84ff\n\
-             account alice@example.com priority=0 plan=Max 20x 5h=4% wk=1% fable=0% cache=75% \
-             state=ok status=active probe=ok stream_errors=2 last_stream_error=overloaded_error \
-             groups=codereview,dev\n\
-             account bob@example.com priority=1 plan=Team 5x 5h=95% wk=91% fable=10% cache=75% \
-             state=near status=active probe=rate-limited stream_errors=2 \
-             last_stream_error=overloaded_error\n\
-             account carol@example.com priority=2 plan=Team Standard 5h=100% wk=100% fable=50% \
-             cache=75% state=spent status=throttled probe=error stream_errors=2 \
-             last_stream_error=overloaded_error\n\
-             account dave@example.com priority=3 5h=n/a wk=n/a cache=n/a state=ok status=active \
-             probe=never stream_errors=0 disabled\n"
+            format!(
+                "verdict: this proxy is not on Claude's route: \
+                 /Users/example/.claude/settings.json sets https://gateway.example.com\n{FLEET}"
+            )
         );
     }
 
@@ -9899,23 +9651,7 @@ mod tests {
         codex_rows: usize,
         traffic: Option<serde_json::Value>,
     ) -> StatusPayload {
-        let accounts: Vec<serde_json::Value> = (0..codex_rows)
-            .map(|i| {
-                serde_json::json!({
-                    "name": format!("codex{i}@example.com/codex"), "provider": "codex",
-                    "priority": i, "status": "active", "disabled": false, "requests": 0,
-                    "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0,
-                    "cacheCreationTokens": 0, "probeStatus": "ok", "quotaState": "normal",
-                    "gate": "ok", "threshold": 0.9,
-                })
-            })
-            .collect();
-        let mut wire = serde_json::json!({
-            "kind": STATUS_KIND,
-            "accounts": accounts,
-            "build": {"sha": "abc1234"},
-            "mitm": mitm,
-        });
+        let mut wire = crate::test_support::status_wire::codex_status_wire(Some(mitm), codex_rows);
         if let Some(traffic) = traffic {
             wire["codex_traffic"] = traffic;
         }
@@ -10133,7 +9869,7 @@ mod tests {
             dirty: Some(false),
             built_at: "2026-01-01T00:00:00Z".to_string(),
         };
-        let rendered = render_accounts_json_at(
+        let rendered = status_rows_json(account_status_rows_at(
             OffsetDateTime::from_unix_timestamp(1_767_225_600).expect("a valid instant"),
             &snapshot,
             &thresholds,
@@ -10144,7 +9880,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             route.as_ref(),
             traffic.as_ref(),
-        );
+        ));
         let rows: Vec<serde_json::Value> = serde_json::from_str(&rendered).expect("an array");
         assert_eq!(rows.len(), 5);
         let mut anthropic = 0;
@@ -11017,7 +10753,7 @@ mod tests {
         vec![claude, codex]
     }
 
-    /// `render_accounts_json_at`, given the facts behind `codex-status.json`, emits exactly
+    /// `status_rows_json(account_status_rows_at(..))`, given the facts behind `codex-status.json`, emits exactly
     /// the rows TcrBar decodes from that file: every key and every derived value, compared
     /// as `serde_json::Value`s with no normalisation and no rounding.
     ///
@@ -11035,7 +10771,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let rendered = render_accounts_json_at(
+        let rendered = status_rows_json(account_status_rows_at(
             fixture_instant(CANONICAL_NOW_MS),
             &snapshot,
             &thresholds,
@@ -11046,7 +10782,7 @@ mod tests {
             &group_colors,
             Some(&route),
             Some(&traffic),
-        );
+        ));
         let rendered: Vec<serde_json::Value> =
             serde_json::from_str(&rendered).expect("the renderer emits a JSON array");
         let serde_json::Value::Array(fixture) = canonical_fixture("codex-status.json") else {
@@ -11145,7 +10881,7 @@ mod tests {
                 wire_sessions: Vec::new(),
                 wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
             };
-            let json = render_accounts_json_at(
+            let json = status_rows_json(account_status_rows_at(
                 now,
                 &snapshot,
                 &[0.85],
@@ -11156,7 +10892,7 @@ mod tests {
                 &std::collections::BTreeMap::new(),
                 None,
                 None,
-            );
+            ));
             let rows: Vec<serde_json::Value> =
                 serde_json::from_str(&json).expect("the renderer emits a JSON array");
             let held = rows[0]["held"]
@@ -11234,7 +10970,7 @@ mod tests {
         .collect();
         let (route, traffic) = canonical_codex_route_and_traffic();
         let render = |snapshot: &StatsSnapshot| -> Vec<serde_json::Value> {
-            let json = render_accounts_json_at(
+            let json = status_rows_json(account_status_rows_at(
                 // After every instant in the contract sample, so each clock-derived field
                 // clamps exactly as it does in the committed file.
                 fixture_instant(1_767_398_400_000),
@@ -11247,7 +10983,7 @@ mod tests {
                 &group_colors,
                 Some(&route),
                 Some(&traffic),
-            );
+            ));
             serde_json::from_str(&json).expect("the renderer emits a JSON array")
         };
         let check = |pass: &str, rows: Vec<serde_json::Value>| {
@@ -11313,29 +11049,14 @@ mod tests {
     #[test]
     fn groups_render_as_array_never_null() {
         let (snapshot, thresholds) = status_contract_snapshot();
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
-        let alice = rows
-            .iter()
-            .find(|r| r["name"] == "alice@example.com")
-            .expect("alice row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Live);
+        let alice = status_row(&json, "alice@example.com");
         assert_eq!(
             alice["groups"],
             serde_json::json!(["codereview", "dev"]),
             "labelled account carries its groups: {alice}"
         );
-        let dave = rows
-            .iter()
-            .find(|r| r["name"] == "dave@example.com")
-            .expect("dave row");
+        let dave = status_row(&json, "dave@example.com");
         assert_eq!(
             dave["groups"],
             serde_json::json!([]),
@@ -11368,11 +11089,7 @@ mod tests {
             None,
             &group_colors,
         );
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
-        let dave = rows
-            .iter()
-            .find(|r| r["name"] == "dave@example.com")
-            .expect("dave row");
+        let dave = status_row(&json, "dave@example.com");
         assert_eq!(
             dave["groups"],
             serde_json::json!([]),
@@ -11561,20 +11278,8 @@ mod tests {
         snapshot.accounts[1].seven_day_oi = None;
         snapshot.accounts[1].seven_day_oi_reset = None;
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
-        let alice = rows
-            .iter()
-            .find(|r| r["name"] == "alice@example.com")
-            .expect("alice row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Live);
+        let alice = status_row(&json, "alice@example.com");
         assert_eq!(
             alice["sevenDayOiState"],
             serde_json::json!("near"),
@@ -11585,10 +11290,7 @@ mod tests {
             serde_json::json!(learned_reset.unix_timestamp_nanos() as i64 / 1_000_000),
             "learned window's reset reaches the wire: {alice}"
         );
-        let dave = rows
-            .iter()
-            .find(|r| r["name"] == "dave@example.com")
-            .expect("dave row");
+        let dave = status_row(&json, "dave@example.com");
         assert_eq!(
             dave["sevenDayOiState"],
             serde_json::Value::Null,
@@ -11679,30 +11381,15 @@ mod tests {
     #[test]
     fn reserved_groups_render_as_array_never_null() {
         let (snapshot, thresholds) = reserved_groups_snapshot();
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
-        let alice = rows
-            .iter()
-            .find(|r| r["name"] == "alice@example.com")
-            .expect("alice row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Live);
+        let alice = status_row(&json, "alice@example.com");
         assert_eq!(
             alice["reservedGroups"],
             serde_json::json!(["codereview"]),
             "reserved subset of alice's groups: {alice}"
         );
         assert_eq!(alice["gate"], serde_json::json!("reserved"));
-        let dave = rows
-            .iter()
-            .find(|r| r["name"] == "dave@example.com")
-            .expect("dave row");
+        let dave = status_row(&json, "dave@example.com");
         assert_eq!(
             dave["reservedGroups"],
             serde_json::json!([]),
@@ -11749,30 +11436,15 @@ mod tests {
         snapshot.accounts[0].reserved_groups = Vec::new();
         snapshot.accounts[0].parked_groups = vec!["codereview".to_string()];
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
-        let alice = rows
-            .iter()
-            .find(|r| r["name"] == "alice@example.com")
-            .expect("alice row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Live);
+        let alice = status_row(&json, "alice@example.com");
         assert_eq!(
             alice["parkedGroups"],
             serde_json::json!(["codereview"]),
             "parked subset of alice's groups: {alice}"
         );
         assert_eq!(alice["gate"], serde_json::json!("parked"));
-        let dave = rows
-            .iter()
-            .find(|r| r["name"] == "dave@example.com")
-            .expect("dave row");
+        let dave = status_row(&json, "dave@example.com");
         assert_eq!(
             dave["parkedGroups"],
             serde_json::json!([]),
