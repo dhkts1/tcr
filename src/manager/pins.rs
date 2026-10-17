@@ -16,8 +16,6 @@
 //!   resolves each identity back to whatever index it occupies THIS boot.
 
 use std::path::Path;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use crate::affinity::{self, LoadReport, StoredPin};
 use crate::config::ConfigError;
@@ -32,19 +30,18 @@ impl Manager {
     /// which is one atomic operation when the flusher is not waiting: the
     /// actual write is done off the request path by the flusher task.
     pub fn mark_affinity_dirty(&self) {
-        self.affinity_dirty.store(true, Ordering::Relaxed);
-        self.affinity_wake.notify_one();
+        self.affinity_file.mark();
     }
 
     /// Resolves once the pin map has changed since the last time this resolved: the
     /// affinity flusher's wake-up, so it sleeps while nothing changes.
     pub async fn affinity_changed(&self) {
-        self.affinity_wake.notified().await;
+        self.affinity_file.changed().await;
     }
 
     /// Consume the dirty flag: `true` when something changed since the last call.
     pub fn take_affinity_dirty(&self) -> bool {
-        self.affinity_dirty.swap(false, Ordering::Relaxed)
+        self.affinity_file.take()
     }
 
     /// Record whether `key`'s most recent request asked Anthropic's cache for
@@ -168,10 +165,9 @@ impl Manager {
     /// pin cache still serves traffic exactly as it did before this file existed.
     pub fn flush_affinity(&self, path: &Path) -> Result<usize, ConfigError> {
         let pins = self.affinity_pin_snapshot();
-        let count = affinity::save(path, &pins, crate::now_ms())?;
-        let (shape, content) = affinity::save_hashes(&pins)?;
-        self.affinity_save.wrote(shape, content, Instant::now());
-        Ok(count)
+        self.affinity_file.save(affinity::save_hashes(&pins)?, || {
+            affinity::save(path, &pins, crate::now_ms())
+        })
     }
 
     /// The flusher's save: [`Self::flush_affinity`] when the pins differ from what the last
@@ -180,14 +176,10 @@ impl Manager {
     /// [`super::AFFINITY_TOUCH_REFRESH`] has passed since the last write.
     pub fn flush_affinity_if_changed(&self, path: &Path) -> Result<SaveOutcome, ConfigError> {
         let pins = self.affinity_pin_snapshot();
-        let (shape, content) = affinity::save_hashes(&pins)?;
-        let now = Instant::now();
-        if let Some(skipped) = self.affinity_save.skip(shape, content, now) {
-            return Ok(skipped);
-        }
-        let count = affinity::save(path, &pins, crate::now_ms())?;
-        self.affinity_save.wrote(shape, content, now);
-        Ok(SaveOutcome::Wrote(count))
+        self.affinity_file
+            .save_if_changed(affinity::save_hashes(&pins)?, || {
+                affinity::save(path, &pins, crate::now_ms())
+            })
     }
 
     /// Restore pins from `path` into the live map, resolving each stored identity
@@ -202,25 +194,7 @@ impl Manager {
     /// Restoring nothing is a legitimate outcome (first boot, everything expired,
     /// accounts all replaced) and never an error.
     pub fn restore_affinity(&self, path: &Path, ttl_ms: i64) -> LoadReport {
-        let candidates: Vec<crate::config::Account> = {
-            let accounts = self
-                .accounts
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            accounts
-                .iter()
-                .map(|a| {
-                    identity::probe(
-                        a.provider,
-                        &a.name,
-                        a.account_uuid.clone(),
-                        a.org_uuid.clone(),
-                        a.org_name.clone(),
-                    )
-                })
-                .collect()
-        };
-        let report = affinity::load(path, &candidates, crate::now_ms(), ttl_ms);
+        let report = affinity::load(path, &self.restore_candidates(), crate::now_ms(), ttl_ms);
         {
             let mut map = self
                 .affinity
@@ -244,12 +218,35 @@ impl Manager {
         }
         report
     }
+
+    /// Each live account's identity, in account order: what a cache file's stored identities
+    /// resolve against at restore. Copied under the accounts lock and returned after it is
+    /// released, so the file read happens under no lock.
+    pub(super) fn restore_candidates(&self) -> Vec<crate::config::Account> {
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        accounts
+            .iter()
+            .map(|a| {
+                identity::probe(
+                    a.provider,
+                    &a.name,
+                    a.account_uuid.clone(),
+                    a.org_uuid.clone(),
+                    a.org_name.clone(),
+                )
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use super::*;
     use crate::affinity::PIN_TTL_MS;

@@ -1397,21 +1397,11 @@ pub struct Manager {
     /// through `select()`, guarded and pruned the same way `affinity` is —
     /// never held while the accounts lock is taken.
     affinity_extended: Mutex<HashSet<u64>>,
-    /// Set whenever `affinity` is mutated, cleared by the flusher task that
-    /// writes the map to disk (see [`Manager::mark_affinity_dirty`] and
-    /// [`crate::affinity`]). A relaxed atomic rather than a channel because the
-    /// setter sits on the request path and the reader is a 5-second timer: the
-    /// only ordering that matters is "a change eventually causes a write", and a
-    /// tick that observes the flag late simply writes on the next one.
-    affinity_dirty: AtomicBool,
-    /// Woken by every change to `affinity`, so its flusher sleeps while nothing changes rather
-    /// than polling the flag on a timer. A permit is stored when nobody waits, so a change
-    /// made between two waits is never missed.
-    affinity_wake: Notify,
-    /// The last pin-file write, so a save whose pins are what is already on disk writes
-    /// nothing. Shape: which session is pinned to which account; the touch times are written
-    /// at most once per [`AFFINITY_TOUCH_REFRESH`]. See [`crate::save_gate`].
-    affinity_save: crate::save_gate::SaveGate,
+    /// The pin file's dirty flag, flusher wake-up and last write (see
+    /// [`Manager::mark_affinity_dirty`] and [`crate::affinity`]). Shape: which session is pinned
+    /// to which account; the touch times are written at most once per
+    /// [`AFFINITY_TOUCH_REFRESH`].
+    affinity_file: crate::cache_file::SavedFile,
     /// Hashed account-bound token → (account index, kind, mint ms): who minted each advisor id,
     /// thinking signature, redacted-thinking payload and message id the fleet has served. See
     /// [`crate::bound_tokens`] for the rule — a conversation carrying one of these is served by
@@ -1428,14 +1418,10 @@ pub struct Manager {
     /// held while the accounts lock is taken. Each part keeps its own mint order
     /// ([`bound_tokens::BoundTokenMap`]), so holding it full costs nothing per record.
     bound_tokens: bound_tokens::ShardedBoundTokens,
-    /// Set whenever [`Self::bound_tokens`] is mutated, cleared by the flusher task that writes
-    /// it to disk — same debounce contract as [`Self::affinity_dirty`].
-    bound_tokens_dirty: AtomicBool,
-    /// Woken by every change to [`Self::bound_tokens`], as [`Self::affinity_wake`] is.
-    bound_tokens_wake: Notify,
-    /// The last bound-token file write. Every change is shape here (a new token is what a
-    /// restart needs), so the gate only skips a save whose map is already on disk.
-    bound_tokens_save: crate::save_gate::SaveGate,
+    /// The bound-token file's dirty flag, flusher wake-up and last write. Every change is shape
+    /// here (a new token is what a restart needs), so the gate only skips a save whose map is
+    /// already on disk.
+    bound_tokens_file: crate::cache_file::SavedFile,
     /// Session keys already logged as held to their pin by bound history, so a long
     /// conversation costs one line and not one per turn. Diagnostic only: nothing routes on it.
     bound_history_logged: Mutex<HashSet<u64>>,
@@ -1454,19 +1440,10 @@ pub struct Manager {
     /// for where it surfaces. A separate lock from every other field here: nothing on the
     /// routing path reads it, so it is never held together with `accounts` or `affinity`.
     wire_sessions: Mutex<crate::session_wire::WireSessionTracker>,
-    /// Set whenever [`Self::wire_sessions`] is mutated, cleared by the flusher
-    /// task that snapshots it to disk — same debounce contract as
-    /// [`Self::affinity_dirty`]/[`crate::affinity`], mirrored for
-    /// [`crate::session_wire_persist`]. A relaxed atomic for the same reason:
-    /// the setter is every request that carries a `wire_session_id`, the
-    /// reader is a slow timer, and the only ordering that matters is "a change
-    /// eventually causes a write".
-    wire_sessions_dirty: AtomicBool,
-    /// Woken by every change to [`Self::wire_sessions`], as [`Self::affinity_wake`] is.
-    wire_sessions_wake: Notify,
-    /// The last Sessions/Tools cache write. Shape: which sessions the table holds; their
-    /// counters and times are written at most once per [`WIRE_SESSIONS_REFRESH`].
-    wire_sessions_save: crate::save_gate::SaveGate,
+    /// The Sessions/Tools cache's dirty flag, flusher wake-up and last write
+    /// ([`crate::session_wire_persist`]). Shape: which sessions the table holds; their counters
+    /// and times are written at most once per [`WIRE_SESSIONS_REFRESH`].
+    wire_sessions_file: crate::cache_file::SavedFile,
     /// Monotonic session-key source handed out by [`Manager::next_session_key`],
     /// one per connection. Starts at 1 so the first key is a nonzero, unique u64.
     session_seq: AtomicU64,
@@ -1822,20 +1799,14 @@ impl Manager {
             select_seq: AtomicU64::new(1),
             affinity: Mutex::new(HashMap::new()),
             affinity_extended: Mutex::new(HashSet::new()),
-            affinity_dirty: AtomicBool::new(false),
-            affinity_wake: Notify::new(),
-            affinity_save: crate::save_gate::SaveGate::new(AFFINITY_TOUCH_REFRESH),
+            affinity_file: crate::cache_file::SavedFile::new(AFFINITY_TOUCH_REFRESH),
             bound_tokens: bound_tokens::ShardedBoundTokens::default(),
-            bound_tokens_dirty: AtomicBool::new(false),
-            bound_tokens_wake: Notify::new(),
-            bound_tokens_save: crate::save_gate::SaveGate::new(std::time::Duration::ZERO),
+            bound_tokens_file: crate::cache_file::SavedFile::new(std::time::Duration::ZERO),
             bound_history_logged: Mutex::new(HashSet::new()),
             bound_switch_warned: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             wire_sessions: Mutex::new(crate::session_wire::WireSessionTracker::new()),
-            wire_sessions_dirty: AtomicBool::new(false),
-            wire_sessions_wake: Notify::new(),
-            wire_sessions_save: crate::save_gate::SaveGate::new(WIRE_SESSIONS_REFRESH),
+            wire_sessions_file: crate::cache_file::SavedFile::new(WIRE_SESSIONS_REFRESH),
             session_seq: AtomicU64::new(1),
             next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
             next_codex_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
@@ -8935,7 +8906,7 @@ mod tests {
             config_with(vec![account("a", 0), account("b", 0)]),
             lock_refresher(),
         );
-        assert!(!manager.affinity_dirty.load(Ordering::Relaxed));
+        assert!(!manager.affinity_file.is_dirty());
         let now = OffsetDateTime::now_utc();
         for i in 0..5u64 {
             manager.select(
@@ -8948,7 +8919,7 @@ mod tests {
             );
         }
         assert!(
-            !manager.affinity_dirty.load(Ordering::Relaxed),
+            !manager.affinity_file.is_dirty(),
             "noise traffic must never mark the persisted affinity map dirty"
         );
         assert!(
