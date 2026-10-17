@@ -161,26 +161,8 @@ impl ServedTurn {
         // ledger files the turn under.
         let session_id = self.wire_session_id.as_deref();
         match self.provider {
-            Provider::Codex => manager.record_codex_wire_session_usage(
-                session_id,
-                record.model.as_deref(),
-                record.input,
-                record.cache_5m,
-                record.cache_1h,
-                record.cache_read,
-                record.output,
-                parsed.reasoning,
-                record.ts_ms,
-            ),
-            Provider::Anthropic => manager.record_wire_session_usage(
-                session_id,
-                record.model.as_deref(),
-                record.input,
-                record.cache_5m,
-                record.cache_1h,
-                record.cache_read,
-                record.output,
-            ),
+            Provider::Codex => manager.record_codex_wire_session_usage(session_id, &record),
+            Provider::Anthropic => manager.record_wire_session_usage(session_id, &record),
         }
         manager.record_usage(self.idx, record);
     }
