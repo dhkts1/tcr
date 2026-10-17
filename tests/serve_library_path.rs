@@ -27,9 +27,7 @@ use tcr::log_err::LogErr as _;
 
 use tcr::config::Config;
 use tcr::proxy::STATUS_PATH;
-use tcr::server::{
-    AffinityFlush, IncumbentPolicy, ServeOptions, TlsSetup, WireSessionsFlush, serve,
-};
+use tcr::server::{CacheFlush, IncumbentPolicy, ServeOptions, TlsSetup, serve};
 use tcr::singleton::{ProxyHost, ProxyOwner};
 use tcr::usage::LedgerShutdown;
 
@@ -223,12 +221,12 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
     );
     assert_eq!(
         report.affinity,
-        AffinityFlush::Written(0),
+        CacheFlush::Written(0),
         "a clean shutdown owes the next boot its final pin write, even when empty"
     );
     assert_eq!(
         report.wire_sessions,
-        WireSessionsFlush::Written(0),
+        CacheFlush::Written(0),
         "a clean shutdown owes the next boot its final Sessions/Tools cache write, even when empty"
     );
 
