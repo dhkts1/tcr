@@ -264,26 +264,9 @@ mod tests {
     /// every restored session to a cold account.
     fn account(name: &str, uuid: &str) -> Account {
         Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
             account_uuid: Some(uuid.to_string()),
             org_uuid: Some("org-1".to_string()),
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture(name)
         }
     }
 

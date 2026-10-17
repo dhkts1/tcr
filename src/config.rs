@@ -7949,26 +7949,11 @@ mod tests {
     /// existing account's own identity with fresh credentials merged in.
     fn full_account(name: &str, access_token: &str) -> Account {
         Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: access_token.to_string(),
             refresh_token: Some(format!("rt-{access_token}")),
             expires_at: Some(1_800_000_000_000),
             priority: Some(2),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture(name)
         }
     }
 
@@ -8170,26 +8155,11 @@ mod tests {
     /// test spells out only the fields it is about.
     fn account_fixture(name: &str) -> Account {
         Account {
-            name: name.to_string(),
-            account_type: AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-fixture".to_string(),
             refresh_token: Some("rt-fixture".to_string()),
             expires_at: Some(1_800_000_000_000),
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: Map::new(),
+            ..Account::fixture(name)
         }
     }
 

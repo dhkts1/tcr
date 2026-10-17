@@ -3356,64 +3356,18 @@ mod divert_verdict_tests {
 #[cfg(test)]
 mod revalidation_sticky_tests {
     use super::*;
-    use crate::config::{Account, ProxyConfig};
+    use crate::config::Account;
     use crate::oauth::NoRefresh;
     use crate::probe::LiveUsageProber;
     use crate::warmer::LiveWarmer;
     use std::collections::HashSet;
 
     fn account(name: &str) -> Account {
-        Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        }
+        Account::fixture(name)
     }
 
     fn config_with(accounts: Vec<Account>) -> Config {
-        Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts,
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
-        }
+        Config::fixture(accounts)
     }
 
     fn build_manager(config: Config) -> Arc<Manager> {
@@ -3515,64 +3469,18 @@ mod revalidation_sticky_tests {
 #[cfg(test)]
 mod sticky_divert_replay_tests {
     use super::*;
-    use crate::config::{Account, ProxyConfig};
+    use crate::config::Account;
     use crate::oauth::NoRefresh;
     use crate::probe::LiveUsageProber;
     use crate::warmer::LiveWarmer;
     use std::collections::HashSet;
 
     fn account(name: &str) -> Account {
-        Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        }
+        Account::fixture(name)
     }
 
     fn config_with(accounts: Vec<Account>) -> Config {
-        Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts,
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
-        }
+        Config::fixture(accounts)
     }
 
     fn build_manager(config: Config) -> Arc<Manager> {
@@ -3688,7 +3596,7 @@ mod sticky_divert_replay_tests {
 #[cfg(test)]
 mod strict_group_door_tests {
     use super::*;
-    use crate::config::{Account, ProxyConfig};
+    use crate::config::Account;
     use crate::oauth::NoRefresh;
     use crate::probe::LiveUsageProber;
     use crate::warmer::LiveWarmer;
@@ -3696,55 +3604,15 @@ mod strict_group_door_tests {
 
     fn account(name: &str, groups: &[&str]) -> Account {
         Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
             groups: Some(groups.iter().map(|g| (*g).to_string()).collect()),
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture(name)
         }
     }
 
     fn config_with(accounts: Vec<Account>, lock_account: Option<String>) -> Config {
         Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
             lock_account,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts,
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
+            ..Config::fixture(accounts)
         }
     }
 
@@ -4196,26 +4064,9 @@ mod reserved_gate_agreement_tests {
     fn account_runtime(groups: &[&str]) -> AccountRuntime {
         AccountRuntime::from_config(
             &Account {
-                name: "probe".to_string(),
-                account_type: crate::config::AccountType::OAuth,
-                provider: Default::default(),
-                account_uuid: None,
-                org_uuid: None,
-                org_name: None,
-                access_token: "at-probe".to_string(),
                 refresh_token: None,
-                expires_at: Some(crate::now_ms() + 3_600_000),
-                priority: Some(0),
-                switch_threshold: None,
-                disabled: None,
                 groups: Some(groups.iter().map(|g| g.to_string()).collect()),
-                organization_type: None,
-                rate_limit_tier: None,
-                seat_tier: None,
-                egress: crate::config::Egress::Local,
-                egress_strict: false,
-                codex_home: None,
-                extra: serde_json::Map::new(),
+                ..Account::fixture("probe")
             },
             false,
         )
@@ -4368,26 +4219,10 @@ mod group_miss_tests {
     fn account(name: &str, groups: &[&str], disabled: bool) -> AccountRuntime {
         AccountRuntime::from_config(
             &Account {
-                name: name.to_string(),
-                account_type: crate::config::AccountType::OAuth,
-                provider: Default::default(),
-                account_uuid: None,
-                org_uuid: None,
-                org_name: None,
-                access_token: format!("at-{name}"),
                 refresh_token: None,
-                expires_at: Some(crate::now_ms() + 3_600_000),
-                priority: Some(0),
-                switch_threshold: None,
                 disabled: disabled.then_some(true),
                 groups: Some(groups.iter().map(|g| g.to_string()).collect()),
-                organization_type: None,
-                rate_limit_tier: None,
-                seat_tier: None,
-                egress: crate::config::Egress::Local,
-                egress_strict: false,
-                codex_home: None,
-                extra: serde_json::Map::new(),
+                ..Account::fixture(name)
             },
             false,
         )
@@ -4570,7 +4405,7 @@ mod group_miss_tests {
 #[cfg(test)]
 mod reset_urgency_tests {
     use super::*;
-    use crate::config::{Account, ProxyConfig};
+    use crate::config::Account;
     use crate::oauth::NoRefresh;
     use crate::probe::LiveUsageProber;
     use crate::quota::QuotaWindow;
@@ -4578,56 +4413,13 @@ mod reset_urgency_tests {
     use std::collections::HashSet;
 
     fn account(name: &str) -> Account {
-        Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        }
+        Account::fixture(name)
     }
 
     fn config_with(accounts: Vec<Account>, tier_hours: u32) -> Config {
         Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
             reset_urgency_tier_hours: tier_hours,
-            http1_only: false,
-            accounts,
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
+            ..Config::fixture(accounts)
         }
     }
 
@@ -4843,7 +4635,7 @@ mod reset_urgency_tests {
 #[cfg(test)]
 mod fable_last_resort_tests {
     use super::*;
-    use crate::config::{Account, ProxyConfig};
+    use crate::config::Account;
     use crate::oauth::NoRefresh;
     use crate::probe::LiveUsageProber;
     use crate::quota::QuotaWindow;
@@ -4854,56 +4646,13 @@ mod fable_last_resort_tests {
     const FABLE_MODEL: &str = "claude-fable-5";
 
     fn account(name: &str) -> Account {
-        Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        }
+        Account::fixture(name)
     }
 
     fn config_with(accounts: Vec<Account>, switch_threshold: f64) -> Config {
         Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts,
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
+            ..Config::fixture(accounts)
         }
     }
 
@@ -5241,35 +4990,14 @@ mod stale_pin_load_tests {
     //! carrying eight sessions, and every session that landed on it was
     //! migrated straight back off.
     use super::*;
-    use crate::config::{Account, ProxyConfig};
+    use crate::config::Account;
     use crate::oauth::NoRefresh;
     use crate::probe::LiveUsageProber;
     use crate::warmer::LiveWarmer;
     use std::collections::HashSet;
 
     fn account(name: &str) -> Account {
-        Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        }
+        Account::fixture(name)
     }
 
     /// Two accounts, `loadBalanceMigration` ON (the only mode that counts pins).
@@ -5280,30 +5008,11 @@ mod stale_pin_load_tests {
             serde_json::Value::Bool(true),
         );
         let config = Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts: vec![account("alice@example.com"), account("bob@example.com")],
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
             extra,
+            ..Config::fixture(vec![
+                account("alice@example.com"),
+                account("bob@example.com"),
+            ])
         };
         Manager::new(
             config,
@@ -5460,7 +5169,7 @@ mod stale_pin_load_tests {
 #[cfg(test)]
 mod provider_filter_tests {
     use super::*;
-    use crate::config::{Account, ProxyConfig};
+    use crate::config::Account;
     use crate::oauth::NoRefresh;
     use crate::probe::LiveUsageProber;
     use crate::provider::Provider;
@@ -5475,28 +5184,7 @@ mod provider_filter_tests {
     /// A healthy Anthropic account, the same shape every other module in this
     /// file builds.
     fn account(name: &str) -> Account {
-        Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
-        }
+        Account::fixture(name)
     }
 
     /// The same account, on the Codex upstream.
@@ -5615,32 +5303,7 @@ mod provider_filter_tests {
     }
 
     fn config_with(accounts: Vec<Account>) -> Config {
-        Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts,
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
-        }
+        Config::fixture(accounts)
     }
 
     fn build(config: Config) -> Arc<Manager> {

@@ -9054,26 +9054,14 @@ mod tests {
     #[test]
     fn add_account_request_carries_the_plan_fields() {
         let mut account = Account {
-            name: "alice@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-a".to_string(),
             refresh_token: None,
             expires_at: None,
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
             organization_type: Some("claude_team".to_string()),
             rate_limit_tier: Some("default_raven".to_string()),
             seat_tier: Some("team_standard".to_string()),
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("alice@example.com")
         };
         let body = serde_json::to_string(&account).expect("serialize the account login sends");
         let parsed: AddAccountRequest =
@@ -9103,26 +9091,14 @@ mod tests {
     #[test]
     fn add_account_request_carries_the_provider() {
         let mut account = Account {
-            name: "alice@example.com/codex".to_string(),
-            account_type: crate::config::AccountType::OAuth,
             provider: crate::provider::Provider::Codex,
             account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
-            org_uuid: None,
-            org_name: None,
             access_token: "at-codex".to_string(),
             refresh_token: Some("rt-codex".to_string()),
             expires_at: None,
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
             organization_type: Some("pro".to_string()),
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("alice@example.com/codex")
         };
         let body = serde_json::to_string(&account).expect("serialize the account an import sends");
         let parsed: AddAccountRequest =
@@ -9139,10 +9115,6 @@ mod tests {
 
     fn dummy_config(api_key: Option<&str>, upstream: &str) -> Config {
         Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
             proxy: ProxyConfig {
                 port: 0,
                 api_key: api_key.map(str::to_string),
@@ -9151,45 +9123,7 @@ mod tests {
             },
             upstream: upstream.to_string(),
             codex_upstream: "http://127.0.0.1:0".to_string(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: crate::config::PacingConfig::default(),
-            account_throttle: crate::config::ThrottleConfig::default(),
-            fleet_throttle: crate::config::ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts: vec![Account {
-                name: "dummy".to_string(),
-                account_type: crate::config::AccountType::OAuth,
-                provider: Default::default(),
-                account_uuid: None,
-                org_uuid: None,
-                org_name: None,
-                access_token: "at-dummy".to_string(),
-                refresh_token: Some("rt-dummy".to_string()),
-                // Not expired, so booting the proxy triggers no token refresh.
-                expires_at: Some(crate::now_ms() + 3_600_000),
-                priority: Some(0),
-                switch_threshold: None,
-                disabled: None,
-                groups: None,
-                organization_type: None,
-                rate_limit_tier: None,
-                seat_tier: None,
-                egress: crate::config::Egress::Local,
-                egress_strict: false,
-                codex_home: None,
-                extra: serde_json::Map::new(),
-            }],
-            group_settings: std::collections::HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
+            ..Config::fixture(vec![Account::fixture("dummy")])
         }
     }
 
@@ -12300,28 +12234,15 @@ mod tests {
     ///
     /// Obviously-fake identities only: this repository is public.
     fn two_account_config(api_key: Option<&str>) -> Config {
+        // The fixture's expiry is an hour out, so booting triggers no token refresh.
         let account = |name: &str, org: &str, uuid: &str, priority: i64| Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
             account_uuid: Some(uuid.to_string()),
             org_uuid: Some(format!("11111111-1111-1111-1111-{org}")),
             org_name: Some(format!("Org {org}")),
             access_token: format!("at-{org}"),
             refresh_token: Some(format!("rt-{org}")),
-            // Not expired, so booting triggers no token refresh.
-            expires_at: Some(crate::now_ms() + 3_600_000),
             priority: Some(priority),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture(name)
         };
         Config {
             accounts: vec![

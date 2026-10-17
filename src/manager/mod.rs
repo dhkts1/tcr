@@ -4347,7 +4347,7 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Account, PacingConfig, ProxyConfig};
+    use crate::config::{Account, PacingConfig};
     use crate::oauth::{OAuthError, RefreshFuture};
     use crate::probe::{ProbeError, ProbeFuture, Usage, UsageBucket};
     use crate::warmer::{AccountWarmer, WarmError, WarmFuture};
@@ -4419,26 +4419,8 @@ mod tests {
 
     fn account(name: &str, priority: i64) -> Account {
         Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            access_token: format!("at-{name}"),
-            refresh_token: Some(format!("rt-{name}")),
-            expires_at: Some(crate::now_ms() + 3_600_000),
             priority: Some(priority),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture(name)
         }
     }
 
@@ -4452,32 +4434,7 @@ mod tests {
     }
 
     fn config_with(accounts: Vec<Account>) -> Config {
-        Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
-            proxy: ProxyConfig::default(),
-            upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
-            switch_threshold: 0.90,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
-            account_throttle: ThrottleConfig::default(),
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts,
-            group_settings: HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
-        }
+        Config::fixture(accounts)
     }
 
     /// Like [`config_with`] but with request pacing configured (for the pacing tests).

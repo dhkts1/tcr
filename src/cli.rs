@@ -7011,26 +7011,11 @@ mod tests {
     /// this can never add a real account.
     fn blank_account() -> Account {
         Account {
-            name: String::new(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: String::new(),
             refresh_token: None,
             expires_at: None,
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("")
         }
     }
 
@@ -7160,26 +7145,11 @@ mod tests {
         tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
 
         let account = Account {
-            name: "new@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-new".to_string(),
             refresh_token: Some("rt-new".to_string()),
             expires_at: Some(1_893_456_000_000),
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("new@example.com")
         };
         let applied = post_add_account(&config, &account)
             .await
@@ -7218,26 +7188,11 @@ mod tests {
         tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
         let account = Account {
-            name: "dup@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-new".to_string(),
             refresh_token: Some("rt-new".to_string()),
             expires_at: None,
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("dup@example.com")
         };
         let err = post_add_account(&config, &account)
             .await

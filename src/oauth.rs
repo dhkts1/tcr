@@ -5902,26 +5902,11 @@ mod tests {
         // held — a real re-login through the same route this unit adds,
         // exactly the race `login()`'s doc-comment describes.
         let rotated_bob = Account {
-            name: "bob@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-bob-ROTATED".to_string(),
             refresh_token: Some("rt-bob-ROTATED".to_string()),
             expires_at: Some(1_893_456_000_000),
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("bob@example.com")
         };
         let rotate_config = load_or_default(&path).unwrap();
         crate::cli::post_add_account(&rotate_config, &rotated_bob)
@@ -6111,26 +6096,11 @@ mod tests {
         // server's own persist path, used directly since the port itself is
         // silent in this scenario and cannot carry a real round-trip.
         let rotated_alice = Account {
-            name: "alice@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-alice-ROTATED".to_string(),
             refresh_token: Some("rt-alice-ROTATED".to_string()),
             expires_at: Some(1_893_456_000_000),
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("alice@example.com")
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
         let after_rotation = std::fs::read_to_string(&path).unwrap();
@@ -6216,26 +6186,11 @@ mod tests {
         // (now-gone) server's own persist path, used directly since the port
         // is silent for the whole test and cannot carry a real round-trip.
         let rotated_alice = Account {
-            name: "alice@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-alice-ROTATED".to_string(),
             refresh_token: Some("rt-alice-ROTATED".to_string()),
             expires_at: Some(1_893_456_000_000),
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("alice@example.com")
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
         let after_rotation = std::fs::read_to_string(&path).unwrap();
@@ -6408,26 +6363,11 @@ mod tests {
         // in for any other writer that touched the file in the window, same
         // as every sibling clobber test in this file.
         let rotated_alice = Account {
-            name: "alice@example.com".to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-alice-ROTATED".to_string(),
             refresh_token: Some("rt-alice-ROTATED".to_string()),
             expires_at: Some(1_893_456_000_000),
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture("alice@example.com")
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
 
@@ -6851,26 +6791,11 @@ mod tests {
     /// [`unnamed_fallback`] reads.
     fn named_account(name: &str) -> Account {
         Account {
-            name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
-            provider: Default::default(),
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
             access_token: "at-placeholder".to_string(),
             refresh_token: None,
             expires_at: None,
             priority: None,
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: crate::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..Account::fixture(name)
         }
     }
 
