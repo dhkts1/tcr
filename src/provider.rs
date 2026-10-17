@@ -128,6 +128,16 @@ impl Provider {
         }
     }
 
+    /// May tcr rewrite this provider's `cache_control` breakpoints to the 1h TTL
+    /// (`cacheTtlRewrite`)? The breakpoints are Anthropic's request shape; a Codex body has
+    /// none, so it is never re-serialized for them.
+    pub fn rewrites_cache_ttl(self) -> bool {
+        match self {
+            Self::Anthropic => true,
+            Self::Codex => false,
+        }
+    }
+
     /// For `#[serde(skip_serializing_if)]` on `config::Account::provider`: an Anthropic row writes
     /// no key, so an upgraded Anthropic-only config re-saves without a `provider` key.
     pub fn is_anthropic(&self) -> bool {
@@ -177,6 +187,8 @@ mod tests {
         assert!(!Provider::Codex.on_peer_mesh());
         assert!(Provider::Anthropic.has_fable_bucket());
         assert!(!Provider::Codex.has_fable_bucket());
+        assert!(Provider::Anthropic.rewrites_cache_ttl());
+        assert!(!Provider::Codex.rewrites_cache_ttl());
     }
 
     #[test]

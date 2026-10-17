@@ -1305,25 +1305,24 @@ pub async fn pinned_egress(attempt: PinnedAttempt<'_>) -> PinnedEgress {
     // cannot honour, and it is answered exactly like one, before the pacing gate
     // so the direct path keeps the slot: refused by name when `egressStrict` is
     // on, one warn line and the direct path otherwise.
-    match attempt.manager.provider(attempt.account_idx) {
-        Some(crate::provider::Provider::Anthropic) => {}
-        Some(crate::provider::Provider::Codex) => {
-            let err = PinnedEgressError::CodexNotCarried {
-                account: account.clone(),
-                peer: peer.display(),
-            };
-            if pin.strict {
-                return PinnedEgress::Answered(err.into_response());
-            }
-            tracing::warn!(
-                account = %account,
-                peer = %peer.display(),
-                "account egress: a Codex account does not leave through a peer in this version; \
-                 sending it from this Mac instead"
-            );
-            return PinnedEgress::TakeTheDirectPath { paced: false };
+    let Some(provider) = attempt.manager.provider(attempt.account_idx) else {
+        return PinnedEgress::TakeTheDirectPath { paced: false };
+    };
+    if !provider.on_peer_mesh() {
+        let err = PinnedEgressError::CodexNotCarried {
+            account: account.clone(),
+            peer: peer.display(),
+        };
+        if pin.strict {
+            return PinnedEgress::Answered(err.into_response());
         }
-        None => return PinnedEgress::TakeTheDirectPath { paced: false },
+        tracing::warn!(
+            account = %account,
+            peer = %peer.display(),
+            "account egress: a Codex account does not leave through a peer in this version; \
+             sending it from this Mac instead"
+        );
+        return PinnedEgress::TakeTheDirectPath { paced: false };
     }
 
     let url = format!("{}{}", attempt.manager.upstream(), attempt.path_and_query);

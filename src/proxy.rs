@@ -2554,7 +2554,7 @@ struct AddAccountRequest {
 /// maps a deserialize failure on a 2xx to `LiveControlError::Unusable`, and
 /// `oauth::probe_add_route` reads that as `AddCapability::Unusable` — a
 /// *successful* live add would then look indistinguishable from a wedged or
-/// route-less proxy, and `login_route` REFUSES outright (bridge item D)
+/// route-less proxy, and `oauth::admit_login` REFUSES outright (bridge item D)
 /// instead of silently falling back to the file beside a server that just
 /// handled the request correctly. Field ADDITIONS are already safe on their
 /// own (an older CLI just ignores a key it doesn't know); this attribute is
@@ -2675,7 +2675,7 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
     // POSTs a blank name to trigger exactly this branch, and reads a STAMPED
     // 400 back as proof this route exists. Changing the status (e.g. to 422),
     // or answering without the route's stamp, silently turns that read into
-    // `AddCapability::Unusable` — `login_route` then REFUSES outright (bridge
+    // `AddCapability::Unusable` — `oauth::admit_login` then REFUSES outright (bridge
     // item D) rather than falling back to the file, so this degrades to a
     // needless refusal beside a server that actually has the route, not the
     // whole-file clobber this feature exists to remove. See the seam test
@@ -3480,10 +3480,7 @@ async fn handle_request(
     //
     // A body that fails to parse yields "no model, no session, no tool events" rather
     // than rejecting the request: these are peeks, never a validation gate.
-    let rewrite_ttl = match provider {
-        crate::provider::Provider::Anthropic => manager.cache_ttl_rewrite_enabled(),
-        crate::provider::Provider::Codex => false,
-    };
+    let rewrite_ttl = provider.rewrites_cache_ttl() && manager.cache_ttl_rewrite_enabled();
     let request = crate::request_body::RequestBody::parse(body_bytes, rewrite_ttl);
     if let Some(before) = request.rewritten_from() {
         tracing::debug!(
@@ -3552,12 +3549,10 @@ async fn handle_request(
     // weekly bucket is an Anthropic fact, so a Codex request whose model id merely
     // contains "fable" never consults it, here (the bound hold, `select_bound`,
     // every 429 hint) any more than in selection.
-    let request_is_fable = match provider {
-        crate::provider::Provider::Anthropic => request_model
+    let request_is_fable = provider.has_fable_bucket()
+        && request_model
             .as_deref()
-            .is_some_and(crate::model::is_fable_model),
-        crate::provider::Provider::Codex => false,
-    };
+            .is_some_and(crate::model::is_fable_model);
 
     // `tcr run --group <name>` (Phase 1, PREFER semantics only). Read once,
     // constant across the rotation loop — same shape as `request_model` above.
@@ -4468,10 +4463,7 @@ async fn handle_request(
                 if !ladder.peer_egress_tried()
                     && nothing_ever_left_this_box
                     && rotation_is_spent
-                    && match provider {
-                        crate::provider::Provider::Anthropic => true,
-                        crate::provider::Provider::Codex => false,
-                    }
+                    && provider.on_peer_mesh()
                 {
                     ladder.spend_peer_egress();
                     let peers_path = crate::peer::egress::peers_path();
