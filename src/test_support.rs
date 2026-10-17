@@ -1,9 +1,24 @@
-//! Fixtures for unit tests: one `Account` and one `Config`, filled in with struct-update syntax.
+//! The one home for test helpers, unit and integration alike: the `#[cfg(test)]` modules reach it
+//! as `crate::test_support`, and `tests/` as `tcr::test_support` through the `test-support`
+//! feature (see the self dev-dependency in `Cargo.toml`). Never compiled into a release build.
 //!
-//! A test writes only the fields it changes (`Account { priority: Some(2), ..Account::fixture(n) }`),
-//! so a field added to either type is added here once instead of in every literal.
+//! - [`Account::fixture`] and [`Config::fixture`]: one `Account` and one `Config`, filled in with
+//!   struct-update syntax. A test writes only the fields it changes
+//!   (`Account { priority: Some(2), ..Account::fixture(n) }`), so a field added to either type is
+//!   added here once instead of in every literal.
+//! - [`stub_upstream`]: fake upstreams served from two shared loopback listeners per binary.
+//! - [`loopback`]: a client that never goes through an ambient proxy, and a port nothing holds.
 
-pub(crate) mod stub_upstream;
+// `clippy.toml`'s test exemption reaches only a `#[cfg(test)]` module, and this one is also
+// compiled under the feature; a helper that cannot do its job fails the test that called it,
+// with a message.
+#![expect(
+    clippy::expect_used,
+    reason = "a test helper fails the calling test with a message; the ban is for production code"
+)]
+
+pub mod loopback;
+pub mod stub_upstream;
 
 use std::collections::HashMap;
 
@@ -15,7 +30,7 @@ use crate::config::{
 impl Account {
     /// A healthy Anthropic OAuth account: token `at-<name>`, refresh token `rt-<name>`, valid for
     /// another hour, priority 0, no groups, local egress.
-    pub(crate) fn fixture(name: &str) -> Self {
+    pub fn fixture(name: &str) -> Self {
         Self {
             name: name.to_string(),
             account_type: AccountType::OAuth,
@@ -43,7 +58,7 @@ impl Account {
 
 impl Config {
     /// A config over `accounts` with the defaults a fresh install would load.
-    pub(crate) fn fixture(accounts: Vec<Account>) -> Self {
+    pub fn fixture(accounts: Vec<Account>) -> Self {
         Self {
             quarantined_accounts: Vec::new(),
             migrated_legacy_throttle: false,

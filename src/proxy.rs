@@ -11514,7 +11514,7 @@ mod tests {
         // The hybrid server injects ClientAddr; base-URL (non-CONNECT) needs no TLS.
         tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = crate::test_support::loopback::client();
         // NO x-api-key — but the client is loopback, so it must be exempt.
         let resp = client.get(format!("http://{addr}/")).send().await.unwrap();
         assert_ne!(
@@ -14440,10 +14440,7 @@ mod tests {
         let serving = Arc::clone(&manager);
         tokio::spawn(async move { crate::mitm::serve(listener, serving, None).await });
 
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("build client");
+        let client = crate::test_support::loopback::client();
         // The EXACT `Account` `oauth::probe_add_route` builds:
         // a blank name, a blank access token, everything else absent.
         // DERIVED, not a restated literal — a future edit to the probe's body
@@ -19879,10 +19876,7 @@ mod tests {
         // Bind then drop: the address is guaranteed to have been free, and now
         // refuses. `spawn_counted_upstream`'s no-reply script cannot produce this
         // — dropping an ACCEPTED socket is a mid-request error, not a connect one.
-        let dead = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap()
-        };
+        let dead = format!("127.0.0.1:{}", closed_loopback_port());
         let manager = fleet(dead, &["a", "b"]);
 
         let (status, headers, body) = post_one_full(manager).await;
@@ -20900,10 +20894,7 @@ mod tests {
 
     /// A port nothing is listening on: bind it, read it back, release it.
     fn closed_loopback_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let port = listener.local_addr().expect("local addr").port();
-        drop(listener);
-        port
+        crate::test_support::loopback::unused_port()
     }
 
     /// The two-sided gate on [`is_offline_error`]. One side alone is worthless —

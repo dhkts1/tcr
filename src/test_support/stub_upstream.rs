@@ -1,4 +1,6 @@
-//! Fake upstreams for unit tests, all served from two loopback listeners per test binary.
+//! Fake upstreams for unit and integration tests, all served from two loopback listeners per test
+//! binary. A `tcr` child process a test starts reaches them the same way: they are ordinary
+//! loopback URLs.
 //!
 //! Every test used to bind its own listener for its fake upstream, so a run of the proxy tests
 //! opened and closed a few hundred ports. Here one listener serves every HTTP stub and one serves
@@ -10,10 +12,11 @@
 //! port of its own.
 //!
 //! Two listeners rather than one because the two kinds route at different grains. An HTTP stub
-//! routes per REQUEST: a client pools connections by host and port, and every stub now shares
-//! both, so one kept-alive connection may carry requests for two stubs in turn. A raw stub owns
-//! its whole CONNECTION (it writes bytes, sleeps, or hangs up), so it is routed once, by the first
-//! request on it, and every raw reply ends that connection.
+//! routes per REQUEST, and every HTTP answer closes its connection: a client pools connections by
+//! host and port, every stub now shares both, and a pooled connection must never outlive the test
+//! that opened it (see [`dispatch_http`]). A raw stub owns its whole CONNECTION (it writes bytes,
+//! sleeps, or hangs up), so it is routed once, by the first request on it, and every raw reply
+//! ends that connection.
 //!
 //! The listeners run on their own runtime on their own thread, which outlives any single
 //! `#[tokio::test]` runtime. A stub is never unregistered: its route lives until the binary exits,
@@ -46,14 +49,14 @@ use crate::log_err::LogErr as _;
 /// `format!("http://{addr}")` every test already writes for an upstream base still yields the
 /// stub's base URL; [`StubAddr::url`] is the same string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct StubAddr {
+pub struct StubAddr {
     listener: SocketAddr,
     id: u64,
 }
 
 impl StubAddr {
     /// The base URL to configure as an upstream: `http://127.0.0.1:<port>/stub/<id>`.
-    pub(crate) fn url(&self) -> String {
+    pub fn url(&self) -> String {
         format!("http://{self}")
     }
 }
@@ -67,11 +70,11 @@ impl fmt::Display for StubAddr {
 const PREFIX: &str = "/stub/";
 
 /// One accepted connection on the raw listener, handed to the stub its first request named.
-pub(crate) struct RawConn {
+pub struct RawConn {
     /// The socket, positioned just after [`RawConn::head`].
-    pub(crate) stream: TcpStream,
-    /// What one read of the request returned (at least its request line), prefix included.
-    pub(crate) head: Vec<u8>,
+    pub stream: TcpStream,
+    /// What the shared listener read of the request (at least its whole head), prefix included.
+    pub head: Vec<u8>,
 }
 
 type RawFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -183,10 +186,20 @@ async fn dispatch_http(mut req: Request) -> Response {
         Ok(uri) => uri,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
-    match router.oneshot(req).await {
+    let mut response = match router.oneshot(req).await {
         Ok(response) => response,
         Err(never) => match never {},
-    }
+    };
+    // Every answer ends its connection. Production keeps one process-wide relay client
+    // (`RELAY_CLIENT` in `proxy.rs`), whose pool is keyed by host and port, and every stub now
+    // shares both: a connection it pooled on one test's runtime would be handed to the next test
+    // after that runtime is gone, and the relay would answer 502. With a port per stub the key
+    // never repeated, so this never came up.
+    response.headers_mut().insert(
+        axum::http::header::CONNECTION,
+        axum::http::HeaderValue::from_static("close"),
+    );
+    response
 }
 
 async fn serve_raw(listener: tokio::net::TcpListener) {
@@ -197,8 +210,10 @@ async fn serve_raw(listener: tokio::net::TcpListener) {
         tokio::spawn(async move {
             let mut head = Vec::new();
             let mut buf = [0u8; 4096];
-            // The request line is all routing needs; one read nearly always holds it.
-            while !head.windows(2).any(|pair| pair == b"\r\n") {
+            // The request line is all routing needs, but read the whole head: a stub that
+            // answered and closed with request bytes still unread would reset the connection
+            // under its own reply. One read nearly always holds it all.
+            while !head.windows(4).any(|quad| quad == b"\r\n\r\n") {
                 match stream.read(&mut buf).await {
                     Ok(0) | Err(_) => return,
                     Ok(n) => head.extend_from_slice(&buf[..n]),
@@ -231,12 +246,12 @@ async fn serve_raw(listener: tokio::net::TcpListener) {
 }
 
 /// Serve `router` as a fake upstream.
-pub(crate) fn http(router: Router) -> StubAddr {
+pub fn http(router: Router) -> StubAddr {
     register(Route::Http(router), false)
 }
 
 /// Hand every connection whose first request names this stub to `handler`.
-pub(crate) fn raw<F, Fut>(handler: F) -> StubAddr
+pub fn raw<F, Fut>(handler: F) -> StubAddr
 where
     F: Fn(RawConn) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
@@ -254,7 +269,7 @@ where
 /// the request and hangs up without a reply, which a client sees as a transport failure. Every
 /// scripted reply must send `connection: close` so attempt N is always connection N. The counter
 /// is the number of connections this stub has been handed, i.e. of upstream attempts.
-pub(crate) fn scripted(script: Vec<Option<String>>) -> (StubAddr, Arc<AtomicUsize>) {
+pub fn scripted(script: Vec<Option<String>>) -> (StubAddr, Arc<AtomicUsize>) {
     let attempts = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&attempts);
     let script = Arc::new(script);
@@ -277,20 +292,44 @@ pub(crate) fn scripted(script: Vec<Option<String>>) -> (StubAddr, Arc<AtomicUsiz
 
 /// A whole raw HTTP/1.1 reply: `status` (`"200 OK"`), one `content-type`, a `content-length`
 /// for `body`, and `connection: close`, the shape every [`scripted`] reply must have.
-pub(crate) fn reply(status: &str, content_type: &str, body: &str) -> String {
+pub fn reply(status: &str, content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     )
 }
 
+/// A fake upstream that answers every request `200` with the JSON `answer`, calling `on_request`
+/// first (a test that watches what the caller did before asking). The counter is how many
+/// requests it has answered.
+pub fn json_answering(
+    answer: &'static str,
+    on_request: impl Fn() + Send + 'static,
+) -> (StubAddr, Arc<AtomicUsize>) {
+    let answered = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&answered);
+    // `Mutex` so a callback that is `Send` but not `Sync` can be shared by connections.
+    let on_request = Mutex::new(on_request);
+    let addr = raw(move |mut conn| {
+        (on_request.lock().expect("stub callback poisoned"))();
+        counter.fetch_add(1, Ordering::SeqCst);
+        async move {
+            conn.stream
+                .write_all(reply("200 OK", "application/json", answer).as_bytes())
+                .await
+                .log_debug("writing a test response");
+        }
+    });
+    (addr, answered)
+}
+
 /// [`scripted`] with one entry: every connection gets `raw`.
-pub(crate) fn canned(raw: impl Into<String>) -> StubAddr {
+pub fn canned(raw: impl Into<String>) -> StubAddr {
     scripted(vec![Some(raw.into())]).0
 }
 
 /// [`raw`] for a stub that reads the request, waits `delay`, then writes `response` and closes.
-pub(crate) fn delayed(response: String, delay: std::time::Duration) -> StubAddr {
+pub fn delayed(response: String, delay: std::time::Duration) -> StubAddr {
     let response = Arc::new(response);
     raw(move |mut conn| {
         let response = Arc::clone(&response);
@@ -307,7 +346,7 @@ pub(crate) fn delayed(response: String, delay: std::time::Duration) -> StubAddr 
 /// [`raw`] for a stub that writes `partial` (a status line, headers and the start of a body that
 /// never ends) and then sends nothing more. It holds the connection until the client closes it,
 /// which is what the per-test server it replaces did by sleeping an hour on it.
-pub(crate) fn stalled(partial: String) -> StubAddr {
+pub fn stalled(partial: String) -> StubAddr {
     let partial = Arc::new(partial);
     raw(move |mut conn| {
         let partial = Arc::clone(&partial);
@@ -342,33 +381,36 @@ mod tests {
         assert_eq!(split_route("/stub/x/v1"), None);
     }
 
-    /// Two stubs share one port, and a pooled client that reuses a connection across them still
-    /// reaches each stub's own router with the path it was sent.
+    /// Two stubs share one port, each reaches its own router with the path it was sent, and
+    /// every answer closes its connection so no client can pool one past its test.
     #[tokio::test]
-    async fn two_http_stubs_on_one_pooled_connection_each_see_their_own_path() {
+    async fn two_http_stubs_on_one_port_each_see_their_own_path_and_close() {
         let a = http(Router::new().fallback(|uri: Uri| async move { format!("a {uri}") }));
         let b = http(Router::new().fallback(|uri: Uri| async move { format!("b {uri}") }));
         assert_eq!(
             a.listener, b.listener,
             "one listener serves every HTTP stub"
         );
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("client");
+        let client = crate::test_support::loopback::client();
         for _ in 0..2 {
             for (stub, want) in [
                 (a, "a /v1/messages?beta=true"),
                 (b, "b /v1/messages?beta=true"),
             ] {
-                let text = client
+                let response = client
                     .get(format!("{}/v1/messages?beta=true", stub.url()))
                     .send()
                     .await
-                    .expect("send")
-                    .text()
-                    .await
-                    .expect("body");
+                    .expect("send");
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("connection")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("close"),
+                    "a kept-alive stub connection would be pooled across tests"
+                );
+                let text = response.text().await.expect("body");
                 assert_eq!(text, want);
             }
         }
@@ -380,10 +422,7 @@ mod tests {
     async fn scripted_answers_by_connection_ordinal() {
         let ok = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
         let (addr, attempts) = scripted(vec![None, Some(ok.to_string())]);
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("client");
+        let client = crate::test_support::loopback::client();
         let url = format!("{}/v1/messages", addr.url());
         assert!(
             client.get(&url).send().await.is_err(),
