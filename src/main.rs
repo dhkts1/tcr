@@ -69,6 +69,10 @@ enum Command {
     /// Add an account: Claude through the browser, or Codex (ChatGPT) with
     /// --codex or --from-codex.
     Login(LoginArgs),
+    /// List the Claude and Codex subscription logins other tools on this machine hold
+    /// (claude-swap, `CLIProxyAPI`'s auth folders, Claude Code, the Codex CLI), each marked new or
+    /// already in tcr. Reads only; `--yes` imports the new ones.
+    Import(ImportArgs),
     /// Mint a long-lived (365-day) token for an existing Claude account, or
     /// every Claude account in a group, and put the result on the clipboard.
     /// Nothing is stored — export only (Claude accounts only).
@@ -1533,6 +1537,21 @@ struct LoginArgs {
     name: Option<String>,
 }
 
+/// `tcr import [--yes]`.
+#[derive(clap::Args)]
+struct ImportArgs {
+    #[command(flatten)]
+    config: ConfigFile,
+    /// Import every login the listing marks new, through the same path `tcr login` writes by.
+    /// Without it, `tcr import` only lists: no refresh, no profile fetch, no write, no call to a
+    /// running proxy. Each refresh token is single-use, so a login taken from claude-swap or
+    /// `CLIProxyAPI` stops working there at tcr's first refresh: remove it from that tool. A login
+    /// already in tcr is never written, so tcr's own token is never replaced by another tool's
+    /// copy. Exits non-zero when any new login could not be imported.
+    #[arg(long)]
+    yes: bool,
+}
+
 #[derive(clap::Args)]
 struct MintArgs {
     #[command(flatten)]
@@ -1684,6 +1703,7 @@ async fn run_main() -> anyhow::Result<()> {
         Some(Command::Server(args)) => run_server(args).await,
         Some(Command::Run(args)) => run_harness(args).await,
         Some(Command::Login(args)) => run_login(args).await,
+        Some(Command::Import(args)) => tcr::import::run(&args.config.path(), args.yes).await,
         Some(Command::Mint(args)) => run_mint(args).await,
         Some(Command::Accounts(args)) => run_accounts(args).await,
         Some(Command::Remove(args)) => run_remove(args).await,
@@ -9935,6 +9955,7 @@ mod tests {
                 oauth::LOGIN_FROM_CODEX_COMMAND,
                 oauth::LOGIN_FROM_CLAUDE_CODE_COMMAND,
                 oauth::LOGIN_CODEX_COMMAND,
+                oauth::IMPORT_COMMAND,
             ]
             .map(str::to_string),
         );
@@ -9986,6 +10007,15 @@ mod tests {
         let import = help(&["login"], "from_codex");
         for fact in ["auth.json", "only while", "same ChatGPT account"] {
             assert!(import.contains(fact), "{import}");
+        }
+        // `tcr import --yes` states the take before anyone runs it: the other tool's copy dies,
+        // and tcr's own rows are never overwritten. Watched red with the help naming neither.
+        let take = help(&["import"], "yes");
+        for fact in ["only lists", "single-use", "never written", "non-zero"] {
+            assert!(
+                take.contains(fact),
+                "`tcr import --help` must say {fact}:\n{take}"
+            );
         }
         assert!(!import.contains("asks you to log in again"), "{import}");
         let ls = help(&["peer", "ls"], "config");

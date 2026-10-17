@@ -287,6 +287,18 @@ fn jwt_payload(jwt: &str) -> Option<serde_json::Value> {
 /// RFC 4648 §5 (URL-safe alphabet), padding optional. `None` on any character outside the
 /// alphabet or an impossible length.
 pub fn base64url_decode(s: &str) -> Option<Vec<u8>> {
+    base64_decode_with(s, b'-', b'_')
+}
+
+/// RFC 4648 §4 (the standard alphabet, `+` and `/`), padding optional: what Python's
+/// `base64.b64encode` writes, and so claude-swap's `.enc` credential files. `None` on any
+/// character outside the alphabet or an impossible length.
+pub fn base64_standard_decode(s: &str) -> Option<Vec<u8>> {
+    base64_decode_with(s, b'+', b'/')
+}
+
+/// The decoder both alphabets share; they differ only in the characters for 62 and 63.
+fn base64_decode_with(s: &str, sixty_two: u8, sixty_three: u8) -> Option<Vec<u8>> {
     let s = s.trim_end_matches('=');
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let mut acc: u32 = 0;
@@ -296,8 +308,8 @@ pub fn base64url_decode(s: &str) -> Option<Vec<u8>> {
             b'A'..=b'Z' => b - b'A',
             b'a'..=b'z' => b - b'a' + 26,
             b'0'..=b'9' => b - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
+            _ if b == sixty_two => 62,
+            _ if b == sixty_three => 63,
             _ => return None,
         });
         acc = (acc << 6) | v;
@@ -374,6 +386,20 @@ mod tests {
             base64url_decode("a+b/").is_none(),
             "standard alphabet is not URL-safe alphabet"
         );
+    }
+
+    /// The standard alphabet reads `+` and `/` as 62 and 63, and refuses the URL-safe pair, so
+    /// a claude-swap `.enc` file decodes and a JWT payload is not mistaken for one.
+    #[test]
+    fn base64_standard_decodes_plus_and_slash_and_refuses_the_url_safe_pair() {
+        assert_eq!(base64_standard_decode("+/8").unwrap(), vec![0xfb, 0xff]);
+        assert_eq!(base64_standard_decode("aGk=").unwrap(), b"hi");
+        assert_eq!(
+            base64_standard_decode("eyJhIjoxfQ==").unwrap(),
+            br#"{"a":1}"#
+        );
+        assert!(base64_standard_decode("-_8").is_none());
+        assert!(base64_standard_decode("a").is_none());
     }
 
     #[test]

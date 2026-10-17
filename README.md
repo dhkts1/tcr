@@ -372,6 +372,9 @@ providers behind the same tool (teamclaude, ccs, Quotio), want no proxy in the r
 (claude-swap, cux, cc-account-switcher), or need an open-source license for commercial use (every
 other row).
 
+Moving to tcr from claude-swap, Quotio, ccs or CLIProxyAPI: `tcr import` lists the logins they
+hold, and `tcr import --yes` takes the new ones ([docs/cli.md](docs/cli.md#tcr-import)).
+
 ## FAQ
 
 ### How do I use Claude Code with more than one Claude account?

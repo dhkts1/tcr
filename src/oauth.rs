@@ -668,6 +668,8 @@ pub const LOGIN_FROM_CODEX_COMMAND: &str = "tcr login --from-codex";
 pub const LOGIN_FROM_CLAUDE_CODE_COMMAND: &str = "tcr login --from-claude-code";
 /// See [`LOGIN_COMMAND`].
 pub const LOGIN_CODEX_COMMAND: &str = "tcr login --codex";
+/// See [`LOGIN_COMMAND`]: `tcr import --yes`, which writes every login `tcr import` lists as new.
+pub const IMPORT_COMMAND: &str = "tcr import --yes";
 
 /// Flatten an error and its whole `anyhow` context chain onto ONE line.
 ///
@@ -1139,6 +1141,79 @@ impl Profile {
             ..self
         }
     }
+
+    /// This profile, with each identity field the profile endpoint left empty taken from
+    /// what the tool the login was imported from stored beside it. The endpoint describes the
+    /// token itself, so a field it did send wins.
+    fn or_stored_identity(self, stored: &StoredClaudeIdentity) -> Self {
+        Self {
+            email: self.email.or_else(|| stored.email.clone()),
+            account_uuid: self.account_uuid.or_else(|| stored.account_uuid.clone()),
+            org_uuid: self.org_uuid.or_else(|| stored.org_uuid.clone()),
+            org_name: self.org_name.or_else(|| stored.org_name.clone()),
+            ..self
+        }
+    }
+}
+
+/// The identity another tool stores beside a Claude login it holds: claude-swap's
+/// `sequence.json` entry, a `CLIProxyAPI` auth file's own fields, Claude Code's
+/// `~/.claude.json` `oauthAccount`. `tcr import` compares it against the fleet without a
+/// network call, and the import falls back to it field by field when the profile fetch
+/// answers nothing ([`Profile::or_stored_identity`]). Empty strings are stored as `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredClaudeIdentity {
+    pub email: Option<String>,
+    pub account_uuid: Option<String>,
+    pub org_uuid: Option<String>,
+    pub org_name: Option<String>,
+}
+
+impl StoredClaudeIdentity {
+    /// The four fields, each `None` when absent, empty or blank.
+    pub fn new(
+        email: Option<String>,
+        account_uuid: Option<String>,
+        org_uuid: Option<String>,
+        org_name: Option<String>,
+    ) -> Self {
+        let kept = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
+        Self {
+            email: kept(email),
+            account_uuid: kept(account_uuid),
+            org_uuid: kept(org_uuid),
+            org_name: kept(org_name),
+        }
+    }
+
+    /// The row of `accounts` this identity already is, by the rule the write resolves its row
+    /// by ([`crate::identity::same_identity`]: account UUID, then the org when both sides know
+    /// it), and by email when either side has no account UUID: a Claude row whose name's email
+    /// part ([`crate::identity::email_of`]) is this email, ignoring case.
+    ///
+    /// Deliberately at least as loose as the write's own resolution, so a login this calls new
+    /// can never resolve onto an existing row at write time and replace its token.
+    pub fn existing_row<'a>(&self, accounts: &'a [Account]) -> Option<&'a Account> {
+        let probe = crate::identity::probe(
+            crate::provider::Provider::Anthropic,
+            self.email.as_deref().unwrap_or_default(),
+            self.account_uuid.clone(),
+            self.org_uuid.clone(),
+            self.org_name.clone(),
+        );
+        accounts
+            .iter()
+            .filter(|row| row.provider == crate::provider::Provider::Anthropic)
+            .find(|row| {
+                if self.account_uuid.is_some() && row.account_uuid.is_some() {
+                    crate::identity::same_identity(row, &probe)
+                } else {
+                    self.email.as_deref().is_some_and(|email| {
+                        crate::identity::email_of(&row.name).eq_ignore_ascii_case(email)
+                    })
+                }
+            })
+    }
 }
 
 /// Fetch the account+org identity from the profile endpoint. Returns an
@@ -1569,6 +1644,8 @@ pub(crate) enum LoginCommand {
     FromCodex,
     /// `tcr login --codex`
     Codex,
+    /// `tcr import --yes`
+    Import,
 }
 
 impl LoginCommand {
@@ -1578,6 +1655,7 @@ impl LoginCommand {
             Self::FromClaudeCode => LOGIN_FROM_CLAUDE_CODE_COMMAND,
             Self::FromCodex => LOGIN_FROM_CODEX_COMMAND,
             Self::Codex => LOGIN_CODEX_COMMAND,
+            Self::Import => IMPORT_COMMAND,
         }
     }
 }
@@ -2662,7 +2740,7 @@ fn codex_live_route_refusal(port: u16, pid: Option<u32>, command: &str) -> Strin
 /// login's email, its ChatGPT user and its workspace, so only a Codex row of that
 /// user in that workspace can match. `None` when no row is this login, and when
 /// two are — a tie the write refuses itself.
-fn existing_codex_row<'a>(
+pub(crate) fn existing_codex_row<'a>(
     config: &'a Config,
     login: &crate::codex_login::CodexLogin,
 ) -> Option<&'a Account> {
@@ -2883,10 +2961,63 @@ async fn import_claude_code_login(
     login: crate::claude_code_login::ClaudeCodeLogin,
     ui: LoginUi,
 ) -> anyhow::Result<Option<String>> {
+    let imported = import_claude_login(
+        config_path,
+        into,
+        force,
+        name,
+        account,
+        login,
+        None,
+        LoginCommand::FromClaudeCode,
+        ui,
+    )
+    .await?;
+    match imported {
+        ClaudeImported::Saved(saved) => Ok(Some(saved)),
+        ClaudeImported::FleetNotEmpty => Ok(None),
+        ClaudeImported::AlreadyAs(row) => {
+            bail!("this login is already saved as '{row}'; nothing was written.")
+        }
+    }
+}
+
+/// What [`import_claude_login`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaudeImported {
+    /// Saved, under this name.
+    Saved(String),
+    /// [`ImportInto::EmptyFleetOnly`], and the config it loaded already had an account.
+    FleetNotEmpty,
+    /// [`ImportInto::NewRowOnly`], and the login is already this row: nothing was written.
+    AlreadyAs(String),
+}
+
+/// [`import_claude_code_login`] for a Claude login from any source: `stored` is the identity
+/// the source keeps beside the login, which fills each field the profile fetch leaves empty
+/// ([`Profile::or_stored_identity`]), and `command` is the login a refusal names.
+///
+/// Under [`ImportInto::NewRowOnly`] the login's identity, after the profile fetch, is checked
+/// against the config the write is based on, and a login that is already a row is
+/// [`ClaudeImported::AlreadyAs`] with nothing written: the write would otherwise update that
+/// row and replace tcr's own working token with another tool's copy.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the login, where it came from, and the options `tcr login` parses for it"
+)]
+pub(crate) async fn import_claude_login(
+    config_path: &Path,
+    into: ImportInto,
+    force: bool,
+    name: Option<&str>,
+    account: Option<&str>,
+    login: crate::claude_code_login::ClaudeCodeLogin,
+    stored: Option<&StoredClaudeIdentity>,
+    command: LoginCommand,
+    ui: LoginUi,
+) -> anyhow::Result<ClaudeImported> {
     ui.install();
-    let route = admit_login(config_path, force, LoginCommand::FromClaudeCode)
-        .await?
-        .route;
+    let route = admit_login(config_path, force, command).await?.route;
 
     let tokens = tokens_from_claude_code_login(login);
 
@@ -2900,9 +3031,24 @@ async fn import_claude_code_login(
     if into == ImportInto::EmptyFleetOnly
         && (!config.accounts.is_empty() || config.refuses_claude_code_import())
     {
-        return Ok(None);
+        return Ok(ClaudeImported::FleetNotEmpty);
     }
     let profile = fetch_profile(&tokens.access_token).await;
+    let profile = match stored {
+        Some(stored) => profile.or_stored_identity(stored),
+        None => profile,
+    };
+    if into == ImportInto::NewRowOnly {
+        let identity = StoredClaudeIdentity::new(
+            profile.email.clone(),
+            profile.account_uuid.clone(),
+            profile.org_uuid.clone(),
+            profile.org_name.clone(),
+        );
+        if let Some(row) = identity.existing_row(&config.accounts) {
+            return Ok(ClaudeImported::AlreadyAs(row.name.clone()));
+        }
+    }
     let resolved_name = mint_login_name(&config, &profile, account, name, ui)?;
 
     finish_login_checked(
@@ -2915,17 +3061,20 @@ async fn import_claude_code_login(
         account,
     )
     .await
-    .map(Some)
+    .map(ClaudeImported::Saved)
 }
 
-/// Which configs [`import_claude_code_login`] may write a Claude Code login into.
+/// Which configs [`import_claude_login`] may write a Claude login into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImportInto {
+pub(crate) enum ImportInto {
     /// `tcr login --from-claude-code`: the user asked, so any config.
     AnyFleet,
     /// The automatic first-run import: only a config with no accounts, checked
     /// again on the read the write is based on.
     EmptyFleetOnly,
+    /// `tcr import --yes`: any config, but only as a new row. A login that is already a row
+    /// is left alone ([`ClaudeImported::AlreadyAs`]).
+    NewRowOnly,
 }
 
 /// What `tcr login --account` says to a row that is not a Claude account, before it does

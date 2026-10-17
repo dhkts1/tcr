@@ -1057,6 +1057,73 @@ automatically change the requested model.
 
 ---
 
+## `tcr import`
+
+Lists every Claude and Codex subscription login another tool on this machine holds, each marked
+new or already in tcr, and with `--yes` imports the new ones. It is the way in from the tools in
+the README's [comparison table](../README.md#compared-with-other-tools).
+
+```bash
+tcr import          # list only: reads, never writes
+tcr import --yes    # import every login the listing marks new
+```
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `--config <path>` | path | `~/.config/tcr.json` | config to compare against and write into |
+| `--yes` | bool | `false` | import every login listed as new; exits non-zero when any of them could not be imported |
+
+One line per login: where it was found, `claude` or `codex`, its email, and one of `new`,
+`already in tcr as '<name>'`, `skipped: <reason>`, or `unknown` for a login whose source stores
+no identity (`--yes` asks the profile endpoint before writing it, and writes nothing when the
+answer is an account tcr already has).
+
+**Where it looks.**
+
+| source | read from | override |
+|---|---|---|
+| claude-swap | `sequence.json` in claude-swap's folder (`~/.claude-swap-backup` on macOS; `$XDG_DATA_HOME/claude-swap` or `~/.local/share/claude-swap` elsewhere), and each slot's `credentials/.creds-<n>-<email>.enc`, else the Keychain item `claude-swap` / `account-<n>-<email>` (macOS) | `TCR_CLAUDE_SWAP_DIR` |
+| CLIProxyAPI, Quotio, ccs | every `*.json` directly inside `~/.cli-proxy-api`, `~/.ccs/cliproxy/auth` and `~/.ccs/cliproxy/auth-paused`; `type` `claude` and `codex` only, every other type is ignored | `TCR_CLIPROXYAPI_DIRS` (folders separated by `:`) |
+| Claude Code | the login [`--from-claude-code`](#tcr-login) reads, named by `~/.claude.json`'s `oauthAccount` | `TCR_CLAUDE_CODE_CREDENTIALS`, `TCR_CLAUDE_CODE_ACCOUNT` |
+| Codex CLI | the login [`--from-codex`](#tcr-login) reads | `TCR_CODEX_AUTH`, `CODEX_HOME` |
+
+`TCR_NO_KEYCHAIN=1` turns every Keychain read off. A Keychain read waits at most 10 seconds (an
+unanswered authorization dialog); one that is refused or times out skips that entry with
+`skipped: keychain read refused or timed out`, and the run asks the Keychain nothing more.
+
+**What is skipped, by name.** API-key logins (`skipped: API key, tcr serves subscriptions only`);
+a login with no refresh token (a setup-token: `tcr login --token` adds those); a Codex file signed
+in through another OAuth client (`signed in with another client`); the claude-swap slot that is
+active in Claude Code, whose backup may be older than the live login the Claude Code line covers;
+and a file that does not parse, named with the error's position.
+
+**Already in tcr** means: a Claude login whose account UUID and org UUID match a row (one person in
+two orgs is two rows), or, when either side has no account UUID, whose email matches a row's; a
+Codex login that is the same ChatGPT user in the same workspace as a row. Such a login is never
+written, so tcr's own working token is never replaced by another tool's copy, and a claude-swap
+slot tcr already has is not even read, so it costs no Keychain dialog. The check runs again
+against the config each write is based on, so one login found in two tools is imported once.
+
+**The listing reads only.** `tcr import` without `--yes` never refreshes a token, never fetches a
+profile, never writes the config and never talks to a running proxy. It compares by the identity
+each source stores.
+
+**`--yes` is a take, not a share.** Refresh tokens are single-use: the first time tcr refreshes an
+imported login, the copy the other tool holds stops working, and claude-swap and CLIProxyAPI
+refresh their own copies in the background, so leaving them running guarantees one side is logged
+out. The run says so once before its first write; remove the imported accounts from those tools.
+Claude Code and Codex CLI imports print the same lines `--from-claude-code` and `--from-codex` do.
+Each import goes through the path `tcr login` writes by, so naming, the running proxy's add route
+and every refusal behave as they do there. A login whose access token has already expired is
+refreshed once before the write, and a refused refresh is that login's failure line. One failed
+import never stops the others.
+
+**What is never read.** Anything in `~/.claude.json` beyond `oauthAccount`'s `accountUuid`,
+`organizationUuid` and `emailAddress`; claude-swap's other files; CLIProxyAPI's config; any
+other tool's store. Nothing `tcr import` prints carries a token.
+
+---
+
 ## `tcr accounts`
 
 Lists the configured accounts. Offline by construction: it builds its own view from the

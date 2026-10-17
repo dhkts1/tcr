@@ -245,17 +245,35 @@ pub fn parse_auth_json(text: &str) -> anyhow::Result<Option<CodexLogin>> {
     ) else {
         return Ok(None);
     };
-    let id = tokens
-        .id_token
-        .as_deref()
+    Ok(Some(login_from_tokens(
+        tokens.id_token.as_deref(),
+        access_token,
+        refresh_token,
+        tokens.account_id,
+    )))
+}
+
+/// A [`CodexLogin`] from its token pair, its id token and a stored account id, read the way
+/// codex reads them: the account id is the stored one, else the id token's claim, else the
+/// access token's; the user, the plan and the FedRAMP mark come from the id token, else the
+/// access token; the email from the id token only; the expiry is the access token's `exp`.
+///
+/// Every reader of a stored Codex login builds it here, so `auth.json` and another tool's copy
+/// of the same login ([`crate::import`]) can never disagree on who it is.
+pub(crate) fn login_from_tokens(
+    id_token: Option<&str>,
+    access_token: String,
+    refresh_token: String,
+    account_id: Option<String>,
+) -> CodexLogin {
+    let id = id_token
         .and_then(crate::codex_oauth::id_claims)
         .unwrap_or_default();
     let access = crate::codex_oauth::id_claims(&access_token).unwrap_or_default();
     let is_fedramp = id.chatgpt_account_is_fedramp || access.chatgpt_account_is_fedramp;
-    Ok(Some(CodexLogin {
+    CodexLogin {
         expires_at_ms: crate::codex_oauth::jwt_exp_ms(&access_token),
-        account_id: tokens
-            .account_id
+        account_id: account_id
             .filter(|a| !a.is_empty())
             .or(id.chatgpt_account_id)
             .or(access.chatgpt_account_id),
@@ -265,7 +283,26 @@ pub fn parse_auth_json(text: &str) -> anyhow::Result<Option<CodexLogin>> {
         access_token,
         refresh_token,
         is_fedramp,
-    }))
+    }
+}
+
+/// Whether `text` is a Codex `auth.json` holding an API-key login rather than a ChatGPT one:
+/// its `auth_mode` is `apikey`, or it has no tokens and carries an `OPENAI_API_KEY`. Reads
+/// nothing but those two keys and never returns the key.
+pub fn auth_json_is_api_key(text: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Shape {
+        #[serde(default)]
+        auth_mode: Option<String>,
+        #[serde(default, rename = "OPENAI_API_KEY")]
+        api_key: Option<String>,
+        #[serde(default)]
+        tokens: Option<serde_json::Value>,
+    }
+    serde_json::from_str::<Shape>(text).is_ok_and(|doc| {
+        doc.auth_mode.as_deref() == Some("apikey")
+            || (doc.tokens.is_none() && doc.api_key.is_some_and(|key| !key.is_empty()))
+    })
 }
 
 /// Where codex asks which backend a ChatGPT login's workspace is served from, joined to
@@ -747,6 +784,21 @@ mod tests {
             "no refresh token is no login"
         );
         assert!(parse_auth_json("not json").is_err());
+    }
+
+    /// `tcr import` names an API-key `auth.json` by what it is: `auth_mode: apikey`, or a key and
+    /// no tokens. A ChatGPT login, a file with neither, and text that is not JSON are not one.
+    ///
+    /// Watched red against a check that reads `auth_mode` alone.
+    #[test]
+    fn an_api_key_auth_json_is_told_from_a_chatgpt_login() {
+        assert!(auth_json_is_api_key(
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-fake"}"#
+        ));
+        assert!(auth_json_is_api_key(r#"{"OPENAI_API_KEY":"sk-fake"}"#));
+        assert!(!auth_json_is_api_key(&fake_auth_json()));
+        assert!(!auth_json_is_api_key(r#"{"OPENAI_API_KEY":null}"#));
+        assert!(!auth_json_is_api_key("not json"));
     }
 
     /// A login whose tokens carry `chatgpt_account_is_fedramp: true` parses as a FedRAMP login:
