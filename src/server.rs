@@ -3208,43 +3208,7 @@ mod tests {
 
     // --- background task supervision (part 1) --------------------------------
 
-    /// A `MakeWriter` that keeps what was written, so a test can inspect
-    /// tracing output without capturing the process's real stdout. Same shape
-    /// as `main.rs`'s/`proxy.rs`'s `SharedBuf` — duplicated locally because
-    /// those are private to their own test modules.
-    #[derive(Clone, Default)]
-    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl SharedBuf {
-        fn contents(&self) -> String {
-            let bytes = self.0.lock().expect("shared buffer poisoned").clone();
-            String::from_utf8_lossy(&bytes).into_owned()
-        }
-
-        fn clear(&self) {
-            self.0.lock().expect("shared buffer poisoned").clear();
-        }
-    }
-
-    impl std::io::Write for SharedBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("shared buffer poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-        type Writer = SharedBuf;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
+    use crate::test_support::log_capture::SharedBuf;
 
     /// THE catch: `supervise` must swallow a panic from the wrapped future so
     /// the spawned task's own `JoinHandle` completes **normally** (this is

@@ -22,6 +22,7 @@
 pub mod live_proxy;
 pub mod log_capture;
 pub mod loopback;
+pub mod status_wire;
 pub mod stub_upstream;
 
 use std::collections::HashMap;

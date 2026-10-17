@@ -9651,23 +9651,7 @@ mod tests {
         codex_rows: usize,
         traffic: Option<serde_json::Value>,
     ) -> StatusPayload {
-        let accounts: Vec<serde_json::Value> = (0..codex_rows)
-            .map(|i| {
-                serde_json::json!({
-                    "name": format!("codex{i}@example.com/codex"), "provider": "codex",
-                    "priority": i, "status": "active", "disabled": false, "requests": 0,
-                    "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0,
-                    "cacheCreationTokens": 0, "probeStatus": "ok", "quotaState": "normal",
-                    "gate": "ok", "threshold": 0.9,
-                })
-            })
-            .collect();
-        let mut wire = serde_json::json!({
-            "kind": STATUS_KIND,
-            "accounts": accounts,
-            "build": {"sha": "abc1234"},
-            "mitm": mitm,
-        });
+        let mut wire = crate::test_support::status_wire::codex_status_wire(Some(mitm), codex_rows);
         if let Some(traffic) = traffic {
             wire["codex_traffic"] = traffic;
         }

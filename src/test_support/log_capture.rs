@@ -14,6 +14,11 @@ impl SharedBuf {
         let bytes = self.0.lock().expect("shared buffer poisoned").clone();
         String::from_utf8_lossy(&bytes).into_owned()
     }
+
+    /// Forget everything written so far.
+    pub fn clear(&self) {
+        self.0.lock().expect("shared buffer poisoned").clear();
+    }
 }
 
 impl std::io::Write for SharedBuf {

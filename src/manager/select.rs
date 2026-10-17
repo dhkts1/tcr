@@ -1003,20 +1003,12 @@ impl Manager {
                                     );
                                     None
                                 } else {
-                                    let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
-                                    let util = accounts
-                                        .get(idx)
-                                        .map(|a| a.quota.max_utilization(now, is_fable))
-                                        .unwrap_or_default();
-                                    if let Some(account) = accounts.get_mut(idx) {
-                                        account.last_selected_seq = tick;
-                                        tracing::info!(
-                                            account = %account.name,
-                                            utilization = util,
-                                            is_fable,
-                                            "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
-                                        );
-                                    }
+                                    self.serve_pinned_over_threshold(
+                                        &mut accounts,
+                                        idx,
+                                        now,
+                                        is_fable,
+                                    );
                                     // `target == idx`, so the commit section below is a
                                     // plain pin refresh: OLD index, fresh `now_ms`.
                                     Some((idx, None))
@@ -1671,12 +1663,7 @@ impl Manager {
             // honest lines about one request, not a defect. The accounts lock is taken
             // only after the affinity lock dropped above — never nested.
             if let Some(reason) = divert_reason {
-                let accounts = self
-                    .accounts
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let pin_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
-                let serve_name = accounts.get(idx).map_or("?", |a| a.name.as_str());
+                let (pin_name, serve_name) = self.pin_and_serve_names(pin_idx, idx);
                 tracing::info!(
                     "affinity: divert session {} pin {} -> serving {} (reason={}, pin kept)",
                     short_session_id(key),
@@ -1846,20 +1833,7 @@ impl Manager {
                 // decided below, on ACCOUNT-level evidence alone — see the comment
                 // there.
                 if !tried.contains(&idx) && accounts.get(idx).is_some_and(hard_ok) {
-                    let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
-                    let util = accounts
-                        .get(idx)
-                        .map(|a| a.quota.max_utilization(now, is_fable))
-                        .unwrap_or_default();
-                    if let Some(account) = accounts.get_mut(idx) {
-                        account.last_selected_seq = tick;
-                        tracing::info!(
-                            account = %account.name,
-                            utilization = util,
-                            is_fable,
-                            "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
-                        );
-                    }
+                    self.serve_pinned_over_threshold(&mut accounts, idx, now, is_fable);
                     return Some(idx);
                 }
                 // The pin cannot serve THIS request → fall through to the fallback
@@ -2029,12 +2003,7 @@ impl Manager {
             // pin stayed and another account served; `keep_pin` unset means the
             // fallback account became the new pin. The accounts lock is taken only
             // after the affinity lock has dropped above — never simultaneously.
-            let accounts = self
-                .accounts
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let pin_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
-            let serve_name = accounts.get(idx).map_or("?", |a| a.name.as_str());
+            let (pin_name, serve_name) = self.pin_and_serve_names(pin_idx, idx);
             tracing::info!(
                 "affinity: revalidation session {} pin {} -> serving {} (reason=revalidation-fallback, pin {})",
                 short_session_id(key),
@@ -2048,6 +2017,44 @@ impl Manager {
             );
         }
         Some(idx)
+    }
+
+    /// Serve the session's pinned account `idx` even though it is over the soft threshold: bump
+    /// its LRU tick and log the `revalidation-serve (pin-honor)` line. The caller holds the
+    /// accounts write lock.
+    fn serve_pinned_over_threshold(
+        &self,
+        accounts: &mut [AccountRuntime],
+        idx: usize,
+        now: OffsetDateTime,
+        is_fable: bool,
+    ) {
+        let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+        let util = accounts
+            .get(idx)
+            .map(|a| a.quota.max_utilization(now, is_fable))
+            .unwrap_or_default();
+        if let Some(account) = accounts.get_mut(idx) {
+            account.last_selected_seq = tick;
+            tracing::info!(
+                account = %account.name,
+                utilization = util,
+                is_fable,
+                "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
+            );
+        }
+    }
+
+    /// The names of the pinned and the serving account for an `affinity:` log line, `?` for an
+    /// index that no longer exists. Takes the accounts read lock itself and drops it before
+    /// returning, so the caller must not hold the affinity lock.
+    fn pin_and_serve_names(&self, pin_idx: usize, idx: usize) -> (String, String) {
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let name = |i: usize| accounts.get(i).map_or("?", |a| a.name.as_str()).to_owned();
+        (name(pin_idx), name(idx))
     }
 
     /// Milliseconds still to run on a LIVE rate-limit hold, or `None` when the
