@@ -36,6 +36,14 @@
 #[path = "tools/api_contract.rs"]
 mod api_contract;
 
+/// The environment every launch of the built `tcr` starts from.
+#[path = "support/tcr_env.rs"]
+mod tcr_env;
+
+/// `Account` and `Config` fixtures for struct-update syntax.
+#[path = "support/fixtures.rs"]
+mod fixtures;
+
 use std::path::{Path, PathBuf};
 use tcr::log_err::LogErr as _;
 
@@ -1798,7 +1806,7 @@ mod fleet {
     use axum::body::Body;
     use axum::response::Response;
     use axum::routing::any;
-    use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
+    use tcr::config::{Account, Config, ProxyConfig, ThrottleConfig};
     use tcr::log_err::LogErr as _;
     use tcr::manager::Manager;
     use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
@@ -1850,62 +1858,26 @@ mod fleet {
 
     fn account() -> Account {
         Account {
-            name: "lender-fake".to_string(),
-            account_type: tcr::config::AccountType::OAuth,
-            provider: Default::default(),
             account_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
             // One org, so every borrowed request lands in ONE per-org GCRA
             // bucket: which is the bucket the pacing gate measures.
             org_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
-            org_name: None,
             access_token: LENDER_TOKEN.to_string(),
             refresh_token: Some("rt-fake-lender".to_string()),
-            expires_at: Some(tcr::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: tcr::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..crate::fixtures::fixture_account("lender-fake")
         }
     }
 
     fn config(upstream: &str, accounts: Vec<Account>, account_throttle: ThrottleConfig) -> Config {
         Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
             proxy: ProxyConfig {
                 port: 0,
-                api_key: None,
-                request_key: None,
-                extra: serde_json::Map::new(),
+                ..ProxyConfig::default()
             },
             upstream: upstream.to_string(),
-            codex_upstream: tcr::provider::CODEX_UPSTREAM.to_string(),
             switch_threshold: 0.98,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
             account_throttle,
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts,
-            group_settings: std::collections::HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
+            ..crate::fixtures::fixture_config(accounts)
         }
     }
 
@@ -5506,9 +5478,15 @@ fn lent_to_carries_the_real_scope_the_real_end_and_whether_it_has_passed() {
 // the proxy on 127.0.0.1:3456.
 // ---------------------------------------------------------------------------
 
+/// The built `tcr` with its `HOME` the directory holding `file`, so every call on one fixture
+/// shares the files the verbs write by default and no call reaches the operator's.
+fn tcr_beside(file: &Path) -> std::process::Command {
+    tcr_env::tcr(file.parent().expect("a fixture file has a directory"))
+}
+
 /// Run `tcr peer <args> --peers <path>` and return `(stdout, stderr, success)`.
 fn run_tcr_peer(peers: &Path, args: &[&str]) -> (String, String, bool) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_beside(peers)
         .arg("peer")
         .args(args)
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
@@ -5566,7 +5544,7 @@ fn peer_lend_and_share_on_refuse_a_codex_scope() {
     .expect("the config fixture writes");
     let refusal = "'work' is a Codex account, and Codex accounts stay on this Mac: only a Claude account can be lent. Nothing was changed.";
     let run = |config: &Path, args: &[&str]| -> std::process::Output {
-        std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+        tcr_beside(&peers)
             .arg("peer")
             .args(args)
             .args(["--peers", peers.to_str().expect("a utf-8 path")])
@@ -5900,7 +5878,7 @@ fn peer_ls_json_carries_the_lent_to_line_keyed_by_account_label() {
     );
     assert!(ok, "lend: {out}{err}");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_beside(&peers)
         .args(["peer", "ls", "--json"])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
         .args(["--config", config.to_str().expect("a utf-8 path")])
@@ -6015,7 +5993,7 @@ fn peer_ls_json_carries_the_mode_the_handed_key_the_switch_and_the_exits() {
     let (out, err, ok) = run_tcr_peer(&peers, &["internet", "on"]);
     assert!(ok, "internet on: {out}{err}");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_beside(&peers)
         .args(["peer", "ls", "--json"])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
         .args(["--config", config.to_str().expect("a utf-8 path")])
@@ -6143,7 +6121,7 @@ fn peer_ls_json_keeps_an_account_whose_name_is_not_a_label() {
     );
     assert!(ok, "lend: {out}{err}");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_beside(&peers)
         .args(["peer", "ls", "--json"])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
         .args(["--config", config.to_str().expect("a utf-8 path")])
@@ -6400,7 +6378,7 @@ fn a_peer_ls_json_row_carries_until_and_ended() {
     // `--for 2h` on the real CLI, so this covers argv → file → JSON and not
     // only the writer.
     let before = unix_seconds();
-    let lent = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let lent = tcr_beside(&peers_path)
         .args(["peer", "lend", &borrower.to_wire()])
         .args(["--peers", &peers_path.display().to_string()])
         .args(["--window", "7d", "--fraction", "0.2", "--for", "2h"])
@@ -6451,7 +6429,7 @@ fn a_peer_ls_json_row_carries_until_and_ended() {
 
 /// The whole `tcr peer ls --json` document, from the binary this build made.
 fn ls_json(peers_path: &Path, config_path: &Path) -> serde_json::Value {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let out = tcr_beside(peers_path)
         .args(["peer", "ls", "--json"])
         .args(["--peers", &peers_path.display().to_string()])
         .args(["--config", &config_path.display().to_string()])

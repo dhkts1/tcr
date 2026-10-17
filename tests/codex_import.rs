@@ -134,10 +134,9 @@ fn scratch_home_answering(
 /// credential stores pinned as the module doc says. `auth` is offered as `TCR_CODEX_AUTH`; `None`
 /// removes it, so the login can only come from a `--codex-home` in `extra` or the scratch `HOME`.
 fn login_from_codex(home: &Path, config: &Path, auth: Option<&Path>, extra: &[&str]) -> Output {
-    let bin = env!("CARGO_BIN_EXE_tcr");
     codex_command(home, config, auth, extra)
         .output()
-        .unwrap_or_else(|err| panic!("spawning the built tcr binary ({bin}) failed: {err}"))
+        .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"))
 }
 
 /// The built `tcr`, pinned as the module doc says: `HOME` the scratch dir; the Claude Code
@@ -150,19 +149,11 @@ fn pinned_tcr(home: &Path) -> Command {
     for dir in [&empty_path, &empty_search] {
         std::fs::create_dir_all(dir).expect("creating an empty directory in the scratch HOME");
     }
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut command = crate::tcr_env::tcr(home);
     command
-        .env("HOME", home)
-        .env(
-            "TCR_CLAUDE_CODE_CREDENTIALS",
-            home.join("no-claude-code-login.json"),
-        )
         .env("PATH", &empty_path)
         .env("TCR_CODEX_SEARCH_DIRS", &empty_search)
-        .env("TCR_BUNDLED_TCR", home.join("no-bundled-tcr"))
-        .env_remove("CODEX_HOME")
-        .env_remove("XDG_CACHE_HOME")
-        .env_remove("TCR_CODEX_AUTH");
+        .env("TCR_BUNDLED_TCR", home.join("no-bundled-tcr"));
     command
 }
 

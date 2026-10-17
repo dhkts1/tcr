@@ -19,7 +19,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// One Claude account, fake from end to end. Its token expires in 2100, and `tcr doctor` never
 /// refreshes, probes or rotates, so the row is only ever read.
@@ -132,23 +131,10 @@ fn run_tcr(
     base_url_env: Option<&str>,
     args: &[&str],
 ) -> (Option<i32>, String, String) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
-    command
-        .args(args)
-        .env("HOME", home)
-        .env_remove("XDG_CACHE_HOME")
-        // doctor looks for `tcr setup shell`'s block in the shell's startup
-        // files; neither variable may point that read outside the scratch HOME.
-        .env_remove("ZDOTDIR")
-        .env_remove("XDG_CONFIG_HOME")
-        // A scratch HOME does not scratch the login Keychain, see
-        // `tests/first_run_no_config.rs` for why this override is set to a path
-        // that does not exist.
-        .env(
-            "TCR_CLAUDE_CODE_CREDENTIALS",
-            home.join("no-credentials.json"),
-        )
-        .current_dir(work_dir(home));
+    // doctor looks for `tcr setup shell`'s block in the shell's startup files; the helper
+    // keeps `ZDOTDIR` and `XDG_CONFIG_HOME` from pointing that read outside the scratch HOME.
+    let mut command = crate::tcr_env::tcr(home);
+    command.args(args).current_dir(work_dir(home));
     match base_url_env {
         Some(url) => command.env("ANTHROPIC_BASE_URL", url),
         None => command.env_remove("ANTHROPIC_BASE_URL"),
@@ -553,37 +539,10 @@ fn run_tcr_codex(
     let no_dirs = home.join("no-dirs");
     std::fs::create_dir_all(&no_dirs).expect("create the empty search directory");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
-    command
-        .args(args)
-        .env("HOME", home)
-        .env_remove("XDG_CACHE_HOME")
-        // doctor looks for `tcr setup shell`'s block in the shell's startup
-        // files; neither variable may point that read outside the scratch HOME.
-        .env_remove("ZDOTDIR")
-        .env_remove("XDG_CONFIG_HOME")
-        .env(
-            "TCR_CLAUDE_CODE_CREDENTIALS",
-            home.join("no-credentials.json"),
-        )
-        .current_dir(work_dir(home));
-    for var in [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "NO_PROXY",
-        "no_proxy",
-        "SSL_CERT_FILE",
-        "CODEX_CA_CERTIFICATE",
-        "CODEX_HOME",
-        "TCR_CODEX_AUTH",
-        "CODEX_BIN",
-    ] {
-        command.env_remove(var);
-    }
+    // doctor looks for `tcr setup shell`'s block in the shell's startup files; the helper
+    // keeps `ZDOTDIR` and `XDG_CONFIG_HOME` from pointing that read outside the scratch HOME.
+    let mut command = crate::tcr_env::tcr(home);
+    command.args(args).current_dir(work_dir(home));
     command
         .env("TCR_CODEX_BIN", &codex)
         .env("TCR_CODEX_SEARCH_DIRS", &no_dirs);

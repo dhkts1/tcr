@@ -51,14 +51,10 @@ fn scratch() -> Scratch {
 
 /// Run `tcr <args…>` with the scratch HOME and `SHELL` set to `shell`.
 fn tcr(scratch: &Scratch, shell: &str, args: &[&str]) -> (i32, String, String) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut command = crate::tcr_env::tcr(&scratch.home);
     command
         .args(args)
-        .env("HOME", &scratch.home)
         .env("SHELL", shell)
-        .env_remove("ZDOTDIR")
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("ANTHROPIC_BASE_URL")
         .current_dir(&scratch.home);
     let output = command.output().expect("run the built tcr");
     (

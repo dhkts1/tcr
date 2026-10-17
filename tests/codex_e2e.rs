@@ -13,7 +13,7 @@
 //!
 //! # Isolation
 //!
-//! Pinned on every spawned [`Command`] ([`isolate`]), never on this test process: `HOME` is a
+//! Pinned on every spawned [`Command`] ([`scratch_tcr`], over `tests/support/tcr_env.rs`), never on this test process: `HOME` is a
 //! fresh [`tempfile::TempDir`] with the XDG overrides removed, so the config, the MITM material,
 //! the usage ledger and the affinity pins all land in it; every proxy variable (`HTTPS_PROXY`,
 //! `HTTP_PROXY`, `ALL_PROXY`, either case) is removed so no ambient proxy can carry a loopback
@@ -224,23 +224,12 @@ fn client() -> reqwest::Client {
 }
 
 /// Point a `tcr` child at the scratch `home` and nothing else: see the module doc.
-fn isolate(command: &mut Command, home: &Path) {
+fn scratch_tcr(home: &Path) -> Command {
+    let mut command = crate::tcr_env::tcr(home);
     command
         .current_dir(home)
-        .env("HOME", home)
-        .env_remove("XDG_CACHE_HOME")
-        // The route line reads the shell's startup files for `tcr setup
-        // shell`'s block; keep that read inside the scratch HOME.
-        .env_remove("ZDOTDIR")
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("https_proxy")
-        .env_remove("HTTP_PROXY")
-        .env_remove("http_proxy")
-        .env_remove("ALL_PROXY")
-        .env_remove("all_proxy")
-        .env("TCR_CLAUDE_CODE_CREDENTIALS", home.join("no-claude-login"))
         .env("TCR_CODEX_AUTH", home.join("no-codex-login"));
+    command
 }
 
 /// A running `tcr server` on its own scratch HOME. Dropping it kills the process, prints its log
@@ -264,9 +253,8 @@ impl Server {
     /// Run `tcr <args…> --config <this server's config>` under the server's isolation, so the
     /// verb reads this server's port from the file and talks to this server alone.
     async fn tcr(&self, args: &[&str]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = scratch_tcr(self.home.path());
         command.args(args).arg("--config").arg(&self.config);
-        isolate(&mut command, self.home.path());
         tokio::task::spawn_blocking(move || command.output())
             .await
             .expect("the blocking task ran")
@@ -369,7 +357,7 @@ async fn start_server_with_first_port(
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         write_config(&config, port, upstream, codex_upstream);
         let log = std::fs::File::create(home.path().join(SERVER_LOG)).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = scratch_tcr(home.path());
         command
             .args(["server", "--headless", "--config"])
             .arg(&config)
@@ -377,7 +365,6 @@ async fn start_server_with_first_port(
             .env("RUST_LOG", "info")
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log));
-        isolate(&mut command, home.path());
         let child = command.spawn().unwrap();
         let mut server = Server {
             child,

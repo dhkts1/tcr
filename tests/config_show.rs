@@ -11,7 +11,6 @@
 //! config with no port means 3456, which is the live proxy on a working Mac.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 struct Scratch {
     _dir: tempfile::TempDir,
@@ -48,13 +47,10 @@ fn config_on_a_dead_port(rest: &str) -> String {
 }
 
 fn tcr(scratch: &Scratch, args: &[&str]) -> (i32, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = crate::tcr_env::tcr(&scratch.home)
         .args(args)
         .arg("--config")
         .arg(&scratch.config)
-        .env("HOME", &scratch.home)
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_CACHE_HOME")
         .current_dir(&scratch.home)
         .output()
         .expect("run the built tcr");

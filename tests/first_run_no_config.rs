@@ -65,30 +65,19 @@ fn run_tcr(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, Strin
             );
         }
     }
-    let bin = env!("CARGO_BIN_EXE_tcr");
-    let mut command = Command::new(bin);
+    let mut command = crate::tcr_env::tcr(home);
     command
         .args(args)
-        .env("HOME", home)
         .env("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
         .env("CODEX_HOME", home.join(".codex"))
-        .env("TCR_CODEX_AUTH", home.join("no-such-codex-auth.json"))
-        // A scratch HOME does not scratch the login Keychain: the first-run
-        // path now imports this machine's Claude Code login when it finds one,
-        // and on a developer's mac that is a REAL credential. Pointing the
-        // override at a path that does not exist is how a test says "this
-        // machine has no Claude Code login", which is the first run these
-        // assertions are about. `tests/claude_code_import.rs` covers the other
-        // first run, the one that finds a login.
-        .env(
-            "TCR_CLAUDE_CODE_CREDENTIALS",
-            home.join("no-such-claude-code-credentials.json"),
-        )
-        .env_remove("XDG_CACHE_HOME");
+        .env("TCR_CODEX_AUTH", home.join("no-such-codex-auth.json"));
+    // The helper's Claude Code login is a file that does not exist: the first run these
+    // assertions are about. `tests/claude_code_import.rs` covers the other first run, the one
+    // that finds a login.
     let guard = connect_guard::ConnectGuard::attach(&mut command, home);
     let out = command
         .output()
-        .unwrap_or_else(|err| panic!("spawning the built tcr binary ({bin}) failed: {err}"));
+        .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
     guard.assert_no_connections();
     (
         out.status.code(),
@@ -268,17 +257,8 @@ fn the_second_run_reuses_the_file_it_created() {
 /// `<home>/.codex/auth.json`. A developer's mac usually has a real one at `~/.codex`, and a
 /// first run that found it would print a line these assertions are not about.
 fn command_without_codex(home: &std::path::Path, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
-    command
-        .args(args)
-        .env("HOME", home)
-        .env(
-            "TCR_CLAUDE_CODE_CREDENTIALS",
-            home.join("no-such-claude-code-credentials.json"),
-        )
-        .env_remove("XDG_CACHE_HOME")
-        .env_remove("CODEX_HOME")
-        .env_remove("TCR_CODEX_AUTH");
+    let mut command = crate::tcr_env::tcr(home);
+    command.args(args);
     command
 }
 

@@ -30,7 +30,6 @@
 //! would probe whatever is on 3456. The branch under test is the same one
 //! either way — `load_or_init` returning a config with zero accounts in it.
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// A fake Claude Code credentials document — obviously-fake values, and the
 /// key names measured on a real install.
@@ -88,14 +87,11 @@ fn scratch_home() -> (tempfile::TempDir, PathBuf) {
 /// Run `tcr <args…>` against a scratch `HOME`, with the credential store
 /// pinned to `credentials`. Returns (exit code, stdout, stderr).
 fn run_tcr(home: &Path, credentials: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let bin = env!("CARGO_BIN_EXE_tcr");
-    let out = Command::new(bin)
+    let out = crate::tcr_env::tcr(home)
         .args(args)
-        .env("HOME", home)
         .env("TCR_CLAUDE_CODE_CREDENTIALS", credentials)
-        .env_remove("XDG_CACHE_HOME")
         .output()
-        .unwrap_or_else(|err| panic!("spawning the built tcr binary ({bin}) failed: {err}"));
+        .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -247,16 +243,11 @@ fn run_tcr_without_codex(
     credentials: &Path,
     args: &[&str],
 ) -> (Option<i32>, String, String) {
-    let bin = env!("CARGO_BIN_EXE_tcr");
-    let out = Command::new(bin)
+    let out = crate::tcr_env::tcr(home)
         .args(args)
-        .env("HOME", home)
         .env("TCR_CLAUDE_CODE_CREDENTIALS", credentials)
-        .env_remove("XDG_CACHE_HOME")
-        .env_remove("CODEX_HOME")
-        .env_remove("TCR_CODEX_AUTH")
         .output()
-        .unwrap_or_else(|err| panic!("spawning the built tcr binary ({bin}) failed: {err}"));
+        .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -288,18 +279,12 @@ fn run_codex_on_a_first_run_never_imports_the_claude_login() {
     let (home, credentials) = scratch_home();
     let config = config_path_in(home.path());
 
-    let bin = env!("CARGO_BIN_EXE_tcr");
-    let out = Command::new(bin)
+    let out = crate::tcr_env::tcr(home.path())
         .args(["run", "--codex"])
-        .env("HOME", home.path())
         .env("TCR_CLAUDE_CODE_CREDENTIALS", &credentials)
-        .env_remove("XDG_CACHE_HOME")
         .env("TCR_CODEX_BIN", "/usr/bin/true")
-        .env_remove("CODEX_BIN")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("https_proxy")
         .output()
-        .unwrap_or_else(|err| panic!("spawning the built tcr binary ({bin}) failed: {err}"));
+        .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),

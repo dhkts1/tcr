@@ -25,7 +25,7 @@
 //! process's own "listening on http://…" log line, never guessed.
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime};
 use tcr::log_err::LogErr as _;
@@ -165,8 +165,6 @@ fn durable_log_has_line(home: &std::path::Path, predicate: impl Fn(&str) -> bool
 #[test]
 fn a_supervised_sigterm_drains_before_the_process_exits() {
     let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
-    let bin = env!("CARGO_BIN_EXE_tcr");
-
     // Isolation must be PROVEN, not assumed from having written `.env()`
     // correctly: snapshot the real HOME's cert mtimes now, and diff them
     // again after the child has minted its own (into the tempdir) and
@@ -175,27 +173,16 @@ fn a_supervised_sigterm_drains_before_the_process_exits() {
     let real_certs = real_home_cert_paths();
     let real_certs_before = real_certs.as_ref().map(|p| mtimes(p));
 
-    let mut child = Command::new(bin)
+    // The helper's `HOME` isolates config, the MITM cert dir, and the affinity/owner-file cache
+    // dir all at once: every one of them resolves off `HOME` (`config::default_path`,
+    // `mitm::config_dir`, `affinity::default_path`). Its Claude Code login is a file that does
+    // not exist, so the first boot on an empty fleet imports nothing from the Keychain.
+    let mut child = crate::tcr_env::tcr(home.path())
         .args(["--headless", "--port", "0", "--no-replace"])
-        // Isolates config, the MITM cert dir, and the affinity/owner-file
-        // cache dir all at once — every one of them resolves off `HOME`
-        // (`config::default_path`, `mitm::config_dir`, `affinity::default_path`).
-        .env("HOME", home.path())
-        // The server's first boot on an empty fleet imports this machine's
-        // Claude Code login when it finds one, and a scratch HOME does not
-        // scratch the login Keychain — on a developer's mac that read would
-        // find a REAL credential and try to write it into this tempdir's
-        // config. An override path that does not exist is how a test says
-        // "this machine has no Claude Code login".
-        .env(
-            "TCR_CLAUDE_CODE_CREDENTIALS",
-            home.path().join("no-such-claude-code-credentials.json"),
-        )
-        .env_remove("XDG_CACHE_HOME")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap_or_else(|err| panic!("spawning the built tcr binary ({bin}) failed: {err}"));
+        .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
 
     let stdout = stream_stdout(&mut child);
 

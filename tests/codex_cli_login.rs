@@ -232,23 +232,14 @@ impl Scratch {
 
     /// The built `tcr`, pinned as the module doc says.
     fn tcr(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = crate::tcr_env::tcr(self.home.path());
         command
-            .env("HOME", self.home.path())
             // Parallel tests spawn many children; bound each child's runtime threads.
             .env("TOKIO_WORKER_THREADS", "2")
             .env("TCR_CODEX_BIN", &self.codex)
-            .env_remove("CODEX_BIN")
             .env("PATH", self.path("empty-path"))
             .env("TCR_CODEX_SEARCH_DIRS", self.path("empty-search"))
             .env("TCR_BUNDLED_TCR", self.path("no-bundled-tcr"))
-            .env(
-                "TCR_CLAUDE_CODE_CREDENTIALS",
-                self.path("no-claude-code-login.json"),
-            )
-            .env_remove("CODEX_HOME")
-            .env_remove("TCR_CODEX_AUTH")
-            .env_remove("XDG_CACHE_HOME")
             .stdin(Stdio::null());
         command
     }

@@ -11,6 +11,10 @@
     reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
 )]
 
+/// The environment every launch of the built `tcr` starts from.
+#[path = "support/tcr_env.rs"]
+mod tcr_env;
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -889,9 +893,15 @@ fn peers_file_with_one_peer(dir: &std::path::Path, listen_port: u16) -> std::pat
     path
 }
 
+/// The built `tcr` with its `HOME` the directory holding `file`, so no call reaches the
+/// operator's files.
+fn tcr_beside(file: &std::path::Path) -> std::process::Command {
+    tcr_env::tcr(file.parent().expect("a fixture file has a directory"))
+}
+
 /// Run `tcr peer reach` against a temp peers file: `(stdout, stderr, ok)`.
 fn run_reach(peers: &std::path::Path, extra: &[&str]) -> (String, String, bool) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_beside(peers)
         .args(["peer", "reach"])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
         .args(extra)
@@ -1987,7 +1997,7 @@ async fn a_dial_that_races_two_live_endpoints_does_not_cool_the_one_it_did_not_u
 
 /// Run `tcr peer internet on|off` against a temp peers file: `(stdout, stderr, ok)`.
 fn run_internet(peers: &std::path::Path, state: &str) -> (String, String, bool) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_beside(peers)
         .args(["peer", "internet", state])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
         .output()
