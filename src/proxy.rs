@@ -7958,12 +7958,7 @@ fn error_response(
     message: &str,
     retry_after: Option<i64>,
 ) -> Response {
-    tracing::warn!(
-        status = status.as_u16(),
-        error.r#type = err_type,
-        error.message = message,
-        "proxy-generated error response"
-    );
+    client_error::warn_refusal(status, err_type, message);
     quiet_error_response(status, err_type, message, retry_after)
 }
 
