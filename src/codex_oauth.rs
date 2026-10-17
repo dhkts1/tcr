@@ -486,62 +486,125 @@ mod tests {
         assert_eq!(error_code(b"nope"), None);
     }
 
-    /// A stub token endpoint on an ephemeral loopback port, for the network tests below: it
-    /// answers every POST with `status` and `body`, and keeps the JSON grant it was sent.
-    async fn stub(
-        status: u16,
-        body: &'static str,
-    ) -> (
-        String,
-        std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
-    ) {
-        use axum::{Router, routing::post};
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let seen2 = seen.clone();
-        let app = Router::new().route(
-            "/oauth/token",
-            post(move |axum::Json(body_in): axum::Json<serde_json::Value>| {
-                let seen2 = seen2.clone();
-                async move {
-                    *seen2.lock().unwrap() = Some(body_in);
-                    (axum::http::StatusCode::from_u16(status).unwrap(), body)
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    /// What the shared stub saw of one request: the JSON grant it was sent and the `user-agent`.
+    #[derive(Clone, Default)]
+    struct Seen {
+        body: Option<serde_json::Value>,
+        user_agent: Option<String>,
+    }
+
+    struct Stub {
+        addr: std::net::SocketAddr,
+        seen: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Seen>>>,
+        next: std::sync::atomic::AtomicU64,
+    }
+
+    /// ONE token endpoint for every network test below, on one loopback port, served from its own
+    /// thread and runtime so it outlives the test that first touched it (each `#[tokio::test]`
+    /// has a runtime of its own). A route per call, `/oauth/token/{id}/{status}/x{hex of body}`,
+    /// answers with that status and body and files what it saw under `id`. Before this, every
+    /// call bound a listener and a connection of its own.
+    static STUB: std::sync::LazyLock<Stub> = std::sync::LazyLock::new(|| {
+        use axum::{Router, extract::Path, extract::State, http::HeaderMap, routing::post};
+        let seen: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Seen>>> =
+            std::sync::Arc::default();
+        let state = seen.clone();
+        let app = Router::new()
+            .route(
+                "/oauth/token/{id}/{status}/{body}",
+                post(
+                    |State(seen): State<
+                        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Seen>>>,
+                    >,
+                     Path((id, status, body)): Path<(u64, u16, String)>,
+                     headers: HeaderMap,
+                     axum::Json(body_in): axum::Json<serde_json::Value>| async move {
+                        let user_agent = headers
+                            .get("user-agent")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        seen.lock().unwrap().insert(
+                            id,
+                            Seen {
+                                body: Some(body_in),
+                                user_agent,
+                            },
+                        );
+                        let bytes: Vec<u8> = body
+                            .strip_prefix('x')
+                            .unwrap_or_default()
+                            .as_bytes()
+                            .chunks(2)
+                            .map(|pair| {
+                                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
+                            })
+                            .collect();
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            String::from_utf8(bytes).unwrap(),
+                        )
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{addr}/oauth/token"), seen)
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        Stub {
+            addr,
+            seen,
+            next: std::sync::atomic::AtomicU64::new(0),
+        }
+    });
+
+    /// The URL of a route on the shared stub that answers every POST with `status` and `body`,
+    /// and the id to read what it was sent with [`seen`].
+    async fn stub(status: u16, body: &str) -> (String, u64) {
+        let id = STUB.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let hex: String = body.bytes().map(|byte| format!("{byte:02x}")).collect();
+        (
+            format!("http://{}/oauth/token/{id}/{status}/x{hex}", STUB.addr),
+            id,
+        )
+    }
+
+    fn seen(id: u64) -> Seen {
+        STUB.seen
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The one client a test uses for all its calls, so they share one pooled connection to the
+    /// shared stub instead of one connection each.
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
     }
 
     #[tokio::test]
     async fn codex_refresh_identifies_tcr_in_the_user_agent() {
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let seen = captured.clone();
-        let app = axum::Router::new().route(
-            "/oauth/token",
-            axum::routing::post(move |headers: axum::http::HeaderMap| {
-                let seen = seen.clone();
-                async move {
-                    *seen.lock().unwrap() = headers
-                        .get("user-agent")
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_owned);
-                    axum::Json(
-                        serde_json::json!({"access_token": "at-fake", "refresh_token": "rt-new"}),
-                    )
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        refresh_access_token_at(&client, "rt-old", &format!("http://{address}/oauth/token"))
+        let (url, id) = stub(
+            200,
+            r#"{"access_token":"at-fake","refresh_token":"rt-new"}"#,
+        )
+        .await;
+        refresh_access_token_at(&client(), "rt-old", &url)
             .await
             .unwrap();
         assert_eq!(
-            captured.lock().unwrap().as_deref(),
+            seen(id).user_agent.as_deref(),
             Some(concat!("tcr/", env!("CARGO_PKG_VERSION")))
         );
     }
@@ -553,7 +616,7 @@ mod tests {
     #[tokio::test]
     async fn a_successful_refresh_sends_the_json_grant_and_reads_exp() {
         let access = format!("{JWT_HEADER}.{EXP_2100_PAYLOAD}.sig");
-        let (url, seen) = stub(
+        let (url, id) = stub(
             200,
             Box::leak(
                 format!(
@@ -564,14 +627,14 @@ mod tests {
             ),
         )
         .await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = client();
         let tokens = refresh_access_token_at(&client, "rt-1", &url)
             .await
             .unwrap();
         assert_eq!(tokens.access_token, access);
         assert_eq!(tokens.refresh_token.as_deref(), Some("rt-2"));
         assert_eq!(tokens.expires_at_ms, 4_102_444_800_000);
-        let body = seen.lock().unwrap().clone().unwrap();
+        let body = seen(id).body.unwrap();
         assert_eq!(body["grant_type"], "refresh_token");
         assert_eq!(body["client_id"], CLIENT_ID);
         assert_eq!(body["refresh_token"], "rt-1");
@@ -593,7 +656,7 @@ mod tests {
                 response["id_token"] = serde_json::json!(id);
             }
             let (url, _) = stub(200, Box::leak(response.to_string().into_boxed_str())).await;
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let client = client();
             let tokens = refresh_access_token_at(&client, "rt-old", &url)
                 .await
                 .unwrap();
@@ -616,7 +679,7 @@ mod tests {
             Box::leak(format!(r#"{{"access_token":"{}"}}"#, access_jwt()).into_boxed_str()),
         )
         .await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = client();
         let tokens = refresh_access_token_at(&client, "rt-1", &url)
             .await
             .unwrap();
@@ -625,7 +688,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_grant_and_401_are_permanent_but_a_500_is_transient() {
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = client();
         let (url, _) = stub(400, r#"{"error":"invalid_grant"}"#).await;
         assert!(matches!(
             refresh_access_token_at(&client, "rt", &url).await,
@@ -664,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn dead_refresh_token_codes_are_permanent_at_every_error_status_and_body_shape() {
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = client();
         let mut failures = Vec::new();
         for status in [400, 401, 403, 500] {
             for code in [
@@ -697,7 +760,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_grant_without_a_400_or_401_is_transient() {
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = client();
         for status in [403, 500] {
             let (url, _) = stub(status, r#"{"error":"invalid_grant"}"#).await;
             let outcome = refresh_access_token_at(&client, "rt", &url).await;
@@ -724,7 +787,7 @@ mod tests {
             ),
         )
         .await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = client();
         let tokens = refresh_access_token_at(&client, "rt-1", &url)
             .await
             .unwrap();
@@ -737,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_access_token_is_transient() {
         let (url, _) = stub(200, r#"{"access_token":"","refresh_token":"rt-2"}"#).await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = client();
         let outcome = refresh_access_token_at(&client, "rt-1", &url).await;
         assert!(
             matches!(outcome, Err(OAuthError::Transient(_))),
@@ -755,7 +818,7 @@ mod tests {
     /// echoing any short code-shaped value and the bare token does.
     #[tokio::test]
     async fn a_400_names_only_a_known_error_code_and_never_echoes_anything_else() {
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = client();
         let message_for = |body: &'static str| {
             let client = client.clone();
             async move {
@@ -796,7 +859,7 @@ mod tests {
     #[tokio::test]
     async fn a_200_that_is_not_a_token_object_never_echoes_its_body() {
         let (url, _) = stub(200, r#""rt-must-not-echo""#).await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = client();
         match refresh_access_token_at(&client, "rt", &url).await {
             Err(OAuthError::Transient(message)) => {
                 assert!(!message.contains("rt-must-not-echo"), "{message}");
@@ -822,7 +885,7 @@ mod tests {
             ),
         )
         .await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = client();
         let before = crate::now_ms();
         let tokens = refresh_access_token_at(&client, "rt-1", &url)
             .await
@@ -864,7 +927,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             drop(socket);
         });
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = client();
         let url = format!("http://{addr}/oauth/token");
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
