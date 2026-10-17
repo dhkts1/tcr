@@ -2,7 +2,7 @@
 //! token, forward the request to Anthropic, and stream the response back
 //! **unchanged** while a side consumer parses SSE usage.
 //!
-//! Behaviours designed out of the JS proxy (see `DESIGN.md` + the sweep notes):
+//! Behaviours by design (see `DESIGN.md` + the sweep notes):
 //! - The client's inbound `authorization` header is **stripped** before we set
 //!   our own `Bearer` (never forward a client token upstream).
 //! - An upstream `401` force-refreshes the serving account's token **once**. If a
@@ -651,8 +651,7 @@ fn max_attempts_for(account_count: usize) -> usize {
 /// server ([`crate::mitm::serve_http`]) so the auth layer can exempt loopback
 /// clients from the api-key gate. A localhost personal proxy must not demand its
 /// own key from the local user; a non-loopback client (were the listener ever
-/// bound wider than 127.0.0.1) still presents it. Mirrors the JS proxy's
-/// "loopback client is exempt" rule.
+/// bound wider than 127.0.0.1) still presents it: a loopback client is exempt.
 #[derive(Clone, Copy)]
 pub struct ClientAddr(pub SocketAddr);
 
@@ -1138,7 +1137,7 @@ pub(crate) const LOCAL_PREFIX: &str = "/_tcr";
 
 /// Paths whose upstream call must carry the **client's own** credential and which
 /// therefore bypass account selection entirely. Matched as prefixes of the request
-/// path, mirroring the JS proxy's `CLIENT_CREDENTIAL_PATHS` (`teamclaude/src/server.js`).
+/// path.
 ///
 /// Do NOT "simplify" any of these back into the catch-all. They are bound to the
 /// identity that authenticated the CLIENT, so a rotated pooled token is the wrong
@@ -1156,7 +1155,7 @@ pub(crate) const LOCAL_PREFIX: &str = "/_tcr";
 ///   identity cannot resolve.
 /// - `/v1/sessions` is Remote Control's session record — read, `/archive`,
 ///   `/unarchive`. Measured across all four rolling proxy logs
-///   (`~/.cache/teamclaude/logs/`), aggregating `upstream response account=… path=…
+///   (the cache directory's `logs/`), aggregating `upstream response account=… path=…
 ///   status=…`: `/v1/sessions/<id>` and its sub-paths came back 404 on 7 of 7
 ///   requests, spread over 6 different pooled accounts, and never once a 2xx from
 ///   any pooled identity. The reason is visible in the ids: the same opaque suffix
@@ -1222,8 +1221,8 @@ pub(crate) const CLIENT_CREDENTIAL_PREFIXES: [&str; 6] = [
 /// refuse it too.
 pub(crate) const CLIENT_TOKEN_REFRESH_PATH: &str = "/v1/oauth/token";
 
-/// `user-agent` sent by [`RelayMode::Raw`] when the client sent none. The JS proxy
-/// defaults to `'node'` here; naming ourselves is more honest about who is calling.
+/// `user-agent` sent by [`RelayMode::Raw`] when the client sent none: naming
+/// ourselves is honest about who is calling.
 const RELAY_USER_AGENT: &str = concat!("tcr/", env!("CARGO_PKG_VERSION"));
 
 /// How a request that must NOT go through account rotation reaches upstream.
@@ -3201,8 +3200,7 @@ async fn handle_request(
     //    for loopback clients, which are exempt. A localhost personal proxy must
     //    not demand its own key from the local user: `claude` authenticates with
     //    its own OAuth (which we strip and replace with a pooled token) and never
-    //    sends the proxy key. The JS proxy exempts loopback for exactly this
-    //    reason. tcr binds 127.0.0.1 only, so every client is loopback in
+    //    sends the proxy key, which is why loopback is exempt. tcr binds 127.0.0.1 only, so every client is loopback in
     //    practice; the gate still guards a non-loopback client if bound wider.
     if let Some(expected) = manager.proxy_api_key()
         && !client_is_loopback
@@ -6230,7 +6228,7 @@ fn build_passthrough_headers(req_headers: &HeaderMap, secrets: ProxySecrets<'_>)
 /// `user-agent` — and nothing else. No `authorization` and no `x-api-key`: a token
 /// refresh authenticates with the credentials in its BODY, so a header credential
 /// would be at best redundant and, for a pooled Bearer, the wrong identity's
-/// entirely. Mirrors the JS proxy's `relayRaw`.
+/// entirely.
 fn build_raw_relay_headers(req_headers: &HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, default) in [
@@ -6251,7 +6249,7 @@ fn build_raw_relay_headers(req_headers: &HeaderMap) -> HeaderMap {
 ///
 /// Deliberately NOT [`Manager::http_client`]: the pooled client follows up to 10
 /// redirects, and a relay must hand a 3xx BACK to the client rather than chase it
-/// (the JS proxy passes `redirect: 'manual'` for this reason). Following one here
+/// (a manual-redirect policy). Following one here
 /// would resolve a location the client never sees, while carrying a credential we
 /// are only forwarding on its behalf. The rest mirrors the pooled client: `no_proxy`
 /// (we ARE the proxy — an ambient `HTTP_PROXY` would loop us through ourselves) and
@@ -6399,9 +6397,9 @@ async fn relay_request(
     };
     let url = format!("{}{}", manager.upstream_for(provider), path_and_query);
     let mut builder = client.request(method.clone(), &url).headers(headers);
-    // A GET/HEAD carries no body, and an empty body is sent as no body at all —
-    // both mirror the JS relays, and the latter keeps a bodyless POST from
-    // acquiring a `content-length: 0` it did not arrive with.
+    // A GET/HEAD carries no body, and an empty body is sent as no body at all,
+    // which keeps a bodyless POST from acquiring a `content-length: 0` it did
+    // not arrive with.
     if method != Method::GET && method != Method::HEAD && !body_bytes.is_empty() {
         builder = builder.body(body_bytes);
     }
@@ -6676,7 +6674,7 @@ fn build_response(
 }
 
 /// Parse a numeric `retry-after` header (seconds). RFC-date form is ignored (the
-/// caller falls back to a default), matching the JS proxy.
+/// caller falls back to a default).
 pub(crate) fn parse_retry_after(headers: &HeaderMap) -> Option<i64> {
     headers
         .get("retry-after")
@@ -6690,7 +6688,7 @@ fn is_quota_rejected(headers: &HeaderMap) -> bool {
 }
 
 /// Sum the input side of a `usage` object: base input plus cache-creation and
-/// cache-read tokens (the JS proxy missed the cache tokens — behaviour fixed).
+/// cache-read tokens.
 /// This is the QUOTA counter — `input_total` folds all three into one u64.
 fn sum_input_tokens(usage: &Value) -> u64 {
     let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
@@ -11241,8 +11239,7 @@ mod tests {
     /// (`mitm::serve`, which injects `ClientAddr`), a KEYLESS request from a
     /// loopback client must NOT be 401 even though a proxy key is configured — it
     /// proceeds upstream (dead port → 503). This is what lets `claude` (which
-    /// sends no proxy key, only its own OAuth) talk to the local proxy, exactly
-    /// as it did with the JS proxy's loopback exemption.
+    /// sends no proxy key, only its own OAuth) talk to the local proxy.
     #[tokio::test]
     async fn loopback_client_is_exempt() {
         let manager = Manager::with_live_refresher(

@@ -130,7 +130,7 @@ pub mod tunnel;
 /// Phase 6: the loopback egress splice.
 pub mod egress;
 
-/// Phase 1: runtime state, `teamclaude/peer-state.json` in the cache directory.
+/// Phase 1: runtime state, `tcr/peer-state.json` in the cache directory.
 pub mod state;
 
 /// What this Mac can be reached on from off this LAN: a NAT-PMP mapping, a

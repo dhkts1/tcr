@@ -73,7 +73,7 @@ impl Manager {
     ///
     /// Exposed for the status endpoint (`crate::proxy`), which ships the SERVER's
     /// thresholds alongside its snapshot. A client must not re-derive them from
-    /// `~/.config/teamclaude.json`: that file may have been edited since the server
+    /// `~/.config/tcr.json`: that file may have been edited since the server
     /// booted, and a client-ordered threshold list zipped against a server-ordered
     /// account list would mislabel which windows are holding which account.
     pub fn thresholds(&self) -> Vec<f64> {
@@ -91,7 +91,7 @@ impl Manager {
     /// Whether this server's accounts are forced onto HTTP/1.1 — see
     /// [`config::Config::http1_only`]. Server-wide, not per-account, and
     /// exposed for the same reason `thresholds` is: a client must not
-    /// re-derive this from `~/.config/teamclaude.json`, which may have been
+    /// re-derive this from `~/.config/tcr.json`, which may have been
     /// edited (or the process not yet restarted to pick it up) since the
     /// server actually booted its clients.
     pub fn http1_only(&self) -> bool {

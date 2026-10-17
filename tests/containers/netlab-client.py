@@ -17,7 +17,7 @@ not reach the proxy at all, and moving that bind is not this tool's call.
 Usage:
     netlab-client.py <config.json> <rate-per-second> <body-bytes> <count>
 
-<config.json> is the node's own teamclaude.json (this script reads
+<config.json> is the node's own tcr.json (this script reads
 proxy.port, proxy.apiKey and accounts[0].name off it, nothing is passed
 twice). One line per request on stdout:
 

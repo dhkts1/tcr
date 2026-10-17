@@ -2,7 +2,7 @@
 //! idle accounts so a cold account is never the one that has to serve the moment
 //! the active one runs out.
 //!
-//! Ported in spirit from `teamclaude/src/warmer.js` (issue #76). It is the SECOND
+//! Issue #76. It is the SECOND
 //! sanctioned active-upstream feature (the quota probe is the first) and differs
 //! in one important way, which is why it is strictly **opt-in and OFF by default**:
 //! the 5h timer only starts on *real usage*, so — unlike the zero-spend
@@ -11,8 +11,8 @@
 //! minimal we warm an account only when its 5h window is not already running, and
 //! we use the cheapest model ([`WARM_MODEL`]).
 //!
-//! Unlike the JS mechanism (spawn a one-shot `claude` pointed back at the proxy),
-//! this warms **in process**: a direct minimal `POST {upstream}/v1/messages` with
+//! Rather than spawn a one-shot `claude` pointed back at the proxy, this warms
+//! **in process**: a direct minimal `POST {upstream}/v1/messages` with
 //! the account's token, mirroring [`crate::probe`]'s prober shape. A warm FAILURE
 //! is NON-FATAL — logged at `warn` and stepped over — never a crash of the loop.
 

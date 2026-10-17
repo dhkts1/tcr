@@ -13,7 +13,7 @@
 //! serving the leaf it loaded at boot, and it would report coverage that proxy does not have.
 //!
 //! The order is fixed, and the first match wins: nothing listening, a status that could not be
-//! read, a proxy older than the `mitm` key, the JS teamclaude leaf, MITM off. A leaf tcr minted
+//! read, a proxy older than the `mitm` key, MITM off. A leaf tcr minted
 //! that intercepts `chatgpt.com` is then not pooled while the pool holds no Codex account (the
 //! proxy blind-tunnels `chatgpt.com` without one), else while the CA is unreadable (codex could
 //! not trust the leaf), else pooled. A minted leaf that does not intercept `chatgpt.com`, and a
@@ -53,8 +53,6 @@ pub const NO_PROXY: &str = "no-proxy";
 pub const STATUS_UNREADABLE: &str = "status-unreadable";
 /// The proxy's status has no `mitm` key: it predates Codex interception.
 pub const PREDATES: &str = "predates";
-/// The proxy serves the JS teamclaude leaf, which covers `api.anthropic.com` only.
-pub const JS_LEAF: &str = "js-leaf";
 /// The proxy runs without MITM: its TLS material failed to load at boot.
 pub const MITM_OFF: &str = "mitm-off";
 /// The proxy could intercept `chatgpt.com`, but its pool holds no Codex account.
@@ -163,15 +161,6 @@ fn decide(
 ) -> CodexRoute {
     let host = crate::provider::CODEX_HOST;
     let (code, reason) = match mitm.leaf.as_str() {
-        MitmStatus::LEAF_JS => (
-            JS_LEAF,
-            format!(
-                "the proxy on :{port} is serving the JS {} leaf, which covers \
-                 api.anthropic.com only and is never re-minted — a restart will not change \
-                 this; see docs/troubleshooting.md",
-                crate::legacy_names::JS_PROXY_BIN
-            ),
-        ),
         MitmStatus::LEAF_NONE => (
             MITM_OFF,
             format!(
@@ -289,12 +278,6 @@ mod tests {
     /// Mismatches are collected, so a regression names every row it breaks.
     #[test]
     fn every_code_carries_the_launchers_reason_verbatim() {
-        let js_leaf_reason = format!(
-            "the proxy on :3999 is serving the JS {} leaf, which covers \
-             api.anthropic.com only and is never re-minted — a restart will not change \
-             this; see docs/troubleshooting.md",
-            crate::legacy_names::JS_PROXY_BIN
-        );
         let no_server = LiveStatusError::NoServer;
         let no_answer = LiveStatusError::NoAnswer("the server did not answer within 5s".into());
         let predates = payload(None, 1, None);
@@ -354,7 +337,15 @@ mod tests {
                 "the proxy on :3999 (build abc1234) predates Codex interception — restart it on \
                  this build at a quiet moment",
             ),
-            (Ok(&js), true, 1, JS_LEAF, &js_leaf_reason),
+            // A leaf kind no build serves any more reads as any other unknown leaf.
+            (
+                Ok(&js),
+                true,
+                1,
+                UNKNOWN_LEAF,
+                "the proxy on :3999 (build abc1234) reports a leaf this build does not know \
+                 (\"js\") — run tcr run --codex from the same build as the proxy",
+            ),
             (
                 Ok(&off),
                 true,
@@ -442,16 +433,16 @@ mod tests {
     #[test]
     fn a_non_default_upstream_is_reported() {
         let pooling = payload(Some(intercepting_chatgpt()), 1, Some("http://127.0.0.1:9"));
-        let js = payload(
-            Some(serde_json::json!({"interceptedHosts": ["api.anthropic.com"], "leaf": "js"})),
+        let off = payload(
+            Some(serde_json::json!({"interceptedHosts": [], "leaf": "none"})),
             1,
             Some("http://127.0.0.1:9"),
         );
         let pooled = codex_route(Ok(&pooling), PORT, ca(), true, 1);
         assert!(pooled.pooled, "{pooled:?}");
         assert_eq!(pooled.upstream.as_deref(), Some("http://127.0.0.1:9"));
-        let not_pooled = codex_route(Ok(&js), PORT, ca(), true, 1);
-        assert_eq!(not_pooled.code.as_deref(), Some(JS_LEAF));
+        let not_pooled = codex_route(Ok(&off), PORT, ca(), true, 1);
+        assert_eq!(not_pooled.code.as_deref(), Some(MITM_OFF));
         assert_eq!(not_pooled.upstream.as_deref(), Some("http://127.0.0.1:9"));
     }
 
@@ -470,12 +461,6 @@ mod tests {
                 true,
                 1,
                 Some(MITM_OFF),
-            ),
-            (
-                serde_json::json!({"interceptedHosts": ["api.anthropic.com"], "leaf": "js"}),
-                true,
-                1,
-                Some(JS_LEAF),
             ),
             (
                 serde_json::json!({

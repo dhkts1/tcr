@@ -1,7 +1,6 @@
 //! Active, zero-spend quota probe — the real feature of this proxy.
 //!
-//! Ported from `teamclaude/src/prober.js` + `oauth.js` (`fetchUsage`,
-//! `normalizeUsageBucket`, `findScopedWeeklyLimit`). On an interval the manager
+//! On an interval the manager
 //! probes **every** OAuth account's quota via the Anthropic OAuth *usage*
 //! endpoint — which reports utilization WITHOUT spending message quota — so idle
 //! accounts' bars stay fresh instead of freezing at their last-served value. A
@@ -60,7 +59,7 @@ pub const PROBE_SPACING: Duration = Duration::from_millis(350);
 
 /// One normalized usage window: fractional utilization (`0.0..=1.0+`) and the
 /// reset instant in epoch **milliseconds**. Either may be `None` when the
-/// endpoint omitted it (matches the JS `{ utilization: null, resetAt }` shape).
+/// endpoint omitted it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UsageBucket {
     pub utilization: Option<f64>,

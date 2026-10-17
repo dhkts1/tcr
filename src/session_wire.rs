@@ -38,12 +38,12 @@
 //!
 //! `command_head` (capped to 120 chars; the per-tool shape is on
 //! [`ToolUseEvent::command_head`]) is held in this in-memory table and is never written to
-//! `~/.cache/teamclaude/logs` or any other log file — the same
+//! `~/.cache/tcr/logs` or any other log file — the same
 //! body-content-never-hits-disk rule `src/proxy.rs` states for the request log.
 //!
 //! It DOES reach one file: the affinity-style snapshot in
 //! [`crate::session_wire_persist`], which round-trips [`WireSession`] to
-//! `~/.cache/teamclaude/session-wire.json`. Between #299 and 2026-09-13 both
+//! `~/.cache/tcr/session-wire.json`. Between #299 and 2026-09-13 both
 //! [`RunningTool::command_head`] and [`SlowTool::command_head`] carried
 //! `#[serde(skip_serializing)]` and that file held no command at all. Gil reversed it the
 //! same day, on a measurement: after a restart, 72 of 95 restored SLOWEST TODAY rows read

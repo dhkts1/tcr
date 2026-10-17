@@ -140,7 +140,7 @@ pub fn public_key_path(config_dir: &Path) -> PathBuf {
     config_dir.join("tcr-node.pub")
 }
 
-/// Where both files live by default: the same directory the drop-in config
+/// Where both files live by default: the same directory the config
 /// already uses, so one `--config`-shaped override reaches all of it and a test
 /// points the whole peer surface at a temp dir with one argument.
 pub fn default_config_dir() -> PathBuf {

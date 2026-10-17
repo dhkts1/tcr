@@ -132,7 +132,7 @@ fn serve_one(mut stream: TcpStream, body: &str) {
 fn write_config(home: &Path, port: u16) -> std::path::PathBuf {
     let dir = home.join(".config");
     std::fs::create_dir_all(&dir).expect("create the config directory");
-    let path = dir.join("teamclaude.json");
+    let path = dir.join("tcr.json");
     std::fs::write(
         &path,
         format!("{{\n  \"accounts\": [],\n  \"proxy\": {{ \"port\": {port} }}\n}}\n"),

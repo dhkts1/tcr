@@ -19,7 +19,7 @@
 //! and `XDG_CACHE_HOME` explicitly removed, via [`std::process::Command::env`]
 //! / [`std::process::Command::env_remove`] — set on the `Command` itself, not
 //! the test harness's own environment, so this process's real
-//! `~/.config`/`~/.cache/teamclaude` (and the live proxy that may be reading
+//! `~/.config`/`~/.cache/tcr` (and the live proxy that may be reading
 //! them) are never touched. `--port 0` binds an OS-assigned ephemeral port,
 //! never the live proxy's `3456`; the bound port is recovered by parsing the
 //! process's own "listening on http://…" log line, never guessed.

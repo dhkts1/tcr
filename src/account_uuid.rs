@@ -33,9 +33,7 @@
 //! patched. Strictness is the safer direction, and such a body is rejected
 //! upstream anyway.
 //!
-//! Originally ported 1:1 from the JS `AccountUuidPatcher`
-//! (`teamclaude/src/account-uuid-rewrite.js`); tcr buffers the whole body, so
-//! this is a single pass over the full slice rather than a chunk-streaming apparatus.
+//! tcr buffers the whole body, so this is a single pass over the full slice rather than a chunk-streaming apparatus.
 
 use std::borrow::Cow;
 
@@ -117,8 +115,8 @@ mod legacy {
         awaiting_key: bool,
     }
 
-    /// Streaming byte-exact locator state (mirrors the JS `AccountUuidPatcher`, but
-    /// read-only: it never mutates the body — it only records the byte offset where
+    /// Streaming byte-exact locator state, read-only: it never mutates the
+    /// body — it only records the byte offset where
     /// the depth-2 `metadata.user_id` `account_uuid` value begins).
     pub(super) struct Patcher {
         frames: Vec<Frame>,

@@ -1,6 +1,6 @@
 //! Operator intent on disk: `tcr-peers.json` in the operator's config directory.
 //!
-//! # Why this is not in `teamclaude.json`
+//! # Why this is not in `tcr.json`
 //!
 //! Every field of the main config except group membership and `groupSettings`
 //! is a BOOT-TIME SNAPSHOT (`Config`, `src/config.rs:785`), and that rule is
@@ -23,7 +23,7 @@
 //! second spelling of it.
 //!
 //! (The blueprint's §4 puts the socket fields in a new `peer` key in
-//! `teamclaude.json` instead. Same two tiers, one fewer file to explain; this
+//! `tcr.json` instead. Same two tiers, one fewer file to explain; this
 //! skeleton keeps them here so nothing in `src/config.rs` changes at all, and
 //! the coder who lands phase 2 can move them with Gil's answer in hand.)
 //!
@@ -1387,7 +1387,7 @@ impl DeadDropConfig {
 /// Which surface a dead drop uses, and what that surface needs.
 ///
 /// The credential lives here, in the peers file, and never in
-/// `teamclaude.json`: this is the file whose 0600 mode is checked on read, the
+/// `tcr.json`: this is the file whose 0600 mode is checked on read, the
 /// same rule [`PeerFile::network_key`] and `PeerRow::rendezvous_secret`
 /// already follow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

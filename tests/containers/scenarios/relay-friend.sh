@@ -157,7 +157,7 @@ pass "every pinned row resolved to exactly one id on each side"
 nx node-a1 tcr peer allow "$c_id_from_a" carry on --peers "$PEERS" >/dev/null 2>&1 || true
 nx node-a1 tcr peer allow "$b_id_from_a" disclose on --peers "$PEERS" >/dev/null 2>&1 || true
 nx node-b1 tcr peer allow "$a_id_from_b" inspect on --peers "$PEERS" >/dev/null 2>&1 || true
-lend_out="$(nx node-b1 tcr peer lend "$a_id_from_b" --fraction 0.5 --ttl 600 --max-inflight 2 --scope all --peers "$PEERS" --config /lab/node-b1/.config/teamclaude.json 2>&1 || true)"
+lend_out="$(nx node-b1 tcr peer lend "$a_id_from_b" --fraction 0.5 --ttl 600 --max-inflight 2 --scope all --peers "$PEERS" --config /lab/node-b1/.config/tcr.json 2>&1 || true)"
 case "$lend_out" in
   *"peer lend: ok"*) pass "node-b1 lent node-a1 a lease: $(echo "$lend_out" | head -1)" ;;
   *) fail "node-b1's lend to node-a1 did not report ok: $lend_out" ;;
@@ -211,7 +211,7 @@ esac
 
 # --- disable node-a1's own account, restart it, so the peer-lease fallback
 #     provider is the only thing that can answer a real request -------------
-nx node-a1 tcr disable node-a1-fake --config /lab/node-a1/.config/teamclaude.json >/dev/null 2>&1 || true
+nx node-a1 tcr disable node-a1-fake --config /lab/node-a1/.config/tcr.json >/dev/null 2>&1 || true
 oldpid="$(cat /lab/node-a1/pid 2>/dev/null || echo)"
 if [ -n "$oldpid" ]; then
   kill "$oldpid" 2>/dev/null || true
@@ -232,7 +232,7 @@ pass "node-a1 restarted with its own account disabled"
 # The punch has to fail before the forwarder fallback runs
 # (`dial_peer_reaching_within` tries `punch_dial` first, and neither router
 # has a mapping), so this one request is the slow part of the whole scenario.
-borrow="$(nx node-a1 env HOME=/lab/node-a1 python3 "$SRC/netlab-client.py" /lab/node-a1/.config/teamclaude.json 1 128 1 2>&1 || true)"
+borrow="$(nx node-a1 env HOME=/lab/node-a1 python3 "$SRC/netlab-client.py" /lab/node-a1/.config/tcr.json 1 128 1 2>&1 || true)"
 echo "relay-friend: node-a1's borrow request: $borrow"
 
 # --- the observable, in two parts ---------------------------------------

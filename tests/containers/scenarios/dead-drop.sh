@@ -118,8 +118,8 @@ A=node-a1-overlay
 B=node-b1-overlay
 A_HOME=/lab/$A
 B_HOME=/lab/$B
-A_CONFIG=$A_HOME/.config/teamclaude.json
-B_CONFIG=$B_HOME/.config/teamclaude.json
+A_CONFIG=$A_HOME/.config/tcr.json
+B_CONFIG=$B_HOME/.config/tcr.json
 
 up_with_routers router-a router-b -- "$A" "$B" || { finish; exit 1; }
 pass "router-a (upnp on), router-b, $A and $B are all up"

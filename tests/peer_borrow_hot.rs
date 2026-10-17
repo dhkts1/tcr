@@ -143,7 +143,7 @@ fn options(config_path: std::path::PathBuf) -> ServeOptions {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_disclose_grant_written_after_boot_is_borrowed_on_without_a_restart() {
     let home = tempfile::tempdir().expect("a temp home");
-    let config_path = home.path().join("teamclaude.json");
+    let config_path = home.path().join("tcr.json");
     std::fs::write(&config_path, br#"{"accounts": []}"#).expect("the temp config writes");
     let peers_path = home.path().join("tcr-peers.json");
 

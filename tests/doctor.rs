@@ -12,7 +12,7 @@
 //! [`tempfile::TempDir`], the config is written into that temp tree and passed
 //! explicitly, and the port under test is a kernel-assigned one bound by this
 //! test process. Nothing here reads the operator's real
-//! `.config/teamclaude.json`, and no test here names a port literal at all:
+//! `.config/tcr.json`, and no test here names a port literal at all:
 //! every port comes from `TcpListener::bind("127.0.0.1:0")`, so the live proxy
 //! is never the thing a test connects to.
 
@@ -35,7 +35,7 @@ use tcr::test_support::loopback::unused_port as free_port;
 fn write_config(home: &Path, port: u16) -> PathBuf {
     let dir = home.join(".config");
     std::fs::create_dir_all(&dir).expect("create the config directory");
-    let path = dir.join("teamclaude.json");
+    let path = dir.join("tcr.json");
     std::fs::write(
         &path,
         format!("{{\n  \"accounts\": [],\n  \"proxy\": {{ \"port\": {port} }}\n}}\n"),
@@ -49,7 +49,7 @@ fn write_config(home: &Path, port: u16) -> PathBuf {
 fn write_config_with(home: &Path, port: u16, accounts: &str) -> PathBuf {
     let dir = home.join(".config");
     std::fs::create_dir_all(&dir).expect("create the config directory");
-    let path = dir.join("teamclaude.json");
+    let path = dir.join("tcr.json");
     std::fs::write(
         &path,
         format!("{{\n  \"accounts\": [{accounts}],\n  \"proxy\": {{ \"port\": {port} }}\n}}\n"),
@@ -889,7 +889,7 @@ fn an_unknown_config_key_is_named_beside_the_codex_block() {
     let write = |port: u16| {
         let dir = home.path().join(".config");
         std::fs::create_dir_all(&dir).expect("create the config directory");
-        let path = dir.join("teamclaude.json");
+        let path = dir.join("tcr.json");
         std::fs::write(
             &path,
             format!(

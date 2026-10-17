@@ -283,10 +283,10 @@ tower = "0.5"
 bytes = "1"
 futures = "0.3"
 
-# SSE parsing that survives chunk-split event boundaries (the JS bug we design out)
+# SSE parsing that survives chunk-split event boundaries
 eventsource-stream = "0.2"
 
-# serde config (drop-in on ~/.config/teamclaude.json)
+# serde config (~/.config/tcr.json)
 serde = { version = "1", features = ["derive"] }
 # `raw_value` is a DEPENDENCY-FREE feature flag (serde_json's own Cargo.toml
 # declares `raw_value = []`), so this adds no package. It lets account_uuid.rs

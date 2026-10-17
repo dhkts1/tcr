@@ -1,8 +1,8 @@
 //! Per-account quota, learned passively from upstream response headers.
 //!
-//! This is where **bug #2 is designed out**. In the JS proxy a quota bar keeps
-//! the last-learned utilization until the next request re-learns it, so a window
-//! that has already passed its reset can read as still-full. Here a window stores
+//! This is where **bug #2 is designed out**: a quota bar that keeps the
+//! last-learned utilization until the next request re-learns it lets a window
+//! that has already passed its reset read as still-full. Here a window stores
 //! its `reset` timestamp and [`QuotaWindow::effective`] computes utilization
 //! **live** against `now`: once `now > reset`, the window reads as a fresh `0.0`.
 //! Nothing is mutated on a tick — the freshness is a pure function of the clock,
@@ -17,7 +17,7 @@ const SEVEN_DAY: Duration = Duration::days(7);
 
 /// Decide a window's `reset` when learning a fresh utilization, so a window is
 /// never pinned out of rotation forever and never wrongly reads as instantly
-/// fresh (bugs #4/#5 and #8 from the JS proxy):
+/// fresh (bugs #4/#5 and #8):
 /// - an explicit reported reset (past OR future) is authoritative;
 /// - otherwise a prior reset is inherited only while still in the future;
 /// - otherwise a bounded reset is synthesized `window` ahead of `now`, so a
@@ -391,8 +391,7 @@ impl Quota {
     /// and the third is the one an earlier `unwrap_or(0.0)` got wrong:
     ///  - the probe reported a utilization → it overwrites the tracked one;
     ///  - it reported `None` and a prior window exists → the prior utilization
-    ///    (and, via [`resolve_reset`], the prior reset) is left intact — this is
-    ///    the JS `applyUsageData` behaviour;
+    ///    (and, via [`resolve_reset`], the prior reset) is left intact;
     ///  - it reported `None` and there is NO prior → the window stays **absent**.
     ///    "We could not read this" is not "this is at 0%", and a fabricated `0.0`
     ///    is byte-identical to a genuine one. See [`apply_bucket`].
@@ -1626,7 +1625,7 @@ mod tests {
     }
 
     /// The same unreadable bucket must still PRESERVE a prior reading — that half
-    /// of the merge (the JS `applyUsageData` behaviour) is not what was broken.
+    /// of the merge is not what was broken.
     ///
     /// The probe here reports a NEW reset alongside the unreadable utilization,
     /// which is what makes this test able to fail: skipping the merge entirely on

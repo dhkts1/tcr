@@ -2,12 +2,12 @@
 //!
 //! tcr tracks a single model-scoped quota bucket — the weekly `7d_oi` window,
 //! which on current plans is the **Fable** weekly cap. To gate it we need two
-//! dependency-free primitives, ported from the JS `src/model.js`:
+//! dependency-free primitives:
 //!   - [`is_fable_model`] — does a model id name a Fable model?
 //!   - [`parse_request_model`] — what model (if any) does a request body ask for?
 //!
-//! Everything else in the JS routing layer (the `routes[]`/glob table, per-account
-//! `models`, the Sonnet bucket) is deliberately out of scope: tcr has exactly one
+//! Model routing (a `routes[]`/glob table, per-account `models`, a Sonnet
+//! bucket) is deliberately out of scope: tcr has exactly one
 //! model-scoped bucket, so a single Fable predicate is the whole surface.
 
 use serde::Deserialize;

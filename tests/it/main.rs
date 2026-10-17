@@ -17,7 +17,7 @@
     reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
 )]
 
-/// Shared by `delete_account_live`, `first_run_no_config` and `migrate_names`.
+/// Shared by `delete_account_live` and `first_run_no_config`.
 #[path = "../support/connect_guard.rs"]
 mod connect_guard;
 
@@ -60,10 +60,6 @@ mod headless_log_file;
 mod headless_sigterm;
 #[path = "../legacy_config_shapes.rs"]
 mod legacy_config_shapes;
-#[path = "../legacy_install_boot.rs"]
-mod legacy_install_boot;
-#[path = "../migrate_names.rs"]
-mod migrate_names;
 #[path = "../peer_abuse.rs"]
 mod peer_abuse;
 #[path = "../peer_aim.rs"]
