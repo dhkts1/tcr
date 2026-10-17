@@ -2,3 +2,26 @@
 # so both lints are exempt inside #[test] functions and #[cfg(test)] modules.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
+
+# Product, protocol and vendor names that `doc_markdown` would otherwise want
+# in backticks as if they were code. `..` keeps clippy's own default list.
+doc-valid-idents = [
+    "..",
+    "ChatGPT",
+    "OpenAI",
+    "TcrBar",
+    "TcrBarCore",
+    "CodexBar",
+    "UPnP",
+    "WANIPConnection",
+    "FedRAMP",
+    "ClientHello",
+    "SplitMix64",
+    "OKLab",
+    "AppKit",
+    "TSan",
+    "ThreadSanitizer",
+    "WireGuard",
+    "SipHash",
+    "DoS",
+]

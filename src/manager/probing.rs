@@ -33,7 +33,7 @@ impl Manager {
             let mut accounts = self
                 .accounts
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             let Some(account) = accounts.get_mut(idx) else {
                 return;
             };
@@ -101,7 +101,7 @@ impl Manager {
         let mut accounts = self
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         let Some(account) = accounts.get_mut(idx) else {
             return 0;
         };
@@ -147,14 +147,11 @@ impl Manager {
     /// row.
     pub fn probeable_indices(&self) -> Vec<usize> {
         let now_ms = crate::now_ms();
-        let accounts = self
-            .accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
         let control = *self
             .control_idx
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         accounts
             .iter()
             .enumerate()
@@ -359,10 +356,7 @@ impl Manager {
             Some(crate::provider::Provider::Codex) | None => return,
         }
         let (already_known, token) = {
-            let accounts = self
-                .accounts
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
             let Some(account) = accounts.get(idx) else {
                 return;
             };
@@ -379,7 +373,7 @@ impl Manager {
             let guard = self
                 .plan_prober
                 .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             guard.clone()
         };
         let plan = prober.plan(token).await;
@@ -396,18 +390,20 @@ impl Manager {
             let mut accounts = self
                 .accounts
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             let Some(account) = accounts.get_mut(idx) else {
                 return;
             };
             if plan.organization_type.is_some() {
-                account.organization_type = plan.organization_type.clone();
+                account
+                    .organization_type
+                    .clone_from(&plan.organization_type);
             }
             if plan.rate_limit_tier.is_some() {
-                account.rate_limit_tier = plan.rate_limit_tier.clone();
+                account.rate_limit_tier.clone_from(&plan.rate_limit_tier);
             }
             if plan.seat_tier.is_some() {
-                account.seat_tier = plan.seat_tier.clone();
+                account.seat_tier.clone_from(&plan.seat_tier);
             }
             tracing::info!(
                 account = %account.name,
@@ -453,7 +449,7 @@ impl Manager {
             let mut accounts = self
                 .accounts
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             let Some(account) = accounts.get_mut(idx) else {
                 return;
             };
@@ -503,9 +499,7 @@ impl Manager {
         if let Err(error) = tokio::task::spawn_blocking(move || {
             // INV1: taken after releasing accounts, and held across the whole read,
             // modify, sync and rename. The async worker waits on neither it nor disk.
-            let _writing = config_write
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _writing = config_write.lock().unwrap_or_else(PoisonError::into_inner);
             match config::save_plan(
                 &path,
                 &target,
@@ -536,11 +530,11 @@ impl Manager {
     /// [`Self::backfill_plan_if_unknown`], which otherwise reaches the real
     /// profile endpoint. Not a runtime knob: call it before the manager serves
     /// anything.
-    pub fn set_plan_prober(&self, prober: Arc<dyn crate::probe::PlanProber>) {
+    pub fn set_plan_prober(&self, prober: Arc<dyn PlanProber>) {
         *self
             .plan_prober
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = prober;
+            .unwrap_or_else(PoisonError::into_inner) = prober;
     }
 }
 
@@ -552,7 +546,7 @@ mod tests {
     struct NoNetwork;
 
     impl TokenRefresher for NoNetwork {
-        fn refresh(&self, _: crate::provider::Provider, _: String) -> crate::oauth::RefreshFuture {
+        fn refresh(&self, _: crate::provider::Provider, _: String) -> oauth::RefreshFuture {
             panic!("a plan probe must not need a refresh");
         }
     }
@@ -567,7 +561,7 @@ mod tests {
                 }),
             };
             Box::pin(async move {
-                Ok(crate::probe::Usage {
+                Ok(Usage {
                     codex,
                     ..Default::default()
                 })
@@ -581,7 +575,7 @@ mod tests {
         }
     }
 
-    impl crate::probe::PlanProber for NoNetwork {
+    impl PlanProber for NoNetwork {
         fn plan(&self, _: String) -> crate::probe::PlanFuture {
             Box::pin(async {
                 crate::probe::Plan {
@@ -645,7 +639,7 @@ mod tests {
         ready_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
-        let (_, responsive) = tokio::join!(manager.probe_account(0), async {
+        let ((), responsive) = tokio::join!(manager.probe_account(0), async {
             tokio::task::yield_now().await;
             let responsive = still_held.load(Ordering::SeqCst);
             release_tx

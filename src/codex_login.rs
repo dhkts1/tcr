@@ -468,6 +468,7 @@ fn shown(value: Option<&serde_json::Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     const ACCOUNT_A: &str = "11111111-1111-4111-8111-111111111111";
     const ACCOUNT_B: &str = "22222222-2222-4222-8222-222222222222";
@@ -542,7 +543,7 @@ mod tests {
             let answer = keyed(&[(ACCOUNT_A, entry)]);
             match judge_accounts_check(&answer, Some(ACCOUNT_A)) {
                 Err(WorkspaceRefusal::NotPoolable(why)) => {
-                    assert!(why.contains(named), "{named}: {why}")
+                    assert!(why.contains(named), "{named}: {why}");
                 }
                 other => panic!("{answer} must be refused as not poolable, got {other:?}"),
             }
@@ -628,14 +629,12 @@ mod tests {
     const ACCESS_PAYLOAD: &str = "eyJleHAiOjE4MDAwMDAwMDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X2FjY291bnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJjaGF0Z3B0X3BsYW5fdHlwZSI6InBybyJ9fQ";
     const ID_PAYLOAD: &str = "eyJleHAiOjE4MDAwMDAwMDAsImVtYWlsIjoiYWxpY2VAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwcm8iLCJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyLWZha2UifX0";
 
-    async fn codex_header_stub(
-        status: u16,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Option<String>>>) {
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let seen = captured.clone();
+    async fn codex_header_stub(status: u16) -> (String, Arc<std::sync::Mutex<Option<String>>>) {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let seen = Arc::clone(&captured);
         let answer = keyed(&[(ACCOUNT_A, workspace("NO_CONSTRAINT", "NO_CONSTRAINT"))]);
         let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
-            let seen = seen.clone();
+            let seen = Arc::clone(&seen);
             let answer = answer.clone();
             async move {
                 *seen.lock().unwrap() = headers

@@ -282,7 +282,7 @@ fn reached_type_from_payload(value: Option<&Value>) -> Option<String> {
 ///
 /// Only a string, because that is what the backend sends (the measured payload's `balance` is
 /// a string, `scripts/codex-contract-probe.sh`), and because the wire promises the backend's
-/// own text: a JSON number would come back re-rendered by serde_json, `12.50` as `"12.5"`,
+/// own text: a JSON number would come back re-rendered by `serde_json`, `12.50` as `"12.5"`,
 /// which is not what ChatGPT wrote.
 fn credits_from_payload(value: Option<&Value>) -> Option<tcr_status_wire::CodexCredits> {
     let credits = value?.as_object()?;
@@ -299,6 +299,7 @@ fn credits_from_payload(value: Option<&Value>) -> Option<tcr_status_wire::CodexC
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     const PAYLOAD: &str = r#"{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,
         "primary_window":{"used_percent":25,"limit_window_seconds":18000,"reset_after_seconds":3600,"reset_at":1800003600},
@@ -913,8 +914,8 @@ mod tests {
     async fn fetch_sends_tcr_user_agent() {
         use axum::{Router, routing::get};
 
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let captured = seen.clone();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let captured = Arc::clone(&seen);
         let app = Router::new().route(
             "/backend-api/wham/usage",
             get(move |headers: axum::http::HeaderMap| async move {
@@ -950,12 +951,12 @@ mod tests {
     #[tokio::test]
     async fn fetch_sends_bearer_and_account_header_and_maps_401() {
         use axum::{Router, response::IntoResponse, routing::get};
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
-        let seen2 = seen.clone();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let seen2 = Arc::clone(&seen);
         let app = Router::new().route(
             "/backend-api/wham/usage",
             get(move |headers: axum::http::HeaderMap| {
-                let seen2 = seen2.clone();
+                let seen2 = Arc::clone(&seen2);
                 async move {
                     let mut s = seen2.lock().unwrap();
                     for k in ["authorization", "chatgpt-account-id"] {

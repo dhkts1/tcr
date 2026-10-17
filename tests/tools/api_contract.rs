@@ -29,13 +29,13 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
 
 /// The header names a message request must carry to be answered at all.
-pub const REQUIRED_REQUEST_HEADERS: [&str; 2] = ["anthropic-version", "content-type"];
+pub(crate) const REQUIRED_REQUEST_HEADERS: [&str; 2] = ["anthropic-version", "content-type"];
 
 /// Which of [`REQUIRED_REQUEST_HEADERS`] this request is missing, in order.
 ///
 /// `content-type` is only asked of a method that carries a body, for the reason
 /// in the module docs.
-pub fn missing_required_headers(method: &Method, headers: &HeaderMap) -> Vec<&'static str> {
+pub(crate) fn missing_required_headers(method: &Method, headers: &HeaderMap) -> Vec<&'static str> {
     let carries_a_body = method != Method::GET && method != Method::HEAD;
     REQUIRED_REQUEST_HEADERS
         .into_iter()
@@ -46,7 +46,7 @@ pub fn missing_required_headers(method: &Method, headers: &HeaderMap) -> Vec<&'s
 
 /// The 400 the origin answers, naming what was missing so a failing test says
 /// which header the path dropped rather than only that the borrow failed.
-pub fn missing_header_refusal(missing: &[&'static str]) -> Response {
+pub(crate) fn missing_header_refusal(missing: &[&'static str]) -> Response {
     let body = format!(
         r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"missing required header(s): {}"}}}}"#,
         missing.join(", ")
@@ -60,7 +60,7 @@ pub fn missing_header_refusal(missing: &[&'static str]) -> Response {
 
 /// The whole rule in one call: `Some(refusal)` when this request would be
 /// refused by the origin, `None` when it may be answered.
-pub fn refuse_if_incomplete(method: &Method, headers: &HeaderMap) -> Option<Response> {
+pub(crate) fn refuse_if_incomplete(method: &Method, headers: &HeaderMap) -> Option<Response> {
     let missing = missing_required_headers(method, headers);
     if missing.is_empty() {
         return None;

@@ -229,10 +229,12 @@ impl ConfigShow {
         let mut text = self.saved.render_text();
         match (&self.running, self.waiting()) {
             (None, _) => {
-                text.push_str("\nNo proxy answered on this config's port, so nothing is waiting.\n")
+                text.push_str(
+                    "\nNo proxy answered on this config's port, so nothing is waiting.\n",
+                );
             }
             (Some(_), waiting) if waiting.is_empty() => {
-                text.push_str("\nThe running proxy uses every value above.\n")
+                text.push_str("\nThe running proxy uses every value above.\n");
             }
             (Some(_), waiting) => text.push_str(&format!(
                 "\nWaiting for a proxy restart: {}.\n",

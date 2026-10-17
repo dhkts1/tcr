@@ -121,19 +121,19 @@ pub enum ProxyHost {
     /// there, do not signal it" is strictly safer than degrading to "nothing is
     /// there", so this maps to [`ProxyKind::TcrEmbedded`].
     ///
-    /// Only ever produced by DEserialization. Nothing in this crate writes it.
+    /// Only ever produced by `DEserialization`. Nothing in this crate writes it.
     #[serde(other)]
     Unknown,
 }
 
 impl ProxyHost {
     /// The incumbent kind a *verified* claim from this host means.
-    fn kind(self) -> ProxyKind {
+    const fn kind(self) -> ProxyKind {
         match self {
-            ProxyHost::Cli => ProxyKind::Tcr,
+            Self::Cli => ProxyKind::Tcr,
             // An unrecognized host is treated as embedded: of the two, it is the
             // kind that is never signalled. See [`ProxyHost::Unknown`].
-            ProxyHost::Embedded | ProxyHost::Unknown => ProxyKind::TcrEmbedded,
+            Self::Embedded | Self::Unknown => ProxyKind::TcrEmbedded,
         }
     }
 }
@@ -508,7 +508,7 @@ fn process_command(pid: u32) -> Vec<String> {
 /// ourselves, NEVER [`listeners::get_process_by_port`]. That shortcut applies no
 /// socket-state filter at all (upstream `listeners` issue #36, open,
 /// maintainer-confirmed) and returns the FIRST socket matching the port —
-/// `sshd` LISTENing on 22 and `sshd-session` ESTABLISHED on the same local port
+/// `sshd` `LISTENing` on 22 and `sshd-session` ESTABLISHED on the same local port
 /// both key to port 22, and the shortcut can hand back the child. Our old
 /// `lsof -sTCP:LISTEN` excluded non-listening sockets specifically so that a
 /// pid merely ESTABLISHED as a *client* of our port could never reach
@@ -655,7 +655,7 @@ fn is_alive(pid: u32) -> bool {
     sys.process(Pid::from_u32(pid)).is_some()
 }
 
-/// How long [`takeover_port`] gives a SIGTERMed incumbent to exit on its own
+/// How long [`takeover_port`] gives a `SIGTERMed` incumbent to exit on its own
 /// before escalating to SIGKILL.
 ///
 /// A **ceiling, not a floor**: [`wait_for_exit`] returns the moment the process
@@ -773,7 +773,7 @@ pub enum Takeover {
 ///
 /// A [`ProxyKind::TcrEmbedded`] incumbent is checked BEFORE `replace`, and is the
 /// one kind `--replace` cannot override: the pid on the port belongs to the host
-/// application, so replacing it means SIGTERMing a GUI that installs no handler
+/// application, so replacing it means `SIGTERMing` a GUI that installs no handler
 /// for it. See [`ProxyKind::TcrEmbedded`].
 ///
 /// That stand-down decides only whether WE bind. It says nothing about the OTHER
@@ -1011,7 +1011,7 @@ mod tests {
     /// transient failure partway through it (the per-process `openat` calls
     /// in `helpers.rs` each silently `continue` on error) can drop THIS
     /// process's own fd from the map even though the listener this test just
-    /// bound is definitely open and definitely LISTENing for the socket-table
+    /// bound is definitely open and definitely `LISTENing` for the socket-table
     /// read that follows. The retry re-runs the whole two-snapshot join; it
     /// never touches production code, and a holder that is genuinely absent
     /// still fails after this bound elapses.
@@ -1066,7 +1066,7 @@ mod tests {
     /// the same pid and port, so without the dedup this reports `[pid, pid]` and
     /// callers that read the first element still get the right pid — but the
     /// `takeover_port` signal loop iterates the WHOLE list, so the SIGTERM ->
-    /// sleep -> is_alive -> SIGKILL sequence would run twice against one process
+    /// sleep -> `is_alive` -> SIGKILL sequence would run twice against one process
     /// with no fresh verification on the second pass. Port 0, in-process,
     /// nothing signalled.
     #[test]
@@ -1585,7 +1585,7 @@ mod tests {
     ///
     /// The stale-file test above only covers "the pid is not listening", which a
     /// recycled pid passes trivially. The scenario that costs someone their unsaved
-    /// state is the other one: `tcr` is SIGKILLed leaving a `cli` claim behind,
+    /// state is the other one: `tcr` is `SIGKILLed` leaving a `cli` claim behind,
     /// months later that pid is a dev server on the same port, and a reader that
     /// treats the claim as sufficient hands it to the kill loop. `verified_owner`
     /// must ask `ps` before believing a `cli` claim, and the pid must then survive

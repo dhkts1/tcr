@@ -292,14 +292,14 @@ pub fn base64url_decode(s: &str) -> Option<Vec<u8>> {
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
     for b in s.bytes() {
-        let v = match b {
+        let v = u32::from(match b {
             b'A'..=b'Z' => b - b'A',
             b'a'..=b'z' => b - b'a' + 26,
             b'0'..=b'9' => b - b'0' + 52,
             b'-' => 62,
             b'_' => 63,
             _ => return None,
-        } as u32;
+        });
         acc = (acc << 6) | v;
         bits += 6;
         if bits >= 8 {
@@ -316,6 +316,7 @@ pub fn base64url_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     const JWT_HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
     const ACCESS_PAYLOAD: &str = "eyJleHAiOjE4MDAwMDAwMDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X2FjY291bnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJjaGF0Z3B0X3BsYW5fdHlwZSI6InBybyJ9fQ";
@@ -495,7 +496,7 @@ mod tests {
 
     struct Stub {
         addr: std::net::SocketAddr,
-        seen: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Seen>>>,
+        seen: Arc<std::sync::Mutex<std::collections::HashMap<u64, Seen>>>,
         next: std::sync::atomic::AtomicU64,
     }
 
@@ -506,15 +507,14 @@ mod tests {
     /// call bound a listener and a connection of its own.
     static STUB: std::sync::LazyLock<Stub> = std::sync::LazyLock::new(|| {
         use axum::{Router, extract::Path, extract::State, http::HeaderMap, routing::post};
-        let seen: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Seen>>> =
-            std::sync::Arc::default();
-        let state = seen.clone();
+        let seen: Arc<std::sync::Mutex<std::collections::HashMap<u64, Seen>>> = Arc::default();
+        let state = Arc::clone(&seen);
         let app = Router::new()
             .route(
                 "/oauth/token/{id}/{status}/{body}",
                 post(
                     |State(seen): State<
-                        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Seen>>>,
+                        Arc<std::sync::Mutex<std::collections::HashMap<u64, Seen>>>,
                     >,
                      Path((id, status, body)): Path<(u64, u16, String)>,
                      headers: HeaderMap,
@@ -705,7 +705,7 @@ mod tests {
                 code: Some("refresh_token_reused")
             })
         ));
-        let (url, _) = stub(401, r#"{}"#).await;
+        let (url, _) = stub(401, "{}").await;
         assert!(matches!(
             refresh_access_token_at(&client, "rt", &url).await,
             Err(OAuthError::AuthRejected {

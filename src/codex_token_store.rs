@@ -8,7 +8,7 @@
 //!
 //! A write holds a private advisory lock shared by tcr writers, writes a private temporary file
 //! in the same directory, and compares the complete original immediately before renaming.
-//! Codex's current FileAuthStorage writes without this lock, so the comparison and rename are
+//! Codex's current `FileAuthStorage` writes without this lock, so the comparison and rename are
 //! not an atomic compare-and-swap against Codex: a Codex write in that final gap can still race.
 //! The lock serializes cooperative tcr writers; the final comparison detects completed external
 //! changes. No cross-process lock protocol is currently shared with Codex.

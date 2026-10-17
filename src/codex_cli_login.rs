@@ -473,7 +473,7 @@ impl ProcessIdentity {
     }
 }
 
-fn signal_target_is_current(expected: ProcessIdentity, current: ProcessIdentity) -> bool {
+const fn signal_target_is_current(expected: ProcessIdentity, current: ProcessIdentity) -> bool {
     expected.pid == current.pid
         && expected.start_time > 0
         && expected.start_time == current.start_time
@@ -575,19 +575,19 @@ enum Caught {
 
 impl Caught {
     /// Its number, the same on macOS and Linux.
-    fn number(self) -> i32 {
+    const fn number(self) -> i32 {
         match self {
-            Caught::Hangup => 1,
-            Caught::Interrupt => 2,
-            Caught::Terminate => 15,
+            Self::Hangup => 1,
+            Self::Interrupt => 2,
+            Self::Terminate => 15,
         }
     }
 
-    fn as_sysinfo(self) -> sysinfo::Signal {
+    const fn as_sysinfo(self) -> sysinfo::Signal {
         match self {
-            Caught::Hangup => sysinfo::Signal::Hangup,
-            Caught::Interrupt => sysinfo::Signal::Interrupt,
-            Caught::Terminate => sysinfo::Signal::Term,
+            Self::Hangup => sysinfo::Signal::Hangup,
+            Self::Interrupt => sysinfo::Signal::Interrupt,
+            Self::Terminate => sysinfo::Signal::Term,
         }
     }
 }
@@ -648,7 +648,7 @@ fn family_of(root: ProcessIdentity) -> Vec<ProcessIdentity> {
         let parent = family[next].pid;
         for process in system.processes().values() {
             let identity = ProcessIdentity::of(process);
-            if process.parent().map(sysinfo::Pid::as_u32) == Some(parent)
+            if process.parent().map(Pid::as_u32) == Some(parent)
                 && !family.iter().any(|member| member.pid == identity.pid)
             {
                 family.push(identity);

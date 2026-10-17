@@ -96,10 +96,7 @@ impl Manager {
         // config lock, and holding both at once here would invert the order
         // `set_disabled` takes them in (accounts, then config).
         let awaiting_first_probe = self.probe_interval_seconds() > 0;
-        let accounts = self
-            .accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
         accounts
             .iter()
             .enumerate()
@@ -223,7 +220,7 @@ impl Manager {
         let mut accounts = self
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         let Some(account) = accounts.get_mut(idx) else {
             return false;
         };
@@ -246,7 +243,7 @@ impl Manager {
         let mut accounts = self
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         let Some(account) = accounts.get_mut(idx) else {
             return;
         };

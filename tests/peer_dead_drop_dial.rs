@@ -50,7 +50,7 @@ use tcr::peer::drop::{
 use tcr::peer::serve;
 use tcr_peer_wire::PeerId;
 
-fn peer_id(fill: u8) -> PeerId {
+const fn peer_id(fill: u8) -> PeerId {
     PeerId([fill; 32])
 }
 

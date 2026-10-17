@@ -67,7 +67,7 @@ const SYMMETRIC_FIRST_PORT: u16 = 61_001;
 
 /// How a box chooses external ports. See the module doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mapping {
+pub(super) enum Mapping {
     /// One external port per internal port, whatever the destination, and
     /// equal to the internal port. RFC 4787 REQ-1's endpoint-independent
     /// mapping, plus port preservation.
@@ -114,7 +114,7 @@ impl std::fmt::Display for Refusal {
 
 impl From<Refusal> for io::Error {
     fn from(refusal: Refusal) -> Self {
-        io::Error::new(io::ErrorKind::ConnectionRefused, refusal.to_string())
+        Self::new(io::ErrorKind::ConnectionRefused, refusal.to_string())
     }
 }
 
@@ -145,7 +145,7 @@ struct BoxState {
 /// One struct rather than a box and a host, because every box here has exactly
 /// one machine behind it and a second one would need an internal address space
 /// this simulator has no use for.
-pub struct NatBox {
+pub(super) struct NatBox {
     public: Ipv4Addr,
     mapping: Mapping,
     internet: Internet,
@@ -154,7 +154,7 @@ pub struct NatBox {
 
 impl NatBox {
     /// This node's public address, which is what a peer punches at.
-    pub fn public_ip(&self) -> IpAddr {
+    pub(super) const fn public_ip(&self) -> IpAddr {
         IpAddr::V4(self.public)
     }
 
@@ -164,7 +164,7 @@ impl NatBox {
     /// inferring it from a punch that worked: a simulator that quietly handed
     /// out a different external port would still let a punch through if the
     /// test only looked at the outcome.
-    pub fn mappings(&self) -> Vec<(u16, u16)> {
+    pub(super) fn mappings(&self) -> Vec<(u16, u16)> {
         let held = self.locked();
         let mut rows: Vec<_> = held
             .table
@@ -176,7 +176,7 @@ impl NatBox {
     }
 
     /// Every refusal this box has made, in order.
-    pub fn refusals(&self) -> Vec<Refusal> {
+    pub(super) fn refusals(&self) -> Vec<Refusal> {
         self.locked().refused.clone()
     }
 
@@ -268,17 +268,17 @@ impl NatBox {
 
 /// The virtual network every box is attached to.
 #[derive(Clone, Default)]
-pub struct Internet {
+pub(super) struct Internet {
     boxes: Arc<Mutex<HashMap<Ipv4Addr, Arc<NatBox>>>>,
 }
 
 impl Internet {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::default()
     }
 
     /// Attach a box at `public`, with one node behind it.
-    pub fn attach(&self, public: Ipv4Addr, mapping: Mapping) -> Node {
+    pub(super) fn attach(&self, public: Ipv4Addr, mapping: Mapping) -> Node {
         let router = Arc::new(NatBox {
             public,
             mapping,
@@ -318,24 +318,24 @@ impl Internet {
 /// another crate cannot be implemented on `Arc`. Clone is cheap and shares one
 /// box, which is what a second task on the same Mac should see.
 #[derive(Clone)]
-pub struct Node {
+pub(super) struct Node {
     router: Arc<NatBox>,
 }
 
 impl Node {
     /// This node's public address, which is what a peer punches at.
-    pub fn public_ip(&self) -> IpAddr {
+    pub(super) fn public_ip(&self) -> IpAddr {
         self.router.public_ip()
     }
 
     /// Every (external port, internal port) pair its box holds. See
     /// [`NatBox::mappings`].
-    pub fn mappings(&self) -> Vec<(u16, u16)> {
+    pub(super) fn mappings(&self) -> Vec<(u16, u16)> {
         self.router.mappings()
     }
 
     /// Every refusal its box has made, in order.
-    pub fn refusals(&self) -> Vec<Refusal> {
+    pub(super) fn refusals(&self) -> Vec<Refusal> {
         self.router.refusals()
     }
 }

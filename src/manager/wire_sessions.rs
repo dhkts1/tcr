@@ -32,7 +32,7 @@ impl Manager {
         let mut tracker = self
             .wire_sessions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         tracker.record_request(session_id, account, model, now_ms, tool_uses, tool_results);
         drop(tracker);
         self.mark_wire_sessions_dirty();
@@ -63,7 +63,7 @@ impl Manager {
         let mut tracker = self
             .wire_sessions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         tracker.record_response_tool_uses(session_id, now_ms, tool_uses);
         drop(tracker);
         self.mark_wire_sessions_dirty();
@@ -93,7 +93,7 @@ impl Manager {
         let mut tracker = self
             .wire_sessions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         tracker.record_usage(session_id, record);
         drop(tracker);
         self.mark_wire_sessions_dirty();
@@ -137,7 +137,7 @@ impl Manager {
         let mut tracker = self
             .wire_sessions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         tracker.record_codex_model_request(session_id, account, path, now_ms);
         drop(tracker);
         self.mark_wire_sessions_dirty();
@@ -163,7 +163,7 @@ impl Manager {
         let mut tracker = self
             .wire_sessions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         tracker.record_codex_tool_calls(session_id, now_ms, calls);
         drop(tracker);
         self.mark_wire_sessions_dirty();
@@ -186,7 +186,7 @@ impl Manager {
         let mut tracker = self
             .wire_sessions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         tracker.record_codex_usage(session_id, record);
         drop(tracker);
         self.mark_wire_sessions_dirty();
@@ -202,7 +202,7 @@ impl Manager {
         let tracker = self
             .wire_sessions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         tracker
             .snapshot(now_ms)
             .into_iter()
@@ -327,13 +327,13 @@ impl Manager {
     /// bare zero it has always shown.
     fn price_session(
         usage: &crate::usage::UsageTracker,
-        by_model: &std::collections::HashMap<String, crate::session_wire::ModelTokenTally>,
+        by_model: &HashMap<String, crate::session_wire::ModelTokenTally>,
     ) -> (f64, u64, u64) {
         let (mut unpriced, mut priced) = (0, 0);
         let nanos: u64 = by_model
             .iter()
-            .filter_map(|(model, tally)| match usage.price_for(model) {
-                Some(price) => {
+            .filter_map(|(model, tally)| {
+                if let Some(price) = usage.price_for(model) {
                     priced += tally.requests;
                     Some(crate::pricing::cost_nanos(
                         &price,
@@ -343,8 +343,7 @@ impl Manager {
                         tally.cache_read,
                         tally.output,
                     ))
-                }
-                None => {
+                } else {
                     unpriced += tally.requests;
                     None
                 }
@@ -359,8 +358,7 @@ impl Manager {
     pub(super) fn wire_sessions_summary(
         rows: &[tcr_status_wire::SessionRow],
     ) -> tcr_status_wire::SessionsSummary {
-        let mut by_tool: std::collections::HashMap<String, tcr_status_wire::ToolBucketRow> =
-            std::collections::HashMap::new();
+        let mut by_tool: HashMap<String, tcr_status_wire::ToolBucketRow> = HashMap::new();
         let mut summary = tcr_status_wire::SessionsSummary::default();
         for row in rows {
             summary.calls += row.tools.calls;
@@ -412,7 +410,7 @@ impl Manager {
     /// flusher, spawned only when a path was configured — and the caller logs the
     /// failure and carries on, same as [`Self::flush_affinity`]: a proxy that cannot
     /// write this cache still serves traffic exactly as it did before this file existed.
-    pub fn flush_wire_sessions(&self, path: &Path) -> Result<usize, crate::config::ConfigError> {
+    pub fn flush_wire_sessions(&self, path: &Path) -> Result<usize, config::ConfigError> {
         let now_ms = crate::now_ms();
         let sessions = self.wire_sessions_to_save(now_ms);
         self.wire_sessions_file
@@ -428,7 +426,7 @@ impl Manager {
     pub fn flush_wire_sessions_if_changed(
         &self,
         path: &Path,
-    ) -> Result<crate::save_gate::SaveOutcome, crate::config::ConfigError> {
+    ) -> Result<crate::save_gate::SaveOutcome, config::ConfigError> {
         let now_ms = crate::now_ms();
         let sessions = self.wire_sessions_to_save(now_ms);
         self.wire_sessions_file
@@ -442,11 +440,11 @@ impl Manager {
     fn wire_sessions_to_save(
         &self,
         now_ms: i64,
-    ) -> std::collections::HashMap<String, crate::session_wire::WireSession> {
+    ) -> HashMap<String, crate::session_wire::WireSession> {
         let tracker = self
             .wire_sessions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         tracker.snapshot(now_ms).into_iter().collect()
     }
 
@@ -465,7 +463,7 @@ impl Manager {
             let mut tracker = self
                 .wire_sessions
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             tracker.restore(report.sessions.clone());
         }
         report
@@ -827,7 +825,7 @@ mod tests {
         );
     }
 
-    fn tmp_wire_sessions_path(label: &str) -> std::path::PathBuf {
+    fn tmp_wire_sessions_path(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "tcr-wire-sessions-manager-test-{}-{label}-{}",
             std::process::id(),
@@ -871,8 +869,7 @@ mod tests {
         assert_eq!(written, 1);
 
         let second = Manager::from_runtimes(vec![]);
-        let report =
-            second.restore_wire_sessions(&path, crate::session_wire_persist::RESTORE_TTL_MS);
+        let report = second.restore_wire_sessions(&path, session_wire_persist::RESTORE_TTL_MS);
         assert_eq!(report.degraded, None);
         assert_eq!(report.sessions.len(), 1);
 
@@ -916,7 +913,7 @@ mod tests {
             &[],
             &[],
         );
-        second.restore_wire_sessions(&path, crate::session_wire_persist::RESTORE_TTL_MS);
+        second.restore_wire_sessions(&path, session_wire_persist::RESTORE_TTL_MS);
 
         let snap = second.snapshot(now);
         assert_eq!(snap.wire_sessions.len(), 1);
@@ -1025,7 +1022,7 @@ mod tests {
             Some("sess-claude"),
             &wire_usage(Some("claude-opus-4-5"), 1_000, 0, 0, 0, 10),
         );
-        let rows: std::collections::HashMap<String, tcr_status_wire::SessionRow> = manager
+        let rows: HashMap<String, tcr_status_wire::SessionRow> = manager
             .snapshot(now)
             .wire_sessions
             .into_iter()
@@ -1046,7 +1043,7 @@ mod tests {
             assert!(json.get(key).is_none(), "a Claude session carries no {key}");
         }
 
-        let config: crate::config::Config =
+        let config: Config =
             serde_json::from_str(r#"{"pricing":{"gpt-5.1-codex":{"input":1.25,"output":10}}}"#)
                 .expect("a config with one price");
         let priced = Manager::with_live_refresher(config, None);
@@ -1125,7 +1122,7 @@ mod tests {
             "no $0.00 while the second turn streams"
         );
 
-        let config: crate::config::Config =
+        let config: Config =
             serde_json::from_str(r#"{"pricing":{"gpt-5.1-codex":{"input":1.25,"output":10}}}"#)
                 .expect("a config with one price");
         let priced = Manager::with_live_refresher(config, None);

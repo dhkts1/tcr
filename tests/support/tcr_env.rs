@@ -16,7 +16,7 @@ use std::process::Command;
 const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// The built `tcr` with the baseline environment over `home`.
-pub fn tcr(home: &Path) -> Command {
+pub(crate) fn tcr(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
     isolate(&mut command, home);
     command
@@ -28,7 +28,7 @@ pub fn tcr(home: &Path) -> Command {
 /// `TCR_CLAUDE_CODE_CREDENTIALS` names a file that does not exist, because a scratch `HOME` does
 /// not scratch the login Keychain and the first run imports this machine's Claude Code login
 /// when it finds one; an empty value reads as unset and falls through to the Keychain.
-pub fn isolate<'a>(command: &'a mut Command, home: &Path) -> &'a mut Command {
+pub(crate) fn isolate<'a>(command: &'a mut Command, home: &Path) -> &'a mut Command {
     command
         .env_clear()
         .env("PATH", SYSTEM_PATH)

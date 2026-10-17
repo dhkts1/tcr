@@ -574,7 +574,7 @@ fn the_briefed_ssrf_answer_is_refused_by_its_own_rule() {
     );
     match outcome {
         Err(UpnpError::UntrustedLocation { reason, .. }) => {
-            assert!(reason.contains("is not the responder"), "got {reason:?}")
+            assert!(reason.contains("is not the responder"), "got {reason:?}");
         }
         other => panic!("expected a named UntrustedLocation refusal, got {other:?}"),
     }
@@ -638,7 +638,7 @@ fn check_location_refuses_a_name_host_and_a_foreign_scheme() {
             assert!(
                 reason.contains("is a name, not an address"),
                 "got {reason:?}"
-            )
+            );
         }
         other => panic!("expected a named refusal for a name host, got {other:?}"),
     }
@@ -647,7 +647,7 @@ fn check_location_refuses_a_name_host_and_a_foreign_scheme() {
         reach_upnp::check_location("file:///etc/hosts", LOOPBACK, LocationPolicy::Loopback);
     match scheme {
         Err(UpnpError::UntrustedLocation { reason, .. }) => {
-            assert!(reason.contains("the scheme is"), "got {reason:?}")
+            assert!(reason.contains("the scheme is"), "got {reason:?}");
         }
         other => panic!("expected a named refusal for a foreign scheme, got {other:?}"),
     }
@@ -707,10 +707,10 @@ fn a_control_url_on_another_host_is_refused_by_name() {
 #[test]
 fn locate_control_url_refuses_a_lookalike_authority() {
     let doc = format!(
-        r#"<root><device><serviceList>
+        "<root><device><serviceList>
       <service><serviceType>{}</serviceType>
         <controlURL>http://192.168.1.1.evil.example/upnp/control</controlURL></service>
-    </serviceList></device></root>"#,
+    </serviceList></device></root>",
         SERVICE_TYPES[0]
     );
     let root = reach_upnp::parse_xml(&doc).expect("a well-formed description must parse");
@@ -724,10 +724,10 @@ fn locate_control_url_refuses_a_lookalike_authority() {
     // must still be accepted: this rule refuses another host, not another
     // spelling.
     let same = format!(
-        r#"<root><device><serviceList>
+        "<root><device><serviceList>
       <service><serviceType>{}</serviceType>
         <controlURL>http://192.168.1.1:80/upnp/control</controlURL></service>
-    </serviceList></device></root>"#,
+    </serviceList></device></root>",
         SERVICE_TYPES[0]
     );
     let root = reach_upnp::parse_xml(&same).expect("a well-formed description must parse");
@@ -772,7 +772,7 @@ fn parse_xml_reads_comments_entities_and_self_closing_tags() {
 #[test]
 fn locate_control_url_finds_the_wan_service_and_resolves_a_relative_url() {
     let doc = format!(
-        r#"<root>
+        "<root>
   <device>
     <serviceList>
       <service><serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType>
@@ -781,7 +781,7 @@ fn locate_control_url_finds_the_wan_service_and_resolves_a_relative_url() {
         <controlURL>/upnp/control</controlURL></service>
     </serviceList>
   </device>
-</root>"#,
+</root>",
         SERVICE_TYPES[0]
     );
     let root = reach_upnp::parse_xml(&doc).expect("a well-formed description must parse");
@@ -796,10 +796,10 @@ fn locate_control_url_finds_the_wan_service_and_resolves_a_relative_url() {
 /// named error, not a panic and not a silent empty answer.
 #[test]
 fn locate_control_url_names_the_error_when_no_wan_service_is_present() {
-    let doc = r#"<root><device><serviceList>
+    let doc = "<root><device><serviceList>
       <service><serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType>
         <controlURL>/upnp/l3f</controlURL></service>
-    </serviceList></device></root>"#;
+    </serviceList></device></root>";
     let root = reach_upnp::parse_xml(doc).expect("a well-formed description must parse");
     let outcome = reach_upnp::locate_control_url(&root, "http://192.168.1.1:5000/desc.xml");
     assert!(
@@ -904,7 +904,7 @@ fn register_lock() -> &'static Mutex<()> {
 fn hold_register() -> std::sync::MutexGuard<'static, ()> {
     register_lock()
         .lock()
-        .unwrap_or_else(|held| held.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// A NAT-PMP gateway address nobody answers from, held open so the OS cannot
@@ -1157,7 +1157,7 @@ fn a_upnp_mapping_is_published_renewed_and_deleted_over_upnp() {
         match (reach::external_socket(), published) {
             (Some(addr), None) if addr.port() == MAPPED_PORT => published = Some(addr),
             (Some(addr), Some(_)) if addr.port() != MAPPED_PORT => {
-                withdrawn_after_publishing = true
+                withdrawn_after_publishing = true;
             }
             (None, Some(_)) => withdrawn_after_publishing = true,
             _ => {}

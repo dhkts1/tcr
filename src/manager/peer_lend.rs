@@ -29,7 +29,7 @@
 
 use super::*;
 
-impl crate::config::EgressPin {
+impl config::EgressPin {
     /// Does this exit lock forbid handing the account's bearer to a borrower?
     ///
     /// # One sentence, three readers, and the one that disagreed
@@ -48,7 +48,7 @@ impl crate::config::EgressPin {
     /// granted, buys nothing, and reports nothing. The other two read `strict`
     /// alone. This is the one answer now, and the lend verb was the one that
     /// moved.
-    pub fn forbids_handoff(&self) -> bool {
+    pub const fn forbids_handoff(&self) -> bool {
         self.strict
     }
 
@@ -75,13 +75,13 @@ impl crate::config::EgressPin {
     }
 }
 
-impl crate::config::Account {
+impl config::Account {
     /// Whether this account's exit lock forbids handing its bearer over.
     ///
     /// The whole rule is in [`crate::config::EgressPin::forbids_handoff`]; this
     /// is the form the two callers that hold a config account want, so neither
     /// of them re-derives the pin.
-    pub fn cannot_be_handed(&self) -> bool {
+    pub const fn cannot_be_handed(&self) -> bool {
         self.egress_pin().forbids_handoff()
     }
 }
@@ -216,18 +216,15 @@ impl Manager {
         // By index, which is the pairing `Manager::account_egress` and
         // `Manager::access_token` already rest on: the config vector and the
         // runtime vector are appended to together and never reordered.
-        let pins: Vec<crate::config::EgressPin> = self
+        let pins: Vec<config::EgressPin> = self
             .config
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .accounts
             .iter()
-            .map(crate::config::Account::egress_pin)
+            .map(config::Account::egress_pin)
             .collect();
-        let accounts = self
-            .accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
         accounts
             .iter()
             .enumerate()
@@ -249,8 +246,7 @@ impl Manager {
             })
             .map(|(index, account)| {
                 let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
-                let guard =
-                    super::select::effective_threshold(threshold, self.control_reserve, true);
+                let guard = select::effective_threshold(threshold, self.control_reserve, true);
                 let utilization = window_utilization(&account.quota, window, now);
                 let room = utilization.map_or(0.0, |utilization| (guard - utilization).max(0.0));
                 // An account with no measured window at all is neither the
@@ -284,7 +280,7 @@ impl Manager {
                 // its own doc says may fall back, so it is lent like any other
                 // account.
                 let handable = account.status != AccountStatus::Throttled
-                    && crate::config::EgressPin::may_be_handed(&pins, index);
+                    && config::EgressPin::may_be_handed(&pins, index);
                 let bearer = handable
                     .then(|| {
                         account
@@ -413,10 +409,7 @@ impl Manager {
         window: tcr_peer_wire::Window,
         now: OffsetDateTime,
     ) -> Vec<Option<f64>> {
-        let accounts = self
-            .accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
         accounts
             .iter()
             .map(|account| window_utilization(&account.quota, window, now))
@@ -446,12 +439,12 @@ struct LendCandidate {
 
 impl LendCandidate {
     /// The one figure a hand-mode lease is both sized by and picked by.
-    fn handable_room(&self) -> f64 {
+    const fn handable_room(&self) -> f64 {
         self.room.min(self.room_anywhere)
     }
 
     /// Whether this account's bearer could go out at all.
-    fn may_be_handed(&self) -> bool {
+    const fn may_be_handed(&self) -> bool {
         self.bearer.is_some()
     }
 
@@ -544,10 +537,7 @@ impl crate::peer::serve::WindowUtilization for Manager {
         // nothing measured to lend.
         self.reload_groups_if_changed();
         let anything_measured = {
-            let accounts = self
-                .accounts
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
             accounts
                 .iter()
                 // Lending a Codex account over the mesh is unmeasured (the borrower's proxy would need the chatgpt-account-id swap too), so this version never lends one.
@@ -632,10 +622,7 @@ impl crate::peer::serve::WindowUtilization for Manager {
                 // carries; both read the SAME sanitized label, which is what
                 // keeps the two in step.
                 let named: Vec<String> = {
-                    let accounts = self
-                        .accounts
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                     accounts
                         .iter()
                         .filter_map(|account| tcr_peer_wire::sanitize_label(&account.name).ok())
@@ -656,10 +643,7 @@ impl crate::peer::serve::WindowUtilization for Manager {
                     return ScopeRestriction::Unenforceable;
                 }
                 let members = {
-                    let accounts = self
-                        .accounts
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                     accounts
                         .iter()
                         .filter(|account| account.groups.iter().any(|group| group == name))
@@ -1103,7 +1087,7 @@ mod tests {
 
         // `work` has a member and no spill; `loose` has a member and spills;
         // `empty` has neither. No real email, no org uuid: this repo is public.
-        let config: config::Config = serde_json::from_str(
+        let config: Config = serde_json::from_str(
             r#"{
                 "groupSettings": {
                     "loose": { "spillToPool": true },

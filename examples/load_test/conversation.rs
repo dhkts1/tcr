@@ -16,7 +16,7 @@ const WORDS: [&str; 24] = [
 
 /// The part of a big body that stays the same from one turn to the next, serialized once:
 /// everything before the newest turn, with `messages` left open.
-pub struct History {
+pub(crate) struct History {
     /// `{"model":…,"system":…,"tools":…,"messages":[<old turns>` with no closing bracket.
     pub head: String,
 }
@@ -24,7 +24,7 @@ pub struct History {
 impl History {
     /// A conversation of about `target_bytes` once serialized, seeded so each session's
     /// history is its own.
-    pub fn generate(target_bytes: usize, seed: u64, user_id: &str) -> Self {
+    pub(crate) fn generate(target_bytes: usize, seed: u64, user_id: &str) -> Self {
         let mut rng = Rng::new(seed);
         let system = json!([
             {"type": "text", "text": "You are an agent for software engineering tasks."},
@@ -79,7 +79,12 @@ impl History {
 
     /// One request: the history, then the newest turn (the last reply's signed thinking
     /// echoed, when there is one, and a user message carrying the cache breakpoint).
-    pub fn body(&self, last_signature: Option<&str>, stream: bool, count_tokens: bool) -> String {
+    pub(crate) fn body(
+        &self,
+        last_signature: Option<&str>,
+        stream: bool,
+        count_tokens: bool,
+    ) -> String {
         let mut out = String::with_capacity(self.head.len() + 512);
         out.push_str(&self.head);
         if let Some(signature) = last_signature {

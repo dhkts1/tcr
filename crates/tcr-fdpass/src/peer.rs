@@ -85,7 +85,7 @@ struct AuditToken {
 }
 
 /// Size of an `audit_token_t`: eight 32-bit words.
-const AUDIT_TOKEN_BYTES: usize = std::mem::size_of::<AuditToken>();
+const AUDIT_TOKEN_BYTES: usize = size_of::<AuditToken>();
 
 /// Read the audit token of the process on the other end of `stream`.
 fn peer_audit_token(stream: &UnixStream) -> io::Result<AuditToken> {
@@ -99,7 +99,7 @@ fn peer_audit_token(stream: &UnixStream) -> io::Result<AuditToken> {
             SOL_LOCAL,
             LOCAL_PEERTOKEN,
             std::ptr::addr_of_mut!(token).cast(),
-            &mut len,
+            &raw mut len,
         )
     };
     if rc != 0 {

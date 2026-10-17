@@ -22,6 +22,7 @@
     reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
 )]
 
+use std::sync::Arc;
 use std::time::Duration;
 use tcr::log_err::LogErr as _;
 
@@ -273,8 +274,8 @@ async fn dropping_the_handle_stops_the_accept_loop_and_every_background_loop() {
     assert_eq!(handle.background_task_count(), 4);
 
     // Every task `serve` spawned captured one of these.
-    let manager = handle.manager().clone();
-    let live_tasks = || std::sync::Arc::strong_count(&manager) - 1;
+    let manager = Arc::clone(handle.manager());
+    let live_tasks = || Arc::strong_count(&manager) - 1;
     assert!(
         live_tasks() >= 4,
         "expected the accept loop and all three background loops to hold a manager clone, saw {}",

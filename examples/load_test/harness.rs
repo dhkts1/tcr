@@ -16,28 +16,28 @@ use tcr::paths::{self, Roots};
 
 /// How many fake accounts the scratch config holds: the size of the fleet the throttle
 /// defaults were tuned on.
-pub const ACCOUNTS: usize = 18;
+pub(crate) const ACCOUNTS: usize = 18;
 
 /// The live proxy's port. The connect guard refuses it even on loopback.
-pub const LIVE_PORT: u16 = 3456;
+pub(crate) const LIVE_PORT: u16 = 3456;
 /// The live proxy's peer listener. The test proxy must not bind it.
-pub const LIVE_PEER_PORT: u16 = 7755;
+pub(crate) const LIVE_PEER_PORT: u16 = 7755;
 
-pub fn account_name(i: usize) -> String {
+pub(crate) fn account_name(i: usize) -> String {
     format!("loadtest{i:02}@example.com")
 }
 
-pub fn account_uuid(i: usize) -> String {
+pub(crate) fn account_uuid(i: usize) -> String {
     format!("{i:08}-1111-4111-8111-111111111111")
 }
 
-pub fn org_uuid(i: usize) -> String {
+pub(crate) fn org_uuid(i: usize) -> String {
     format!("{i:08}-2222-4222-8222-222222222222")
 }
 
 /// The scratch config: 18 fake OAuth accounts (one org each, tokens valid for a year),
 /// `upstream` on the stub, and every timer that could reach elsewhere switched off.
-pub fn config_json(stub_port: u16, throttles_off: bool, now_ms: i64) -> Value {
+pub(crate) fn config_json(stub_port: u16, throttles_off: bool, now_ms: i64) -> Value {
     let upstream = format!("http://127.0.0.1:{stub_port}");
     let accounts: Vec<Value> = (0..ACCOUNTS)
         .map(|i| {
@@ -75,23 +75,23 @@ pub fn config_json(stub_port: u16, throttles_off: bool, now_ms: i64) -> Value {
 }
 
 /// The scratch roots one phase's proxy resolves every path from.
-pub struct Scratch {
+pub(crate) struct Scratch {
     pub home: PathBuf,
 }
 
 impl Scratch {
-    pub fn create(root: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn create(root: &Path) -> anyhow::Result<Self> {
         let home = root.to_path_buf();
         fs::create_dir_all(home.join(".config"))?;
         fs::create_dir_all(home.join(".cache"))?;
         Ok(Self { home })
     }
 
-    pub fn config_path(&self) -> PathBuf {
+    pub(crate) fn config_path(&self) -> PathBuf {
         self.home.join(".config").join(paths::CONFIG_FILE)
     }
 
-    pub fn roots(&self) -> Roots {
+    pub(crate) fn roots(&self) -> Roots {
         Roots {
             home: Some(self.home.clone()),
             xdg_cache_home: Some(self.home.join(".cache")),
@@ -99,7 +99,7 @@ impl Scratch {
     }
 
     /// The bound-token file the proxy restores at boot, by the crate's own path rule.
-    pub fn bound_token_path(&self) -> PathBuf {
+    pub(crate) fn bound_token_path(&self) -> PathBuf {
         bound_tokens::path_beside(&paths::cache_dir_in(&self.roots()).affinity_file())
     }
 }
@@ -107,7 +107,7 @@ impl Scratch {
 /// Fill the bound-token file to [`BOUND_TOKEN_CAP`] with fake tokens spread over the 18
 /// accounts and the last 20 hours, through the crate's own writer so the format is always
 /// the one the proxy reads.
-pub fn seed_bound_tokens(path: &Path, now_ms: i64) -> anyhow::Result<usize> {
+pub(crate) fn seed_bound_tokens(path: &Path, now_ms: i64) -> anyhow::Result<usize> {
     fs::create_dir_all(path.parent().context("the bound-token file has a parent")?)?;
     let mut snapshot = Snapshot::default();
     let slots: Vec<_> = (0..ACCOUNTS)
@@ -180,7 +180,7 @@ fn scratch_env(
 /// Prove the connect guard interposes on THIS binary before trusting it: run `tcr status`
 /// against a listener this process owns, with that port denied, and check the guard
 /// refused the connection and logged it, and the listener saw nothing.
-pub fn guard_positive_control(tcr: &Path, guard: &Path, dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn guard_positive_control(tcr: &Path, guard: &Path, dir: &Path) -> anyhow::Result<()> {
     let scratch = Scratch::create(&dir.join("guard-control"))?;
     fs::create_dir_all(scratch.home.join("tmp"))?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -213,7 +213,7 @@ pub fn guard_positive_control(tcr: &Path, guard: &Path, dir: &Path) -> anyhow::R
 
 /// The running test proxy. Dropping it kills the process, so a failed phase never leaves
 /// one behind.
-pub struct Proxy {
+pub(crate) struct Proxy {
     child: Child,
     /// The proxy's own durable log directory, inside the scratch cache.
     pub log_dir: PathBuf,
@@ -225,7 +225,7 @@ impl Proxy {
     /// Start the proxy the way TcrBar does (`ServerController.swift` sends stdout to
     /// `/dev/null`): the durable log under the scratch cache is the only copy of each line,
     /// so the harness pays the same logging cost the shipped app pays, not a second file write.
-    pub fn spawn(
+    pub(crate) fn spawn(
         tcr: &Path,
         scratch: &Scratch,
         guard: &Path,
@@ -253,13 +253,13 @@ impl Proxy {
         })
     }
 
-    pub fn pid(&self) -> u32 {
+    pub(crate) fn pid(&self) -> u32 {
         self.child.id()
     }
 
     /// Every line of the durable log so far, the daily files in name (date) order. Empty
     /// before the proxy has created its log directory.
-    pub fn log_text(&self) -> anyhow::Result<String> {
+    pub(crate) fn log_text(&self) -> anyhow::Result<String> {
         let entries = match fs::read_dir(&self.log_dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
@@ -277,7 +277,7 @@ impl Proxy {
     }
 
     /// Wait for the `listening on http://` line and return the port it names.
-    pub fn wait_listening(&mut self, timeout: Duration) -> anyhow::Result<u16> {
+    pub(crate) fn wait_listening(&mut self, timeout: Duration) -> anyhow::Result<u16> {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(port) = listening_port(&self.log_text()?) {
@@ -304,14 +304,14 @@ impl Proxy {
     }
 
     /// Connections the guard refused, one line each.
-    pub fn refused_connects(&self) -> anyhow::Result<usize> {
+    pub(crate) fn refused_connects(&self) -> anyhow::Result<usize> {
         let text = fs::read_to_string(&self.attempts)
             .with_context(|| format!("reading the guard's log {}", self.attempts.display()))?;
         Ok(text.lines().count())
     }
 
     /// SIGTERM, then wait for the drain; SIGKILL only if it hangs.
-    pub fn stop(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn stop(&mut self) -> anyhow::Result<()> {
         let status = Command::new("/bin/kill")
             .args(["-TERM", &self.child.id().to_string()])
             .status()?;
@@ -332,7 +332,7 @@ impl Proxy {
 
 impl Drop for Proxy {
     fn drop(&mut self) {
-        if let Ok(None) = self.child.try_wait() {
+        if matches!(self.child.try_wait(), Ok(None)) {
             if let Err(err) = self.child.kill() {
                 eprintln!(
                     "[load-test] could not kill test proxy {}: {err}",
@@ -350,7 +350,7 @@ impl Drop for Proxy {
 }
 
 /// The port in `tcr listening on http://127.0.0.1:PORT (headless)`.
-pub fn listening_port(log: &str) -> Option<u16> {
+pub(crate) fn listening_port(log: &str) -> Option<u16> {
     let marker = "listening on http://";
     let line = log.lines().find(|l| l.contains(marker))?;
     let after = &line[line.find(marker)? + marker.len()..];
@@ -364,7 +364,7 @@ pub fn listening_port(log: &str) -> Option<u16> {
 }
 
 /// The boot lines that name a path, for the report's proof of where the proxy looked.
-pub fn boot_path_lines(log: &str) -> Vec<String> {
+pub(crate) fn boot_path_lines(log: &str) -> Vec<String> {
     log.lines()
         .take_while(|l| !l.contains("listening on http://"))
         .filter(|l| l.contains('/'))
@@ -373,7 +373,7 @@ pub fn boot_path_lines(log: &str) -> Vec<String> {
 }
 
 /// Boot lines that name the operator's own config or cache. Must be empty.
-pub fn live_path_mentions(lines: &[String], real_home: &str) -> Vec<String> {
+pub(crate) fn live_path_mentions(lines: &[String], real_home: &str) -> Vec<String> {
     let live = [
         format!("{real_home}/.config"),
         format!("{real_home}/.cache"),
@@ -387,7 +387,7 @@ pub fn live_path_mentions(lines: &[String], real_home: &str) -> Vec<String> {
 }
 
 /// `restored=N` on the `bound-token pins restored` boot line.
-pub fn restored_bound_tokens(log: &str) -> Option<usize> {
+pub(crate) fn restored_bound_tokens(log: &str) -> Option<usize> {
     let line = log
         .lines()
         .find(|l| l.contains("bound-token pins restored"))?;
@@ -403,12 +403,12 @@ pub fn restored_bound_tokens(log: &str) -> Option<usize> {
 /// What `lsof -nP -a -p <pid> -i` showed: every internet endpoint, and the ones that are
 /// not loopback or that touch the live proxy's ports.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct SocketCheck {
+pub(crate) struct SocketCheck {
     pub endpoints: usize,
     pub foreign: Vec<String>,
 }
 
-pub fn check_sockets(lsof: &str) -> SocketCheck {
+pub(crate) fn check_sockets(lsof: &str) -> SocketCheck {
     let mut check = SocketCheck::default();
     for line in lsof.lines().skip(1) {
         let cols: Vec<&str> = line.split_whitespace().collect();
@@ -436,7 +436,7 @@ pub fn check_sockets(lsof: &str) -> SocketCheck {
 /// The process's lifetime peak physical footprint in MiB, from `vmmap --summary`: the figure
 /// macOS charges the process for, compressed pages included, which resident size undercounts
 /// on a box under memory pressure.
-pub fn peak_footprint_mb(pid: u32) -> anyhow::Result<f64> {
+pub(crate) fn peak_footprint_mb(pid: u32) -> anyhow::Result<f64> {
     let output = Command::new("/usr/bin/vmmap")
         .args(["--summary", &pid.to_string()])
         .output()
@@ -452,7 +452,7 @@ pub fn peak_footprint_mb(pid: u32) -> anyhow::Result<f64> {
 }
 
 /// How many threads the process has now, from `ps -M` (one line per thread under a header).
-pub fn thread_count(pid: u32) -> anyhow::Result<usize> {
+pub(crate) fn thread_count(pid: u32) -> anyhow::Result<usize> {
     let output = Command::new("/bin/ps")
         .args(["-M", "-p", &pid.to_string()])
         .output()
@@ -468,7 +468,7 @@ pub fn thread_count(pid: u32) -> anyhow::Result<usize> {
 }
 
 /// `Physical footprint (peak):  49.1M` in MiB.
-pub fn parse_peak_footprint(vmmap: &str) -> Option<f64> {
+pub(crate) fn parse_peak_footprint(vmmap: &str) -> Option<f64> {
     let line = vmmap
         .lines()
         .find(|l| l.trim_start().starts_with("Physical footprint (peak):"))?;
@@ -484,7 +484,7 @@ pub fn parse_peak_footprint(vmmap: &str) -> Option<f64> {
     Some(number * scale)
 }
 
-pub fn lsof(pid: u32) -> anyhow::Result<String> {
+pub(crate) fn lsof(pid: u32) -> anyhow::Result<String> {
     let output = Command::new("/usr/sbin/lsof")
         .args(["-nP", "-a", "-p", &pid.to_string(), "-i"])
         .output()

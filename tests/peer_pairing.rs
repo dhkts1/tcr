@@ -133,7 +133,7 @@ async fn serve(context: SessionContext) -> SocketAddr {
     crate::peer_support::serve_shipped(context).await
 }
 
-fn instance(byte: u8) -> InstanceId {
+const fn instance(byte: u8) -> InstanceId {
     InstanceId([byte; INSTANCE_ID_BYTES])
 }
 
@@ -487,7 +487,7 @@ fn two_concurrent_joiners_on_one_use_invite_leave_exactly_one_ok() {
                         &enroll,
                         &secret,
                         now,
-                        Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
+                        Some(SocketAddr::from(([127, 0, 0, 1], 9600))),
                     )
                 })
             })
@@ -1259,8 +1259,7 @@ async fn a_silent_socket_is_closed_after_the_message_one_timeout() {
     assert!(
         read.is_ok(),
         "the listener must close a silent socket rather than hold it, and it was still \
-         open after {:?}",
-        elapsed
+         open after {elapsed:?}"
     );
     assert_eq!(
         back.len(),
@@ -3158,7 +3157,7 @@ async fn a_hello_carries_a_brief_for_a_mutual_friend_and_the_far_side_records_it
         allow: config::Allow::default(),
         lend: Vec::new(),
     });
-    for row in a_file.peers.iter_mut() {
+    for row in &mut a_file.peers {
         if row.node == b.key.id() {
             row.allow.control.briefs = true;
         }
@@ -3182,7 +3181,7 @@ async fn a_hello_carries_a_brief_for_a_mutual_friend_and_the_far_side_records_it
     // here, whatever the operator had granted it. So the two nodes swapping
     // neighbour lists is two grants, and this test sets both rather than
     // relying on the applying side taking whatever arrives.
-    for row in b_file.peers.iter_mut() {
+    for row in &mut b_file.peers {
         if row.node == a.key.id() {
             row.allow.control.briefs = true;
         }
@@ -3518,12 +3517,8 @@ fn share_on_keeps_the_mode_and_the_window_of_the_grant_it_replaces() {
 }
 
 /// One pinned row with one grant, for the CLI tests above.
-fn pinned_row(
-    node: PeerId,
-    label: &str,
-    grant: tcr::peer::config::LendGrant,
-) -> tcr::peer::config::PeerRow {
-    tcr::peer::config::PeerRow {
+fn pinned_row(node: PeerId, label: &str, grant: config::LendGrant) -> config::PeerRow {
+    config::PeerRow {
         node,
         label: label.to_string(),
         endpoints: Vec::new(),
@@ -3641,7 +3636,7 @@ fn a_reservation_placeholder_is_never_selected() {
 fn a_learned_key_survives_the_window_it_was_learned_in() {
     let mut state = PeerState::default();
     let learned = PeerId([0x44; 32]);
-    state.accepted.push(tcr::peer::state::AcceptedInstance {
+    state.accepted.push(state::AcceptedInstance {
         instance_id: InstanceId([0x01; INSTANCE_ID_BYTES]),
         addr: "192.0.2.30".to_string(),
         until_ms: 2_000,
@@ -3650,7 +3645,7 @@ fn a_learned_key_survives_the_window_it_was_learned_in() {
     });
     // A window with no key at all: it goes, which is what keeps the kept rows
     // from being "expire stopped working".
-    state.accepted.push(tcr::peer::state::AcceptedInstance {
+    state.accepted.push(state::AcceptedInstance {
         instance_id: InstanceId([0x02; INSTANCE_ID_BYTES]),
         addr: "192.0.2.31".to_string(),
         until_ms: 2_000,
@@ -3785,7 +3780,7 @@ fn an_open_window_does_not_evict_an_extra_learned_key() {
 ///
 /// Watched red: remove the `FileLock::acquire` line this test's production
 /// change adds to `revoke_invite`, and this fails inside the first few trials
-/// with either "the invite came back" or "accept_enrolment said Ok but the row
+/// with either "the invite came back" or "`accept_enrolment` said Ok but the row
 /// is gone".
 #[test]
 fn a_concurrent_revoke_and_enrolment_never_resurrect_or_drop_a_row() {
@@ -3832,7 +3827,7 @@ fn a_concurrent_revoke_and_enrolment_never_resurrect_or_drop_a_row() {
                     &enroll,
                     &secret,
                     now,
-                    Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
+                    Some(SocketAddr::from(([127, 0, 0, 1], 9600))),
                 )
             })
         };

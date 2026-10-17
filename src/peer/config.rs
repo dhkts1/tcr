@@ -239,13 +239,13 @@ pub fn default_listen() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 7755))
 }
 
-fn default_max_hops() -> u8 {
+const fn default_max_hops() -> u8 {
     1
 }
 
 /// Mirrors [`crate::peer::serve::BORROW_TIMEOUT`]: a fresh install behaves
 /// exactly as it did before this field existed.
-fn default_borrow_timeout_ms() -> u64 {
+const fn default_borrow_timeout_ms() -> u64 {
     10_000
 }
 
@@ -296,7 +296,7 @@ impl NetworkKey {
 
     /// Build one from raw bytes, for a share link, which carries the key in
     /// base32, and for a test.
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
@@ -306,7 +306,7 @@ impl NetworkKey {
     }
 
     /// The raw bytes, for the Noise `psk0` a knock mixes in.
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
@@ -591,7 +591,7 @@ pub enum EndpointSource {
 ///
 /// **The pinned static key is the identifier and this is the locator.** Moving
 /// does not change who a peer is, which is why [`PeerRow::node`] is the
-/// authorization and this list is advice, the split RFC 7401 (HIPv2) makes
+/// authorization and this list is advice, the split RFC 7401 (`HIPv2`) makes
 /// between a host identity and any address it answers on. `config.rs` has said
 /// so in prose since the skeleton; this type is where the prose became a type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -606,7 +606,7 @@ pub struct Endpoint {
 
 impl Endpoint {
     /// A socket endpoint observed now.
-    pub fn direct(addr: SocketAddr, observed_at_ms: i64, source: EndpointSource) -> Self {
+    pub const fn direct(addr: SocketAddr, observed_at_ms: i64, source: EndpointSource) -> Self {
         Self {
             locator: Locator::Direct { addr },
             observed_at_ms,
@@ -615,7 +615,7 @@ impl Endpoint {
     }
 
     /// A forwarded endpoint through `node`.
-    pub fn via(node: PeerId, observed_at_ms: i64, source: EndpointSource) -> Self {
+    pub const fn via(node: PeerId, observed_at_ms: i64, source: EndpointSource) -> Self {
         Self {
             locator: Locator::Via { node },
             observed_at_ms,
@@ -624,7 +624,7 @@ impl Endpoint {
     }
 
     /// The socket to open, or `None` for a hop this node cannot dial itself.
-    pub fn direct_addr(&self) -> Option<SocketAddr> {
+    pub const fn direct_addr(&self) -> Option<SocketAddr> {
         match self.locator {
             Locator::Direct { addr } => Some(addr),
             // Neither one is a socket this node opens: a `Via` hop is dialled
@@ -635,7 +635,7 @@ impl Endpoint {
     }
 
     /// Whether this endpoint needs another machine to carry it.
-    pub fn is_via(&self) -> bool {
+    pub const fn is_via(&self) -> bool {
         matches!(self.locator, Locator::Via { .. })
     }
 }
@@ -744,7 +744,7 @@ impl PeerRow {
     /// The question four candidate gates ask, spelled once: a row a session
     /// completed against and that has no endpoint is invisible to all of them,
     /// which is the bug the endpoint writer exists to stop.
-    pub fn has_endpoint(&self) -> bool {
+    pub const fn has_endpoint(&self) -> bool {
         !self.endpoints.is_empty()
     }
 
@@ -1041,7 +1041,7 @@ pub fn observe_seen_address(
 /// literally named its own configured listen socket, `0.0.0.0:7766`, and that
 /// string sat on the row next to `198.51.100.7:7766`, the address that
 /// actually answered.
-fn is_dialable_claim(addr: SocketAddr) -> bool {
+const fn is_dialable_claim(addr: SocketAddr) -> bool {
     !addr.ip().is_unspecified() && addr.port() != 0
 }
 
@@ -1302,7 +1302,7 @@ pub struct ControlGrants {
 /// 30-second slots would be 2,880 writes per friend per day.
 pub const DROP_SLOT_SECONDS: u64 = 3_600;
 
-fn default_drop_slot_seconds() -> u64 {
+const fn default_drop_slot_seconds() -> u64 {
     DROP_SLOT_SECONDS
 }
 
@@ -1344,7 +1344,7 @@ impl DeadDropConfig {
     ///
     /// One function rather than two reads, so "on but pointed at nothing"
     /// cannot mean one thing to the publisher and another to the fetcher.
-    pub fn is_live(&self) -> bool {
+    pub const fn is_live(&self) -> bool {
         self.enabled && self.store.is_some()
     }
 
@@ -1434,7 +1434,7 @@ impl LendMode {
     /// way. It was a `skip_serializing_if` predicate until the panel started
     /// reading the mode: see [`LendGrant::mode`] for why the key is now always
     /// written.
-    pub fn is_serve(&self) -> bool {
+    pub const fn is_serve(&self) -> bool {
         matches!(self, Self::Serve)
     }
 }
@@ -1564,7 +1564,7 @@ mod secret32_hex {
     use serde::de::Error as _;
     use serde::{Deserialize as _, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(
+    pub(super) fn serialize<S: Serializer>(
         secret: &Option<[u8; 32]>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
@@ -1580,7 +1580,7 @@ mod secret32_hex {
         }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Option<[u8; 32]>, D::Error> {
         let Some(raw) = Option::<String>::deserialize(deserializer)? else {
@@ -1623,7 +1623,7 @@ pub const MAX_LEND_FRACTION: f64 = 0.5;
 /// propagating: `NaN` compares false against both clamp bounds, so it survives
 /// a bare `clamp` untouched and then makes every comparison downstream of it
 /// answer false, which is a grant that is neither refused nor enforced.
-pub fn lend_fraction(raw: f64) -> f64 {
+pub const fn lend_fraction(raw: f64) -> f64 {
     if !raw.is_finite() {
         return 0.0;
     }
@@ -1642,11 +1642,13 @@ mod lease_id_hex {
     use serde::de::Error as _;
     use serde::{Deserialize as _, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(id: &u128, serializer: S) -> Result<S::Ok, S::Error> {
+    pub(super) fn serialize<S: Serializer>(id: &u128, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&format!("{id:032x}"))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u128, D::Error> {
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<u128, D::Error> {
         let raw = String::deserialize(deserializer)?;
         let trimmed = raw.trim();
         let trimmed = trimmed.strip_prefix("0x").unwrap_or(trimmed);
@@ -1679,7 +1681,7 @@ pub fn lease_id_string(id: u128) -> String {
 
 impl LendGrant {
     /// A grant with today's defaults and no end: every account, one window.
-    pub fn new(window: Window, fraction: f64, ttl_s: u32, max_inflight: u8) -> Self {
+    pub const fn new(window: Window, fraction: f64, ttl_s: u32, max_inflight: u8) -> Self {
         Self {
             id: 0,
             mode: LendMode::Serve,
@@ -2257,7 +2259,7 @@ impl PeerRow {
         &self,
         window: Window,
         now_s: u64,
-        enforceable: &dyn Fn(&tcr_peer_wire::LendScope) -> bool,
+        enforceable: &dyn Fn(&LendScope) -> bool,
     ) -> Option<&LendGrant> {
         self.lend
             .iter()

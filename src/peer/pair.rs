@@ -122,7 +122,7 @@ impl DialAddressKind {
     /// The one word a surface prints for this kind. One spelling, so an
     /// operator grepping their scrollback and a reader of this file see the
     /// same token.
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Chosen => "chosen",
             Self::Tailscale => "tailscale",
@@ -144,7 +144,7 @@ pub struct DialAddress {
 
 impl DialAddress {
     /// An address read out of a pasted key.
-    pub fn from_key(addr: SocketAddr) -> Self {
+    pub const fn from_key(addr: SocketAddr) -> Self {
         Self {
             addr,
             kind: DialAddressKind::FromKey,
@@ -853,19 +853,20 @@ pub fn accept_enrolment(
         rendezvous_secret: None,
         sees_us_at: None,
     };
-    match from {
-        Some(socket) => tracing::debug!(
+    if let Some(socket) = from {
+        tracing::debug!(
             peer = %joiner.display(),
             socket = %socket,
             "peer enrol: not recording the accepted socket as an endpoint; its port is the \
              joiner's ephemeral one for this connection and its own Hello on this stream \
              teaches the dialable form"
-        ),
-        None => tracing::debug!(
+        );
+    } else {
+        tracing::debug!(
             peer = %joiner.display(),
             "peer enrol: this enrolment arrived through a carrier; no socket is recorded as \
              evidence about the joiner"
-        ),
+        );
     }
     // A re-enrolment of a key already pinned replaces the row rather than
     // adding a second one, for the reason `pin_row` documents.
@@ -1158,7 +1159,9 @@ pub async fn knock(store: &PeerStore, addr: SocketAddr, proposed_name: &str) -> 
             // with the feature off is not listening on it.
             listen_port: file.listen.map(|listen| listen.port()),
         },
-        file.network_key.as_ref().map(|key| key.as_bytes()),
+        file.network_key
+            .as_ref()
+            .map(super::config::NetworkKey::as_bytes),
     )
     .await
 }
@@ -1837,7 +1840,7 @@ impl JoinInput {
     /// The join key to enrol with, if this input carries one. An ask carries
     /// neither a key nor a network key: that is the honest answer, not a
     /// missing case.
-    pub fn join_token(&self) -> Option<&JoinToken> {
+    pub const fn join_token(&self) -> Option<&JoinToken> {
         match self {
             Self::Link(link) => link.join.as_ref(),
             Self::Key(token) => Some(token),
@@ -1846,7 +1849,7 @@ impl JoinInput {
     }
 
     /// The network key to set, if this input carries one.
-    pub fn network_key(&self) -> Option<crate::peer::config::NetworkKey> {
+    pub const fn network_key(&self) -> Option<crate::peer::config::NetworkKey> {
         match self {
             Self::Link(link) => Some(link.network_key),
             Self::Key(_) | Self::Ask(_) => None,
@@ -2106,7 +2109,7 @@ mod tests {
         );
         let link = ShareLink {
             network_key,
-            join: Some(token.clone()),
+            join: Some(token),
         };
         let rendered = link.to_link();
         assert!(
@@ -2151,7 +2154,7 @@ mod tests {
     /// silently read as if the magic matched.
     #[test]
     fn a_v3_key_with_the_wrong_magic_is_refused() {
-        let bytes = tcr_peer_wire::encode_bytes(&[0_u8; 70]);
+        let bytes = encode_bytes(&[0_u8; 70]);
         let key = format!("{TOKEN_PREFIX_V3}{bytes}");
         let refusal = JoinToken::parse(&key).expect_err("the wrong magic must be refused");
         assert!(

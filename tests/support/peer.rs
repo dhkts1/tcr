@@ -37,7 +37,7 @@ use tokio::net::{TcpListener, TcpStream};
 /// temp dir, so two tests in one binary and several lanes running at once
 /// never collide on one path. Emptied first: a directory left by a killed run
 /// must not hand this one its files.
-pub fn scratch_dir(file: &str, tag: &str) -> PathBuf {
+pub(crate) fn scratch_dir(file: &str, tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "tcr-peer-{file}-{tag}-{}-{:?}",
         std::process::id(),
@@ -49,13 +49,13 @@ pub fn scratch_dir(file: &str, tag: &str) -> PathBuf {
 }
 
 /// One machine's key material, as a test holds it.
-pub struct Node {
+pub(crate) struct Node {
     pub secret: [u8; 32],
     pub id: PeerId,
 }
 
 /// A freshly minted static keypair.
-pub fn node() -> Node {
+pub(crate) fn node() -> Node {
     let (secret, public) = noise::generate_static().expect("mint a static keypair");
     Node {
         secret,
@@ -64,7 +64,7 @@ pub fn node() -> Node {
 }
 
 /// A listener on a kernel-chosen loopback port.
-pub async fn loopback() -> TcpListener {
+pub(crate) async fn loopback() -> TcpListener {
     TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a loopback listener")
@@ -76,7 +76,7 @@ pub async fn loopback() -> TcpListener {
 /// `serve_on_with` and not a hand-rolled loop: the caps, the ban check, the
 /// pattern dispatch and the knock queue all live in it, so a harness that
 /// re-implemented the loop would be measuring the harness.
-pub async fn serve_shipped(context: SessionContext) -> SocketAddr {
+pub(crate) async fn serve_shipped(context: SessionContext) -> SocketAddr {
     let listener = listener::bind("127.0.0.1:0".parse().expect("a loopback address"))
         .await
         .expect("bind a kernel-chosen port on loopback");
@@ -94,7 +94,7 @@ pub async fn serve_shipped(context: SessionContext) -> SocketAddr {
 /// Dial `addr` as `requester` with a `Return` handshake pinned to `responder`,
 /// and write `header` as the stream's first frame. The stream and session are
 /// the caller's for whatever the test sends or reads next.
-pub async fn dial_and_open(
+pub(crate) async fn dial_and_open(
     addr: SocketAddr,
     requester: &Node,
     responder: &PeerId,
@@ -123,7 +123,7 @@ pub async fn dial_and_open(
 /// A target that counts what reached it, so "refused" can be measured as *the
 /// target was never dialled* instead of as an error string.
 #[derive(Clone, Default)]
-pub struct Target {
+pub(crate) struct Target {
     pub connections: Arc<AtomicUsize>,
     pub bytes: Arc<AtomicUsize>,
 }
@@ -134,7 +134,7 @@ pub struct Target {
 /// It speaks nothing: a forwarder splices raw bytes and has no business knowing
 /// what its target's protocol is, so a target that answers a fixed string is a
 /// truthful stand-in for everything but an end-to-end handshake.
-pub fn target_on(listener: TcpListener, reply: Vec<u8>) -> Target {
+pub(crate) fn target_on(listener: TcpListener, reply: Vec<u8>) -> Target {
     let target = Target::default();
     let watch = target.clone();
     tokio::spawn(async move {
@@ -168,7 +168,7 @@ pub fn target_on(listener: TcpListener, reply: Vec<u8>) -> Target {
 /// A Mac that receives a carried CONTROL frame over a duplex: its own node
 /// key, and a pinned row for one peer already on its file, so the ordinary
 /// CONTROL gate admits what that peer sends.
-pub struct DuplexTarget {
+pub(crate) struct DuplexTarget {
     pub peers: PathBuf,
     pub state: PathBuf,
     pub key: NodeKey,
@@ -177,7 +177,7 @@ pub struct DuplexTarget {
 impl DuplexTarget {
     /// `dir` is the target's own scratch directory; `peer` is the one row it
     /// pins, labelled `the-far-side`, with every grant at its default.
-    pub fn new(dir: &Path, peer: PeerId) -> Self {
+    pub(crate) fn new(dir: &Path, peer: PeerId) -> Self {
         let peers = dir.join("tcr-peers.json");
         let state = dir.join("peer-state.json");
         let row = PeerRow {
@@ -199,11 +199,11 @@ impl DuplexTarget {
         Self { peers, state, key }
     }
 
-    pub fn context(&self) -> SessionContext {
+    pub(crate) fn context(&self) -> SessionContext {
         SessionContext::new(&self.key, &self.peers, &self.state)
     }
 
-    pub fn file(&self) -> PeerFile {
+    pub(crate) fn file(&self) -> PeerFile {
         peer_config::read_or_default(&self.peers).expect("the peers file reads")
     }
 }
@@ -215,7 +215,7 @@ impl DuplexTarget {
 /// One captured tracing event: its level, its message, and every field as a
 /// string, the message included under `message`.
 #[derive(Debug, Clone)]
-pub struct CapturedEvent {
+pub(crate) struct CapturedEvent {
     pub level: tracing::Level,
     pub message: String,
     pub fields: BTreeMap<String, String>,
@@ -225,7 +225,7 @@ pub struct CapturedEvent {
 /// (globally in a binary of its own, or for one closure); the layer decides
 /// nothing about that.
 #[derive(Clone, Default)]
-pub struct CaptureLayer {
+pub(crate) struct CaptureLayer {
     pub events: Arc<Mutex<Vec<CapturedEvent>>>,
 }
 
@@ -276,7 +276,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
 
 impl CaptureLayer {
     /// Every event whose message contains `needle`.
-    pub fn matching(&self, needle: &str) -> Vec<CapturedEvent> {
+    pub(crate) fn matching(&self, needle: &str) -> Vec<CapturedEvent> {
         self.events
             .lock()
             .expect("capture lock")
@@ -287,7 +287,7 @@ impl CaptureLayer {
     }
 
     /// Every event whose message is exactly `line`.
-    pub fn matching_exactly(&self, line: &str) -> Vec<CapturedEvent> {
+    pub(crate) fn matching_exactly(&self, line: &str) -> Vec<CapturedEvent> {
         self.events
             .lock()
             .expect("capture lock")
@@ -298,7 +298,7 @@ impl CaptureLayer {
     }
 
     /// How many events this layer has seen, whatever they said.
-    pub fn count(&self) -> usize {
+    pub(crate) fn count(&self) -> usize {
         self.events.lock().expect("capture lock").len()
     }
 }
@@ -306,7 +306,7 @@ impl CaptureLayer {
 /// One collected tracing event: the message, unquoted, and every OTHER field
 /// as a string.
 #[derive(Debug, Clone)]
-pub struct LoggedEvent {
+pub(crate) struct LoggedEvent {
     pub message: String,
     pub fields: HashMap<String, String>,
 }
@@ -314,16 +314,16 @@ pub struct LoggedEvent {
 /// A layer that collects every event, kept in order, for assertions about the
 /// message and about which fields a line carries.
 #[derive(Clone, Default)]
-pub struct Collector {
+pub(crate) struct Collector {
     events: Arc<Mutex<Vec<LoggedEvent>>>,
 }
 
 impl Collector {
-    pub fn events(&self) -> Vec<LoggedEvent> {
+    pub(crate) fn events(&self) -> Vec<LoggedEvent> {
         self.events.lock().expect("the collector lock").clone()
     }
 
-    pub fn matching(&self, needle: &str) -> Vec<LoggedEvent> {
+    pub(crate) fn matching(&self, needle: &str) -> Vec<LoggedEvent> {
         self.events()
             .into_iter()
             .filter(|event| event.message.contains(needle))
@@ -335,14 +335,14 @@ impl Collector {
     /// Order is the assertion for a carry offer: a count alone cannot tell
     /// "offered after the fleet was walked" from "offered on the first
     /// account's connect failure", and the second one is the bug.
-    pub fn first_index(&self, needle: &str) -> Option<usize> {
+    pub(crate) fn first_index(&self, needle: &str) -> Option<usize> {
         self.events()
             .iter()
             .position(|event| event.message.contains(needle))
     }
 
     /// Every message, in order, for an assertion's failure output.
-    pub fn messages(&self) -> Vec<String> {
+    pub(crate) fn messages(&self) -> Vec<String> {
         self.events()
             .into_iter()
             .map(|event| event.message)

@@ -120,7 +120,7 @@ impl RelayRefusal {
     /// enforce the cap and had no way to
     /// say so, and a borrower reading `lease-spent` for a full pipe stops asking
     /// when it should retry in a moment.
-    pub fn to_wire(self) -> LeaseRefusal {
+    pub const fn to_wire(self) -> LeaseRefusal {
         match self {
             Self::Lease(refusal) => refusal,
             Self::TooManyInflight { .. } => LeaseRefusal::InFlightFull,
@@ -141,7 +141,7 @@ impl RelayRefusal {
 /// it is real for an api-key account and no account in this fleet lends one yet,
 /// so the refusal is typed instead of arriving as a surprise comparison between
 /// a token count and a utilization fraction.
-fn fraction_budget(unit: LeaseUnit) -> Option<f64> {
+const fn fraction_budget(unit: LeaseUnit) -> Option<f64> {
     match unit {
         LeaseUnit::Fraction(fraction) => Some(fraction),
         LeaseUnit::Tokens(_) | LeaseUnit::Unknown => None,
@@ -284,7 +284,7 @@ pub struct Granted {
 impl Granted {
     /// A refusal decided before any grant was picked, so there is nothing that
     /// funded it.
-    fn unfunded(refusal: LeaseRefusal) -> Self {
+    const fn unfunded(refusal: LeaseRefusal) -> Self {
         Self {
             answer: LeaseGrant {
                 lease: None,
@@ -935,7 +935,7 @@ pub fn lease_has_ended(lease: &Lease, now_ms: i64) -> bool {
 /// Read rather than scheduled, for the reason the expiry check in
 /// [`HandedTokens::bearer`] is read rather than swept: a laptop sleeps, and a
 /// timer that fired while the lid was shut is a renewal nobody received.
-pub fn handoff_renewal_due(handed_expires_at_ms: Option<i64>, now_ms: i64) -> bool {
+pub const fn handoff_renewal_due(handed_expires_at_ms: Option<i64>, now_ms: i64) -> bool {
     match handed_expires_at_ms {
         None => true,
         Some(expires_at_ms) => expires_at_ms - now_ms <= HANDOFF_RENEW_LEAD_MS,
@@ -988,7 +988,7 @@ pub fn handoff_push_is_due(last: Option<HandedBearer>, next: HandedBearer, now_m
     if !handoff_renewal_due(last.map(|sent| sent.expires_at_ms), now_ms) {
         return false;
     }
-    !last.is_some_and(|sent| sent.fingerprint == next.fingerprint)
+    last.is_none_or(|sent| sent.fingerprint != next.fingerprint)
 }
 
 pub fn bearer_fingerprint(access_token: &str) -> u64 {
@@ -1111,8 +1111,8 @@ pub async fn serve_on_handed_bearer(
     // on the wire is done here instead; `build_handed_bearer_headers` then puts
     // the owner's bearer on and strips what a pooled request never carries.
     let mut forwarded = HeaderMap::new();
-    for (name, value) in ask.headers.iter() {
-        if crate::peer::serve::lender_forwards_header(name.as_str()) {
+    for (name, value) in &ask.headers {
+        if serve::lender_forwards_header(name.as_str()) {
             forwarded.append(name.clone(), value.clone());
         }
     }
@@ -1135,7 +1135,7 @@ pub async fn serve_on_handed_bearer(
             .context("peer hand: the client's method is not a method")?,
         url,
     );
-    for (name, value) in headers.iter() {
+    for (name, value) in &headers {
         send = send.header(name.clone(), value.clone());
     }
     if !ask.body.is_empty() {
@@ -1512,7 +1512,7 @@ impl Ledger {
 
     /// Whether a charge is waiting for [`Self::flush`], so a gate reads the
     /// hot path's promise off the ledger rather than off a copy.
-    pub fn is_dirty(&self) -> bool {
+    pub const fn is_dirty(&self) -> bool {
         self.dirty
     }
 
@@ -1718,7 +1718,7 @@ impl Ledger {
         peer: &PeerId,
         ask: &LeaseRequest,
         store: &PeerStore,
-        fleet: &dyn crate::peer::serve::WindowUtilization,
+        fleet: &dyn serve::WindowUtilization,
     ) -> Granted {
         store.reload_if_changed();
         // THE CAP, before the row is even looked at: this refusal is about how
@@ -1752,8 +1752,7 @@ impl Ledger {
             .as_ref()
             .and_then(|row| {
                 row.grant_for(ask.window, seconds_of(crate::now_ms()), &|scope| {
-                    fleet.scope_restriction(scope)
-                        != crate::peer::serve::ScopeRestriction::Unenforceable
+                    fleet.scope_restriction(scope) != serve::ScopeRestriction::Unenforceable
                 })
             })
             .cloned();
@@ -1773,7 +1772,7 @@ impl Ledger {
         // straddling a clock tick see `contains` say yes against one second
         // and the close computed against a different one.
         let schedule_now = time::OffsetDateTime::now_utc();
-        let schedule = granted.as_ref().and_then(|grant| grant.schedule());
+        let schedule = granted.as_ref().and_then(LendGrant::schedule);
         if let Some(schedule) = schedule.as_ref()
             && let Some(refusal) = schedule_refusal(Some(schedule), schedule_now)
         {
@@ -2285,15 +2284,16 @@ impl Ledger {
             self.lease_paths.get(&lease_id).copied(),
             self.grantees.get(&lease_id).copied(),
         ) {
-            match crate::peer::tunnel::path_meter().lock() {
-                Ok(mut meter) => meter.charge_tokens(&peer, path, tokens, crate::now_ms()),
+            if let Ok(mut meter) = crate::peer::tunnel::path_meter().lock() {
+                meter.charge_tokens(&peer, path, tokens, crate::now_ms());
+            } else {
                 // Never silent, and never a refused relay: the request is
                 // already served and the lease is already charged by the time
                 // this runs. See the same trade in `handle_forward_on`.
-                Err(_) => tracing::error!(
+                tracing::error!(
                     "peer lease: the per-path meter's lock is poisoned, so this lease's tokens \
                      are missing from every per-path figure until restart"
-                ),
+                );
             }
         }
         // A moved `spent` is the ceiling H2 exists to keep binding, so it is the
@@ -2689,35 +2689,28 @@ async fn read_handed_bearers(
                                 continue;
                             }
                         };
-                        match handed_tokens().lock() {
-                            Ok(mut held) => {
-                                held.put(
-                                    lease_id,
-                                    access_token.reveal().to_string(),
-                                    expires_at_ms,
-                                );
-                                // The baseline the next answer is measured
-                                // against, taken monotonically: a renewal
-                                // carries the owner's window as it stands now,
-                                // and a later frame can only move it forward.
-                                note_handed_baseline(lease_id, baseline);
-                                // The deadline and the lease, never the token:
-                                // this line is the one an operator reads while
-                                // a hand-mode borrow is running.
-                                tracing::info!(
-                                    peer = %lender.display(),
-                                    expires_at_ms,
-                                    "peer lease: the lender handed this Mac a bearer for the \
-                                     lease it just granted"
-                                );
-                            }
-                            Err(_) => {
-                                tracing::error!(
-                                    "peer lease: the handed-token store's lock is poisoned, so \
-                                     this borrow falls back to the lender's own path"
-                                );
-                                return;
-                            }
+                        if let Ok(mut held) = handed_tokens().lock() {
+                            held.put(lease_id, access_token.reveal().to_string(), expires_at_ms);
+                            // The baseline the next answer is measured
+                            // against, taken monotonically: a renewal
+                            // carries the owner's window as it stands now,
+                            // and a later frame can only move it forward.
+                            note_handed_baseline(lease_id, baseline);
+                            // The deadline and the lease, never the token:
+                            // this line is the one an operator reads while
+                            // a hand-mode borrow is running.
+                            tracing::info!(
+                                peer = %lender.display(),
+                                expires_at_ms,
+                                "peer lease: the lender handed this Mac a bearer for the \
+                                 lease it just granted"
+                            );
+                        } else {
+                            tracing::error!(
+                                "peer lease: the handed-token store's lock is poisoned, so \
+                                 this borrow falls back to the lender's own path"
+                            );
+                            return;
                         }
                     }
                     other => {
@@ -2746,14 +2739,13 @@ async fn read_handed_bearers(
             );
         }
     }
-    match handed_tokens().lock() {
-        Ok(mut held) => {
-            held.forget(lease.lease_id);
-        }
-        Err(_) => tracing::error!(
+    if let Ok(mut held) = handed_tokens().lock() {
+        held.forget(lease.lease_id);
+    } else {
+        tracing::error!(
             "peer lease: the handed-token store's lock is poisoned, so an ended lease's bearer \
-             is left in memory until restart"
-        ),
+         is left in memory until restart"
+        );
     }
     // The meter goes with the bearer: nothing can be reported on a session
     // that has ended, and a meter left behind would hold a sender nobody reads
@@ -2834,7 +2826,7 @@ impl PeerLeaseProvider {
     /// refused to borrow over a cache file would have traded a real service
     /// for a durability promise.
     pub fn new(peers_path: PathBuf) -> Self {
-        let state_path = crate::peer::serve::peer_state_path(&peers_path);
+        let state_path = serve::peer_state_path(&peers_path);
         let mut leases: HashMap<PeerId, Lease> = HashMap::new();
         let now_ms = crate::now_ms();
         match crate::peer::state::load(&state_path, now_ms) {
@@ -2902,7 +2894,7 @@ impl PeerLeaseProvider {
     /// The borrower's whole test for "is this lease in hand mode": the owner
     /// backs a `hand` grant with a pushed token, and a mode with no token is a
     /// request this node could not pay for.
-    fn handed_bearer_is_live(&self, lease_id: u128) -> bool {
+    fn handed_bearer_is_live(lease_id: u128) -> bool {
         let now_ms = crate::now_ms();
         handed_tokens()
             .lock()
@@ -3203,7 +3195,7 @@ impl FallbackProvider for PeerLeaseProvider {
                 // rather than off a field it was told: a mode the owner
                 // asserted but never backed with a bearer would otherwise
                 // become a request this node cannot pay for.
-                if self.handed_bearer_is_live(lease.lease_id) {
+                if Self::handed_bearer_is_live(lease.lease_id) {
                     match self.serve_handed(ask, &lease).await {
                         Ok(Some(response)) => return Some(response),
                         Ok(None) => {}
@@ -3325,7 +3317,7 @@ pub struct LentTo {
     /// [`crate::peer::config::LendGrant::id`].
     pub id: String,
     /// What the lease draws from, in the CLI's own `--scope` spelling.
-    pub scope: tcr_peer_wire::LendScope,
+    pub scope: LendScope,
     pub window: Window,
     /// The grant's ceiling, which is what the card's "20 %" is.
     pub fraction: f64,
@@ -3433,11 +3425,11 @@ pub fn lent_to(
 /// A group is matched by NAME against the account's own group list, so the
 /// answer follows `tcr group` hot-reloads rather than a membership frozen at
 /// lend time.
-pub fn scope_covers(scope: &tcr_peer_wire::LendScope, label: &str, groups: &[String]) -> bool {
+pub fn scope_covers(scope: &LendScope, label: &str, groups: &[String]) -> bool {
     match scope {
-        tcr_peer_wire::LendScope::All => true,
-        tcr_peer_wire::LendScope::Group(name) => groups.iter().any(|group| group == name),
-        tcr_peer_wire::LendScope::Accounts(labels) => labels.iter().any(|named| named == label),
+        LendScope::All => true,
+        LendScope::Group(name) => groups.iter().any(|group| group == name),
+        LendScope::Accounts(labels) => labels.iter().any(|named| named == label),
     }
 }
 

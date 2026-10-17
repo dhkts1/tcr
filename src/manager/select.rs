@@ -59,7 +59,7 @@ const PIN_LOAD_IDLE_MS: i64 = 60 * 60 * 1000;
 /// `is_self` is the requesting session's own pin: that session is demonstrably
 /// alive — it is making this very request — so its own last-touch stamp (which
 /// still names its PREVIOUS request) never disqualifies it.
-fn pin_counts_as_load(is_self: bool, touched_ms: i64, now_ms: i64) -> bool {
+const fn pin_counts_as_load(is_self: bool, touched_ms: i64, now_ms: i64) -> bool {
     is_self || now_ms.saturating_sub(touched_ms) <= PIN_LOAD_IDLE_MS
 }
 
@@ -145,7 +145,7 @@ pub(super) enum GroupMiss {
 impl GroupMiss {
     /// One greppable token for the `reason=` log field, so an operator can count
     /// group misses by cause without parsing prose.
-    pub(super) fn as_str(self) -> &'static str {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "no-such-group",
             Self::OnlyControl => "control-account-only",
@@ -157,7 +157,7 @@ impl GroupMiss {
 
     /// The sentence a human reads in the log. Says what to DO about it in the
     /// one case that has a remedy the operator must apply by hand.
-    pub(super) fn explain(self) -> &'static str {
+    pub(super) const fn explain(self) -> &'static str {
         match self {
             Self::Unknown => "no configured account carries the requested group",
             Self::OnlyControl => {
@@ -281,7 +281,7 @@ pub(super) fn effective_threshold(threshold: f64, reserve: f64, allow_reserve: b
 }
 
 /// The ONE resolver for the effective Fable-weekly (`7d_oi`) threshold, consumed
-/// by both [`Manager::model_blocked`] and [`Manager::account_gate`]'s FableWeekly
+/// by both [`Manager::model_blocked`] and [`Manager::account_gate`]'s `FableWeekly`
 /// push so they can never independently drift — see
 /// [`crate::config::Config::fable_weekly_threshold`]'s doc for the operator-facing
 /// contract. `today` is whatever threshold the caller would otherwise apply to
@@ -419,7 +419,7 @@ impl Manager {
     pub(crate) fn codex_accounts_with_unsupported_exit(&self) -> HashSet<usize> {
         self.config
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .accounts
             .iter()
             .enumerate()
@@ -442,7 +442,7 @@ impl Manager {
         }
         self.affinity
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .retain(|_, (idx, _)| !unsupported.contains(idx));
         let mut excluded = tried.clone();
         excluded.extend(unsupported);
@@ -586,10 +586,7 @@ impl Manager {
         if let Some(li) = self.locked_account_for(provider) {
             if let Some(g) = strict_group {
                 let in_group = {
-                    let accounts = self
-                        .accounts
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                     accounts
                         .get(li)
                         .is_some_and(|a| a.groups.iter().any(|carried| carried == g))
@@ -648,10 +645,7 @@ impl Manager {
             // the accounts lock — the two are NEVER held simultaneously (the
             // documented deadlock).
             let (pinned, counts) = {
-                let pins = self
-                    .affinity
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let pins = self.affinity.lock().unwrap_or_else(PoisonError::into_inner);
                 let pinned = pins.get(&key).map(|&(idx, touched_ms)| (idx, touched_ms));
                 // Only pins that are plausibly LIVE count as load — a days-dead pin
                 // must not make its account read as busy. See `PIN_LOAD_IDLE_MS`.
@@ -681,10 +675,7 @@ impl Manager {
                 // is served by its own provider's pool and the pin stays where
                 // the session it belongs to is warm.
                 let other_provider = {
-                    let accounts = self
-                        .accounts
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                     accounts.get(idx).is_some_and(|a| a.provider != provider)
                 };
                 // A STRICT GROUP ASK OUTRANKS AN EXISTING PIN, and once it
@@ -714,19 +705,13 @@ impl Manager {
                 // returns `None`, which is the honest refusal a strict ask is
                 // owed, never a serve on the out-of-group pin.
                 let out_of_strict_group = strict_group.is_some_and(|g| {
-                    let accounts = self
-                        .accounts
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                     !accounts
                         .get(idx)
                         .is_some_and(|a| a.groups.iter().any(|carried| carried == g))
                 });
                 if other_provider {
-                    let accounts = self
-                        .accounts
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                     keep_pin = Some(idx);
                     divert_reason = Some("other-provider");
                     divert_until_ms = accounts
@@ -734,10 +719,7 @@ impl Manager {
                         .and_then(|a| a.rate_limited_until_ms)
                         .unwrap_or(0);
                 } else if out_of_strict_group {
-                    let accounts = self
-                        .accounts
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                     keep_pin = Some(idx);
                     divert_reason = Some("group-strict");
                     divert_until_ms = accounts
@@ -755,10 +737,7 @@ impl Manager {
                     // `account_hard_ok`, not `hard_ok`: the model-class gate is about
                     // THIS request, so a Fable-exhausted pin that a Fable request
                     // already tried still keeps its pin for the session's Opus turns.
-                    let accounts = self
-                        .accounts
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                     if accounts.get(idx).is_some_and(|a| {
                         Self::account_hard_ok(
                             a,
@@ -798,7 +777,7 @@ impl Manager {
                         let mut accounts = self
                             .accounts
                             .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            .unwrap_or_else(PoisonError::into_inner);
                         // The full (soft-inclusive) gate. Failing it does NOT bench the
                         // pin — it only means we drop into the hard-gate re-test below,
                         // which decides serve-anyway vs durable re-key.
@@ -819,7 +798,82 @@ impl Manager {
                                 &groups.parked,
                             )
                         });
-                        if !x_usable {
+                        if x_usable {
+                            // Default: honour the pin. With migration disabled (the
+                            // default), or when `count_x < 2` (a LONE session),
+                            // `target` stays `idx` and nothing below runs, so this
+                            // path is byte-identical to the pre-migration behaviour —
+                            // a warm session's cache is never moved.
+                            let mut target = idx;
+                            let mut migrate_names: Option<(String, String)> = None;
+                            if migration_ok {
+                                // Least-loaded eligible target, ordered by
+                                // (pinned-session-count asc, in_flight asc,
+                                // last_selected_seq asc / LRU). A candidate qualifies
+                                // ONLY if it strictly improves balance — this guard
+                                // prevents thrash and equal-swaps.
+                                let mut best: Option<usize> = None;
+                                let mut best_key: Option<(usize, u32, u64)> = None;
+                                for (cand, account) in accounts.iter().enumerate() {
+                                    if cand == idx || tried.contains(&cand) {
+                                        continue;
+                                    }
+                                    let count_y = counts.get(&cand).copied().unwrap_or(0);
+                                    if count_y + 1 >= count_x {
+                                        continue;
+                                    }
+                                    // Only migrate onto an ELIGIBLE account — the same
+                                    // gate the pin honours (disabled/error/rate-limit/
+                                    // quota/pacing), so a throttled `Y` is never chosen.
+                                    if !Self::eligible(
+                                        account,
+                                        self.global_threshold,
+                                        self.fable_weekly_threshold,
+                                        &self.pacing,
+                                        true,
+                                        now,
+                                        now_ms,
+                                        is_fable,
+                                        provider,
+                                        // `strict_group`, not `None`: the fourth door out of a
+                                        // strict group, and the one that returns from inside the
+                                        // affinity fast path. A migration target is a NEW pin, not
+                                        // a re-litigation of the existing one, so it is held to the
+                                        // same strict ask every other candidate loop in this
+                                        // function already is.
+                                        strict_group,
+                                        group, // reservation is not a preference, real ask
+                                        &groups.reserved,
+                                        &groups.parked,
+                                    ) {
+                                        continue;
+                                    }
+                                    let cand_key =
+                                        (count_y, account.in_flight, account.last_selected_seq);
+                                    if best_key.is_none_or(|b| cand_key < b) {
+                                        best = Some(cand);
+                                        best_key = Some(cand_key);
+                                    }
+                                }
+                                if let Some(y) = best {
+                                    let x_name = accounts
+                                        .get(idx)
+                                        .map(|a| a.name.clone())
+                                        .unwrap_or_default();
+                                    let y_name =
+                                        accounts.get(y).map(|a| a.name.clone()).unwrap_or_default();
+                                    migrate_names = Some((x_name, y_name));
+                                    target = y;
+                                }
+                            }
+                            // Stamp the chosen account so a second session's LRU steers
+                            // away from an account already busy under a pin.
+                            let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                            if let Some(account) = accounts.get_mut(target) {
+                                account.last_selected_seq = tick;
+                            }
+                            Some((target, migrate_names))
+                        } else {
                             // Re-test the SAME account against the ACCOUNT-level HARD
                             // gates ALONE to separate a per-REQUEST yield from a real
                             // block. Passing there means the pin cleared
@@ -1014,81 +1068,6 @@ impl Manager {
                                     Some((idx, None))
                                 }
                             }
-                        } else {
-                            // Default: honour the pin. With migration disabled (the
-                            // default), or when `count_x < 2` (a LONE session),
-                            // `target` stays `idx` and nothing below runs, so this
-                            // path is byte-identical to the pre-migration behaviour —
-                            // a warm session's cache is never moved.
-                            let mut target = idx;
-                            let mut migrate_names: Option<(String, String)> = None;
-                            if migration_ok {
-                                // Least-loaded eligible target, ordered by
-                                // (pinned-session-count asc, in_flight asc,
-                                // last_selected_seq asc / LRU). A candidate qualifies
-                                // ONLY if it strictly improves balance — this guard
-                                // prevents thrash and equal-swaps.
-                                let mut best: Option<usize> = None;
-                                let mut best_key: Option<(usize, u32, u64)> = None;
-                                for (cand, account) in accounts.iter().enumerate() {
-                                    if cand == idx || tried.contains(&cand) {
-                                        continue;
-                                    }
-                                    let count_y = counts.get(&cand).copied().unwrap_or(0);
-                                    if count_y + 1 >= count_x {
-                                        continue;
-                                    }
-                                    // Only migrate onto an ELIGIBLE account — the same
-                                    // gate the pin honours (disabled/error/rate-limit/
-                                    // quota/pacing), so a throttled `Y` is never chosen.
-                                    if !Self::eligible(
-                                        account,
-                                        self.global_threshold,
-                                        self.fable_weekly_threshold,
-                                        &self.pacing,
-                                        true,
-                                        now,
-                                        now_ms,
-                                        is_fable,
-                                        provider,
-                                        // `strict_group`, not `None`: the fourth door out of a
-                                        // strict group, and the one that returns from inside the
-                                        // affinity fast path. A migration target is a NEW pin, not
-                                        // a re-litigation of the existing one, so it is held to the
-                                        // same strict ask every other candidate loop in this
-                                        // function already is.
-                                        strict_group,
-                                        group, // reservation is not a preference, real ask
-                                        &groups.reserved,
-                                        &groups.parked,
-                                    ) {
-                                        continue;
-                                    }
-                                    let cand_key =
-                                        (count_y, account.in_flight, account.last_selected_seq);
-                                    if best_key.is_none_or(|b| cand_key < b) {
-                                        best = Some(cand);
-                                        best_key = Some(cand_key);
-                                    }
-                                }
-                                if let Some(y) = best {
-                                    let x_name = accounts
-                                        .get(idx)
-                                        .map(|a| a.name.clone())
-                                        .unwrap_or_default();
-                                    let y_name =
-                                        accounts.get(y).map(|a| a.name.clone()).unwrap_or_default();
-                                    migrate_names = Some((x_name, y_name));
-                                    target = y;
-                                }
-                            }
-                            // Stamp the chosen account so a second session's LRU steers
-                            // away from an account already busy under a pin.
-                            let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
-                            if let Some(account) = accounts.get_mut(target) {
-                                account.last_selected_seq = tick;
-                            }
-                            Some((target, migrate_names))
                         }
                     };
                     if let Some((target, migrate_names)) = decision {
@@ -1108,10 +1087,7 @@ impl Manager {
                         // accounts lock is taken here (the re-check needs only the
                         // affinity-map counts + the already-chosen target; the next
                         // select re-checks eligibility anyway).
-                        let mut pins = self
-                            .affinity
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let mut pins = self.affinity.lock().unwrap_or_else(PoisonError::into_inner);
                         let mut committed = target;
                         if target != idx {
                             let still_pinned_x = pins.get(&key).map(|&(i, _)| i) == Some(idx);
@@ -1183,10 +1159,8 @@ impl Manager {
                         && !tried.contains(&idx)
                     {
                         let usable = {
-                            let accounts = self
-                                .accounts
-                                .read()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let accounts =
+                                self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                             accounts.get(idx).is_some_and(|a| {
                                 Self::eligible(
                                     a,
@@ -1214,7 +1188,7 @@ impl Manager {
                             let mut accounts = self
                                 .accounts
                                 .write()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                .unwrap_or_else(PoisonError::into_inner);
                             let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
                             if let Some(account) = accounts.get_mut(idx) {
                                 account.last_selected_seq = tick;
@@ -1238,10 +1212,8 @@ impl Manager {
                         && !tried.contains(&control_idx)
                     {
                         let usable = {
-                            let accounts = self
-                                .accounts
-                                .read()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let accounts =
+                                self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                             accounts.get(control_idx).is_some_and(|a| {
                                 // `control_eligible` deliberately bypasses `disabled` and
                                 // every other narrowing gate (see its own doc), it is NOT
@@ -1267,7 +1239,7 @@ impl Manager {
                             let mut accounts = self
                                 .accounts
                                 .write()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                .unwrap_or_else(PoisonError::into_inner);
                             let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
                             if let Some(account) = accounts.get_mut(control_idx) {
                                 account.last_selected_seq = tick;
@@ -1305,16 +1277,13 @@ impl Manager {
             let episode = affinity.and_then(|key| {
                 self.divert_ledger
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(PoisonError::into_inner)
                     .get(&key)
                     .copied()
             });
             match divert_verdict(episode, pin_idx, divert_until_ms, 0) {
                 DivertVerdict::Sticky(sticky) if !tried.contains(&sticky) => {
-                    let accounts = self
-                        .accounts
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                     let usable = accounts.get(sticky).is_some_and(|a| {
                         Self::eligible(
                             a,
@@ -1359,7 +1328,7 @@ impl Manager {
             let mut accounts = self
                 .accounts
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
             if let Some(account) = accounts.get_mut(sticky) {
                 account.last_selected_seq = tick;
@@ -1369,7 +1338,7 @@ impl Manager {
             let mut accounts = self
                 .accounts
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
 
             // By default inference NEVER selects the control account, so that
             // inference load can never burn the one identity the control plane
@@ -1522,37 +1491,36 @@ impl Manager {
                         // than always blaming pacing: an operator debugging why
                         // `--group` did not land where expected must not read a log
                         // line about pacing when pacing was never the reason.
-                        match group {
-                            Some(g) => {
-                                let miss = Self::classify_group_miss(
-                                    &accounts,
-                                    tried,
-                                    control_excluded,
-                                    self.global_threshold,
-                                    self.fable_weekly_threshold,
-                                    &self.pacing,
-                                    now,
-                                    now_ms,
-                                    is_fable,
-                                    provider,
-                                    g,
-                                    &groups.reserved,
-                                    &groups.parked,
-                                );
-                                tracing::info!(
-                                    account = %account.name,
-                                    in_flight = account.in_flight,
-                                    group = g,
-                                    reason = miss.as_str(),
-                                    "group: falling back to the whole pool (group ignored), serving least-loaded — {}",
-                                    miss.explain(),
-                                );
-                            }
-                            None => tracing::info!(
+                        if let Some(g) = group {
+                            let miss = Self::classify_group_miss(
+                                &accounts,
+                                tried,
+                                control_excluded,
+                                self.global_threshold,
+                                self.fable_weekly_threshold,
+                                &self.pacing,
+                                now,
+                                now_ms,
+                                is_fable,
+                                provider,
+                                g,
+                                &groups.reserved,
+                                &groups.parked,
+                            );
+                            tracing::info!(
+                                account = %account.name,
+                                in_flight = account.in_flight,
+                                group = g,
+                                reason = miss.as_str(),
+                                "group: falling back to the whole pool (group ignored), serving least-loaded — {}",
+                                miss.explain(),
+                            );
+                        } else {
+                            tracing::info!(
                                 account = %account.name,
                                 in_flight = account.in_flight,
                                 "pacing: all accounts paced, serving least-loaded"
-                            ),
+                            );
                         }
                     }
                     best = Some(idx);
@@ -1621,10 +1589,7 @@ impl Manager {
             // heavily-diverted session the eviction victim.
             let pin_idx = keep_pin.unwrap_or(idx);
             let moved_off = {
-                let mut pins = self
-                    .affinity
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut pins = self.affinity.lock().unwrap_or_else(PoisonError::into_inner);
                 let previous = pins.get(&key).map(|&(i, _)| i);
                 // Capped at AFFINITY_CAP: an insert over it evicts the oldest-last-touch
                 // entry other than this one.
@@ -1641,10 +1606,7 @@ impl Manager {
             // The accounts lock is taken ONLY after the affinity lock has dropped
             // above; the two are never held simultaneously.
             if let Some(previous) = moved_off {
-                let accounts = self
-                    .accounts
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                 let old_name = accounts.get(previous).map_or("?", |a| a.name.as_str());
                 let new_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
                 tracing::info!(
@@ -1817,17 +1779,14 @@ impl Manager {
         // the pin's HARD gates under the accounts lock (never nested). No throttle.
         if let Some(key) = affinity {
             let pinned = {
-                let pins = self
-                    .affinity
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let pins = self.affinity.lock().unwrap_or_else(PoisonError::into_inner);
                 pins.get(&key).map(|&(idx, _)| idx)
             };
             if let Some(idx) = pinned {
                 let mut accounts = self
                     .accounts
                     .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(PoisonError::into_inner);
                 // `tried` gates SERVING and nothing else: the pin already failed THIS
                 // request upstream, so it cannot answer it. Whether the PIN MOVES is
                 // decided below, on ACCOUNT-level evidence alone — see the comment
@@ -1887,7 +1846,7 @@ impl Manager {
             let episode = affinity.and_then(|key| {
                 self.divert_ledger
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(PoisonError::into_inner)
                     .get(&key)
                     .copied()
             });
@@ -1903,7 +1862,7 @@ impl Manager {
             let mut accounts = self
                 .accounts
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
 
             let sticky_usable = sticky_pick.filter(|&s| accounts.get(s).is_some_and(hard_ok));
             via_sticky = sticky_usable.is_some();
@@ -1976,10 +1935,7 @@ impl Manager {
         if let Some(key) = affinity {
             let pin_idx = keep_pin.unwrap_or(idx);
             let previous = {
-                let mut pins = self
-                    .affinity
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut pins = self.affinity.lock().unwrap_or_else(PoisonError::into_inner);
                 let previous = pins.get(&key).map(|&(i, _)| i);
                 pins.insert(key, (pin_idx, now_ms));
                 self.mark_affinity_dirty();
@@ -2049,10 +2005,7 @@ impl Manager {
     /// index that no longer exists. Takes the accounts read lock itself and drops it before
     /// returning, so the caller must not hold the affinity lock.
     fn pin_and_serve_names(&self, pin_idx: usize, idx: usize) -> (String, String) {
-        let accounts = self
-            .accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
         let name = |i: usize| accounts.get(i).map_or("?", |a| a.name.as_str()).to_owned();
         (name(pin_idx), name(idx))
     }
@@ -2082,10 +2035,7 @@ impl Manager {
     /// the safe direction, since the only caller uses a `true` to re-admit an
     /// account into a request's rotation.
     pub fn hold_expired(&self, idx: usize, now_ms: i64) -> bool {
-        let accounts = self
-            .accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
         accounts
             .get(idx)
             .is_some_and(|account| Self::hold_remaining_ms(account, now_ms).is_none())
@@ -2144,7 +2094,7 @@ impl Manager {
         if five_hour.utilization < weekly_util {
             return None;
         }
-        five_hour.reset.map(super::odt_to_ms)
+        five_hour.reset.map(odt_to_ms)
     }
 
     /// Whether a `rejected` status clears while this session's prompt cache is still
@@ -2640,7 +2590,11 @@ impl Manager {
     ///   - **pacing** is a fact we measure exactly and continuously about our OWN
     ///     concurrency, and spreading a session's burst is the entire reason the cap
     ///     exists. It stays a per-REQUEST yield: divert this one, keep the pin.
-    pub(super) fn paced_out(account: &AccountRuntime, pacing: &PacingConfig, now_ms: i64) -> bool {
+    pub(super) const fn paced_out(
+        account: &AccountRuntime,
+        pacing: &PacingConfig,
+        now_ms: i64,
+    ) -> bool {
         if !pacing.is_active() {
             return false;
         }
@@ -2935,7 +2889,7 @@ impl Manager {
             let reset = account
                 .quota
                 .governing_weekly_reset(now)
-                .map_or(i128::MIN, |r| r.unix_timestamp() as i128);
+                .map_or(i128::MIN, |r| i128::from(r.unix_timestamp()));
             let key = (
                 account.priority,
                 self.reset_urgency_tier(account, now),
@@ -3002,7 +2956,7 @@ impl Manager {
             let reset = account
                 .quota
                 .governing_weekly_reset(now)
-                .map_or(i128::MIN, |r| r.unix_timestamp() as i128);
+                .map_or(i128::MIN, |r| i128::from(r.unix_timestamp()));
             let key = (
                 account.in_flight,
                 account.priority,
@@ -3096,7 +3050,7 @@ impl Manager {
             let reset = account
                 .quota
                 .governing_weekly_reset(now)
-                .map_or(i128::MIN, |r| r.unix_timestamp() as i128);
+                .map_or(i128::MIN, |r| i128::from(r.unix_timestamp()));
             let key = (
                 oi_bucket,
                 account.priority,
@@ -3122,7 +3076,7 @@ impl Manager {
         let map = self
             .conn_affinity
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         map.get(&conn_key).and_then(|&(idx, touch)| {
             if now_ms.saturating_sub(touch) < CONN_AFFINITY_TTL_MS {
                 Some(idx)
@@ -3141,7 +3095,7 @@ impl Manager {
         let mut map = self
             .conn_affinity
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         map.insert(conn_key, (idx, now_ms));
     }
 
@@ -3182,7 +3136,7 @@ impl Manager {
         let mut ledger = self
             .divert_ledger
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         let entry = ledger
             .entry(session_key)
             .and_modify(|e| {
@@ -3214,7 +3168,7 @@ impl Manager {
 /// longest-possible constraint, so it must sort as the LATEST-clearing gate.
 /// Among known instants the natural chronological order applies. Used by
 /// [`Manager::account_gate`] to pick the binding (latest-clearing) gate.
-fn gate_clear_key(at: Option<OffsetDateTime>) -> (u8, OffsetDateTime) {
+const fn gate_clear_key(at: Option<OffsetDateTime>) -> (u8, OffsetDateTime) {
     match at {
         Some(t) => (0, t),
         None => (1, OffsetDateTime::UNIX_EPOCH),
@@ -3247,11 +3201,11 @@ mod select_test_support {
     }
 
     /// [`live_manager`], with `path` as the config file behind it.
-    pub(super) fn live_manager_on_file(config: Config, path: std::path::PathBuf) -> Arc<Manager> {
+    pub(super) fn live_manager_on_file(config: Config, path: PathBuf) -> Arc<Manager> {
         live_manager_with(config, Some(path))
     }
 
-    fn live_manager_with(config: Config, path: Option<std::path::PathBuf>) -> Arc<Manager> {
+    fn live_manager_with(config: Config, path: Option<PathBuf>) -> Arc<Manager> {
         Manager::new(
             config,
             Arc::new(NoRefresh),
@@ -3267,7 +3221,7 @@ mod select_test_support {
         manager
             .affinity
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(key, (idx, touched_ms));
     }
 
@@ -3276,7 +3230,7 @@ mod select_test_support {
         manager
             .affinity
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&key)
             .map(|&(idx, _)| idx)
     }
@@ -3445,7 +3399,7 @@ mod revalidation_sticky_tests {
         let episode = manager
             .divert_ledger
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&key)
             .copied()
             .expect("episode recorded");
@@ -3543,7 +3497,7 @@ mod sticky_divert_replay_tests {
         let episode = manager
             .divert_ledger
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&key)
             .copied()
             .expect("episode recorded");
@@ -3610,9 +3564,7 @@ mod strict_group_door_tests {
     /// control-preferred overlay below needs to reach.
     fn config_with_control(accounts: Vec<Account>, control_name: &str) -> Config {
         let mut config = config_with(accounts, None);
-        config.control_account = Some(crate::config::ControlAccountRef::Name(
-            control_name.to_string(),
-        ));
+        config.control_account = Some(config::ControlAccountRef::Name(control_name.to_string()));
         config
     }
 
@@ -3732,7 +3684,7 @@ mod strict_group_door_tests {
             let accounts = manager
                 .accounts
                 .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             accounts[pin].groups[0].clone()
         };
         let answer = manager.select_with_group(
@@ -4028,7 +3980,7 @@ mod reserved_gate_agreement_tests {
         AccountRuntime::from_config(
             &Account {
                 refresh_token: None,
-                groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+                groups: Some(groups.iter().map(ToString::to_string).collect()),
                 ..Account::fixture("probe")
             },
             false,
@@ -4058,7 +4010,7 @@ mod reserved_gate_agreement_tests {
             let account = account_runtime(groups);
             for reserved_list in reserved_combos {
                 let reserved: HashSet<String> =
-                    reserved_list.iter().map(|s| s.to_string()).collect();
+                    reserved_list.iter().map(ToString::to_string).collect();
                 let blocked = Manager::reserved_blocks(&account, None, &reserved);
 
                 let elig = Manager::eligible(
@@ -4184,7 +4136,7 @@ mod group_miss_tests {
             &Account {
                 refresh_token: None,
                 disabled: disabled.then_some(true),
-                groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+                groups: Some(groups.iter().map(ToString::to_string).collect()),
                 ..Account::fixture(name)
             },
             false,
@@ -4388,7 +4340,7 @@ mod reset_urgency_tests {
         let mut accounts = manager
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         accounts[idx].quota.seven_day = Some(QuotaWindow {
             utilization: 0.10,
             reset: Some(now + time::Duration::hours(hours)),
@@ -4399,7 +4351,7 @@ mod reset_urgency_tests {
         let mut accounts = manager
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         accounts[idx].last_selected_seq = seq;
     }
 
@@ -4523,7 +4475,7 @@ mod reset_urgency_tests {
             let accounts = manager
                 .accounts
                 .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             manager.reset_urgency_tier(&accounts[0], now)
         };
 
@@ -4538,14 +4490,14 @@ mod reset_urgency_tests {
             let mut accounts = manager
                 .accounts
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             accounts[0].quota.seven_day = None;
         }
         {
             let accounts = manager
                 .accounts
                 .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             assert_eq!(
                 manager.reset_urgency_tier(&accounts[0], now),
                 i64::MIN,
@@ -4556,10 +4508,7 @@ mod reset_urgency_tests {
         // Disabled → a constant tie for everyone, including the unknown arm.
         let off = live_manager(config_with(vec![account("a")], 0));
         {
-            let accounts = off
-                .accounts
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let accounts = off.accounts.read().unwrap_or_else(PoisonError::into_inner);
             assert_eq!(
                 off.reset_urgency_tier(&accounts[0], now),
                 0,
@@ -4604,7 +4553,7 @@ mod fable_last_resort_tests {
         let mut accounts = manager
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         accounts[idx].quota.seven_day_oi = Some(QuotaWindow {
             utilization,
             reset: Some(now + Duration::hours(2)),
@@ -4624,7 +4573,7 @@ mod fable_last_resort_tests {
         let accounts = manager
             .accounts
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         assert!(
             Manager::model_blocked(
                 &accounts[0],
@@ -4654,7 +4603,7 @@ mod fable_last_resort_tests {
         let accounts = manager
             .accounts
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         assert!(
             !Manager::model_blocked(
                 &accounts[0],
@@ -4678,7 +4627,7 @@ mod fable_last_resort_tests {
         );
     }
 
-    /// `account_gate`'s FableWeekly push must agree with `model_blocked` on the
+    /// `account_gate`'s `FableWeekly` push must agree with `model_blocked` on the
     /// same account under both an absent and a set `fableWeeklyThreshold` — two
     /// independently-resolved copies is exactly how the panel and routing can
     /// drift; see [`effective_fable_threshold`], the one resolver both consume.
@@ -4694,7 +4643,7 @@ mod fable_last_resort_tests {
             let accounts = manager
                 .accounts
                 .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             let blocked = Manager::model_blocked(
                 &accounts[0],
                 manager.global_threshold,
@@ -4886,7 +4835,7 @@ mod fable_last_resort_tests {
         let mut config = config_with(vec![priv_account, account("pool-account")], 0.95);
         config.group_settings.insert(
             "priv".to_string(),
-            crate::config::GroupSettings {
+            config::GroupSettings {
                 reserved: true,
                 ..Default::default()
             },
@@ -5051,7 +5000,7 @@ mod stale_pin_load_tests {
         let pins = manager
             .affinity
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         assert_eq!(pins.len(), 7, "no stale pin was evicted by the filter");
         assert!((1..=6).all(|k| pins.get(&k).map(|&(i, _)| i) == Some(1)));
     }
@@ -5105,7 +5054,7 @@ mod provider_filter_tests {
             let path = dir.path().join(crate::paths::CONFIG_FILE);
             let mut config = config_with(vec![
                 Account {
-                    egress: crate::config::Egress::Via(peer),
+                    egress: config::Egress::Via(peer),
                     egress_strict: true,
                     ..codex("alice@example.com/codex")
                 },
@@ -5115,8 +5064,8 @@ mod provider_filter_tests {
             if door == "locked" {
                 config.lock_account = Some("alice@example.com/codex".into());
             }
-            crate::config::save(&path, &config).unwrap();
-            let config = crate::config::load(&path).unwrap();
+            config::save(&path, &config).unwrap();
+            let config = config::load(&path).unwrap();
             assert_eq!(
                 config.accounts.len(),
                 2,
@@ -5168,9 +5117,9 @@ mod provider_filter_tests {
     fn supported_peer_exit_settings_keep_their_selection_behavior() {
         let peer = tcr_peer_wire::PeerId([0x55; 32]);
         for (provider, egress, strict) in [
-            (Provider::Anthropic, crate::config::Egress::Via(peer), true),
-            (Provider::Codex, crate::config::Egress::Via(peer), false),
-            (Provider::Codex, crate::config::Egress::Local, true),
+            (Provider::Anthropic, config::Egress::Via(peer), true),
+            (Provider::Codex, config::Egress::Via(peer), false),
+            (Provider::Codex, config::Egress::Local, true),
         ] {
             let manager = live_manager(config_with(vec![Account {
                 provider,
@@ -5201,14 +5150,14 @@ mod provider_filter_tests {
     fn set_window(
         manager: &Manager,
         idx: usize,
-        window: fn(&mut crate::quota::Quota) -> &mut Option<QuotaWindow>,
+        window: fn(&mut Quota) -> &mut Option<QuotaWindow>,
         utilization: f64,
     ) {
         let now = OffsetDateTime::now_utc();
         let mut accounts = manager
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         *window(&mut accounts[idx].quota) = Some(QuotaWindow {
             utilization,
             reset: Some(now + Duration::hours(2)),
@@ -5239,7 +5188,7 @@ mod provider_filter_tests {
     #[test]
     fn eligible_refuses_an_account_of_the_other_provider() {
         let mut codex = runtime("alice@example.com");
-        codex.provider = crate::provider::Provider::Codex;
+        codex.provider = Provider::Codex;
         let anthropic = runtime("bob@example.com");
         let now = OffsetDateTime::now_utc();
         let now_ms = odt_to_ms(now);
@@ -5256,7 +5205,7 @@ mod provider_filter_tests {
                 now,
                 now_ms,
                 false,
-                crate::provider::Provider::Anthropic,
+                Provider::Anthropic,
                 None,
                 None,
                 &empty,
@@ -5274,7 +5223,7 @@ mod provider_filter_tests {
                 now,
                 now_ms,
                 false,
-                crate::provider::Provider::Codex,
+                Provider::Codex,
                 None,
                 None,
                 &empty,
@@ -5291,7 +5240,7 @@ mod provider_filter_tests {
             now,
             now_ms,
             false,
-            crate::provider::Provider::Codex,
+            Provider::Codex,
             None,
             None,
             &empty,
@@ -5443,7 +5392,7 @@ mod provider_filter_tests {
         let manager = live_manager(config_with(vec![
             Account {
                 account_uuid: Some("11111111-1111-1111-1111-111111111111".into()),
-                egress: crate::config::Egress::Via(tcr_peer_wire::PeerId([0x55; 32])),
+                egress: config::Egress::Via(tcr_peer_wire::PeerId([0x55; 32])),
                 egress_strict: true,
                 ..codex("alice@example.com")
             },
@@ -5476,15 +5425,15 @@ mod provider_filter_tests {
         let path = dir.path().join(crate::paths::CONFIG_FILE);
         let mut config = config_with(vec![account("alice@example.com"), codex("bob@example.com")]);
         config.proxy.port = 9;
-        crate::config::save(&path, &config).unwrap();
+        config::save(&path, &config).unwrap();
         let manager = live_manager_on_file(config.clone(), path.clone());
         assert_eq!(manager.provider_account_count(Provider::Anthropic), 1);
         let writing = manager.config_write.lock().unwrap();
         config.accounts.remove(0);
-        crate::config::save(&path, &config).unwrap();
+        config::save(&path, &config).unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let worker_manager = manager.clone();
+        let worker_manager = Arc::clone(&manager);
         let worker = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
             let count = worker_manager.provider_account_count(Provider::Anthropic);
@@ -5675,7 +5624,7 @@ mod provider_filter_tests {
     #[test]
     fn the_control_overlay_never_routes_the_other_providers_request() {
         let mut config = config_with(vec![codex("alice@example.com"), account("bob@example.com")]);
-        config.control_account = Some(crate::config::ControlAccountRef::Name(
+        config.control_account = Some(config::ControlAccountRef::Name(
             "bob@example.com".to_string(),
         ));
         let manager = live_manager(config);

@@ -8,7 +8,7 @@ use crate::stats::Rng;
 /// The phases, in the order a full run takes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Phase {
+pub(crate) enum Phase {
     /// Throttles off, the stub answers at once: what the proxy itself costs.
     Overhead,
     /// The fleet's five-day average, about 1.5 requests a second, default throttles.
@@ -27,7 +27,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    pub const ALL: [Phase; 7] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Overhead,
         Self::Steady,
         Self::Peak,
@@ -37,7 +37,7 @@ impl Phase {
         Self::Idle,
     ];
 
-    pub fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Overhead => "overhead",
             Self::Steady => "steady",
@@ -49,25 +49,25 @@ impl Phase {
         }
     }
 
-    pub fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|p| p.as_str() == raw)
     }
 
     /// Whether the proxy boots with its throttles switched off for this phase: the phases
     /// that measure the proxy's own cost per request.
-    pub fn throttles_off(self) -> bool {
+    pub(crate) const fn throttles_off(self) -> bool {
         self.closed_loop()
     }
 
     /// Whether each session sends its next request the moment its last reply ends, rather
     /// than on a schedule.
-    pub fn closed_loop(self) -> bool {
+    pub(crate) const fn closed_loop(self) -> bool {
         matches!(self, Self::Overhead | Self::Big1m | Self::Big4m)
     }
 
     /// The size each request is generated to, for the big-body phases. The others send a
     /// short conversation behind a `--body-kb` system prompt.
-    pub fn big_body_bytes(self) -> Option<usize> {
+    pub(crate) const fn big_body_bytes(self) -> Option<usize> {
         match self {
             Self::Big1m => Some(1024 * 1024),
             Self::Big4m => Some(4 * 1024 * 1024),
@@ -79,7 +79,7 @@ impl Phase {
 /// Which endpoint one request goes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum Kind {
+pub(crate) enum Kind {
     /// `/v1/messages`, `stream: true`: most of what Claude Code sends.
     Streamed,
     /// `/v1/messages`, `stream: false`.
@@ -90,7 +90,7 @@ pub enum Kind {
 
 impl Kind {
     /// 85% streamed, 5% buffered, 10% `count_tokens`.
-    pub fn draw(rng: &mut Rng) -> Self {
+    pub(crate) fn draw(rng: &mut Rng) -> Self {
         let u = rng.unit();
         if u < 0.85 {
             Self::Streamed
@@ -104,23 +104,23 @@ impl Kind {
 
 /// One planned send: when, from which session, to which endpoint.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Planned {
+pub(crate) struct Planned {
     pub at_ms: f64,
     pub session: usize,
     pub kind: Kind,
 }
 
 /// The fleet's five-day average send rate (`src/config.rs`, `default_account_throttle`).
-pub const STEADY_RATE: f64 = 1.5;
+pub(crate) const STEADY_RATE: f64 = 1.5;
 /// The busiest one-second window in the same replay: 36 sends.
-pub const PEAK_BURST: usize = 36;
+pub(crate) const PEAK_BURST: usize = 36;
 /// Seconds between peak bursts.
-pub const PEAK_EVERY_S: f64 = 5.0;
+pub(crate) const PEAK_EVERY_S: f64 = 5.0;
 /// The runaway offer: three times the fleet ceiling's sustained 10 a second.
-pub const RUNAWAY_RATE: f64 = 30.0;
+pub(crate) const RUNAWAY_RATE: f64 = 30.0;
 
 /// How many concurrent sessions each phase spreads its sends over.
-pub fn sessions(phase: Phase) -> usize {
+pub(crate) const fn sessions(phase: Phase) -> usize {
     match phase {
         Phase::Overhead => 16,
         // Idle warms up the steady phase's sessions, so the caches it saves hold them.
@@ -134,7 +134,7 @@ pub fn sessions(phase: Phase) -> usize {
 
 /// The open-loop schedule for `phase` over `duration_s`. The overhead phase is closed-loop
 /// (each worker sends its next request when the last one ends) and has no schedule.
-pub fn schedule(phase: Phase, duration_s: f64, seed: u64) -> Vec<Planned> {
+pub(crate) fn schedule(phase: Phase, duration_s: f64, seed: u64) -> Vec<Planned> {
     let mut rng = Rng::new(seed);
     let end = duration_s * 1_000.0;
     let n = sessions(phase);
@@ -217,7 +217,7 @@ mod tests {
             .filter(|p| (1_000.0..2_000.0).contains(&p.at_ms))
             .map(|p| p.session)
             .collect();
-        let mut distinct = first.clone();
+        let mut distinct = first;
         distinct.sort_unstable();
         distinct.dedup();
         assert!(distinct.len() >= PEAK_BURST, "{} distinct", distinct.len());
@@ -253,7 +253,7 @@ mod tests {
         let streamed = (0..n)
             .filter(|_| Kind::draw(&mut rng) == Kind::Streamed)
             .count();
-        let share = streamed as f64 / n as f64;
+        let share = streamed as f64 / f64::from(n);
         assert!((share - 0.85).abs() < 0.02, "streamed share {share}");
     }
 }

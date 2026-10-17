@@ -83,7 +83,7 @@ pub struct UsageTotals {
 }
 
 /// `skip_serializing_if` for a counter that is written only once it counts something.
-fn is_zero(n: &u64) -> bool {
+const fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
@@ -333,7 +333,7 @@ pub struct SessionToolsRow {
     /// `#[serde(default)]` so a payload from a server built before this field existed
     /// decodes as "no split known" rather than a parse failure.
     #[serde(default)]
-    pub timeouts_by_class: std::collections::BTreeMap<String, u64>,
+    pub timeouts_by_class: BTreeMap<String, u64>,
     /// The commands that timed out in this session, newest first, capped at 20 — the rows
     /// behind [`Self::timeouts_by_class`]. Same `#[serde(default)]` reasoning.
     #[serde(default)]
@@ -379,7 +379,7 @@ pub struct SessionsSummary {
     /// same reason [`Self::by_tool`] is: the panel's headline and its "TIMED OUT TODAY"
     /// section read one number rather than two client-side re-sums that can drift.
     #[serde(default)]
-    pub timeouts_by_class: std::collections::BTreeMap<String, u64>,
+    pub timeouts_by_class: BTreeMap<String, u64>,
     #[serde(default)]
     pub by_tool: Vec<ToolBucketRow>,
     /// Sum of [`SessionRow::cost_usd`] across every live session — see that field's

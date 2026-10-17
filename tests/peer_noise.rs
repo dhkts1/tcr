@@ -63,7 +63,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CountingWriter<W> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let counted = self.written.clone();
+        let counted = Arc::clone(&self.written);
         let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &polled {
             counted.fetch_add(*n, Ordering::SeqCst);
@@ -88,7 +88,7 @@ fn counted(stream: TcpStream) -> (Counted, Arc<AtomicUsize>) {
     let (read, write) = tokio::io::split(stream);
     let writer = CountingWriter {
         inner: write,
-        written: written.clone(),
+        written: Arc::clone(&written),
     };
     (tokio::io::join(read, writer), written)
 }
@@ -122,7 +122,7 @@ fn pinned(key: [u8; 32]) -> PeerRow {
 }
 
 /// A header for one stream kind, with a hop budget and no `via`.
-fn header(kind: StreamKind, target: Option<TunnelTarget>) -> StreamHeader {
+const fn header(kind: StreamKind, target: Option<TunnelTarget>) -> StreamHeader {
     StreamHeader {
         kind,
         target,
@@ -145,7 +145,7 @@ async fn dial_first_pairing<S>(
     secret: &[u8; 32],
 ) -> anyhow::Result<noise::PeerSession>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + AsyncWrite + Unpin,
 {
     noise::dial_handshake_with_payload(
         stream,
@@ -743,7 +743,7 @@ async fn answer_pairing_revealing<S>(
     reveal: &[u8; noise::PAIR_NONCE_BYTES],
 ) -> anyhow::Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + AsyncWrite + Unpin,
 {
     let mut state = noise::responder_with_secret(secret, noise::PATTERN_PAIR, &[])?;
     let mut scratch = vec![0_u8; noise::HANDSHAKE_SCRATCH_BYTES];
@@ -1294,7 +1294,7 @@ fn a_state_file_a_wider_mode_is_quarantined_and_the_saved_one_is_0600() {
     );
     let quarantined: Vec<_> = std::fs::read_dir(dir.path())
         .expect("the dir reads")
-        .filter_map(|entry| entry.ok())
+        .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|name| name.contains(".corrupt-"))
         .collect();
@@ -1703,7 +1703,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
     let joiner_key = NodeKey::load_or_mint(joiner_dir.path()).expect("a joiner keypair");
 
     // Bind first, so the token carries the port the kernel actually gave us.
-    let listener = tcr::peer::listener::bind("127.0.0.1:0".parse().expect("an addr"))
+    let listener = listener::bind("127.0.0.1:0".parse().expect("an addr"))
         .await
         .expect("a loopback peer socket");
     let addr = listener.local_addr().expect("the bound address");
@@ -1712,7 +1712,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
 
     let registrar_store = PeerStore::open(&registrar_peers).expect("the registrar's file opens");
     let (invite, token) =
-        tcr::peer::pair::mint_invite_as(&registrar_store, &registrar_key, "laptop-2", 600, 1, None)
+        pair::mint_invite_as(&registrar_store, &registrar_key, "laptop-2", 600, 1, None)
             .expect("an invite is minted");
 
     // The registrar's half: exactly what the listener has to do for an
@@ -1769,7 +1769,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
         else {
             panic!("an enrolment session may send exactly one Enroll and nothing else");
         };
-        tcr::peer::pair::accept_enrolment(
+        pair::accept_enrolment(
             &registrar_path,
             session.peer,
             &enroll,
@@ -1780,10 +1780,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
         .expect("the joiner is pinned and the invite is spent");
 
         // The acknowledgement: the ordinary Hello a pinned peer may receive.
-        let hello = hello_for_peer(
-            &NodeFacts::minimal(registrar_id),
-            &tcr::peer::config::ControlGrants::default(),
-        );
+        let hello = hello_for_peer(&NodeFacts::minimal(registrar_id), &ControlGrants::default());
         let bytes = serde_json::to_vec(&Control::Hello(hello)).expect("the Hello serializes");
         noise::send_encrypted(&mut stream, &mut session.transport, &bytes)
             .await
@@ -1791,7 +1788,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
     });
 
     let joiner_store = PeerStore::open(&joiner_peers).expect("the joiner's file opens");
-    let pinned = tcr::peer::pair::join_as(&joiner_store, &joiner_key, &token, "laptop-2")
+    let pinned = pair::join_as(&joiner_store, &joiner_key, &token, "laptop-2")
         .await
         .expect("the joiner enrols");
     accepting.await.expect("the registrar's half");
@@ -1858,14 +1855,14 @@ fn a_one_use_invite_refuses_its_second_joiner() {
     let node = NodeKey::load_or_mint(dir.path()).expect("a keypair");
     let store = PeerStore::open(&peers).expect("the file opens");
 
-    let (invite, _token) = tcr::peer::pair::mint_invite_as(&store, &node, "laptop-2", 600, 1, None)
-        .expect("an invite is minted");
+    let (invite, _token) =
+        pair::mint_invite_as(&store, &node, "laptop-2", 600, 1, None).expect("an invite is minted");
     let enroll = Enroll {
         invite_id: 0,
         label: "laptop-2".to_string(),
     };
 
-    let first = tcr::peer::pair::accept_enrolment(
+    let first = pair::accept_enrolment(
         &peers,
         PeerId([4_u8; 32]),
         &enroll,
@@ -1876,7 +1873,7 @@ fn a_one_use_invite_refuses_its_second_joiner() {
     .expect("the first joiner proves the invite and is pinned");
     assert_eq!(first.node, PeerId([4_u8; 32]));
 
-    let second = tcr::peer::pair::accept_enrolment(
+    let second = pair::accept_enrolment(
         &peers,
         PeerId([5_u8; 32]),
         &enroll,
@@ -1914,11 +1911,11 @@ fn a_hostile_enrolment_label_is_refused_and_spends_nothing() {
     peers_file_with_listener(&peers, "127.0.0.1:9600".parse().expect("an addr"));
     let node = NodeKey::load_or_mint(dir.path()).expect("a keypair");
     let store = PeerStore::open(&peers).expect("the file opens");
-    let (invite, _token) = tcr::peer::pair::mint_invite_as(&store, &node, "laptop-2", 600, 1, None)
-        .expect("an invite is minted");
+    let (invite, _token) =
+        pair::mint_invite_as(&store, &node, "laptop-2", 600, 1, None).expect("an invite is minted");
 
     for hostile in ["alice@example.com", "laptop\u{1b}[31m2", "laptop\n2"] {
-        let refusal = tcr::peer::pair::accept_enrolment(
+        let refusal = pair::accept_enrolment(
             &peers,
             PeerId([6_u8; 32]),
             &Enroll {
@@ -2126,7 +2123,7 @@ fn forget_takes_the_file_lock() {
     // than against an assumption about how fast a file write is.
     let started = std::time::Instant::now();
     assert!(
-        tcr::peer::pair::forget(&store, &other).expect("the forget writes"),
+        pair::forget(&store, &other).expect("the forget writes"),
         "the row was there, so this reports a removal"
     );
     let unlocked = started.elapsed();
@@ -2138,7 +2135,7 @@ fn forget_takes_the_file_lock() {
     // And now with somebody else's read-modify-write in flight.
     let held = tcr::peer::config::FileLock::acquire(&peers).expect("take the file lock first");
     let started = std::time::Instant::now();
-    let removed = tcr::peer::pair::forget(&store, &doomed).expect("the forget writes");
+    let removed = pair::forget(&store, &doomed).expect("the forget writes");
     let waited = started.elapsed();
     drop(held);
 
@@ -2157,7 +2154,7 @@ fn forget_takes_the_file_lock() {
         "and both rows are gone"
     );
     assert!(
-        !tcr::peer::pair::forget(&store, &doomed).expect("a second forget is not an error"),
+        !pair::forget(&store, &doomed).expect("a second forget is not an error"),
         "a peer that is not pinned reports no removal and writes nothing"
     );
 }
@@ -2185,7 +2182,7 @@ fn a_pin_takes_the_file_lock_and_an_enrolment_still_completes() {
     let peer = PeerId([66_u8; 32]);
 
     let started = std::time::Instant::now();
-    tcr::peer::pair::confirm(&store, &peer, "123456", None).expect("the pin writes");
+    pair::confirm(&store, &peer, "123456", None).expect("the pin writes");
     let unlocked = started.elapsed();
     assert!(
         unlocked < std::time::Duration::from_millis(200),
@@ -2201,7 +2198,7 @@ fn a_pin_takes_the_file_lock_and_an_enrolment_still_completes() {
 
     let held = tcr::peer::config::FileLock::acquire(&peers).expect("take the file lock first");
     let started = std::time::Instant::now();
-    tcr::peer::pair::confirm(&store, &peer, "654321", None).expect("the re-pin writes");
+    pair::confirm(&store, &peer, "654321", None).expect("the re-pin writes");
     let waited = started.elapsed();
     drop(held);
     assert!(
@@ -2216,10 +2213,9 @@ fn a_pin_takes_the_file_lock_and_an_enrolment_still_completes() {
     let joiner = PeerId([67_u8; 32]);
     let node =
         tcr::peer::id::NodeKey::load_or_mint(dir.path()).expect("a node key for the registrar");
-    let (invite, _token) =
-        tcr::peer::pair::mint_invite_as(&store, &node, "attic-nuc", 600, 1, None)
-            .expect("an invite is minted");
-    let row = tcr::peer::pair::accept_enrolment(
+    let (invite, _token) = pair::mint_invite_as(&store, &node, "attic-nuc", 600, 1, None)
+        .expect("an invite is minted");
+    let row = pair::accept_enrolment(
         &peers,
         joiner,
         &tcr_peer_wire::Enroll {
@@ -2382,8 +2378,8 @@ fn a_node_key_file_is_never_visible_before_its_bytes() {
     for _ in 0..MINTS {
         let dir = tempfile::tempdir().expect("a temp dir");
         let key_path = tcr::peer::id::private_key_path(dir.path());
-        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let watcher_start = start.clone();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let watcher_start = Arc::clone(&start);
         let watched = key_path.clone();
         // The first length this reader manages to see, and whether it saw the
         // file at all: a run that never sampled proves nothing, so it is
@@ -2464,7 +2460,7 @@ fn minting_leaves_only_the_two_key_files() {
 ///
 /// Watched red by putting `read_frame(stream)` back: the oversized prefix is
 /// accepted, 65 535 bytes are allocated, and the refusal that follows is the
-/// pattern check, which says "are not a Noise_XX… message 1".
+/// pattern check, which says "are not a `Noise_XX`… message 1".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_responders_first_read_is_bounded_by_its_own_pattern() {
     use tokio::io::AsyncWriteExt as _;

@@ -153,7 +153,7 @@ async fn a_disclose_grant_written_after_boot_is_borrowed_on_without_a_restart() 
         .expect("bind the stand-in lender");
     let lender_addr = lender.local_addr().expect("the stand-in lender's addr");
     let dialled = Arc::new(AtomicUsize::new(0));
-    let counter = dialled.clone();
+    let counter = Arc::clone(&dialled);
     tokio::spawn(async move {
         while let Ok((stream, _)) = lender.accept().await {
             counter.fetch_add(1, Ordering::SeqCst);

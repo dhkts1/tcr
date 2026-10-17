@@ -378,7 +378,7 @@ pub fn lender_forwards_header(name: &str) -> bool {
 /// The one HTTP method a relayed request may carry.
 ///
 /// [`ServeRequest::method`] used to be built as the literal `"POST"` and read
-/// by nobody, so a borrower that sent `GET` had it silently POSTed on the
+/// by nobody, so a borrower that sent `GET` had it silently `POSTed` on the
 /// lender's account. The field is honoured instead of removed because the
 /// borrower's client really does choose the method and a lender must be able to
 /// say which one it will serve. See [`handle_serve_on`], which refuses
@@ -1236,7 +1236,7 @@ pub async fn handle_serve_on<S>(
     serving: &crate::peer::listener::LeaseServing,
     header_request_id: u128,
     now_ms: i64,
-    from: std::net::SocketAddr,
+    from: SocketAddr,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1960,7 +1960,7 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
         return Ok(None);
     };
 
-    let key = crate::peer::id::NodeKey::load_or_mint(&node_key_dir(store))
+    let key = NodeKey::load_or_mint(&node_key_dir(store))
         .context("peer hello: this node has no keypair to greet a peer with")?;
     let mut session = noise::dial_handshake(
         &mut stream,
@@ -2451,14 +2451,10 @@ where
     loop {
         tokio::select! {
             Some((candidate, outcome)) = running.next(), if !running.is_empty() => {
-                match outcome {
-                    Some(value) => return RaceOutcome { won: Some((candidate, value)), failed },
-                    None => {
-                        failed.push(candidate);
-                        if running.is_empty() && next_start.is_none() {
-                            return RaceOutcome { won: None, failed };
-                        }
-                    }
+                if let Some(value) = outcome { return RaceOutcome { won: Some((candidate, value)), failed } }
+                failed.push(candidate);
+                if running.is_empty() && next_start.is_none() {
+                    return RaceOutcome { won: None, failed };
                 }
             }
             () = async {
@@ -2900,10 +2896,12 @@ pub fn forwarders_for(target: &PeerId, store: &PeerStore) -> Vec<PeerId> {
                 crate::peer::probe::carrier_key(&row.node, seen, table),
             )
         })
-        .unwrap_or((
-            0,
-            (0, u32::MAX, std::cmp::Reverse(seen.unwrap_or(i64::MIN))),
-        ))
+        .unwrap_or_else(|_| {
+            (
+                0,
+                (0, u32::MAX, std::cmp::Reverse(seen.unwrap_or(i64::MIN))),
+            )
+        })
     };
     chosen.sort_by_key(|row| order(row));
     chosen.into_iter().map(|row| row.node).collect()
@@ -3423,26 +3421,23 @@ async fn exchange_addresses(row: &PeerRow, store: &PeerStore, borrow_timeout_ms:
         );
         return false;
     }
-    match crate::peer::reach::learn_from_hint(&row.node, &theirs) {
-        Some(addr) => {
-            tracing::info!(
-                peer = %row.node.display(),
-                via = %carrier.display(),
-                addr = %addr,
-                "peer aim: that peer named where it is now, over a friend they both still \
-                 reach"
-            );
-            true
-        }
-        None => {
-            tracing::debug!(
-                peer = %row.node.display(),
-                via = %carrier.display(),
-                "peer aim: nothing that peer named is an address anything can dial, so this \
-                 node still has nowhere to aim"
-            );
-            false
-        }
+    if let Some(addr) = crate::peer::reach::learn_from_hint(&row.node, &theirs) {
+        tracing::info!(
+            peer = %row.node.display(),
+            via = %carrier.display(),
+            addr = %addr,
+            "peer aim: that peer named where it is now, over a friend they both still \
+             reach"
+        );
+        true
+    } else {
+        tracing::debug!(
+            peer = %row.node.display(),
+            via = %carrier.display(),
+            "peer aim: nothing that peer named is an address anything can dial, so this \
+             node still has nowhere to aim"
+        );
+        false
     }
 }
 
@@ -3459,12 +3454,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             crate::request_key::HEADER,
-            axum::http::HeaderValue::from_static("not-a-real-request-key"),
+            HeaderValue::from_static("not-a-real-request-key"),
         );
-        headers.insert(
-            "content-type",
-            axum::http::HeaderValue::from_static("application/json"),
-        );
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
         assert_eq!(scrub_client_credentials(&mut headers), 1);
         assert!(headers.get(crate::request_key::HEADER).is_none());
         assert!(headers.get("content-type").is_some());

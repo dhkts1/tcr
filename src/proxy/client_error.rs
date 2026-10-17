@@ -75,13 +75,13 @@ impl ClientError {
     }
 
     /// Seconds the client is asked to wait, sent as `retry-after`.
-    pub(super) fn retry_after(mut self, seconds: i64) -> Self {
+    pub(super) const fn retry_after(mut self, seconds: i64) -> Self {
         self.retry_after = Some(seconds);
         self
     }
 
     /// Whether the client may resend on its own, sent as `x-should-retry`.
-    pub(super) fn should_retry(mut self, should_retry: bool) -> Self {
+    pub(super) const fn should_retry(mut self, should_retry: bool) -> Self {
         self.should_retry = Some(should_retry);
         self
     }

@@ -119,12 +119,12 @@ impl NodeKey {
     }
 
     /// This node's own id, the public half, as every peer sees it.
-    pub fn id(&self) -> PeerId {
+    pub const fn id(&self) -> PeerId {
         PeerId(self.public)
     }
 
     /// The private static, for `snow`'s builder and no other caller.
-    pub fn secret_bytes(&self) -> &[u8; 32] {
+    pub const fn secret_bytes(&self) -> &[u8; 32] {
         &self.secret
     }
 }
@@ -279,7 +279,7 @@ fn write_key_file(path: &Path, bytes: &[u8; 32], mode: u32) -> Result<()> {
         None => ".tcr-".to_string(),
     };
     let mut staged = tempfile::Builder::new()
-        .permissions(std::fs::Permissions::from_mode(mode))
+        .permissions(fs::Permissions::from_mode(mode))
         .prefix(prefix.as_str())
         .suffix(".tmp")
         .tempfile_in(dir)
@@ -306,7 +306,7 @@ fn write_key_file(path: &Path, bytes: &[u8; 32], mode: u32) -> Result<()> {
     // the same inode and one link is enough, on failure an orphan beside a key
     // file is a file holding this node's private key.
     let staged = staged.into_temp_path();
-    std::fs::hard_link(&staged, path).with_context(|| format!("creating {}", path.display()))?;
+    fs::hard_link(&staged, path).with_context(|| format!("creating {}", path.display()))?;
     Ok(())
 }
 

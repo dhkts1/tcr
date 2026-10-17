@@ -790,7 +790,7 @@ async fn a_carry_delivers_the_canned_messages_body_through_a_gateway() {
         .send()
         .await
         .expect("the carried request completes");
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await.expect("the carried body");
     assert_eq!(
         body, CANNED_BODY,
@@ -1483,7 +1483,7 @@ fn fake_account() -> Account {
         access_token: "at-alice".to_string(),
         refresh_token: Some("rt-alice".to_string()),
         expires_at: Some(4_102_444_800_000),
-        ..tcr::config::Account::fixture("alice@example.com")
+        ..Account::fixture("alice@example.com")
     }
 }
 
@@ -1517,7 +1517,7 @@ fn fleet_with(upstream: &str, accounts: Vec<Account>) -> Arc<Manager> {
     let config = Config {
         upstream: upstream.to_string(),
         switch_threshold: 0.95,
-        ..tcr::config::Config::fixture(accounts)
+        ..Config::fixture(accounts)
     };
     Manager::new(
         config,
@@ -2161,7 +2161,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     let peers = dir.path().join("tcr-peers.json");
     let config = dir.path().join("teamclaude.json");
     let peer = node().id;
-    let file = tcr::peer::config::PeerFile {
+    let file = PeerFile {
         peers: vec![row(&peer, "attic-nuc", Vec::new(), true)],
         ..Default::default()
     };
@@ -2471,7 +2471,7 @@ async fn the_operators_timeout_is_what_a_silent_gateway_is_given() {
 /// The far end here is the production gateway handler with a FIXED origin that
 /// accepts TCP and then says nothing, which is exactly the shape that hung: the
 /// carry is real and taken, the requester's ClientHello goes out, and no
-/// ServerHello ever comes back. Nothing leaves this box.
+/// `ServerHello` ever comes back. Nothing leaves this box.
 ///
 /// Watched red by moving `send_through(...)` back out from under the deadline.
 /// It was given a 600-second one instead, purely so the mutation run would end,
@@ -3692,7 +3692,7 @@ fn the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead() {
 #[test]
 fn peer_egress_keeps_anthropic_hosts_and_never_carries_chatgpt() {
     assert_eq!(
-        tcr::peer::egress::PEER_EGRESS_HOSTS,
+        egress::PEER_EGRESS_HOSTS,
         &["api.anthropic.com", "platform.claude.com"]
     );
     assert!(egress::host_allowed("api.anthropic.com", 443));

@@ -9,10 +9,10 @@ impl Manager {
     pub fn probe_interval_seconds(&self) -> u64 {
         self.config
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .extra
             .get("quotaProbeSeconds")
-            .and_then(|v| v.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .map_or(crate::probe::DEFAULT_PROBE_SECONDS, |v| v.max(0) as u64)
     }
 
@@ -23,10 +23,10 @@ impl Manager {
     pub fn warmup_interval_seconds(&self) -> u64 {
         self.config
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .extra
             .get("warmupSeconds")
-            .and_then(|v| v.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .map_or(0, |v| v.max(0) as u64)
     }
 
@@ -36,7 +36,7 @@ impl Manager {
     /// toward keeping caches warm: measured 2026-08-14, a config that lost its
     /// `sessionAffinity` key silently went cold when the default was `false`,
     /// and the client-side prompt-cache hit ratio dropped 0.952 → 0.498 with
-    /// cache_creation rising 6.5M/hour → 122M/hour, sustained seven hours — a
+    /// `cache_creation` rising 6.5M/hour → 122M/hour, sustained seven hours — a
     /// single missing key costing roughly 100M re-created tokens per hour.
     /// The read itself is [`crate::config::Config::session_affinity_enabled`],
     /// which `tcr config show` calls too. When explicitly
@@ -46,7 +46,7 @@ impl Manager {
     pub fn session_affinity_enabled(&self) -> bool {
         self.config
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .session_affinity_enabled()
     }
 
@@ -58,10 +58,10 @@ impl Manager {
     pub fn revalidation_serve_enabled(&self) -> bool {
         self.config
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .extra
             .get("revalidationServe")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(true)
     }
 
@@ -79,10 +79,10 @@ impl Manager {
     pub fn load_balance_migration_enabled(&self) -> bool {
         self.config
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .extra
             .get("loadBalanceMigration")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
     }
 
@@ -107,14 +107,11 @@ impl Manager {
     /// account; the fleet's composition is the finest grain it has. An explicit
     /// `"cacheTtlRewrite": true` or `false` overrides the default either way.
     pub fn cache_ttl_rewrite_enabled(&self) -> bool {
-        let config = self
-            .config
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
         match config
             .extra
             .get("cacheTtlRewrite")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
         {
             Some(explicit) => explicit,
             None => config.accounts.iter().all(|a| a.account_type.is_oauth()),
@@ -136,10 +133,10 @@ impl Manager {
     pub fn divert_budget(&self) -> u32 {
         self.config
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .extra
             .get("divertBudget")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .map_or(0, |v| v.min(u64::from(u32::MAX)) as u32)
     }
 
@@ -147,7 +144,7 @@ impl Manager {
     /// `warm_wake().notified()`, so the first sweep after boot happens as soon as
     /// the probe has read some quota rather than a full `warmupSeconds` later. See
     /// the field docs on [`Manager`] for why a lost wake is impossible here.
-    pub fn warm_wake(&self) -> &Notify {
+    pub const fn warm_wake(&self) -> &Notify {
         &self.warm_wake
     }
 
@@ -160,7 +157,7 @@ impl Manager {
     pub fn account_count(&self) -> usize {
         self.accounts
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
 
@@ -177,7 +174,7 @@ impl Manager {
         self.reload_groups_if_changed();
         self.accounts
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .filter(|a| a.provider == provider)
             .filter(|a| !a.removed)
@@ -250,7 +247,7 @@ impl Manager {
         let locked = self.locked_account_for(crate::provider::Provider::Codex);
         self.accounts
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .enumerate()
             .filter(|(idx, account)| match account.provider {
@@ -303,11 +300,7 @@ impl Manager {
     /// a window or a refusal without speaking its provider's header dialect, which is a
     /// different parser for each provider.
     #[cfg(test)]
-    pub(crate) fn edit_quota_for_test(
-        &self,
-        idx: usize,
-        edit: impl FnOnce(&mut crate::quota::Quota),
-    ) {
+    pub(crate) fn edit_quota_for_test(&self, idx: usize, edit: impl FnOnce(&mut Quota)) {
         if let Some(account) = self
             .accounts
             .write()
@@ -359,7 +352,7 @@ impl Manager {
     }
 
     /// The unkeyed-caller counters `GET /_tcr/status` reports.
-    pub fn unkeyed(&self) -> &crate::request_key::UnkeyedCounters {
+    pub const fn unkeyed(&self) -> &crate::request_key::UnkeyedCounters {
         &self.unkeyed
     }
 
@@ -370,7 +363,7 @@ impl Manager {
     pub(super) fn account<R>(&self, idx: usize, f: impl FnOnce(&AccountRuntime) -> R) -> Option<R> {
         self.accounts
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .get(idx)
             .map(f)
     }
@@ -381,7 +374,7 @@ impl Manager {
     /// never observed on the live serving path — it exists for the same reason
     /// [`Self::access_token`] and [`Self::account_name`] return `Option`).
     pub fn http_client(&self, idx: usize) -> Option<Arc<reqwest::Client>> {
-        self.account(idx, |a| a.http.clone())
+        self.account(idx, |a| Arc::clone(&a.http))
     }
 
     /// The access token to inject for account `idx` (a clone — the request
@@ -413,13 +406,13 @@ impl Manager {
     /// [`Self::access_token`] returns one, and nothing else: a pin that could
     /// not be read never reaches this call, because serde refuses it at config
     /// load rather than handing the request path a value to interpret.
-    pub fn account_egress(&self, idx: usize) -> Option<crate::config::EgressPin> {
+    pub fn account_egress(&self, idx: usize) -> Option<config::EgressPin> {
         self.config
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .accounts
             .get(idx)
-            .map(crate::config::Account::egress_pin)
+            .map(config::Account::egress_pin)
     }
 
     /// The pooled `account_uuid` to inject for account `idx` (a clone — the
@@ -451,7 +444,7 @@ impl Manager {
     }
 
     /// A provider only while its slot remains live. Rotation counts must match
-    /// provider_account_count, which excludes retired rows.
+    /// `provider_account_count`, which excludes retired rows.
     pub(crate) fn live_provider(&self, idx: usize) -> Option<crate::provider::Provider> {
         self.account(idx, |account| {
             (!account.removed).then_some(account.provider)

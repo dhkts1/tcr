@@ -611,7 +611,7 @@ fn apply_bucket(
     };
     let reported = bucket
         .reset_at_ms
-        .and_then(|ms| OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000).ok());
+        .and_then(|ms| OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok());
     let reset = if reported.is_none() && utilization == 0.0 {
         // Nothing to gate — do not invent a window. See the exception above.
         None
@@ -672,7 +672,7 @@ fn scope_is_allowed(headers: &impl HeaderView, name: &str) -> bool {
 /// reads account-wide if the aggregate is taken at face value. That is issue
 /// #178: one Fable 429 benched a whole account for every model.
 ///
-/// Written by YogevKr; verified by hand against the header block in #178.
+/// Written by `YogevKr`; verified by hand against the header block in #178.
 pub fn quota_rejections(headers: &impl HeaderView) -> Vec<UnifiedRejectionKind> {
     let status = |name: &str, expected: &str| header_says(headers, name, expected);
     let allowed = |name: &str| scope_is_allowed(headers, name);
@@ -682,9 +682,7 @@ pub fn quota_rejections(headers: &impl HeaderView) -> Vec<UnifiedRejectionKind> 
     let shared_allowed = allowed("anthropic-ratelimit-unified-5h-status")
         && allowed("anthropic-ratelimit-unified-7d-status");
     let overall_rejected = status("anthropic-ratelimit-unified-status", "rejected")
-        && !five_rejected
-        && !seven_rejected
-        && !(fable_rejected && shared_allowed);
+        && !(five_rejected || seven_rejected || fable_rejected && shared_allowed);
 
     [
         (overall_rejected, UnifiedRejectionKind::Overall),
@@ -925,7 +923,7 @@ fn codex_error_reset(error: &serde_json::Value, now: OffsetDateTime) -> Option<O
                 .get("resets_in_seconds")
                 .and_then(serde_json::Value::as_i64)
                 .filter(|seconds| *seconds > 0)
-                .and_then(|seconds| now.checked_add(time::Duration::seconds(seconds)))
+                .and_then(|seconds| now.checked_add(Duration::seconds(seconds)))
         })
 }
 
@@ -1066,7 +1064,9 @@ impl Quota {
         if let Some(refusal) = refusal {
             self.codex.refusal_reset = refusal.reset;
             self.status = Some("rejected".to_string());
-            self.codex.limit_reached_type = refusal.limit_reached_type.clone();
+            self.codex
+                .limit_reached_type
+                .clone_from(&refusal.limit_reached_type);
         } else if read_a_window && (200..300).contains(&http_status) {
             self.status = Some("allowed".to_string());
             self.codex.limit_reached_type = None;
@@ -1194,7 +1194,7 @@ mod tests {
         let body = br#"{"error":{"message":"out","resets_at":1900007200}}"#;
         let refusal = CodexQuotaRefusal::parse(&headers, body, now).expect("header quota refusal");
         assert_eq!(
-            refusal.reset.map(|at| at.unix_timestamp()),
+            refusal.reset.map(OffsetDateTime::unix_timestamp),
             Some(1_900_007_200)
         );
     }
@@ -1656,7 +1656,7 @@ mod tests {
         let window = quota.five_hour.expect("the prior window must survive");
         assert_eq!(window.utilization, 0.77, "prior utilization kept");
         assert_eq!(
-            window.reset.map(|r| r.unix_timestamp()),
+            window.reset.map(OffsetDateTime::unix_timestamp),
             Some(reported_reset.unix_timestamp()),
             "and the freshly reported reset is still adopted"
         );
@@ -2479,7 +2479,7 @@ mod tests {
     }
 
     fn names(list: &[&str]) -> Option<Vec<String>> {
-        Some(list.iter().map(|name| name.to_string()).collect())
+        Some(list.iter().map(ToString::to_string).collect())
     }
 
     /// The shape a ChatGPT Pro login reports: its weekly window only, in the PRIMARY slot.

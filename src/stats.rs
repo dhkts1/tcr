@@ -73,9 +73,9 @@ impl QuotaState {
     /// exactly once.
     pub fn from_utilization(util: Option<f64>, threshold: f64) -> Self {
         match util {
-            Some(u) if u >= 1.0 => QuotaState::Exhausted,
-            Some(u) if u >= threshold => QuotaState::NearLimit,
-            _ => QuotaState::Normal,
+            Some(u) if u >= 1.0 => Self::Exhausted,
+            Some(u) if u >= threshold => Self::NearLimit,
+            _ => Self::Normal,
         }
     }
 }
@@ -408,7 +408,7 @@ impl AccountSnapshot {
 
 /// Whether a live session was keyed on a stable client identity (a Codex
 /// request's `session-id` header, tier 0 and Codex paths only; x-api-key /
-/// metadata.user_id), on a hash of its cacheable prefix (`system` + `tools`)
+/// `metadata.user_id`), on a hash of its cacheable prefix (`system` + `tools`)
 /// because it had no stronger identity, or had neither and served unpinned.
 /// DISPLAY-only — never a routing input.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -480,7 +480,7 @@ pub struct CurrentByProvider {
 
 impl CurrentByProvider {
     /// The account serving `provider`.
-    pub fn get(&self, provider: Provider) -> Option<usize> {
+    pub const fn get(&self, provider: Provider) -> Option<usize> {
         match provider {
             Provider::Anthropic => self.anthropic,
             Provider::Codex => self.codex,
@@ -488,7 +488,7 @@ impl CurrentByProvider {
     }
 
     /// Record `idx` as the account serving `provider`.
-    pub fn set(&mut self, provider: Provider, idx: usize) {
+    pub const fn set(&mut self, provider: Provider, idx: usize) {
         match provider {
             Provider::Anthropic => self.anthropic = Some(idx),
             Provider::Codex => self.codex = Some(idx),
@@ -559,8 +559,8 @@ mod tests {
     impl std::fmt::Display for Probe {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                Probe::Variants(names) => write!(f, "variant names {names:?}"),
-                Probe::Other(msg) => f.write_str(msg),
+                Self::Variants(names) => write!(f, "variant names {names:?}"),
+                Self::Other(msg) => f.write_str(msg),
             }
         }
     }
@@ -569,7 +569,7 @@ mod tests {
 
     impl serde::de::Error for Probe {
         fn custom<T: std::fmt::Display>(msg: T) -> Self {
-            Probe::Other(msg.to_string())
+            Self::Other(msg.to_string())
         }
     }
 

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// p50, p95, p99 and max of one series, in the series' own unit.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Summary {
+pub(crate) struct Summary {
     pub count: usize,
     pub p50: f64,
     pub p95: f64,
@@ -16,7 +16,7 @@ pub struct Summary {
 
 /// Nearest-rank percentile of an ascending slice: the smallest value with at least `p`
 /// percent of the series at or below it. `None` for an empty slice.
-pub fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
+pub(crate) fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
     if sorted.is_empty() {
         return None;
     }
@@ -26,7 +26,7 @@ pub fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
 }
 
 /// The four figures the report prints for a series, or `None` when nothing was measured.
-pub fn summarize(values: &[f64]) -> Option<Summary> {
+pub(crate) fn summarize(values: &[f64]) -> Option<Summary> {
     let mut sorted: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
     sorted.sort_by(f64::total_cmp);
     Some(Summary {
@@ -40,7 +40,7 @@ pub fn summarize(values: &[f64]) -> Option<Summary> {
 
 /// CPU seconds the proxy spent per 1,000 requests it served. `None` when it served none,
 /// because a figure divided by zero requests is not a cost.
-pub fn cpu_seconds_per_thousand(cpu_ms: u64, served: usize) -> Option<f64> {
+pub(crate) fn cpu_seconds_per_thousand(cpu_ms: u64, served: usize) -> Option<f64> {
     if served == 0 {
         return None;
     }
@@ -50,7 +50,7 @@ pub fn cpu_seconds_per_thousand(cpu_ms: u64, served: usize) -> Option<f64> {
 /// The most events inside any window of `window_ms`, over event times in milliseconds
 /// (any order). The upstream-rate check reads it: the fleet ceiling holds when no
 /// one-second window carries more sends than its burst plus its rate allows.
-pub fn max_in_window(times_ms: &[u64], window_ms: u64) -> usize {
+pub(crate) fn max_in_window(times_ms: &[u64], window_ms: u64) -> usize {
     let mut sorted = times_ms.to_vec();
     sorted.sort_unstable();
     let mut best = 0;
@@ -67,13 +67,13 @@ pub fn max_in_window(times_ms: &[u64], window_ms: u64) -> usize {
 /// Sends a GCRA bucket of `burst` with one send per `spacing_ms` can admit inside any window
 /// of `window_ms`: the burst, plus one per spacing the window spans. Arrival times at the stub
 /// carry scheduling jitter, so the check reading this adds a small allowance on top.
-pub fn gcra_window_bound(burst: u32, spacing_ms: u64, window_ms: u64) -> usize {
+pub(crate) fn gcra_window_bound(burst: u32, spacing_ms: u64, window_ms: u64) -> usize {
     burst as usize + window_ms.div_ceil(spacing_ms.max(1)) as usize
 }
 
 /// One frame's share of the samples it was on top of the stack for.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Frame {
+pub(crate) struct Frame {
     pub name: String,
     pub self_samples: u64,
     pub share: f64,
@@ -82,7 +82,7 @@ pub struct Frame {
 /// The `n` frames with the most SELF time in a folded-stack file (`a;b;c 12`, the format
 /// `inferno-collapse-sample` writes): the leaf of each line is the frame that was running.
 /// Ties order by name so the list is stable from run to run.
-pub fn top_self_frames(folded: &str, n: usize) -> Vec<Frame> {
+pub(crate) fn top_self_frames(folded: &str, n: usize) -> Vec<Frame> {
     let mut by_frame: HashMap<&str, u64> = HashMap::new();
     let mut total = 0u64;
     for line in folded.lines() {
@@ -102,7 +102,7 @@ pub fn top_self_frames(folded: &str, n: usize) -> Vec<Frame> {
 /// The `n` frames of module `module` (`tcr`) that most often sat nearest the leaf: each stack's
 /// samples go to its deepest frame from that module. Where [`top_self_frames`] names the
 /// system call a thread was in, this names the proxy code that made it.
-pub fn top_module_frames(folded: &str, module: &str, n: usize) -> Vec<Frame> {
+pub(crate) fn top_module_frames(folded: &str, module: &str, n: usize) -> Vec<Frame> {
     let prefix = format!("{module}`");
     let mut by_frame: HashMap<&str, u64> = HashMap::new();
     let mut total = 0u64;
@@ -126,7 +126,7 @@ pub fn top_module_frames(folded: &str, module: &str, n: usize) -> Vec<Frame> {
 /// flame graph draws one tower per kind of thread instead of one per thread. Only the root
 /// frame changes, so every leaf and every `tcr` frame keeps its samples. A thread with no name
 /// becomes `unnamed thread`; the main thread's queue label is kept, whitespace collapsed.
-pub fn merge_threads(folded: &str) -> String {
+pub(crate) fn merge_threads(folded: &str) -> String {
     let mut merged: Vec<(String, u64)> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for line in folded.lines() {
@@ -145,12 +145,11 @@ pub fn merge_threads(folded: &str) -> String {
             Some(rest) => format!("{name};{rest}"),
             None => name,
         };
-        match index.get(&key) {
-            Some(&i) => merged[i].1 += count,
-            None => {
-                index.insert(key.clone(), merged.len());
-                merged.push((key, count));
-            }
+        if let Some(&i) = index.get(&key) {
+            merged[i].1 += count;
+        } else {
+            index.insert(key.clone(), merged.len());
+            merged.push((key, count));
         }
     }
     merged
@@ -178,7 +177,7 @@ fn thread_name(root: &str) -> String {
 }
 
 /// Every sample in a folded-stack file.
-pub fn total_samples(folded: &str) -> u64 {
+pub(crate) fn total_samples(folded: &str) -> u64 {
     folded
         .lines()
         .filter_map(|l| l.trim_end().rsplit_once(' '))
@@ -206,7 +205,7 @@ fn rank(by_frame: HashMap<&str, u64>, total: u64, n: usize) -> Vec<Frame> {
 
 /// `throttle_ms` of every `request usage` line in a slice of the proxy's log: the time each
 /// served request spent inside the proxy's own throttle (`RequestTiming` in `src/proxy.rs`).
-pub fn throttle_waits(log: &str) -> Vec<u64> {
+pub(crate) fn throttle_waits(log: &str) -> Vec<u64> {
     log.lines()
         .filter(|line| line.contains("request usage"))
         .filter_map(|line| field(line, "throttle_ms"))
@@ -215,7 +214,7 @@ pub fn throttle_waits(log: &str) -> Vec<u64> {
 
 /// The INFO lines in `log`, counted by message: the words after the target up to the first
 /// `key=value` field. What the default log filter writes, line for line.
-pub fn info_messages(log: &str) -> BTreeMap<String, usize> {
+pub(crate) fn info_messages(log: &str) -> BTreeMap<String, usize> {
     let mut out = BTreeMap::new();
     for line in log.lines() {
         let Some((_, rest)) = line.split_once(" INFO ") else {
@@ -247,14 +246,14 @@ fn field(line: &str, key: &str) -> Option<u64> {
 /// A tiny deterministic generator (xorshift64*), so a phase's arrival plan is the same on
 /// every run without a dependency.
 #[derive(Debug, Clone)]
-pub struct Rng(u64);
+pub(crate) struct Rng(u64);
 
 impl Rng {
-    pub fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self(seed.max(1))
     }
 
-    pub fn next_u64(&mut self) -> u64 {
+    pub(crate) const fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -264,17 +263,17 @@ impl Rng {
     }
 
     /// Uniform in `[0, 1)`.
-    pub fn unit(&mut self) -> f64 {
+    pub(crate) fn unit(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
     /// Uniform in `0..n`.
-    pub fn below(&mut self, n: usize) -> usize {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
         (self.unit() * n as f64) as usize % n.max(1)
     }
 
     /// An exponential gap with mean `1 / rate`, in milliseconds: Poisson arrivals.
-    pub fn exp_gap_ms(&mut self, rate_per_s: f64) -> f64 {
+    pub(crate) fn exp_gap_ms(&mut self, rate_per_s: f64) -> f64 {
         -(1.0 - self.unit()).ln() / rate_per_s * 1_000.0
     }
 }

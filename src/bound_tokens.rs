@@ -105,7 +105,7 @@ pub enum BoundTokenKind {
 
 impl BoundTokenKind {
     /// The word this kind is logged as.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::ServerToolUse => "server-tool-id",
             Self::ThinkingSignature => "thinking-signature",
@@ -295,12 +295,12 @@ impl Prepared {
     }
 
     /// How many tokens the file will hold.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.tokens.len()
     }
 
     /// Whether the file will hold no token.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.tokens.is_empty()
     }
 
@@ -336,21 +336,20 @@ pub fn prepare(snapshot: Snapshot) -> Result<Prepared, ConfigError> {
     let mut table: Vec<StoredAccount> = Vec::new();
     for token in &mut tokens {
         let from = token.account;
-        let to = match placed.get(from).copied().flatten() {
-            Some(to) => to,
-            None => {
-                let Some(account) = unplaced.get_mut(from).and_then(Option::take) else {
-                    return Err(ConfigError::Io(std::io::Error::other(format!(
-                        "bound-token snapshot names account slot {from}, which it does not hold"
-                    ))));
-                };
-                table.push(account);
-                let to = table.len() - 1;
-                if let Some(cell) = placed.get_mut(from) {
-                    *cell = Some(to);
-                }
-                to
+        let to = if let Some(to) = placed.get(from).copied().flatten() {
+            to
+        } else {
+            let Some(account) = unplaced.get_mut(from).and_then(Option::take) else {
+                return Err(ConfigError::Io(std::io::Error::other(format!(
+                    "bound-token snapshot names account slot {from}, which it does not hold"
+                ))));
+            };
+            table.push(account);
+            let to = table.len() - 1;
+            if let Some(cell) = placed.get_mut(from) {
+                *cell = Some(to);
             }
+            to
         };
         token.account = to;
     }
@@ -475,12 +474,11 @@ mod tests {
         let mut accounts: Vec<StoredAccount> = Vec::new();
         let mut stored = Vec::with_capacity(tokens.len());
         for (hash, kind, account, ms) in tokens {
-            let slot = match accounts.iter().position(|a| *a == account) {
-                Some(slot) => slot,
-                None => {
-                    accounts.push(account);
-                    accounts.len() - 1
-                }
+            let slot = if let Some(slot) = accounts.iter().position(|a| *a == account) {
+                slot
+            } else {
+                accounts.push(account);
+                accounts.len() - 1
             };
             stored.push(StoredBoundToken {
                 hash,

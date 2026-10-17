@@ -27,7 +27,7 @@ pub(crate) enum WireFold<'a> {
 }
 
 impl WireFold<'_> {
-    fn provider(&self) -> Provider {
+    const fn provider(&self) -> Provider {
         match self {
             Self::Anthropic { .. } => Provider::Anthropic,
             Self::Codex { .. } => Provider::Codex,
