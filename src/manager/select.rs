@@ -2,9 +2,14 @@
 
 use super::*;
 
+/// Bound on [`Manager::affinity`] and on its side set
+/// [`Manager::affinity_extended`]. Stable pins survive reconnects, so this size
+/// cap, not a disconnect hook, is what keeps a long-lived proxy from growing
+/// the map without limit.
+pub(super) const AFFINITY_CAP: usize = 1024;
 /// Bound on [`Manager::conn_affinity`] — see its doc-comment for why the map is
 /// memory-only and never persisted.
-const CONN_AFFINITY_CAP: usize = 256;
+pub(super) const CONN_AFFINITY_CAP: usize = 256;
 /// Idle TTL for a [`Manager::conn_affinity`] entry: an entry older than this is
 /// treated as absent (the connection is presumed gone). Short on purpose — this
 /// map exists only to keep NOISE traffic (`/api/event_logging`, `/mcp-registry`)
@@ -186,14 +191,14 @@ pub(super) fn classify_request(path: &str) -> RequestClass {
     }
 }
 
-/// Bound on [`Manager::divert_ledger`] — same cap `select()`'s `AFFINITY_CAP`
-/// applies to `self.affinity` (`:664-675`). [`DivertEpisode`] carries no
+/// Bound on [`Manager::divert_ledger`] — the same figure as [`AFFINITY_CAP`].
+/// [`DivertEpisode`] carries no
 /// separate last-touch stamp (§4.1's struct is quoted verbatim from the
 /// design doc), so `until_ms` is the eviction sort key here — the closest
 /// available recency proxy, not a perfect one. A session that never diverts
 /// again after arming a short hold ages out of this bound the same way a
 /// long-idle `affinity` entry does.
-const DIVERT_LEDGER_CAP: usize = 1024;
+pub(super) const DIVERT_LEDGER_CAP: usize = 1024;
 
 /// The three-way verdict [`divert_verdict`] hands back for one divert
 /// decision. `Fresh` and `Sticky` are consulted every divert regardless of
@@ -453,14 +458,14 @@ impl Manager {
     /// hot-reloaded cache, so a `groupSettings` edit takes effect on the next
     /// request.
     pub fn is_group_spill(&self, group: &str) -> bool {
-        self.spill_groups().contains(group)
+        self.groups().spill.contains(group)
     }
 
     /// **Whether a request asking for `group` is held STRICTLY inside it**,
     /// the one answer, for every reader.
     ///
-    /// `reserved || !spill`, which is verbatim the expression
-    /// [`Self::select_with_group`] computes for its own `strict_group`. A
+    /// `reserved || !spill` ([`GroupPolicy::is_strict`]), the same call
+    /// [`Self::select_with_group`] makes for its own `strict_group`. A
     /// measurement found two readers outside the picker asking
     /// [`Self::is_group_reserved`] ALONE, `src/proxy.rs`'s refusal arm and its
     /// mirror on the exhausted path, so for a group that is neither reserved
@@ -475,7 +480,7 @@ impl Manager {
     /// rule the picker and the refusal disagree about is a request held in a
     /// group and refused about a pool.
     pub fn is_group_strict(&self, group: &str) -> bool {
-        self.is_group_reserved(group) || !self.is_group_spill(group)
+        self.groups().is_strict(group)
     }
 
     /// [`Self::select`], with an optional PREFER-semantics group (`tcr run
@@ -524,24 +529,16 @@ impl Manager {
         // file's mtime has not moved since the last check.
         self.reload_groups_if_changed();
 
-        // A single point-in-time snapshot for the whole call — see
-        // `Self::reserved_groups`'s doc for why this clones rather than holding
+        // One version of the group settings for the whole call — see
+        // `Self::groups`'s doc for why this clones an `Arc` rather than holding
         // the lock across the accounts/affinity locks taken below.
-        let reserved_groups = self.reserved_groups();
-        // Same point-in-time-snapshot reasoning as `reserved_groups` above — see
-        // `Self::parked_groups`'s and `Self::control_allowed_groups`'s docs.
-        let parked_groups = self.parked_groups();
-        let control_allowed_groups = self.control_allowed_groups();
-        // Same point-in-time-snapshot reasoning as `reserved_groups` above —
-        // see `Self::spill_groups`'s doc.
-        let spill_groups = self.spill_groups();
+        let groups = self.groups();
         // THE GROUP ASK THIS CALL WILL HOLD STRICTLY, computed once here rather
         // than at the pool pick alone, because the affinity fast-path below has
         // to ask the same question and used to have no way to. See the pool
         // pick's own comment for what strictness means and for the two
-        // carve-outs; this is the identical expression, hoisted.
-        let strict_group =
-            group.filter(|g| reserved_groups.contains(*g) || !spill_groups.contains(*g));
+        // carve-outs.
+        let strict_group = group.filter(|g| groups.is_strict(g));
         // THE PROVIDER THIS REQUEST BELONGS TO, decided by its path (see
         // `crate::provider`'s module doc for why path and not host). Computed
         // here, above the hard lock, for the same reason `strict_group` is: the
@@ -767,8 +764,8 @@ impl Manager {
                             a,
                             now_ms,
                             group,
-                            &reserved_groups,
-                            &parked_groups,
+                            &groups.reserved,
+                            &groups.parked,
                             warm,
                         )
                     }) {
@@ -818,8 +815,8 @@ impl Manager {
                                 provider,
                                 None,  // no group PREFERENCE — honouring an existing pin
                                 group, // but reservation is not a preference — real ask
-                                &reserved_groups,
-                                &parked_groups,
+                                &groups.reserved,
+                                &groups.parked,
                             )
                         });
                         if !x_usable {
@@ -894,8 +891,8 @@ impl Manager {
                                     a,
                                     now_ms,
                                     group,
-                                    &reserved_groups,
-                                    &parked_groups,
+                                    &groups.reserved,
+                                    &groups.parked,
                                     warm,
                                 )
                             });
@@ -973,8 +970,8 @@ impl Manager {
                                                 provider,
                                                 None,
                                                 group,
-                                                &reserved_groups,
-                                                &parked_groups,
+                                                &groups.reserved,
+                                                &groups.parked,
                                             )
                                     });
                                 if idle_ms >= warm.ms() && has_eligible_alternative {
@@ -1070,8 +1067,8 @@ impl Manager {
                                         // function already is.
                                         strict_group,
                                         group, // reservation is not a preference, real ask
-                                        &reserved_groups,
-                                        &parked_groups,
+                                        &groups.reserved,
+                                        &groups.parked,
                                     ) {
                                         continue;
                                     }
@@ -1216,8 +1213,8 @@ impl Manager {
                                     // it must never be followed onto.
                                     strict_group,
                                     group, // reservation is not a preference, real ask
-                                    &reserved_groups,
-                                    &parked_groups,
+                                    &groups.reserved,
+                                    &groups.parked,
                                 )
                             })
                         };
@@ -1350,8 +1347,8 @@ impl Manager {
                             // divert later.
                             strict_group,
                             group, // reservation is not a preference, real ask
-                            &reserved_groups,
-                            &parked_groups,
+                            &groups.reserved,
+                            &groups.parked,
                         )
                     });
                     usable.then_some(sticky)
@@ -1423,7 +1420,7 @@ impl Manager {
                 if request_class == RequestClass::Inference && !self.control_pooled {
                     self.control().filter(|&idx| {
                         let opted_in = group.is_some_and(|g| {
-                            control_allowed_groups.contains(g)
+                            groups.control_allowed.contains(g)
                                 && accounts
                                     .get(idx)
                                     .is_some_and(|a| a.groups.iter().any(|gr| gr == g))
@@ -1513,8 +1510,8 @@ impl Manager {
                         is_fable,
                         provider,
                         g,
-                        &reserved_groups,
-                        &parked_groups,
+                        &groups.reserved,
+                        &groups.parked,
                     );
                     tracing::info!(
                         group = g,
@@ -1547,8 +1544,8 @@ impl Manager {
                                     is_fable,
                                     provider,
                                     g,
-                                    &reserved_groups,
-                                    &parked_groups,
+                                    &groups.reserved,
+                                    &groups.parked,
                                 );
                                 tracing::info!(
                                     account = %account.name,
@@ -1628,7 +1625,7 @@ impl Manager {
             // `tried`) diverted THIS request only: re-insert the OLD index, not the
             // account we are about to serve. The insert still has to happen — this
             // `now_ms` is one of only two writers of the last-touch stamp that the
-            // AFFINITY_CAP eviction below sorts on, so skipping it would make a
+            // AFFINITY_CAP eviction sorts on, so skipping it would make a
             // heavily-diverted session the eviction victim.
             let pin_idx = keep_pin.unwrap_or(idx);
             let moved_off = {
@@ -1637,19 +1634,10 @@ impl Manager {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let previous = pins.get(&key).map(|&(i, _)| i);
+                // Capped at AFFINITY_CAP: an insert over it evicts the oldest-last-touch
+                // entry other than this one.
                 pins.insert(key, (pin_idx, now_ms));
                 self.mark_affinity_dirty();
-                // Bound the map by size + LRU-by-last-touch: once over AFFINITY_CAP, evict
-                // the single oldest-last-touch entry (not the one we just inserted). Stable
-                // pins survive reconnects, so this size cap — not a disconnect hook — is
-                // what keeps a long-lived proxy from growing the map without limit.
-                const AFFINITY_CAP: usize = 1024;
-                if pins.len() > AFFINITY_CAP
-                    && let Some((&oldest, _)) = pins.iter().min_by_key(|&(_, &(_, touch))| touch)
-                    && oldest != key
-                {
-                    pins.remove(&oldest);
-                }
                 // Only a real change is worth a line: `None` on an initial pin, and on
                 // a soft divert (where `pin_idx` is the unchanged old index).
                 previous.filter(|&p| p != pin_idx)
@@ -1788,8 +1776,7 @@ impl Manager {
         // saturates. The pin-honor path is never throttled here.
         const REVALIDATION_MIN_SPACING_MS: i64 = 2000;
 
-        let reserved_groups = self.reserved_groups();
-        let parked_groups = self.parked_groups();
+        let groups = self.groups();
         let now_ms = odt_to_ms(now);
         // Derived exactly as `select_with_group` derives them.
         let provider = crate::provider::Provider::of_path(path);
@@ -1821,8 +1808,8 @@ impl Manager {
                     now_ms,
                     is_fable,
                     None,
-                    &reserved_groups,
-                    &parked_groups,
+                    &groups.reserved,
+                    &groups.parked,
                     warm,
                 )
         };
@@ -1892,7 +1879,7 @@ impl Manager {
                 // the opposite decision on the identical fact and documents why
                 // (see its affinity fast-path); the two now agree.
                 if accounts.get(idx).is_some_and(|a| {
-                    Self::account_hard_ok(a, now_ms, None, &reserved_groups, &parked_groups, warm)
+                    Self::account_hard_ok(a, now_ms, None, &groups.reserved, &groups.parked, warm)
                 }) {
                     keep_pin = Some(idx);
                     pin_until_ms = accounts
@@ -2884,8 +2871,7 @@ impl Manager {
         respect_pacing: bool,
         group: Option<&str>,
     ) -> Option<usize> {
-        let reserved_groups = self.reserved_groups();
-        let parked_groups = self.parked_groups();
+        let groups = self.groups();
         let mut best: Option<usize> = None;
         let mut best_key: Option<(i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
@@ -2904,8 +2890,8 @@ impl Manager {
                 provider,
                 group,
                 group, // this pass's own real ask — see `eligible`'s `reserved_group` doc
-                &reserved_groups,
-                &parked_groups,
+                &groups.reserved,
+                &groups.parked,
             ) {
                 // Distinguish a pacing skip (healthy but capped/spaced) from a real
                 // ineligibility (disabled/error/quota) so the log names only the former.
@@ -2923,8 +2909,8 @@ impl Manager {
                         provider,
                         group,
                         group,
-                        &reserved_groups,
-                        &parked_groups,
+                        &groups.reserved,
+                        &groups.parked,
                     )
                 {
                     tracing::info!(
@@ -2979,8 +2965,7 @@ impl Manager {
         provider: crate::provider::Provider,
         group: Option<&str>,
     ) -> Option<usize> {
-        let reserved_groups = self.reserved_groups();
-        let parked_groups = self.parked_groups();
+        let groups = self.groups();
         let mut best: Option<usize> = None;
         let mut best_key: Option<(u32, i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
@@ -2999,8 +2984,8 @@ impl Manager {
                 provider,
                 group,
                 group,
-                &reserved_groups,
-                &parked_groups,
+                &groups.reserved,
+                &groups.parked,
             ) {
                 continue;
             }
@@ -3053,8 +3038,7 @@ impl Manager {
         now_ms: i64,
         provider: crate::provider::Provider,
     ) -> Option<usize> {
-        let reserved_groups = self.reserved_groups();
-        let parked_groups = self.parked_groups();
+        let groups = self.groups();
         let mut best: Option<usize> = None;
         let mut best_key: Option<(u64, i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
@@ -3074,7 +3058,7 @@ impl Manager {
             // Parked is an account-level block like `disabled` above, and this
             // last-resort pass relaxes only the Fable `7d_oi` prediction — never
             // an operator's own decision to hold a group out.
-            if Self::parked_blocks(account, &parked_groups) {
+            if Self::parked_blocks(account, &groups.parked) {
                 continue;
             }
             if let Some(until) = account.rate_limited_until_ms
@@ -3094,7 +3078,7 @@ impl Manager {
             if account.quota.model_weekly_rejected(now) {
                 continue;
             }
-            if Self::reserved_blocks(account, None, &reserved_groups) {
+            if Self::reserved_blocks(account, None, &groups.reserved) {
                 continue;
             }
             if !self.pool_pick_respects_control_reserve(idx, account, now) {
@@ -3143,9 +3127,8 @@ impl Manager {
 
     /// Write half of [`Manager::conn_affinity`]: record (or refresh) which
     /// account served connection `conn_key`, then evict the single
-    /// oldest-last-touch entry if the map grew past [`CONN_AFFINITY_CAP`] —
-    /// mirrors `select()`'s `AFFINITY_CAP` eviction for `self.affinity`, but on
-    /// this SEPARATE, never-persisted map. Never touches `self.affinity` and
+    /// oldest-last-touch entry if the map grew past [`CONN_AFFINITY_CAP`]
+    /// ([`CappedMap::insert`]), on this SEPARATE, never-persisted map. Never touches `self.affinity` and
     /// never marks it dirty.
     pub(super) fn conn_affinity_record(&self, conn_key: u64, idx: usize, now_ms: i64) {
         let mut map = self
@@ -3153,12 +3136,6 @@ impl Manager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.insert(conn_key, (idx, now_ms));
-        if map.len() > CONN_AFFINITY_CAP
-            && let Some((&oldest, _)) = map.iter().min_by_key(|&(_, &(_, touch))| touch)
-            && oldest != conn_key
-        {
-            map.remove(&oldest);
-        }
     }
 
     /// Write half of [`Manager::divert_ledger`] (§4.1/§4.2): record `dest` as
@@ -3176,9 +3153,8 @@ impl Manager {
     /// by design (§4.1: "so the sticky overlay has a single preferred index
     /// without scanning the mask").
     ///
-    /// Bounded by [`DIVERT_LEDGER_CAP`] + LRU-by-`until_ms` eviction, mirroring
-    /// `select()`'s `AFFINITY_CAP` pattern (`:664-675`) on this separate,
-    /// never-persisted map.
+    /// Bounded by [`DIVERT_LEDGER_CAP`] + LRU-by-`until_ms` eviction
+    /// ([`CappedMap::evict_sparing`]) on this separate, never-persisted map.
     pub(super) fn record_divert(
         &self,
         session_key: u64,
@@ -3222,13 +3198,7 @@ impl Manager {
             entry.sticky = dest;
         }
         entry.destinations |= bit;
-
-        if ledger.len() > DIVERT_LEDGER_CAP
-            && let Some((&oldest, _)) = ledger.iter().min_by_key(|(_, e)| e.until_ms)
-            && oldest != session_key
-        {
-            ledger.remove(&oldest);
-        }
+        ledger.evict_sparing(session_key);
     }
 }
 

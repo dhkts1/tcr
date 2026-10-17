@@ -246,8 +246,7 @@ impl Manager {
     ) -> T {
         self.reload_groups_if_changed();
         let unsupported = self.codex_accounts_with_unsupported_exit();
-        let parked = self.parked_groups();
-        let reserved = self.reserved_groups();
+        let groups = self.groups();
         let locked = self.locked_account_for(crate::provider::Provider::Codex);
         self.accounts
             .read()
@@ -263,8 +262,8 @@ impl Manager {
                         && group.is_none_or(|group| account.groups.iter().any(|g| g == group))
                         && !account.disabled
                         && account.status != AccountStatus::Error
-                        && !Self::parked_blocks(account, &parked)
-                        && !Self::reserved_blocks(account, group, &reserved)
+                        && !Self::parked_blocks(account, &groups.parked)
+                        && !Self::reserved_blocks(account, group, &groups.reserved)
                         && !unsupported.contains(idx)
                 }
             })
@@ -275,12 +274,10 @@ impl Manager {
     /// A lock never disables another provider's independent pool.
     pub(crate) fn locked_account_for(&self, provider: crate::provider::Provider) -> Option<usize> {
         let idx = self.locked_idx?;
-        self.accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(idx)
-            .filter(|account| !account.removed && account.provider == provider)
-            .map(|_| idx)
+        self.account(idx, |account| {
+            !account.removed && account.provider == provider
+        })
+        .and_then(|live| live.then_some(idx))
     }
 
     #[cfg(test)]
@@ -366,27 +363,31 @@ impl Manager {
         &self.unkeyed
     }
 
+    /// `f` applied to account row `idx`, under a short read of the accounts
+    /// lock. `None` is the one answer for an index past the end, so no reader
+    /// decides on its own what a missing row means. `f` runs with the lock
+    /// held: it must not take `affinity` or any lock ordered before accounts.
+    pub(super) fn account<R>(&self, idx: usize, f: impl FnOnce(&AccountRuntime) -> R) -> Option<R> {
+        self.accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(idx)
+            .map(f)
+    }
+
     /// Account `idx`'s OWN upstream-forwarding client — see
     /// [`AccountRuntime::http`] for why every account carries its own. `None`
     /// only if `idx` is stale (accounts are appended, never removed, so this is
     /// never observed on the live serving path — it exists for the same reason
     /// [`Self::access_token`] and [`Self::account_name`] return `Option`).
     pub fn http_client(&self, idx: usize) -> Option<Arc<reqwest::Client>> {
-        self.accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(idx)
-            .map(|a| a.http.clone())
+        self.account(idx, |a| a.http.clone())
     }
 
     /// The access token to inject for account `idx` (a clone — the request
     /// outlives the lock).
     pub fn access_token(&self, idx: usize) -> Option<String> {
-        self.accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(idx)
-            .map(|a| a.access_token.clone())
+        self.account(idx, |a| a.access_token.clone())
     }
 
     /// Whether account `idx` carries a refresh token. `false` for a
@@ -394,20 +395,12 @@ impl Manager {
     /// can never be renewed — so for such a row an upstream 401 is proof the
     /// credential is dead, not rotation churn (see the proxy's 401 arm).
     pub fn has_refresh_token(&self, idx: usize) -> bool {
-        self.accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(idx)
-            .is_some_and(|a| a.refresh_token.is_some())
+        self.account(idx, |a| a.refresh_token.is_some()) == Some(true)
     }
 
     /// Display name of account `idx`, for the request log.
     pub fn account_name(&self, idx: usize) -> Option<String> {
-        self.accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(idx)
-            .map(|a| a.name.clone())
+        self.account(idx, |a| a.name.clone())
     }
 
     /// Account `idx`'s exit lock, parsed once out of the config row that
@@ -433,11 +426,7 @@ impl Manager {
     /// request outlives the lock). `None` when the account has no configured
     /// UUID, in which case the proxy leaves the body unchanged.
     pub fn account_uuid(&self, idx: usize) -> Option<String> {
-        self.accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(idx)
-            .and_then(|a| a.account_uuid.clone())
+        self.account(idx, |a| a.account_uuid.clone()).flatten()
     }
 
     /// The ChatGPT account id a Codex row's requests and probes carry as `chatgpt-account-id`:
@@ -445,37 +434,29 @@ impl Manager {
     /// saved before the workspace was split from the user keeps that id. `None` for an index
     /// that no longer exists, or a row with neither.
     pub fn codex_account_id(&self, idx: usize) -> Option<String> {
-        let accounts = self
-            .accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let row = accounts.get(idx)?;
-        row.org_uuid
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .or(row.account_uuid.as_deref())
-            .map(str::to_string)
+        self.account(idx, |row| {
+            row.org_uuid
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .or(row.account_uuid.as_deref())
+                .map(str::to_string)
+        })
+        .flatten()
     }
 
     /// A slot's immutable provider, including retired slots. Bound history still
     /// needs this identity to release a conversation through its normal warning path.
     pub fn provider(&self, idx: usize) -> Option<crate::provider::Provider> {
-        self.accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(idx)
-            .map(|a| a.provider)
+        self.account(idx, |a| a.provider)
     }
 
     /// A provider only while its slot remains live. Rotation counts must match
     /// provider_account_count, which excludes retired rows.
     pub(crate) fn live_provider(&self, idx: usize) -> Option<crate::provider::Provider> {
-        self.accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(idx)
-            .filter(|account| !account.removed)
-            .map(|account| account.provider)
+        self.account(idx, |account| {
+            (!account.removed).then_some(account.provider)
+        })
+        .flatten()
     }
 }
 

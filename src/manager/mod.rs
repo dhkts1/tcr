@@ -46,6 +46,10 @@ use crate::stats::{
 use crate::warmer::{AccountWarmer, LiveWarmer};
 
 mod bound_tokens;
+mod capped_map;
+use capped_map::{CappedMap, CappedSet};
+mod groups;
+use groups::GroupPolicy;
 // The one TYPE that module owns and `proxy.rs` names: one minted token as the response path
 // hands it over, so a kind can never be paired with another token's string.
 pub use bound_tokens::MintedToken;
@@ -1238,43 +1242,14 @@ pub struct Manager {
     /// push). Snapshotted at construction, same restart-to-take-effect contract
     /// as `global_threshold` above.
     fable_weekly_threshold: Option<f64>,
-    /// The set of group labels marked `reserved` (`tcr group reserve`).
-    /// Seeded from the config at construction and **hot-reloaded** from the
-    /// config file's `groupSettings` thereafter — see
-    /// [`Self::reload_groups_if_changed`] for when and how. `RwLock` (not a
-    /// plain field) precisely because it is no longer construction-only: a
-    /// reader takes a short read lock and clones ([`Self::reserved_groups`]),
-    /// never held across the accounts/affinity locks. See
-    /// [`Manager::eligible`]'s `reserved_group` doc for the rule this drives.
-    reserved_groups: RwLock<HashSet<String>>,
-    /// The set of group labels marked `parked` (`tcr group park`) — every
-    /// member is out of rotation while its label is in here. Seeded at
-    /// construction and **hot-reloaded** thereafter, same cadence and same
-    /// `RwLock` reasoning as [`Self::reserved_groups`]: parking a group is one
-    /// `groupSettings` key, so a running proxy picks it up on its next natural
-    /// cadence check with no restart. See [`Manager::parked_blocks`].
-    parked_groups: RwLock<HashSet<String>>,
-    /// The set of group labels opted in to `allowControlAccount` (`tcr group
-    /// allow-control`). Seeded from the config at construction and
-    /// **hot-reloaded** thereafter, same cadence and same `RwLock` reasoning
-    /// as [`Self::reserved_groups`] — see
-    /// [`Self::reload_groups_if_changed`]. See `select.rs`'s
-    /// `control_excluded` handling for the rule this drives.
-    control_allowed_groups: RwLock<HashSet<String>>,
-    /// The set of group labels opted in to `spillToPool` (the escape hatch
-    /// back to pre-2026-09-13 spill-on-exhaustion behaviour). Seeded from the
-    /// config at construction and **hot-reloaded** thereafter, same cadence
-    /// and same `RwLock` reasoning as [`Self::reserved_groups`] — see
-    /// [`Self::reload_groups_if_changed`]. See `select.rs`'s `strict_group`
-    /// handling for the rule this drives.
-    spill_groups: RwLock<HashSet<String>>,
-    /// Every group on the fleet mapped to its resolved color
-    /// (`config::Config::group_colors`). Seeded at construction and
-    /// hot-reloaded alongside [`Self::reserved_groups`] — same
-    /// [`Self::reload_groups_if_changed`] cadence, same `RwLock` reasoning.
-    /// `BTreeMap` for deterministic wire order, matching
-    /// [`config::Config::group_colors`]'s own return type.
-    group_colors: RwLock<BTreeMap<String, String>>,
+    /// The group settings (`reserved`, `parked`, `allowControlAccount`,
+    /// `spillToPool`, colors) as one value. Seeded from the config at
+    /// construction and **hot-reloaded** from the config file thereafter; see
+    /// [`Self::reload_groups_if_changed`] for when and how. A reload swaps the
+    /// whole `Arc`, and a reader clones one ([`Self::groups`]) and never holds
+    /// this lock across the accounts/affinity locks, so every read in one call
+    /// sees one version of the file.
+    groups: RwLock<Arc<GroupPolicy>>,
     /// What this process's MITM listener can intercept by its policy and leaf,
     /// recorded once by `server::serve` from its boot-time TLS load
     /// ([`Self::record_mitm_status`]). `OnceLock` because the listener's leaf
@@ -1384,7 +1359,7 @@ pub struct Manager {
     /// there is no disconnect-release. Kept a plain `std::sync::Mutex` and **never**
     /// held while the accounts lock is taken (read the pin, drop this lock, then do
     /// eligibility) so the two can never deadlock.
-    affinity: Mutex<HashMap<u64, (usize, i64)>>,
+    affinity: Mutex<CappedMap<u64, (usize, i64)>>,
     /// Session keys whose MOST RECENT request carried Anthropic's extended
     /// `"cache_control": {"ttl": "1h"}` (see [`crate::cache_ttl`]), so
     /// [`crate::manager::pins::affinity_pin_snapshot`] knows which persisted
@@ -1395,9 +1370,11 @@ pub struct Manager {
     /// widening the hot map's value type for every read site there would be
     /// blast radius this doesn't need. Written directly from the request path
     /// (`crate::proxy`, alongside where `session_key` is computed) rather than
-    /// through `select()`, guarded and pruned the same way `affinity` is —
-    /// never held while the accounts lock is taken.
-    affinity_extended: Mutex<HashSet<u64>>,
+    /// through `select()`, guarded the same way `affinity` is — never held
+    /// while the accounts lock is taken. Capped at `AFFINITY_CAP` on its own,
+    /// because the pin flush that prunes it to the live pins never runs when
+    /// affinity is off or there is no affinity file.
+    affinity_extended: Mutex<CappedSet<u64>>,
     /// The pin file's dirty flag, flusher wake-up and last write (see
     /// [`Manager::mark_affinity_dirty`] and [`crate::affinity`]). Shape: which session is pinned
     /// to which account; the touch times are written at most once per
@@ -1434,7 +1411,7 @@ pub struct Manager {
     /// Per-session serving stats (session key → account/count/last-seen), for
     /// live per-session visibility in the TUI. Separate from `affinity` so the
     /// routing pin stays byte-for-byte unchanged; bounded in `record_served`.
-    sessions: Mutex<HashMap<u64, SessionStat>>,
+    sessions: Mutex<CappedMap<u64, SessionStat>>,
     /// The Claude Code `session_id`-keyed table with tool-call timing (F1,
     /// `docs/design/panel-tabs.md`), on a different grain from [`Self::sessions`] above — see
     /// [`crate::session_wire`] for the tracker itself and [`crate::stats::StatsSnapshot::wire_sessions`]
@@ -1468,7 +1445,7 @@ pub struct Manager {
     /// dead connection's entry ages out rather than persisting as a ghost.
     /// Guarded the same way as `affinity` — never held while the accounts lock
     /// is taken.
-    conn_affinity: Mutex<HashMap<u64, (usize, i64)>>,
+    conn_affinity: Mutex<CappedMap<u64, (usize, i64)>>,
     /// One [`DivertEpisode`] per session currently mid-hold, session key ->
     /// episode. See the divert-budget design notes §4.1/§4.2.
     ///
@@ -1478,9 +1455,8 @@ pub struct Manager {
     /// a restart the pins are restored but no hold is, so every session
     /// legitimately starts a fresh episode) and bounded the same way `affinity`
     /// is — a size cap + LRU-by-last-touch eviction, keyed on `until_ms` as the
-    /// episode's own last-touch (see [`select`]'s `AFFINITY_CAP` eviction for the
-    /// pattern this mirrors).
-    pub(super) divert_ledger: Mutex<HashMap<u64, DivertEpisode>>,
+    /// episode's own last-touch.
+    divert_ledger: Mutex<CappedMap<u64, DivertEpisode>>,
     /// Per-account quota headroom reserved for the control account (§3, part 2
     /// of the control-account feature) — `switchThreshold`/`global_threshold`
     /// minus this, applied ONLY when a general (non-control-preferred) pick
@@ -1613,16 +1589,6 @@ fn cooldown_elapsed(deadline_ms: Option<i64>, now_ms: i64) -> bool {
     deadline_ms.is_some_and(|until| now_ms >= until)
 }
 
-/// A sorted `Vec` of `set`'s members, for a deterministic (and readable)
-/// before/after in [`Manager::apply_group_reload`]'s change log — `HashSet`'s
-/// own iteration order is unspecified and would make the same reload log
-/// differently run to run.
-fn sorted_groups(set: &HashSet<String>) -> Vec<String> {
-    let mut v: Vec<String> = set.iter().cloned().collect();
-    v.sort();
-    v
-}
-
 impl Manager {
     /// Build a manager over `config`, using `refresher` for token refresh,
     /// `prober` for background usage reads, and persisting refreshes to
@@ -1663,15 +1629,7 @@ impl Manager {
             .filter(|key| !key.is_empty());
         let global_threshold = config.switch_threshold;
         let fable_weekly_threshold = config.fable_weekly_threshold;
-        let reserved_groups = config.reserved_group_names();
-        let parked_groups = config.parked_group_names();
-        let control_allowed_groups = config.control_allowed_group_names();
-        let spill_groups = config.spill_group_names();
-        // Snapshotted at construction, same restart-to-take-effect contract as
-        // `reserved_groups` above and `config::Account::groups` itself — a
-        // `tcr group color` write needs a restart before the running server's
-        // wire reflects it.
-        let group_colors = config.group_colors();
+        let groups = Arc::new(GroupPolicy::from_config(&config));
         let pacing = config.pacing.clone();
         let account_throttle = config.account_throttle.clone();
         let fleet_throttle = config.fleet_throttle.clone();
@@ -1778,11 +1736,7 @@ impl Manager {
             unkeyed: crate::request_key::UnkeyedCounters::default(),
             global_threshold,
             fable_weekly_threshold,
-            reserved_groups: RwLock::new(reserved_groups),
-            parked_groups: RwLock::new(parked_groups),
-            control_allowed_groups: RwLock::new(control_allowed_groups),
-            spill_groups: RwLock::new(spill_groups),
-            group_colors: RwLock::new(group_colors),
+            groups: RwLock::new(groups),
             mitm: std::sync::OnceLock::new(),
             codex_refused: Mutex::new(CodexRefusals::default()),
             codex_unpooled: Mutex::new(MinuteRing::default()),
@@ -1798,21 +1752,23 @@ impl Manager {
             current: Mutex::new(None),
             current_by_provider: Mutex::new(crate::stats::CurrentByProvider::default()),
             select_seq: AtomicU64::new(1),
-            affinity: Mutex::new(HashMap::new()),
-            affinity_extended: Mutex::new(HashSet::new()),
+            affinity: Mutex::new(CappedMap::new(select::AFFINITY_CAP, |&(_, touch)| touch)),
+            affinity_extended: Mutex::new(CappedSet::new(select::AFFINITY_CAP)),
             affinity_file: crate::cache_file::SavedFile::new(AFFINITY_TOUCH_REFRESH),
             bound_tokens: bound_tokens::ShardedBoundTokens::default(),
             bound_tokens_file: crate::cache_file::SavedFile::new(std::time::Duration::ZERO),
             bound_history_logged: Mutex::new(HashSet::new()),
             bound_switch_warned: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(CappedMap::new(snapshot::SESSION_CAP, |s| s.last_seen_ms)),
             wire_sessions: Mutex::new(crate::session_wire::WireSessionTracker::new()),
             wire_sessions_file: crate::cache_file::SavedFile::new(WIRE_SESSIONS_REFRESH),
             session_seq: AtomicU64::new(1),
             next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
             next_codex_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
-            conn_affinity: Mutex::new(HashMap::new()),
-            divert_ledger: Mutex::new(HashMap::new()),
+            conn_affinity: Mutex::new(CappedMap::new(select::CONN_AFFINITY_CAP, |&(_, touch)| {
+                touch
+            })),
+            divert_ledger: Mutex::new(CappedMap::new(select::DIVERT_LEDGER_CAP, |e| e.until_ms)),
             control_reserve,
             control_pooled,
             control_identity,
@@ -1898,11 +1854,7 @@ impl Manager {
     /// Hard state of account `idx` — lets the proxy skip an account that a
     /// refresh just proved dead (`Error`) without wasting an upstream round-trip.
     pub fn account_status(&self, idx: usize) -> Option<AccountStatus> {
-        self.accounts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(idx)
-            .map(|a| a.status)
+        self.account(idx, |a| a.status)
     }
 
     /// A `retry-after` hint (seconds) for a synthetic 429 when every account is
@@ -2052,8 +2004,7 @@ impl Manager {
             }
             Some(crate::provider::Provider::Anthropic) | None => None,
         };
-        let reserved_groups = self.reserved_groups();
-        let parked_groups = self.parked_groups();
+        let groups = self.groups();
         let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
         let mut gated: BTreeMap<GateReason, usize> = BTreeMap::new();
         let mut soonest: Option<(i64, GateReason)> = None;
@@ -2083,8 +2034,8 @@ impl Manager {
                 now_ms,
                 is_fable,
                 group,
-                &reserved_groups,
-                &parked_groups,
+                &groups.reserved,
+                &groups.parked,
             );
             if reason == GateReason::Rejected {
                 match account.provider {
@@ -2666,25 +2617,25 @@ impl Manager {
         }
     }
 
-    /// A cloned snapshot of the currently-reserved group names. Clones rather
-    /// than returning a guard so a caller never holds this lock across a
-    /// second lock acquisition (`accounts`, `affinity`) — the set is a
-    /// handful of short strings, so the clone costs nothing worth avoiding.
-    /// See the field's own doc for the hot-reload contract this serves.
-    fn reserved_groups(&self) -> HashSet<String> {
-        self.reserved_groups
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    /// The current group settings, one version of the config file. Clones the
+    /// `Arc` rather than returning a guard so a caller never holds this lock
+    /// across a second lock acquisition (`accounts`, `affinity`). A caller that
+    /// asks more than one group question reads them all from one `groups()`,
+    /// so a reload between two questions cannot hand it a mix of two versions.
+    fn groups(&self) -> Arc<GroupPolicy> {
+        Arc::clone(&self.groups.read().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// A cloned snapshot of the currently-parked group names. Same
-    /// clone-not-guard reasoning as [`Self::reserved_groups`].
+    /// The currently-reserved group names, for a caller that needs the set
+    /// itself. Two calls to this and [`Self::parked_groups`] may read two
+    /// versions; a caller that needs both reads [`Self::groups`] once.
+    fn reserved_groups(&self) -> HashSet<String> {
+        self.groups().reserved.clone()
+    }
+
+    /// The currently-parked group names. See [`Self::reserved_groups`].
     pub(super) fn parked_groups(&self) -> HashSet<String> {
-        self.parked_groups
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.groups().parked.clone()
     }
 
     /// Whether `group` is currently reserved — and therefore STRICT: its own
@@ -2697,29 +2648,13 @@ impl Manager {
     /// path. Reads the same hot-reloaded cache, so `tcr group unreserve` takes
     /// effect on the next request with no restart.
     pub fn is_group_reserved(&self, group: &str) -> bool {
-        self.reserved_groups
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(group)
+        self.groups().reserved.contains(group)
     }
 
-    /// A cloned snapshot of the currently control-account-allowed group
-    /// names. Same clone-not-guard reasoning as [`Self::reserved_groups`].
-    fn control_allowed_groups(&self) -> HashSet<String> {
-        self.control_allowed_groups
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
-    /// A cloned snapshot of the group names currently opted in to
-    /// `spillToPool`. Same clone-not-guard reasoning as
+    /// The group names currently opted in to `spillToPool`. See
     /// [`Self::reserved_groups`].
     pub(super) fn spill_groups(&self) -> HashSet<String> {
-        self.spill_groups
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.groups().spill.clone()
     }
 
     /// Re-read [`config::Account::groups`] and `groupSettings` (`reserved`,
@@ -2819,13 +2754,14 @@ impl Manager {
     /// file, or a mtime bump from an unrelated write). Called only from
     /// [`Self::reload_groups_if_changed`], under `config_write`.
     ///
-    /// Reserved-group membership is applied BEFORE per-account `groups`, so
+    /// The group settings are swapped as one [`GroupPolicy`], and only when
+    /// one of them changed. They are applied BEFORE per-account `groups`, so
     /// that by the time this returns and the caller re-tests a pinned
     /// session's hard gate, a session on an account whose group just became
     /// reserved is judged against the fresh reservation — the existing
     /// pin-reclaim-on-reservation test (`pin_reclaim_when_the_pinned_accounts_group_is_reserved`)
     /// extends to the reload path for free, because [`Self::select_with_group`]
-    /// re-tests [`Self::account_hard_ok`] against a fresh [`Self::reserved_groups`]
+    /// re-tests [`Self::account_hard_ok`] against a fresh [`Self::groups`]
     /// snapshot on every call — reservation was never cached PAST one call, only
     /// ACROSS them until this reload existed.
     ///
@@ -2835,79 +2771,15 @@ impl Manager {
     /// mid-way through a login churn (a display name changed, an org backfilled)
     /// still reloads the right row instead of silently dropping its groups.
     fn apply_group_reload(&self, fresh: &Config) {
-        let new_reserved = fresh.reserved_group_names();
-        let new_parked = fresh.parked_group_names();
-        let new_control_allowed = fresh.control_allowed_group_names();
-        let new_spill = fresh.spill_group_names();
-        let new_colors = fresh.group_colors();
-        let mut changed: Vec<String> = Vec::new();
-
-        {
-            let mut reserved = self
-                .reserved_groups
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
-            if *reserved != new_reserved {
-                changed.push(format!(
-                    "reserved groups: {:?} -> {:?}",
-                    sorted_groups(&reserved),
-                    sorted_groups(&new_reserved)
-                ));
-                *reserved = new_reserved;
+        let fresh_groups = GroupPolicy::from_config(fresh);
+        let mut changed: Vec<String> = {
+            let mut groups = self.groups.write().unwrap_or_else(PoisonError::into_inner);
+            let changed = groups.changes_to(&fresh_groups);
+            if !changed.is_empty() {
+                *groups = Arc::new(fresh_groups);
             }
-        }
-        {
-            let mut parked = self
-                .parked_groups
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
-            if *parked != new_parked {
-                changed.push(format!(
-                    "parked groups: {:?} -> {:?}",
-                    sorted_groups(&parked),
-                    sorted_groups(&new_parked)
-                ));
-                *parked = new_parked;
-            }
-        }
-        {
-            let mut control_allowed = self
-                .control_allowed_groups
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
-            if *control_allowed != new_control_allowed {
-                changed.push(format!(
-                    "control-allowed groups: {:?} -> {:?}",
-                    sorted_groups(&control_allowed),
-                    sorted_groups(&new_control_allowed)
-                ));
-                *control_allowed = new_control_allowed;
-            }
-        }
-        {
-            let mut spill = self
-                .spill_groups
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
-            if *spill != new_spill {
-                changed.push(format!(
-                    "spill-to-pool groups: {:?} -> {:?}",
-                    sorted_groups(&spill),
-                    sorted_groups(&new_spill)
-                ));
-                *spill = new_spill;
-            }
-        }
-        {
-            let mut colors = self
-                .group_colors
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
-            if *colors != new_colors {
-                changed.push(format!("group colors: {:?} -> {:?}", *colors, new_colors));
-                *colors = new_colors;
-            }
-        }
+            changed
+        };
         {
             let mut accounts = self
                 .accounts
@@ -3278,11 +3150,7 @@ impl Manager {
     /// indexing avoids a panic either way).
     pub fn control_name(&self) -> Option<String> {
         let idx = self.control()?;
-        self.accounts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(idx)
-            .map(|a| a.name.clone())
+        self.account(idx, |a| a.name.clone())
     }
 
     /// Whether the control account also takes general inference traffic — the
@@ -3303,14 +3171,10 @@ impl Manager {
     /// and `accountUuid`. `None` when no control account is set.
     pub fn control_identity_target(&self) -> Option<crate::control_identity::ControlIdentity> {
         let idx = self.control()?;
-        self.accounts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(idx)
-            .map(|a| crate::control_identity::ControlIdentity {
-                name: a.name.clone(),
-                account_uuid: a.account_uuid.clone(),
-            })
+        self.account(idx, |a| crate::control_identity::ControlIdentity {
+            name: a.name.clone(),
+            account_uuid: a.account_uuid.clone(),
+        })
     }
 
     /// The resolved-client-identity cache the check reads and fills.
@@ -3326,12 +3190,8 @@ impl Manager {
     /// outside the process, the same reasoning as `http1_only` on that line.
     pub fn locked_account_name(&self) -> Option<String> {
         let idx = self.locked_idx?;
-        self.accounts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(idx)
-            .filter(|a| !a.removed)
-            .map(|a| a.name.clone())
+        self.account(idx, |a| (!a.removed).then(|| a.name.clone()))
+            .flatten()
     }
 
     /// Whether per-account request pacing does anything (see
@@ -3430,22 +3290,18 @@ impl Manager {
     /// `accounts`/`config`).
     fn set_control(&self, idx: Option<usize>) -> ControlPersist {
         let target = idx.and_then(|i| {
-            self.accounts
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(i)
-                .map(|a| {
-                    // Carries the account's provider for the reason
-                    // `set_disabled`'s probe does: `save_control_account`
-                    // checks the row through `config::locate_account_entry`.
-                    crate::identity::probe(
-                        a.provider,
-                        &a.name,
-                        a.account_uuid.clone(),
-                        a.org_uuid.clone(),
-                        a.org_name.clone(),
-                    )
-                })
+            self.account(i, |a| {
+                // Carries the account's provider for the reason
+                // `set_disabled`'s probe does: `save_control_account`
+                // checks the row through `config::locate_account_entry`.
+                crate::identity::probe(
+                    a.provider,
+                    &a.name,
+                    a.account_uuid.clone(),
+                    a.org_uuid.clone(),
+                    a.org_name.clone(),
+                )
+            })
         });
         {
             let mut control = self
@@ -16768,5 +16624,115 @@ mod tests {
         assert_eq!(manager.codex_traffic(t0 + 599_000).unpooled_10m, 3);
         assert_eq!(manager.codex_traffic(t0 + 600_000).unpooled_10m, 0);
         assert_eq!(manager.codex_traffic(t0 + 599_000).refused_10m, 0);
+    }
+
+    /// The extended-cache set stays bounded with no pin flush to prune it: with affinity off
+    /// (no file, no flusher) every keyed request that asked for the 1h cache used to add a
+    /// key for good. Over the cap the least recently noted key goes, and the newest stays.
+    #[test]
+    fn the_extended_cache_set_is_capped_without_a_pin_flush() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let noted = select::AFFINITY_CAP as u64 * 2;
+        for key in 0..noted {
+            manager.note_affinity_ttl(key, true);
+        }
+        let held = manager
+            .affinity_extended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        assert_eq!(held, select::AFFINITY_CAP);
+        assert_eq!(manager.warm_window(Some(noted - 1)), WarmWindow::EXTENDED);
+        assert_eq!(manager.warm_window(Some(0)), WarmWindow::DEFAULT);
+    }
+
+    /// `group` settings as `(reserved, spill_to_pool)` for the one group `g`.
+    fn config_with_g_settings(accounts: Vec<Account>, reserved: bool, spill: bool) -> Config {
+        let mut config = config_with(accounts);
+        config.group_settings.insert(
+            "g".to_string(),
+            crate::config::GroupSettings {
+                reserved,
+                spill_to_pool: spill,
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    /// A `--group g` select reads every group setting from ONE version of the config.
+    ///
+    /// Two versions, both strict for `g`: (reserved false, spill false) and (reserved true,
+    /// spill true). The only member of `g` is disabled, so a strict ask refuses and a spill
+    /// ask lands on the outsider `o`. A select that read `reserved` from the first version and
+    /// `spill` from the second would see (false, true), the one mix that is not strict, and
+    /// route the request to `o`. A thread flips between the two versions while this one
+    /// selects; any `Some` is a torn read.
+    #[test]
+    fn a_group_reload_mid_select_never_routes_on_a_mix_of_two_versions() {
+        let accounts = || {
+            vec![
+                Account {
+                    disabled: Some(true),
+                    ..account_in_groups("m", 0, &["g"])
+                },
+                account("o", 0),
+            ]
+        };
+        let neither = config_with_g_settings(accounts(), false, false);
+        let both = config_with_g_settings(accounts(), true, true);
+        let refresher = || {
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+        };
+        let select_g = |manager: &Manager| {
+            manager.select_with_group(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("g"),
+            )
+        };
+
+        // Positive control: the mixed version itself does route to `o`.
+        let mixed = build_manager(config_with_g_settings(accounts(), false, true), refresher());
+        assert_eq!(select_g(&mixed), Some(1), "the torn mix must route to `o`");
+        let manager = build_manager(neither.clone(), refresher());
+        assert_eq!(select_g(&manager), None, "(false, false) is strict");
+        manager.apply_group_reload(&both);
+        assert_eq!(select_g(&manager), None, "(true, true) is strict");
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flipper = {
+            let manager = Arc::clone(&manager);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    manager.apply_group_reload(&neither);
+                    manager.apply_group_reload(&both);
+                }
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut torn = 0usize;
+        let mut selects = 0usize;
+        while std::time::Instant::now() < deadline {
+            selects += 1;
+            if select_g(&manager).is_some() {
+                torn += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(flipper.join().is_ok(), "the reload thread panicked");
+        assert_eq!(torn, 0, "{torn} of {selects} selects routed on a torn read");
     }
 }
