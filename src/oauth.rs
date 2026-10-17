@@ -1382,15 +1382,16 @@ pub fn upsert_account(
     }
 }
 
-/// The proxy port a login must guard against — the port the running server binds.
-/// Reads `proxy.port` from the config (falling back to the serde default when the
-/// file is missing or unreadable), so the guard checks the SAME port `tcr server`
-/// takes over.
-fn login_target_port(config_path: &Path) -> u16 {
-    config::load(config_path).map_or_else(
-        |_| config::ProxyConfig::default().port,
-        |config| config.proxy.port,
-    )
+/// Where an admitted login writes its finished credential. The two routes the
+/// guard lets through; a refusal is not one of them (it is [`LoginRoute::Refuse`],
+/// which [`admit_login_against`] turns into an error), so code after admission
+/// cannot match on a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteRoute {
+    /// Write the config file ([`LoginRoute::File`]).
+    File,
+    /// Post to the live proxy's add route ([`LoginRoute::Live`]).
+    Live,
 }
 
 /// What `login()` should do with the finished credential, decided purely from
@@ -1591,12 +1592,11 @@ impl LoginCommand {
     }
 }
 
-/// A login the guard let through: the route to write by (never
-/// [`LoginRoute::Refuse`]), the port and incumbent it was decided against, and
+/// A login the guard let through: the route to write by, the port and incumbent it was decided against, and
 /// the providers the probe's answer advertised ([`probe_add_route`]).
 #[derive(Debug)]
 struct Admitted {
-    route: LoginRoute,
+    route: WriteRoute,
     port: u16,
     pid: Option<u32>,
     providers: Vec<crate::provider::Provider>,
@@ -1606,7 +1606,7 @@ impl Admitted {
     /// Refuse a live server that cannot store a Codex login, naming `command`
     /// as the login to run again ([`codex_live_route_refusal`]).
     fn require_codex(&self, command: LoginCommand) -> anyhow::Result<()> {
-        if self.route == LoginRoute::Live
+        if self.route == WriteRoute::Live
             && !self.providers.contains(&crate::provider::Provider::Codex)
         {
             bail!(
@@ -1621,15 +1621,20 @@ impl Admitted {
 /// The admission every login starts with: find the port the server binds, look
 /// for an incumbent on it, and resolve which route the finished credential
 /// takes ([`admit_login_against`]). A refusal comes back as the error, so an
-/// [`Admitted`] route is never [`LoginRoute::Refuse`].
+/// [`Admitted`] carries a [`WriteRoute`], which has no refusal.
+///
+/// Reads the config once: its `proxy.port` is the port the running server
+/// binds, so the guard checks the SAME port `tcr server` takes over, and the
+/// same value feeds the probe.
 async fn admit_login(
     config_path: &Path,
     force: bool,
     command: LoginCommand,
 ) -> anyhow::Result<Admitted> {
-    let port = login_target_port(config_path);
+    let config = load_or_default(config_path)?;
+    let port = config.proxy.port;
     let incumbent = singleton::live_proxy_server(port);
-    admit_login_against(config_path, incumbent, port, force, command).await
+    admit_login_against(config_path, &config, incumbent, port, force, command).await
 }
 
 /// [`login_guard_refusal_for`] for plain `tcr login`, whose refusal says `run 'tcr login'`. The
@@ -1669,6 +1674,7 @@ fn login_guard_refusal(
 /// proxy answered but rejected our api-key.
 async fn admit_login_against(
     config_path: &Path,
+    config: &Config,
     incumbent: Option<singleton::Incumbent>,
     port: u16,
     force: bool,
@@ -1676,8 +1682,7 @@ async fn admit_login_against(
 ) -> anyhow::Result<Admitted> {
     let pid = incumbent.map(|incumbent| incumbent.pid);
     let command = command.as_str();
-    let config = load_or_default(config_path)?;
-    let (capability, providers) = probe_add_route(&config).await;
+    let (capability, providers) = probe_add_route(config).await;
     let route = match capability {
         // Positive evidence the proxy is alive: it answered, parsed our
         // request, and rejected the key. Refuses regardless of `--force` —
@@ -1715,9 +1720,11 @@ async fn admit_login_against(
             LoginRoute::File
         }
     };
-    if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
-    }
+    let route = match route {
+        LoginRoute::Refuse(msg) => bail!("{}", msg),
+        LoginRoute::File => WriteRoute::File,
+        LoginRoute::Live => WriteRoute::Live,
+    };
     Ok(Admitted {
         route,
         port,
@@ -2421,7 +2428,7 @@ pub fn first_codex_account_notice(
 /// Existence checks, never a read of either file.
 ///
 /// It follows a save that already happened, so it cannot fail the login: a config it cannot read
-/// is read as the default one, as [`login_target_port`] reads it.
+/// is read as the default one, by falling back to the serde default.
 pub(crate) async fn read_first_codex_account_notice(config_path: &Path) -> String {
     let Ok(config) = config::load(config_path).or_else(|_| serde_json::from_str::<Config>("{}"))
     else {
@@ -3077,7 +3084,7 @@ fn looks_like_email(s: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn finish_login_checked(
     config_path: &Path,
-    route: LoginRoute,
+    route: WriteRoute,
     config: &mut Config,
     name: &str,
     tokens: &Tokens,
@@ -3327,8 +3334,8 @@ fn persist_via_account_or_file(config_path: &Path, account: &Account) -> anyhow:
 }
 
 /// Persist a finished login's `account` row per `route`, and return the name
-/// it was saved under: through the live proxy when it is [`LoginRoute::Live`],
-/// via [`persist_via_file`] when it is [`LoginRoute::File`]. Split out of
+/// it was saved under: through the live proxy when it is [`WriteRoute::Live`],
+/// via [`persist_via_file`] when it is [`WriteRoute::File`]. Split out of
 /// [`login`] so WHERE the credential lands is testable without driving a real
 /// browser.
 ///
@@ -3360,16 +3367,13 @@ fn persist_via_account_or_file(config_path: &Path, account: &Account) -> anyhow:
 /// are.
 async fn finish_login_account(
     config_path: &Path,
-    route: LoginRoute,
+    route: WriteRoute,
     config: &Config,
     account: Account,
 ) -> anyhow::Result<String> {
     match route {
-        LoginRoute::Refuse(_) => {
-            unreachable!("every login bails on a refusal before it has a credential to persist")
-        }
-        LoginRoute::File => persist_via_file(config_path, account),
-        LoginRoute::Live => {
+        WriteRoute::File => persist_via_file(config_path, account),
+        WriteRoute::Live => {
             match crate::cli::post_add_account(config, &account).await {
                 // Behind the provider gate, and checked anyway: a non-Anthropic
                 // row the server did not confirm storing AS that provider is a
@@ -3509,7 +3513,7 @@ fn misstored_provider_refusal(
 /// login authenticated as, plus the tokens it produced.
 async fn finish_login(
     config_path: &Path,
-    route: LoginRoute,
+    route: WriteRoute,
     config: &mut Config,
     name: &str,
     tokens: &Tokens,
@@ -4692,6 +4696,11 @@ mod tests {
         Some(singleton::Incumbent { pid: 4242, kind })
     }
 
+    /// The config at `path`, read once, as `admit_login` hands it to the guard.
+    fn cfg(path: &Path) -> Config {
+        load_or_default(path).expect("test config loads")
+    }
+
     /// Unwrap a [`LoginRoute::Refuse`]'s message, or panic naming what came back
     /// instead — every existing refusal test still wants the bare message
     /// string, and this is the one place that unwrap lives now that the guard
@@ -4894,19 +4903,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn login_target_port_reads_config_and_defaults_when_missing() {
-        // Reads proxy.port so the guard checks the SAME port the server binds.
-        let path =
-            std::env::temp_dir().join(format!("tcr-oauth-login-port-{}.json", std::process::id()));
-        std::fs::write(&path, r#"{ "proxy": { "port": 4999 } }"#).unwrap();
-        assert_eq!(login_target_port(&path), 4999);
-        std::fs::remove_file(&path).ok();
-        // A missing/unreadable config falls back to the serde default (3456).
-        let missing = std::env::temp_dir().join("tcr-oauth-login-port-does-not-exist.json");
-        assert_eq!(login_target_port(&missing), 3456);
-    }
-
     // --- probe_add_capability -----------------------------------------------
 
     #[tokio::test]
@@ -4926,7 +4922,7 @@ mod tests {
     /// own router produces, even its 404s and 405s) — is first-hand evidence
     /// a live process holds the port. It must NOT collapse into `Absent`
     /// (renamed from this test's old expectation): folding it in there is
-    /// exactly what let `login_route` silently choose `File` beside a real,
+    /// exactly what let the login guard silently choose `File` beside a real,
     /// answering-but-old server whenever pid detection missed it.
     #[tokio::test]
     async fn probe_add_capability_unstamped_404_is_unusable_not_absent() {
@@ -5002,20 +4998,20 @@ mod tests {
         );
     }
 
-    // --- login_route ----------------------------------------------------------
+    // --- admit_login_against ----------------------------------------------------------
 
     /// THE INTEGRATION-LEVEL VERSION of
     /// `login_guard_proceeds_live_on_a_confirmed_route_even_when_incumbent_detection_missed_it`:
     /// a real live server answering the real route, called with `incumbent:
     /// None` (simulating a pid/argv/owner-file detection MISS — the TcrBar
     /// case, where `argv[0]` ends in `/TcrBar` and
-    /// `singleton::classify_proxy_server` recognizes nothing). `login_route`
+    /// `singleton::classify_proxy_server` recognizes nothing). `admit_login_against`
     /// must still probe and proceed live — it must never gate the probe
     /// itself on `incumbent.is_some()`, which is exactly the shape of bug
     /// this test catches: skipping the probe here would fall through to
-    /// `LoginRoute::File` beside a real, answering server.
+    /// `WriteRoute::File` beside a real, answering server.
     #[tokio::test]
-    async fn login_route_proceeds_live_even_when_incumbent_detection_missed_a_real_server() {
+    async fn admit_login_proceeds_live_even_when_incumbent_detection_missed_a_real_server() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let path = std::env::temp_dir().join(format!(
@@ -5029,23 +5025,24 @@ mod tests {
         let manager = crate::manager::Manager::with_live_refresher(server_config, None);
         tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
-        let route = admit_login_against(&path, None, port, false, LoginCommand::Browser)
-            .await
-            .expect("a confirmed route must not error")
-            .route;
+        let route =
+            admit_login_against(&path, &cfg(&path), None, port, false, LoginCommand::Browser)
+                .await
+                .expect("a confirmed route must not error")
+                .route;
         assert_eq!(
             route,
-            LoginRoute::Live,
+            WriteRoute::Live,
             "the probe must decide this on its own, independent of incumbent detection"
         );
         std::fs::remove_file(&path).ok();
     }
 
-    /// Bridge item C, at the `login_route` level: `--force` must still probe
+    /// Bridge item C, at the `admit_login_against` level: `--force` must still probe
     /// and still prefer `Live` when a real server confirms the route — never
     /// skip straight to `File` the way the pre-fix early-return did.
     #[tokio::test]
-    async fn login_route_prefers_live_over_force_when_a_real_server_confirms_the_route() {
+    async fn admit_login_prefers_live_over_force_when_a_real_server_confirms_the_route() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let path = std::env::temp_dir().join(format!(
@@ -5059,26 +5056,27 @@ mod tests {
         let manager = crate::manager::Manager::with_live_refresher(server_config, None);
         tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
-        let route = admit_login_against(&path, None, port, true, LoginCommand::Browser)
-            .await
-            .expect("a confirmed route under --force must not error")
-            .route;
+        let route =
+            admit_login_against(&path, &cfg(&path), None, port, true, LoginCommand::Browser)
+                .await
+                .expect("a confirmed route under --force must not error")
+                .route;
         assert_eq!(
             route,
-            LoginRoute::Live,
+            WriteRoute::Live,
             "--force must still probe and prefer Live when the route is confirmed"
         );
         std::fs::remove_file(&path).ok();
     }
 
-    /// Bridge item D, at the `login_route` level: a wedged port — something
+    /// Bridge item D, at the `admit_login_against` level: a wedged port — something
     /// answers the TCP connect and then never responds — must refuse even
     /// when `incumbent` is `None` (pid/argv detection missed it entirely, the
     /// TcrBar shape). Before this fix, `AddCapability::Absent` covered this
-    /// case too, and `login_guard_refusal`'s `None => LoginRoute::File` arm
+    /// case too, and `login_guard_refusal`'s `None => WriteRoute::File` arm
     /// let it through with no `--force` needed at all.
     #[tokio::test]
-    async fn login_route_refuses_a_wedged_port_even_when_incumbent_detection_missed_it() {
+    async fn admit_login_refuses_a_wedged_port_even_when_incumbent_detection_missed_it() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let path = std::env::temp_dir().join(format!(
@@ -5087,7 +5085,7 @@ mod tests {
         ));
         std::fs::write(&path, format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
 
-        let err = admit_login_against(&path, None, port, false, LoginCommand::Browser)
+        let err = admit_login_against(&path, &cfg(&path), None, port, false, LoginCommand::Browser)
             .await
             .expect_err("a wedged port must refuse, not silently choose File");
         assert!(err.to_string().contains("--force"), "{err}");
@@ -5099,7 +5097,7 @@ mod tests {
     /// The escape hatch still works past a wedged-port refusal: `--force`
     /// resolves to `File` rather than erroring out.
     #[tokio::test]
-    async fn login_route_force_resolves_to_file_past_a_wedged_port_refusal() {
+    async fn admit_login_force_resolves_to_file_past_a_wedged_port_refusal() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let path = std::env::temp_dir().join(format!(
@@ -5108,11 +5106,12 @@ mod tests {
         ));
         std::fs::write(&path, format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
 
-        let route = admit_login_against(&path, None, port, true, LoginCommand::Browser)
-            .await
-            .expect("--force must still resolve past a wedged-port refusal")
-            .route;
-        assert_eq!(route, LoginRoute::File);
+        let route =
+            admit_login_against(&path, &cfg(&path), None, port, true, LoginCommand::Browser)
+                .await
+                .expect("--force must still resolve past a wedged-port refusal")
+                .route;
+        assert_eq!(route, WriteRoute::File);
 
         std::fs::remove_file(&path).ok();
         drop(listener);
@@ -5134,6 +5133,7 @@ mod tests {
 
         let err = admit_login_against(
             &path,
+            &cfg(&path),
             incumbent(singleton::ProxyKind::Tcr),
             port,
             false,
@@ -5148,6 +5148,7 @@ mod tests {
 
         let admitted = admit_login_against(
             &path,
+            &cfg(&path),
             incumbent(singleton::ProxyKind::Tcr),
             port,
             true,
@@ -5155,7 +5156,7 @@ mod tests {
         )
         .await
         .expect("--force admits the file route past that refusal");
-        assert_eq!(admitted.route, LoginRoute::File);
+        assert_eq!(admitted.route, WriteRoute::File);
         assert_eq!(admitted.pid, Some(4242));
         assert!(admitted.require_codex(LoginCommand::Codex).is_ok());
 
@@ -5166,10 +5167,10 @@ mod tests {
     /// refusal (above), but it must NOT be one past `AddCapability::
     /// Unauthorized`. A rejected api-key is positive evidence the proxy is
     /// alive and healthy — the worst-informed moment to fall back to a
-    /// whole-file write beside it — so `login_route` must keep refusing even
+    /// whole-file write beside it — so `admit_login_against` must keep refusing even
     /// under `--force`, and nothing along the way may touch the config file.
     #[tokio::test]
-    async fn login_route_refuses_unauthorized_even_under_force() {
+    async fn admit_login_refuses_unauthorized_even_under_force() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server_config: Config = serde_json::from_str(&format!(
@@ -5179,7 +5180,7 @@ mod tests {
         let manager = crate::manager::Manager::with_live_refresher(server_config, None);
         tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
-        // The file `login_route` reads carries the WRONG key.
+        // The file `admit_login_against` reads carries the WRONG key.
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-route-unauthorized-force-{}-{port}.json",
             std::process::id()
@@ -5188,7 +5189,7 @@ mod tests {
         std::fs::write(&path, &seed).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let err = admit_login_against(&path, None, port, true, LoginCommand::Browser)
+        let err = admit_login_against(&path, &cfg(&path), None, port, true, LoginCommand::Browser)
             .await
             .expect_err("--force must not rescue a rejected api-key");
         assert!(err.to_string().contains("api-key"), "{err}");
@@ -5281,7 +5282,7 @@ mod tests {
 
         let err = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "alice@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
@@ -5316,7 +5317,7 @@ mod tests {
 
         let name = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "alice@example.com",
             &tokens("at-fresh", "rt-fresh", 1_893_456_000_000),
@@ -5362,7 +5363,7 @@ mod tests {
         };
         let err = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "alice@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
@@ -5415,7 +5416,7 @@ mod tests {
 
         let err = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "dup@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
@@ -5467,7 +5468,7 @@ mod tests {
 
         let name = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "dup@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
@@ -5562,7 +5563,7 @@ mod tests {
 
         let err = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "me@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
@@ -5745,7 +5746,7 @@ mod tests {
 
         let name = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "me@example.com (Corp)",
             &tokens("at-fresh-corp", "rt-fresh-corp", 1_893_456_000_000),
@@ -5803,7 +5804,7 @@ mod tests {
 
         let err = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "work",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
@@ -5846,7 +5847,7 @@ mod tests {
 
         let name = finish_login_checked(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
@@ -5932,7 +5933,7 @@ mod tests {
         // Now finish a THIRD account's login, live, using the STALE snapshot.
         let name = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut client_config,
             "charlie@example.com",
             &tokens("at-charlie", "rt-charlie", 1_893_456_000_000),
@@ -5996,7 +5997,7 @@ mod tests {
 
         let err = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut client_config,
             "dave@example.com",
             &tokens("at-dave", "rt-dave", 1_893_456_000_000),
@@ -6036,7 +6037,7 @@ mod tests {
 
         let name = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut config,
             "erin@example.com",
             &tokens("at-erin", "rt-erin", 1_893_456_000_000),
@@ -6119,7 +6120,7 @@ mod tests {
 
         let name = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut client_config,
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
@@ -6209,7 +6210,7 @@ mod tests {
 
         let name = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut client_config,
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
@@ -6240,7 +6241,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// THE σ5 EXPERIMENT for `LoginRoute::File` itself — the arm
+    /// THE σ5 EXPERIMENT for `WriteRoute::File` itself — the arm
     /// `persist_via_file` serves directly, not one of its live-path
     /// fallbacks. Reproduces the 2026-08-14 incident: a `tcr login` lands on
     /// `File` (no live proxy answers on the guarded port — the exact
@@ -6294,7 +6295,7 @@ mod tests {
 
         let name = finish_login(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut client_config,
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
@@ -6381,7 +6382,7 @@ mod tests {
 
         let name = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut client_config,
             "dana@example.com",
             &tokens("at-dana", "rt-dana", 1_893_456_000_000),
@@ -6416,7 +6417,7 @@ mod tests {
     /// `read_document` opens the file with `fs::read_to_string`, which cannot
     /// create one that is not there — so a `NoServer` result reached with NO
     /// config file on disk at all must still fall back to `persist_via_file`
-    /// (the same whole-file write `LoginRoute::File` always used) instead of
+    /// (the same whole-file write `WriteRoute::File` always used) instead of
     /// bailing on the read error. A first-ever login must be able to create
     /// the file exactly as it always has.
     #[tokio::test]
@@ -6441,7 +6442,7 @@ mod tests {
 
         let name = finish_login(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &mut client_config,
             "frank@example.com",
             &tokens("at-frank", "rt-frank", 1_893_456_000_000),
@@ -6508,7 +6509,7 @@ mod tests {
 
         let name = finish_login(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "gina",
             &setup_tokens,
@@ -6874,7 +6875,7 @@ mod tests {
 
         let name = finish_login(
             &path,
-            LoginRoute::File,
+            WriteRoute::File,
             &mut config,
             "imported@example.com",
             &tokens,
@@ -7192,7 +7193,7 @@ mod tests {
         assert_eq!(name, "alice@example.com/codex");
         let saved = finish_login_account(
             &path,
-            LoginRoute::Live,
+            WriteRoute::Live,
             &config,
             codex_account_row(name, login, None),
         )
