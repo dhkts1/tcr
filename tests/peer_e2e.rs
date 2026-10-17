@@ -93,8 +93,7 @@ mod matrix;
 
 /// What the real API refuses a request without, shared by every fake upstream
 /// in this tree. See that module's docs for why a fake upstream is strict.
-#[path = "tools/api_contract.rs"]
-mod api_contract;
+use crate::api_contract;
 
 /// How long any one "wait for this line" step may take. Generous because a
 /// debug-profile `tcr` boots a manager, mints a CA and binds two sockets;

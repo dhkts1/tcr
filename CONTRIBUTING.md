@@ -220,6 +220,15 @@ Unit tests live beside the code they cover; integration tests are in `tests/` wi
 `tests/fixtures/`. The Swift side has its own tests under `apps/macos/Tests`, run with `swift test`
 from `apps/macos`.
 
+Most integration test files are modules of one test crate, `tests/it/main.rs`, because every test
+crate links the whole `tcr` library and one link is far cheaper than fifty. Run one file with
+`cargo test --test it peer_wire::` and one test with `cargo test --test it peer_wire::<name>`. A few
+files own process-wide state (a global `tracing` subscriber, the peer-lease fallback, an in-process
+server) and are their own `[[test]]` in `Cargo.toml`, with the reason beside each; those still run
+as `cargo test --test <file>`. `Cargo.toml` sets `autotests = false`, so a new file goes into one of
+the two lists or it never builds; `every_test_file_is_a_module_here_or_its_own_test_target` in
+`tests/it/main.rs` fails the suite until it does.
+
 **A green suite is a floor, not a finish line.** Before you trust a test you just wrote, watch it
 fail:
 

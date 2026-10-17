@@ -41,8 +41,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 
-#[path = "tools/api_contract.rs"]
-mod api_contract;
+use crate::api_contract;
 
 const ACCOUNT_ID_A: &str = "11111111-1111-4111-8111-111111111111";
 const ACCOUNT_ID_B: &str = "22222222-2222-4222-8222-222222222222";

@@ -53,6 +53,9 @@ if [ ! -f "$CMP_MANIFEST" ]; then
   echo "SKIP comparison 1: no comparison worktree at $CMP_WORKTREE (set PEER_COMPARE_WORKTREE)" >&2
 else
   echo "-- listing test names --"
+  # A comparison worktree from before `tests/it/main.rs` lists the tests of a
+  # merged file without their `<file>::` prefix, so against one every merged test
+  # reads as removed here and added there. Compare two trees on the same side.
   CARGO_TARGET_DIR="$CMP_TARGET_DIR" cargo test --manifest-path "$CMP_MANIFEST" --workspace --no-fail-fast -- --list \
     > "$LOGDIR/main-list-raw.txt" 2>&1
   cargo test --manifest-path "$MANIFEST" --workspace --no-fail-fast -- --list \
@@ -100,14 +103,14 @@ else
 fi
 
 echo "== comparison 2: latency, local vs borrowed =="
-cargo test --manifest-path "$MANIFEST" --test peer_e2e measure_latency_local_vs_borrowed \
+cargo test --manifest-path "$MANIFEST" --test it peer_e2e::measure_latency_local_vs_borrowed \
   -- --ignored --nocapture --test-threads=1 > "$LOGDIR/latency.log" 2>&1
 latency_status=$?
 grep -E '^(STEP|measure):' "$LOGDIR/latency.log"
 [ "$latency_status" -eq 0 ] || { echo "the latency measurement test itself failed (exit $latency_status); log: $LOGDIR/latency.log" >&2; overall_status=1; }
 
 echo "== comparison 3: boot cost, with and without a peers file =="
-cargo test --manifest-path "$MANIFEST" --test peer_e2e measure_boot_cost_with_and_without_peers_file \
+cargo test --manifest-path "$MANIFEST" --test it peer_e2e::measure_boot_cost_with_and_without_peers_file \
   -- --ignored --nocapture --test-threads=1 > "$LOGDIR/boot.log" 2>&1
 boot_status=$?
 grep -E '^(STEP|measure):' "$LOGDIR/boot.log"

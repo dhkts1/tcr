@@ -84,7 +84,7 @@ PY
 # expect_red <test-name> <expected-text-in-the-failure> <log-name>
 expect_red() {
   local test_name="$1" expected="$2" log="$LOGDIR/$3"
-  cargo test --manifest-path "$MANIFEST" --test peer_e2e "$test_name" \
+  cargo test --manifest-path "$MANIFEST" --test it "peer_e2e::$test_name" \
     -- --nocapture --test-threads=1 > "$log" 2>&1
   local status=$?
   if [ "$status" -eq 0 ]; then
@@ -103,7 +103,7 @@ expect_red() {
 
 expect_green() {
   local log="$LOGDIR/restored.log"
-  cargo test --manifest-path "$MANIFEST" --test peer_e2e -- --test-threads=1 > "$log" 2>&1
+  cargo test --manifest-path "$MANIFEST" --test it peer_e2e:: -- --test-threads=1 > "$log" 2>&1
   local status=$?
   [ "$status" -eq 0 ] || { echo "FAIL: the restored tree is not green; log: $log" >&2; exit 7; }
   echo "GREEN with both lines restored"

@@ -17,8 +17,7 @@
 //! the live proxy's 3456, and runs under the test network guard, which refuses
 //! 3456 and every non-loopback connection before it is made. Every account is
 //! invented.
-#[path = "support/connect_guard.rs"]
-mod connect_guard;
+use crate::connect_guard;
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};

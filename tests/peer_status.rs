@@ -642,8 +642,8 @@ fn the_committed_peers_fixture_matches_what_the_payload_renders() {
     let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "cannot read the committed peers fixture at {}: {e}. Regenerate with \
-             TCR_UPDATE_FIXTURES=1 cargo test --test peer_status \
-             the_committed_peers_fixture_matches_what_the_payload_renders",
+             TCR_UPDATE_FIXTURES=1 cargo test --test it \
+             peer_status::the_committed_peers_fixture_matches_what_the_payload_renders",
             path.display()
         )
     });
@@ -1365,8 +1365,8 @@ fn the_committed_peer_ls_fixture_matches_what_the_document_renders() {
     let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "cannot read the committed fixture at {}: {e}. Regenerate with \
-             TCR_UPDATE_FIXTURES=1 cargo test --test peer_status \
-             the_committed_peer_ls_fixture_matches_what_the_document_renders",
+             TCR_UPDATE_FIXTURES=1 cargo test --test it \
+             peer_status::the_committed_peer_ls_fixture_matches_what_the_document_renders",
             path.display()
         )
     });

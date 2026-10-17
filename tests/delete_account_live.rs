@@ -25,8 +25,7 @@
 //! from the config file, which the delete has already edited, so it would pass
 //! these tests whether or not the running proxy dropped anything.
 
-#[path = "support/connect_guard.rs"]
-mod connect_guard;
+use crate::connect_guard;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

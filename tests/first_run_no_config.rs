@@ -24,8 +24,7 @@
 //! non-loopback connections before they leave the child, and records attempts without
 //! account data. Its positive control uses only an owned ephemeral listener. Status
 //! with an explicit fixture port falls back to its offline snapshot.
-#[path = "support/connect_guard.rs"]
-mod connect_guard;
+use crate::connect_guard;
 
 use std::path::PathBuf;
 use std::process::Command;

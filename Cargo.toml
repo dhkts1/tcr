@@ -21,6 +21,9 @@ publish = false
 description = "tcr (Team Capacity Router): a local proxy that runs Claude Code across multiple Claude accounts"
 repository = "https://github.com/dhkts1/tcr"
 homepage = "https://github.com/dhkts1/tcr"
+# Integration tests are declared below rather than one crate per `tests/*.rs`: every test crate
+# links the whole `tcr` library, so 53 of them meant 53 links per `cargo test`.
+autotests = false
 
 # `publish = false` above hides this package from cargo-dist, which reads it to
 # decide what is distributable, so v0.2.4's release job failed with "This
@@ -40,6 +43,63 @@ path = "src/main.rs"
 name = "load_test"
 path = "examples/load_test/main.rs"
 test = true
+
+# One crate for the integration tests that can share a process: `tests/it/main.rs` names each
+# file as a module, so `cargo test --test it peer_wire::` runs what `--test peer_wire` used to.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+# Each of these stays its own process because it owns process-wide state a sibling module
+# would see or break. The reason is beside each one, and in the file's own docs where it has one.
+# A process-wide `tracing` subscriber, installed once with `set_global_default`:
+[[test]]
+name = "codex_log_lines"
+path = "tests/codex_log_lines.rs"
+[[test]]
+name = "peer_forward"
+path = "tests/peer_forward.rs"
+[[test]]
+name = "peer_refusal_log"
+path = "tests/peer_refusal_log.rs"
+[[test]]
+name = "usage-ledger-write-failure-policy"
+path = "tests/usage-ledger-write-failure-policy.rs"
+# The global subscriber again, and an in-process `server::serve`, which installs the egress
+# peers path, the peer-lease fallback and the probe path table for the whole process:
+[[test]]
+name = "peer_boot"
+path = "tests/peer_boot.rs"
+# `server::serve` in process (see `peer_boot`):
+[[test]]
+name = "serve_library_path"
+path = "tests/serve_library_path.rs"
+[[test]]
+name = "peer_borrow_hot"
+path = "tests/peer_borrow_hot.rs"
+# `fallback::install_provider`, which installs once per process:
+[[test]]
+name = "codex_never_borrowed"
+path = "tests/codex_never_borrowed.rs"
+[[test]]
+name = "peer_lease"
+path = "tests/peer_lease.rs"
+# `egress::install_peers_path`, which installs once per process:
+[[test]]
+name = "peer_egress"
+path = "tests/peer_egress.rs"
+# The leaf the process loaded last decides which CONNECT hosts `mitm` terminates:
+[[test]]
+name = "intercepted_host"
+path = "tests/intercepted_host.rs"
+# Both publish router mappings to the process-wide register `reach::external_socket` reads,
+# which the dead-drop and listener paths in other modules advertise:
+[[test]]
+name = "peer_reach"
+path = "tests/peer_reach.rs"
+[[test]]
+name = "peer_reach_upnp"
+path = "tests/peer_reach_upnp.rs"
 
 [dependencies]
 # The shared `tcr status --json` wire type (`AccountStatusRow`), consumed by
