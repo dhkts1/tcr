@@ -13,7 +13,7 @@ title = "tcr"
 useDefault = true
 
 # The repo is intentionally free of real credentials — accounts live in
-# ~/.config/teamclaude.json (never committed). If a unit test ever needs a
+# ~/.config/tcr.json (never committed). If a unit test ever needs a
 # realistic-looking token, make it obviously fake and allowlist it here rather
 # than weakening the ruleset.
 [allowlist]

@@ -1,10 +1,8 @@
 # tcr MITM / forward-proxy "backwards mode"
 
-Goal: make `tcr` a drop-in for the JS teamclaude's `HTTPS_PROXY` forward-proxy mode, so Gil's
-existing terminals (which export `HTTPS_PROXY=http://127.0.0.1:<port>` +
-`NODE_EXTRA_CA_CERTS=~/.config/teamclaude-ca.pem`) work against `tcr` unchanged. Reference impl:
-`~/git/teamclaude/src/mitm.js` + `src/x509.js`. Reuse `tcr`'s existing account-selection + token
-injection — only the CONNECT + TLS-termination front-end is new.
+Goal: a terminal that exports `HTTPS_PROXY=http://127.0.0.1:<port>` +
+`NODE_EXTRA_CA_CERTS=~/.config/tcr-ca.pem` reaches Anthropic through `tcr`. Reuse `tcr`'s existing
+account-selection + token injection — only the CONNECT + TLS-termination front-end is new.
 
 ## How it works
 A client with `HTTPS_PROXY` set sends `CONNECT api.anthropic.com:443` to us. Instead of blind
@@ -13,14 +11,11 @@ via its CA), read the plaintext HTTP request, run it through the SAME proxy path
 (select account → inject `authorization: Bearer <account token>` → forward to the real
 api.anthropic.com over our own TLS client → stream back).
 
-## Cert reuse (the key win — no re-trusting)
-- `~/.config/teamclaude-leaf.pem` (leaf cert, SAN `api.anthropic.com`, valid to 2028) +
-  `~/.config/teamclaude-leaf.key` (PKCS#8) already exist and are signed by the CA Gil's clients
-  trust. **Load these into a rustls `ServerConfig`** and present them. tcr does NOT need the CA
-  private key (the leaf is already signed).
-- If the leaf is missing/expired/doesn't cover the host: fall back to generating a fresh CA+leaf
-  with `rcgen`, persist `~/.config/tcr-ca.pem` + `tcr-leaf.pem`/`.key` (leaf key 0600), and print
-  `NODE_EXTRA_CA_CERTS=~/.config/tcr-ca.pem` for the user to trust. (Primary path is reuse.)
+## Certificates
+- tcr mints its own CA and leaf with `rcgen` (`generate_and_persist`), persists
+  `~/.config/tcr-ca.pem` + `tcr-ca.key` + `tcr-leaf.pem`/`.key` (keys 0600), loads the leaf into a
+  rustls `ServerConfig`, and prints `NODE_EXTRA_CA_CERTS=~/.config/tcr-ca.pem` for the user to
+  trust. Every later start reuses that chain (`load_tls_in`), so a client trusts it once.
 
 ## Security (what shipped — this section was written as a plan and the plan changed)
 - **Three hosts are on the MITM policy list**, not one (`ALLOWED_HOSTS`, `src/mitm.rs:86`):
@@ -33,10 +28,8 @@ api.anthropic.com over our own TLS client → stream back).
   certificate that fails the handshake (`src/mitm.rs:892-898`). `chatgpt.com` requires a marked Codex connection
   (`HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port>`) and a pooled Codex account, counted on every `CONNECT`
   (`host_intercepted`), and blind-tunneled otherwise, so a `codex` with no pooled account to serve
-  it keeps its own login. The reused `teamclaude-leaf.pem`'s SANs cannot be read without an x509
-  parser, so on that path tcr claims `api.anthropic.com` only (`src/mitm.rs:452`) and tunnels the
-  other two; the leaf tcr mints itself covers all three plus the JS test host `www.example.org`
-  (`FALLBACK_LEAF_SANS`, `src/mitm.rs:102-107`). Adding a host to that list makes the `tcr-leaf.sans`
+  it keeps its own login. The leaf tcr mints covers all three plus the test host
+  `www.example.org` (`FALLBACK_LEAF_SANS` in `src/mitm.rs`). Adding a host to that list makes the `tcr-leaf.sans`
   sidecar of every leaf tcr minted earlier stale, so the next start re-mints that leaf under the
   persisted CA key, and a client that already trusts that CA trusts the new leaf with nothing to
   change. That holds only for a client already told about the CA: `codex` takes no CA from
@@ -83,7 +76,7 @@ api.anthropic.com over our own TLS client → stream back).
   in manager/oauth/probe) — do NOT route our own upstream back through an ambient `HTTPS_PROXY`.
 
 ## Acceptance (must prove end-to-end, not just compile)
-- `curl --proxy http://127.0.0.1:<port> --cacert ~/.config/teamclaude-ca.pem -H "x-api-key: <master>"
+- `curl --proxy http://127.0.0.1:<port> --cacert ~/.config/tcr-ca.pem -H "x-api-key: <master>"
   -H 'anthropic-version: 2023-06-01' -d '{"model":"claude-haiku-4-5","max_tokens":10,"messages":[{"role":"user","content":"Reply with exactly: mitm works"}]}'
   https://api.anthropic.com/v1/messages` → **200 with a real completion**, served by a pooled
   account. (This is the real test — base-URL mode "compiled but didn't proxy" until a live request
@@ -97,5 +90,5 @@ api.anthropic.com over our own TLS client → stream back).
 
 ## Ergonomics (fold in if quick, else a follow-up)
 - `tcr run [-- claude args]`: if a `tcr` server is up on the config port, exec `claude` with
-  `HTTPS_PROXY=http://127.0.0.1:<port>` + `NODE_EXTRA_CA_CERTS=<caPath>` set (mirrors `teamclaude run`,
-  so `alias claude='tcr run --'` works). If the server is down, exec `claude` directly (passthrough).
+  `HTTPS_PROXY=http://127.0.0.1:<port>` + `NODE_EXTRA_CA_CERTS=<caPath>` set, so
+  `alias claude='tcr run --'` works. If the server is down, exec `claude` directly (passthrough).
