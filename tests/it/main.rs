@@ -163,3 +163,101 @@ fn every_test_file_is_a_module_here_or_its_own_test_target() {
         wrong.join("\n")
     );
 }
+
+/// The first run of ten or more spaces that sits INSIDE a string literal on `line`, with a
+/// word on each side. That is what a `\` line continuation leaves when something later joins the
+/// pieces and keeps the next line's indentation: a log line that reads "... carry is      not on".
+/// Indentation (the run before the first non-space) is not inside a literal, and the quote count
+/// tells the two apart. `\"` is skipped; a raw string is not understood, which only matters for
+/// a line this heuristic would then miss.
+fn space_run_inside_literal(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut in_literal = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_literal => i += 1,
+            b'"' => in_literal = !in_literal,
+            b' ' if in_literal => {
+                let run = bytes[i..].iter().take_while(|b| **b == b' ').count();
+                let word_before = i > 0 && bytes[i - 1] != b'"';
+                let word_after = bytes.get(i + run).is_some_and(|b| *b != b'"');
+                if run >= 10 && word_before && word_after {
+                    return Some(run);
+                }
+                i += run - 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Files whose literals are column-aligned output on purpose: the tables `tcr stats` prints, the
+/// `config show` columns and a pretty-printed JSON body under test.
+const ALIGNED_ON_PURPOSE: [&str; 3] = ["wrap.rs", "config_show.rs", "cache_ttl.rs"];
+
+/// Positive control: the scanner must flag the shape it exists for, and pass the shapes it must not.
+#[test]
+fn the_space_run_scanner_flags_a_continuation_scar() {
+    let scar = r#"        "the lock is poisoned, so this carry is                          not on any hour""#;
+    assert_eq!(space_run_inside_literal(scar), Some(26));
+    assert_eq!(
+        space_run_inside_literal(r#"        "one sentence, single spaces""#),
+        None
+    );
+    assert_eq!(
+        space_run_inside_literal("                let x = 1; // a            b"),
+        None
+    );
+    assert_eq!(
+        space_run_inside_literal(r#"    "  claude-opus-5                requests=2""#),
+        Some(16),
+        "an aligned table cell is a run too: such a file is exempt by name, not by the scanner"
+    );
+}
+
+/// **No log or error message in `src/` carries a run of spaces from a joined line continuation.**
+/// `tracing::warn!("a \<newline>   b")` drops the newline AND the indentation, but a rewrite that
+/// joined the pieces onto one line kept the indentation inside the text, and the log read as
+/// "so this carry is                          not on any path's hour" (found in
+/// `peer/listener.rs`, `reach.rs`, `serve.rs`, `tui.rs`, `discovery.rs`).
+#[test]
+fn no_string_literal_in_src_carries_a_run_of_spaces() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read a src dir") {
+            let path = entry.expect("a src entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    assert!(
+        files.iter().any(|path| path.ends_with("peer/listener.rs")),
+        "the walk must reach src/peer/listener.rs, or it checks nothing: {files:?}"
+    );
+    let mut scars = Vec::new();
+    for path in files {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        if name.is_some_and(|n| ALIGNED_ON_PURPOSE.contains(&n.as_str())) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read a src file");
+        for (number, line) in text.lines().enumerate() {
+            if let Some(run) = space_run_inside_literal(line) {
+                scars.push(format!("{}:{}: {run} spaces", path.display(), number + 1));
+            }
+        }
+    }
+    assert!(
+        scars.is_empty(),
+        "a string literal holds a run of spaces (a joined line continuation?):\n{}",
+        scars.join("\n")
+    );
+}

@@ -1628,7 +1628,7 @@ impl Drop for RelaySlot<'_> {
             Ok(held) => held,
             Err(poisoned) => {
                 tracing::error!(
-                    "peer serve: the ledger lock is poisoned, so this relay's in-flight slot                      is being given back through it rather than left held for the lease's                      whole life"
+                    "peer serve: the ledger lock is poisoned, so this relay's in-flight slot is being given back through it rather than left held for the lease's whole life"
                 );
                 poisoned.into_inner()
             }
@@ -2038,7 +2038,7 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
                 peer = %peer.display(),
                 told = %told,
                 error = %err,
-                "peer hello: this peer said it sees us at something that is not a socket                  address; ignoring the hint"
+                "peer hello: this peer said it sees us at something that is not a socket address; ignoring the hint"
             ),
         }
     }
@@ -2770,7 +2770,7 @@ pub async fn dial_peer_reaching_within(
         Err(failure) => tracing::debug!(
             peer = %row.node.display(),
             failure = %failure,
-            "peer serve: nothing on this peer's row answered and a punch did not get              through either; a carried stream is what is left"
+            "peer serve: nothing on this peer's row answered and a punch did not get through either; a carried stream is what is left"
         ),
     }
 
