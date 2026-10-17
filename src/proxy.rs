@@ -61,6 +61,10 @@ use crate::provider::Provider;
 use crate::quota::{UnifiedRejectionKind, quota_rejections};
 use crate::stats::{GateReason, RequestLogEntry, SessionKind};
 
+mod ladder;
+
+use ladder::Tally;
+
 /// Cap on a buffered request body (256 MiB) — a single-user localhost proxy has
 /// no legitimate payload near this, but an unbounded read is a DoS surface. The
 /// non-stream *response* body is bounded by the same cap (see [`read_capped_body`]).
@@ -3991,32 +3995,11 @@ async fn handle_request(
     // bounding is how much of the fleet one client request may walk, so it must not
     // reset when the account changes.
     let mut failovers_529 = 0u32;
-    // Distinguishes "no account available" (429) from "every attempt hit a
-    // transport failure" once the loop can no longer make progress. The latter is
-    // a 502 — EXCEPT when `offline_failures` below says the transport failures
-    // were this machine's resolver, which is a 503.
-    //
-    // These were ONE BOOL, and that was the bug: any single `send()` failure
-    // latched it for the rest of the request, and the check sits BEFORE both the
-    // soft-wait and the revalidation-serve — so one transport blip on one account
-    // disabled the entire recovery ladder and returned a 502 whose message ("every
-    // account transport-failed") was simply false. Observed live 09:16:46: the 502
-    // fired while two accounts had already answered with honest 429s and a third
-    // served a 200 1.6s later. Counting BOTH outcomes keeps the 502 for the only
-    // case it actually describes — nothing ever reached an upstream at all.
-    let mut transport_failures = 0usize;
-    let mut upstream_responses = 0usize;
-    // Set the moment any transport failure fails PAST the connect phase
-    // (`!err.is_connect()`, offline/DNS excluded — that is machine-level, not
-    // this). A connect-phase failure never left this box, so replaying it is
-    // free; a non-connect failure means a connection existed and the request
-    // may already have been written to it, so whether the upstream received or
-    // acted on it is unknown. One such attempt anywhere in the ladder taints the
-    // terminal answer for the whole request — see [`bad_gateway`]'s two shapes.
-    let mut unknown_outcome_transport_failure = false;
+    // Every attempt's outcome, counted for the terminal answer (`Tally::verdict`).
+    let mut tally = Tally::default();
     // Blind peer egress is offered ONCE per request, and this is the bound.
     //
-    // It sits beside `unknown_outcome_transport_failure` because it is the same
+    // It sits beside `tally.unknown_outcome_transport_failure` because it is the same
     // fact read the other way round: a carry is only ever offered while that
     // flag is still false, nothing this request sent has left this box, so a
     // resend down another path cannot double-send a POST. `src/peer/egress.rs`
@@ -4025,20 +4008,6 @@ async fn handle_request(
     // terminal, so both entry points the design names are one call site rather
     // than two that can drift.
     let mut peer_egress_tried = false;
-    // Accounts upstream refused with a 403 on OUR pooled credential, in the order
-    // seen. Every entry here is also an `upstream_responses` and a `tried` — a 403
-    // is a real answer, not a transport gap, and there is nothing to retry on the
-    // same account (unlike 401, a fresh token does not change WHICH account this
-    // is). Kept as `(idx, name)` rather than folded into a bare counter because the
-    // fast-fail response below must name the refused account(s), not just count
-    // them.
-    let mut refused_403: Vec<(usize, Option<String>)> = Vec::new();
-    // Model access can differ between ChatGPT plans. A rejection benches the account
-    // for this request only: it may still serve another model on the very next turn.
-    let mut model_refusals: Vec<(Option<String>, String)> = Vec::new();
-    let mut account_access_blocks = 0;
-    let mut codex_access_read_failures = 0;
-    let mut last_account_access_block: Option<(HeaderMap, Bytes)> = None;
     // Bound the total attempts so per-account 401/429 retries can never loop.
     let max_attempts = max_attempts_for(account_count);
     // The account the NEXT iteration must use, bypassing select(). Three producers:
@@ -4113,10 +4082,9 @@ async fn handle_request(
     // In-place waits this request has spent on a name-resolution failure, and how
     // many such failures it saw at all. Per-REQUEST: an offline machine is one
     // condition shared by every account, so there is nothing to count per account.
-    // `offline_failures` outlives the waits so the terminal answer can be the
+    // `tally.offline_failures` outlives the waits so the terminal answer can be the
     // honest 503 even if the request later rotates for an unrelated reason.
     let mut offline_waits = 0u32;
-    let mut offline_failures = 0usize;
 
     for _ in 0..max_attempts {
         let now = OffsetDateTime::now_utc();
@@ -4213,102 +4181,15 @@ async fn handle_request(
                         body: body_bytes.clone(),
                         headers: fallback::Ask::scrubbed(&req_headers),
                     });
-                    if every_attempt_transport_failed(transport_failures, upstream_responses) {
-                        // Nothing reached an upstream — but WHY decides the status.
-                        // If any attempt died in the resolver, the honest answer is
-                        // the recoverable 503, not a 502 asserting the upstream is
-                        // unreachable when it is this machine that is off the
-                        // network. Reachable here only if the offline arm's own
-                        // bound was not what ended the walk (a mixed request that
-                        // rotated for another reason first).
-                        if offline_failures > 0 {
-                            return offline_unavailable(offline_failures);
-                        }
-                        return bad_gateway(transport_failures, unknown_outcome_transport_failure);
-                    }
-                    // Every upstream answer this request got was a 403 refusing OUR
-                    // credential — refusals are the WHOLE story, not one dead
-                    // account among others still worth a 429/quota wait. Fast-fail
-                    // here, before the soft-wait and revalidation-serve below: those
-                    // exist to ride out a transient PARK, and a 403'd credential is
-                    // not coming back on a timer. Gated on `upstream_responses`
-                    // (mirroring `every_attempt_transport_failed` above), not on
-                    // `account_count`, so this fires equally for a pinned request
-                    // that only ever tried its one pin. Mixed outcomes — some
-                    // accounts refused, others merely exhausted — fall through
-                    // unchanged to the existing exhaustion handling, which can still
-                    // recover on the accounts that were not refused.
-                    if !model_refusals.is_empty() {
-                        return codex_model_unavailable_response(
-                            &manager,
-                            request_model.as_deref(),
-                            &model_refusals,
-                            &refused_403,
-                        );
-                    }
-                    if codex_access_read_failures > 0
-                        && codex_access_read_failures == upstream_responses
-                    {
-                        return error_response(
-                            StatusCode::BAD_GATEWAY,
-                            "proxy_error",
-                            "Could not read the upstream access-denied responses. The affected Codex accounts are held briefly; retry shortly.",
-                            None,
-                        );
-                    }
-                    if account_access_blocks > 0
-                        && account_access_blocks + refused_403.len() == upstream_responses
-                        && let Some((headers, body)) = last_account_access_block.take()
-                    {
-                        if !refused_403.is_empty() {
-                            let mut combined: Value =
-                                serde_json::from_slice(&body).unwrap_or_else(|_| {
-                                    codex_error_body(
-                                        CodexRefusalKind::CredentialRefused,
-                                        "ChatGPT refused workspace access.",
-                                    )
-                                });
-                            let message = combined
-                                .pointer("/error/message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("ChatGPT refused workspace access.");
-                            let message = format!(
-                                "{message} {}",
-                                codex_credential_refused_message(&refused_403)
-                            );
-                            if !combined.get("error").is_some_and(Value::is_object) {
-                                combined["error"] = serde_json::json!({});
-                            }
-                            combined["error"]["message"] = message.into();
-                            return codex_error_response(
-                                StatusCode::FORBIDDEN,
-                                combined.to_string(),
-                                None,
-                            );
-                        }
-                        return build_response(
-                            StatusCode::FORBIDDEN,
-                            &headers,
-                            Body::from(body),
-                            ServedBy::PooledAccount,
-                        );
-                    }
-                    if !refused_403.is_empty() && refused_403.len() == upstream_responses {
-                        return credential_refused_response(provider, &refused_403);
-                    }
-                    // A refused pool is an access problem, not a rate-limit retry. Keep
-                    // that status throughout the short revalidation hold, even near its end.
-                    match provider {
-                        Provider::Codex => {
-                            if manager.codex_pool_is_refused(now, bound_to, strict_group) {
-                                manager.note_codex_refusal(
-                                    CodexRefusalKind::CredentialRefused,
-                                    crate::now_ms(),
-                                );
-                                return codex_refused_pool_response();
-                            }
-                        }
-                        Provider::Anthropic => {}
+                    if let Some(answer) = tally.verdict(
+                        &manager,
+                        provider,
+                        request_model.as_deref(),
+                        now,
+                        bound_to,
+                        strict_group,
+                    ) {
+                        return answer;
                     }
                     // A cold shared-limiter burst parks the whole fleet for ~15-20s.
                     // Rather than telling the client "all exhausted" for a transient
@@ -4720,7 +4601,7 @@ async fn handle_request(
                 // so a 502 assembled out of these failures had no line anywhere to
                 // attribute it to; `is_connect` / `is_timeout` separate "never
                 // reached the host" from "the host went quiet mid-request".
-                transport_failures += 1;
+                tally.transport_failures += 1;
                 // **Blind peer egress, the one offer per request.**
                 //
                 // Four conjuncts, and the first two are what stop a carry
@@ -4761,9 +4642,12 @@ async fn handle_request(
                 // `is_offline_error`, `every_attempt_transport_failed` or
                 // either terminal status is widened.
                 let machine_level = is_offline_error(&err);
-                let nothing_ever_left_this_box = !unknown_outcome_transport_failure
+                let nothing_ever_left_this_box = !tally.unknown_outcome_transport_failure
                     && (err.is_connect() || machine_level)
-                    && every_attempt_transport_failed(transport_failures, upstream_responses);
+                    && every_attempt_transport_failed(
+                        tally.transport_failures,
+                        tally.upstream_responses,
+                    );
                 // `tried` never contains `idx` yet (it is inserted on the way
                 // out of this arm), so this account plus the benched ones is
                 // the whole of this request's provider's accounts exactly when
@@ -4896,7 +4780,7 @@ async fn handle_request(
                 // possibly help — it only unpins the session and burns the fleet.
                 // Hold the pin, wait briefly, retry the SAME account.
                 if is_offline_error(&err) {
-                    offline_failures += 1;
+                    tally.offline_failures += 1;
                     if offline_waits < MAX_OFFLINE_WAITS_PER_REQUEST {
                         offline_waits += 1;
                         tracing::warn!(
@@ -4912,14 +4796,14 @@ async fn handle_request(
                         tokio::time::sleep(Duration::from_secs(OFFLINE_WAIT_SECS)).await;
                         continue;
                     }
-                    return offline_unavailable(offline_failures);
+                    return offline_unavailable(tally.offline_failures);
                 }
                 // Past the connect phase: a connection existed and the request may
                 // already be in flight on the wire, so this attempt's outcome upstream
                 // is unknown regardless of whether it now gets retried in place or the
                 // ladder rotates away from it. See `unknown_outcome_transport_failure`.
                 if !err.is_connect() {
-                    unknown_outcome_transport_failure = true;
+                    tally.unknown_outcome_transport_failure = true;
                 }
                 // Classified ONCE per attempt, see `TransportFailureReason`'s own
                 // doc for why a stream reset needs different handling than a
@@ -4977,7 +4861,7 @@ async fn handle_request(
         };
         // This attempt reached an upstream and got an HTTP status back, whatever it
         // was. That fact alone disproves "every account transport-failed".
-        upstream_responses += 1;
+        tally.upstream_responses += 1;
 
         let status = resp.status();
         // One greppable line per upstream response, tagged with the true serving
@@ -5156,7 +5040,7 @@ async fn handle_request(
                         let hold = NO_GUIDANCE_HOLD_SECS
                             + i64::from(now.nanosecond()) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
                         manager.mark_rate_limited(idx, hold);
-                        codex_access_read_failures += 1;
+                        tally.codex_access_read_failures += 1;
                         tried.insert(idx);
                         continue;
                     }
@@ -5169,8 +5053,8 @@ async fn handle_request(
                             .is_some_and(|body| codex_forbidden_is_account_error(&up_headers, body))
                         {
                             manager.mark_refused(idx);
-                            account_access_blocks += 1;
-                            last_account_access_block = body.map(|body| (up_headers, body));
+                            tally.account_access_blocks += 1;
+                            tally.last_account_access_block = body.map(|body| (up_headers, body));
                             tried.insert(idx);
                             continue;
                         }
@@ -5202,7 +5086,7 @@ async fn handle_request(
                 "upstream 403 Forbidden — credential refused, rotating to another account"
             );
             manager.mark_refused(idx);
-            refused_403.push((idx, account_name.clone()));
+            tally.refused_403.push((idx, account_name.clone()));
             tried.insert(idx);
             continue;
         }
@@ -6001,7 +5885,7 @@ async fn handle_request(
                     && let Some(detail) = codex_model_refusal_detail(&bytes)
                 {
                     log_upstream_error_body(idx, account_name.as_deref(), status, &bytes);
-                    model_refusals.push((account_name.clone(), detail));
+                    tally.model_refusals.push((account_name.clone(), detail));
                     tried.insert(idx);
                     continue;
                 }
@@ -6110,36 +5994,35 @@ async fn handle_request(
         );
     }
 
-    if !model_refusals.is_empty() {
-        return codex_model_unavailable_response(
-            &manager,
-            request_model.as_deref(),
-            &model_refusals,
-            &refused_403,
-        );
+    // Ran out of attempts while still rotating: the same verdict the select-found-nothing
+    // arm reads off the tallies, and otherwise an upstream did answer us and the honest
+    // verdict is exhausted quota.
+    let now = OffsetDateTime::now_utc();
+    // The MIRROR of the refusal arm above, and the same fix: a strict ask is
+    // `reserved || !spill`, so this terminal's own scoping has to ask the same
+    // question the picker did.
+    let strict_group = request_group
+        .as_deref()
+        .filter(|g| manager.is_group_strict(g));
+    if let Some(answer) = tally.verdict(
+        &manager,
+        provider,
+        request_model.as_deref(),
+        now,
+        bound_to,
+        strict_group,
+    ) {
+        return answer;
     }
-
-    // Ran out of attempts while still rotating — a bad gateway only if transport
-    // failure was the WHOLE story (same rule as the mid-loop check above);
-    // otherwise an upstream did answer us and the honest verdict is exhausted quota.
-    if every_attempt_transport_failed(transport_failures, upstream_responses) {
-        bad_gateway(transport_failures, unknown_outcome_transport_failure)
-    } else {
-        exhausted_response(
-            &manager,
-            OffsetDateTime::now_utc(),
-            provider_account_count,
-            request_is_fable,
-            provider,
-            // The MIRROR of the refusal arm above, and the same fix: a
-            // strict ask is `reserved || !spill`, so this terminal's own
-            // scoping has to ask the same question the picker did.
-            request_group
-                .as_deref()
-                .filter(|g| manager.is_group_strict(g)),
-            bound_to,
-        )
-    }
+    exhausted_response(
+        &manager,
+        now,
+        provider_account_count,
+        request_is_fable,
+        provider,
+        strict_group,
+        bound_to,
+    )
 }
 
 /// Length-independent comparison of the presented key against the configured
@@ -21722,6 +21605,95 @@ mod tests {
         assert!(
             !every_attempt_transport_failed(0, 0),
             "no attempt made → exhausted, not unreachable"
+        );
+    }
+
+    /// Both terminals (select finding nothing, and the attempt budget running out) read one
+    /// verdict off the tallies. The budget terminal used to answer a transport-only walk with a
+    /// 502 whatever the resolver said, and an all-refused walk with the exhausted 429.
+    #[tokio::test]
+    async fn the_terminal_verdict_reads_every_arm_off_the_tallies() {
+        struct NoRefresh;
+        impl crate::oauth::TokenRefresher for NoRefresh {
+            fn refresh(
+                &self,
+                _provider: crate::provider::Provider,
+                _t: String,
+            ) -> crate::oauth::RefreshFuture {
+                Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+            }
+        }
+        let manager = Manager::new(
+            dummy_config(None, "http://127.0.0.1:9"),
+            Arc::new(NoRefresh),
+            Arc::new(crate::probe::LiveUsageProber::new()),
+            Arc::new(crate::warmer::LiveWarmer::new()),
+            None,
+        );
+        let now = OffsetDateTime::now_utc();
+        // The status and `x-should-retry`, which tell the four shapes apart: the offline 503
+        // carries none, `bad_gateway`'s 503 says `true`, its 502 says `false`, and the
+        // credential-refused 502 carries none.
+        let verdict = |mut tally: Tally| {
+            tally
+                .verdict(&manager, Provider::Anthropic, None, now, None, None)
+                .map(|response| {
+                    let should_retry = response
+                        .headers()
+                        .get("x-should-retry")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    (response.status(), should_retry)
+                })
+        };
+
+        let offline = Tally {
+            transport_failures: 2,
+            offline_failures: 1,
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(offline),
+            Some((StatusCode::SERVICE_UNAVAILABLE, None)),
+            "a resolver failure in a transport-only walk is the offline 503"
+        );
+        let connect_only = Tally {
+            transport_failures: 2,
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(connect_only),
+            Some((StatusCode::SERVICE_UNAVAILABLE, Some("true".into())))
+        );
+        let unknown_outcome = Tally {
+            transport_failures: 1,
+            unknown_outcome_transport_failure: true,
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(unknown_outcome),
+            Some((StatusCode::BAD_GATEWAY, Some("false".into())))
+        );
+        let all_refused = Tally {
+            upstream_responses: 2,
+            refused_403: vec![(0, Some("a".into())), (1, Some("b".into()))],
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(all_refused),
+            Some((StatusCode::BAD_GATEWAY, None)),
+            "every answer a refused 403 is the credential-refused 502"
+        );
+        let answered = Tally {
+            transport_failures: 1,
+            upstream_responses: 2,
+            refused_403: vec![(0, None)],
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(answered),
+            None,
+            "an upstream that answered other than with a refusal leaves the caller's last resort"
         );
     }
 
