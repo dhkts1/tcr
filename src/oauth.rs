@@ -4148,26 +4148,19 @@ mod tests {
     /// with `left: None, right: Some("rt-original")`. Restored, it passes.
     #[tokio::test]
     async fn refresh_access_token_at_preserves_stored_refresh_token_when_response_omits_one() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let endpoint = format!("http://127.0.0.1:{port}/");
-        tokio::spawn(async move {
-            let app = axum::Router::new().route(
-                "/",
-                axum::routing::post(|| async {
-                    // A real rotation response that omits `refresh_token` —
-                    // exactly the shape Anthropic's endpoint sends when it
-                    // does not rotate the refresh token on this call.
-                    axum::Json(serde_json::json!({
-                        "access_token": "at-fresh",
-                        "expires_at": 1_893_456_000_000i64
-                    }))
-                }),
-            );
-            axum::serve(listener, app)
-                .await
-                .log_debug("serving a test server");
-        });
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async {
+                // A real rotation response that omits `refresh_token` —
+                // exactly the shape Anthropic's endpoint sends when it
+                // does not rotate the refresh token on this call.
+                axum::Json(serde_json::json!({
+                    "access_token": "at-fresh",
+                    "expires_at": 1_893_456_000_000i64
+                }))
+            }),
+        );
+        let endpoint = format!("http://{}/", serve_router(app).await);
 
         let client = reqwest::Client::new();
         let tokens = refresh_access_token_at(&client, "rt-original", &endpoint)
@@ -4216,9 +4209,7 @@ mod tests {
                 "/codex",
                 axum::routing::post(recorder("codex", seen.clone())),
             );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let addr = serve_router(app).await;
 
         let mut refresher =
             LiveRefresher::new().with_codex_endpoint(format!("http://{addr}/codex"));
@@ -4903,12 +4894,82 @@ mod tests {
         );
     }
 
+    // --- loopback helpers: the only places this module's tests open a socket -------------
+
+    /// A port nothing listens on, so a connect to it is refused outright. Port 1 (tcpmux) is
+    /// never bound on a dev machine or CI, so no socket is opened to find one; this replaces a
+    /// bind-read-drop of a port-0 listener in each test that wanted a refusal.
+    const DEAD_PORT: u16 = 1;
+
+    /// A listener on an ephemeral loopback port, and that port. The caller hands the listener
+    /// over to whatever serves on it, so no free port is ever found and then re-bound.
+    async fn bind_loopback() -> (TcpListener, u16) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    /// Serve `app` on its own ephemeral loopback port for the rest of the test, and return the
+    /// address. The one `axum::serve` of the per-test stubs below.
+    async fn serve_router(app: axum::Router) -> std::net::SocketAddr {
+        let (listener, port) = bind_loopback().await;
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .log_debug("serving a test server");
+        });
+        std::net::SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// Serve `app` on a loopback port for the life of the test binary, from a thread and runtime
+    /// of its own (each `#[tokio::test]` has a runtime that dies with it, so a server spawned
+    /// from one test would die under the others). For a stub whose answer never varies, one
+    /// listener then does for every test that wants it.
+    fn serve_for_the_binary(app: axum::Router) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = TcpListener::from_std(listener).unwrap();
+                axum::serve(listener, app)
+                    .await
+                    .log_debug("serving a shared test server");
+            });
+        });
+        port
+    }
+
+    /// The port of one shared server whose router has no routes: it answers every path with a
+    /// 404 carrying no `ENDPOINT_HEADER`, the shape of an older tcr.
+    fn empty_router_port() -> u16 {
+        static PORT: std::sync::LazyLock<u16> =
+            std::sync::LazyLock::new(|| serve_for_the_binary(axum::Router::new()));
+        *PORT
+    }
+
+    /// The port of one shared listener that accepts nothing: a connect succeeds off the kernel
+    /// backlog and nothing is ever written back, the wedged shape. Held in a static, so it
+    /// outlives every test and a connect to it never closes under one.
+    fn wedged_port() -> u16 {
+        static WEDGED: std::sync::LazyLock<(std::net::TcpListener, u16)> =
+            std::sync::LazyLock::new(|| {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                (listener, port)
+            });
+        WEDGED.1
+    }
+
     // --- probe_add_capability -----------------------------------------------
 
     #[tokio::test]
     async fn probe_add_capability_reads_a_stamped_400_as_present() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = bind_loopback().await;
         let config: Config =
             serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
         let manager = crate::manager::Manager::with_live_refresher(config.clone(), None);
@@ -4926,13 +4987,7 @@ mod tests {
     /// answering-but-old server whenever pid detection missed it.
     #[tokio::test]
     async fn probe_add_capability_unstamped_404_is_unusable_not_absent() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            axum::serve(listener, axum::Router::new())
-                .await
-                .log_debug("serving a test server");
-        });
+        let port = empty_router_port();
         let config: Config =
             serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
         assert!(matches!(
@@ -4948,10 +5003,7 @@ mod tests {
     /// server.
     #[tokio::test]
     async fn probe_add_capability_connection_refused_is_absent() {
-        let dead_port = {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        let dead_port = DEAD_PORT;
         let config: Config =
             serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {dead_port} }} }}"#)).unwrap();
         assert_eq!(probe_add_capability(&config).await, AddCapability::Absent);
@@ -4963,8 +5015,7 @@ mod tests {
     /// ever written back. Costs the probe's own 5s deadline by construction.
     #[tokio::test]
     async fn probe_add_capability_wedged_port_is_unusable() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let port = wedged_port();
         let config: Config =
             serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
 
@@ -4972,13 +5023,11 @@ mod tests {
             probe_add_capability(&config).await,
             AddCapability::Unusable(_)
         ));
-        drop(listener);
     }
 
     #[tokio::test]
     async fn probe_add_capability_wrong_api_key_is_unauthorized_not_absent() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = bind_loopback().await;
         let server_config: Config = serde_json::from_str(&format!(
             r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#
         ))
@@ -5012,8 +5061,7 @@ mod tests {
     /// `WriteRoute::File` beside a real, answering server.
     #[tokio::test]
     async fn admit_login_proceeds_live_even_when_incumbent_detection_missed_a_real_server() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = bind_loopback().await;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-route-missed-incumbent-{}-{port}.json",
             std::process::id()
@@ -5043,8 +5091,7 @@ mod tests {
     /// skip straight to `File` the way the pre-fix early-return did.
     #[tokio::test]
     async fn admit_login_prefers_live_over_force_when_a_real_server_confirms_the_route() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = bind_loopback().await;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-route-force-live-{}-{port}.json",
             std::process::id()
@@ -5077,8 +5124,7 @@ mod tests {
     /// let it through with no `--force` needed at all.
     #[tokio::test]
     async fn admit_login_refuses_a_wedged_port_even_when_incumbent_detection_missed_it() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let port = wedged_port();
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-route-wedged-{}-{port}.json",
             std::process::id()
@@ -5091,15 +5137,13 @@ mod tests {
         assert!(err.to_string().contains("--force"), "{err}");
 
         std::fs::remove_file(&path).ok();
-        drop(listener);
     }
 
     /// The escape hatch still works past a wedged-port refusal: `--force`
     /// resolves to `File` rather than erroring out.
     #[tokio::test]
     async fn admit_login_force_resolves_to_file_past_a_wedged_port_refusal() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let port = wedged_port();
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-route-wedged-force-{}-{port}.json",
             std::process::id()
@@ -5114,7 +5158,6 @@ mod tests {
         assert_eq!(route, WriteRoute::File);
 
         std::fs::remove_file(&path).ok();
-        drop(listener);
     }
 
     /// A refusal comes back as the error, naming the login that was run, and
@@ -5122,9 +5165,7 @@ mod tests {
     /// `Admitted` is never `Refuse`.
     #[tokio::test]
     async fn admit_login_bails_on_a_refusal_naming_the_command_and_force_admits_the_file() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = DEAD_PORT;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-admit-refusal-{}-{port}.json",
             std::process::id()
@@ -5171,8 +5212,7 @@ mod tests {
     /// under `--force`, and nothing along the way may touch the config file.
     #[tokio::test]
     async fn admit_login_refuses_unauthorized_even_under_force() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = bind_loopback().await;
         let server_config: Config = serde_json::from_str(&format!(
             r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#
         ))
@@ -5596,12 +5636,7 @@ mod tests {
     /// A fleet of one Claude row and one Codex row, `bob@example.com/codex`, whose proxy is on
     /// a port nothing listens on, written to a fresh tempdir.
     async fn claude_and_codex_rows() -> (tempfile::TempDir, std::path::PathBuf) {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = DEAD_PORT;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(
@@ -5882,8 +5917,7 @@ mod tests {
     /// be reverted. It must not be.
     #[tokio::test]
     async fn finish_login_live_path_does_not_clobber_a_concurrent_rotation() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = bind_loopback().await;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-live-clobber-{}-{port}.json",
             std::process::id()
@@ -5974,8 +6008,7 @@ mod tests {
     /// how the two halves end up disagreeing about an account's credentials.
     #[tokio::test]
     async fn finish_login_live_unauthorized_does_not_fall_back_to_file() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = bind_loopback().await;
         let seed = format!(r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#);
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-live-unauthorized-{}-{port}.json",
@@ -6020,10 +6053,7 @@ mod tests {
     /// as the historical file-only path always has.
     #[tokio::test]
     async fn finish_login_no_server_falls_back_to_file_quietly() {
-        let dead_port = {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        let dead_port = DEAD_PORT;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-live-noserver-{}-{dead_port}.json",
             std::process::id()
@@ -6083,8 +6113,7 @@ mod tests {
         // Bound and never accepted: connections queue in the kernel backlog
         // and the connect succeeds, but nothing is ever written back —
         // `post_add_account` times out at its own 5s deadline.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let port = wedged_port();
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-live-timeout-{}-{port}.json",
             std::process::id()
@@ -6149,7 +6178,6 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
-        drop(listener);
     }
 
     /// THE σ5 EXPERIMENT for the `NoServer` arm specifically — same shape as
@@ -6171,10 +6199,7 @@ mod tests {
         // was live a moment ago (mirroring the capability probe having
         // confirmed it), but by the time `finish_login` runs, nothing is
         // listening and a connect is refused outright.
-        let dead_port = {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        let dead_port = DEAD_PORT;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-live-noserver-clobber-{}-{dead_port}.json",
             std::process::id()
@@ -6343,13 +6368,7 @@ mod tests {
     /// rather than `Unusable`.
     #[tokio::test]
     async fn finish_login_no_route_does_not_clobber_other_accounts() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            axum::serve(listener, axum::Router::new())
-                .await
-                .log_debug("serving a test server");
-        });
+        let port = empty_router_port();
 
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-live-noroute-{}-{port}.json",
@@ -6422,10 +6441,7 @@ mod tests {
     /// the file exactly as it always has.
     #[tokio::test]
     async fn finish_login_no_server_creates_the_file_when_none_exists() {
-        let dead_port = {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        let dead_port = DEAD_PORT;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-live-noserver-nofile-{}-{dead_port}.json",
             std::process::id()
@@ -6680,8 +6696,7 @@ mod tests {
     /// A canned upstream that answers every connection with `status_line` and an
     /// empty body, for [`verify_setup_token`]. Returns its base URL.
     async fn canned_upstream(status_line: &'static str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, port) = bind_loopback().await;
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
@@ -6703,7 +6718,7 @@ mod tests {
                 });
             }
         });
-        format!("http://{addr}")
+        format!("http://127.0.0.1:{port}")
     }
 
     /// The bug this guards: a pasted token upstream refuses with 401 must be
@@ -6749,11 +6764,8 @@ mod tests {
     /// stores it with a warning rather than refusing an offline operator.
     #[tokio::test]
     async fn verify_setup_token_reports_dead_upstream_as_unreachable() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
         assert!(matches!(
-            verify_setup_token(&format!("http://{addr}"), "any-token").await,
+            verify_setup_token(&format!("http://127.0.0.1:{DEAD_PORT}"), "any-token").await,
             SetupTokenCheck::Unreachable { .. }
         ));
     }
@@ -7151,8 +7163,7 @@ mod tests {
     #[tokio::test]
     async fn a_codex_import_over_the_live_route_lands_as_codex_beside_the_anthropic_row() {
         use crate::provider::Provider;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = bind_loopback().await;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-codex-live-{}-{port}.json",
             std::process::id()
@@ -7320,13 +7331,7 @@ mod tests {
                 )
             }
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let addr = serve_router(origin).await;
         (format!("http://{addr}"), seen)
     }
 
@@ -7405,14 +7410,7 @@ mod tests {
                 }
             }),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            axum::serve(listener, route)
-                .await
-                .log_debug("serving a test server");
-        });
-        (port, seen)
+        (serve_router(route).await.port(), seen)
     }
 
     /// THE GATE. A live proxy that answers the route but names no providers predates
@@ -7476,8 +7474,7 @@ mod tests {
     #[tokio::test]
     async fn a_codex_import_over_a_proxy_that_names_codex_lands_live_as_codex() {
         use crate::provider::Provider;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = bind_loopback().await;
         let (_dir, path) = import_config(
             port,
             &unconstrained_upstream().await,
@@ -8022,13 +8019,7 @@ mod tests {
                 )
             }
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let addr = serve_router(origin).await;
         (format!("http://{addr}"), seen)
     }
 
@@ -8114,10 +8105,7 @@ mod tests {
     /// profile fetch, so no network.
     #[tokio::test]
     async fn first_run_import_stops_when_another_process_imported_first() {
-        let dead_port = {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        let dead_port = DEAD_PORT;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-import-race-{}-{dead_port}.json",
             std::process::id()

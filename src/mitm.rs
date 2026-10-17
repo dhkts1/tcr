@@ -1979,18 +1979,17 @@ mod tests {
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        // The handshake is rustls against rustls; no TCP is needed to prove it, so the two ends
+        // are an in-memory pipe.
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
         let acceptor = second.acceptor;
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
             acceptor
-                .accept(stream)
+                .accept(server_stream)
                 .await
                 .expect("server-side handshake over the re-minted leaf must succeed")
         });
 
-        let client_stream = TcpStream::connect(addr).await.unwrap();
         let server_name = rustls::pki_types::ServerName::try_from("api.anthropic.com")
             .expect("valid DNS name")
             .to_owned();
@@ -1998,10 +1997,34 @@ mod tests {
             .connect(server_name, client_stream)
             .await
             .expect("a client trusting the persisted CA must accept the re-minted leaf");
-        drop(client_tls);
+        // Unlike a TCP socket, the pipe reports the peer's close at once, so the client end is
+        // held open until the server's side of the handshake has finished writing.
         server.await.expect("server task must complete");
+        drop(client_tls);
 
         std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
+    }
+
+    /// An echo upstream on an ephemeral loopback port: each connection echoes its first read
+    /// (up to 64 bytes) and closes. The one copy for every test that needs a real upstream
+    /// socket, because [`TunnelConnector`] dials a `TcpStream`.
+    async fn spawn_echo_upstream() -> SocketAddr {
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    if let Ok(n) = stream.read(&mut buf).await {
+                        stream
+                            .write_all(&buf[..n])
+                            .await
+                            .log_debug("echoing in a test upstream");
+                    }
+                });
+            }
+        });
+        addr
     }
 
     /// The blind tunnel pipes bytes to the requested upstream and back, and first
@@ -2010,19 +2033,8 @@ mod tests {
     /// refused, which is what Claude Code needs from the forward proxy.
     #[tokio::test]
     async fn tunnel_pipes_bytes_through_to_upstream() {
-        // Upstream: a one-shot echo server.
-        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let echo_port = echo.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            if let Ok((mut s, _)) = echo.accept().await {
-                let mut buf = [0u8; 64];
-                if let Ok(n) = s.read(&mut buf).await {
-                    s.write_all(&buf[..n])
-                        .await
-                        .log_debug("echoing in a test upstream");
-                }
-            }
-        });
+        // Upstream: the shared echo server.
+        let echo_port = spawn_echo_upstream().await.port();
 
         // A front socket standing in for the client<->tcr connection.
         let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2152,18 +2164,7 @@ mod tests {
     #[tokio::test]
     async fn an_unkeyed_connect_is_served_and_counted_and_a_keyed_one_is_not_counted() {
         const KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = upstream.accept().await {
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 64];
-                    if let Ok(n) = stream.read(&mut buf).await {
-                        stream.write_all(&buf[..n]).await.ok();
-                    }
-                });
-            }
-        });
+        let upstream_addr = spawn_echo_upstream().await;
         let connector: TunnelConnector =
             Arc::new(move |_host, _port| Box::pin(TcpStream::connect(upstream_addr)));
 
