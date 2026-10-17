@@ -58,6 +58,8 @@ mod first_run_no_config;
 mod headless_log_file;
 #[path = "../headless_sigterm.rs"]
 mod headless_sigterm;
+#[path = "../import.rs"]
+mod import;
 #[path = "../legacy_config_shapes.rs"]
 mod legacy_config_shapes;
 #[path = "../peer_abuse.rs"]

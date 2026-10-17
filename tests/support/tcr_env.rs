@@ -28,6 +28,8 @@ pub(crate) fn tcr(home: &Path) -> Command {
 /// `TCR_CLAUDE_CODE_CREDENTIALS` names a file that does not exist, because a scratch `HOME` does
 /// not scratch the login Keychain and the first run imports this machine's Claude Code login
 /// when it finds one; an empty value reads as unset and falls through to the Keychain.
+/// `TCR_NO_KEYCHAIN` turns every other Keychain read off too (`tcr import` reads claude-swap's
+/// items from it).
 pub(crate) fn isolate<'a>(command: &'a mut Command, home: &Path) -> &'a mut Command {
     command
         .env_clear()
@@ -38,4 +40,5 @@ pub(crate) fn isolate<'a>(command: &'a mut Command, home: &Path) -> &'a mut Comm
             "TCR_CLAUDE_CODE_CREDENTIALS",
             home.join("no-claude-code-login.json"),
         )
+        .env("TCR_NO_KEYCHAIN", "1")
 }

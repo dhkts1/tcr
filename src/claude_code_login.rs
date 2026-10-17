@@ -114,8 +114,16 @@ pub fn read_claude_code_login() -> anyhow::Result<Option<ClaudeCodeLogin>> {
         return read_file(&path);
     }
     #[cfg(target_os = "macos")]
-    if let Some(json) = read_keychain() {
-        return parse(&json).context("reading the Claude Code login from the login Keychain");
+    match read_keychain_item(KEYCHAIN_SERVICE, None) {
+        Ok(Some(json)) => {
+            return parse(&json).context("reading the Claude Code login from the login Keychain");
+        }
+        Err(KeychainError::TimedOut) => eprintln!(
+            "[tcr] warning: reading the Claude Code login from the Keychain took longer than {}s \
+             (an unanswered authorization dialog?), continuing without it",
+            KEYCHAIN_TIMEOUT.as_secs()
+        ),
+        Ok(None) | Err(KeychainError::Off | KeychainError::Refused) => {}
     }
     match default_file_path() {
         Some(path) => read_file(&path),
@@ -149,36 +157,76 @@ fn read_file(path: &Path) -> anyhow::Result<Option<ClaudeCodeLogin>> {
     }
 }
 
-/// The raw JSON from the login Keychain, or `None` for every way that can not
-/// happen: no such item, the read refused, the binary missing, the ACL dialog
-/// left unanswered past [`KEYCHAIN_TIMEOUT`].
-///
-/// Deliberately returns `Option`, not `Result`: none of those outcomes says
-/// anything is wrong with this machine, and all of them mean the same thing to
-/// the caller — try the file next. A document that IS there and is unparseable
-/// is the failure worth surfacing, and that is [`parse`]'s job, above.
+/// Set to any non-empty value, this turns every login Keychain read in the
+/// process off: [`read_keychain_item`] answers [`KeychainError::Off`] without
+/// spawning `security`. The tests set it on every binary they spawn
+/// (`tests/support/tcr_env.rs`), because a scratch `HOME` does not scratch the
+/// Keychain, and `tcr import` reads claude-swap's items from it.
+pub const NO_KEYCHAIN_ENV: &str = "TCR_NO_KEYCHAIN";
+
+/// Why [`read_keychain_item`] read nothing. An item that is not there is not
+/// one of these: that is `Ok(None)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeychainError {
+    /// [`NO_KEYCHAIN_ENV`] is set.
+    Off,
+    /// `security` could not be run, or exited non-zero for a reason other than
+    /// "no such item" (a denied authorization dialog, a locked Keychain).
+    Refused,
+    /// `security` was still waiting past [`KEYCHAIN_TIMEOUT`], most likely on
+    /// an authorization dialog nobody answered. It was killed.
+    TimedOut,
+}
+
+/// Whether [`NO_KEYCHAIN_ENV`] turns Keychain reads off in this process.
+pub fn keychain_is_off() -> bool {
+    std::env::var_os(NO_KEYCHAIN_ENV).is_some_and(|value| !value.is_empty())
+}
+
+/// `security find-generic-password` exits with this when no item matches.
 #[cfg(target_os = "macos")]
-fn read_keychain() -> Option<String> {
+const SECURITY_NOT_FOUND: i32 = 44;
+
+/// The secret of the login Keychain's generic-password item under `service`
+/// (and `account`, when given), trimmed: `Ok(None)` when there is no such item
+/// or it is empty, `Err` naming why nothing could be read.
+///
+/// Bounded by [`KEYCHAIN_TIMEOUT`]: `security` blocks on a GUI authorization
+/// dialog when this binary is not on the item's access list, and a dialog the
+/// user ignores must not wedge `tcr status` (TcrBar polls it). Prints nothing
+/// and never retries; each caller decides what a failure means to it. The
+/// secret is never logged: `security`'s stderr is discarded, its stdout is
+/// the return value.
+#[cfg(target_os = "macos")]
+pub fn read_keychain_item(
+    service: &str,
+    account: Option<&str>,
+) -> Result<Option<String>, KeychainError> {
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
-    let mut child = Command::new("security")
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
+    if keychain_is_off() {
+        return Err(KeychainError::Off);
+    }
+    let mut command = Command::new("security");
+    command.args(["find-generic-password", "-s", service]);
+    if let Some(account) = account {
+        command.args(["-a", account]);
+    }
+    let mut child = command
+        .arg("-w")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
+        .map_err(|_| KeychainError::Refused)?;
 
     let deadline = Instant::now() + KEYCHAIN_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
-            }
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(status)) if status.code() == Some(SECURITY_NOT_FOUND) => return Ok(None),
+            Ok(Some(_)) | Err(_) => return Err(KeychainError::Refused),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     child
@@ -187,27 +235,32 @@ fn read_keychain() -> Option<String> {
                     child
                         .wait()
                         .log_debug("reaping the timed-out keychain reader");
-                    eprintln!(
-                        "[tcr] warning: reading the Claude Code login from the Keychain took \
-                         longer than {}s (an unanswered authorization dialog?) — continuing \
-                         without it",
-                        KEYCHAIN_TIMEOUT.as_secs()
-                    );
-                    return None;
+                    return Err(KeychainError::TimedOut);
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(_) => return None,
         }
     }
 
-    let output = child.wait_with_output().ok()?;
-    let json = String::from_utf8(output.stdout).ok()?;
-    let json = json.trim().to_string();
-    if json.is_empty() {
-        return None;
+    let output = child
+        .wait_with_output()
+        .map_err(|_| KeychainError::Refused)?;
+    let secret = String::from_utf8(output.stdout).map_err(|_| KeychainError::Refused)?;
+    let secret = secret.trim();
+    Ok((!secret.is_empty()).then(|| secret.to_string()))
+}
+
+/// There is no login Keychain off macOS: every read is "no such item", or
+/// [`KeychainError::Off`] when [`NO_KEYCHAIN_ENV`] says so.
+#[cfg(not(target_os = "macos"))]
+pub fn read_keychain_item(
+    _service: &str,
+    _account: Option<&str>,
+) -> Result<Option<String>, KeychainError> {
+    if keychain_is_off() {
+        return Err(KeychainError::Off);
     }
-    Some(json)
+    Ok(None)
 }
 
 #[cfg(test)]
