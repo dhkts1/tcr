@@ -17,10 +17,8 @@ use std::process::Command;
 /// The port the scratch config names: one the kernel just handed out and
 /// nothing listens on, never the default, so `tcr doctor` below cannot reach
 /// the live proxy and a leaked default would show up as a mismatch.
-static PORT: std::sync::LazyLock<u16> = std::sync::LazyLock::new(|| {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
-    listener.local_addr().expect("local addr").port()
-});
+static PORT: std::sync::LazyLock<u16> =
+    std::sync::LazyLock::new(tcr::test_support::loopback::unused_port);
 
 struct Scratch {
     _dir: tempfile::TempDir,

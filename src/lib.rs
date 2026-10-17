@@ -68,8 +68,8 @@ pub mod setup;
 pub mod singleton;
 pub mod stats;
 pub mod status;
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod tui;
 pub mod update;
 pub mod usage;

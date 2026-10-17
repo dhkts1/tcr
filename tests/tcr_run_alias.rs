@@ -23,10 +23,7 @@ struct Scratch {
 fn scratch() -> Scratch {
     let dir = tempfile::tempdir().expect("scratch HOME");
     let home = dir.path().to_path_buf();
-    let port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
-        listener.local_addr().expect("local addr").port()
-    };
+    let port = tcr::test_support::loopback::unused_port();
     std::fs::create_dir_all(home.join(".config")).expect("config dir");
     std::fs::write(
         home.join(".config/teamclaude.json"),

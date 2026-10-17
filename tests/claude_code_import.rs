@@ -49,17 +49,8 @@ fn config_path_in(home: &Path) -> PathBuf {
     home.join(".config").join("teamclaude.json")
 }
 
-/// A port nothing is listening on: bound to learn the number, then released.
-fn dead_port() -> u16 {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port must work");
-    let port = listener
-        .local_addr()
-        .expect("a bound listener has an address")
-        .port();
-    drop(listener);
-    port
-}
+/// A port nothing is listening on.
+use tcr::test_support::loopback::unused_port as dead_port;
 
 /// A scratch `HOME` holding a zero-account config on a dead port and a fake
 /// Claude Code credentials file. Returns the tempdir and the credentials path.

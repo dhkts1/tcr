@@ -295,6 +295,15 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 # (`tests/peer_props.rs`). Gil approved this as a dev-dependency on
 # 2026-09-18, and no other new dependency.
 proptest = "1"
+# This crate again, with `test-support` on, so the integration tests under `tests/` reach the
+# same `tcr::test_support` (fixtures, stub upstreams, loopback helpers) the unit tests use, rather
+# than a hand copy of it. A path dependency on itself: no package is added.
+tcr = { path = ".", features = ["test-support"] }
+
+[features]
+# Compiles `src/test_support` into the library for the integration tests (see the
+# dev-dependency above). Never on in a release build: nothing outside tests enables it.
+test-support = []
 
 # Incremental compilation is off, and stays off. sccache cannot serve an incremental compile
 # (`sccache --show-stats` lists it under `Non-cacheable reasons: incremental`), so with it on every

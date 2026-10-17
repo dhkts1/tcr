@@ -767,9 +767,7 @@ async fn a_plain_label_and_an_email_label_both_delete() {
 #[tokio::test]
 async fn with_no_server_running_the_file_edit_is_the_delete() {
     let home = tempfile::tempdir().expect("scratch home");
-    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = dead.local_addr().unwrap().port();
-    drop(dead);
+    let port = tcr::test_support::loopback::unused_port();
     let dir = home.path().join(".config");
     std::fs::create_dir_all(&dir).unwrap();
     let config = dir.join("teamclaude.json");

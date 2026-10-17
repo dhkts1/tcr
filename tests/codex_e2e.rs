@@ -186,10 +186,7 @@ async fn spawn_stub(origin: &'static str, ledger: Ledger) -> String {
     let app = Router::new()
         .fallback(any(stub_handler))
         .with_state(Stub { ledger, origin });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    base
+    tcr::test_support::stub_upstream::http(app).url()
 }
 
 /// The two stub origins on one ledger, as `(upstream, codexUpstream, ledger)`.
@@ -200,27 +197,11 @@ async fn spawn_origins() -> (String, String, Ledger) {
     (anthropic, codex, ledger)
 }
 
-/// A port nothing is listening on: bound to learn the number, then released. Copied from
-/// `tests/claude_code_import.rs`: each file under `tests/` is its own crate, so it cannot be
-/// imported.
-fn dead_port() -> u16 {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port must work");
-    let port = listener
-        .local_addr()
-        .expect("a bound listener has an address")
-        .port();
-    drop(listener);
-    port
-}
+use tcr::test_support::loopback::unused_port as dead_port;
 
 /// A client that never sends a loopback request through an ambient proxy.
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .unwrap()
+    tcr::test_support::loopback::client_with_timeout(REQUEST_TIMEOUT)
 }
 
 /// Point a `tcr` child at the scratch `home` and nothing else: see the module doc.
@@ -700,10 +681,7 @@ async fn spawn_weekly_refusing_codex_origin(weekly_reset: u64) -> String {
         )
             .into_response()
     });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    base
+    tcr::test_support::stub_upstream::http(app).url()
 }
 
 /// Both Codex accounts at their weekly limit, through the real binary: `tcr status --json`
