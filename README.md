@@ -239,6 +239,11 @@ whether `codex` is pooled and, if it is not, why. The import and its token-shari
 [`docs/cli.md`](docs/cli.md#--from-codex-importing-the-login-codex-already-has); what tcr does
 with a Codex request is in [`docs/architecture.md`](docs/architecture.md#codex-requests).
 
+**OpenClaw runs on the pool too.** Started with the proxy settings tcr gives its own launches,
+[OpenClaw](https://github.com/openclaw/openclaw) sends its Claude turns through the real `claude`
+binary and its ChatGPT turns through tcr's Codex accounts, with no change to either project. The
+settings and what was tested are in [`docs/openclaw.md`](docs/openclaw.md).
+
 ## Watching it
 
 `apps/macos` holds TcrBar, a native front end over `tcr status --json`; the terminal dashboard
