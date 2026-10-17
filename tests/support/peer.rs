@@ -13,7 +13,7 @@
 //! wherever it is built. Nothing here installs process-wide state: the
 //! captures are layers, and the file that installs one owns that decision.
 
-#![allow(
+#![expect(
     dead_code,
     reason = "each test crate uses a different subset of this module"
 )]

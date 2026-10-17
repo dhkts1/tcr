@@ -3077,7 +3077,6 @@ fn looks_like_email(s: &str) -> bool {
 /// when one was given. Split out so the assertion + write sequence `login()`
 /// runs is directly testable without a real browser or network round trip —
 /// exactly the reason [`finish_login`] itself was split from [`login`].
-#[allow(clippy::too_many_arguments)]
 async fn finish_login_checked(
     config_path: &Path,
     route: WriteRoute,

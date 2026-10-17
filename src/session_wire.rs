@@ -1298,21 +1298,17 @@ pub fn extract_tool_events(messages: &RawValue) -> (Vec<ToolUseEvent>, Vec<ToolR
                 continue;
             };
             match (msg.role.as_str(), b.kind.as_str()) {
-                ("assistant", "tool_use") => {
-                    if let Some(id) = b.id {
-                        tool_uses.push(tool_use_event_from_block(id, b.name, b.input.as_ref()));
-                    }
+                ("assistant", "tool_use") if let Some(id) = b.id => {
+                    tool_uses.push(tool_use_event_from_block(id, b.name, b.input.as_ref()));
                 }
-                ("user", "tool_result") => {
-                    if let Some(id) = b.tool_use_id {
-                        let is_error = b.is_error.unwrap_or(false);
-                        let timed_out = is_error && content_mentions_timeout(&b.content);
-                        tool_results.push(ToolResultEvent {
-                            id,
-                            is_error,
-                            timed_out,
-                        });
-                    }
+                ("user", "tool_result") if let Some(id) = b.tool_use_id => {
+                    let is_error = b.is_error.unwrap_or(false);
+                    let timed_out = is_error && content_mentions_timeout(&b.content);
+                    tool_results.push(ToolResultEvent {
+                        id,
+                        is_error,
+                        timed_out,
+                    });
                 }
                 _ => {}
             }

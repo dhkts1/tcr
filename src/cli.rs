@@ -2498,7 +2498,13 @@ fn format_reset_countdown(reset: OffsetDateTime, now: OffsetDateTime) -> String 
 /// Retained deliberately: the text status line now renders per-window inline
 /// `(+countdown)` tokens instead, but `held_windows` still backs the JSON
 /// `held` array and this suffix stays available for that parity / future reuse.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "kept for the JSON `held` parity described above; only tests call it"
+    )
+)]
 fn held_suffix(a: &AccountSnapshot, threshold: f64, now: OffsetDateTime) -> String {
     let mut s = String::new();
     for h in held_windows(a, threshold) {
@@ -2963,7 +2969,10 @@ fn account_status_rows(
 ///
 /// No Codex key ever reaches an Anthropic row — neither these two nor the
 /// account's own Codex facts — so such a row is the bytes it always was.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the snapshot plus each piece of server state a status row renders"
+)]
 fn account_status_rows_at(
     now: OffsetDateTime,
     snapshot: &StatsSnapshot,
@@ -9011,7 +9020,10 @@ mod tests {
     /// Every field is passed explicitly rather than defaulted, so a new field on
     /// [`AccountSnapshot`] breaks this call site and forces a decision about what
     /// the contract sample should say about it.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a test builder whose arguments are the row's fields"
+    )]
     fn contract_account(
         name: &str,
         priority: i64,

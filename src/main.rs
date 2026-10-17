@@ -232,12 +232,15 @@ struct SetupStatusArgs {
 /// the config file, so every write it makes is an argv built from this surface
 /// and every read is a `--json` sibling document.
 ///
-/// `#[allow(dead_code)]`: the fields below are the surface, and the phase that
+/// `#[expect(dead_code)]`: the fields below are the surface, and the phase that
 /// fills `run_peer`'s bodies is what starts reading them. It deletes this line
 /// on the way past, the suppression is deliberately on the module rather than
 /// on each struct inside it, so there is one thing to delete and one place to
 /// look.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "the CLI surface ahead of the phase that reads it; see above"
+)]
 mod peer_cli {
     use std::path::PathBuf;
 

@@ -42,7 +42,10 @@
 //! against [`tcr::peer::reach::PunchNet`] exactly as it runs against
 //! the kernel.
 
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "the simulator's surface is wider than the one test crate that uses it"
+)]
 
 use std::collections::HashMap;
 use std::io;

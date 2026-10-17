@@ -70,10 +70,8 @@ fn usage_buckets(
             "today" | "lastHour" | "window" | "sevenDayWindow" => {
                 buckets.extend(value.as_object_mut());
             }
-            "todayByModel" => {
-                if let Some(models) = value.as_object_mut() {
-                    buckets.extend(models.values_mut().filter_map(|v| v.as_object_mut()));
-                }
+            "todayByModel" if let Some(models) = value.as_object_mut() => {
+                buckets.extend(models.values_mut().filter_map(|v| v.as_object_mut()));
             }
             _ => {}
         }

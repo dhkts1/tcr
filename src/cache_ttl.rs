@@ -66,7 +66,7 @@ enum TextOrBlocks {
     // The string itself is never read — its only job is to consume the
     // `Text` shape so it does not fall through to `Blocks` and expose
     // whatever `cache_control`-shaped substring it might quote.
-    Text(#[allow(dead_code)] String),
+    Text(#[expect(dead_code, reason = "consumed so it cannot match `Blocks`, never read")] String),
     Blocks(Vec<ContentBlock>),
 }
 
