@@ -5243,10 +5243,27 @@ async fn handle_request(
             );
         }
 
-        let is_stream = up_headers
+        let declared_stream = up_headers
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.contains("text/event-stream"));
+        // The header is not the whole answer: a 2xx SSE body under any other Content-Type was
+        // buffered and parsed as JSON, so its tokens never reached the ledger. Such a body's
+        // first bytes decide, and the chunks read to decide go back in front of the rest.
+        let mut upstream_body = resp.bytes_stream();
+        let (is_stream, sniffed) = if declared_stream || !status.is_success() {
+            (declared_stream, Vec::new())
+        } else {
+            sniff_sse(&mut upstream_body).await
+        };
+        if is_stream && !declared_stream {
+            tracing::debug!(
+                account_index = idx,
+                content_type = ?up_headers.get(CONTENT_TYPE),
+                "a 2xx body not labelled text/event-stream opens as SSE; reading it as a stream"
+            );
+        }
+        let upstream_body = futures::stream::iter(sniffed).chain(upstream_body);
 
         if is_stream {
             // Tee: the passthrough to the client is NEVER gated on the parser.
@@ -5466,7 +5483,7 @@ async fn handle_request(
                 timing: StreamTiming,
             }
             let state = TeeState {
-                inner: resp.bytes_stream(),
+                inner: upstream_body,
                 tx,
                 evidence_dropped,
                 ended: Some(ended_tx),
@@ -5563,7 +5580,7 @@ async fn handle_request(
         // Non-stream body: buffer it (capped like the request path — an unbounded
         // `resp.bytes().await` is the same DoS surface `MAX_BODY_BYTES` guards on
         // the way in), parse usage from the JSON, forward it.
-        let bytes = match read_capped_body(resp.bytes_stream(), MAX_BODY_BYTES).await {
+        let bytes = match read_capped_body(upstream_body, MAX_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(BodyReadError::Transport) => {
                 return ClientError::new(
@@ -5730,6 +5747,54 @@ where
         collected.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(collected))
+}
+
+/// The most of a 2xx body [`sniff_sse`] holds before it gives up and calls it not a stream.
+const SSE_SNIFF_CAP: usize = 4096;
+
+/// Whether a body's first bytes are a Server-Sent Events stream: `Some(true)` when its first
+/// non-blank line opens with an SSE field (`event:`, `data:`, `id:`, `retry:`) or a `:`
+/// comment, `Some(false)` when it cannot, and `None` while too few bytes have arrived to say.
+fn sse_verdict(head: &[u8]) -> Option<bool> {
+    const FIELDS: [&[u8]; 5] = [b":", b"data:", b"event:", b"id:", b"retry:"];
+    let start = head.iter().position(|b| !b.is_ascii_whitespace())?;
+    let rest = &head[start..];
+    if FIELDS.iter().any(|field| rest.starts_with(field)) {
+        Some(true)
+    } else if FIELDS.iter().any(|field| field.starts_with(rest)) {
+        // A field name still arriving across chunks: `ev` of `event:`.
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// Read a 2xx body's first chunks until [`sse_verdict`] can say whether it is an SSE stream,
+/// for a response whose `Content-Type` did not say `text/event-stream`. Codex streams arrive
+/// that way: a 127 KB Codex turn went down the buffered arm, failed its JSON parse at the first
+/// byte and was booked with no tokens (2026-10-17). Returns the verdict and the chunks read,
+/// errors included, so the caller replays them ahead of the rest of the body.
+async fn sniff_sse<S, E>(stream: &mut S) -> (bool, Vec<Result<Bytes, E>>)
+where
+    S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    let mut read = Vec::new();
+    let mut head: Vec<u8> = Vec::new();
+    while head.len() < SSE_SNIFF_CAP {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let Ok(bytes) = &chunk else {
+            read.push(chunk);
+            break;
+        };
+        head.extend_from_slice(bytes);
+        read.push(chunk);
+        if let Some(verdict) = sse_verdict(&head) {
+            return (verdict, read);
+        }
+    }
+    (false, read)
 }
 
 /// Log a non-2xx upstream RESPONSE body: `error.type` and `error.message` pulled
@@ -10557,6 +10622,35 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// **A body's first bytes say whether it is SSE**, across a field name split between
+    /// chunks, and every chunk read to decide is handed back in order.
+    #[tokio::test]
+    async fn sniff_sse_reads_the_first_non_blank_line() {
+        assert_eq!(sse_verdict(b"event: response.created\n"), Some(true));
+        assert_eq!(sse_verdict(b"\n\ndata: {}\n"), Some(true));
+        assert_eq!(sse_verdict(b": keep-alive\n"), Some(true));
+        assert_eq!(sse_verdict(b"{\"usage\":{}}"), Some(false));
+        assert_eq!(sse_verdict(b"  [1]"), Some(false));
+        assert_eq!(sse_verdict(b"eve"), None, "half a field name");
+        assert_eq!(sse_verdict(b" \n"), None, "nothing but blanks yet");
+
+        let chunks = ["ev", "ent: response.created\n", "data: {}\n\n", "tail"];
+        let mut body = futures::stream::iter(
+            chunks.map(|c| Ok::<_, Infallible>(Bytes::from_static(c.as_bytes()))),
+        );
+        let (is_sse, read) = sniff_sse(&mut body).await;
+        assert!(is_sse);
+        let read: Vec<Bytes> = read.into_iter().map(Result::unwrap).collect();
+        assert_eq!(read, [&b"ev"[..], &b"ent: response.created\n"[..]]);
+        let rest: Vec<Bytes> = body.map(Result::unwrap).collect().await;
+        assert_eq!(rest, [&b"data: {}\n\n"[..], &b"tail"[..]]);
+
+        let mut json = futures::stream::iter([Ok::<_, Infallible>(Bytes::from_static(b"{}"))]);
+        assert!(!sniff_sse(&mut json).await.0);
+        let mut empty = futures::stream::iter(Vec::<Result<Bytes, Infallible>>::new());
+        assert_eq!(sniff_sse(&mut empty).await, (false, Vec::new()));
     }
 
     // The three non-streamed readers as they shipped before the one-parse change, each parsing
@@ -22230,6 +22324,71 @@ mod tests {
             "bob's Codex turn (polls: {polls})"
         );
         assert_eq!(last_hour(0).reasoning_tokens, 0, "alice's Anthropic turn");
+    }
+
+    /// **A Codex turn streamed under some other Content-Type still reaches the ledger.** The
+    /// stream arm used to be chosen by the `Content-Type` header alone, so an SSE body labelled
+    /// anything but `text/event-stream` was buffered and read as JSON, failed at its first byte,
+    /// and booked the request with zero tokens (seen live on 2026-10-17: a 127 KB Codex body,
+    /// `expected value at line 1 column 1`). The body's first bytes decide now.
+    #[tokio::test]
+    async fn a_codex_stream_under_another_content_type_is_still_counted() {
+        for content_type in [
+            "application/json",
+            "text/plain; charset=utf-8",
+            "application/octet-stream",
+        ] {
+            let codex_url = spawn_fixed_origin(
+                content_type,
+                concat!(
+                    "event: response.created\n",
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-6-astra\"}}\n\n",
+                    "event: response.completed\n",
+                    r#"data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-6-astra","usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":100},"output_tokens":40,"output_tokens_details":{"reasoning_tokens":10}}}}"#,
+                    "\n\n",
+                ),
+            )
+            .await;
+            let anthropic_url = spawn_fixed_origin("application/json", "{}").await;
+            let manager =
+                Manager::with_live_refresher(codex_fleet(&anthropic_url, &codex_url), None);
+            let (status, bytes) = drive(
+                Arc::clone(&manager),
+                Method::POST,
+                crate::provider::CODEX_RESPONSES_PATH,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own"),
+                    ("content-type", "application/json"),
+                ],
+                r#"{"input":[]}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{content_type}");
+            assert!(
+                bytes.starts_with(b"event: response.created\n"),
+                "{content_type}: the client gets the stream byte for byte"
+            );
+            // Booked by the tee's detached task, which can finish after the client reads EOF.
+            let last_hour = || {
+                manager.snapshot(OffsetDateTime::now_utc()).accounts[1]
+                    .usage
+                    .as_ref()
+                    .map(|usage| usage.last_hour)
+                    .unwrap_or_default()
+            };
+            let mut polls = 0u32;
+            while last_hour().output_tokens == 0 && polls < 200 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                polls += 1;
+            }
+            let row = last_hour();
+            assert_eq!(
+                (row.output_tokens, row.reasoning_tokens),
+                (40, 10),
+                "{content_type}: the turn's tokens (polls: {polls})"
+            );
+        }
     }
 
     /// **A non-streamed Codex turn is booked with Codex's own field names.** Its body is a bare
