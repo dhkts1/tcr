@@ -211,6 +211,11 @@ tags alone and can never be reached from a pull request.
 `--locked` everywhere is deliberate: CI must fail rather than silently rewrite `Cargo.lock`, because
 this is an auth-handling proxy and the reviewed dependency set is the one that should ship.
 
+The `ci` job's clippy runs on Linux, and clippy on a Mac never sees the Linux side of a
+`#[cfg(target_os = "macos")]` block: an import only macOS code uses passes locally and fails there.
+Before pushing a change that touches such code or its imports, run `scripts/linux-clippy.sh`, which
+runs the same clippy command in a Docker container on the pinned toolchain and prints every hit.
+
 Before opening a PR, read your own `git diff origin/main..HEAD`. Catch the obvious before a reviewer
 or a bot does.
 
