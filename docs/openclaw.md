@@ -57,6 +57,17 @@ Each variable does one job:
 
 The port is 3456, tcr's default, and the CA is the one tcr keeps at `~/.config/tcr-ca.pem`.
 
+## As an OpenClaw skill
+
+[`integrations/openclaw/tcr`](../integrations/openclaw/tcr/SKILL.md) packages the steps above as
+an OpenClaw skill. It has two scripts:
+
+- `scripts/openclaw-on-tcr` sets the four variables and runs `openclaw` with your arguments, for
+  example `openclaw-on-tcr gateway run`. It refuses to start when tcr is missing, not running, or
+  has no CA yet.
+- `scripts/check` sends one Claude turn and one ChatGPT turn through the running Gateway. It then
+  confirms in tcr's own records that tcr served both, and exits non-zero when it did not.
+
 ## What the test showed
 
 One Gateway process ran three Claude turns and three ChatGPT turns, alternating:
