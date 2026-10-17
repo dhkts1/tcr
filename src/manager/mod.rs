@@ -1882,11 +1882,7 @@ impl Manager {
     /// Hard state of account `idx` — lets the proxy skip an account that a
     /// refresh just proved dead (`Error`) without wasting an upstream round-trip.
     pub fn account_status(&self, idx: usize) -> Option<AccountStatus> {
-        self.accounts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(idx)
-            .map(|a| a.status)
+        self.account(idx, |a| a.status)
     }
 
     /// A `retry-after` hint (seconds) for a synthetic 429 when every account is
@@ -3192,11 +3188,7 @@ impl Manager {
     /// indexing avoids a panic either way).
     pub fn control_name(&self) -> Option<String> {
         let idx = self.control()?;
-        self.accounts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(idx)
-            .map(|a| a.name.clone())
+        self.account(idx, |a| a.name.clone())
     }
 
     /// Whether the control account also takes general inference traffic — the
@@ -3217,14 +3209,10 @@ impl Manager {
     /// and `accountUuid`. `None` when no control account is set.
     pub fn control_identity_target(&self) -> Option<crate::control_identity::ControlIdentity> {
         let idx = self.control()?;
-        self.accounts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(idx)
-            .map(|a| crate::control_identity::ControlIdentity {
-                name: a.name.clone(),
-                account_uuid: a.account_uuid.clone(),
-            })
+        self.account(idx, |a| crate::control_identity::ControlIdentity {
+            name: a.name.clone(),
+            account_uuid: a.account_uuid.clone(),
+        })
     }
 
     /// The resolved-client-identity cache the check reads and fills.
@@ -3240,12 +3228,8 @@ impl Manager {
     /// outside the process, the same reasoning as `http1_only` on that line.
     pub fn locked_account_name(&self) -> Option<String> {
         let idx = self.locked_idx?;
-        self.accounts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(idx)
-            .filter(|a| !a.removed)
-            .map(|a| a.name.clone())
+        self.account(idx, |a| (!a.removed).then(|| a.name.clone()))
+            .flatten()
     }
 
     /// Whether per-account request pacing does anything (see
@@ -3353,22 +3337,18 @@ impl Manager {
     /// `accounts`/`config`).
     fn set_control(&self, idx: Option<usize>) -> ControlPersist {
         let target = idx.and_then(|i| {
-            self.accounts
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(i)
-                .map(|a| {
-                    // Carries the account's provider for the reason
-                    // `set_disabled`'s probe does: `save_control_account`
-                    // checks the row through `config::locate_account_entry`.
-                    crate::identity::probe(
-                        a.provider,
-                        &a.name,
-                        a.account_uuid.clone(),
-                        a.org_uuid.clone(),
-                        a.org_name.clone(),
-                    )
-                })
+            self.account(i, |a| {
+                // Carries the account's provider for the reason
+                // `set_disabled`'s probe does: `save_control_account`
+                // checks the row through `config::locate_account_entry`.
+                crate::identity::probe(
+                    a.provider,
+                    &a.name,
+                    a.account_uuid.clone(),
+                    a.org_uuid.clone(),
+                    a.org_name.clone(),
+                )
+            })
         });
         {
             let mut control = self
