@@ -139,9 +139,8 @@ final class CommandProseTests: XCTestCase {
             CodexBanner.noRequests(processes: 2, bundledTcrWithoutCLI: bundledTcr).text,
             CodexSignInCopy.savedDetail(plan: "ChatGPT Pro", bundledTcrWithoutCLI: bundledTcr),
             AccountExit.codexStrictStatement(name: "bob@example.com/codex"),
-            "Codex is not pooled: the proxy on :3456 is serving the JS teamclaude leaf, which "
-                + "covers api.anthropic.com only and is never re-minted — a restart will not "
-                + "change this; see docs/troubleshooting.md",
+            "Codex is not pooled: the proxy on :3456 does not route codex traffic and a "
+                + "restart will not change this; see docs/troubleshooting.md",
             "could not find the codex CLI (searched TCR_CODEX_BIN, CODEX_BIN, PATH, "
                 + "/Users/example/.local/bin, /Users/example/.cargo/bin, /opt/homebrew/bin, "
                 + "/usr/local/bin, /Users/example/.npm-global/bin). Install it, or set "

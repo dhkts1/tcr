@@ -25,7 +25,7 @@ never reads `~/.config/tcr.json`, never handles a token and never sends an
 already holding it, costing every live session a full cold prompt-cache prefix.
 That is the worst case, not the rule, and this file used to state it as the rule.
 Session affinity persists the session→account pins to
-`~/.cache/teamclaude/session-affinity.json` — flushed every 5s while the map is
+`~/.cache/tcr/session-affinity.json` — flushed every 5s while the map is
 dirty (`src/server.rs:674-690`) and restored at boot (`src/server.rs:643`) — so a
 takeover *inside* the pin TTL (`affinity::PIN_TTL_MS`, 15 minutes,
 `src/affinity.rs:71`) keeps most sessions warm, while one after it restores
@@ -57,9 +57,7 @@ an incumbent holds the port is reported as "already running", which is a success
 
 Each row has an Enable/Disable button. It shells out to `tcr enable <name>` /
 `tcr disable <name>` and nothing else — TcrBar never writes
-`~/.config/tcr.json`, because that file holds credentials and `tcr` owns it. The one file
-operation it starts is `tcr migrate --json`, at launch before its server starts and only while
-old names are still there, which moves an older install's `teamclaude` config and cache to the `tcr` names.
+`~/.config/tcr.json`, because that file holds credentials and `tcr` owns it.
 
 `tcr`'s account query is an *exact* match — the configured name, else the email
 parsed out of it — and it is case-sensitive and untrimmed. It is not a substring

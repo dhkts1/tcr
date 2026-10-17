@@ -88,14 +88,14 @@ final class WhatsNewTests: XCTestCase {
     /// The literal `build-tcrbar.sh` writes into `SUFeedURL`.
     func testFeedLocationParsesTheShippedFeedURL() {
         let loc = ReleaseFeedLocation.parse(
-            feedURL: "https://github.com/dhkts1/teamclaude-rs/releases/latest/download/appcast.xml")
-        XCTAssertEqual(loc, ReleaseFeedLocation(owner: "dhkts1", repo: "teamclaude-rs"))
+            feedURL: "https://github.com/dhkts1/tcr/releases/latest/download/appcast.xml")
+        XCTAssertEqual(loc, ReleaseFeedLocation(owner: "dhkts1", repo: "tcr"))
         XCTAssertEqual(
             loc?.releaseAPIURL(tag: "v0.2.34")?.absoluteString,
-            "https://api.github.com/repos/dhkts1/teamclaude-rs/releases/tags/v0.2.34")
+            "https://api.github.com/repos/dhkts1/tcr/releases/tags/v0.2.34")
         XCTAssertEqual(
             loc?.releasePageURL(tag: "v0.2.34")?.absoluteString,
-            "https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.34")
+            "https://github.com/dhkts1/tcr/releases/tag/v0.2.34")
     }
 
     func testFeedLocationRejectsOtherHostsAndJunk() {
@@ -115,7 +115,7 @@ final class WhatsNewTests: XCTestCase {
 
         A closing line.
 
-        ## Install teamclaude-rs 0.2.34
+        ## Install tcr 0.2.34
 
         curl something
         """
@@ -124,7 +124,7 @@ final class WhatsNewTests: XCTestCase {
         let section = WhatsNewMarkdown.section("What's new", in: body)
         XCTAssertTrue(section.contains("Copy Access Token"))
         XCTAssertTrue(section.contains("A closing line."))
-        XCTAssertFalse(section.contains("Install teamclaude-rs"))
+        XCTAssertFalse(section.contains("Install tcr"))
         XCTAssertFalse(section.contains("curl something"))
     }
 
@@ -143,7 +143,7 @@ final class WhatsNewTests: XCTestCase {
                 .bullet("`tcr login --token` checks the token first (#186)."),
                 .bullet("Right-click → **Copy Access Token** (#186)."),
                 .paragraph("A closing line."),
-                .heading("Install teamclaude-rs 0.2.34"),
+                .heading("Install tcr 0.2.34"),
                 .paragraph("curl something"),
             ])
     }

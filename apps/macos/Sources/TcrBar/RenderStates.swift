@@ -307,14 +307,14 @@ enum RenderStates {
             // The empty fleet on a Mac holding a codex login: one more line under its detail.
             // See ``codexSeeds(for:)``.
             ("07b-empty-fleet-codex-login", .loaded(fleet("[]")), false, nil),
-            // A proxy serving the JS leaf, which cannot pool codex: the Codex line says why.
+            // A proxy that cannot pool codex: the Codex line says why.
             (
                 "26-codex-not-pooled-banner",
                 .loaded(
                     fleet(
                         codexRows(
                             [.bob, .dana],
-                            extra: ["codexRoute": jsLeafRoute, "codexTraffic": quietCodexTraffic]))),
+                            extra: ["codexRoute": unpooledRoute, "codexTraffic": quietCodexTraffic]))),
                 false, nil
             ),
             // The canonical refusals, while this Mac shares its accounts with trusted Macs.
@@ -334,7 +334,7 @@ enum RenderStates {
             // A route that is not pooled and refusals at once: only the route's line shows.
             (
                 "26f-codex-banner-precedence",
-                .loaded(fleet(codexRows([.bob, .dana], extra: ["codexRoute": jsLeafRoute]))),
+                .loaded(fleet(codexRows([.bob, .dana], extra: ["codexRoute": unpooledRoute]))),
                 false, nil
             ),
             // 26d with no command-line tcr on this Mac: the line names the tcr inside TcrBar.
@@ -349,7 +349,7 @@ enum RenderStates {
                 .commandFailed(
                     exitCode: 1,
                     message:
-                        "error: could not read /Users/example/.config/teamclaude.json: account "
+                        "error: could not read /Users/example/.config/tcr.json: account "
                         + "\"bob@example.com/codex\" carries credentialVersion 2, which this build "
                         + "only understands up to 1; refusing to load rather than silently "
                         + "reinterpret its credential shape"),
@@ -362,7 +362,7 @@ enum RenderStates {
             // group, kept under her line.
             ("25f-codex-group-add-warning", .loaded(fleet(codexGroupAddWarningJSON)), false, nil),
             // The Sessions tab of a fleet holding both providers: alice's Claude
-            // session and bob's Codex one, both in teamclaude-rs, bob's joined by
+            // session and bob's Codex one, both in tcr, bob's joined by
             // the first line of his rollout file. It shows the mixed fleet's
             // footer, the `Codex` lead on bob's subtitle and the summary's two
             // clause groups.
@@ -549,7 +549,7 @@ enum RenderStates {
         case "21b-update-failed":
             return .failed(
                 "the proxy on :3456 rejected the api-key in "
-                    + "~/.config/teamclaude.json while checking the feed")
+                    + "~/.config/tcr.json while checking the feed")
         default: return nil
         }
     }
@@ -593,7 +593,7 @@ enum RenderStates {
                 .failed(
                     reason:
                         "the proxy on :3456 rejected the api-key in "
-                        + "~/.config/teamclaude.json while checking whether it could take a "
+                        + "~/.config/tcr.json while checking whether it could take a "
                         + "live login — no browser was opened and nothing was changed."),
                 nil
             ),
@@ -817,10 +817,10 @@ enum RenderStates {
         // no Codex session to join.
         let alice = SessionFile(
             sessionId: "a1f3c2d4-0000-4000-8000-000000000001",
-            cwd: "/Users/example/git/teamclaude-rs", name: "teamclaude-rs-c7", status: "busy")
+            cwd: "/Users/example/git/tcr", name: "tcr-c7", status: "busy")
         let bob = SessionFile(
             sessionId: "019a3c5e-0000-7000-8000-000000000002",
-            cwd: "/Users/example/git/teamclaude-rs")
+            cwd: "/Users/example/git/tcr")
         switch sceneName {
         case "16b-sessions-tab-mixed", "17c-tools-tab-codex":
             return [alice.sessionId: alice, bob.sessionId: bob]
@@ -835,7 +835,7 @@ enum RenderStates {
         return [
             "aaaaaaaa-1111-2222-3333-444444444444": SessionFile(
                 sessionId: "aaaaaaaa-1111-2222-3333-444444444444",
-                cwd: "/Users/alice/git/teamclaude-rs", name: "teamclaude-rs-c7",
+                cwd: "/Users/alice/git/tcr", name: "tcr-c7",
                 status: "busy"),
             "bbbbbbbb-1111-2222-3333-444444444444": SessionFile(
                 sessionId: "bbbbbbbb-1111-2222-3333-444444444444",
@@ -3719,7 +3719,7 @@ enum RenderStates {
     /// only ``initialTab(for:)`` decides which tab opens.
     ///
     /// The mockup's own five sessions (`docs/design/panel-tabs-mockup.html`'s
-    /// Sessions panel), verbatim: `teamclaude-rs-c7` (busy, two running
+    /// Sessions panel), verbatim: `tcr-c7` (busy, two running
     /// tools — a Bash call and the Agent call that is 20s from the 600s
     /// timeout) and `orchard-c2` (waiting 12m) under `henry10@example.com`;
     /// `m-075377` (idle 40m) rounds out that account's three; `toolkit-c1`
@@ -3858,7 +3858,7 @@ enum RenderStates {
                             // the label cannot fit beside the pill, and every
                             // earlier fixture command fitted.
                             commandHead:
-                                "cd ~/src/example && ./scripts/cargo-q.sh test -p teamclaude "
+                                "cd ~/src/example && ./scripts/cargo-q.sh test -p tcr "
                                 + "--all-features 2>&1 | tee test.log",
                             endedMs: msAgo(48 * 60), seconds: 343.0),
                     ],
@@ -4766,12 +4766,11 @@ extension RenderStates {
         return "[\(rows.map { codexRow($0, now: now, extra: extra) }.joined(separator: ","))]"
     }
 
-    /// The route of a proxy serving the JS teamclaude leaf, which cannot pool codex, in the
-    /// words `tcr status --json` gives it.
-    private static let jsLeafRoute: [String: Any] = [
-        "pooled": false, "code": "js-leaf",
+    /// The route of a proxy that cannot pool codex, in the words `tcr status --json` gives it.
+    private static let unpooledRoute: [String: Any] = [
+        "pooled": false, "code": "not-pooled",
         "reason":
-            "the proxy on :3456 is serving the JS teamclaude leaf, which covers api.anthropic.com only and is never re-minted — a restart will not change this; see docs/troubleshooting.md",
+            "the proxy on :3456 does not route codex traffic and a restart will not change this; see docs/troubleshooting.md",
     ]
 
     /// Scenes `26d`, `26e` and `26g`: bob and dana at zero requests, with quiet traffic.
@@ -4973,10 +4972,10 @@ extension RenderStates {
                  {"commandClass": "git-local", "commandHead": "git status",
                   "endedMs": \(ago(125)), "seconds": 1.5, "tool": "Bash"},
                  {"commandClass": null,
-                  "commandHead": "Read /Users/example/git/teamclaude-rs/src/session_wire.rs",
+                  "commandHead": "Read /Users/example/git/tcr/src/session_wire.rs",
                   "endedMs": \(ago(280)), "seconds": 0.4, "tool": "Read"},
                  {"commandClass": null,
-                  "commandHead": "Read /Users/example/git/teamclaude-rs/src/proxy.rs",
+                  "commandHead": "Read /Users/example/git/tcr/src/proxy.rs",
                   "endedMs": \(ago(350)), "seconds": 0.1, "tool": "Read"}],
                "subagentsRunning": 0, "timedOut": [], "timeouts": 0, "timeoutsByClass": {}}}
             """

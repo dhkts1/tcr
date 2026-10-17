@@ -305,7 +305,7 @@ final class FleetStatusTests: XCTestCase {
     //
     // `Fleet.decode` decodes ONLY the bare account array `tcr status
     // --json` sends — confirmed against the merged F1 work
-    // (`teamclaude-rs#232`, `crates/tcr-status-wire/src/lib.rs`): the wire's
+    // (`tcr#232`, `crates/tcr-status-wire/src/lib.rs`): the wire's
     // `SessionRow`/`StatusPayload.sessions` live on the proxy's own
     // `/_tcr/status` HTTP response, gated by the proxy's api-key
     // (`fetch_live_status`, `src/cli.rs`), and `tcr status --json` discards

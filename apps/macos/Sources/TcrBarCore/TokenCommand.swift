@@ -3,7 +3,7 @@ import Foundation
 /// Reading one account's access token for the row's "Copy Access Token"
 /// action — `tcr token <query>` (`src/cli.rs`'s
 /// `print_access_token`). A subprocess, like every other credential touch in
-/// this app: `~/.config/teamclaude.json` holds live OAuth tokens and this app
+/// this app: `~/.config/tcr.json` holds live OAuth tokens and this app
 /// never opens it directly.
 ///
 /// The token is the whole of stdout, one line. It is a secret: the caller
