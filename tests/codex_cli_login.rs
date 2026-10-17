@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tcr::log_err::LogErr as _;
+use tcr::test_support::child::KillOnDrop;
 
 /// `{"alg":"none","typ":"JWT"}`.
 const JWT_HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
@@ -882,7 +883,7 @@ fn login_codex_stops_codex_and_removes_its_folder_when_cancelled() {
         if group {
             std::os::unix::process::CommandExt::process_group(&mut command, 0);
         }
-        let mut child = command.spawn().expect("spawning the built tcr binary");
+        let mut child = KillOnDrop::spawn(&mut command).expect("spawning the built tcr binary");
         let tcr = child.id();
         let stdout = child.stdout.take().expect("piped stdout");
         let (lines, received) = std::sync::mpsc::channel::<String>();
@@ -997,14 +998,15 @@ fn cancelling_codex_login_reports_a_throwaway_folder_it_could_not_delete() {
     );
     let error_log = scratch.path("cancel.stderr");
     let event_log = scratch.path("cancel.stdout");
-    let mut child = scratch
-        .tcr()
-        .args(["login", "--codex", "--non-interactive", "--config"])
-        .arg(&scratch.config)
-        .stdout(std::fs::File::create(&event_log).unwrap())
-        .stderr(std::fs::File::create(&error_log).unwrap())
-        .spawn()
-        .unwrap();
+    let mut child = KillOnDrop::spawn(
+        scratch
+            .tcr()
+            .args(["login", "--codex", "--non-interactive", "--config"])
+            .arg(&scratch.config)
+            .stdout(std::fs::File::create(&event_log).unwrap())
+            .stderr(std::fs::File::create(&error_log).unwrap()),
+    )
+    .unwrap();
     let mut cleanup = TestProcessCleanup::new(child.id());
     // Allow both freshly built tcr and the fresh shell fixture to finish loader startup.
     let ready = within(Duration::from_secs(20), || {

@@ -21,6 +21,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use tcr::log_err::LogErr as _;
+use tcr::test_support::child::KillOnDrop;
 
 use tcr::{legacy_names, paths, singleton::owner_path_in};
 
@@ -57,13 +58,14 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Boot, wait for the listening line, stop, and return the port it bound.
 fn boot_and_stop(home: &Path) -> u16 {
-    let mut child = crate::tcr_env::tcr(home)
-        .args(["server", "--headless", "--port", "0"])
-        .env("CODEX_HOME", home.join(".codex"))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
+    let mut child = KillOnDrop::spawn(
+        crate::tcr_env::tcr(home)
+            .args(["server", "--headless", "--port", "0"])
+            .env("CODEX_HOME", home.join(".codex"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
 
     let stdout = child.stdout.take().expect("stdout was piped");
     let (tx, rx) = mpsc::channel();

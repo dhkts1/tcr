@@ -8,6 +8,7 @@
 //!   added here once instead of in every literal.
 //! - [`stub_upstream`]: fake upstreams served from two shared loopback listeners per binary.
 //! - [`loopback`]: a client that never goes through an ambient proxy, and a port nothing holds.
+//! - [`child`]: a spawned `tcr` killed when its test ends, even if the test binary is killed.
 
 // `clippy.toml`'s test exemption reaches only a `#[cfg(test)]` module, and this one is also
 // compiled under the feature; a helper that cannot do its job fails the test that called it,
@@ -17,6 +18,7 @@
     reason = "a test helper fails the calling test with a message; the ban is for production code"
 )]
 
+pub mod child;
 pub mod loopback;
 pub mod stub_upstream;
 

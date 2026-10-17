@@ -22,6 +22,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tcr::log_err::LogErr as _;
+use tcr::test_support::child::KillOnDrop;
 
 use tcr::paths;
 
@@ -59,13 +60,14 @@ fn listening_port(text: &str) -> Option<u16> {
 #[test]
 fn the_log_file_holds_the_boot_and_the_last_shutdown_line_with_stdout_on_the_null_device() {
     let home = tempfile::tempdir().expect("a scratch HOME");
-    let mut child = crate::tcr_env::tcr(home.path())
-        .args(["--headless", "--port", "0", "--no-replace"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
+    let mut child = KillOnDrop::spawn(
+        crate::tcr_env::tcr(home.path())
+            .args(["--headless", "--port", "0", "--no-replace"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
 
     let deadline = Instant::now() + BOOT_TIMEOUT;
     let port = loop {

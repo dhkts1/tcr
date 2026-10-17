@@ -30,10 +30,11 @@
 //! since their offline probe goes to the loopback `codexUpstream`. The server's stdout and stderr
 //! go to a log in the scratch HOME, printed when a test fails.
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tcr::log_err::LogErr as _;
+use tcr::test_support::child::KillOnDrop;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -216,7 +217,7 @@ fn scratch_tcr(home: &Path) -> Command {
 /// A running `tcr server` on its own scratch HOME. Dropping it kills the process, prints its log
 /// if the test is failing, and removes the HOME.
 struct Server {
-    child: Child,
+    child: KillOnDrop,
     port: u16,
     home: tempfile::TempDir,
     config: PathBuf,
@@ -346,7 +347,7 @@ async fn start_server_with_first_port(
             .env("RUST_LOG", "info")
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log));
-        let child = command.spawn().unwrap();
+        let child = KillOnDrop::spawn(&mut command).unwrap();
         let mut server = Server {
             child,
             port,

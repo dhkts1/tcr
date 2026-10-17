@@ -29,6 +29,7 @@ use std::process::{Child, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime};
 use tcr::log_err::LogErr as _;
+use tcr::test_support::child::KillOnDrop;
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
 
@@ -177,12 +178,13 @@ fn a_supervised_sigterm_drains_before_the_process_exits() {
     // dir all at once: every one of them resolves off `HOME` (`config::default_path`,
     // `mitm::config_dir`, `affinity::default_path`). Its Claude Code login is a file that does
     // not exist, so the first boot on an empty fleet imports nothing from the Keychain.
-    let mut child = crate::tcr_env::tcr(home.path())
-        .args(["--headless", "--port", "0", "--no-replace"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
+    let mut child = KillOnDrop::spawn(
+        crate::tcr_env::tcr(home.path())
+            .args(["--headless", "--port", "0", "--no-replace"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
 
     let stdout = stream_stdout(&mut child);
 
