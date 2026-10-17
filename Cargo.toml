@@ -283,6 +283,18 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 # 2026-09-18, and no other new dependency.
 proptest = "1"
 
+# Incremental compilation is off, and stays off. sccache cannot serve an incremental compile
+# (`sccache --show-stats` lists it under `Non-cacheable reasons: incremental`), so with it on every
+# new checkout or worktree recompiles the whole `tcr` crate itself; and its state costs GBs of disk
+# per target dir. The price is a slower edit loop in a single checkout.
+[profile.dev]
+incremental = false
+
+# `cargo test` builds with this profile, which inherits `dev`; stated so nobody has to know that.
+[profile.test]
+incremental = false
+
+# Release is already non-incremental by cargo's default.
 [profile.release]
 opt-level = 3
 lto = "thin"
