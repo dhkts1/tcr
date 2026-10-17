@@ -2964,6 +2964,7 @@ dependencies = [
  "sha2 0.11.1",
  "snow",
  "sysinfo",
+ "tcr",
  "tcr-fdpass",
  "tcr-peer-wire",
  "tcr-status-wire",

@@ -25,8 +25,8 @@ mod connect_guard;
 #[path = "../support/tcr_env.rs"]
 mod tcr_env;
 
-/// Shared by `peer_props`, `throttle_exempt` and `workload_scenarios` (and compiled into the
-/// separate `peer_egress` and `peer_lease` too).
+/// The old names for `tcr::test_support`'s fixtures, still called by `peer_props` (and compiled
+/// into the separate `peer_egress` and `peer_lease` too).
 #[path = "../support/fixtures.rs"]
 mod fixtures;
 

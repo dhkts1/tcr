@@ -104,7 +104,7 @@ fn account(name: &str, priority: i64) -> Account {
     Account {
         expires_at: Some(to_ms(t0()) + 3_600_000),
         priority: Some(priority),
-        ..crate::fixtures::fixture_account(name)
+        ..Account::fixture(name)
     }
 }
 
@@ -203,9 +203,7 @@ impl Fleet {
         let config = Config {
             switch_threshold: SWITCH_THRESHOLD,
             pacing,
-            ..crate::fixtures::fixture_config(
-                accounts.iter().map(|(n, p)| account(n, *p)).collect(),
-            )
+            ..Config::fixture(accounts.iter().map(|(n, p)| account(n, *p)).collect())
         };
         let manager = Manager::new(
             config,

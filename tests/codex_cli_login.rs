@@ -127,36 +127,14 @@ fn fixture() -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// A stub `codexUpstream` on loopback that answers every request `200` with `answer`, calling
+/// A stub `codexUpstream` that answers every request `200` with `answer`, calling
 /// `seen` first. Returns its base URL and how many requests it answered.
 fn spawn_upstream(
     answer: &'static str,
     seen: impl Fn() + Send + 'static,
 ) -> (String, Arc<AtomicUsize>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding the stub upstream");
-    let addr = listener.local_addr().expect("an address");
-    let answered = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&answered);
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut reader = BufReader::new(&mut stream);
-            let mut line = String::new();
-            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
-                line.clear();
-            }
-            seen();
-            counter.fetch_add(1, Ordering::SeqCst);
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
-                 connection: close\r\n\r\n{answer}",
-                answer.len()
-            )
-            .log_debug("writing a test response");
-        }
-    });
-    (format!("http://{addr}"), answered)
+    let (addr, answered) = tcr::test_support::stub_upstream::json_answering(answer, seen);
+    (addr.url(), answered)
 }
 
 /// One scratch machine: a `HOME`, its config, a fake `codex`, and the files that drive it.

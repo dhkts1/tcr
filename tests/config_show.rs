@@ -30,11 +30,8 @@ fn scratch(config_json: &str) -> Scratch {
     }
 }
 
-/// A loopback port that was free a moment ago: bound, read, and released.
-fn dead_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
-    listener.local_addr().expect("its address").port()
-}
+/// A loopback port that was free a moment ago.
+use tcr::test_support::loopback::unused_port as dead_port;
 
 /// `{"proxy": {"port": <dead>}, "accounts": [], <rest>}`.
 fn config_on_a_dead_port(rest: &str) -> String {

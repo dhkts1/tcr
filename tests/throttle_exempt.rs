@@ -133,7 +133,7 @@ fn account(i: usize) -> Account {
         // keyed per-org: `spread_burst_across_orgs_is_not_paced` measured exactly
         // `(8-4)*350 = 1400ms`, the closed form for a single bucket.
         priority: Some(0),
-        ..crate::fixtures::fixture_account(&format!("acct{i}"))
+        ..Account::fixture(&format!("acct{i}"))
     }
 }
 
@@ -160,7 +160,7 @@ fn config(
         account_throttle,
         fleet_throttle,
         extra,
-        ..crate::fixtures::fixture_config((0..POOL).map(account).collect())
+        ..Config::fixture((0..POOL).map(account).collect())
     }
 }
 
@@ -274,16 +274,11 @@ async fn spawn_json_upstream_recording() -> (String, Arc<AtomicUsize>, ServedBy)
                 .expect("build upstream response")
         }
     }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind json upstream");
-    let addr = listener.local_addr().expect("json upstream addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .log_debug("serving a test server");
-    });
-    (format!("http://{addr}"), hits, served)
+    (
+        tcr::test_support::stub_upstream::http(app).url(),
+        hits,
+        served,
+    )
 }
 
 /// How many DISTINCT accounts served requests since `from` (an index into the
@@ -300,6 +295,8 @@ fn served_len(served: &ServedBy) -> usize {
     served.lock().expect("served-by lock poisoned").len()
 }
 
+/// The proxy on a real listener through `mitm::serve`, kept on a socket on purpose: that server is
+/// what attaches the per-connection session key and client address the pacing reads.
 async fn spawn_proxy(manager: Arc<Manager>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -322,12 +319,7 @@ fn body(user_id: &str) -> Vec<u8> {
     .expect("serialize body")
 }
 
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("build client")
-}
+use tcr::test_support::loopback::client;
 
 async fn post(cli: &reqwest::Client, base: &str, path: &str, payload: &[u8]) -> (u16, Duration) {
     let start = Instant::now();

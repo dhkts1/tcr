@@ -31,13 +31,8 @@ use tcr::{legacy_names, paths, singleton::owner_path_in};
 const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A port nothing holds right now: the kernel hands one out and it is released.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
-    let port = listener.local_addr().expect("local addr").port();
-    assert_ne!(port, 3456, "never the live proxy's port");
-    port
-}
+/// A port nothing holds right now, for the child `tcr server` to bind itself.
+use tcr::test_support::loopback::unused_port as free_port;
 
 /// A HOME holding only the old names: the config (on `port`, one invented
 /// account) and a cache directory with a marker file and an old-prefix log.
