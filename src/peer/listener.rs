@@ -2673,7 +2673,7 @@ where
                 } else {
                     tracing::warn!(
                         peer = %accepted_peer.display(),
-                        "peer stream: the path meter's lock is poisoned, so this carry is                          not on any path's hour"
+                        "peer stream: the path meter's lock is poisoned, so this carry is not on any path's hour"
                     );
                 }
             }
@@ -3260,7 +3260,7 @@ where
                                 Err(failure) => tracing::info!(
                                     peer = %peer.display(),
                                     failure = %failure,
-                                    "peer punch: this peer asked for a punch and none of the                                      slots got through"
+                                    "peer punch: this peer asked for a punch and none of the slots got through"
                                 ),
                             }
                         });

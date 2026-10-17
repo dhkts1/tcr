@@ -2553,7 +2553,7 @@ mod tests {
         assert_eq!(
             terminal.backend().row(0),
             "FRAME-ONE",
-            "if this now recovers on its own, ratatui changed its swap/flush order              and the SCREEN_DIRTY handling in `run` can be simplified"
+            "if this now recovers on its own, ratatui changed its swap/flush order and the SCREEN_DIRTY handling in `run` can be simplified"
         );
     }
 

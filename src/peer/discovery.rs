@@ -1324,7 +1324,7 @@ mod tests {
         assert_eq!(
             both,
             vec!["192.0.2.7".to_string(), "2001:db8::7".to_string()],
-            "both families are kept; the link-local one arrives with no interface zone, so              nothing could dial it"
+            "both families are kept; the link-local one arrives with no interface zone, so nothing could dial it"
         );
     }
 
