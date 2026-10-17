@@ -473,6 +473,43 @@ pub struct Account {
 }
 
 impl Account {
+    /// An OAuth account holding only what it cannot exist without: a name, the
+    /// upstream it belongs to and an access token. Every other field is unset,
+    /// so a caller names the ones it knows with struct update syntax
+    /// (`Account { refresh_token, ..Account::new(..) }`), and a field added to
+    /// [`Account`] costs one edit here.
+    ///
+    /// Not `Default`: an account with an empty name and token is not a valid
+    /// account, and must not be what a forgotten field silently gets.
+    pub fn new(
+        name: impl Into<String>,
+        provider: crate::provider::Provider,
+        access_token: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            account_type: AccountType::OAuth,
+            provider,
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: access_token.into(),
+            refresh_token: None,
+            expires_at: None,
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+            egress: Egress::Local,
+            egress_strict: false,
+            codex_home: None,
+            extra: Map::new(),
+        }
+    }
+
     /// A strict peer exit cannot be honoured for Codex. Keep the row readable so
     /// the CLI can clear its pin, but never select it for a pooled request.
     pub(crate) fn has_unsupported_strict_peer_exit(&self) -> bool {

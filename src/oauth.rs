@@ -1361,26 +1361,8 @@ pub fn upsert_account(
                 .map_or(0, |max| max + 1);
 
             config.accounts.push(Account {
-                name: name.to_string(),
-                account_type: crate::config::AccountType::OAuth,
-                provider: Default::default(),
-                account_uuid,
-                org_uuid,
-                org_name,
-                access_token: tokens.access_token.clone(),
-                refresh_token: tokens.refresh_token.clone(),
-                expires_at: Some(tokens.expires_at_ms),
                 priority: Some(next_priority),
-                switch_threshold: None,
-                disabled: None,
-                groups: None,
-                organization_type: profile.organization_type.clone(),
-                rate_limit_tier: profile.rate_limit_tier.clone(),
-                seat_tier: profile.seat_tier.clone(),
-                egress: crate::config::Egress::Local,
-                egress_strict: false,
-                codex_home: None,
-                extra: serde_json::Map::new(),
+                ..claude_login_row(name, tokens, profile)
             });
             Ok(())
         }
@@ -1564,28 +1546,7 @@ async fn probe_add_capability(config: &Config) -> AddCapability {
 /// header) learns it with no second request. Empty when the server named none,
 /// which is how a server that predates the header, and every non-answer, reads.
 async fn probe_add_route(config: &Config) -> (AddCapability, Vec<crate::provider::Provider>) {
-    let probe = Account {
-        name: String::new(),
-        account_type: crate::config::AccountType::OAuth,
-        provider: Default::default(),
-        account_uuid: None,
-        org_uuid: None,
-        org_name: None,
-        access_token: String::new(),
-        refresh_token: None,
-        expires_at: None,
-        priority: None,
-        switch_threshold: None,
-        disabled: None,
-        groups: None,
-        organization_type: None,
-        rate_limit_tier: None,
-        seat_tier: None,
-        egress: crate::config::Egress::Local,
-        egress_strict: false,
-        codex_home: None,
-        extra: serde_json::Map::new(),
-    };
+    let probe = Account::new("", crate::provider::Provider::default(), "");
     let (answer, providers) = crate::cli::post_add_account_with_providers(config, &probe).await;
     let capability = match answer {
         // A blank name/token can never be added, so `Ok` cannot happen in
@@ -2752,26 +2713,13 @@ fn codex_account_row(
     codex_home: Option<&Path>,
 ) -> Account {
     Account {
-        name,
-        account_type: crate::config::AccountType::OAuth,
-        provider: crate::provider::Provider::Codex,
         account_uuid: login.user_id,
         org_uuid: login.account_id,
-        org_name: None,
-        access_token: login.access_token,
         refresh_token: Some(login.refresh_token),
         expires_at: login.expires_at_ms,
-        priority: None,
-        switch_threshold: None,
-        disabled: None,
-        groups: None,
         organization_type: login.plan_type,
-        rate_limit_tier: None,
-        seat_tier: None,
-        egress: crate::config::Egress::Local,
-        egress_strict: false,
         codex_home: codex_home.map(|folder| folder.display().to_string()),
-        extra: serde_json::Map::new(),
+        ..Account::new(name, crate::provider::Provider::Codex, login.access_token)
     }
 }
 
@@ -3567,34 +3515,34 @@ async fn finish_login(
     tokens: &Tokens,
     profile: Profile,
 ) -> anyhow::Result<String> {
-    let account = Account {
-        name: name.to_string(),
-        account_type: crate::config::AccountType::OAuth,
-        provider: Default::default(),
-        account_uuid: profile.account_uuid,
-        org_uuid: profile.org_uuid,
-        org_name: profile.org_name,
-        access_token: tokens.access_token.clone(),
+    let account = claude_login_row(name, tokens, &profile);
+    finish_login_account(config_path, route, config, account).await
+}
+
+/// The Anthropic row a login becomes: the profile it authenticated as, plus the
+/// tokens it produced, with no priority (the caller sets one or leaves the
+/// server to).
+///
+/// The plan fields ride the SERVER route too, and for free: the request body
+/// `finish_login_account` posts is a serialized `config::Account`, so the two
+/// serde fields put the plan on the wire without a second payload shape to
+/// keep in step. Pinned by `add_account_request_carries_the_plan_fields`.
+fn claude_login_row(name: &str, tokens: &Tokens, profile: &Profile) -> Account {
+    Account {
+        account_uuid: profile.account_uuid.clone(),
+        org_uuid: profile.org_uuid.clone(),
+        org_name: profile.org_name.clone(),
         refresh_token: tokens.refresh_token.clone(),
         expires_at: Some(tokens.expires_at_ms),
-        priority: None,
-        switch_threshold: None,
-        disabled: None,
-        groups: None,
-        // Carried on the SERVER route too, and for free: the request body
-        // `finish_login_account` posts is a serialized `config::Account`, so the
-        // two serde fields put the plan on the wire without a second payload
-        // shape to keep in step. Pinned by
-        // `add_account_request_carries_the_plan_fields`.
-        organization_type: profile.organization_type,
-        rate_limit_tier: profile.rate_limit_tier,
-        seat_tier: profile.seat_tier,
-        egress: crate::config::Egress::Local,
-        egress_strict: false,
-        codex_home: None,
-        extra: serde_json::Map::new(),
-    };
-    finish_login_account(config_path, route, config, account).await
+        organization_type: profile.organization_type.clone(),
+        rate_limit_tier: profile.rate_limit_tier.clone(),
+        seat_tier: profile.seat_tier.clone(),
+        ..Account::new(
+            name,
+            crate::provider::Provider::Anthropic,
+            tokens.access_token.clone(),
+        )
+    }
 }
 
 /// Load the config for a login, creating the file with defaults when it does
