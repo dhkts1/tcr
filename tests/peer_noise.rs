@@ -34,6 +34,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use tcr::log_err::LogErr as _;
 
 use tcr::peer::config::{Allow, ControlGrants, PeerRow};
 use tcr::peer::listener::{
@@ -792,7 +793,10 @@ async fn a_pairing_nonce_that_does_not_match_its_commitment_is_refused() {
         text.contains("committed to"),
         "the refusal names what went wrong, so an operator is not left guessing: {text}"
     );
-    let _ = answering.await.expect("the answering task");
+    answering
+        .await
+        .expect("the answering task")
+        .log_debug("answering a pairing whose reveal misses");
 }
 
 /// **The digits move with the responder's nonce, on one handshake hash.**

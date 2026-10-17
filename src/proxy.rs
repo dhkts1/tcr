@@ -5937,10 +5937,10 @@ async fn handle_request(
                             "upstream transport failure mid-stream — forwarding the \
                              severed connection to the client"
                         );
-                        if let Some(ended) = state.ended.take() {
-                            if ended.send(()).is_err() {
-                                tracing::debug!("stream-end receiver already dropped");
-                            }
+                        if let Some(ended) = state.ended.take()
+                            && ended.send(()).is_err()
+                        {
+                            tracing::debug!("stream-end receiver already dropped");
                         }
                         state.timing.mark_ended();
                         Some((Err(err), state))
@@ -5952,10 +5952,10 @@ async fn handle_request(
                         // body (hence this whole stream, mid-poll) instead of
                         // ever seeing it reach `None`, which drops `state` —
                         // and `state.ended` along with it — unfired.
-                        if let Some(ended) = state.ended.take() {
-                            if ended.send(()).is_err() {
-                                tracing::debug!("stream-end receiver already dropped");
-                            }
+                        if let Some(ended) = state.ended.take()
+                            && ended.send(()).is_err()
+                        {
+                            tracing::debug!("stream-end receiver already dropped");
                         }
                         // `state` drops as this arm returns, and with it
                         // `StreamTiming`, which reads this as the end.

@@ -1593,7 +1593,7 @@ mod tests {
         .await
         .unwrap();
         request.abort();
-        let _joined = request.await;
+        request.await.log_debug("joining the aborted test request");
         assert!(
             lock.try_lock().is_err(),
             "a disconnected request must not release an unfinished publication's lock"

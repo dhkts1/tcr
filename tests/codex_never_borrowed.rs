@@ -16,6 +16,11 @@
 //! locally and nothing is refreshed. The proxy is driven in-process through
 //! `proxy::app`, so no port is bound at all, least of all 3456.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 

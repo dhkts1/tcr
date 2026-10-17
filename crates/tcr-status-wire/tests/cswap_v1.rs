@@ -13,6 +13,11 @@
 //! compares the code against an independent statement of the contract. It is
 //! also the file to drop into CodexBar's `ClaudeSwapListParserTests`.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 use std::collections::{BTreeMap, HashSet};
 
 use serde_json::Value;

@@ -421,18 +421,19 @@ fn with_account<R>(
     let mut list = accounts
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if idx >= list.len() {
-        list.resize_with(idx + 1, Mutex::default);
-    }
-    match list.get_mut(idx) {
-        Some(slot) => f(slot
+    // Another caller may have grown the list between the read lock and this one.
+    if let Some(slot) = list.get_mut(idx) {
+        return f(slot
             .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)),
-        None => {
-            tracing::error!("a usage slot was missing right after the list grew past it");
-            f(&mut AccountUsage::default())
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner));
     }
+    // `idx` is past the end: the account's usage starts empty, `f` records into it, and it
+    // is stored at `idx`, with an empty row for every index between the old end and it.
+    let mut usage = AccountUsage::default();
+    let result = f(&mut usage);
+    list.resize_with(idx, Mutex::default);
+    list.push(Mutex::new(usage));
+    result
 }
 
 fn add_into(map: &mut BTreeMap<String, Totals>, model: &str, totals: &Totals) {

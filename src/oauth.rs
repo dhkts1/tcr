@@ -3952,7 +3952,9 @@ mod tests {
                 field("redirect_uri"),
                 field("state")
             );
-            let _response = reqwest::get(&callback).await;
+            reqwest::get(&callback)
+                .await
+                .log_debug("calling the test callback");
         });
 
         let collected = recorded.clone();
@@ -4197,7 +4199,9 @@ mod tests {
                     }))
                 }),
             );
-            let _served = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .log_debug("serving a test server");
         });
 
         let client = reqwest::Client::new();
@@ -4968,7 +4972,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _served = axum::serve(listener, axum::Router::new()).await;
+            axum::serve(listener, axum::Router::new())
+                .await
+                .log_debug("serving a test server");
         });
         let config: Config =
             serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
@@ -6376,7 +6382,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _served = axum::serve(listener, axum::Router::new()).await;
+            axum::serve(listener, axum::Router::new())
+                .await
+                .log_debug("serving a test server");
         });
 
         let path = std::env::temp_dir().join(format!(
@@ -6732,15 +6740,17 @@ mod tests {
                 };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
-                    let _read = sock.read(&mut buf).await;
-                    let _written = sock
-                        .write_all(
-                            format!(
-                                "HTTP/1.1 {status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                            )
-                            .as_bytes(),
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
+                    sock.write_all(
+                        format!(
+                            "HTTP/1.1 {status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                         )
-                        .await;
+                        .as_bytes(),
+                    )
+                    .await
+                    .log_debug("writing a test response");
                 });
             }
         });
@@ -7379,7 +7389,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _served = axum::serve(listener, origin).await;
+            axum::serve(listener, origin)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), seen)
     }
@@ -7462,7 +7474,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _served = axum::serve(listener, route).await;
+            axum::serve(listener, route)
+                .await
+                .log_debug("serving a test server");
         });
         (port, seen)
     }
@@ -8077,7 +8091,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _served = axum::serve(listener, origin).await;
+            axum::serve(listener, origin)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), seen)
     }

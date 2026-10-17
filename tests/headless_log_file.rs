@@ -21,6 +21,7 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use tcr::log_err::LogErr as _;
 
 use tcr::paths;
 
@@ -85,7 +86,7 @@ fn the_log_file_holds_the_boot_and_the_last_shutdown_line_with_stdout_on_the_nul
             );
         }
         if Instant::now() > deadline {
-            let _ = child.kill();
+            child.kill().log_debug("killing a test child");
             panic!(
                 "the log file never got the `listening on` line within {BOOT_TIMEOUT:?}: the \
                  writer stopped once init returned, or never ran; file held {:?}",
@@ -107,7 +108,7 @@ fn the_log_file_holds_the_boot_and_the_last_shutdown_line_with_stdout_on_the_nul
             break status;
         }
         if Instant::now() > deadline {
-            let _ = child.kill();
+            child.kill().log_debug("killing a test child");
             panic!("tcr did not exit within {SHUTDOWN_TIMEOUT:?} of SIGTERM");
         }
         std::thread::sleep(Duration::from_millis(20));

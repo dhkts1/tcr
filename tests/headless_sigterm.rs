@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime};
+use tcr::log_err::LogErr as _;
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
 
@@ -202,14 +203,14 @@ fn a_supervised_sigterm_drains_before_the_process_exits() {
         line.contains("listening on http://")
     })
     .unwrap_or_else(|| {
-        let _ = child.kill();
+        child.kill().log_debug("killing a test child");
         panic!(
             "tcr never printed a 'listening on http://' line within {BOOT_TIMEOUT:?} \
              — cannot recover the bound port to check the owner-file claim"
         );
     });
     let port = parse_listening_port(&listening_line).unwrap_or_else(|| {
-        let _ = child.kill();
+        child.kill().log_debug("killing a test child");
         panic!("could not parse a port out of the listening line: {listening_line:?}")
     });
 
@@ -261,7 +262,7 @@ fn a_supervised_sigterm_drains_before_the_process_exits() {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            child.kill().log_debug("killing a test child");
             panic!(
                 "process did not exit within {SHUTDOWN_TIMEOUT:?} of SIGTERM — the shutdown \
                  grace is 5s, so this means it hung rather than merely needing a kill"

@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
+use tcr::log_err::LogErr as _;
 
 use tcr::{legacy_names, paths, singleton::owner_path_in};
 
@@ -85,19 +86,19 @@ fn boot_and_stop(home: &Path) -> u16 {
     let port = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let _ = child.kill();
+            child.kill().log_debug("killing a test child");
             panic!("tcr never printed a 'listening on http://' line within {BOOT_TIMEOUT:?}");
         }
         match rx.recv_timeout(remaining.min(Duration::from_millis(200))) {
             Ok(line) if line.contains("listening on http://") => {
                 break parse_listening_port(&line).unwrap_or_else(|| {
-                    let _ = child.kill();
+                    child.kill().log_debug("killing a test child");
                     panic!("could not parse a port out of the listening line: {line:?}")
                 });
             }
             Ok(_) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                let _ = child.kill();
+                child.kill().log_debug("killing a test child");
                 panic!("tcr exited before it printed a listening line");
             }
         }
@@ -125,7 +126,7 @@ fn boot_and_stop(home: &Path) -> u16 {
             break;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            child.kill().log_debug("killing a test child");
             panic!("tcr did not exit within {EXIT_TIMEOUT:?} of SIGTERM");
         }
         std::thread::sleep(Duration::from_millis(20));

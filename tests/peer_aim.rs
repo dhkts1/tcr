@@ -47,6 +47,7 @@
 
 use std::net::SocketAddr;
 use std::time::Duration;
+use tcr::log_err::LogErr as _;
 
 use tcr::peer::config::{self as peer_config, PeerFile, PeerRow};
 use tcr::peer::id::NodeKey;
@@ -69,7 +70,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     std::fs::create_dir_all(&dir).expect("create the scratch dir");
     dir
 }

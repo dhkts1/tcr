@@ -28,6 +28,11 @@
 //! the connection), and the proxy is driven in-process through `proxy::app`, so no port is bound
 //! at all, least of all 3456.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

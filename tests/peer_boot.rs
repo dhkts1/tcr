@@ -19,6 +19,11 @@
 //! configured, so nothing can reach
 //! Anthropic.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -673,6 +678,7 @@ mod lender {
     use axum::response::Response;
     use axum::routing::any;
     use tcr::fallback::Ask;
+    use tcr::log_err::LogErr as _;
     use tcr::peer::config::{
         Allow, ControlGrants, Endpoint, EndpointSource, LendGrant, PeerFile, PeerRow, PeerStore,
     };
@@ -726,7 +732,9 @@ mod lender {
                         .expect("the credential log is never poisoned")
                         .push(credential.to_string());
                 }
-                let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+                axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .log_debug("reading a test request body");
                 Response::builder()
                     .status(200)
                     .header("content-type", "application/json")
@@ -739,7 +747,9 @@ mod lender {
             .expect("bind the fake upstream");
         let addr = listening.local_addr().expect("upstream addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listening, app).await;
+            axum::serve(listening, app)
+                .await
+                .log_debug("serving a test server");
         });
         format!("http://{addr}")
     }
@@ -1051,7 +1061,9 @@ mod lender {
             manager,
         }));
         tokio::spawn(async move {
-            let _ = listener::serve_on_with(listening, context).await;
+            listener::serve_on_with(listening, context)
+                .await
+                .log_debug("serving a test peer listener");
         });
 
         write_peers(

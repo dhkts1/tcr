@@ -27,9 +27,15 @@
 //! at the scratch copy before any request runs. Nothing here touches the proxy on
 //! `127.0.0.1:3456`.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use tcr::log_err::LogErr as _;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -65,7 +71,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     std::fs::create_dir_all(&dir).expect("create the scratch dir");
     dir
 }
@@ -324,8 +330,11 @@ async fn a_carry_that_died_inside_the_peer_stream_is_not_logged_as_carried() {
             .await
             .expect("dial the loopback splice");
         local.write_all(b"GET / HTTP/1.1\r\n").await.ok();
-        let _ = local.flush().await;
-        let _ = local.shutdown().await;
+        local.flush().await.log_debug("flushing a test stream");
+        local
+            .shutdown()
+            .await
+            .log_debug("shutting down a test stream");
     }
 
     // Waited for by its own log line rather than by joining the task: the
@@ -351,7 +360,10 @@ async fn a_carry_that_died_inside_the_peer_stream_is_not_logged_as_carried() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     };
-    let _ = gateway_task.await;
+    gateway_task
+        .await
+        .log_debug("joining the test gateway")
+        .and_then(|served| served.log_debug("serving the test gateway"));
 
     assert_ne!(
         ending.message, "peer egress: carried",
@@ -1125,7 +1137,10 @@ async fn the_sni_parser_reads_a_real_client_hello() {
     let read = stream.read(&mut first).await.expect("the ClientHello");
     first.truncate(read);
     drop(stream);
-    let _ = attempt.await;
+    attempt
+        .await
+        .log_debug("joining the test client")
+        .and_then(|sent| sent.log_debug("sending through the closed handshake"));
 
     assert_eq!(
         tunnel::client_hello_sni(&first)
@@ -3196,7 +3211,9 @@ async fn the_real_listener_hands_a_tunnel_to_the_production_handler() {
     let context =
         listener::SessionContext::new(&gateway_key, store.path(), &dir.join("peer-state.json"));
     tokio::spawn(async move {
-        let _ = listener::serve_on_with(listening, context).await;
+        listener::serve_on_with(listening, context)
+            .await
+            .log_debug("serving a test peer listener");
     });
 
     let mut stream = TcpStream::connect(gateway_addr)
@@ -3284,7 +3301,9 @@ async fn a_tunnel_with_no_target_is_refused_by_the_real_listener() {
     let context =
         listener::SessionContext::new(&gateway_key, store.path(), &dir.join("peer-state.json"));
     tokio::spawn(async move {
-        let _ = listener::serve_on_with(listening, context).await;
+        listener::serve_on_with(listening, context)
+            .await
+            .log_debug("serving a test peer listener");
     });
 
     let mut stream = TcpStream::connect(gateway_addr)

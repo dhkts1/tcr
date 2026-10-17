@@ -26,6 +26,11 @@
 //! The one other socket is a stand-in lender on a kernel port that accepts a
 //! connection and closes it.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;

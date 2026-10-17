@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tcr::log_err::LogErr as _;
 
 use tcr::peer::config::{Allow, Endpoint, EndpointSource, Locator, PeerFile, PeerRow, PeerStore};
 use tcr::peer::id::NodeKey;
@@ -508,7 +509,9 @@ async fn the_real_listener_echoes_a_probe_with_both_fields_untouched() {
     tokio::spawn(async move {
         // The loop only ends when the socket is dropped, which is when this
         // test finishes.
-        let _ = listener::serve_on_with(listening, context).await;
+        listener::serve_on_with(listening, context)
+            .await
+            .log_debug("serving a test peer listener");
     });
 
     let (mut stream, mut session) = open_control(addr, &dialer_secret, &key.id().0)
@@ -1198,7 +1201,9 @@ async fn a_completed_hello_measures_the_path_and_it_survives_a_restart() {
     let context = SessionContext::new(&listener_key, listener_store.path(), &listener_state_path);
     tokio::spawn(async move {
         // Ends when the socket drops, at the end of this test.
-        let _ = listener::serve_on_with(listening, context).await;
+        listener::serve_on_with(listening, context)
+            .await
+            .log_debug("serving a test peer listener");
     });
 
     // The dialer pins the listener at its bound loopback address, the row

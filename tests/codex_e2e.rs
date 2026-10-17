@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tcr::log_err::LogErr as _;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -301,8 +302,8 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.kill().log_debug("killing a test child");
+        self.child.wait().log_debug("reaping a test child");
         if std::thread::panicking() {
             eprintln!("--- tcr server log (:{}) ---\n{}", self.port, self.log());
         }

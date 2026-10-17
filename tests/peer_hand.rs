@@ -34,6 +34,7 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use tcr::log_err::LogErr as _;
 
 use tcr::fallback::Ask;
 use tcr::peer::config::LendMode;
@@ -1250,7 +1251,9 @@ async fn owner_lending_expiring(
         .expect("bind the owner's peer listener");
     let addr = listening.local_addr().expect("the owner's peer addr");
     tokio::spawn(async move {
-        let _ = listener::serve_on_with(listening, context).await;
+        listener::serve_on_with(listening, context)
+            .await
+            .log_debug("serving a test peer listener");
     });
 
     Owner {

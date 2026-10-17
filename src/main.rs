@@ -8330,6 +8330,7 @@ mod tests {
     use build_info::StandDownBuild;
     use std::os::unix::fs::PermissionsExt as _;
     use tcr::codex_route::no_codex_account_reason;
+    use tcr::log_err::LogErr as _;
 
     fn silent() -> cli::Liveness {
         cli::Liveness::Silent {
@@ -11113,7 +11114,7 @@ mod tests {
             "booting with no config must create {}",
             path.display()
         );
-        let _removed = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).log_debug("removing a test config");
     }
 
     /// The behaviour this task changed: a config that exists and fails to
