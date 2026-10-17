@@ -252,14 +252,7 @@ fn the_caps_are_still_the_numbers_the_plan_shipped() {
 /// two tests in this binary (and several lanes running at once), never collide
 /// on one path.
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tcr-peer-abuse-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
-    std::fs::create_dir_all(&dir).expect("create the scratch dir");
-    dir
+    crate::peer_support::scratch_dir("abuse", tag)
 }
 
 /// One Mac's files: a peers file, a state file beside it, and a node key in the
@@ -314,18 +307,7 @@ impl Node {
 /// enforced inside it, so a harness that re-implemented the loop would be
 /// attacking the harness.
 async fn serve(context: SessionContext) -> SocketAddr {
-    let listener = listener::bind("127.0.0.1:0".parse().expect("a loopback address"))
-        .await
-        .expect("bind a kernel-chosen port on loopback");
-    let addr = listener.local_addr().expect("the bound address");
-    tokio::spawn(async move {
-        // The loop returns only on an accept failure, which is the harness
-        // going away at the end of the test.
-        listener::serve_on_with(listener, context)
-            .await
-            .log_debug("serving a test peer listener");
-    });
-    addr
+    crate::peer_support::serve_shipped(context).await
 }
 
 /// The address every connection in this file comes from, in

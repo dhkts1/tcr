@@ -20,14 +20,7 @@ use tcr::log_err::LogErr as _;
 /// the same instant cannot read or write this one's peers file. Same shape as
 /// `tests/peer_reach.rs::scratch`.
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tcr-peer-graph-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
-    std::fs::create_dir_all(&dir).expect("create the scratch dir");
-    dir
+    crate::peer_support::scratch_dir("graph", tag)
 }
 
 /// A peers file with two pinned peers and two paths on one of them, written as

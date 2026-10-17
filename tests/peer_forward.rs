@@ -38,9 +38,13 @@
     reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
 )]
 
+/// The harness pieces the `peer_*` test files share.
+#[path = "support/peer.rs"]
+mod peer_support;
+
+use peer_support::{Collector, LoggedEvent, Node, dial_and_open, loopback, node, target_on};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tcr::log_err::LogErr as _;
 
 use tcr::peer::config::{self, Allow, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore};
 use tcr::peer::listener;
@@ -53,38 +57,8 @@ use tokio::net::{TcpListener, TcpStream};
 /// A fixed instant, so nothing here reads the clock.
 const NOW_MS: i64 = 1_767_225_600_000;
 
-/// A scratch directory named after this process and thread, so five lanes
-/// running at once never collide on one path.
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tcr-peer-forward-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
-    std::fs::create_dir_all(&dir).expect("create the scratch dir");
-    dir
-}
-
-/// One machine's key material, as a test holds it.
-struct Node {
-    secret: [u8; 32],
-    id: PeerId,
-}
-
-fn node() -> Node {
-    let (secret, public) = noise::generate_static().expect("mint a static keypair");
-    Node {
-        secret,
-        id: PeerId(public),
-    }
-}
-
-/// A listener on a kernel-chosen loopback port.
-async fn loopback() -> TcpListener {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind a loopback listener")
+    peer_support::scratch_dir("forward", tag)
 }
 
 /// A pinned row for `peer`, with `relay` granted or not.
@@ -512,52 +486,6 @@ async fn forward_one(stream: TcpStream, forwarder: &Forwarder) -> anyhow::Result
     .await
 }
 
-/// A target that counts what reached it, so "refused" can be measured as *the
-/// target was never dialled* instead of as an error string.
-#[derive(Clone, Default)]
-struct Target {
-    connections: Arc<AtomicUsize>,
-    bytes: Arc<AtomicUsize>,
-}
-
-/// Accept forever, count every connection and byte, and answer `reply` once per
-/// connection.
-///
-/// It speaks nothing: a forwarder splices raw bytes and has no business knowing
-/// what its target's protocol is, so a target that answers a fixed string is a
-/// truthful stand-in for every case except the end-to-end one below, which
-/// runs a real responder handshake instead.
-fn target_on(listener: TcpListener, reply: Vec<u8>) -> Target {
-    let target = Target::default();
-    let watch = target.clone();
-    tokio::spawn(async move {
-        while let Ok((mut socket, _)) = listener.accept().await {
-            watch.connections.fetch_add(1, Ordering::SeqCst);
-            let seen = Arc::clone(&watch.bytes);
-            let reply = reply.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0_u8; 4096];
-                let mut answered = false;
-                loop {
-                    match socket.read(&mut buf).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(read) => {
-                            seen.fetch_add(read, Ordering::SeqCst);
-                            if !answered {
-                                answered = true;
-                                if socket.write_all(&reply).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-    target
-}
-
 /// The requester's half: the outer session to the forwarder, the header, and
 /// the plaintext stream the forwarder will splice onward.
 async fn ask_to_forward(
@@ -566,25 +494,7 @@ async fn ask_to_forward(
     forwarder: &Node,
     header: &StreamHeader,
 ) -> NoiseStream {
-    let mut stream = TcpStream::connect(forwarder_addr)
-        .await
-        .expect("dial the forwarder");
-    let mut session = noise::dial_handshake(
-        &mut stream,
-        &requester.secret,
-        Handshake::Return,
-        Some(&forwarder.id.0),
-        None,
-    )
-    .await
-    .expect("the outer handshake completes");
-    noise::send_encrypted(
-        &mut stream,
-        &mut session.transport,
-        &serde_json::to_vec(header).expect("the header serializes"),
-    )
-    .await
-    .expect("the header is written");
+    let (stream, session) = dial_and_open(forwarder_addr, requester, &forwarder.id, header).await;
     NoiseStream::start(stream, session)
 }
 
@@ -875,65 +785,6 @@ async fn respond_once(
     })
 }
 
-/// One captured tracing event: the message, plus the fields as strings.
-#[derive(Debug, Clone)]
-struct Logged {
-    message: String,
-    fields: std::collections::HashMap<String, String>,
-}
-
-/// Collect every event on this thread while the guard lives.
-#[derive(Clone, Default)]
-struct Collector {
-    events: Arc<Mutex<Vec<Logged>>>,
-}
-
-impl<S> tracing_subscriber::Layer<S> for Collector
-where
-    S: tracing::Subscriber,
-{
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        struct Visitor {
-            message: String,
-            fields: std::collections::HashMap<String, String>,
-        }
-        impl tracing::field::Visit for Visitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                let rendered = format!("{value:?}");
-                if field.name() == "message" {
-                    self.message = rendered.trim_matches('"').to_string();
-                } else {
-                    self.fields.insert(field.name().to_string(), rendered);
-                }
-            }
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                if field.name() == "message" {
-                    self.message = value.to_string();
-                } else {
-                    self.fields
-                        .insert(field.name().to_string(), value.to_string());
-                }
-            }
-        }
-        let mut visitor = Visitor {
-            message: String::new(),
-            fields: std::collections::HashMap::new(),
-        };
-        event.record(&mut visitor);
-        self.events
-            .lock()
-            .expect("the collector lock")
-            .push(Logged {
-                message: visitor.message,
-                fields: visitor.fields,
-            });
-    }
-}
-
 /// Every tracing event this test BINARY emits, collected once, process-wide.
 ///
 /// Process-wide rather than per test, and that is a flake measured here rather
@@ -1074,7 +925,7 @@ async fn a_forward_reaches_the_target_which_authenticates_the_requester_not_the_
         "a completed nested handshake moves bytes both ways: up {up}, down {down}"
     );
 
-    let events = log.events.lock().expect("the collector lock").clone();
+    let events = log.events();
     for event in &events {
         assert!(
             !event.message.contains(MARKER),
@@ -1092,7 +943,7 @@ async fn a_forward_reaches_the_target_which_authenticates_the_requester_not_the_
     // node in this file has its own fresh key, so this names exactly one
     // forward.
     let mine = a.id.display();
-    let carried: Vec<&Logged> = events
+    let carried: Vec<&LoggedEvent> = events
         .iter()
         .filter(|event| {
             event.message == "peer forward: carried"

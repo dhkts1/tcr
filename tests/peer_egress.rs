@@ -36,11 +36,11 @@
 #[path = "support/tcr_env.rs"]
 mod tcr_env;
 
-/// `Account` and `Config` fixtures for struct-update syntax.
-#[path = "support/fixtures.rs"]
-mod fixtures;
+/// The harness pieces the `peer_*` test files share.
+#[path = "support/peer.rs"]
+mod peer_support;
 
-use std::collections::HashMap;
+use peer_support::{Collector, Node, dial_and_open, loopback, node};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tcr::log_err::LogErr as _;
@@ -53,7 +53,7 @@ use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
 use tcr::peer::config::{Allow, Endpoint, EndpointSource, PeerFile, PeerRow};
 use tcr::peer::egress::{self, GatewayCandidate, ViaSetting};
 use tcr::peer::listener;
-use tcr::peer::noise::{self, Handshake};
+use tcr::peer::noise;
 use tcr::peer::tunnel::{self, Admission, Carry, OriginRoute, TunnelBudget};
 use tcr::probe::{ProbeError, ProbeFuture, UsageProber};
 use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
@@ -71,36 +71,13 @@ const ORIGIN: &str = "api.anthropic.com";
 const CANNED_BODY: &str =
     r#"{"id":"msg_carried","type":"message","content":[{"type":"text","text":"carried"}]}"#;
 
-/// A scratch directory named after this process and thread, so five lanes
-/// running at once never collide on one path.
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tcr-peer-egress-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
-    std::fs::create_dir_all(&dir).expect("create the scratch dir");
-    dir
+    peer_support::scratch_dir("egress", tag)
 }
 
 // ---------------------------------------------------------------------------
 // Two Macs
 // ---------------------------------------------------------------------------
-
-/// One machine's key material, as a test holds it.
-struct Node {
-    secret: [u8; 32],
-    id: PeerId,
-}
-
-fn node() -> Node {
-    let (secret, public) = noise::generate_static().expect("mint a static keypair");
-    Node {
-        secret,
-        id: PeerId(public),
-    }
-}
 
 /// The fixture spelling of "these are the sockets this row was paired over".
 ///
@@ -555,10 +532,73 @@ fn carried_client(origin: &Origin, splice_port: u16) -> reqwest::Client {
         .expect("a client")
 }
 
-async fn loopback() -> TcpListener {
-    TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .expect("bind a kernel-chosen loopback port")
+/// The peers file of a Mac whose account is locked to leave from `gateway`:
+/// one row for it at `addr`, the carry granted (it may carry for us), and the
+/// gateway grant off (we do not carry for it).
+fn write_carrying_gateway(peers: &std::path::Path, gateway: &PeerId, addr: &str) {
+    let mut file = PeerFile::default();
+    file.peers
+        .push(row(gateway, "gateway", vec![addr.to_string()], false));
+    file.peers[0].allow.carry = true;
+    tcr::peer::config::save(peers, &file).expect("write the peers file");
+}
+
+/// `egress::retry_through_peer` for one `POST https://{ORIGIN}/v1/messages`
+/// with an empty JSON body and no headers, against the peers file at `peers`.
+async fn carry_one_message(peers: &std::path::Path) -> egress::ViaCarry {
+    egress::retry_through_peer(egress::CarriedRequest {
+        url: &format!("https://{ORIGIN}/v1/messages"),
+        method: &axum::http::Method::POST,
+        headers: axum::http::HeaderMap::new(),
+        body: Some(bytes::Bytes::from_static(b"{}")),
+        peers_path: peers,
+    })
+    .await
+}
+
+/// A TUNNEL header to `host:443`, one hop, numbered `request_id`.
+fn tunnel_to_origin(host: &str, request_id: u128) -> StreamHeader {
+    StreamHeader {
+        kind: StreamKind::Tunnel,
+        target: Some(TunnelTarget::Origin {
+            host: host.to_string(),
+            port: 443,
+        }),
+        via: Vec::new(),
+        hops_remaining: 1,
+        request_id,
+    }
+}
+
+/// The SHIPPED peer listener on a loopback port, for a gateway whose key and
+/// peers file live in `dir`, pinning `requester` with the one carry grant.
+/// Returns the gateway's key and address.
+///
+/// The state file is inside `dir` and does not exist, so a test on it reads
+/// nothing under the operator's cache directory and cannot be perturbed by an
+/// operator with a pairing window open while the suite runs.
+async fn real_gateway_pinning(
+    dir: &std::path::Path,
+    requester: &Node,
+) -> (tcr::peer::id::NodeKey, SocketAddr) {
+    let gateway_key = tcr::peer::id::NodeKey::load_or_mint(dir).expect("the gateway's node key");
+    let peers = dir.join("tcr-peers.json");
+    let mut file = PeerFile::default();
+    file.peers
+        .push(row(&requester.id, "requester", Vec::new(), true));
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
+
+    let listening = loopback().await;
+    let gateway_addr = listening.local_addr().expect("the gateway address");
+    let store = tcr::peer::config::PeerStore::open(&peers).expect("open the peers file");
+    let context =
+        listener::SessionContext::new(&gateway_key, store.path(), &dir.join("peer-state.json"));
+    tokio::spawn(async move {
+        listener::serve_on_with(listening, context)
+            .await
+            .log_debug("serving a test peer listener");
+    });
+    (gateway_key, gateway_addr)
 }
 
 /// What a pooled account's answer carries that the local client must never see,
@@ -828,35 +868,15 @@ async fn a_host_off_the_allow_list_is_refused() {
         1024 * 1024,
     );
 
-    let mut stream = TcpStream::connect(gateway_addr)
-        .await
-        .expect("dial the gateway");
-    let mut session = noise::dial_handshake(
-        &mut stream,
-        &requester.secret,
-        Handshake::Return,
-        Some(&gateway.id.0),
-        None,
+    // Held to the end of the test, so the gateway's refusal is its own and not
+    // a reaction to the requester hanging up.
+    let (_stream, _session) = dial_and_open(
+        gateway_addr,
+        &requester,
+        &gateway.id,
+        &tunnel_to_origin("example.com", 7),
     )
-    .await
-    .expect("the handshake completes");
-    let header = StreamHeader {
-        kind: StreamKind::Tunnel,
-        target: Some(TunnelTarget::Origin {
-            host: "example.com".to_string(),
-            port: 443,
-        }),
-        via: Vec::new(),
-        hops_remaining: 1,
-        request_id: 7,
-    };
-    noise::send_encrypted(
-        &mut stream,
-        &mut session.transport,
-        &serde_json::to_vec(&header).expect("the header serializes"),
-    )
-    .await
-    .expect("the header is written");
+    .await;
 
     let refusal = gateway_task
         .await
@@ -930,25 +950,8 @@ async fn a_relay_target_is_refused_by_a_gateway() {
         Some(TunnelTarget::Peer { node: onward.id }),
     );
 
-    let mut stream = TcpStream::connect(gateway_addr)
-        .await
-        .expect("dial the gateway");
-    let mut session = noise::dial_handshake(
-        &mut stream,
-        &requester.secret,
-        Handshake::Return,
-        Some(&gateway.id.0),
-        None,
-    )
-    .await
-    .expect("the handshake completes");
-    noise::send_encrypted(
-        &mut stream,
-        &mut session.transport,
-        &serde_json::to_vec(&origin_header).expect("the origin header serializes"),
-    )
-    .await
-    .expect("the header is written");
+    let (_stream, _session) =
+        dial_and_open(gateway_addr, &requester, &gateway.id, &origin_header).await;
 
     let refusal = gateway_task
         .await
@@ -1076,35 +1079,13 @@ async fn a_carry_that_sends_no_client_hello_is_closed_on() {
         1024 * 1024,
     );
 
-    let mut stream = TcpStream::connect(gateway_addr)
-        .await
-        .expect("dial the gateway");
-    let mut session = noise::dial_handshake(
-        &mut stream,
-        &requester.secret,
-        Handshake::Return,
-        Some(&gateway.id.0),
-        None,
+    let (_stream, _session) = dial_and_open(
+        gateway_addr,
+        &requester,
+        &gateway.id,
+        &tunnel_to_origin(ORIGIN, 11),
     )
-    .await
-    .expect("the handshake completes");
-    let header = StreamHeader {
-        kind: StreamKind::Tunnel,
-        target: Some(TunnelTarget::Origin {
-            host: ORIGIN.to_string(),
-            port: 443,
-        }),
-        via: Vec::new(),
-        hops_remaining: 1,
-        request_id: 11,
-    };
-    noise::send_encrypted(
-        &mut stream,
-        &mut session.transport,
-        &serde_json::to_vec(&header).expect("the header serializes"),
-    )
-    .await
-    .expect("the header is written");
+    .await;
     // And then nothing at all.
 
     let started = std::time::Instant::now();
@@ -1448,94 +1429,6 @@ async fn the_requester_refuses_a_host_the_mesh_does_not_carry() {
 // Item 2: the seam, and item 4: the metric line
 // ---------------------------------------------------------------------------
 
-/// One captured tracing event: the message, plus the fields as strings.
-#[derive(Debug, Clone)]
-struct Event {
-    message: String,
-    fields: HashMap<String, String>,
-}
-
-/// Collect every event on this thread while the guard lives.
-#[derive(Clone, Default)]
-struct Collector {
-    events: Arc<Mutex<Vec<Event>>>,
-}
-
-impl Collector {
-    fn events(&self) -> Vec<Event> {
-        self.events.lock().expect("the collector lock").clone()
-    }
-
-    fn matching(&self, needle: &str) -> Vec<Event> {
-        self.events()
-            .into_iter()
-            .filter(|event| event.message.contains(needle))
-            .collect()
-    }
-
-    /// Where `needle` first appears in this thread's event ORDER.
-    ///
-    /// Order is the assertion for the carry offer: a count alone cannot tell
-    /// "offered after the fleet was walked" from "offered on the first
-    /// account's connect failure", and the second one is the bug.
-    fn first_index(&self, needle: &str) -> Option<usize> {
-        self.events()
-            .iter()
-            .position(|event| event.message.contains(needle))
-    }
-
-    /// Every message, in order, for an assertion's failure output.
-    fn messages(&self) -> Vec<String> {
-        self.events()
-            .into_iter()
-            .map(|event| event.message)
-            .collect()
-    }
-}
-
-impl<S> tracing_subscriber::Layer<S> for Collector
-where
-    S: tracing::Subscriber,
-{
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        struct Visitor {
-            message: String,
-            fields: HashMap<String, String>,
-        }
-        impl tracing::field::Visit for Visitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                let rendered = format!("{value:?}");
-                if field.name() == "message" {
-                    self.message = rendered.trim_matches('"').to_string();
-                } else {
-                    self.fields.insert(field.name().to_string(), rendered);
-                }
-            }
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                if field.name() == "message" {
-                    self.message = value.to_string();
-                } else {
-                    self.fields
-                        .insert(field.name().to_string(), value.to_string());
-                }
-            }
-        }
-        let mut visitor = Visitor {
-            message: String::new(),
-            fields: HashMap::new(),
-        };
-        event.record(&mut visitor);
-        self.events.lock().expect("the collector lock").push(Event {
-            message: visitor.message,
-            fields: visitor.fields,
-        });
-    }
-}
-
 /// Capture this thread's tracing events for as long as the guard lives.
 ///
 /// `set_default`, not `set_global_default`: every `#[tokio::test]` here runs on
@@ -1590,7 +1483,7 @@ fn fake_account() -> Account {
         access_token: "at-alice".to_string(),
         refresh_token: Some("rt-alice".to_string()),
         expires_at: Some(4_102_444_800_000),
-        ..fixtures::fixture_account("alice@example.com")
+        ..tcr::config::Account::fixture("alice@example.com")
     }
 }
 
@@ -1624,7 +1517,7 @@ fn fleet_with(upstream: &str, accounts: Vec<Account>) -> Arc<Manager> {
     let config = Config {
         upstream: upstream.to_string(),
         switch_threshold: 0.95,
-        ..fixtures::fixture_config(accounts)
+        ..tcr::config::Config::fixture(accounts)
     };
     Manager::new(
         config,
@@ -1633,6 +1526,30 @@ fn fleet_with(upstream: &str, accounts: Vec<Account>) -> Arc<Manager> {
         Arc::new(NeverWarms),
         None,
     )
+}
+
+/// What a peer reports it carried for account 0 (`alice@example.com`): a
+/// `POST /v1/messages` with no session, no model and no tool blocks, answered
+/// `status` with `upstream_headers`. A test sets the fields it is about with
+/// struct-update syntax.
+fn carried_answer(
+    status: u16,
+    upstream_headers: &axum::http::HeaderMap,
+) -> egress::CarriedRecord<'_> {
+    egress::CarriedRecord {
+        account_idx: 0,
+        account: Some("alice@example.com".to_string()),
+        session_key: None,
+        session_kind: tcr::stats::SessionKind::Stable,
+        wire_session_id: None,
+        model: None,
+        method: "POST".to_string(),
+        path: "/v1/messages".to_string(),
+        status,
+        tool_uses: &[],
+        tool_results: &[],
+        upstream_headers,
+    }
 }
 
 /// One `/v1/messages` POST through the real router.
@@ -1760,14 +1677,7 @@ async fn a_gateway_that_does_not_answer_leaves_todays_503() {
     // in this binary, so the seam is exercised directly here rather than
     // through the installed cell: the proxy hunk's own call is covered by the
     // no-mesh test above.
-    let carried = egress::retry_through_peer(egress::CarriedRequest {
-        url: &format!("https://{ORIGIN}/v1/messages"),
-        method: &axum::http::Method::POST,
-        headers: axum::http::HeaderMap::new(),
-        body: Some(bytes::Bytes::from_static(b"{}")),
-        peers_path: &peers,
-    })
-    .await;
+    let carried = carry_one_message(&peers).await;
     assert!(
         matches!(carried, egress::ViaCarry::NotTaken),
         "a Mac that does not answer took nothing, so the request keeps today's answer"
@@ -2448,14 +2358,7 @@ async fn via_off_costs_no_dial_and_no_wait() {
 
     let (collector, _guard) = capture();
     let started = std::time::Instant::now();
-    let carried = egress::retry_through_peer(egress::CarriedRequest {
-        url: &format!("https://{ORIGIN}/v1/messages"),
-        method: &axum::http::Method::POST,
-        headers: axum::http::HeaderMap::new(),
-        body: Some(bytes::Bytes::from_static(b"{}")),
-        peers_path: &peers,
-    })
-    .await;
+    let carried = carry_one_message(&peers).await;
     let elapsed = started.elapsed();
     accepting.abort();
 
@@ -2528,14 +2431,7 @@ async fn the_operators_timeout_is_what_a_silent_gateway_is_given() {
 
     let (collector, _guard) = capture();
     let started = std::time::Instant::now();
-    let carried = egress::retry_through_peer(egress::CarriedRequest {
-        url: &format!("https://{ORIGIN}/v1/messages"),
-        method: &axum::http::Method::POST,
-        headers: axum::http::HeaderMap::new(),
-        body: Some(bytes::Bytes::from_static(b"{}")),
-        peers_path: &peers,
-    })
-    .await;
+    let carried = carry_one_message(&peers).await;
     let elapsed = started.elapsed();
     held.abort();
 
@@ -2628,14 +2524,7 @@ async fn a_lender_that_takes_the_carry_and_never_answers_still_releases_the_requ
 
     let (collector, _guard) = capture();
     let started = std::time::Instant::now();
-    let carried = egress::retry_through_peer(egress::CarriedRequest {
-        url: &format!("https://{ORIGIN}/v1/messages"),
-        method: &axum::http::Method::POST,
-        headers: axum::http::HeaderMap::new(),
-        body: Some(bytes::Bytes::from_static(b"{}")),
-        peers_path: &peers,
-    })
-    .await;
+    let carried = carry_one_message(&peers).await;
     let elapsed = started.elapsed();
     origin_task.abort();
     gateway_task.abort();
@@ -2785,18 +2674,10 @@ async fn a_carried_request_lands_in_the_ledger() {
     egress::record_carried(
         &manager,
         egress::CarriedRecord {
-            account_idx: 0,
-            account: Some("alice@example.com".to_string()),
             session_key: Some(7),
-            session_kind: tcr::stats::SessionKind::Stable,
             wire_session_id: Some("11111111-1111-1111-1111-111111111111"),
             model: Some("claude-opus-4-6".to_string()),
-            method: "POST".to_string(),
-            path: "/v1/messages".to_string(),
-            status: 200,
-            tool_uses: &[],
-            tool_results: &[],
-            upstream_headers: &axum::http::HeaderMap::new(),
+            ..carried_answer(200, &axum::http::HeaderMap::new())
         },
     )
     .await;
@@ -2862,18 +2743,10 @@ async fn a_carried_requests_spend_reaches_the_quota_window() {
     egress::record_carried(
         &manager,
         egress::CarriedRecord {
-            account_idx: 0,
-            account: Some("alice@example.com".to_string()),
             session_key: Some(9),
-            session_kind: tcr::stats::SessionKind::Stable,
             wire_session_id: Some("11111111-1111-1111-1111-111111111111"),
             model: Some("claude-opus-4-6".to_string()),
-            method: "POST".to_string(),
-            path: "/v1/messages".to_string(),
-            status: 200,
-            tool_uses: &[],
-            tool_results: &[],
-            upstream_headers: &upstream_headers,
+            ..carried_answer(200, &upstream_headers)
         },
     )
     .await;
@@ -2930,24 +2803,7 @@ async fn a_carried_rejection_holds_the_account_the_way_a_direct_one_does() {
     );
     upstream_headers.insert("retry-after", "600".parse().expect("a header value"));
 
-    egress::record_carried(
-        &manager,
-        egress::CarriedRecord {
-            account_idx: 0,
-            account: Some("alice@example.com".to_string()),
-            session_key: None,
-            session_kind: tcr::stats::SessionKind::Stable,
-            wire_session_id: None,
-            model: None,
-            method: "POST".to_string(),
-            path: "/v1/messages".to_string(),
-            status: 429,
-            tool_uses: &[],
-            tool_results: &[],
-            upstream_headers: &upstream_headers,
-        },
-    )
-    .await;
+    egress::record_carried(&manager, carried_answer(429, &upstream_headers)).await;
 
     assert_eq!(
         manager.account_status(0),
@@ -2985,24 +2841,7 @@ async fn a_carried_success_clears_the_hold_a_carried_rejection_armed() {
         "the fixture starts held, or the assertion below is about nothing"
     );
 
-    egress::record_carried(
-        &manager,
-        egress::CarriedRecord {
-            account_idx: 0,
-            account: Some("alice@example.com".to_string()),
-            session_key: None,
-            session_kind: tcr::stats::SessionKind::Stable,
-            wire_session_id: None,
-            model: None,
-            method: "POST".to_string(),
-            path: "/v1/messages".to_string(),
-            status: 200,
-            tool_uses: &[],
-            tool_results: &[],
-            upstream_headers: &axum::http::HeaderMap::new(),
-        },
-    )
-    .await;
+    egress::record_carried(&manager, carried_answer(200, &axum::http::HeaderMap::new())).await;
 
     assert_ne!(
         manager.account_status(0),
@@ -3037,24 +2876,7 @@ async fn a_carried_401_on_a_token_only_account_marks_it_error() {
         }],
     );
 
-    egress::record_carried(
-        &manager,
-        egress::CarriedRecord {
-            account_idx: 0,
-            account: Some("alice@example.com".to_string()),
-            session_key: None,
-            session_kind: tcr::stats::SessionKind::Stable,
-            wire_session_id: None,
-            model: None,
-            method: "POST".to_string(),
-            path: "/v1/messages".to_string(),
-            status: 401,
-            tool_uses: &[],
-            tool_results: &[],
-            upstream_headers: &axum::http::HeaderMap::new(),
-        },
-    )
-    .await;
+    egress::record_carried(&manager, carried_answer(401, &axum::http::HeaderMap::new())).await;
 
     assert_eq!(
         manager.account_status(0),
@@ -3084,24 +2906,7 @@ async fn a_carried_transient_429_parks_for_what_the_direct_path_parks() {
     let manager = fleet_of("http://127.0.0.1:1", &["alice@example.com"]);
 
     // A 429 with NO unified rejection and NO `retry-after`: the transient shape.
-    egress::record_carried(
-        &manager,
-        egress::CarriedRecord {
-            account_idx: 0,
-            account: Some("alice@example.com".to_string()),
-            session_key: None,
-            session_kind: tcr::stats::SessionKind::Stable,
-            wire_session_id: None,
-            model: None,
-            method: "POST".to_string(),
-            path: "/v1/messages".to_string(),
-            status: 429,
-            tool_uses: &[],
-            tool_results: &[],
-            upstream_headers: &axum::http::HeaderMap::new(),
-        },
-    )
-    .await;
+    egress::record_carried(&manager, carried_answer(429, &axum::http::HeaderMap::new())).await;
 
     assert_eq!(
         manager.account_status(0),
@@ -3149,59 +2954,16 @@ async fn a_carried_transient_429_parks_for_what_the_direct_path_parks() {
 async fn the_real_listener_hands_a_tunnel_to_the_production_handler() {
     let dir = scratch("real-listener-tunnel");
     let requester = node();
-    let gateway_key = tcr::peer::id::NodeKey::load_or_mint(&dir).expect("the gateway's node key");
-
     // A pinned requester holding the one carry grant, in a peers file written
     // by the one writer (0600, atomic).
-    let peers = dir.join("tcr-peers.json");
-    let mut file = PeerFile::default();
-    file.peers
-        .push(row(&requester.id, "requester", Vec::new(), true));
-    tcr::peer::config::save(&peers, &file).expect("write the peers file");
-
-    let listening = loopback().await;
-    let gateway_addr = listening.local_addr().expect("the gateway address");
-    let store = tcr::peer::config::PeerStore::open(&peers).expect("open the peers file");
-    // The state file is inside the scratch dir and does not exist, so this test
-    // reads nothing under the operator's cache directory and cannot be
-    // perturbed by an operator with a pairing window open while the suite runs.
-    let context =
-        listener::SessionContext::new(&gateway_key, store.path(), &dir.join("peer-state.json"));
-    tokio::spawn(async move {
-        listener::serve_on_with(listening, context)
-            .await
-            .log_debug("serving a test peer listener");
-    });
-
-    let mut stream = TcpStream::connect(gateway_addr)
-        .await
-        .expect("dial the real listener");
-    let mut session = noise::dial_handshake(
-        &mut stream,
-        &requester.secret,
-        Handshake::Return,
-        Some(&gateway_key.id().0),
-        None,
+    let (gateway_key, gateway_addr) = real_gateway_pinning(&dir, &requester).await;
+    let (mut stream, _session) = dial_and_open(
+        gateway_addr,
+        &requester,
+        &gateway_key.id(),
+        &tunnel_to_origin(ORIGIN, 81),
     )
-    .await
-    .expect("a pinned peer completes the handshake with the real listener");
-    let header = StreamHeader {
-        kind: StreamKind::Tunnel,
-        target: Some(TunnelTarget::Origin {
-            host: ORIGIN.to_string(),
-            port: 443,
-        }),
-        via: Vec::new(),
-        hops_remaining: 1,
-        request_id: 81,
-    };
-    noise::send_encrypted(
-        &mut stream,
-        &mut session.transport,
-        &serde_json::to_vec(&header).expect("the header serializes"),
-    )
-    .await
-    .expect("the header is written");
+    .await;
 
     // And then nothing at all: the handler's own deadline is what closes this.
     let started = std::time::Instant::now();
@@ -3244,51 +3006,13 @@ async fn the_real_listener_hands_a_tunnel_to_the_production_handler() {
 async fn a_tunnel_with_no_target_is_refused_by_the_real_listener() {
     let dir = scratch("real-listener-tunnel-no-target");
     let requester = node();
-    let gateway_key = tcr::peer::id::NodeKey::load_or_mint(&dir).expect("the gateway's node key");
-
-    let peers = dir.join("tcr-peers.json");
-    let mut file = PeerFile::default();
-    file.peers
-        .push(row(&requester.id, "requester", Vec::new(), true));
-    tcr::peer::config::save(&peers, &file).expect("write the peers file");
-
-    let listening = loopback().await;
-    let gateway_addr = listening.local_addr().expect("the gateway address");
-    let store = tcr::peer::config::PeerStore::open(&peers).expect("open the peers file");
-    let context =
-        listener::SessionContext::new(&gateway_key, store.path(), &dir.join("peer-state.json"));
-    tokio::spawn(async move {
-        listener::serve_on_with(listening, context)
-            .await
-            .log_debug("serving a test peer listener");
-    });
-
-    let mut stream = TcpStream::connect(gateway_addr)
-        .await
-        .expect("dial the real listener");
-    let mut session = noise::dial_handshake(
-        &mut stream,
-        &requester.secret,
-        Handshake::Return,
-        Some(&gateway_key.id().0),
-        None,
-    )
-    .await
-    .expect("a pinned peer completes the handshake");
+    let (gateway_key, gateway_addr) = real_gateway_pinning(&dir, &requester).await;
     let header = StreamHeader {
-        kind: StreamKind::Tunnel,
         target: None,
-        via: Vec::new(),
-        hops_remaining: 1,
-        request_id: 82,
+        ..tunnel_to_origin(ORIGIN, 82)
     };
-    noise::send_encrypted(
-        &mut stream,
-        &mut session.transport,
-        &serde_json::to_vec(&header).expect("the header serializes"),
-    )
-    .await
-    .expect("the header is written");
+    let (mut stream, _session) =
+        dial_and_open(gateway_addr, &requester, &gateway_key.id(), &header).await;
 
     let mut carried = Vec::new();
     let read = tokio::time::timeout(
@@ -3548,15 +3272,7 @@ async fn a_pinned_request_leaves_through_its_peer_on_every_request() {
         3,
     );
 
-    let mut file = PeerFile::default();
-    file.peers.push(row(
-        &gateway.id,
-        "gateway",
-        vec![gateway_addr.to_string()],
-        false,
-    ));
-    file.peers[0].allow.carry = true;
-    tcr::peer::config::save(&peers, &file).expect("write the peers file");
+    write_carrying_gateway(&peers, &gateway.id, &gateway_addr.to_string());
 
     let manager = fleet_with(
         &format!("https://{ORIGIN}"),
@@ -3602,15 +3318,7 @@ async fn a_down_peer_refuses_by_name_when_the_account_is_strict() {
     let dir = scratch("pinned-strict");
     let peers = dir.join("tcr-peers.json");
     let gateway = node();
-    let mut file = PeerFile::default();
-    file.peers.push(row(
-        &gateway.id,
-        "gateway",
-        vec!["127.0.0.1:1".to_string()],
-        false,
-    ));
-    file.peers[0].allow.carry = true;
-    tcr::peer::config::save(&peers, &file).expect("write the peers file");
+    write_carrying_gateway(&peers, &gateway.id, "127.0.0.1:1");
 
     let manager = fleet_with(
         &format!("https://{ORIGIN}"),
@@ -3696,15 +3404,7 @@ async fn a_carry_that_was_taken_and_failed_is_not_sent_again_from_this_mac() {
         1,
     );
 
-    let mut file = PeerFile::default();
-    file.peers.push(row(
-        &gateway.id,
-        "gateway",
-        vec![gateway_addr.to_string()],
-        false,
-    ));
-    file.peers[0].allow.carry = true;
-    tcr::peer::config::save(&peers, &file).expect("write the peers file");
+    write_carrying_gateway(&peers, &gateway.id, &gateway_addr.to_string());
 
     let manager = fleet_with(
         &format!("https://{ORIGIN}"),
@@ -3752,15 +3452,7 @@ async fn a_down_peer_falls_back_to_this_mac_with_one_line_when_it_is_not_strict(
     let dir = scratch("pinned-loose");
     let peers = dir.join("tcr-peers.json");
     let gateway = node();
-    let mut file = PeerFile::default();
-    file.peers.push(row(
-        &gateway.id,
-        "gateway",
-        vec!["127.0.0.1:1".to_string()],
-        false,
-    ));
-    file.peers[0].allow.carry = true;
-    tcr::peer::config::save(&peers, &file).expect("write the peers file");
+    write_carrying_gateway(&peers, &gateway.id, "127.0.0.1:1");
 
     let (collector, _guard) = capture();
     let manager = fleet_with(
@@ -4045,15 +3737,7 @@ async fn codex_pinned_account_is_never_carried() {
         2,
     );
 
-    let mut file = PeerFile::default();
-    file.peers.push(row(
-        &gateway.id,
-        "gateway",
-        vec![gateway_addr.to_string()],
-        false,
-    ));
-    file.peers[0].allow.carry = true;
-    tcr::peer::config::save(&peers, &file).expect("write the peers file");
+    write_carrying_gateway(&peers, &gateway.id, &gateway_addr.to_string());
 
     let (collector, _guard) = capture();
     for strict in [true, false] {
