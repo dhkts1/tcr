@@ -9,6 +9,7 @@
 //! - [`stub_upstream`]: fake upstreams served from two shared loopback listeners per binary.
 //! - [`loopback`]: a client that never goes through an ambient proxy, and a port nothing holds.
 //! - [`log_capture`]: a tracing writer a test can read back.
+//! - [`live_proxy`]: a real proxy served in-process, for code that dials `proxy.port`.
 
 // `clippy.toml`'s test exemption reaches only a `#[cfg(test)]` module, and this one is also
 // compiled under the feature; a helper that cannot do its job fails the test that called it,
@@ -18,6 +19,7 @@
     reason = "a test helper fails the calling test with a message; the ban is for production code"
 )]
 
+pub mod live_proxy;
 pub mod log_capture;
 pub mod loopback;
 pub mod stub_upstream;

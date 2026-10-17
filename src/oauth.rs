@@ -4901,19 +4901,11 @@ mod tests {
     /// bind-read-drop of a port-0 listener in each test that wanted a refusal.
     const DEAD_PORT: u16 = 1;
 
-    /// A listener on an ephemeral loopback port, and that port. The caller hands the listener
-    /// over to whatever serves on it, so no free port is ever found and then re-bound.
-    async fn bind_loopback() -> (TcpListener, u16) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        (listener, port)
-    }
-
     /// Serve `app` on its own ephemeral loopback port for the rest of the test, and return the
     /// address. Only for code that dials a bare PORT (a live proxy's `proxy.port`); a stub reached
     /// by a base URL is a route on `test_support::stub_upstream` instead, with no port of its own.
     async fn serve_router(app: axum::Router) -> std::net::SocketAddr {
-        let (listener, port) = bind_loopback().await;
+        let (listener, port) = crate::test_support::loopback::listener().await;
         tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
@@ -4922,24 +4914,23 @@ mod tests {
         std::net::SocketAddr::from(([127, 0, 0, 1], port))
     }
 
-    /// Serve a live proxy on `listener` whose config is the JSON `seed`, with `config_path` as
-    /// the file behind it, for the rest of the test. Answers its manager.
+    /// [`crate::test_support::live_proxy::serve`] for the config the JSON `seed` holds.
     fn serve_live_proxy(
         listener: TcpListener,
         seed: &str,
         config_path: Option<std::path::PathBuf>,
     ) -> std::sync::Arc<crate::manager::Manager> {
-        let config: Config = serde_json::from_str(seed).unwrap();
-        let manager = crate::manager::Manager::with_live_refresher(config, config_path);
-        let served = std::sync::Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
-        manager
+        crate::test_support::live_proxy::serve(
+            listener,
+            serde_json::from_str(seed).unwrap(),
+            config_path,
+        )
     }
 
     /// A live proxy, with no config file, that admits only requests carrying `api_key`.
     /// Answers its port.
     async fn live_proxy_requiring_the_api_key(api_key: &str) -> u16 {
-        let (listener, port) = bind_loopback().await;
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let seed = format!(r#"{{ "proxy": {{ "port": {port}, "apiKey": "{api_key}" }} }}"#);
         serve_live_proxy(listener, &seed, None);
         port
@@ -4948,7 +4939,7 @@ mod tests {
     /// A live proxy, and a temp config file tagged `tag` that names its port and nothing else.
     /// The proxy itself runs with no config file behind it. Answers the file's path and the port.
     async fn a_live_proxy_and_its_config_file(tag: &str) -> (std::path::PathBuf, u16) {
-        let (listener, port) = bind_loopback().await;
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-route-{tag}-{}-{port}.json",
             std::process::id()
@@ -5007,7 +4998,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_add_capability_reads_a_stamped_400_as_present() {
-        let (listener, port) = bind_loopback().await;
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let seed = format!(r#"{{ "proxy": {{ "port": {port} }} }}"#);
         serve_live_proxy(listener, &seed, None);
         let config: Config = serde_json::from_str(&seed).unwrap();
@@ -5877,7 +5868,7 @@ mod tests {
     /// be reverted. It must not be.
     #[tokio::test]
     async fn finish_login_live_path_does_not_clobber_a_concurrent_rotation() {
-        let (listener, port) = bind_loopback().await;
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-live-clobber-{}-{port}.json",
             std::process::id()
@@ -5964,7 +5955,7 @@ mod tests {
     /// how the two halves end up disagreeing about an account's credentials.
     #[tokio::test]
     async fn finish_login_live_unauthorized_does_not_fall_back_to_file() {
-        let (listener, port) = bind_loopback().await;
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let seed = format!(r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#);
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-live-unauthorized-{}-{port}.json",
@@ -6589,7 +6580,7 @@ mod tests {
     /// A canned upstream that answers every connection with `status_line` and an
     /// empty body, for [`verify_setup_token`]. Returns its base URL.
     async fn canned_upstream(status_line: &'static str) -> String {
-        let (listener, port) = bind_loopback().await;
+        let (listener, port) = crate::test_support::loopback::listener().await;
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
@@ -7056,7 +7047,7 @@ mod tests {
     #[tokio::test]
     async fn a_codex_import_over_the_live_route_lands_as_codex_beside_the_anthropic_row() {
         use crate::provider::Provider;
-        let (listener, port) = bind_loopback().await;
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let path = std::env::temp_dir().join(format!(
             "tcr-oauth-codex-live-{}-{port}.json",
             std::process::id()
@@ -7389,7 +7380,7 @@ mod tests {
     #[tokio::test]
     async fn a_codex_import_over_a_proxy_that_names_codex_lands_live_as_codex() {
         use crate::provider::Provider;
-        let (listener, port) = bind_loopback().await;
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let (_dir, path) = import_config(
             port,
             &unconstrained_upstream().await,
