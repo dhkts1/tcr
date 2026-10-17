@@ -159,6 +159,11 @@ async fn spawn_upstream() -> (String, Upstream) {
 // One Mac
 // ---------------------------------------------------------------------------
 
+/// How many times one Mac may lose the peer-port race before its boot is a
+/// failure rather than a retry. See [`Mac::boot`] for why the race exists at
+/// all and why it is retried instead of removed.
+const PORT_RACE_ATTEMPTS: u32 = 5;
+
 /// A port the kernel just handed back, released before it is written into a
 /// peers file.
 ///
@@ -167,17 +172,8 @@ async fn spawn_upstream() -> (String, Upstream) {
 /// `tcr peer invite` copies that value into the token it mints: so `:0` is not
 /// usable here even though the listener itself would accept it. See gap 2 in
 /// this file's docs.
-/// How many times one Mac may lose the peer-port race before its boot is a
-/// failure rather than a retry. See [`Mac::boot`] for why the race exists at
-/// all and why it is retried instead of removed.
-const PORT_RACE_ATTEMPTS: u32 = 5;
-
 fn free_loopback_port() -> u16 {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port to borrow");
-    probe
-        .local_addr()
-        .expect("the borrowed port has an address")
-        .port()
+    tcr::test_support::loopback::unused_port()
 }
 
 /// How many draws [`loopback_port_other_than`] makes before it calls the
@@ -1677,16 +1673,11 @@ async fn spawn_upstream_with_trip(trip_credential: String) -> (String, Upstream,
                 .expect("the canned upstream answer builds")
         }
     }));
-    let listening = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind the fake upstream");
-    let addr = listening.local_addr().expect("the fake upstream's address");
-    tokio::spawn(async move {
-        axum::serve(listening, app)
-            .await
-            .log_debug("serving a test server");
-    });
-    (format!("http://{addr}"), upstream, armed)
+    (
+        tcr::test_support::stub_upstream::http(app).url(),
+        upstream,
+        armed,
+    )
 }
 
 /// **Chained borrow**: `root` lends to `middle`, and `middle`, separately,
@@ -2061,16 +2052,7 @@ async fn spawn_slow_upstream(delay: Duration) -> (String, Upstream) {
                 .expect("the canned upstream answer builds")
         }
     }));
-    let listening = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind the fake upstream");
-    let addr = listening.local_addr().expect("the fake upstream's address");
-    tokio::spawn(async move {
-        axum::serve(listening, app)
-            .await
-            .log_debug("serving a test server");
-    });
-    (format!("http://{addr}"), upstream)
+    (tcr::test_support::stub_upstream::http(app).url(), upstream)
 }
 
 // ---------------------------------------------------------------------------

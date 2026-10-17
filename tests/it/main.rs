@@ -25,11 +25,6 @@ mod connect_guard;
 #[path = "../support/tcr_env.rs"]
 mod tcr_env;
 
-/// The old names for `tcr::test_support`'s fixtures, still called by `peer_props` (and compiled
-/// into the separate `peer_egress` and `peer_lease` too).
-#[path = "../support/fixtures.rs"]
-mod fixtures;
-
 /// The harness pieces the `peer_*` modules share (and compiled into the separate `peer_*`
 /// targets that use them too).
 #[path = "../support/peer.rs"]

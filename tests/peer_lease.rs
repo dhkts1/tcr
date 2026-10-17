@@ -40,10 +40,6 @@ mod api_contract;
 #[path = "support/tcr_env.rs"]
 mod tcr_env;
 
-/// `Account` and `Config` fixtures for struct-update syntax.
-#[path = "support/fixtures.rs"]
-mod fixtures;
-
 use std::path::{Path, PathBuf};
 use tcr::log_err::LogErr as _;
 
@@ -2042,21 +2038,6 @@ mod fleet {
             .log_debug("reading a test request body");
     }
 
-    /// Serve `app` on a kernel port and return its URL. `what` names the
-    /// upstream in the bind failure.
-    async fn serve_on_kernel_port(app: Router, what: &str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect(what);
-        let addr = listener.local_addr().expect("upstream addr");
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .log_debug("serving a test server");
-        });
-        format!("http://{addr}")
-    }
-
     struct NeverRefreshes;
     impl TokenRefresher for NeverRefreshes {
         fn refresh(
@@ -2099,7 +2080,7 @@ mod fleet {
             org_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
             access_token: LENDER_TOKEN.to_string(),
             refresh_token: Some("rt-fake-lender".to_string()),
-            ..crate::fixtures::fixture_account("lender-fake")
+            ..tcr::config::Account::fixture("lender-fake")
         }
     }
 
@@ -2112,7 +2093,7 @@ mod fleet {
             upstream: upstream.to_string(),
             switch_threshold: 0.98,
             account_throttle,
-            ..crate::fixtures::fixture_config(accounts)
+            ..tcr::config::Config::fixture(accounts)
         }
     }
 
@@ -2163,10 +2144,7 @@ mod fleet {
                 allowed_answer(vec![b'x'; bytes])
             }
         }));
-        (
-            serve_on_kernel_port(app, "bind the oversized upstream").await,
-            hits,
-        )
+        (tcr::test_support::stub_upstream::http(app).url(), hits)
     }
 
     /// A fake upstream that holds every answer for `delay` before sending it,
@@ -2188,10 +2166,7 @@ mod fleet {
                 allowed_answer(CANNED.to_vec())
             }
         }));
-        (
-            serve_on_kernel_port(app, "bind the slow upstream").await,
-            hits,
-        )
+        (tcr::test_support::stub_upstream::http(app).url(), hits)
     }
 
     /// A fake upstream that rejects every request with a long 429, so the one
@@ -2217,10 +2192,7 @@ mod fleet {
                     .expect("build the canned 429")
             }
         }));
-        (
-            serve_on_kernel_port(app, "bind the rejecting upstream").await,
-            hits,
-        )
+        (tcr::test_support::stub_upstream::http(app).url(), hits)
     }
 
     /// A fleet of ONE account, LOCKED to that account by name.
@@ -2297,9 +2269,36 @@ mod fleet {
     /// Every request the fake upstream was called with, in order.
     pub type ServedBy = Arc<Mutex<Vec<SeenRequest>>>;
 
-    /// A fake upstream on a kernel port that answers [`CANNED`] and records who
-    /// asked.
+    /// A fake upstream that answers [`CANNED`] and records who asked, served
+    /// as a route on the binary's shared stub listener.
     pub async fn spawn_upstream() -> (String, Arc<AtomicUsize>, ServedBy) {
+        let (app, hits, served) = recording_app();
+        (
+            tcr::test_support::stub_upstream::http(app).url(),
+            hits,
+            served,
+        )
+    }
+
+    /// [`spawn_upstream`] on a kernel port of its own, for an ORIGIN a hand-mode
+    /// borrower sends to: `serve_on_handed_bearer` sets the request's path on
+    /// the origin URL rather than appending to it, so a shared stub's
+    /// `/stub/<id>` prefix would be dropped and the request would miss it.
+    pub async fn spawn_origin() -> (String, Arc<AtomicUsize>, ServedBy) {
+        let (app, hits, served) = recording_app();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the fake origin");
+        let addr = listener.local_addr().expect("origin addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .log_debug("serving a test server");
+        });
+        (format!("http://{addr}"), hits, served)
+    }
+
+    fn recording_app() -> (Router, Arc<AtomicUsize>, ServedBy) {
         let hits = Arc::new(AtomicUsize::new(0));
         let served: ServedBy = Arc::new(Mutex::new(Vec::new()));
         let counter = hits.clone();
@@ -2347,11 +2346,7 @@ mod fleet {
                 allowed_answer(CANNED.to_vec())
             }
         }));
-        (
-            serve_on_kernel_port(app, "bind the fake upstream").await,
-            hits,
-            served,
-        )
+        (app, hits, served)
     }
 
     /// A real proxy on a kernel port in front of `manager`.
@@ -7634,7 +7629,7 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
     // The borrower's OWN origin, on its own port. Which origin received the
     // request is the whole instrument: hand mode means these bytes never touch
     // the owner's Mac.
-    let (borrower_origin, borrower_hits, borrower_served) = fleet::spawn_upstream().await;
+    let (borrower_origin, borrower_hits, borrower_served) = fleet::spawn_origin().await;
     let provider = PeerLeaseProvider::new(borrower_peers.clone())
         .with_hand_egress(borrower_origin, reqwest::Client::new());
 
@@ -7933,7 +7928,7 @@ async fn a_borrowed_request_carries_its_query_string_to_the_lenders_upstream() {
 /// (`src/peer/lease.rs`) and the upstream sees a bare `/v1/messages`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_handed_request_carries_its_query_string_to_the_owners_upstream() {
-    let (upstream, hits, served) = fleet::spawn_upstream().await;
+    let (upstream, hits, served) = fleet::spawn_origin().await;
     // A lease id of this test's own, because the handed-token store is one
     // process-wide map and every test in this binary shares it.
     let lease_id = 0xc0ff_ee00_u128;

@@ -677,16 +677,7 @@ mod lender {
                     .expect("build the canned answer")
             }
         }));
-        let listening = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind the fake upstream");
-        let addr = listening.local_addr().expect("upstream addr");
-        tokio::spawn(async move {
-            axum::serve(listening, app)
-                .await
-                .log_debug("serving a test server");
-        });
-        format!("http://{addr}")
+        tcr::test_support::stub_upstream::http(app).url()
     }
 
     /// A manager with ONE fake account, pointed at `upstream`. No real email,

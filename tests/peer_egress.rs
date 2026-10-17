@@ -36,10 +36,6 @@
 #[path = "support/tcr_env.rs"]
 mod tcr_env;
 
-/// `Account` and `Config` fixtures for struct-update syntax.
-#[path = "support/fixtures.rs"]
-mod fixtures;
-
 /// The harness pieces the `peer_*` test files share.
 #[path = "support/peer.rs"]
 mod peer_support;
@@ -1487,7 +1483,7 @@ fn fake_account() -> Account {
         access_token: "at-alice".to_string(),
         refresh_token: Some("rt-alice".to_string()),
         expires_at: Some(4_102_444_800_000),
-        ..fixtures::fixture_account("alice@example.com")
+        ..tcr::config::Account::fixture("alice@example.com")
     }
 }
 
@@ -1521,7 +1517,7 @@ fn fleet_with(upstream: &str, accounts: Vec<Account>) -> Arc<Manager> {
     let config = Config {
         upstream: upstream.to_string(),
         switch_threshold: 0.95,
-        ..fixtures::fixture_config(accounts)
+        ..tcr::config::Config::fixture(accounts)
     };
     Manager::new(
         config,
