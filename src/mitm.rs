@@ -1185,7 +1185,7 @@ async fn read_request_head(stream: &mut TcpStream) -> io::Result<String> {
             break;
         }
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(String::from_utf8_lossy_owned(buf))
 }
 
 /// The `CONNECT` a decrypted stream came through: its host, and whether its head

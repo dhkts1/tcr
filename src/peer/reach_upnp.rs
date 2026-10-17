@@ -1114,7 +1114,7 @@ fn fetch(
             Ok(Fetched {
                 status,
                 redirect_to,
-                body: String::from_utf8_lossy(&collected).into_owned(),
+                body: String::from_utf8_lossy_owned(collected),
             })
         })
     });

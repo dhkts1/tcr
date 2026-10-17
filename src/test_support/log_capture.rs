@@ -12,7 +12,7 @@ impl SharedBuf {
     /// Everything written so far, as text.
     pub fn contents(&self) -> String {
         let bytes = self.0.lock().expect("shared buffer poisoned").clone();
-        String::from_utf8_lossy(&bytes).into_owned()
+        String::from_utf8_lossy_owned(bytes)
     }
 
     /// Forget everything written so far.

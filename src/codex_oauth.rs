@@ -764,10 +764,7 @@ mod tests {
         for status in [403, 500] {
             let (url, _) = stub(status, r#"{"error":"invalid_grant"}"#).await;
             let outcome = refresh_access_token_at(&client, "rt", &url).await;
-            assert!(
-                matches!(outcome, Err(OAuthError::Transient(_))),
-                "{outcome:?}"
-            );
+            std::assert_matches!(outcome, Err(OAuthError::Transient(_)));
         }
     }
 
@@ -802,10 +799,7 @@ mod tests {
         let (url, _) = stub(200, r#"{"access_token":"","refresh_token":"rt-2"}"#).await;
         let client = client();
         let outcome = refresh_access_token_at(&client, "rt-1", &url).await;
-        assert!(
-            matches!(outcome, Err(OAuthError::Transient(_))),
-            "{outcome:?}"
-        );
+        std::assert_matches!(outcome, Err(OAuthError::Transient(_)));
     }
 
     /// A 400's `error` is repeated in its Transient message, which the manager logs at WARN, only
@@ -935,15 +929,12 @@ mod tests {
         )
         .await
         .expect("a 401 is rejected promptly even when its body never arrives");
-        assert!(
-            matches!(
-                outcome,
-                Err(OAuthError::AuthRejected {
-                    status: 401,
-                    code: None
-                })
-            ),
-            "{outcome:?}"
+        std::assert_matches!(
+            outcome,
+            Err(OAuthError::AuthRejected {
+                status: 401,
+                code: None
+            })
         );
     }
 }

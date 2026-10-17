@@ -5111,10 +5111,7 @@ mod tests {
         .unwrap();
 
         let err = load(&path).unwrap_err();
-        assert!(
-            matches!(err, ConfigError::Parse(_)),
-            "expected a Parse-shaped error, got {err:?}"
-        );
+        std::assert_matches!(err, ConfigError::Parse(_), "expected a Parse-shaped error");
         fs::remove_file(&path).ok();
     }
 
@@ -7085,10 +7082,7 @@ mod tests {
         let json = r#"{"accounts":[{"name":"acct-a","accessToken":"at-a"}]}"#;
 
         let err = write_atomic(&target, json).expect_err("rename onto a directory must fail");
-        assert!(
-            matches!(err, ConfigError::Io(_)),
-            "a rename failure is an I/O error, got {err:?}"
-        );
+        std::assert_matches!(err, ConfigError::Io(_), "a rename failure is an I/O error");
 
         let orphans: Vec<PathBuf> = fs::read_dir(&dir)
             .expect("read the destination directory")
@@ -8393,9 +8387,10 @@ mod tests {
         codex.access_token = "at-codex".to_string();
         codex.refresh_token = Some("rt-codex".to_string());
         let write = save_account(&path, &codex).expect("saves");
-        assert!(
-            matches!(write, AccountWrite::Added),
-            "a Codex row must be ADDED beside the Anthropic row, got {write:?}"
+        std::assert_matches!(
+            write,
+            AccountWrite::Added,
+            "a Codex row must be ADDED beside the Anthropic row"
         );
         let after: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let rows = after["accounts"].as_array().unwrap();

@@ -649,7 +649,7 @@ pub(crate) fn read_ledger_day(dir: &Path, date: Date) -> String {
             gz
         }
     };
-    String::from_utf8_lossy(&bytes).into_owned()
+    String::from_utf8_lossy_owned(bytes)
 }
 
 /// What one pass of [`compress_closed_days`] did.

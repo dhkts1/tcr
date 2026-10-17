@@ -489,7 +489,7 @@ pub(crate) fn lsof(pid: u32) -> anyhow::Result<String> {
         .args(["-nP", "-a", "-p", &pid.to_string(), "-i"])
         .output()
         .context("running lsof")?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy_owned(output.stdout))
 }
 
 #[cfg(test)]
