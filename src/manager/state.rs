@@ -12,7 +12,7 @@ impl Manager {
             .expect("config lock poisoned")
             .extra
             .get("quotaProbeSeconds")
-            .and_then(|v| v.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .map_or(crate::probe::DEFAULT_PROBE_SECONDS, |v| v.max(0) as u64)
     }
 
@@ -26,7 +26,7 @@ impl Manager {
             .expect("config lock poisoned")
             .extra
             .get("warmupSeconds")
-            .and_then(|v| v.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .map_or(0, |v| v.max(0) as u64)
     }
 
@@ -36,7 +36,7 @@ impl Manager {
     /// toward keeping caches warm: measured 2026-08-14, a config that lost its
     /// `sessionAffinity` key silently went cold when the default was `false`,
     /// and the client-side prompt-cache hit ratio dropped 0.952 → 0.498 with
-    /// cache_creation rising 6.5M/hour → 122M/hour, sustained seven hours — a
+    /// `cache_creation` rising 6.5M/hour → 122M/hour, sustained seven hours — a
     /// single missing key costing roughly 100M re-created tokens per hour.
     /// The read itself is [`crate::config::Config::session_affinity_enabled`],
     /// which `tcr config show` calls too. When explicitly
@@ -61,7 +61,7 @@ impl Manager {
             .expect("config lock poisoned")
             .extra
             .get("revalidationServe")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(true)
     }
 
@@ -82,7 +82,7 @@ impl Manager {
             .expect("config lock poisoned")
             .extra
             .get("loadBalanceMigration")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
     }
 
@@ -111,7 +111,7 @@ impl Manager {
         match config
             .extra
             .get("cacheTtlRewrite")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
         {
             Some(explicit) => explicit,
             None => config.accounts.iter().all(|a| a.account_type.is_oauth()),
@@ -136,7 +136,7 @@ impl Manager {
             .expect("config lock poisoned")
             .extra
             .get("divertBudget")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .map_or(0, |v| v.min(u64::from(u32::MAX)) as u32)
     }
 
@@ -144,7 +144,7 @@ impl Manager {
     /// `warm_wake().notified()`, so the first sweep after boot happens as soon as
     /// the probe has read some quota rather than a full `warmupSeconds` later. See
     /// the field docs on [`Manager`] for why a lost wake is impossible here.
-    pub fn warm_wake(&self) -> &Notify {
+    pub const fn warm_wake(&self) -> &Notify {
         &self.warm_wake
     }
 
@@ -356,7 +356,7 @@ impl Manager {
     }
 
     /// The unkeyed-caller counters `GET /_tcr/status` reports.
-    pub fn unkeyed(&self) -> &crate::request_key::UnkeyedCounters {
+    pub const fn unkeyed(&self) -> &crate::request_key::UnkeyedCounters {
         &self.unkeyed
     }
 
@@ -459,7 +459,7 @@ impl Manager {
     }
 
     /// A provider only while its slot remains live. Rotation counts must match
-    /// provider_account_count, which excludes retired rows.
+    /// `provider_account_count`, which excludes retired rows.
     pub(crate) fn live_provider(&self, idx: usize) -> Option<crate::provider::Provider> {
         self.accounts
             .read()

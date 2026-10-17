@@ -200,7 +200,11 @@ impl Drop for Server {
         let pid = self.child.id().to_string();
         let signalled = Command::new("kill").args(["-TERM", &pid]).status();
         let deadline = Instant::now() + EXIT_TIMEOUT;
-        while signalled.as_ref().is_ok_and(|s| s.success()) && Instant::now() < deadline {
+        while signalled
+            .as_ref()
+            .is_ok_and(std::process::ExitStatus::success)
+            && Instant::now() < deadline
+        {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return;
             }

@@ -95,10 +95,10 @@ impl Manager {
                 account.pending_codex_writeback = None;
                 return;
             }
-            if !account
+            if account
                 .pending_codex_writeback
                 .as_ref()
-                .is_some_and(|p| crate::now_ms() >= p.retry_after_ms)
+                .is_none_or(|p| crate::now_ms() < p.retry_after_ms)
             {
                 return;
             }
@@ -160,7 +160,7 @@ impl Manager {
         if let Some((name, account, org, org_name, provider, tokens)) = state {
             let me = self.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                me.persist_tokens(&name, account, org, org_name, provider, &tokens)
+                me.persist_tokens(&name, account, org, org_name, provider, &tokens);
             })
             .await;
         }
@@ -634,7 +634,7 @@ impl Manager {
                     crate::provider::Provider::Codex => {
                         if let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) {
                             let _ = tokio::task::spawn_blocking(move || {
-                                me.persist_codex_writeback_record(idx)
+                                me.persist_codex_writeback_record(idx);
                             })
                             .await;
                         }
@@ -738,12 +738,12 @@ impl Manager {
     fn apply_refresh(&self, idx: usize, tokens: &Tokens, cooldown_after: Option<i64>) {
         let mut accounts = self.accounts.write().expect("accounts lock poisoned");
         if let Some(account) = accounts.get_mut(idx) {
-            account.access_token = tokens.access_token.clone();
+            account.access_token.clone_from(&tokens.access_token);
             // THE TRAP: `tokens.refresh_token` must be `Some(...)` on every
             // reachable refresh success — see [`Tokens::refresh_token`]'s doc
             // comment. Writing a bare `None` here would silently make a
             // healthy account unrefreshable with no error and no log line.
-            account.refresh_token = tokens.refresh_token.clone();
+            account.refresh_token.clone_from(&tokens.refresh_token);
             account.expires_at_ms = Some(tokens.expires_at_ms);
             account.refresh_retry_after_ms = cooldown_after;
             if account.status == AccountStatus::Error {

@@ -165,7 +165,7 @@ pub struct PricingTable {
 }
 
 impl PricingTable {
-    pub fn new(overrides: BTreeMap<String, PricingOverride>) -> Self {
+    pub const fn new(overrides: BTreeMap<String, PricingOverride>) -> Self {
         Self { overrides }
     }
 

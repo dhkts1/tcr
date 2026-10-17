@@ -84,7 +84,7 @@ impl SaveGate {
     }
 
     /// How long a change outside the shape may wait before it is written.
-    pub fn refresh(&self) -> Duration {
+    pub const fn refresh(&self) -> Duration {
         self.refresh
     }
 

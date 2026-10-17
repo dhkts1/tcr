@@ -101,7 +101,7 @@ pub struct Ask<'a> {
     /// # Why an `Ask` carries one at all
     ///
     /// `ServeRequest::method` used to be written as the literal `"POST"` by the
-    /// borrower, so a client that sent `GET /v1/messages` had it POSTed on
+    /// borrower, so a client that sent `GET /v1/messages` had it `POSTed` on
     /// somebody else's account: an answer to a question it never asked, paid
     /// for out of a lease. The lender refuses a non-POST frame now
     /// (`peer::serve::handle_serve_on`), but that refusal happens after the

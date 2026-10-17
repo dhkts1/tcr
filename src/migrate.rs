@@ -52,10 +52,10 @@ pub enum Unit {
 }
 
 impl Unit {
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
-            Unit::Config => "config file",
-            Unit::Cache => "cache directory",
+            Self::Config => "config file",
+            Self::Cache => "cache directory",
         }
     }
 }
@@ -270,8 +270,8 @@ impl Run {
     /// The summary word.
     pub fn outcome(&self) -> Outcome {
         match self {
-            Run::Refused(_) => Outcome::Refused,
-            Run::Done(report) => report.outcome(),
+            Self::Refused(_) => Outcome::Refused,
+            Self::Done(report) => report.outcome(),
         }
     }
 
@@ -280,8 +280,8 @@ impl Run {
     pub fn to_json(&self) -> serde_json::Value {
         let empty = Report::default();
         let (refusal, report) = match self {
-            Run::Refused(refusal) => (Some(refusal), &empty),
-            Run::Done(report) => (None, report),
+            Self::Refused(refusal) => (Some(refusal), &empty),
+            Self::Done(report) => (None, report),
         };
         serde_json::json!({
             "outcome": self.outcome(),
@@ -541,7 +541,7 @@ pub fn after_update() {
              proxy is stopped.",
             refusal.port, refusal.pid
         ),
-        done => print(&done, false),
+        done @ Run::Done(_) => print(&done, false),
     }
 }
 

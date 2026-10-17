@@ -279,13 +279,13 @@ impl UsageRecord {
     }
 
     /// The quota counter's input figure — the caller's number, unchanged.
-    pub fn input_total(&self) -> u64 {
+    pub const fn input_total(&self) -> u64 {
         self.quota_input
     }
 
     /// Total cache-creation tokens, both TTLs — the existing
     /// `cache_creation_tokens` counter's meaning, unchanged.
-    pub fn cache_creation(&self) -> u64 {
+    pub const fn cache_creation(&self) -> u64 {
         self.cache_5m + self.cache_1h
     }
 
@@ -312,7 +312,7 @@ struct Totals {
 }
 
 impl Totals {
-    fn add(&mut self, other: &Totals) {
+    const fn add(&mut self, other: &Self) {
         self.requests += other.requests;
         self.input += other.input;
         self.cache_5m += other.cache_5m;
@@ -449,7 +449,7 @@ fn sum(map: &BTreeMap<String, Totals>) -> Totals {
 /// [`warn_if_local_offset_unavailable`], which says so once at boot rather than
 /// letting every day boundary silently mean something else.
 pub fn local_day(ts_ms: i64) -> Date {
-    let at = OffsetDateTime::from_unix_timestamp_nanos(ts_ms as i128 * 1_000_000)
+    let at = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ts_ms) * 1_000_000)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH);
     let offset = UtcOffset::local_offset_at(at).unwrap_or(UtcOffset::UTC);
     at.to_offset(offset).date()
@@ -471,7 +471,7 @@ pub fn warn_if_local_offset_unavailable() {
 /// own file is named after, rather than re-deriving that from the timestamp a
 /// second way.
 pub(crate) fn ledger_date(ts_ms: i64) -> Date {
-    OffsetDateTime::from_unix_timestamp_nanos(ts_ms as i128 * 1_000_000)
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ts_ms) * 1_000_000)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
         .date()
 }
@@ -553,7 +553,7 @@ pub(crate) struct LedgerLine {
 
 /// For `#[serde(skip_serializing_if)]` on [`LedgerLine::rt`]: a line with no reasoning tokens
 /// writes no key, so an Anthropic line is byte for byte what it was.
-fn is_zero(n: &u64) -> bool {
+const fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
@@ -987,33 +987,25 @@ impl Ledger {
     }
 
     fn append(&mut self, line: &LedgerLine) {
-        match self.try_append(line) {
-            // Report every TRANSITION, in both directions. Warning once and
-            // then falling silent forever is how a ledger that died at 10:00
-            // goes on looking healthy at 18:00; warning per failed write is a
-            // log flood. A transition is the one event that is both bounded and
-            // never absent.
-            Err(err) => {
-                if self.set_healthy(false) {
-                    tracing::warn!(
-                        dir = %self.dir.display(),
-                        error = %err,
-                        dropped_lines = self.dropped.load(Ordering::Relaxed),
-                        "the usage ledger stopped writing; today's totals will NOT survive a \
-                         restart until it recovers"
-                    );
-                }
+        if let Err(err) = self.try_append(line) {
+            if self.set_healthy(false) {
+                tracing::warn!(
+                    dir = %self.dir.display(),
+                    error = %err,
+                    dropped_lines = self.dropped.load(Ordering::Relaxed),
+                    "the usage ledger stopped writing; today's totals will NOT survive a \
+                     restart until it recovers"
+                );
             }
-            Ok(()) => {
-                if self.set_healthy(true) {
-                    tracing::info!(
-                        dir = %self.dir.display(),
-                        dropped_lines = self.dropped.load(Ordering::Relaxed),
-                        "the usage ledger is writing again; the lines it missed are gone"
-                    );
-                }
-                self.note_drop_episode();
+        } else {
+            if self.set_healthy(true) {
+                tracing::info!(
+                    dir = %self.dir.display(),
+                    dropped_lines = self.dropped.load(Ordering::Relaxed),
+                    "the usage ledger is writing again; the lines it missed are gone"
+                );
             }
+            self.note_drop_episode();
         }
     }
 
@@ -3238,7 +3230,7 @@ mod tests {
 
         // The org-b account is removed. Its lines name a uuid that IS still in
         // the fleet, on the sibling — and they are still not the sibling's.
-        let survivor = vec![corp.clone()];
+        let survivor = vec![corp];
         let replayed = tracker();
         let report = replayed.attach_ledger(dir.clone(), 90, &survivor, now);
         assert_eq!(

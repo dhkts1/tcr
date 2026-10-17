@@ -806,7 +806,7 @@ fn a_grant_is_clamped_by_the_narrowest_of_the_three() {
     assert_eq!(
         lease::clamp_to_grant(
             &token_unit,
-            Some(granted.clone()),
+            Some(granted),
             true,
             0.40,
             NOW,
@@ -1365,7 +1365,7 @@ fn a_lease_with_no_grantee_is_neither_persisted_nor_restored() {
     assert_eq!(on_disk.leases[0].peer, PeerId([48_u8; 32]));
 
     // The reader, against a file an older build could have left behind.
-    let mut planted = on_disk.clone();
+    let mut planted = on_disk;
     planted.leases.push(tcr::peer::state::LeaseRow {
         lease: live,
         peer: PeerId([0_u8; 32]),
@@ -1635,7 +1635,7 @@ impl serve::WindowUtilization for AnyScope {
     }
 }
 
-fn lease_with(lease_id: u128, budget: f64, spent: f64) -> Lease {
+const fn lease_with(lease_id: u128, budget: f64, spent: f64) -> Lease {
     Lease {
         lease_id,
         window: Window::SevenDay,
@@ -1662,7 +1662,7 @@ fn lease_with(lease_id: u128, budget: f64, spent: f64) -> Lease {
 /// lease is debited against the ledger's own clock, and the fixed fixture clock
 /// is two years in the past, so a lease built on it is expired before the test
 /// starts.
-fn token_lease_at(lease_id: u128, tokens: u64, now_ms: i64) -> Lease {
+const fn token_lease_at(lease_id: u128, tokens: u64, now_ms: i64) -> Lease {
     Lease {
         lease_id,
         window: Window::SevenDay,
@@ -1796,12 +1796,12 @@ mod fleet {
 
     /// The canned body the fake upstream answers with. A relayed request that
     /// reached a real account comes back as exactly these bytes.
-    pub const CANNED: &[u8] = br#"{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#;
+    pub(crate) const CANNED: &[u8] = br#"{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#;
 
     /// The lender's one account. Its access token is the instrument: the fake
     /// upstream records the Bearer it was called with, so "served on the
     /// LENDER's account" is measured rather than assumed.
-    pub const LENDER_TOKEN: &str = "at-fake-lender";
+    pub(crate) const LENDER_TOKEN: &str = "at-fake-lender";
 
     struct NeverRefreshes;
     impl TokenRefresher for NeverRefreshes {
@@ -1899,7 +1899,10 @@ mod fleet {
     }
 
     /// A manager with ONE account: the lender's fleet.
-    pub fn lending_manager(upstream: &str, account_throttle: ThrottleConfig) -> Arc<Manager> {
+    pub(crate) fn lending_manager(
+        upstream: &str,
+        account_throttle: ThrottleConfig,
+    ) -> Arc<Manager> {
         Manager::new(
             config(upstream, vec![account()], account_throttle),
             Arc::new(NeverRefreshes),
@@ -1913,7 +1916,7 @@ mod fleet {
     /// origin pointed at `upstream` too: a lender that HAS an account a Codex
     /// path could be served on, so a refusal of one is a decision and not an
     /// accident of an Anthropic-only fleet.
-    pub fn codex_lending_manager(upstream: &str) -> Arc<Manager> {
+    pub(crate) fn codex_lending_manager(upstream: &str) -> Arc<Manager> {
         let mut config = config(
             upstream,
             vec![Account {
@@ -1934,7 +1937,7 @@ mod fleet {
 
     /// A fake upstream whose answer is `bytes` long: more than one relayed
     /// frame carries, which is any long completion.
-    pub async fn spawn_huge_upstream(bytes: usize) -> (String, Arc<AtomicUsize>) {
+    pub(crate) async fn spawn_huge_upstream(bytes: usize) -> (String, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = hits.clone();
         let app = Router::new().fallback(any(move |req: axum::extract::Request| {
@@ -1965,7 +1968,9 @@ mod fleet {
     /// A fake upstream that holds every answer for `delay` before sending it,
     /// so a borrow whose deadline is shorter runs out of time AFTER its body
     /// has crossed to the lender and reached the origin.
-    pub async fn spawn_slow_upstream(delay: std::time::Duration) -> (String, Arc<AtomicUsize>) {
+    pub(crate) async fn spawn_slow_upstream(
+        delay: std::time::Duration,
+    ) -> (String, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = hits.clone();
         let app = Router::new().fallback(any(move |req: axum::extract::Request| {
@@ -2001,7 +2006,7 @@ mod fleet {
     /// A fake upstream that rejects every request with a long 429, so the one
     /// account that tried it is put on a hold the picker will not come back to
     /// inside this test.
-    pub async fn spawn_rejecting_upstream() -> (String, Arc<AtomicUsize>) {
+    pub(crate) async fn spawn_rejecting_upstream() -> (String, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = hits.clone();
         let app = Router::new().fallback(any(move |req: axum::extract::Request| {
@@ -2038,7 +2043,7 @@ mod fleet {
     /// fleet does. The difference is what may happen there: a dry fleet may
     /// borrow, and a locked one may not, because a peer's credential is not
     /// the account the operator pinned this fleet to.
-    pub fn locked_manager(upstream: &str) -> Arc<Manager> {
+    pub(crate) fn locked_manager(upstream: &str) -> Arc<Manager> {
         let locked = account();
         let name = locked.name.clone();
         let mut config = config(upstream, vec![locked], ThrottleConfig::default());
@@ -2054,7 +2059,7 @@ mod fleet {
 
     /// A manager with NO accounts at all: the dry fleet, which is the only
     /// condition under which the fallback seam is consulted.
-    pub fn dry_manager() -> Arc<Manager> {
+    pub(crate) fn dry_manager() -> Arc<Manager> {
         Manager::new(
             config("http://127.0.0.1:1", Vec::new(), ThrottleConfig::default()),
             Arc::new(NeverRefreshes),
@@ -2071,7 +2076,7 @@ mod fleet {
     /// asks what the lender's outbound request carried, and a recorder that
     /// keeps one header cannot answer a question about the others.
     #[derive(Debug, Clone)]
-    pub struct SeenRequest {
+    pub(crate) struct SeenRequest {
         /// The Bearer, with `Bearer ` stripped, or `<none>`.
         pub token: String,
         /// Every header name and value, lower-cased names.
@@ -2084,7 +2089,7 @@ mod fleet {
 
     impl SeenRequest {
         /// The first value under `name`, or `None`.
-        pub fn header(&self, name: &str) -> Option<&str> {
+        pub(crate) fn header(&self, name: &str) -> Option<&str> {
             self.headers
                 .iter()
                 .find(|(seen, _)| seen == name)
@@ -2094,7 +2099,7 @@ mod fleet {
         /// Every header value, for an assertion about a SECRET rather than
         /// about a name: a borrower's cookie arriving under a name nobody
         /// thought to check is invisible to a per-name assertion.
-        pub fn values(&self) -> Vec<&str> {
+        pub(crate) fn values(&self) -> Vec<&str> {
             self.headers
                 .iter()
                 .map(|(_, value)| value.as_str())
@@ -2103,11 +2108,11 @@ mod fleet {
     }
 
     /// Every request the fake upstream was called with, in order.
-    pub type ServedBy = Arc<Mutex<Vec<SeenRequest>>>;
+    pub(crate) type ServedBy = Arc<Mutex<Vec<SeenRequest>>>;
 
     /// A fake upstream on a kernel port that answers [`CANNED`] and records who
     /// asked.
-    pub async fn spawn_upstream() -> (String, Arc<AtomicUsize>, ServedBy) {
+    pub(crate) async fn spawn_upstream() -> (String, Arc<AtomicUsize>, ServedBy) {
         let hits = Arc::new(AtomicUsize::new(0));
         let served: ServedBy = Arc::new(Mutex::new(Vec::new()));
         let counter = hits.clone();
@@ -2173,7 +2178,7 @@ mod fleet {
     }
 
     /// A real proxy on a kernel port in front of `manager`.
-    pub async fn spawn_proxy(manager: Arc<Manager>) -> String {
+    pub(crate) async fn spawn_proxy(manager: Arc<Manager>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the proxy");
@@ -2184,7 +2189,7 @@ mod fleet {
         format!("http://{addr}")
     }
 
-    pub fn tight_throttle() -> ThrottleConfig {
+    pub(crate) const fn tight_throttle() -> ThrottleConfig {
         ThrottleConfig {
             min_spacing_ms: Some(350),
             burst: Some(1),
@@ -2238,14 +2243,14 @@ mod mesh {
     /// a real rise needs the fake upstream to move the lender's utilization
     /// between two probes, which is a test of `update_from_headers` rather than
     /// of the debit.
-    pub struct ScriptedUtilization {
+    pub(crate) struct ScriptedUtilization {
         script: Vec<Vec<Option<f64>>>,
         taken: Mutex<usize>,
     }
 
     impl ScriptedUtilization {
         /// A reader that answers `script[0]`, then `script[1]`, and so on.
-        pub fn new(script: Vec<Vec<Option<f64>>>) -> Self {
+        pub(crate) fn new(script: Vec<Vec<Option<f64>>>) -> Self {
             assert!(!script.is_empty(), "a script with no reads answers nothing");
             Self {
                 script,
@@ -2255,7 +2260,7 @@ mod mesh {
 
         /// How many reads happened. The positive control on the instrument: a
         /// reader nobody called would satisfy a debit assertion by accident.
-        pub fn reads_taken(&self) -> usize {
+        pub(crate) fn reads_taken(&self) -> usize {
             *self.taken.lock().expect("scripted-utilization lock")
         }
     }
@@ -2283,7 +2288,7 @@ mod mesh {
     /// operator who has `tcr peer pair` open while the suite runs. A missing
     /// file reads as a closed window, which is what a pinned-peer `IK` return
     /// needs anyway.
-    pub async fn spawn_lender(
+    pub(crate) async fn spawn_lender(
         key_dir: PathBuf,
         peers_path: PathBuf,
         ledger: Arc<Mutex<Ledger>>,
@@ -2330,7 +2335,7 @@ mod mesh {
     /// borrower's own write can fail with the connection already gone, which
     /// hides the defect behind the kernel's timing. A lender that simply never
     /// answers is the same fact to the borrower and it is the same every run.
-    pub async fn spawn_lender_that_takes_nothing(
+    pub(crate) async fn spawn_lender_that_takes_nothing(
         key_dir: PathBuf,
         peers_path: PathBuf,
     ) -> SocketAddr {
@@ -2378,7 +2383,7 @@ mod mesh {
     }
 
     /// Every DECRYPTED request frame the lender read, in order.
-    pub type CapturedFrames = Arc<Mutex<Vec<Vec<u8>>>>;
+    pub(crate) type CapturedFrames = Arc<Mutex<Vec<Vec<u8>>>>;
 
     /// A lender that captures the decrypted [`serve::ServeRequest`] frame and
     /// answers a canned reply, serving nothing.
@@ -2398,7 +2403,7 @@ mod mesh {
     /// That is what makes `a_relayed_frame_the_lender_receives_holds_no_
     /// credential` a measurement: delete the scrub and the borrower's token is
     /// in these bytes.
-    pub async fn spawn_capturing_lender(
+    pub(crate) async fn spawn_capturing_lender(
         key_dir: PathBuf,
         peers_path: PathBuf,
         captured: CapturedFrames,
@@ -2509,7 +2514,7 @@ mod mesh {
     }
 
     /// How many `Control::LeaseRequest` frames a lender has read.
-    pub type LeaseAsks = Arc<std::sync::atomic::AtomicUsize>;
+    pub(crate) type LeaseAsks = Arc<std::sync::atomic::AtomicUsize>;
 
     /// A lender that COUNTS lease asks, grants every one of them, and serves
     /// whatever is then relayed to it.
@@ -2528,7 +2533,7 @@ mod mesh {
     /// enough that four more land inside it, which is the race
     /// `PeerLeaseProvider::lease_for`'s ask gate exists to close. Without the
     /// gate this counter reads five.
-    pub async fn spawn_counting_lease_lender(
+    pub(crate) async fn spawn_counting_lease_lender(
         key_dir: PathBuf,
         peers_path: PathBuf,
         asks: LeaseAsks,
@@ -3062,7 +3067,7 @@ async fn a_borrowed_request_is_served_on_the_lenders_account() {
         // unmeasurable and `Ledger::debit` charges MIN_DEBIT, which is what
         // assertion 3 reads: see `a_served_request_debits_the_measured_rise`
         // for the other half.
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -3288,7 +3293,7 @@ async fn a_lender_forwards_only_the_allowlisted_headers() {
         pair.peers_path.clone(),
         pair.ledger.clone(),
         lender_proxy,
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -3405,11 +3410,11 @@ async fn a_lender_forwards_only_the_allowlisted_headers() {
     }
 }
 
-/// **A non-POST relayed request is refused, never silently POSTed.**
+/// **A non-POST relayed request is refused, never silently `POSTed`.**
 ///
 /// `ServeRequest::method` was written as the literal `"POST"` by the borrower
 /// and read by nobody, so a borrower whose client sent `GET /v1/messages` had
-/// it POSTed on the lender's account: an answer to a question it never asked,
+/// it `POSTed` on the lender's account: an answer to a question it never asked,
 /// paid for out of a lease. The field is honoured, this build serves exactly
 /// one method and refuses the rest rather than rewriting them.
 ///
@@ -3427,7 +3432,7 @@ async fn a_non_post_relayed_request_is_refused() {
         pair.peers_path.clone(),
         pair.ledger.clone(),
         lender_proxy,
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -3591,7 +3596,7 @@ async fn a_relayed_frame_the_lender_receives_holds_no_credential() {
 /// the figure the reader reported is the figure the lease was charged.
 ///
 /// Watch it fail by restoring `ledger.debit(request.lease_id,
-/// request.request_id, 0.0)`: `spent` is then MIN_DEBIT (0.002) against the
+/// request.request_id, 0.0)`: `spent` is then `MIN_DEBIT` (0.002) against the
 /// 0.07 asserted here. Measured red that way before this test was kept.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_served_request_debits_the_measured_utilization_rise() {
@@ -4076,7 +4081,7 @@ async fn borrowed_burst(throttle: tcr::config::ThrottleConfig) -> std::time::Dur
         lender_peers.clone(),
         ledger,
         lender_proxy,
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -4149,7 +4154,7 @@ async fn a_lender_refuses_a_local_control_path_in_a_frame() {
         pair.peers_path.clone(),
         pair.ledger.clone(),
         lender_proxy,
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -4215,7 +4220,7 @@ async fn a_borrower_on_the_older_serve_flow_is_refused_and_nothing_is_served() {
         pair.peers_path.clone(),
         pair.ledger.clone(),
         lender_proxy,
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -4306,7 +4311,7 @@ async fn an_answer_that_cannot_be_carried_back_is_never_retryable() {
         pair.peers_path.clone(),
         pair.ledger.clone(),
         format!("http://{truncating}"),
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -4598,16 +4603,7 @@ fn a_grant_past_its_end_mints_nothing_and_one_ahead_carries_it() {
     );
 
     // No end asked for, no end on the lease.
-    let endless = lease::clamp_to_grant(
-        &ask,
-        Some(granted.clone()),
-        true,
-        0.40,
-        now_ms,
-        LEASE,
-        None,
-        None,
-    );
+    let endless = lease::clamp_to_grant(&ask, Some(granted), true, 0.40, now_ms, LEASE, None, None);
     assert_eq!(
         endless.lease.expect("a lease with no end is granted").until,
         None
@@ -6242,7 +6238,7 @@ fn an_unenforceable_grant_is_skipped_and_the_next_one_on_the_window_mints() {
 /// its input before trying each arm. The position it then reports is where the
 /// BUFFER ran out, not where the bad field is: for this fixture it named line
 /// 11 (where the list closes), for a defect on line 9, under the message
-/// "data did not match any variant of untagged enum OneOrMany", which names
+/// "data did not match any variant of untagged enum `OneOrMany`", which names
 /// neither the field nor anything an operator can act on.
 ///
 /// Watch it fail by putting the untagged enum back: measured, the refusal then
@@ -6512,7 +6508,7 @@ async fn an_accepted_connection_opens_the_peers_file_once() {
         lender_peers.clone(),
         ledger.clone(),
         lender_proxy.clone(),
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -6608,7 +6604,7 @@ async fn a_borrowed_lease_is_written_and_a_fresh_ls_reads_its_until() {
         lender_peers.clone(),
         ledger.clone(),
         lender_proxy.clone(),
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -6730,7 +6726,7 @@ async fn a_borrow_through_the_provider_carries_the_headers_the_api_requires() {
         lender_peers.clone(),
         ledger.clone(),
         lender_proxy.clone(),
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -7038,7 +7034,7 @@ async fn a_borrow_that_was_delivered_is_never_offered_to_another_lender() {
             peers,
             ledger,
             lender_proxy.clone(),
-            std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+            std::sync::Arc::new(serve::NoFleetUtilization),
             fleet::dry_manager(),
         )
         .await;
@@ -7049,10 +7045,10 @@ async fn a_borrow_that_was_delivered_is_never_offered_to_another_lender() {
     // The deadline is the borrower's own file, which is the production path:
     // shorter than the origin's delay, so the first lender runs out of time
     // with the body already gone.
-    let file = tcr::peer::config::PeerFile {
+    let file = PeerFile {
         peers: rows,
         borrow_timeout_ms: 300,
-        ..tcr::peer::config::PeerFile::default()
+        ..PeerFile::default()
     };
     tcr::peer::config::save(&borrower_peers, &file).expect("the borrower's peers file writes");
 
@@ -7310,7 +7306,7 @@ async fn a_lender_that_refuses_at_its_gate_is_not_this_lender_and_the_next_serve
             peers,
             ledger,
             lender_proxy.clone(),
-            std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+            std::sync::Arc::new(serve::NoFleetUtilization),
             fleet::dry_manager(),
         )
         .await;
@@ -7318,10 +7314,10 @@ async fn a_lender_that_refuses_at_its_gate_is_not_this_lender_and_the_next_serve
         homes.push(home);
     }
 
-    let file = tcr::peer::config::PeerFile {
+    let file = PeerFile {
         peers: rows,
         borrow_timeout_ms: 3_000,
-        ..tcr::peer::config::PeerFile::default()
+        ..PeerFile::default()
     };
     tcr::peer::config::save(&borrower_peers, &file).expect("the borrower's peers file writes");
 
@@ -7378,10 +7374,10 @@ async fn borrow_timeout_ms_on_the_peers_file_is_the_deadline_open_serve_uses() {
         }
     });
 
-    let file = tcr::peer::config::PeerFile {
+    let file = PeerFile {
         peers: vec![borrower_row_for(lender_id, true, vec![addr.to_string()])],
         borrow_timeout_ms: 50,
-        ..tcr::peer::config::PeerFile::default()
+        ..PeerFile::default()
     };
     tcr::peer::config::save(&borrower_peers, &file).expect("the borrower's peers file writes");
 
@@ -7909,7 +7905,7 @@ fn a_row_is_dialled_newest_first_and_through_a_peer_last() {
         "newest direct socket, then the older one, then the hop: {order:?}"
     );
     assert!(
-        order.last().map(Endpoint::is_via).unwrap_or(false),
+        order.last().is_some_and(Endpoint::is_via),
         "a forwarded hop is tried last: {order:?}"
     );
 }
@@ -8030,7 +8026,7 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
     // A bearer is handed over only for an account whose window this Mac has
     // MEASURED: the frame carries the baseline the borrower's own rises are
     // counted against, so an unmeasured account has no handoff to make.
-    let mut measured = reqwest::header::HeaderMap::new();
+    let mut measured = HeaderMap::new();
     measured.insert(
         "anthropic-ratelimit-unified-7d-utilization",
         "0.10".parse().expect("a header value"),
@@ -8071,7 +8067,7 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
         lender_peers.clone(),
         ledger.clone(),
         owner_proxy.clone(),
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         manager.clone(),
     )
     .await;
@@ -8101,7 +8097,7 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
     // The lease the provider is holding, read off the borrower's own state
     // file, which is where it writes the borrowed rows. Its id is what the
     // bearer is keyed by and what this test forgets on the way out.
-    let borrower_state = tcr::peer::serve::peer_state_path(&borrower_peers);
+    let borrower_state = serve::peer_state_path(&borrower_peers);
     let handed = tcr::peer::state::load(&borrower_state, tcr::now_ms())
         .expect("the borrower's state file reads")
         .borrowed
@@ -8390,7 +8386,7 @@ async fn a_borrowed_request_carries_its_query_string_to_the_lenders_upstream() {
         lender_peers.clone(),
         ledger.clone(),
         lender_proxy.clone(),
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -8566,7 +8562,7 @@ async fn a_relay_outside_the_grants_hours_is_refused_rather_than_served() {
         lender_peers.clone(),
         ledger.clone(),
         lender_proxy.clone(),
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -8717,7 +8713,7 @@ async fn codex_path_in_a_frame_is_refused_by_the_lender() {
         pair.peers_path.clone(),
         pair.ledger.clone(),
         lender_proxy,
-        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;

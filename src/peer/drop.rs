@@ -212,7 +212,7 @@ impl DropName {
     }
 
     /// The raw bytes, for the sealed record's associated data.
-    pub fn as_bytes(&self) -> &[u8; 16] {
+    pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
 }
@@ -221,7 +221,7 @@ impl DropName {
 ///
 /// [`crate::peer::reach::current_slot`]'s shape over this module's own slot
 /// length.
-pub fn current_slot(unix_seconds: u64) -> u64 {
+pub const fn current_slot(unix_seconds: u64) -> u64 {
     unix_seconds / DROP_SLOT_SECONDS
 }
 
@@ -233,7 +233,7 @@ pub fn current_slot(unix_seconds: u64) -> u64 {
 /// nothing yet, while the slot just ended is where a record written four
 /// minutes ago still sits. Ordered current, previous, which is the order a
 /// reader should try them in.
-pub fn accepted_slots(slot: u64) -> [u64; 2] {
+pub const fn accepted_slots(slot: u64) -> [u64; 2] {
     [slot, slot.saturating_sub(1)]
 }
 

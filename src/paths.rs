@@ -32,13 +32,13 @@ pub const CACHE_DIR: &str = "tcr";
 /// The rotating log file prefix inside the new cache directory.
 pub const LOG_PREFIX: &str = "tcr.log";
 
-/// Codex's auth document inside an explicitly selected CODEX_HOME.
+/// Codex's auth document inside an explicitly selected `CODEX_HOME`.
 pub const CODEX_AUTH_FILE: &str = "auth.json";
 /// The stable advisory lock shared by tcr's imported-login writers; Codex does not take it.
 const CODEX_AUTH_LOCK_FILE: &str = ".auth.json.tcr-lock";
 /// A private temporary sibling used to publish a guarded imported-login update.
 pub(crate) const CODEX_AUTH_TEMP_PREFIX: &str = ".auth.json.tcr-";
-/// A throwaway CODEX_HOME beside the selected tcr config, removed when sign-in ends.
+/// A throwaway `CODEX_HOME` beside the selected tcr config, removed when sign-in ends.
 pub(crate) const CODEX_LOGIN_PREFIX: &str = "tcr-codex-login.";
 
 /// Codex's state directory: an explicitly selected home wins, otherwise HOME/.codex.
@@ -119,7 +119,7 @@ pub enum Generation {
 }
 
 /// The rule: new if it exists, else old if it exists, else new.
-fn pick(new_exists: bool, old_exists: bool) -> Generation {
+const fn pick(new_exists: bool, old_exists: bool) -> Generation {
     if !new_exists && old_exists {
         Generation::Legacy
     } else {
@@ -158,7 +158,7 @@ impl CacheDir {
     }
 
     /// Which name the directory resolved to.
-    pub fn generation(&self) -> Generation {
+    pub const fn generation(&self) -> Generation {
         self.generation
     }
 
@@ -189,7 +189,7 @@ impl CacheDir {
 
     /// The log file prefix for this directory: `tcr.log` in the new one,
     /// `teamclaude-rs.log` in the old one, so the old logs keep being pruned.
-    pub fn log_prefix(&self) -> &'static str {
+    pub const fn log_prefix(&self) -> &'static str {
         match self.generation {
             Generation::Current => LOG_PREFIX,
             Generation::Legacy => legacy_names::LOG_PREFIX,

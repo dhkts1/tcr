@@ -1,7 +1,7 @@
 //! Noticing that the machine slept, so a pooled upstream connection that died
 //! during the sleep is retired before a request is sent on it.
 //!
-//! A Mac on battery sleeps and DarkWakes roughly every 15 minutes. While it
+//! A Mac on battery sleeps and `DarkWakes` roughly every 15 minutes. While it
 //! sleeps, Anthropic's edge (or a NAT on the way) closes the idle connections
 //! tcr keeps pooled. On wake, the first send per account checks one of them out
 //! and fails with `ConnectionReset`; one day's log held 935 such same-account
@@ -32,7 +32,7 @@ use std::time::{Duration, Instant, SystemTime};
 /// a synced machine slews or steps by milliseconds to low single seconds, and
 /// reading the two clocks a few instructions apart under heavy load differs by
 /// microseconds. Above it: the sleeps that matter, which are minutes long (the
-/// DarkWake cadence is ~15 minutes). A false positive (a large forward NTP
+/// `DarkWake` cadence is ~15 minutes). A false positive (a large forward NTP
 /// step) costs one TCP+TLS handshake per client and nothing else, so erring
 /// low is cheap; erring high only misses sleeps short enough that the pooled
 /// connection most likely survived them.
@@ -170,7 +170,7 @@ impl<T> SleepAwareClient<T> {
     }
 
     #[cfg(test)]
-    pub(crate) fn detector(&self) -> &WakeDetector {
+    pub(crate) const fn detector(&self) -> &WakeDetector {
         &self.detector
     }
 }
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn a_wall_clock_far_ahead_of_the_monotonic_one_is_a_sleep() {
         assert_eq!(
-            slept_between(SECOND, Some(Duration::from_secs(900))),
+            slept_between(SECOND, Some(Duration::from_mins(15))),
             Some(Duration::from_secs(899)),
             "900 s of wall time over 1 s of monotonic time is an 899 s sleep"
         );
@@ -216,12 +216,12 @@ mod tests {
     #[test]
     fn a_wall_clock_stepping_backwards_is_not_a_sleep() {
         assert_eq!(
-            slept_between(Duration::from_secs(900), None),
+            slept_between(Duration::from_mins(15), None),
             None,
             "a backwards wall step is a clock change, not a sleep"
         );
         assert_eq!(
-            slept_between(Duration::from_secs(900), Some(SECOND)),
+            slept_between(Duration::from_mins(15), Some(SECOND)),
             None,
             "a wall clock BEHIND the monotonic one is a backwards step too"
         );
@@ -231,7 +231,7 @@ mod tests {
     fn the_detector_reports_an_injected_sleep_once() {
         let detector = WakeDetector::new();
         assert_eq!(detector.observe(), None, "no sleep yet");
-        detector.inject_sleep(Duration::from_secs(900));
+        detector.inject_sleep(Duration::from_mins(15));
         assert!(
             detector
                 .observe()

@@ -1,5 +1,5 @@
 //! Codex launch and upgrade diagnostics through the built CLI. Each fixture owns
-//! its HOME, CODEX_HOME and loopback status stub; the fake codex prints argv and
+//! its HOME, `CODEX_HOME` and loopback status stub; the fake codex prints argv and
 //! never sends a request. Both configured upstreams fail closed on loopback.
 
 use std::io::{Read, Write};
@@ -39,7 +39,7 @@ impl Fixture {
                     "name": "alice@example.com/codex", "provider": "codex", "credentialVersion": 2,
                     "accountUuid": "11111111-1111-1111-1111-111111111111",
                     "orgUuid": "22222222-2222-2222-2222-222222222222",
-                    "accessToken": "at-fake", "refreshToken": "rt-fake", "expiresAt": 4102444800000i64
+                    "accessToken": "at-fake", "refreshToken": "rt-fake", "expiresAt": 4_102_444_800_000_i64
                 }]
             }).to_string(),
         ).unwrap();

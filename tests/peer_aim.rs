@@ -390,7 +390,7 @@ fn a_collapse_hint_still_carries_the_three_keys_the_wire_already_pins() {
         .expect("an internally tagged Control serializes as an object");
     let mut keys: Vec<&str> = object
         .keys()
-        .map(|key| key.as_str())
+        .map(String::as_str)
         .filter(|key| *key != "type")
         .collect();
     keys.sort_unstable();

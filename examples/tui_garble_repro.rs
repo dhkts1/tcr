@@ -5,7 +5,7 @@
 //! BACKGROUND task panics, as any task in the server may. The screen is captured
 //! before and after by the caller (`scripts/repro-323.sh` under tmux).
 //!
-//! Run: cargo run --example tui_garble_repro -- [panic|clean|fixed|desync|desync-fixed]
+//! Run: cargo run --example `tui_garble_repro` -- [panic|clean|fixed|desync|desync-fixed]
 //!   panic  — the hook as it shipped: a background panic drops the screen (issue #323)
 //!   fixed  — the hook as it stands now: the screen survives and repaints
 //!   clean  — the same loop, no panic at all (control)
@@ -105,7 +105,7 @@ async fn main() -> io::Result<()> {
         // `r` is the escape hatch `desync-fixed` demonstrates and `desync` lacks.
         while event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
-                let redraw = matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'));
+                let redraw = matches!(key.code, KeyCode::Char('r' | 'R'));
                 if redraw && mode == "desync-fixed" {
                     SCREEN_DIRTIED_BY_PANIC.store(true, Ordering::SeqCst);
                 }

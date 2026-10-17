@@ -104,7 +104,7 @@ pub const WIRE_SESSIONS_REFRESH: std::time::Duration = std::time::Duration::from
 /// writes the map whatever the cadence; what this bounds is a crash or SIGKILL, which loses at
 /// most this long of newly minted tokens, whose conversations then route as they did before
 /// this map existed.
-pub const BOUND_TOKENS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+pub const BOUND_TOKENS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_mins(10);
 
 const REQUEST_LOG_CAPACITY: usize = 200;
 
@@ -185,21 +185,21 @@ pub struct WarmWindow {
 
 impl WarmWindow {
     /// The 5-minute default window.
-    pub const DEFAULT: WarmWindow = WarmWindow {
+    pub const DEFAULT: Self = Self {
         ms: CACHE_WARM_HOLD_SECS * 1000,
     };
     /// The window of a session whose latest request asked for `"ttl":"1h"`.
-    pub const EXTENDED: WarmWindow = WarmWindow {
+    pub const EXTENDED: Self = Self {
         ms: crate::affinity::EXTENDED_PIN_TTL_MS,
     };
 
     /// The window in milliseconds.
-    pub fn ms(self) -> i64 {
+    pub const fn ms(self) -> i64 {
         self.ms
     }
 
     /// The window in whole seconds, for log lines.
-    pub fn secs(self) -> i64 {
+    pub const fn secs(self) -> i64 {
         self.ms / 1000
     }
 }
@@ -313,11 +313,11 @@ pub enum AccountStatus {
 }
 
 impl AccountStatus {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            AccountStatus::Active => "active",
-            AccountStatus::Throttled => "throttled",
-            AccountStatus::Error => "error",
+            Self::Active => "active",
+            Self::Throttled => "throttled",
+            Self::Error => "error",
         }
     }
 }
@@ -634,9 +634,10 @@ enum RecycleReason {
 /// default h2 path.
 pub(crate) fn build_serving_client(http1_only: bool) -> Arc<reqwest::Client> {
     #[cfg(test)]
-    if FAIL_NEXT_CLIENT_BUILD.with(|f| f.replace(false)) {
-        panic!("build reqwest client (test-injected failure)");
-    }
+    assert!(
+        !FAIL_NEXT_CLIENT_BUILD.with(|f| f.replace(false)),
+        "build reqwest client (test-injected failure)"
+    );
     // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
     // proxy — routing our upstream through an ambient proxy (e.g. the JS
     // teamclaude on :3456) loops us through the thing we replace and every
@@ -877,7 +878,7 @@ impl DisablePersist {
     /// after a failed **enable** it comes back BENCHED. A single direction-blind
     /// line told the user "it returns to rotation on restart" for both — so on a
     /// failed enable they restarted on that advice and got the opposite.
-    pub fn warning(self, disabled: bool) -> Option<&'static str> {
+    pub const fn warning(self, disabled: bool) -> Option<&'static str> {
         match self {
             // The flag is durable, or was never meant to be (demo/status have no
             // config file at all) — nothing to say.
@@ -906,7 +907,7 @@ impl DisablePersist {
     /// so a Codex row names that remedy (remove one, or re-import it under a name of its own),
     /// where a Claude row keeps its `orgUuid` remedy. Every other outcome reads the same for
     /// both providers.
-    pub fn warning_for(
+    pub const fn warning_for(
         self,
         disabled: bool,
         provider: crate::provider::Provider,
@@ -991,7 +992,7 @@ impl ControlPersist {
     /// needs no explanation. Mirrors [`DisablePersist::warning`]; there is no
     /// direction-dependent wording here because clearing and setting fail the
     /// same way — a failed write just leaves the file saying whatever it said.
-    pub fn warning(self) -> Option<&'static str> {
+    pub const fn warning(self) -> Option<&'static str> {
         match self {
             Self::Persisted | Self::NoConfigFile => None,
             Self::Ambiguous => Some(
@@ -1039,7 +1040,7 @@ pub enum AddPersist {
 impl AddPersist {
     /// The one line to put in front of the operator, or `None` when the outcome
     /// needs no explanation.
-    pub fn warning(self) -> Option<&'static str> {
+    pub const fn warning(self) -> Option<&'static str> {
         match self {
             Self::Persisted | Self::NoConfigFile => None,
             Self::Ambiguous => Some(
@@ -1120,7 +1121,7 @@ pub struct Manager {
     /// `Weak`, so the manager's own field cannot keep it alive; `OnceLock`, set by
     /// [`Self::assemble`] the moment the `Arc` exists. Unset means "built some other
     /// way": the refresh then runs inline, exactly as it did before.
-    me: std::sync::OnceLock<std::sync::Weak<Manager>>,
+    me: std::sync::OnceLock<std::sync::Weak<Self>>,
     accounts: RwLock<Vec<AccountRuntime>>,
     refresher: Arc<dyn TokenRefresher>,
     /// Reads each account's quota from the zero-spend usage endpoint on a timer.
@@ -1225,7 +1226,7 @@ pub struct Manager {
     /// [`crate::config::Config::fable_weekly_threshold`]. `None` means "use
     /// whatever threshold the site would apply anyway", resolved by
     /// [`crate::manager::select::effective_fable_threshold`] at the two call
-    /// sites ([`Self::model_blocked`], [`Self::account_gate`]'s FableWeekly
+    /// sites ([`Self::model_blocked`], [`Self::account_gate`]'s `FableWeekly`
     /// push). Snapshotted at construction, same restart-to-take-effect contract
     /// as `global_threshold` above.
     fable_weekly_threshold: Option<f64>,
@@ -1593,7 +1594,7 @@ pub struct ExhaustionHint {
     pub gated: BTreeMap<GateReason, usize>,
 }
 
-fn odt_to_ms(now: OffsetDateTime) -> i64 {
+const fn odt_to_ms(now: OffsetDateTime) -> i64 {
     (now.unix_timestamp_nanos() / 1_000_000) as i64
 }
 
@@ -1602,15 +1603,15 @@ fn odt_to_ms(now: OffsetDateTime) -> i64 {
 /// `spacing_ms` (T) and bucket capacity `burst` (B), returns
 /// `(new_tat_ms, allow_at_ms)`. The caller advances the stored TAT to `new_tat_ms`
 /// and sleeps until `allow_at_ms` if it is in the future. `burst` requests admit
-/// instantly after idle (allow_at <= now), then one per T.
+/// instantly after idle (`allow_at` <= now), then one per T.
 fn throttle_slot(tat_ms: i64, now_ms: i64, spacing_ms: i64, burst: u32) -> (i64, i64) {
-    let tau = spacing_ms * (burst.max(1) as i64 - 1); // burst tolerance (B-1)*T
+    let tau = spacing_ms * (i64::from(burst.max(1)) - 1); // burst tolerance (B-1)*T
     let base = tat_ms.max(now_ms); // can't schedule in the past
     (base + spacing_ms, base - tau) // (new TAT, earliest allowed)
 }
 
 fn ms_to_odt(ms: i64) -> Option<OffsetDateTime> {
-    OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000).ok()
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
 }
 
 /// Fold a u64 session key to a short, stable hex id for display (24 bits).
@@ -2606,11 +2607,11 @@ impl Manager {
             if let crate::identity::Resolved::One(position) = placement
                 && let Some(account) = config.accounts.get_mut(position)
             {
-                account.access_token = tokens.access_token.clone();
+                account.access_token.clone_from(&tokens.access_token);
                 // THE TRAP: same invariant as `apply_refresh` in
                 // `manager/refresh.rs` — `tokens.refresh_token` must be
                 // `Some(...)` on every reachable refresh success.
-                account.refresh_token = tokens.refresh_token.clone();
+                account.refresh_token.clone_from(&tokens.refresh_token);
                 account.expires_at = Some(tokens.expires_at_ms);
                 match provider {
                     crate::provider::Provider::Anthropic => {}
@@ -2949,12 +2950,12 @@ impl Manager {
                     // and bench flag included.
                     account.removed = false;
                     account.disabled = matched.disabled.unwrap_or(false);
-                    account.access_token = matched.access_token.clone();
-                    account.refresh_token = matched.refresh_token.clone();
+                    account.access_token.clone_from(&matched.access_token);
+                    account.refresh_token.clone_from(&matched.refresh_token);
                     account.expires_at_ms = matched.expires_at.map(oauth::normalize_expires_at);
                     // The folder too. `login_error` is left as it is, as `status` is: a restored
                     // entry holds whatever tokens it held, and the next refresh decides.
-                    account.codex_home = matched.codex_home.clone();
+                    account.codex_home.clone_from(&matched.codex_home);
                     changed.push(format!("{}: back in the config", account.name));
                     if fresh_control.as_deref() == Some(account.name.as_str()) {
                         let mut control = self.control_idx.write().expect("control lock poisoned");
@@ -3068,7 +3069,7 @@ impl Manager {
         // be. Every other arm leaves the snapshot alone.
         if matches!(
             outcome,
-            Ok(config::DisabledWrite::Updated) | Ok(config::DisabledWrite::Unchanged)
+            Ok(config::DisabledWrite::Updated | config::DisabledWrite::Unchanged)
         ) {
             let mut config = self.config.lock().expect("config lock poisoned");
             // Resolved by identity, through the one `identity::resolve` that
@@ -3276,12 +3277,12 @@ impl Manager {
     /// because it is the one routing flag whose cost is an OUTAGE rather than a
     /// slowdown, and an operator reading that line after a restart needs to see
     /// it without opening the config.
-    pub fn control_pooled(&self) -> bool {
+    pub const fn control_pooled(&self) -> bool {
         self.control_pooled
     }
 
     /// The boot-time `controlIdentity` snapshot — see [`crate::control_identity`].
-    pub fn control_identity(&self) -> crate::config::ControlIdentityMode {
+    pub const fn control_identity(&self) -> crate::config::ControlIdentityMode {
         self.control_identity
     }
 
@@ -3300,7 +3301,7 @@ impl Manager {
     }
 
     /// The resolved-client-identity cache the check reads and fills.
-    pub fn client_identities(&self) -> &crate::control_identity::ClientIdentityCache {
+    pub const fn client_identities(&self) -> &crate::control_identity::ClientIdentityCache {
         &self.client_identities
     }
 
@@ -3324,7 +3325,7 @@ impl Manager {
     /// [`config::PacingConfig::is_active`]). Read by the boot-line log in
     /// `server.rs`, not the request path — [`Self::eligible`] reads
     /// `self.pacing` directly.
-    pub fn pacing_active(&self) -> bool {
+    pub const fn pacing_active(&self) -> bool {
         self.pacing.is_active()
     }
 
@@ -3336,7 +3337,7 @@ impl Manager {
     /// `true` when either bucket is live, because "throttling is on" is what the
     /// boot line is telling the operator; a build with only the fleet ceiling armed
     /// is still throttled.
-    pub fn throttle_active(&self) -> bool {
+    pub const fn throttle_active(&self) -> bool {
         self.account_throttle.is_active() || self.fleet_throttle.is_active()
     }
 
@@ -3376,7 +3377,7 @@ impl Manager {
         // the desired state.
         if matches!(
             outcome,
-            Ok(config::ControlWrite::Updated) | Ok(config::ControlWrite::Unchanged)
+            Ok(config::ControlWrite::Updated | config::ControlWrite::Unchanged)
         ) {
             let mut config = self.config.lock().expect("config lock poisoned");
             config.control_account = target.as_ref().map(config::ControlAccountRef::from);
@@ -3690,7 +3691,7 @@ impl Manager {
                 idx: usize,
                 name: String,
                 /// The row's OWN identity (post-backfill) plus its REAL routing
-                /// state (priority/switch_threshold/disabled) — never
+                /// state (`priority/switch_threshold/disabled`) — never
                 /// `identity::probe`'s placeholders, see [`Self::persist_replaced`]
                 /// and the F5 note there. Boxed: `Added` is a bare `usize`, and
                 /// clippy flags the size gap between variants otherwise.
@@ -3770,8 +3771,8 @@ impl Manager {
                         let row = accounts
                             .get_mut(idx)
                             .expect("idx was just resolved against this same vec");
-                        row.access_token = account.access_token.clone();
-                        row.refresh_token = account.refresh_token.clone();
+                        row.access_token.clone_from(&account.access_token);
+                        row.refresh_token.clone_from(&account.refresh_token);
                         row.expires_at_ms = account.expires_at.map(oauth::normalize_expires_at);
                         // F4: fresh credentials clear a stuck error — `eligible`
                         // hard-gates on `status == Error` — but do NOT clear a
@@ -3801,7 +3802,7 @@ impl Manager {
                             crate::provider::Provider::Anthropic => {}
                             crate::provider::Provider::Codex => {
                                 row.login_error = None;
-                                row.codex_home = account.codex_home.clone();
+                                row.codex_home.clone_from(&account.codex_home);
                                 row.pending_codex_writeback = None;
                             }
                         }
@@ -3819,13 +3820,13 @@ impl Manager {
                         // like any other fully-known account.
                         row.account_type = account.account_type.clone();
                         if row.account_uuid.is_none() {
-                            row.account_uuid = account.account_uuid.clone();
+                            row.account_uuid.clone_from(&account.account_uuid);
                         }
                         if row.org_uuid.is_none() {
-                            row.org_uuid = account.org_uuid.clone();
+                            row.org_uuid.clone_from(&account.org_uuid);
                         }
                         if row.org_name.is_none() {
-                            row.org_name = account.org_name.clone();
+                            row.org_name.clone_from(&account.org_name);
                         }
                         // Plan fields are OVERWRITTEN where the submission has
                         // one, not backfilled like the identity fields above —
@@ -3836,13 +3837,13 @@ impl Manager {
                         // `config::merge_account`'s durable half; see
                         // `config::Account::organization_type`.
                         if account.organization_type.is_some() {
-                            row.organization_type = account.organization_type.clone();
+                            row.organization_type.clone_from(&account.organization_type);
                         }
                         if account.rate_limit_tier.is_some() {
-                            row.rate_limit_tier = account.rate_limit_tier.clone();
+                            row.rate_limit_tier.clone_from(&account.rate_limit_tier);
                         }
                         if account.seat_tier.is_some() {
-                            row.seat_tier = account.seat_tier.clone();
+                            row.seat_tier.clone_from(&account.seat_tier);
                         }
                         // F5: carry the row's REAL routing state, not
                         // `identity::probe`'s None placeholders — see
@@ -4096,8 +4097,8 @@ impl Manager {
             return AddPersist::NoConfigFile;
         };
         let mut for_disk = target.clone();
-        for_disk.access_token = fresh.access_token.clone();
-        for_disk.refresh_token = fresh.refresh_token.clone();
+        for_disk.access_token.clone_from(&fresh.access_token);
+        for_disk.refresh_token.clone_from(&fresh.refresh_token);
         for_disk.expires_at = fresh.expires_at;
         match fresh.provider {
             crate::provider::Provider::Anthropic => {}
@@ -4114,16 +4115,16 @@ impl Manager {
         // back over the file this call just fixed.
         if matches!(
             outcome,
-            Ok(config::AccountWrite::Updated) | Ok(config::AccountWrite::Added)
+            Ok(config::AccountWrite::Updated | config::AccountWrite::Added)
         ) {
             let mut config = self.config.lock().expect("config lock poisoned");
             match crate::identity::resolve(config.accounts.iter().enumerate(), target) {
                 crate::identity::Resolved::One(position) => {
                     if let Some(entry) = config.accounts.get_mut(position) {
-                        entry.access_token = for_disk.access_token.clone();
-                        entry.refresh_token = for_disk.refresh_token.clone();
+                        entry.access_token.clone_from(&for_disk.access_token);
+                        entry.refresh_token.clone_from(&for_disk.refresh_token);
                         entry.expires_at = for_disk.expires_at;
-                        entry.codex_home = for_disk.codex_home.clone();
+                        entry.codex_home.clone_from(&for_disk.codex_home);
                         entry.extra.remove(config::CODEX_SYNC_PENDING_KEY);
                     }
                 }
@@ -4196,7 +4197,7 @@ struct MinuteRing {
 }
 
 impl MinuteRing {
-    fn bump(&mut self, now_ms: i64) {
+    const fn bump(&mut self, now_ms: i64) {
         let minute = now_ms.div_euclid(60_000);
         let slot = &mut self.buckets[minute.rem_euclid(TRAFFIC_RING_MINUTES) as usize];
         if slot.0 != minute {
@@ -4380,7 +4381,12 @@ mod tests {
     /// tests.
     fn account_in_groups(name: &str, priority: i64, groups: &[&str]) -> Account {
         Account {
-            groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+            groups: Some(
+                groups
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect(),
+            ),
             ..account(name, priority)
         }
     }
@@ -4451,7 +4457,7 @@ mod tests {
 
     /// A refresher whose FIRST call fails transiently (the leader — after a
     /// short delay so the herd queues) and whose every later call succeeds.
-    /// Records the refresh token POSTed on each call so a test can assert the
+    /// Records the refresh token `POSTed` on each call so a test can assert the
     /// single-use token was sent exactly once across a concurrent batch.
     struct TransientThenOkRefresher {
         calls: Arc<AtomicUsize>,
@@ -6191,7 +6197,7 @@ mod tests {
         let stale = crate::now_ms() - 40 * 60 * 1000;
         let rewind = |manager: &Manager| {
             accounts_mut(manager)[1].quota.updated_at = Some(
-                OffsetDateTime::from_unix_timestamp_nanos(stale as i128 * 1_000_000)
+                OffsetDateTime::from_unix_timestamp_nanos(i128::from(stale) * 1_000_000)
                     .expect("valid instant"),
             );
         };
@@ -9050,7 +9056,7 @@ mod tests {
     }
 
     /// #1 Default-OFF is inert: an account that WOULD be paced (saturated
-    /// in_flight + just served) is still selected exactly as before, so an
+    /// `in_flight` + just served) is still selected exactly as before, so an
     /// unconfigured proxy is byte-identical to the pre-pacing build.
     #[test]
     fn pacing_off_is_inert() {
@@ -9094,7 +9100,7 @@ mod tests {
 
     /// #3 An account selected less than `min_spacing_ms` ago is skipped; once the
     /// window elapses it is eligible again. Tested at `eligible()` so the soft
-    /// select() fallback can't mask the gate.
+    /// `select()` fallback can't mask the gate.
     #[test]
     fn min_spacing_skips_recently_served() {
         let pacing = PacingConfig {
@@ -9153,7 +9159,7 @@ mod tests {
     }
 
     /// #4 SOFT invariant: when EVERY account is paced out but otherwise healthy,
-    /// select() still returns Some (the least-loaded) — pacing never turns a
+    /// `select()` still returns Some (the least-loaded) — pacing never turns a
     /// servable request into a failure.
     #[test]
     fn all_paced_falls_back_to_serve() {
@@ -9273,7 +9279,7 @@ mod tests {
 
         manager
             .wake
-            .inject_sleep(std::time::Duration::from_secs(900));
+            .inject_sleep(std::time::Duration::from_mins(15));
         drop(manager.enter_in_flight(0));
         let woken = clients(&manager);
         for (i, (before, after)) in original.iter().zip(&woken).enumerate() {
@@ -9480,7 +9486,7 @@ mod tests {
         });
         let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
         let now = OffsetDateTime::now_utc();
-        let tried: HashSet<usize> = [0].into_iter().collect();
+        let tried: HashSet<usize> = std::iter::once(0).collect();
         assert_eq!(
             manager.select(&tried, now, None, None, "/v1/messages", None),
             None
@@ -10001,7 +10007,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
-    /// U1 (storm fix): a token within the proactive EXPIRING_SOON buffer refreshes
+    /// U1 (storm fix): a token within the proactive `EXPIRING_SOON` buffer refreshes
     /// on a NON-force `ensure_fresh` (before it hard-expires), while a token
     /// comfortably outside the buffer is still left alone.
     #[tokio::test]
@@ -10264,7 +10270,7 @@ mod tests {
         {
             let mut accounts = accounts_mut(&manager);
             accounts[0].quota.updated_at = Some(
-                OffsetDateTime::from_unix_timestamp_nanos(stale as i128 * 1_000_000)
+                OffsetDateTime::from_unix_timestamp_nanos(i128::from(stale) * 1_000_000)
                     .expect("valid instant"),
             );
         }
@@ -10298,7 +10304,7 @@ mod tests {
         {
             let mut accounts = accounts_mut(&manager);
             accounts[0].quota.updated_at = Some(
-                OffsetDateTime::from_unix_timestamp_nanos(stale as i128 * 1_000_000)
+                OffsetDateTime::from_unix_timestamp_nanos(i128::from(stale) * 1_000_000)
                     .expect("valid instant"),
             );
         }
@@ -10595,7 +10601,7 @@ mod tests {
 
     /// Change 3: an account near/over its weekly quota is held out of rotation but
     /// stays operationally ACTIVE — never a red "error". The snapshot exposes this
-    /// as a `quota_state` (NearLimit / Exhausted) while `status` remains "active".
+    /// as a `quota_state` (`NearLimit` / Exhausted) while `status` remains "active".
     #[test]
     fn near_and_over_quota_render_active_with_honest_quota_state() {
         use crate::stats::QuotaState;
@@ -10642,8 +10648,8 @@ mod tests {
     /// literal, so it tracks the constant: an account at 0.92 weekly utilization
     /// has real headroom under the 0.95 default → stays Normal and eligible. On
     /// the pre-change tree (default 0.90) that same 0.92 tripped the line → held
-    /// NearLimit and select() would refuse it, so this fails before the raise.
-    /// 0.96 → NearLimit (held, credential fine); 1.00 → Exhausted (fully spent).
+    /// `NearLimit` and `select()` would refuse it, so this fails before the raise.
+    /// 0.96 → `NearLimit` (held, credential fine); 1.00 → Exhausted (fully spent).
     #[test]
     fn default_threshold_raise_gives_92pct_headroom_normal_near_full() {
         use crate::stats::QuotaState;
@@ -11041,7 +11047,7 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         exhaust_oi_bucket(&manager, 0, now);
-        let tried: HashSet<usize> = [1].into_iter().collect();
+        let tried: HashSet<usize> = std::iter::once(1).collect();
         assert_eq!(
             manager.select(
                 &tried,
@@ -11069,7 +11075,7 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         exhaust_oi_bucket(&manager, 0, now);
-        let tried: HashSet<usize> = [1].into_iter().collect();
+        let tried: HashSet<usize> = std::iter::once(1).collect();
         assert_eq!(
             manager.select(&tried, now, None, None, "/v1/messages", None),
             Some(0),
@@ -11276,7 +11282,7 @@ mod tests {
         // The failover that put A in `tried` was durable: it armed a hold that
         // outlives A's prompt cache, so there is nothing left to come home to.
         manager.mark_rate_limited(a, LONG_HOLD_SECS);
-        let tried: HashSet<usize> = [a].into_iter().collect();
+        let tried: HashSet<usize> = std::iter::once(a).collect();
         let b = manager
             .select(&tried, now, None, Some(9), "/v1/messages", None)
             .expect("the untried account is eligible");
@@ -11563,7 +11569,7 @@ mod tests {
         let pinned = manager
             .select(&HashSet::new(), now, None, Some(4567), "/v1/messages", None)
             .expect("an account is eligible");
-        let tried: HashSet<usize> = [pinned].into_iter().collect();
+        let tried: HashSet<usize> = std::iter::once(pinned).collect();
 
         let served = manager
             .select(&tried, now, None, Some(4567), "/v1/messages", None)
@@ -12443,7 +12449,7 @@ mod tests {
     }
 
     /// Directly pin `key` to account `idx` in the affinity map (last-touch = now),
-    /// bypassing a select() call — lets a migration test set up an arbitrary stacked
+    /// bypassing a `select()` call — lets a migration test set up an arbitrary stacked
     /// starting layout without depending on how the initial pins were formed.
     fn pin_session(manager: &Manager, key: u64, idx: usize) {
         manager
@@ -12932,7 +12938,7 @@ mod tests {
     }
 
     /// A near standard (API-key) token limit with a future `standard_reset` and no
-    /// other gate is reported as `(Standard, Some(reset))` — account_gate now sees
+    /// other gate is reported as `(Standard, Some(reset))` — `account_gate` now sees
     /// the same dimension `eligible`/`is_near` enforces.
     #[test]
     fn account_gate_gates_a_near_standard_limit() {
@@ -13000,7 +13006,7 @@ mod tests {
     }
 
     /// G-a: an OAuth account (all standard fields `None`) produces NO Standard gate,
-    /// so account_gate is byte-identical to its pre-fix behavior for OAuth.
+    /// so `account_gate` is byte-identical to its pre-fix behavior for OAuth.
     #[test]
     fn account_gate_ignores_standard_for_oauth() {
         let now = OffsetDateTime::now_utc();
@@ -13023,7 +13029,7 @@ mod tests {
     }
 
     /// An expired `standard_reset` (in the PAST) means the upstream limit has
-    /// refreshed, so a spent count must NOT keep gating — mirrors is_near's expiry
+    /// refreshed, so a spent count must NOT keep gating — mirrors `is_near`'s expiry
     /// rule so a spent standard window never pins an API-key account out forever.
     #[test]
     fn account_gate_ignores_expired_standard() {
@@ -15027,7 +15033,7 @@ mod tests {
     fn add_or_update_account_updated_path_never_builds_a_client() {
         let existing = account("alice@example.com", 0);
         let manager = build_manager(config_with(vec![existing.clone()]), lock_refresher());
-        let mut resubmission = existing.clone();
+        let mut resubmission = existing;
         resubmission.access_token = "at-alice-rotated".to_string();
 
         fail_next_client_build();

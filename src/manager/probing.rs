@@ -380,13 +380,15 @@ impl Manager {
                 return;
             };
             if plan.organization_type.is_some() {
-                account.organization_type = plan.organization_type.clone();
+                account
+                    .organization_type
+                    .clone_from(&plan.organization_type);
             }
             if plan.rate_limit_tier.is_some() {
-                account.rate_limit_tier = plan.rate_limit_tier.clone();
+                account.rate_limit_tier.clone_from(&plan.rate_limit_tier);
             }
             if plan.seat_tier.is_some() {
-                account.seat_tier = plan.seat_tier.clone();
+                account.seat_tier.clone_from(&plan.seat_tier);
             }
             tracing::info!(
                 account = %account.name,
@@ -613,7 +615,7 @@ mod tests {
         ready_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
-        let (_, responsive) = tokio::join!(manager.probe_account(0), async {
+        let ((), responsive) = tokio::join!(manager.probe_account(0), async {
             tokio::task::yield_now().await;
             let responsive = still_held.load(Ordering::SeqCst);
             let _ = release_tx.send(());

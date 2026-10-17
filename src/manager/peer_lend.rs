@@ -48,7 +48,7 @@ impl crate::config::EgressPin {
     /// granted, buys nothing, and reports nothing. The other two read `strict`
     /// alone. This is the one answer now, and the lend verb was the one that
     /// moved.
-    pub fn forbids_handoff(&self) -> bool {
+    pub const fn forbids_handoff(&self) -> bool {
         self.strict
     }
 
@@ -81,7 +81,7 @@ impl crate::config::Account {
     /// The whole rule is in [`crate::config::EgressPin::forbids_handoff`]; this
     /// is the form the two callers that hold a config account want, so neither
     /// of them re-derives the pin.
-    pub fn cannot_be_handed(&self) -> bool {
+    pub const fn cannot_be_handed(&self) -> bool {
         self.egress_pin().forbids_handoff()
     }
 }
@@ -440,12 +440,12 @@ struct LendCandidate {
 
 impl LendCandidate {
     /// The one figure a hand-mode lease is both sized by and picked by.
-    fn handable_room(&self) -> f64 {
+    const fn handable_room(&self) -> f64 {
         self.room.min(self.room_anywhere)
     }
 
     /// Whether this account's bearer could go out at all.
-    fn may_be_handed(&self) -> bool {
+    const fn may_be_handed(&self) -> bool {
         self.bearer.is_some()
     }
 

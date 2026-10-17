@@ -110,11 +110,8 @@ fn far_end(
         anyhow::ensure!(header.kind == StreamKind::Control, "a CONTROL stream");
 
         loop {
-            let frame = match noise::recv_encrypted(&mut stream, &mut session.transport).await {
-                Ok(frame) => frame,
-                // The dialler hung up, which is how every one of these tests
-                // ends.
-                Err(_) => return Ok(()),
+            let Ok(frame) = noise::recv_encrypted(&mut stream, &mut session.transport).await else {
+                return Ok(());
             };
             let message: Control = serde_json::from_slice(&frame)?;
             let Control::Probe { nonce, sent_ms } = message else {

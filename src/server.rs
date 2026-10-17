@@ -95,7 +95,7 @@ impl IncumbentPolicy {
     ///
     /// The only correct policy for a library caller or a test, which is why it
     /// is what you get for free.
-    pub fn never_signal() -> Self {
+    pub const fn never_signal() -> Self {
         Self(Signal::Never)
     }
 
@@ -103,7 +103,7 @@ impl IncumbentPolicy {
     /// `teamclaude` proxy on the port (displacing it is why the takeover exists,
     /// and leaving it running would token-war over single-use refresh tokens),
     /// but stand down for a `tcr` peer.
-    pub fn replace_legacy_js_only() -> Self {
+    pub const fn replace_legacy_js_only() -> Self {
         Self(Signal::LegacyJsOnly)
     }
 
@@ -114,13 +114,13 @@ impl IncumbentPolicy {
     ///
     /// Reserve this for an operator who typed `--replace`. Nothing in a test or
     /// an embedder should call it.
-    pub fn kill_the_incumbent_proxy() -> Self {
+    pub const fn kill_the_incumbent_proxy() -> Self {
         Self(Signal::Recognized)
     }
 
     /// Whether this policy can signal a process at all — for a caller that wants
     /// to assert it is holding the harmless one.
-    pub fn signals_anything(&self) -> bool {
+    pub const fn signals_anything(&self) -> bool {
         !matches!(self.0, Signal::Never)
     }
 }
@@ -252,7 +252,7 @@ impl ServeOptions {
     /// the binary passes. The binary spells its own options out in
     /// `main::run_server`, because every one of them is a decision about files
     /// and processes a library caller must not make by accident.
-    pub fn new(config: Config) -> Self {
+    pub const fn new(config: Config) -> Self {
         Self {
             config,
             persist_path: None,
@@ -312,8 +312,8 @@ impl ServeOutcome {
     /// If the outcome was a stand-down.
     pub fn expect_started(self) -> ServerHandle {
         match self {
-            ServeOutcome::Started(handle) => handle,
-            ServeOutcome::StoodDown(stand_down) => panic!(
+            Self::Started(handle) => handle,
+            Self::StoodDown(stand_down) => panic!(
                 "expected a bound server; an incumbent (pid {}) holds :{}",
                 stand_down.pid, stand_down.port
             ),
@@ -343,17 +343,17 @@ pub enum AffinityFlush {
 
 impl AffinityFlush {
     /// The pin count when one was actually written, else `None`.
-    pub fn pins_written(&self) -> Option<usize> {
+    pub const fn pins_written(&self) -> Option<usize> {
         match self {
-            AffinityFlush::Written(count) => Some(*count),
+            Self::Written(count) => Some(*count),
             _ => None,
         }
     }
 
     /// Did a write that was supposed to happen fail? The one condition a caller
     /// should surface even though shutdown is not fallible.
-    pub fn failed(&self) -> bool {
-        matches!(self, AffinityFlush::Failed(_))
+    pub const fn failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
     }
 }
 
@@ -376,16 +376,16 @@ pub enum WireSessionsFlush {
 
 impl WireSessionsFlush {
     /// The session count when one was actually written, else `None`.
-    pub fn sessions_written(&self) -> Option<usize> {
+    pub const fn sessions_written(&self) -> Option<usize> {
         match self {
-            WireSessionsFlush::Written(count) => Some(*count),
+            Self::Written(count) => Some(*count),
             _ => None,
         }
     }
 
     /// Did a write that was supposed to happen fail?
-    pub fn failed(&self) -> bool {
-        matches!(self, WireSessionsFlush::Failed(_))
+    pub const fn failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
     }
 }
 
@@ -452,12 +452,12 @@ pub struct ServerHandle {
 
 impl ServerHandle {
     /// The address actually bound — the resolved port when `0` was requested.
-    pub fn addr(&self) -> SocketAddr {
+    pub const fn addr(&self) -> SocketAddr {
         self.addr
     }
 
     /// The live [`Manager`], for a caller that wants the same state the TUI reads.
-    pub fn manager(&self) -> &Arc<Manager> {
+    pub const fn manager(&self) -> &Arc<Manager> {
         &self.manager
     }
 
@@ -466,12 +466,12 @@ impl ServerHandle {
     /// `None` is a fresh install, and every install that has not written a
     /// `listen` into its peers file: the port is opt-in and there is no second
     /// switch.
-    pub fn peer_addr(&self) -> Option<SocketAddr> {
+    pub const fn peer_addr(&self) -> Option<SocketAddr> {
         self.peer_addr
     }
 
     /// How many background loops this config spawned (the accept loop excluded).
-    pub fn background_task_count(&self) -> usize {
+    pub const fn background_task_count(&self) -> usize {
         self.background.len()
     }
 
@@ -547,15 +547,17 @@ impl ServerHandle {
             // `&mut JoinHandle` polls the join without consuming it: losing the
             // race to the caller's own timeout leaves the task owned here.
             let stopped = self.server_finished
-                || match tokio::time::timeout_at(deadline, &mut *server).await {
-                    Ok(_) => true,
-                    Err(_) => {
-                        // NOT awaited after the abort: a task wedged in a
-                        // synchronous write never reaches a cancellation point,
-                        // so awaiting it back would reintroduce the hang.
-                        server.abort();
-                        false
-                    }
+                || if tokio::time::timeout_at(deadline, &mut *server)
+                    .await
+                    .is_ok()
+                {
+                    true
+                } else {
+                    // NOT awaited after the abort: a task wedged in a
+                    // synchronous write never reaches a cancellation point,
+                    // so awaiting it back would reintroduce the hang.
+                    server.abort();
+                    false
                 };
             self.server = None;
             if stopped {
@@ -566,12 +568,11 @@ impl ServerHandle {
             }
         }
         while let Some(task) = self.background.last_mut() {
-            match tokio::time::timeout_at(deadline, &mut *task).await {
-                Ok(_) => self.tasks_joined += 1,
-                Err(_) => {
-                    task.abort();
-                    self.tasks_aborted += 1;
-                }
+            if tokio::time::timeout_at(deadline, &mut *task).await.is_ok() {
+                self.tasks_joined += 1;
+            } else {
+                task.abort();
+                self.tasks_aborted += 1;
             }
             self.background.pop();
         }
@@ -777,7 +778,7 @@ enum SavedCache {
 
 impl SavedCache {
     /// How long after a change the save runs, so a burst of changes is one write.
-    fn delay(self) -> Duration {
+    const fn delay(self) -> Duration {
         match self {
             Self::Affinity => crate::manager::AFFINITY_SAVE_DELAY,
             Self::BoundTokens => crate::manager::BOUND_TOKENS_SAVE_DELAY,
@@ -1141,7 +1142,7 @@ async fn boot_peer_listener(
     note_owner_headroom(manager, &ledger);
     {
         let manager = manager.clone();
-        let ledger = ledger.clone();
+        let ledger = ledger;
         let mut stop = shutdown.subscribe();
         background.push(tokio::spawn(supervise("peer-headroom", async move {
             let notes = async {
@@ -1216,7 +1217,7 @@ async fn boot_peer_listener(
     if file.dead_drop.is_live() {
         match file.dead_drop.open_store() {
             Ok(store) => {
-                spawn_dead_drop_publisher(peers_path, store, key.id(), local, shutdown, background)
+                spawn_dead_drop_publisher(peers_path, store, key.id(), local, shutdown, background);
             }
             Err(refusal) => tracing::warn!(
                 error = %refusal,
@@ -1566,15 +1567,14 @@ fn path_traffic_tick(
     last_written: &mut Vec<crate::peer::state::PathTraffic>,
 ) {
     let now_ms = crate::now_ms();
-    let rows = match crate::peer::tunnel::path_meter().lock() {
-        Ok(mut meter) => meter.rows(now_ms),
-        Err(_) => {
-            tracing::warn!(
-                "peer path traffic: the path meter's lock is poisoned, so this wake summed \
-                 nothing"
-            );
-            return;
-        }
+    let rows = if let Ok(mut meter) = crate::peer::tunnel::path_meter().lock() {
+        meter.rows(now_ms)
+    } else {
+        tracing::warn!(
+            "peer path traffic: the path meter's lock is poisoned, so this wake summed \
+             nothing"
+        );
+        return;
     };
     if path_traffic_rows_match(&rows, last_written) {
         return;
@@ -1656,7 +1656,7 @@ fn spawn_dead_drop_publisher(
             DEAD_DROP_PUBLISH_INTERVAL,
         );
         tokio::select! {
-            _ = publishing => {}
+            () = publishing => {}
             _ = stop.changed() => {}
         }
     })));
@@ -2203,7 +2203,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
             // a half-written pin file; the loss is at most one interval, which
             // `ServerHandle::shutdown`'s final flush then recovers.
             tokio::select! {
-                _ = flush => {}
+                () = flush => {}
                 _ = stop.changed() => {}
             }
         })));
@@ -2263,13 +2263,13 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         // before `shutdown` returns. Only a task still running at the grace deadline is aborted,
         // and a write already under way is synchronous, so the abort cannot cut it in half.
         let flusher = manager.clone();
-        let flush_path = bound_token_path.clone();
+        let flush_path = bound_token_path;
         let mut stop = shutdown_tx.subscribe();
         background.push(tokio::spawn(supervise("bound-token-flusher", async move {
             {
                 let flush = save_on_change(SavedCache::BoundTokens, &flusher, &flush_path);
                 tokio::select! {
-                    _ = flush => {}
+                    () = flush => {}
                     _ = stop.changed() => {}
                 }
             }
@@ -2328,7 +2328,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
                 // a half-written file; the loss is at most one interval, which
                 // `ServerHandle::shutdown`'s final flush then recovers.
                 tokio::select! {
-                    _ = flush => {}
+                    () = flush => {}
                     _ = stop.changed() => {}
                 }
             },
@@ -2357,7 +2357,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
                     .await;
             };
             tokio::select! {
-                _ = probe => {}
+                () = probe => {}
                 _ = stop.changed() => {}
             }
         })));
@@ -2385,7 +2385,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         background.push(tokio::spawn(supervise("keep-warm", async move {
             let warm = crate::schedule::run(m, crate::schedule::Job::Warm, warmup_seconds);
             tokio::select! {
-                _ = warm => {}
+                () = warm => {}
                 _ = stop.changed() => {}
             }
         })));
@@ -2837,7 +2837,7 @@ mod tests {
         let server = deaf();
         let background: Vec<JoinHandle<()>> = (0..3).map(|_| deaf()).collect();
         let aborts: Vec<tokio::task::AbortHandle> = std::iter::once(server.abort_handle())
-            .chain(background.iter().map(|task| task.abort_handle()))
+            .chain(background.iter().map(tokio::task::JoinHandle::abort_handle))
             .collect();
 
         let handle = handle_owning(shutdown, server, background);
@@ -3154,7 +3154,7 @@ mod tests {
         let background: Vec<JoinHandle<()>> =
             (0..2).map(|_| watcher(shutdown.subscribe())).collect();
         let aborts: Vec<tokio::task::AbortHandle> = std::iter::once(server.abort_handle())
-            .chain(background.iter().map(|task| task.abort_handle()))
+            .chain(background.iter().map(tokio::task::JoinHandle::abort_handle))
             .collect();
 
         drop(handle_owning(shutdown, server, background));
@@ -3203,7 +3203,7 @@ mod tests {
     }
 
     impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-        type Writer = SharedBuf;
+        type Writer = Self;
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
@@ -3679,7 +3679,7 @@ mod tests {
     fn path_traffic_tick_writes_a_real_charge_to_the_state_file() {
         let _guard = path_traffic_test_lock()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!(
             "tcr-server-path-traffic-{}-{:?}",
             std::process::id(),
@@ -3728,7 +3728,7 @@ mod tests {
     fn a_second_tick_with_nothing_new_does_not_move_the_files_mtime() {
         let _guard = path_traffic_test_lock()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!(
             "tcr-server-path-traffic-quiet-{}-{:?}",
             std::process::id(),

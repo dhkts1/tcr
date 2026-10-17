@@ -566,10 +566,7 @@ fn login_codex_prints_its_notices_only_when_they_hold() {
     });
     assert_eq!(out.status.code(), Some(0), "{}", says(&out));
     let lines = events(&out);
-    assert_eq!(
-        notices(&lines),
-        [n1.clone(), n3.clone(), n2a.clone(), n2b.clone()]
-    );
+    assert_eq!(notices(&lines), [n1.clone(), n3, n2a, n2b]);
     assert_eq!(lines.last().expect("a last line")["event"], "saved");
 
     // (b) A second account, codex has its login, no tcr in reach: no notice at all.
@@ -785,7 +782,7 @@ fn gone(expected: (u32, u64)) -> bool {
     })
 }
 
-fn cleanup_identity_is_current(expected: (u32, u64), current: (u32, u64)) -> bool {
+const fn cleanup_identity_is_current(expected: (u32, u64), current: (u32, u64)) -> bool {
     expected.0 == current.0 && expected.1 > 0 && expected.1 == current.1
 }
 

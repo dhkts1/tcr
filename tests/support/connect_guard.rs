@@ -2,12 +2,12 @@
 use std::path::Path;
 use std::process::Command;
 
-pub struct ConnectGuard {
+pub(crate) struct ConnectGuard {
     directory: tempfile::TempDir,
 }
 
 impl ConnectGuard {
-    pub fn attach(command: &mut Command, home: &Path) -> Self {
+    pub(crate) fn attach(command: &mut Command, home: &Path) -> Self {
         let directory = tempfile::tempdir_in(home).expect("private network guard directory");
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/connect_guard.c");
         let library = directory.path().join("guard.so");
@@ -97,7 +97,7 @@ impl ConnectGuard {
         Self { directory }
     }
 
-    pub fn assert_no_connections(&self) {
+    pub(crate) fn assert_no_connections(&self) {
         assert!(
             std::fs::read(self.directory.path().join("attempts"))
                 .unwrap()

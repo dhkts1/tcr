@@ -73,8 +73,8 @@ enum TextOrBlocks {
 impl TextOrBlocks {
     fn any_extended(&self) -> bool {
         match self {
-            TextOrBlocks::Text(_) => false,
-            TextOrBlocks::Blocks(blocks) => blocks.iter().any(|b| is_extended(&b.cache_control)),
+            Self::Text(_) => false,
+            Self::Blocks(blocks) => blocks.iter().any(|b| is_extended(&b.cache_control)),
         }
     }
 }
@@ -185,12 +185,12 @@ pub(crate) const EXTENDED_TTL: &str = "1h";
 ///
 /// What differs from the tree walk:
 /// - the rewritten body keeps the client's key order and whitespace; the tree
-///   walk re-serialised every object with its keys sorted (serde_json's map is
+///   walk re-serialised every object with its keys sorted (`serde_json`'s map is
 ///   a `BTreeMap`). The content Anthropic hashes for the cache is the blocks'
 ///   text, not the key order around it, and now the bytes outside the edited
 ///   `ttl` fields are the client's own.
 /// - members this function does not read are skipped, not parsed, and
-///   serde_json's skip is laxer than its full parse: a lone UTF-16 surrogate
+///   `serde_json`'s skip is laxer than its full parse: a lone UTF-16 surrogate
 ///   escape (`"\ud800"`), a number outside `f64` range, or nesting deeper than
 ///   128 levels inside a skipped member made the tree walk give up and return
 ///   `None`, where this rewrites the breakpoints. The body is still checked to
@@ -253,7 +253,7 @@ struct Walk<'s, 'b> {
 
 impl Walk<'_, '_> {
     /// The same walk, writing into `splices` instead.
-    fn writing_to<'t>(&self, splices: &'t mut Vec<Splice>) -> Walk<'t, '_> {
+    const fn writing_to<'t>(&self, splices: &'t mut Vec<Splice>) -> Walk<'t, '_> {
         Walk {
             body: self.body,
             splices,
@@ -445,7 +445,7 @@ impl<'de> Visitor<'de> for Item<'_, '_> {
 /// Queue the splice that makes `cache_control` carry `ttl: "1h"`, if it is an
 /// object that does not already. One that is not an object (null, a string, a
 /// number) queues nothing. `None` only when a span does not point into `body`,
-/// which serde_json's borrowed `RawValue` rules out; the walk then fails and the
+/// which `serde_json`'s borrowed `RawValue` rules out; the walk then fails and the
 /// body is forwarded unchanged rather than spliced at a wild offset.
 pub(crate) fn extend_cache_control(
     body: &str,
@@ -493,7 +493,7 @@ pub(crate) fn is_extended_ttl(ttl: &RawValue) -> bool {
             && serde_json::from_str::<String>(ttl.get()).is_ok_and(|s| s == EXTENDED_TTL))
 }
 
-/// Byte offset of `part` inside `body`. `part` is a span serde_json borrowed out
+/// Byte offset of `part` inside `body`. `part` is a span `serde_json` borrowed out
 /// of `body`, so pointer distance is the offset; the range check means a span
 /// that somehow did not come from `body` is a miss, never a wild splice (the
 /// same guard as `crate::account_uuid::locate`).
@@ -554,7 +554,7 @@ impl<'de, const N: usize> DeserializeSeed<'de> for MemberSlot<'_, N> {
     }
 }
 
-impl<'de, const N: usize> Visitor<'de> for MemberSlot<'_, N> {
+impl<const N: usize> Visitor<'_> for MemberSlot<'_, N> {
     type Value = Option<usize>;
 
     fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -783,7 +783,7 @@ mod tests {
         );
     }
 
-    /// The one class where the two disagree, as the doc says: serde_json's full
+    /// The one class where the two disagree, as the doc says: `serde_json`'s full
     /// parse refuses a lone surrogate escape, an out-of-range number or nesting
     /// past its recursion limit of 128, and its skip does not, so the tree walk
     /// forwarded such a body untouched and the splice version extends its
@@ -842,7 +842,7 @@ mod tests {
     /// Timing, not a gate: run with
     /// `cargo test --release --lib cache_ttl -- --ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "a timing measurement, run by hand with --release"]
     fn extend_all_ttls_on_a_long_conversation_costs() {
         let body = long_conversation_body();
         assert_matches_reference(&body);

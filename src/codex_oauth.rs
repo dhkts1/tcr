@@ -292,14 +292,14 @@ pub fn base64url_decode(s: &str) -> Option<Vec<u8>> {
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
     for b in s.bytes() {
-        let v = match b {
+        let v = u32::from(match b {
             b'A'..=b'Z' => b - b'A',
             b'a'..=b'z' => b - b'a' + 26,
             b'0'..=b'9' => b - b'0' + 52,
             b'-' => 62,
             b'_' => 63,
             _ => return None,
-        } as u32;
+        });
         acc = (acc << 6) | v;
         bits += 6;
         if bits >= 8 {
@@ -642,7 +642,7 @@ mod tests {
                 code: Some("refresh_token_reused")
             })
         ));
-        let (url, _) = stub(401, r#"{}"#).await;
+        let (url, _) = stub(401, "{}").await;
         assert!(matches!(
             refresh_access_token_at(&client, "rt", &url).await,
             Err(OAuthError::AuthRejected {

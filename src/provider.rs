@@ -100,7 +100,7 @@ impl Provider {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
             Self::Codex => "codex",
@@ -109,7 +109,7 @@ impl Provider {
 
     /// For `#[serde(skip_serializing_if)]` on `config::Account::provider`: an Anthropic row writes
     /// no key, so an upgraded Anthropic-only config re-saves without a `provider` key.
-    pub fn is_anthropic(&self) -> bool {
+    pub const fn is_anthropic(&self) -> bool {
         match self {
             Self::Anthropic => true,
             Self::Codex => false,

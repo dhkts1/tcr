@@ -64,7 +64,7 @@ fn wire_has_no_credential_field() {
     let code_lines: Vec<String> = source
         .lines()
         .filter(|line| !line.trim_start().starts_with("//"))
-        .map(|line| line.to_lowercase())
+        .map(str::to_lowercase)
         .collect();
 
     // The exempt span: the `Handoff` variant's declaration, from the line that
@@ -540,21 +540,17 @@ fn scan_serializable_types(source: &str) -> Vec<String> {
         // one line.
         loop {
             if in_attr {
-                match rest.find(']') {
-                    Some(close) => {
-                        derives.push_str(&rest[..close]);
-                        derives.push(' ');
-                        in_attr = false;
-                        rest = rest[close + 1..].trim_start();
-                        continue;
-                    }
-                    None => {
-                        derives.push_str(rest);
-                        derives.push(' ');
-                        rest = "";
-                        break;
-                    }
+                if let Some(close) = rest.find(']') {
+                    derives.push_str(&rest[..close]);
+                    derives.push(' ');
+                    in_attr = false;
+                    rest = rest[close + 1..].trim_start();
+                    continue;
                 }
+                derives.push_str(rest);
+                derives.push(' ');
+                rest = "";
+                break;
             }
 
             match rest.strip_prefix("#[") {

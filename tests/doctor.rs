@@ -39,7 +39,7 @@ fn free_port() -> u16 {
 /// A config with no accounts and one port. `tcr doctor` never rotates, probes
 /// or refreshes, so an empty fleet is the honest fixture: the verb's subject is
 /// the ROUTE, not the accounts.
-fn write_config(home: &Path, port: u16) -> std::path::PathBuf {
+fn write_config(home: &Path, port: u16) -> PathBuf {
     let dir = home.join(".config");
     std::fs::create_dir_all(&dir).expect("create the config directory");
     let path = dir.join("teamclaude.json");
@@ -93,7 +93,7 @@ fn normalize(text: &str, home: &Path, port: u16) -> String {
         .collect()
 }
 
-fn write_settings(home: &Path, base_url: &str) -> std::path::PathBuf {
+fn write_settings(home: &Path, base_url: &str) -> PathBuf {
     let dir = home.join(".claude");
     std::fs::create_dir_all(&dir).expect("create the settings directory");
     let path = dir.join("settings.json");
@@ -121,7 +121,7 @@ fn write_settings(home: &Path, base_url: &str) -> std::path::PathBuf {
 /// other test in this binary.
 /// A working directory for the child, inside the scratch HOME and holding no
 /// `.claude` of its own.
-fn work_dir(home: &Path) -> std::path::PathBuf {
+fn work_dir(home: &Path) -> PathBuf {
     let path = home.join("work");
     std::fs::create_dir_all(&path).expect("create the scratch working directory");
     path

@@ -181,7 +181,7 @@ struct SetupSettingsArgs {
     /// Take out the key tcr wrote, and nothing else.
     #[arg(long)]
     remove: bool,
-    /// Replace an ANTHROPIC_BASE_URL that points somewhere else.
+    /// Replace an `ANTHROPIC_BASE_URL` that points somewhere else.
     #[arg(long, conflicts_with = "remove")]
     force: bool,
     /// Path to the config file.
@@ -229,13 +229,13 @@ mod peer_cli {
     use clap::Subcommand;
 
     #[derive(clap::Args)]
-    pub struct PeerArgs {
+    pub(crate) struct PeerArgs {
         #[command(subcommand)]
         pub action: PeerAction,
     }
 
     #[derive(Subcommand)]
-    pub enum PeerAction {
+    pub(crate) enum PeerAction {
         /// Print this node's own peer id, minting the keypair on first use.
         ///
         /// Never re-mints: a new key evicts every peer that pinned this one.
@@ -325,7 +325,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerGraphArgs {
+    pub(crate) struct PeerGraphArgs {
         /// Path to the peers file (default: `tcr-peers.json` in the
         /// operator's own config directory). Also selects the runtime-state
         /// file beside it and the node-key directory, the same one-flag
@@ -346,7 +346,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerAccountArgs {
+    pub(crate) struct PeerAccountArgs {
         /// Path to the peers file (default: `tcr-peers.json` in the config
         /// directory). Read to turn a Mac's NAME into the peer id the pin
         /// stores, and to say so when no pinned Mac answers to it.
@@ -379,7 +379,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerInternetArgs {
+    pub(crate) struct PeerInternetArgs {
         /// Path to the peers file (default: `tcr-peers.json` in the config directory).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -389,7 +389,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerDropArgs {
+    pub(crate) struct PeerDropArgs {
         /// Path to the peers file (default: `tcr-peers.json` in the config directory).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -404,7 +404,7 @@ mod peer_cli {
     /// shape and for the same measured reason: a nested subcommand refuses `--peers`
     /// placed before the action.
     #[derive(clap::Args)]
-    pub struct PeerDropStoreArgs {
+    pub(crate) struct PeerDropStoreArgs {
         /// Path to the peers file (default: `tcr-peers.json` in the config directory).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -422,7 +422,7 @@ mod peer_cli {
     }
 
     #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-    pub enum PeerDropStoreAction {
+    pub(crate) enum PeerDropStoreAction {
         /// Point the store at a template, or a token, or both.
         Set,
         /// Print the kind and the template, token redacted.
@@ -432,7 +432,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerStatusArgs {
+    pub(crate) struct PeerStatusArgs {
         /// Path to the main config, read for the port and api-key this asks on.
         #[arg(long)]
         pub config: Option<PathBuf>,
@@ -442,7 +442,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerReachArgs {
+    pub(crate) struct PeerReachArgs {
         /// Path to the peers file (default: `tcr-peers.json` in the config directory).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -461,7 +461,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerPendingArgs {
+    pub(crate) struct PeerPendingArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json). Also
         /// selects the runtime-state file beside it, so a test points the
         /// whole peer surface at a temp dir with this one argument.
@@ -479,7 +479,7 @@ mod peer_cli {
     /// selector that meant different things per verb is the kind of difference
     /// nobody discovers until they block the wrong Mac.
     #[derive(clap::Args)]
-    pub struct PeerDecideArgs {
+    pub(crate) struct PeerDecideArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -488,7 +488,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerUnblockArgs {
+    pub(crate) struct PeerUnblockArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -508,7 +508,7 @@ mod peer_cli {
     /// surface an operator gets wrong once and a test harness gets wrong
     /// silently.
     #[derive(clap::Args)]
-    pub struct PeerNetworkKeyArgs {
+    pub(crate) struct PeerNetworkKeyArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -533,7 +533,7 @@ mod peer_cli {
     }
 
     #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-    pub enum PeerNetworkKeyAction {
+    pub(crate) enum PeerNetworkKeyAction {
         /// Mint a key and print it once. Every Mac in the office pastes it in
         /// with `network-key join`.
         Set,
@@ -547,7 +547,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerLinkArgs {
+    pub(crate) struct PeerLinkArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -568,7 +568,7 @@ mod peer_cli {
     /// a reader looking for either finds both, and rather than a bare string,
     /// so a third spelling cannot appear at one call site and not another.
     #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-    pub enum PeerMovedAction {
+    pub(crate) enum PeerMovedAction {
         /// Print one link for one already-trusted Mac, saying where this Mac
         /// is now.
         Mint,
@@ -578,7 +578,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerMovedArgs {
+    pub(crate) struct PeerMovedArgs {
         /// `mint` or `open`.
         #[arg(value_enum)]
         pub action: PeerMovedAction,
@@ -609,7 +609,7 @@ mod peer_cli {
     /// On or off. A typed pair rather than a bare string, so a third spelling
     /// cannot appear at one call site and not another.
     #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-    pub enum Switch {
+    pub(crate) enum Switch {
         On,
         Off,
     }
@@ -642,7 +642,7 @@ mod peer_cli {
     /// point: `inspect` is "I will read their requests" and `disclose` is
     /// "they may read mine". A lease needs an explicit act on both machines.
     #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-    pub enum PeerGrant {
+    pub(crate) enum PeerGrant {
         /// Carry this peer's bytes out to an allow-listed origin, blind.
         Gateway,
         /// We may ask this peer to carry us out. The inverse of `Gateway`,
@@ -676,7 +676,7 @@ mod peer_cli {
     /// every account verb: a test points the whole peer surface at a temp file
     /// with one argument and touches nothing real.
     #[derive(clap::Args)]
-    pub struct PeerIdArgs {
+    pub(crate) struct PeerIdArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json). Also
         /// selects the node-key directory, so a test points the whole peer
         /// surface at a temp dir with this one argument.
@@ -693,7 +693,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerLsArgs {
+    pub(crate) struct PeerLsArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -724,7 +724,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerSwitchArgs {
+    pub(crate) struct PeerSwitchArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -793,7 +793,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerLendArgs {
+    pub(crate) struct PeerLendArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -874,7 +874,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerFindArgs {
+    pub(crate) struct PeerFindArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -896,7 +896,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerNameArgs {
+    pub(crate) struct PeerNameArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -907,7 +907,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerPairArgs {
+    pub(crate) struct PeerPairArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -929,7 +929,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerInviteArgs {
+    pub(crate) struct PeerInviteArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -973,7 +973,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerJoinArgs {
+    pub(crate) struct PeerJoinArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -1008,7 +1008,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerForgetArgs {
+    pub(crate) struct PeerForgetArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -1017,7 +1017,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerHelloArgs {
+    pub(crate) struct PeerHelloArgs {
         /// Path to the peers file (default: `tcr-peers.json` in the config directory).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -1028,7 +1028,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerAllowArgs {
+    pub(crate) struct PeerAllowArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -1049,7 +1049,7 @@ mod peer_cli {
     }
 
     #[derive(clap::Args)]
-    pub struct PeerViaArgs {
+    pub(crate) struct PeerViaArgs {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
@@ -1689,7 +1689,7 @@ fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
 fn main() -> anyhow::Result<()> {
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let workers =
-        tcr::server::worker_threads(std::env::var("TOKIO_WORKER_THREADS").ok().as_deref(), cores);
+        server::worker_threads(std::env::var("TOKIO_WORKER_THREADS").ok().as_deref(), cores);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
@@ -1837,30 +1837,29 @@ fn run_peer_account(a: peer_cli::PeerAccountArgs) -> anyhow::Result<()> {
         Some(raw) if raw.trim() == config::Egress::LOCAL => Some(config::Egress::Local),
         Some(raw) => {
             let raw = raw.trim();
-            match tcr_peer_wire::PeerId::parse(raw) {
-                Ok(peer) => Some(config::Egress::Via(peer)),
-                Err(_) => {
-                    let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
-                    let store = peer::config::PeerStore::open(&peers_path)?;
-                    let matched: Vec<peer::config::PeerRow> = store
-                        .peers()
-                        .into_iter()
-                        .filter(|row| row.label == raw)
-                        .collect();
-                    match matched.as_slice() {
-                        [only] => Some(config::Egress::Via(only.node)),
-                        [] => anyhow::bail!(
-                            "no pinned Mac is named `{raw}`, and it is not a peer id either \
-                             (`tcr peer ls` prints both, and `local` is the word for this \
-                             Mac's own socket)"
-                        ),
-                        several => anyhow::bail!(
-                            "`{raw}` names {} pinned Macs, so it cannot say which one this \
-                             account leaves from; give the peer id instead (`tcr peer ls \
-                             --json` prints it as `node`)",
-                            several.len()
-                        ),
-                    }
+            if let Ok(peer) = tcr_peer_wire::PeerId::parse(raw) {
+                Some(config::Egress::Via(peer))
+            } else {
+                let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
+                let store = peer::config::PeerStore::open(&peers_path)?;
+                let matched: Vec<peer::config::PeerRow> = store
+                    .peers()
+                    .into_iter()
+                    .filter(|row| row.label == raw)
+                    .collect();
+                match matched.as_slice() {
+                    [only] => Some(config::Egress::Via(only.node)),
+                    [] => anyhow::bail!(
+                        "no pinned Mac is named `{raw}`, and it is not a peer id either \
+                         (`tcr peer ls` prints both, and `local` is the word for this \
+                         Mac's own socket)"
+                    ),
+                    several => anyhow::bail!(
+                        "`{raw}` names {} pinned Macs, so it cannot say which one this \
+                         account leaves from; give the peer id instead (`tcr peer ls \
+                         --json` prints it as `node`)",
+                        several.len()
+                    ),
                 }
             }
         }
@@ -1907,11 +1906,11 @@ fn run_peer_account(a: peer_cli::PeerAccountArgs) -> anyhow::Result<()> {
 /// `None` for every serve grant and every ended grant, which is `handoff_for`'s
 /// own first two refusals, in the same order and for the same reasons.
 fn peer_ls_handed_key_until(
-    grant: &tcr::peer::config::LendGrant,
+    grant: &peer::config::LendGrant,
     accounts: &[config::Account],
     now_s: u64,
 ) -> Option<u64> {
-    if grant.mode != tcr::peer::config::LendMode::Hand {
+    if grant.mode != peer::config::LendMode::Hand {
         return None;
     }
     if grant.has_ended(now_s) {
@@ -2007,7 +2006,7 @@ fn peer_ls_inert_exit_lines(accounts: &[config::Account]) -> Vec<String> {
 
 fn peer_ls_exits(
     accounts: &[config::Account],
-    peers: &[tcr::peer::config::PeerRow],
+    peers: &[peer::config::PeerRow],
     last_seen: &[(tcr_peer_wire::PeerId, i64)],
     now_ms: i64,
 ) -> std::collections::BTreeMap<String, status::PeerExitJson> {
@@ -2061,9 +2060,9 @@ fn peer_ls_exits(
 /// its own `until`, and a borrower that is still being served must not be
 /// drawn as ended.
 fn peer_ls_ends(
-    row: &tcr::peer::config::PeerRow,
-    leases: &[tcr::peer::state::LeaseRow],
-    borrowed: &[tcr::peer::state::BorrowedRow],
+    row: &peer::config::PeerRow,
+    leases: &[peer::state::LeaseRow],
+    borrowed: &[peer::state::BorrowedRow],
     now_s: u64,
 ) -> (Option<u64>, bool) {
     // (end, has it passed) for every lease this row is party to.
@@ -2136,8 +2135,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             let peers_path = a.peers.clone().unwrap_or_else(peer::config::default_path);
             let config_dir = peers_path
                 .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(peer::id::default_config_dir);
+                .map_or_else(peer::id::default_config_dir, Path::to_path_buf);
 
             if a.regenerate {
                 if !a.yes {
@@ -2699,22 +2697,21 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                      be identical, and a mismatch means a machine in the middle relayed it"
                 );
             }
-            let offered = match a.code.clone() {
-                Some(code) => code,
-                None => {
-                    // The prompt is prose only. In `--json` the `comparing`
-                    // line above IS the prompt, and a reader that got an
-                    // English sentence on the same stream would have to
-                    // decide which of the two to believe.
-                    if !a.json {
-                        println!("peer pair: type the digits the other Mac is showing:");
-                    }
-                    let mut line = String::new();
-                    std::io::stdin()
-                        .read_line(&mut line)
-                        .context("peer pair: could not read the compared code")?;
-                    line
+            let offered = if let Some(code) = a.code.clone() {
+                code
+            } else {
+                // The prompt is prose only. In `--json` the `comparing`
+                // line above IS the prompt, and a reader that got an
+                // English sentence on the same stream would have to
+                // decide which of the two to believe.
+                if !a.json {
+                    println!("peer pair: type the digits the other Mac is showing:");
                 }
+                let mut line = String::new();
+                std::io::stdin()
+                    .read_line(&mut line)
+                    .context("peer pair: could not read the compared code")?;
+                line
             };
             if !pending.matches(&offered) {
                 let message = format!(
@@ -3196,14 +3193,16 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                         grant.fraction,
                         grant.ttl_s,
                         grant.max_inflight,
-                        grant.until.map_or("none".to_string(), |at| at.to_string()),
+                        grant
+                            .until
+                            .map_or_else(|| "none".to_string(), |at| at.to_string()),
                         grant
                             .between
-                            .map_or("any".to_string(), |window| window.to_string()),
+                            .map_or_else(|| "any".to_string(), |window| window.to_string()),
                         grant
                             .days
                             .as_ref()
-                            .map_or("any".to_string(), |days| days.to_string()),
+                            .map_or_else(|| "any".to_string(), ToString::to_string),
                         grant.ended
                     );
                 }
@@ -3261,7 +3260,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                     peer::config::lease_id_string(id),
                     peer_id.display(),
                     peer_window_name(window),
-                    until.map_or("none".to_string(), |at| at.to_string())
+                    until.map_or_else(|| "none".to_string(), |at| at.to_string())
                 );
                 return Ok(());
             }
@@ -3390,14 +3389,14 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 printed.max_inflight,
                 printed
                     .until
-                    .map_or("none".to_string(), |at| at.to_string()),
+                    .map_or_else(|| "none".to_string(), |at| at.to_string()),
                 printed
                     .between
-                    .map_or("any".to_string(), |window| window.to_string()),
+                    .map_or_else(|| "any".to_string(), |window| window.to_string()),
                 printed
                     .days
                     .as_ref()
-                    .map_or("any".to_string(), |days| days.to_string())
+                    .map_or_else(|| "any".to_string(), ToString::to_string)
             );
             println!(
                 "peer lend: a grant is a CEILING on one lease, not a promise, the lender's \
@@ -3506,9 +3505,9 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string(&PendingJson {
-                        pending: pending.clone(),
+                        pending,
                         muted: state.muted.clone(),
-                        banned: state.banned.clone(),
+                        banned: state.banned,
                     })?
                 );
                 return Ok(());
@@ -3540,8 +3539,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                     ban.reason,
                     ban.since_ms,
                     ban.key
-                        .map(|key| key.display())
-                        .unwrap_or_else(|| "not-learned".to_string())
+                        .map_or_else(|| "not-learned".to_string(), |key| key.display())
                 );
             }
             Ok(())
@@ -3638,8 +3636,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             peer::state::save(&state_path, &state)?;
             println!(
                 "peer block: ok addr={addr} key={}",
-                key.map(|key| key.display())
-                    .unwrap_or_else(|| "not-learned".to_string())
+                key.map_or_else(|| "not-learned".to_string(), |key| key.display())
             );
             if key.is_none() {
                 println!(
@@ -3757,10 +3754,10 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                      to map yet"
                 ),
                 peer::reach::InternetSwitch::Off { deleted: Some(_) } => {
-                    println!("peer.internet: off (the router mapping was deleted)")
+                    println!("peer.internet: off (the router mapping was deleted)");
                 }
                 peer::reach::InternetSwitch::Off { deleted: None } => {
-                    println!("peer.internet: off (there was no mapping to delete)")
+                    println!("peer.internet: off (there was no mapping to delete)");
                 }
             }
             Ok(())
@@ -3909,7 +3906,7 @@ async fn run_peer_status(args: peer_cli::PeerStatusArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
     let config = config::load(&config_path)
         .with_context(|| format!("peer status: could not read {}", config_path.display()))?;
-    let peers = tcr::cli::live_peers(&config)
+    let peers = cli::live_peers(&config)
         .await
         .map_err(|why| anyhow::anyhow!("peer status: {why}"))?;
 
@@ -3932,7 +3929,7 @@ async fn run_peer_status(args: peer_cli::PeerStatusArgs) -> anyhow::Result<()> {
             row.name,
             row.address.as_deref().unwrap_or("none"),
             row.last_seen_ms
-                .map_or("never".to_string(), |at| at.to_string()),
+                .map_or_else(|| "never".to_string(), |at| at.to_string()),
             row.paths.len(),
             row.trusted
         );
@@ -3955,8 +3952,7 @@ async fn run_peer_graph(args: peer_cli::PeerGraphArgs) -> anyhow::Result<()> {
         .unwrap_or_else(peer::config::default_path);
     let config_dir = peers_path
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(peer::id::default_config_dir);
+        .map_or_else(peer::id::default_config_dir, Path::to_path_buf);
     let this = peer::id::NodeKey::load_or_mint(&config_dir)?.id();
     let this_label = peer::config::read_or_default(&peers_path)?.display_name();
 
@@ -3964,7 +3960,7 @@ async fn run_peer_graph(args: peer_cli::PeerGraphArgs) -> anyhow::Result<()> {
         return serve_peer_graph(peers_path, this, this_label, &args.addr).await;
     }
 
-    let graph = tcr::status::peer_graph_block(&peers_path, &this, &this_label, now_unix_ms());
+    let graph = status::peer_graph_block(&peers_path, &this, &this_label, now_unix_ms());
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&graph)?);
@@ -3982,14 +3978,14 @@ async fn run_peer_graph(args: peer_cli::PeerGraphArgs) -> anyhow::Result<()> {
             node.id,
             node.name,
             match node.role {
-                tcr::status::GraphRole::ThisMac => "self",
-                tcr::status::GraphRole::Peer => "peer",
+                status::GraphRole::ThisMac => "self",
+                status::GraphRole::Peer => "peer",
             }
         );
     }
     for edge in &graph.edges {
         match &edge.detail {
-            tcr::status::GraphEdgeDetail::Path {
+            status::GraphEdgeDetail::Path {
                 endpoint,
                 path_kind,
                 rtt_ms,
@@ -4004,7 +4000,7 @@ async fn run_peer_graph(args: peer_cli::PeerGraphArgs) -> anyhow::Result<()> {
                 rtt_ms.map_or("unmeasured".to_string(), |v| v.to_string()),
                 loss_pct.map_or("unmeasured".to_string(), |v| v.to_string()),
             ),
-            tcr::status::GraphEdgeDetail::Lease {
+            status::GraphEdgeDetail::Lease {
                 lease_id, spent, ..
             } => println!(
                 "peer graph: edge lease from={} to={} lease_id={} spent={:.2}",
@@ -4075,7 +4071,7 @@ async fn serve_peer_graph(
     /// host with no port, which is what `proxy::strip_port` is for and what
     /// the transcription had inlined.
     fn host_is_loopback(host: &str) -> bool {
-        tcr::proxy::host_is_loopback(tcr::proxy::strip_port(host))
+        proxy::host_is_loopback(proxy::strip_port(host))
     }
 
     /// The one check every route on this listener passes before its handler
@@ -4107,7 +4103,7 @@ async fn serve_peer_graph(
     }
 
     async fn graph_json(State(state): State<GraphState>) -> impl IntoResponse {
-        let graph = tcr::status::peer_graph_block(
+        let graph = status::peer_graph_block(
             &state.peers_path,
             &state.this,
             &state.this_label,
@@ -4272,7 +4268,7 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
     // live half of `dial_addresses` reads the external socket off a register a
     // keeper thread fills and this process has run none, so the walk is done
     // here and the mapping above is handed in explicitly.
-    let host: Vec<peer::pair::HostAddress> = tcr::status::network_fact::interfaces()
+    let host: Vec<peer::pair::HostAddress> = status::network_fact::interfaces()
         .into_iter()
         .map(|(interface, addr)| peer::pair::HostAddress { interface, addr })
         .collect();
@@ -4305,8 +4301,7 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
 
     let config_dir = peers_path
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(peer::id::default_config_dir);
+        .map_or_else(peer::id::default_config_dir, Path::to_path_buf);
     let this = peer::id::NodeKey::load_or_mint(&config_dir)?.id();
 
     let record = peer::moved::MovedRecord {
@@ -4485,7 +4480,7 @@ fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
     // their own Mac had forgotten a row the preview had just named.
     match peer::config::observe_endpoints(peers_path, &node, &fresh)? {
         peer::config::Observed::Written { added } => {
-            println!("peer moved: added {added} address(es) to {label}; nothing else changed")
+            println!("peer moved: added {added} address(es) to {label}; nothing else changed");
         }
         peer::config::Observed::NothingDialable => println!(
             "peer moved: nothing was written; every address in this link is one nothing can \
@@ -4678,7 +4673,7 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
             })
             .collect();
         let payload = serde_json::json!({
-            "ipv6": v6.iter().map(|addr| addr.to_string()).collect::<Vec<_>>(),
+            "ipv6": v6.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "gateway": gateway,
             "externalAddress": external,
             "mapping": mapping,
@@ -4772,7 +4767,7 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
             match last_fetched_ms {
                 Some(ms) => println!("reach: dead-drop: last-fetch-wrote: {ms}"),
                 None => {
-                    println!("reach: dead-drop: last-fetch-wrote: never (or nothing new to write)")
+                    println!("reach: dead-drop: last-fetch-wrote: never (or nothing new to write)");
                 }
             }
         }
@@ -4960,7 +4955,7 @@ fn peer_lend_grant(
     fraction: f64,
     ttl_s: u32,
     max_inflight: u8,
-) -> anyhow::Result<tcr::peer::config::LendGrant> {
+) -> anyhow::Result<peer::config::LendGrant> {
     // REFUSED, not clamped, and this is the only fraction that is. `NaN`
     // compares false against both of `clamp`'s bounds, so it passed through the
     // clamp below unchanged and printed nothing; `serde_json` then writes a
@@ -4972,14 +4967,14 @@ fn peer_lend_grant(
              of the window between 0 and {MAX_LEND_FRACTION}"
         );
     }
-    let clamped = tcr::peer::config::lend_fraction(fraction);
+    let clamped = peer::config::lend_fraction(fraction);
     if (clamped - fraction).abs() > f64::EPSILON {
         println!(
             "peer lend: clamped fraction {fraction} to {clamped} (the ceiling on one lease is \
              {MAX_LEND_FRACTION}, the same clamp the main config applies to its own reserve)"
         );
     }
-    Ok(tcr::peer::config::LendGrant::new(
+    Ok(peer::config::LendGrant::new(
         window,
         clamped,
         ttl_s,
@@ -4991,7 +4986,7 @@ fn peer_lend_grant(
 /// flag that accepts a fraction and the reader that parses one off disk answer
 /// to one number, or a hand-edited file carries what this flag would have
 /// refused.
-const MAX_LEND_FRACTION: f64 = tcr::peer::config::MAX_LEND_FRACTION;
+const MAX_LEND_FRACTION: f64 = peer::config::MAX_LEND_FRACTION;
 
 #[cfg(test)]
 mod peer_lend_fraction_tests {
@@ -5043,7 +5038,7 @@ mod peer_lend_fraction_tests {
 
 /// The wire's own name for a window, so a printed line and a JSON field cannot
 /// disagree about what `7d` is called.
-fn peer_window_name(window: tcr_peer_wire::Window) -> &'static str {
+const fn peer_window_name(window: tcr_peer_wire::Window) -> &'static str {
     match window {
         tcr_peer_wire::Window::FiveHour => "5h",
         tcr_peer_wire::Window::SevenDay => "7d",
@@ -5259,8 +5254,7 @@ impl PeerFinder for RealPeerFinder {
             let name = as_found
                 .announced_name
                 .as_deref()
-                .map(masked_label)
-                .unwrap_or_else(|| "no name announced".to_string());
+                .map_or_else(|| "no name announced".to_string(), masked_label);
             println!("{}  {}", as_found.dial_address(), name);
         }
         Ok(())
@@ -5295,7 +5289,7 @@ fn ensure_listen_for_opt_in(file: &mut peer::config::PeerFile) -> Option<std::ne
 /// `listener::bind`); `PeerStore::reload_if_changed` re-reads the policy half
 /// of this file whenever its mtime moves but nothing re-binds a socket, so a
 /// port written now is a port that opens at the next start and not before.
-fn print_listen_written(addr: std::net::SocketAddr, peers_path: &std::path::Path) {
+fn print_listen_written(addr: std::net::SocketAddr, peers_path: &Path) {
     println!(
         "peer.listen: {addr} written into {} (this Mac had no peer port, and turning this on \
          needs one)",
@@ -6255,7 +6249,7 @@ fn run_wrap(args: WrapArgs) -> anyhow::Result<()> {
 /// the app is only findable by knowing it is there.
 ///
 /// It deliberately does NOT build the app or know where the checkout is. It asks
-/// LaunchServices to open a bundle id, which resolves wherever the app was
+/// `LaunchServices` to open a bundle id, which resolves wherever the app was
 /// installed. A `tcr` that shells into a source tree would break the moment the
 /// checkout moved.
 /// The shared mount/swap logic, embedded once so `install.sh` and this binary
@@ -7253,7 +7247,7 @@ impl LaunchKey {
     }
 
     /// The key to send, when this launch sends one.
-    fn key(&self) -> Option<&LaunchRequestKey> {
+    const fn key(&self) -> Option<&LaunchRequestKey> {
         match self {
             Self::Send(key) => Some(key),
             _ => None,
@@ -7392,7 +7386,7 @@ fn apply_codex_see_through_env(
     caller_ca_exported: bool,
     key: &LaunchKey,
 ) -> Vec<String> {
-    let proxy = loopback_proxy_url(Some(tcr::mitm::CODEX_PROXY_USERNAME), key.key(), port);
+    let proxy = loopback_proxy_url(Some(mitm::CODEX_PROXY_USERNAME), key.key(), port);
     cmd.env("HTTPS_PROXY", &proxy.env);
     cmd.env("https_proxy", &proxy.env);
     // Codex reads its extra CA from this variable (`openai/codex` http-client/src/custom_ca.rs:61);
@@ -7436,7 +7430,7 @@ fn apply_nested_claude_ca(cmd: &mut std::process::Command, ca: &Path, caller_exp
 
 /// The host the MITM leaf must cover for `tcr run --codex` to route `codex`
 /// through the pool.
-fn mitm_codex_host() -> &'static str {
+const fn mitm_codex_host() -> &'static str {
     tcr::provider::CODEX_HOST
 }
 
@@ -7666,7 +7660,10 @@ const EXIT_STOOD_DOWN_NOT_ANSWERING: i32 = 4;
 /// Liveness outranks build skew because it is the more urgent fact — nothing is
 /// serving at all — and because a proxy that would not answer also could not
 /// report a build, so its build verdict is `Unknown` by construction.
-fn stand_down_exit_code(liveness: &cli::Liveness, verdict: build_info::StandDownBuild) -> i32 {
+const fn stand_down_exit_code(
+    liveness: &cli::Liveness,
+    verdict: build_info::StandDownBuild,
+) -> i32 {
     if matches!(liveness, cli::Liveness::Silent { .. }) {
         return EXIT_STOOD_DOWN_NOT_ANSWERING;
     }
@@ -7841,7 +7838,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         // Block until Ctrl-C, SIGTERM, or the server task exits.
         let trigger = tokio::select! {
             _ = tokio::signal::ctrl_c() => ShutdownTrigger::CtrlC,
-            _ = async {
+            () = async {
                 match sigterm.as_mut() {
                     Some(sig) => {
                         sig.recv().await;
@@ -7866,7 +7863,9 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         if sigterm.is_none() {
             tracing::warn!("could not install SIGTERM handler; terminal may not restore if killed");
         }
-        let tui_fut = tui::run(handle.manager().clone());
+        let tui_fut = tui::run(std::sync::Arc::<tcr::manager::Manager>::clone(
+            handle.manager(),
+        ));
         tokio::pin!(tui_fut);
         tokio::select! {
             res = &mut tui_fut => {
@@ -7874,7 +7873,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
                     tracing::error!(error = %err, "tui error");
                 }
             }
-            _ = async {
+            () = async {
                 match sigterm.as_mut() {
                     Some(sig) => {
                         sig.recv().await;
@@ -7938,7 +7937,7 @@ impl ShutdownTrigger {
     /// Returned rather than logged inline so every variant is forced to have
     /// one by the type system, and so `every_shutdown_trigger_logs_a_line` can
     /// check them without a running server.
-    fn shutdown_line(self) -> &'static str {
+    const fn shutdown_line(self) -> &'static str {
         match self {
             Self::CtrlC => "shutdown signal received",
             Self::Sigterm => "SIGTERM received; shutting down",
@@ -7957,7 +7956,7 @@ impl ShutdownTrigger {
 /// the advice that DOES work — quitting the host application — was never printed.
 /// An instruction that cannot succeed is a bug even when the code behind it is
 /// correct.
-fn wedged_incumbent_recovery(kind: singleton::ProxyKind) -> &'static str {
+const fn wedged_incumbent_recovery(kind: singleton::ProxyKind) -> &'static str {
     match kind {
         singleton::ProxyKind::TcrEmbedded => {
             "`tcr --replace` cannot take this one over: the pid belongs to the host application \
@@ -8091,7 +8090,7 @@ fn default_config() -> Config {
 /// It now shares `paths::cache_dir` with it on purpose: two resolutions of
 /// "old directory or new" could disagree, and an install would split its cache
 /// across two folders.
-fn log_location() -> (std::path::PathBuf, &'static str) {
+fn log_location() -> (PathBuf, &'static str) {
     let cache = tcr::paths::cache_dir();
     (cache.log_dir(), cache.log_prefix())
 }
@@ -8159,7 +8158,7 @@ fn log_location() -> (std::path::PathBuf, &'static str) {
 /// not local midnight — for the stated goal of human discoverability, that
 /// means the daily boundary lands at 03:00 in Asia/Jerusalem, not midnight.
 fn open_log_appender(
-    log_dir: &std::path::Path,
+    log_dir: &Path,
     prefix: &str,
 ) -> std::io::Result<tracing_appender::rolling::RollingFileAppender> {
     use std::os::unix::fs::DirBuilderExt as _;
@@ -8475,7 +8474,7 @@ mod tests {
         let _lines = apply_codex_see_through_env(
             &mut cmd,
             3999,
-            std::path::Path::new("/tmp/ca.pem"),
+            Path::new("/tmp/ca.pem"),
             false,
             &LaunchKey::ServerPredatesKeys,
         );
@@ -9984,7 +9983,7 @@ mod tests {
                 .filter(|span| span.starts_with("tcr "))
                 .collect();
             assert!(!spans.is_empty(), "names no tcr command: {text}");
-            commands.extend(spans.iter().map(|span| span.to_string()));
+            commands.extend(spans.iter().map(ToString::to_string));
         }
         commands.extend(
             [
@@ -10245,7 +10244,7 @@ mod tests {
                         "`{sentence}` tells the user to run `{command}`, which does not parse: {e}"
                     );
                 }
-                named.push(argv.iter().map(|word| word.to_string()).collect());
+                named.push(argv.iter().map(ToString::to_string).collect());
             }
         }
 
@@ -10318,7 +10317,7 @@ mod tests {
     /// Never the real cache directory's `logs/` — tests must not touch the
     /// live proxy's cache directory (`session-affinity.json` lives one level up
     /// and is being written by a running process).
-    fn unique_log_dir(tag: &str) -> std::path::PathBuf {
+    fn unique_log_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "tcr-test-{tag}-{}-{:?}",
             std::process::id(),
@@ -10420,7 +10419,7 @@ mod tests {
     }
 
     impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-        type Writer = SharedBuf;
+        type Writer = Self;
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
@@ -10434,10 +10433,10 @@ mod tests {
     ///
     /// `prefix` is the one the appender was opened with: the resolved cache
     /// directory's own, never a fixed name.
-    fn read_the_one_log_file(dir: &std::path::Path, prefix: &str) -> String {
+    fn read_the_one_log_file(dir: &Path, prefix: &str) -> String {
         let mut matches: Vec<_> = std::fs::read_dir(dir)
             .expect("read temp log dir")
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
             .collect();
         assert_eq!(
@@ -10590,7 +10589,7 @@ mod tests {
         assert_eq!(dir, cache.root().join("logs"));
         assert_eq!(
             Some(cache.root()),
-            tcr::affinity::default_path().parent(),
+            affinity::default_path().parent(),
             "logs and the pin file share one cache directory"
         );
         let expected = match cache.generation() {
@@ -10659,7 +10658,7 @@ mod tests {
 
         let remaining: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
             .expect("read temp log dir")
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         std::fs::remove_dir_all(&dir).ok();
@@ -10809,7 +10808,7 @@ mod tests {
     fn account_with_groups(name: &str, groups: Option<&[&str]>) -> config::Account {
         config::Account {
             name: name.to_string(),
-            account_type: crate::config::AccountType::OAuth,
+            account_type: config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -10820,11 +10819,11 @@ mod tests {
             priority: None,
             switch_threshold: None,
             disabled: None,
-            groups: groups.map(|gs| gs.iter().map(|g| g.to_string()).collect()),
+            groups: groups.map(|gs| gs.iter().map(ToString::to_string).collect()),
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
-            egress: crate::config::Egress::Local,
+            egress: config::Egress::Local,
             egress_strict: false,
             codex_home: None,
             extra: serde_json::Map::new(),
@@ -11037,7 +11036,7 @@ mod tests {
 
     // --- legacy `throttle` migration: boot-time behaviour ---------------------
 
-    fn unique_config_path(tag: &str) -> std::path::PathBuf {
+    fn unique_config_path(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);

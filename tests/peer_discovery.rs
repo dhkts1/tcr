@@ -14,7 +14,7 @@ use tcr_peer_wire::{INSTANCE_ID_BYTES, InstanceId, PeerId};
 
 /// An instance id distinctive enough that a fragment of it could not appear by
 /// chance in a TXT record.
-fn test_instance() -> InstanceId {
+const fn test_instance() -> InstanceId {
     InstanceId([0x5A; INSTANCE_ID_BYTES])
 }
 
@@ -641,7 +641,10 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
         "the old endpoint is kept as history rather than replaced"
     );
     assert_eq!(
-        refreshed.endpoints.first().map(|e| e.direct_addr()),
+        refreshed
+            .endpoints
+            .first()
+            .map(tcr::peer::config::Endpoint::direct_addr),
         Some(Some(moved_addr)),
         "and the newest observation leads the dial order"
     );
@@ -862,7 +865,7 @@ async fn five_hundred_brief_addresses_write_once_and_never_outrank_the_paired_en
     let parsed = discovery::neighbor_brief_endpoints(std::slice::from_ref(&flood), &pinned, 5_000);
     assert_eq!(
         parsed.len(),
-        tcr::peer::discovery::MAX_BRIEF_ADDRS,
+        discovery::MAX_BRIEF_ADDRS,
         "one brief may teach four addresses, and the other 496 are never parsed, held or \
          carried; this batch produced {} endpoints",
         parsed.len()
@@ -898,7 +901,7 @@ async fn five_hundred_brief_addresses_write_once_and_never_outrank_the_paired_en
         .count();
     assert_eq!(
         from_brief,
-        tcr::peer::discovery::MAX_BRIEF_ENDPOINTS_PER_PEER,
+        discovery::MAX_BRIEF_ENDPOINTS_PER_PEER,
         "at most two of the eight slots are a peer's word about a third machine, so six \
          stay with the endpoints this node proved: {:?}",
         row.endpoints

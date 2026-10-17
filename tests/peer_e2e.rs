@@ -950,8 +950,7 @@ async fn two_macs_find_each_other_pair_on_six_digits_and_pin() {
     let instance = asked
         .rsplit_once("as instance ")
         .and_then(|(_, rest)| rest.split_whitespace().next())
-        .map(str::to_string)
-        .unwrap_or(instance);
+        .map_or(instance, str::to_string);
     assert_eq!(
         instance.len(),
         16,
@@ -1098,13 +1097,10 @@ async fn two_macs_find_each_other_pair_on_six_digits_and_pin() {
 /// outside that range is a test-runner mistake, not a shape this test learns
 /// to tolerate, so it panics rather than clamping silently.
 fn e2e_node_count() -> usize {
-    let n = std::env::var("TCR_E2E_NODES")
-        .ok()
-        .map(|raw| {
-            raw.parse::<usize>()
-                .unwrap_or_else(|err| panic!("TCR_E2E_NODES={raw:?} is not a number: {err}"))
-        })
-        .unwrap_or(2);
+    let n = std::env::var("TCR_E2E_NODES").ok().map_or(2, |raw| {
+        raw.parse::<usize>()
+            .unwrap_or_else(|err| panic!("TCR_E2E_NODES={raw:?} is not a number: {err}"))
+    });
     assert!((2..=5).contains(&n), "TCR_E2E_NODES must be 2..=5, got {n}");
     n
 }
@@ -2177,7 +2173,7 @@ fn percentile(values: &[f64], pct: usize) -> f64 {
 ///
 /// If the borrowed leg cannot reach a served 200 (the LEASE-WIRE arm named in
 /// this file's module docs, gap 4, not yet in the tree), that is reported as
-/// `measure: latency_borrowed_blocked` with the file:line and status/body
+/// `measure: latency_borrowed_blocked` with the <file:line> and status/body
 /// that blocked it, and the local leg's numbers are still printed, this
 /// test never fakes a borrowed-leg number and never implements the missing
 /// arm itself.
@@ -2260,13 +2256,7 @@ async fn measure_latency_local_vs_borrowed() {
         percentile(&local_ms, 95)
     );
 
-    if !primed {
-        println!(
-            "measure: latency_borrowed_blocked src/peer/listener.rs:1486 \
-             (listener::serve_control's Control::LeaseRequest arm) never reached a served 200 \
-             within {BORROW_SERVED_ATTEMPTS} attempts"
-        );
-    } else {
+    if primed {
         println!("STEP: {SAMPLES} requests borrowed through the lender");
         let mut borrowed_ms = Vec::with_capacity(SAMPLES as usize);
         let mut blocked_at: Option<(u32, u16, String)> = None;
@@ -2280,22 +2270,27 @@ async fn measure_latency_local_vs_borrowed() {
             }
             borrowed_ms.push(elapsed);
         }
-        match blocked_at {
-            Some((i, status, body)) => println!(
+        if let Some((i, status, body)) = blocked_at {
+            println!(
                 "measure: latency_borrowed_blocked request {i} of {SAMPLES} answered \
-                 status={status} body={body}"
-            ),
-            None => {
-                let borrowed_p50 = percentile(&borrowed_ms, 50);
-                let borrowed_p95 = percentile(&borrowed_ms, 95);
-                println!("measure: latency_borrowed_p50 {borrowed_p50:.2} ms");
-                println!("measure: latency_borrowed_p95 {borrowed_p95:.2} ms");
-                println!(
-                    "measure: latency_delta_p50 {:.2} ms",
-                    borrowed_p50 - percentile(&local_ms, 50)
-                );
-            }
+             status={status} body={body}"
+            );
+        } else {
+            let borrowed_p50 = percentile(&borrowed_ms, 50);
+            let borrowed_p95 = percentile(&borrowed_ms, 95);
+            println!("measure: latency_borrowed_p50 {borrowed_p50:.2} ms");
+            println!("measure: latency_borrowed_p95 {borrowed_p95:.2} ms");
+            println!(
+                "measure: latency_delta_p50 {:.2} ms",
+                borrowed_p50 - percentile(&local_ms, 50)
+            );
         }
+    } else {
+        println!(
+            "measure: latency_borrowed_blocked src/peer/listener.rs:1486 \
+             (listener::serve_control's Control::LeaseRequest arm) never reached a served 200 \
+             within {BORROW_SERVED_ATTEMPTS} attempts"
+        );
     }
 
     lender.shutdown();
@@ -3687,7 +3682,7 @@ async fn an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs(
         "the borrow is SERVED, over the socket the lender parked, and through the fallback \
          provider the borrower's dry fleet installs for itself, inside the borrow timeout",
     );
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let (status, _body) = post_messages(&borrower.proxy).await;
     let elapsed = started.elapsed();
     assert_eq!(

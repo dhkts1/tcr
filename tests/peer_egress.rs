@@ -189,14 +189,11 @@ async fn serve_one_carry(
     // A pinned requester on an IK return: the same authorization the
     // production responder applies, between message 1 and message 2.
     let pin_rows = rows.to_vec();
-    let mut session = noise::accept_handshake(
-        &mut stream,
-        secret,
-        noise::Handshake::Return,
-        &[],
-        move |remote| noise::pin_check_rows(remote, &pin_rows),
-    )
-    .await?;
+    let mut session =
+        noise::accept_handshake(&mut stream, secret, Handshake::Return, &[], move |remote| {
+            noise::pin_check_rows(remote, &pin_rows)
+        })
+        .await?;
     let frame = noise::recv_encrypted(&mut stream, &mut session.transport).await?;
     let header: StreamHeader = serde_json::from_slice(&frame)?;
     let row = rows.iter().find(|row| row.node == session.peer);
@@ -244,7 +241,7 @@ fn gateway_that_corrupts(
         let mut session = noise::accept_handshake(
             &mut stream,
             &secret,
-            noise::Handshake::Return,
+            Handshake::Return,
             &[],
             move |remote| noise::pin_check_rows(remote, &pin_rows),
         )
@@ -730,7 +727,7 @@ async fn a_carry_delivers_the_canned_messages_body_through_a_gateway() {
         .send()
         .await
         .expect("the carried request completes");
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await.expect("the carried body");
     assert_eq!(
         body, CANNED_BODY,
@@ -1173,7 +1170,9 @@ fn a_spent_hour_refuses_the_next_carry() {
             assert_eq!(allowance, slice);
             open
         }
-        refused => panic!("an untouched hour must admit a carry, got {refused:?}"),
+        refused @ Admission::OverBudget { .. } => {
+            panic!("an untouched hour must admit a carry, got {refused:?}")
+        }
     };
     // Closed having spent 600, which is more than its slice only because a
     // test may say so; the ledger records what it is told.
@@ -1187,7 +1186,9 @@ fn a_spent_hour_refuses_the_next_carry() {
             );
             open
         }
-        refused => panic!("400 bytes left must admit a carry, got {refused:?}"),
+        refused @ Admission::OverBudget { .. } => {
+            panic!("400 bytes left must admit a carry, got {refused:?}")
+        }
     };
     budget.close(open, &peer, 400, now);
     assert_eq!(
@@ -1637,7 +1638,7 @@ fn fleet_with(upstream: &str, accounts: Vec<Account>) -> Arc<Manager> {
         reset_urgency_tier_hours: 24,
         http1_only: false,
         accounts,
-        group_settings: std::collections::HashMap::new(),
+        group_settings: HashMap::new(),
         pricing: Default::default(),
         usage_retention_days: 90,
         extra: serde_json::Map::new(),
@@ -2267,7 +2268,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     let peers = dir.path().join("tcr-peers.json");
     let config = dir.path().join("teamclaude.json");
     let peer = node().id;
-    let file = tcr::peer::config::PeerFile {
+    let file = PeerFile {
         peers: vec![row(&peer, "attic-nuc", Vec::new(), true)],
         ..Default::default()
     };
@@ -2603,7 +2604,7 @@ async fn the_operators_timeout_is_what_a_silent_gateway_is_given() {
 /// The far end here is the production gateway handler with a FIXED origin that
 /// accepts TCP and then says nothing, which is exactly the shape that hung: the
 /// carry is real and taken, the requester's ClientHello goes out, and no
-/// ServerHello ever comes back. Nothing leaves this box.
+/// `ServerHello` ever comes back. Nothing leaves this box.
 ///
 /// Watched red by moving `send_through(...)` back out from under the deadline.
 /// It was given a 600-second one instead, purely so the mutation run would end,
@@ -2748,7 +2749,9 @@ fn five_concurrent_carries_at_a_four_carry_budget_refuse_the_fifth() {
                 assert_eq!(allowance, 1_000, "carry {n} holds one slice of the hour");
                 open.push(id);
             }
-            refused => panic!("carry {n} of four must be admitted, got {refused:?}"),
+            refused @ Admission::OverBudget { .. } => {
+                panic!("carry {n} of four must be admitted, got {refused:?}")
+            }
         }
     }
     assert_eq!(
@@ -2775,7 +2778,9 @@ fn five_concurrent_carries_at_a_four_carry_budget_refuse_the_fifth() {
             allowance, 990,
             "the slice that came back, less what the closed carry actually spent"
         ),
-        refused => panic!("a released slice must admit the next carry, got {refused:?}"),
+        refused @ Admission::OverBudget { .. } => {
+            panic!("a released slice must admit the next carry, got {refused:?}")
+        }
     }
     // Closing the same reservation twice cannot free a second slice.
     let before = budget.reserved_by(&peer);
@@ -4022,7 +4027,7 @@ fn the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead() {
 #[test]
 fn peer_egress_keeps_anthropic_hosts_and_never_carries_chatgpt() {
     assert_eq!(
-        tcr::peer::egress::PEER_EGRESS_HOSTS,
+        egress::PEER_EGRESS_HOSTS,
         &["api.anthropic.com", "platform.claude.com"]
     );
     assert!(egress::host_allowed("api.anthropic.com", 443));

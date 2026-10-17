@@ -94,7 +94,7 @@ struct RefreshResponse {
 /// Normalize an `expires_at` to milliseconds. OAuth backends may report seconds;
 /// Claude Code credentials use milliseconds. Values below ~`1e12` are seconds
 /// (that boundary is year 2001 in ms, far in the future in seconds).
-pub fn normalize_expires_at(value: i64) -> i64 {
+pub const fn normalize_expires_at(value: i64) -> i64 {
     if value < 1_000_000_000_000 {
         value * 1000
     } else {
@@ -112,7 +112,7 @@ fn expires_at_from(now_ms: i64, expires_in: Option<i64>) -> i64 {
 
 /// Has the token already expired at `now_ms`? A `None` expiry is treated as
 /// non-expiring (nothing to refresh).
-pub fn is_expired(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
+pub const fn is_expired(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
     match expires_at_ms {
         Some(exp) => now_ms >= exp,
         None => false,
@@ -120,7 +120,7 @@ pub fn is_expired(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
 }
 
 /// Is the token within [`EXPIRING_SOON_MS`] of expiry at `now_ms`?
-pub fn is_expiring_soon(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
+pub const fn is_expiring_soon(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
     match expires_at_ms {
         Some(exp) => now_ms + EXPIRING_SOON_MS >= exp,
         None => false,
@@ -441,21 +441,18 @@ impl LoginUi {
     /// Point [`PROSE`] at this mode for the rest of the process. Called once,
     /// at the top of [`login`] and of every other login entry point.
     pub(crate) fn install(self) {
-        PROSE.store(
-            self == LoginUi::Terminal,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        PROSE.store(self == Self::Terminal, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// True when stdin is a completion path and a prompt has somewhere to go.
     fn reads_stdin(self) -> bool {
-        self == LoginUi::Terminal
+        self == Self::Terminal
     }
 
     /// Emit one progress event, or nothing at all in [`LoginUi::Terminal`]
     /// (which narrates in prose instead — see [`LoginUi::say`]).
     pub(crate) fn emit(self, event: LoginEvent<'_>) {
-        if self == LoginUi::Machine {
+        if self == Self::Machine {
             println!("{}", event.line());
         }
     }
@@ -465,7 +462,7 @@ impl LoginUi {
     /// it. Goes through [`prose`] rather than `println!` so this mode and the
     /// deep persist-path lines can never disagree about what silence means.
     fn say(self, message: &str) {
-        if self == LoginUi::Terminal {
+        if self == Self::Terminal {
             prose(format_args!("{message}"));
         }
     }
@@ -594,28 +591,25 @@ impl LoginRefusal {
 /// as it is. Anything else gives the uncoded line it always gave, its reason flattened from the
 /// whole chain by [`one_line_reason`].
 pub fn machine_error_line(error: &anyhow::Error) -> (String, String) {
-    match error
+    if let Some(refusal) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<LoginRefusal>())
     {
-        Some(refusal) => {
-            let reason = refusal
-                .reason
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            let line = LoginEvent::Refused {
-                code: refusal.code,
-                reason: &reason,
-            }
-            .line();
-            (line, reason)
+        let reason = refusal
+            .reason
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let line = LoginEvent::Refused {
+            code: refusal.code,
+            reason: &reason,
         }
-        None => {
-            let reason = one_line_reason(error);
-            let line = LoginEvent::Error { reason: &reason }.line();
-            (line, reason)
-        }
+        .line();
+        (line, reason)
+    } else {
+        let reason = one_line_reason(error);
+        let line = LoginEvent::Error { reason: &reason }.line();
+        (line, reason)
     }
 }
 
@@ -916,13 +910,13 @@ async fn wait_for_code(
     if !ui.reads_stdin() {
         return tokio::select! {
             result = run_callback_server(listener, expected_state) => result,
-            _ = tokio::time::sleep(LOGIN_TIMEOUT) => Err(anyhow!("Login timed out after 2 minutes")),
+            () = tokio::time::sleep(LOGIN_TIMEOUT) => Err(anyhow!("Login timed out after 2 minutes")),
         };
     }
     tokio::select! {
         result = run_callback_server(listener, expected_state) => result,
         result = read_stdin_code(expected_state) => result,
-        _ = tokio::time::sleep(LOGIN_TIMEOUT) => Err(anyhow!("Login timed out after 2 minutes")),
+        () = tokio::time::sleep(LOGIN_TIMEOUT) => Err(anyhow!("Login timed out after 2 minutes")),
     }
 }
 
@@ -1116,14 +1110,14 @@ impl Profile {
     /// taken from the token-exchange response instead. A field the profile
     /// endpoint did send is kept. Both answers describe the one token the
     /// exchange just minted, so they cannot name two different accounts.
-    fn or_exchange_identity(self, identity: ExchangeIdentity) -> Profile {
+    fn or_exchange_identity(self, identity: ExchangeIdentity) -> Self {
         let (account_uuid, email) = identity
             .account
             .map_or((None, None), |a| (a.uuid, a.email_address));
         let (org_uuid, org_name) = identity
             .organization
             .map_or((None, None), |o| (o.uuid, o.name));
-        Profile {
+        Self {
             email: self.email.or(email),
             account_uuid: self.account_uuid.or(account_uuid),
             org_uuid: self.org_uuid.or(org_uuid),
@@ -1301,8 +1295,8 @@ pub fn upsert_account(
         crate::identity::Resolved::One(index) => {
             let account = &mut config.accounts[index];
             account.account_type = crate::config::AccountType::OAuth;
-            account.access_token = tokens.access_token.clone();
-            account.refresh_token = tokens.refresh_token.clone();
+            account.access_token.clone_from(&tokens.access_token);
+            account.refresh_token.clone_from(&tokens.refresh_token);
             account.expires_at = Some(tokens.expires_at_ms);
             // Backfill any identity field the stored entry was missing (e.g. a
             // legacy pre-org entry newly profiled), without overwriting known
@@ -1322,13 +1316,15 @@ pub fn upsert_account(
             // `config::Account::organization_type`. A `None` writes nothing, so
             // a profile fetch that failed never blanks a known plan.
             if profile.organization_type.is_some() {
-                account.organization_type = profile.organization_type.clone();
+                account
+                    .organization_type
+                    .clone_from(&profile.organization_type);
             }
             if profile.rate_limit_tier.is_some() {
-                account.rate_limit_tier = profile.rate_limit_tier.clone();
+                account.rate_limit_tier.clone_from(&profile.rate_limit_tier);
             }
             if profile.seat_tier.is_some() {
-                account.seat_tier = profile.seat_tier.clone();
+                account.seat_tier.clone_from(&profile.seat_tier);
             }
             Ok(())
         }
@@ -1778,7 +1774,7 @@ pub async fn login(
     let incumbent = singleton::live_proxy_server(port);
     let route = login_route(config_path, incumbent, port, force).await?;
     if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
+        bail!("{msg}");
     }
 
     // Resolve --account early, ONLY to compute the login_hint (ergonomics —
@@ -2067,7 +2063,7 @@ pub async fn login_with_token(
     let incumbent = singleton::live_proxy_server(port);
     let route = login_route(config_path, incumbent, port, force).await?;
     if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
+        bail!("{msg}");
     }
 
     let access_token = read_setup_token()?;
@@ -2433,7 +2429,7 @@ pub(crate) async fn codex_login_route_check(config_path: &Path, force: bool) -> 
         login_route_with_providers(config_path, incumbent, port, force, LOGIN_CODEX_COMMAND)
             .await?;
     if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
+        bail!("{msg}");
     }
     if route == LoginRoute::Live && !providers.contains(&crate::provider::Provider::Codex) {
         bail!(
@@ -2559,7 +2555,7 @@ pub(crate) async fn import_codex_login_as(
     let (route, providers) =
         login_route_with_providers(config_path, incumbent, port, force, command).await?;
     if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
+        bail!("{msg}");
     }
     if route == LoginRoute::Live && !providers.contains(&crate::provider::Provider::Codex) {
         bail!("{}", codex_live_route_refusal(port, pid, command));
@@ -2688,7 +2684,7 @@ fn existing_codex_row<'a>(
 /// NEWER than the one being imported (`import`). Only a provable "newer" counts:
 /// an expiry missing on either side is no evidence, and an equal one is the same
 /// credential imported twice, which is harmless.
-fn holds_newer_credential(stored: Option<i64>, import: Option<i64>) -> bool {
+const fn holds_newer_credential(stored: Option<i64>, import: Option<i64>) -> bool {
     matches!((stored, import), (Some(stored), Some(import)) if stored > import)
 }
 
@@ -2906,7 +2902,7 @@ async fn import_claude_code_login(
     )
     .await?;
     if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
+        bail!("{msg}");
     }
 
     let tokens = tokens_from_claude_code_login(login);
@@ -3234,7 +3230,7 @@ fn assert_requested_identity(
 /// One case `config::save_account` cannot serve on its own: no file exists
 /// at `config_path` yet at all. Its `read_document` is a bare
 /// `fs::read_to_string`, which cannot create a missing path — mirrors the
-/// same NotFound guard [`persist_via_account_or_file`] already carries for
+/// same `NotFound` guard [`persist_via_account_or_file`] already carries for
 /// exactly this reason. There is nothing on disk in that case for a stale
 /// snapshot to clobber, so falling back to a fresh single-account
 /// [`config::save`] is safe rather than a reintroduction of the hazard this
@@ -3619,8 +3615,8 @@ mod tests {
         // The oauth2-built flow yields a non-empty verifier and CSRF state, and
         // an authorize URL rooted at Claude's endpoint.
         let flow = build_login_flow("http://localhost:12345/callback", None).unwrap();
-        assert!(!flow.verifier.is_empty());
-        assert!(!flow.state.is_empty());
+        assert_ne!(flow.verifier, "");
+        assert_ne!(flow.state, "");
         assert!(flow.auth_url.starts_with(AUTHORIZE_URL));
         // Claude's authorize endpoint rejects short states ("Invalid request
         // format", observed live 2026-07-17 with the 22-char crate default).
@@ -6426,7 +6422,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// `persist_via_account_or_file`'s NotFound guard: `config::save_account`'s
+    /// `persist_via_account_or_file`'s `NotFound` guard: `config::save_account`'s
     /// `read_document` opens the file with `fs::read_to_string`, which cannot
     /// create one that is not there — so a `NoServer` result reached with NO
     /// config file on disk at all must still fall back to `persist_via_file`

@@ -28,7 +28,7 @@ use tcr::peer::moved::{
 use tcr_peer_wire::{PeerId, decode_bytes};
 
 /// A peer id that is plainly not a real one: 32 copies of one byte.
-fn peer_id(fill: u8) -> PeerId {
+const fn peer_id(fill: u8) -> PeerId {
     PeerId([fill; 32])
 }
 
@@ -666,7 +666,7 @@ fn a_moved_endpoint_sorts_behind_a_brief_and_beside_a_drop() {
 /// Spelled here rather than imported because it is the module's own private
 /// arithmetic, and a test that imported it could not tell a changed minimum
 /// from a broken one.
-fn crate_min_link_bytes() -> usize {
+const fn crate_min_link_bytes() -> usize {
     4 + 1 + 12 + 16 + 1
 }
 

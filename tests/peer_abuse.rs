@@ -81,38 +81,38 @@ mod plan {
     use std::time::Duration;
 
     /// `1 knock / 10 s, burst 3, per address`.
-    pub const KNOCK_BURST: u32 = 3;
+    pub(crate) const KNOCK_BURST: u32 = 3;
     /// `1 knock / 10 s, burst 3, per address`.
-    pub const KNOCK_INTERVAL_MS: i64 = 10_000;
+    pub(crate) const KNOCK_INTERVAL_MS: i64 = 10_000;
     /// `at most 8 PENDING per node`.
-    pub const MAX_PENDING_KNOCKS: usize = 8;
+    pub(crate) const MAX_PENDING_KNOCKS: usize = 8;
     /// `16 concurrent unauthenticated sockets per node`.
-    pub const MAX_UNAUTHENTICATED_SOCKETS: usize = 16;
+    pub(crate) const MAX_UNAUTHENTICATED_SOCKETS: usize = 16;
     /// `2 per address`.
-    pub const MAX_UNAUTHENTICATED_PER_ADDRESS: usize = 2;
+    pub(crate) const MAX_UNAUTHENTICATED_PER_ADDRESS: usize = 2;
     /// `5 s to deliver message 1`.
-    pub const MESSAGE_1_TIMEOUT: Duration = Duration::from_secs(5);
+    pub(crate) const MESSAGE_1_TIMEOUT: Duration = Duration::from_secs(5);
     /// The handshake bound the listener's own doc-comment states.
-    pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+    pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
     /// `message 1 capped at 64 bytes` is the plan's figure for message 1
     /// itself; the KNOCK FRAME the session carries is bounded separately, and
     /// `listener::MAX_KNOCK_FRAME_BYTES` is the number the code shipped for it.
-    pub const MAX_KNOCK_FRAME_BYTES: usize = 512;
+    pub(crate) const MAX_KNOCK_FRAME_BYTES: usize = 512;
     /// `found list capped at 12 rows`.
-    pub const MAX_FOUND_ROWS: usize = 12;
+    pub(crate) const MAX_FOUND_ROWS: usize = 12;
     /// `at most 2 rows per source address`.
-    pub const MAX_FOUND_PER_ADDRESS: usize = 2;
+    pub(crate) const MAX_FOUND_PER_ADDRESS: usize = 2;
     /// `a row that stops announcing leaves after 60 s`.
-    pub const FOUND_TTL_MS: i64 = 60_000;
+    pub(crate) const FOUND_TTL_MS: i64 = 60_000;
     /// `an ignored address is muted for 1 h`.
-    pub const MUTE_MS: i64 = 3_600_000;
+    pub(crate) const MUTE_MS: i64 = 3_600_000;
     /// `one log line per address per hour`.
-    pub const REFUSAL_LOG_QUIET_MS: i64 = 3_600_000;
+    pub(crate) const REFUSAL_LOG_QUIET_MS: i64 = 3_600_000;
     /// How many addresses that log remembers: the number the code shipped,
     /// and the cost of beating the line above.
-    pub const REFUSAL_LOG_ADDRESSES: usize = 1_024;
+    pub(crate) const REFUSAL_LOG_ADDRESSES: usize = 1_024;
     /// `COMPARING has a 120 s window keyed to one instance id`.
-    pub const PAIRING_WINDOW_SECS: i64 = 120;
+    pub(crate) const PAIRING_WINDOW_SECS: i64 = 120;
 }
 
 /// **Every cap is still the number the record shipped.**
@@ -330,7 +330,7 @@ async fn serve(context: SessionContext) -> SocketAddr {
 /// dropped).
 const LOOPBACK: &str = "127.0.0.1";
 
-fn instance(byte: u8) -> InstanceId {
+const fn instance(byte: u8) -> InstanceId {
     InstanceId([byte; INSTANCE_ID_BYTES])
 }
 

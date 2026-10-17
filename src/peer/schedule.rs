@@ -50,7 +50,7 @@ pub struct Hhmm {
 
 impl Hhmm {
     /// `None` if `hour >= 24` or `minute >= 60`.
-    pub fn new(hour: u8, minute: u8) -> Option<Self> {
+    pub const fn new(hour: u8, minute: u8) -> Option<Self> {
         if hour < 24 && minute < 60 {
             Some(Self { hour, minute })
         } else {
@@ -59,12 +59,12 @@ impl Hhmm {
     }
 
     /// `0..24`.
-    pub fn hour(self) -> u8 {
+    pub const fn hour(self) -> u8 {
         self.hour
     }
 
     /// `0..60`.
-    pub fn minute(self) -> u8 {
+    pub const fn minute(self) -> u8 {
         self.minute
     }
 
@@ -169,7 +169,7 @@ impl Days {
 
     /// Empty means the operator named no day at all, which is a refusal to
     /// build a schedule from rather than a schedule that is never open.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }

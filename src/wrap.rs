@@ -153,7 +153,7 @@ impl From<Agg> for Totals {
 /// For `#[serde(skip_serializing_if)]` on every `unpriced_requests`: a report with no
 /// unpriced Codex request writes no such key, which keeps a Claude-only report's JSON
 /// byte for byte what it was.
-fn is_zero(n: &u64) -> bool {
+const fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 

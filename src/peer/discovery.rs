@@ -511,7 +511,7 @@ pub enum AnnounceStep {
 /// accepts the current minute and the one before, so a beacon stamped once at
 /// registration stops verifying about two minutes later and the node goes
 /// undiscoverable while still announcing.
-pub fn announce_step(
+pub const fn announce_step(
     find_on: bool,
     stamped_minute: Option<i64>,
     now_unix_secs: i64,
@@ -1160,17 +1160,17 @@ impl FoundList {
     /// Counted rather than discarded so the UI can be honest: "12 shown, N more
     /// not shown" tells an operator their Mac is on a noisy network, and a
     /// silently truncated list tells them their Mac is broken.
-    pub fn not_shown(&self) -> usize {
+    pub const fn not_shown(&self) -> usize {
         self.rows.len().saturating_sub(MAX_FOUND_ROWS)
     }
 
     /// How many rows are held in total.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.rows.len()
     }
 
     /// Whether nothing has been found.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
 }

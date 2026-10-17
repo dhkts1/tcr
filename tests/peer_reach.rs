@@ -476,7 +476,7 @@ fn the_v6_probe_reports_only_addresses_that_pass_the_filter() {
 struct Seeded(u64);
 
 impl Seeded {
-    fn next(&mut self) -> u64 {
+    const fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
         x ^= x >> 7;
@@ -794,7 +794,7 @@ fn the_address_a_peer_sees_this_mac_at_survives_a_restart() {
     let peer = tcr_peer_wire::PeerId([0x22; 32]);
     // The public address a peer would report: documentation space, never a
     // real one, and not a socket this test opens.
-    let seen: std::net::SocketAddr = "203.0.113.77:41236".parse().expect("a literal address");
+    let seen: SocketAddr = "203.0.113.77:41236".parse().expect("a literal address");
 
     let (out, err, ok) = run_reach(&peers, &["--json"]);
     assert!(ok, "tcr peer reach exited non-zero: {err}");
@@ -861,7 +861,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
 /// config structs would make it fail to COMPILE every time a field is added
 /// to those structs elsewhere, which is a different failure from the one this test exists to
 /// report.
-fn peers_file_with_one_peer(dir: &std::path::Path, listen_port: u16) -> std::path::PathBuf {
+fn peers_file_with_one_peer(dir: &Path, listen_port: u16) -> std::path::PathBuf {
     let node = tcr_peer_wire::PeerId([0x22; 32]).to_wire();
     let body = format!(
         r#"{{
@@ -884,7 +884,7 @@ fn peers_file_with_one_peer(dir: &std::path::Path, listen_port: u16) -> std::pat
 }
 
 /// Run `tcr peer reach` against a temp peers file: `(stdout, stderr, ok)`.
-fn run_reach(peers: &std::path::Path, extra: &[&str]) -> (String, String, bool) {
+fn run_reach(peers: &Path, extra: &[&str]) -> (String, String, bool) {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
         .args(["peer", "reach"])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
@@ -1811,7 +1811,7 @@ async fn two_blackholing_endpoints_leave_a_later_step_time_to_run() {
 
     let dir = tempfile::tempdir().expect("a temp dir for the peers file");
     let path = dir.path().join("tcr-peers.json");
-    let file = peer_config::PeerFile {
+    let file = PeerFile {
         peers: vec![row],
         ..Default::default()
     };
@@ -1972,7 +1972,7 @@ async fn a_dial_that_races_two_live_endpoints_does_not_cool_the_one_it_did_not_u
 }
 
 /// Run `tcr peer internet on|off` against a temp peers file: `(stdout, stderr, ok)`.
-fn run_internet(peers: &std::path::Path, state: &str) -> (String, String, bool) {
+fn run_internet(peers: &Path, state: &str) -> (String, String, bool) {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
         .args(["peer", "internet", state])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
@@ -2454,7 +2454,7 @@ fn a_punch_that_cannot_start_names_what_is_missing() {
     let (addr, secret) = reach::punch_target(&node, &[]).expect("both halves are held now");
     assert_eq!(
         addr,
-        "203.0.113.20".parse::<std::net::IpAddr>().expect("parses"),
+        "203.0.113.20".parse::<IpAddr>().expect("parses"),
         "the punch aims at the address, and the port comes from the derivation"
     );
     assert_eq!(secret, [0x5c; 32]);
@@ -2482,7 +2482,7 @@ fn a_punch_that_cannot_start_names_what_is_missing() {
 #[test]
 fn aim_off_the_row() {
     let node = tcr_peer_wire::PeerId([0x77; 32]);
-    let moved: std::net::SocketAddr = "198.51.100.7:7755".parse().expect("a test address parses");
+    let moved: SocketAddr = "198.51.100.7:7755".parse().expect("a test address parses");
     let endpoints = [tcr::peer::config::Endpoint::direct(
         moved,
         2_000,
@@ -2511,7 +2511,7 @@ fn aim_off_the_row() {
     let (fresher, _) = reach::punch_target(&node, &endpoints).expect("both halves are held");
     assert_eq!(
         fresher,
-        "203.0.113.9".parse::<std::net::IpAddr>().expect("parses"),
+        "203.0.113.9".parse::<IpAddr>().expect("parses"),
         "the freshest observation still wins over a row endpoint"
     );
 }
@@ -2551,7 +2551,7 @@ fn a_neighbour_in_this_macs_own_v6_prefix_is_answered_with_the_switch_off() {
         .expect("the unspecified dual-stack bind address");
     // This Mac's own delegated address, and the Mac on the next desk in the
     // same prefix with a different host part.
-    let own: std::net::Ipv6Addr = "2001:db8:1234:5678::1"
+    let own: Ipv6Addr = "2001:db8:1234:5678::1"
         .parse()
         .expect("a documentation address");
     let neighbour: IpAddr = "2001:db8:1234:5678:aaaa:bbbb:cccc:dddd"
@@ -2642,9 +2642,9 @@ fn a_keeper_whose_internet_flag_goes_off_deletes_its_mapping_and_stops() {
     });
     let dir = tempfile::tempdir().expect("a temp profile directory");
     let peers_path = dir.path().join("tcr-peers.json");
-    let on = tcr::peer::config::PeerFile {
+    let on = PeerFile {
         internet: true,
-        ..tcr::peer::config::PeerFile::default()
+        ..PeerFile::default()
     };
     tcr::peer::config::save(&peers_path, &on).expect("the peers file writes");
 
@@ -2653,9 +2653,9 @@ fn a_keeper_whose_internet_flag_goes_off_deletes_its_mapping_and_stops() {
     let flipping = peers_path.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
-        let off = tcr::peer::config::PeerFile {
+        let off = PeerFile {
             internet: false,
-            ..tcr::peer::config::PeerFile::default()
+            ..PeerFile::default()
         };
         tcr::peer::config::save(&flipping, &off).expect("the peers file writes");
     });
@@ -3288,7 +3288,11 @@ fn a_different_default_gateway_puts_the_ladder_back_on_its_first_rung() {
     // route-table tool.
     let mut retry = MappingRetry::new();
     retry.answered(MappingAnswer::Refused);
-    retry.tick(reach::GATEWAY_RECHECK_INTERVAL - Duration::from_secs(1));
+    retry.tick(
+        reach::GATEWAY_RECHECK_INTERVAL
+            .checked_sub(Duration::from_secs(1))
+            .unwrap(),
+    );
     assert!(!retry.gateway_read_due());
     retry.tick(Duration::from_secs(1));
     assert!(

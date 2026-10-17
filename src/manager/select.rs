@@ -54,7 +54,7 @@ const PIN_LOAD_IDLE_MS: i64 = 60 * 60 * 1000;
 /// `is_self` is the requesting session's own pin: that session is demonstrably
 /// alive — it is making this very request — so its own last-touch stamp (which
 /// still names its PREVIOUS request) never disqualifies it.
-fn pin_counts_as_load(is_self: bool, touched_ms: i64, now_ms: i64) -> bool {
+const fn pin_counts_as_load(is_self: bool, touched_ms: i64, now_ms: i64) -> bool {
     is_self || now_ms.saturating_sub(touched_ms) <= PIN_LOAD_IDLE_MS
 }
 
@@ -140,7 +140,7 @@ pub(super) enum GroupMiss {
 impl GroupMiss {
     /// One greppable token for the `reason=` log field, so an operator can count
     /// group misses by cause without parsing prose.
-    pub(super) fn as_str(self) -> &'static str {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "no-such-group",
             Self::OnlyControl => "control-account-only",
@@ -152,7 +152,7 @@ impl GroupMiss {
 
     /// The sentence a human reads in the log. Says what to DO about it in the
     /// one case that has a remedy the operator must apply by hand.
-    pub(super) fn explain(self) -> &'static str {
+    pub(super) const fn explain(self) -> &'static str {
         match self {
             Self::Unknown => "no configured account carries the requested group",
             Self::OnlyControl => {
@@ -276,7 +276,7 @@ pub(super) fn effective_threshold(threshold: f64, reserve: f64, allow_reserve: b
 }
 
 /// The ONE resolver for the effective Fable-weekly (`7d_oi`) threshold, consumed
-/// by both [`Manager::model_blocked`] and [`Manager::account_gate`]'s FableWeekly
+/// by both [`Manager::model_blocked`] and [`Manager::account_gate`]'s `FableWeekly`
 /// push so they can never independently drift — see
 /// [`crate::config::Config::fable_weekly_threshold`]'s doc for the operator-facing
 /// contract. `today` is whatever threshold the caller would otherwise apply to
@@ -800,7 +800,82 @@ impl Manager {
                                 &parked_groups,
                             )
                         });
-                        if !x_usable {
+                        if x_usable {
+                            // Default: honour the pin. With migration disabled (the
+                            // default), or when `count_x < 2` (a LONE session),
+                            // `target` stays `idx` and nothing below runs, so this
+                            // path is byte-identical to the pre-migration behaviour —
+                            // a warm session's cache is never moved.
+                            let mut target = idx;
+                            let mut migrate_names: Option<(String, String)> = None;
+                            if migration_ok {
+                                // Least-loaded eligible target, ordered by
+                                // (pinned-session-count asc, in_flight asc,
+                                // last_selected_seq asc / LRU). A candidate qualifies
+                                // ONLY if it strictly improves balance — this guard
+                                // prevents thrash and equal-swaps.
+                                let mut best: Option<usize> = None;
+                                let mut best_key: Option<(usize, u32, u64)> = None;
+                                for (cand, account) in accounts.iter().enumerate() {
+                                    if cand == idx || tried.contains(&cand) {
+                                        continue;
+                                    }
+                                    let count_y = counts.get(&cand).copied().unwrap_or(0);
+                                    if count_y + 1 >= count_x {
+                                        continue;
+                                    }
+                                    // Only migrate onto an ELIGIBLE account — the same
+                                    // gate the pin honours (disabled/error/rate-limit/
+                                    // quota/pacing), so a throttled `Y` is never chosen.
+                                    if !Self::eligible(
+                                        account,
+                                        self.global_threshold,
+                                        self.fable_weekly_threshold,
+                                        &self.pacing,
+                                        true,
+                                        now,
+                                        now_ms,
+                                        is_fable,
+                                        provider,
+                                        // `strict_group`, not `None`: the fourth door out of a
+                                        // strict group, and the one that returns from inside the
+                                        // affinity fast path. A migration target is a NEW pin, not
+                                        // a re-litigation of the existing one, so it is held to the
+                                        // same strict ask every other candidate loop in this
+                                        // function already is.
+                                        strict_group,
+                                        group, // reservation is not a preference, real ask
+                                        &reserved_groups,
+                                        &parked_groups,
+                                    ) {
+                                        continue;
+                                    }
+                                    let cand_key =
+                                        (count_y, account.in_flight, account.last_selected_seq);
+                                    if best_key.is_none_or(|b| cand_key < b) {
+                                        best = Some(cand);
+                                        best_key = Some(cand_key);
+                                    }
+                                }
+                                if let Some(y) = best {
+                                    let x_name = accounts
+                                        .get(idx)
+                                        .map(|a| a.name.clone())
+                                        .unwrap_or_default();
+                                    let y_name =
+                                        accounts.get(y).map(|a| a.name.clone()).unwrap_or_default();
+                                    migrate_names = Some((x_name, y_name));
+                                    target = y;
+                                }
+                            }
+                            // Stamp the chosen account so a second session's LRU steers
+                            // away from an account already busy under a pin.
+                            let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                            if let Some(account) = accounts.get_mut(target) {
+                                account.last_selected_seq = tick;
+                            }
+                            Some((target, migrate_names))
+                        } else {
                             // Re-test the SAME account against the ACCOUNT-level HARD
                             // gates ALONE to separate a per-REQUEST yield from a real
                             // block. Passing there means the pin cleared
@@ -1003,81 +1078,6 @@ impl Manager {
                                     Some((idx, None))
                                 }
                             }
-                        } else {
-                            // Default: honour the pin. With migration disabled (the
-                            // default), or when `count_x < 2` (a LONE session),
-                            // `target` stays `idx` and nothing below runs, so this
-                            // path is byte-identical to the pre-migration behaviour —
-                            // a warm session's cache is never moved.
-                            let mut target = idx;
-                            let mut migrate_names: Option<(String, String)> = None;
-                            if migration_ok {
-                                // Least-loaded eligible target, ordered by
-                                // (pinned-session-count asc, in_flight asc,
-                                // last_selected_seq asc / LRU). A candidate qualifies
-                                // ONLY if it strictly improves balance — this guard
-                                // prevents thrash and equal-swaps.
-                                let mut best: Option<usize> = None;
-                                let mut best_key: Option<(usize, u32, u64)> = None;
-                                for (cand, account) in accounts.iter().enumerate() {
-                                    if cand == idx || tried.contains(&cand) {
-                                        continue;
-                                    }
-                                    let count_y = counts.get(&cand).copied().unwrap_or(0);
-                                    if count_y + 1 >= count_x {
-                                        continue;
-                                    }
-                                    // Only migrate onto an ELIGIBLE account — the same
-                                    // gate the pin honours (disabled/error/rate-limit/
-                                    // quota/pacing), so a throttled `Y` is never chosen.
-                                    if !Self::eligible(
-                                        account,
-                                        self.global_threshold,
-                                        self.fable_weekly_threshold,
-                                        &self.pacing,
-                                        true,
-                                        now,
-                                        now_ms,
-                                        is_fable,
-                                        provider,
-                                        // `strict_group`, not `None`: the fourth door out of a
-                                        // strict group, and the one that returns from inside the
-                                        // affinity fast path. A migration target is a NEW pin, not
-                                        // a re-litigation of the existing one, so it is held to the
-                                        // same strict ask every other candidate loop in this
-                                        // function already is.
-                                        strict_group,
-                                        group, // reservation is not a preference, real ask
-                                        &reserved_groups,
-                                        &parked_groups,
-                                    ) {
-                                        continue;
-                                    }
-                                    let cand_key =
-                                        (count_y, account.in_flight, account.last_selected_seq);
-                                    if best_key.is_none_or(|b| cand_key < b) {
-                                        best = Some(cand);
-                                        best_key = Some(cand_key);
-                                    }
-                                }
-                                if let Some(y) = best {
-                                    let x_name = accounts
-                                        .get(idx)
-                                        .map(|a| a.name.clone())
-                                        .unwrap_or_default();
-                                    let y_name =
-                                        accounts.get(y).map(|a| a.name.clone()).unwrap_or_default();
-                                    migrate_names = Some((x_name, y_name));
-                                    target = y;
-                                }
-                            }
-                            // Stamp the chosen account so a second session's LRU steers
-                            // away from an account already busy under a pin.
-                            let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
-                            if let Some(account) = accounts.get_mut(target) {
-                                account.last_selected_seq = tick;
-                            }
-                            Some((target, migrate_names))
                         }
                     };
                     if let Some((target, migrate_names)) = decision {
@@ -1489,37 +1489,36 @@ impl Manager {
                         // than always blaming pacing: an operator debugging why
                         // `--group` did not land where expected must not read a log
                         // line about pacing when pacing was never the reason.
-                        match group {
-                            Some(g) => {
-                                let miss = Self::classify_group_miss(
-                                    &accounts,
-                                    tried,
-                                    control_excluded,
-                                    self.global_threshold,
-                                    self.fable_weekly_threshold,
-                                    &self.pacing,
-                                    now,
-                                    now_ms,
-                                    is_fable,
-                                    provider,
-                                    g,
-                                    &reserved_groups,
-                                    &parked_groups,
-                                );
-                                tracing::info!(
-                                    account = %account.name,
-                                    in_flight = account.in_flight,
-                                    group = g,
-                                    reason = miss.as_str(),
-                                    "group: falling back to the whole pool (group ignored), serving least-loaded — {}",
-                                    miss.explain(),
-                                );
-                            }
-                            None => tracing::info!(
+                        if let Some(g) = group {
+                            let miss = Self::classify_group_miss(
+                                &accounts,
+                                tried,
+                                control_excluded,
+                                self.global_threshold,
+                                self.fable_weekly_threshold,
+                                &self.pacing,
+                                now,
+                                now_ms,
+                                is_fable,
+                                provider,
+                                g,
+                                &reserved_groups,
+                                &parked_groups,
+                            );
+                            tracing::info!(
+                                account = %account.name,
+                                in_flight = account.in_flight,
+                                group = g,
+                                reason = miss.as_str(),
+                                "group: falling back to the whole pool (group ignored), serving least-loaded — {}",
+                                miss.explain(),
+                            );
+                        } else {
+                            tracing::info!(
                                 account = %account.name,
                                 in_flight = account.in_flight,
                                 "pacing: all accounts paced, serving least-loaded"
-                            ),
+                            );
                         }
                     }
                     best = Some(idx);
@@ -2577,7 +2576,11 @@ impl Manager {
     ///   - **pacing** is a fact we measure exactly and continuously about our OWN
     ///     concurrency, and spreading a session's burst is the entire reason the cap
     ///     exists. It stays a per-REQUEST yield: divert this one, keep the pin.
-    pub(super) fn paced_out(account: &AccountRuntime, pacing: &PacingConfig, now_ms: i64) -> bool {
+    pub(super) const fn paced_out(
+        account: &AccountRuntime,
+        pacing: &PacingConfig,
+        now_ms: i64,
+    ) -> bool {
         if !pacing.is_active() {
             return false;
         }
@@ -2873,7 +2876,7 @@ impl Manager {
             let reset = account
                 .quota
                 .governing_weekly_reset(now)
-                .map_or(i128::MIN, |r| r.unix_timestamp() as i128);
+                .map_or(i128::MIN, |r| i128::from(r.unix_timestamp()));
             let key = (
                 account.priority,
                 self.reset_urgency_tier(account, now),
@@ -2941,7 +2944,7 @@ impl Manager {
             let reset = account
                 .quota
                 .governing_weekly_reset(now)
-                .map_or(i128::MIN, |r| r.unix_timestamp() as i128);
+                .map_or(i128::MIN, |r| i128::from(r.unix_timestamp()));
             let key = (
                 account.in_flight,
                 account.priority,
@@ -3036,7 +3039,7 @@ impl Manager {
             let reset = account
                 .quota
                 .governing_weekly_reset(now)
-                .map_or(i128::MIN, |r| r.unix_timestamp() as i128);
+                .map_or(i128::MIN, |r| i128::from(r.unix_timestamp()));
             let key = (
                 oi_bucket,
                 account.priority,
@@ -3168,7 +3171,7 @@ impl Manager {
 /// longest-possible constraint, so it must sort as the LATEST-clearing gate.
 /// Among known instants the natural chronological order applies. Used by
 /// [`Manager::account_gate`] to pick the binding (latest-clearing) gate.
-fn gate_clear_key(at: Option<OffsetDateTime>) -> (u8, OffsetDateTime) {
+const fn gate_clear_key(at: Option<OffsetDateTime>) -> (u8, OffsetDateTime) {
     match at {
         Some(t) => (0, t),
         None => (1, OffsetDateTime::UNIX_EPOCH),
@@ -4132,7 +4135,12 @@ mod reserved_gate_agreement_tests {
                 priority: Some(0),
                 switch_threshold: None,
                 disabled: None,
-                groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+                groups: Some(
+                    groups
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
+                ),
                 organization_type: None,
                 rate_limit_tier: None,
                 seat_tier: None,
@@ -4167,8 +4175,10 @@ mod reserved_gate_agreement_tests {
         for groups in group_combos {
             let account = account_runtime(groups);
             for reserved_list in reserved_combos {
-                let reserved: HashSet<String> =
-                    reserved_list.iter().map(|s| s.to_string()).collect();
+                let reserved: HashSet<String> = reserved_list
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect();
                 let blocked = Manager::reserved_blocks(&account, None, &reserved);
 
                 let elig = Manager::eligible(
@@ -4304,7 +4314,12 @@ mod group_miss_tests {
                 priority: Some(0),
                 switch_threshold: None,
                 disabled: disabled.then_some(true),
-                groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+                groups: Some(
+                    groups
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
+                ),
                 organization_type: None,
                 rate_limit_tier: None,
                 seat_tier: None,
@@ -4895,7 +4910,7 @@ mod fable_last_resort_tests {
         );
     }
 
-    /// `account_gate`'s FableWeekly push must agree with `model_blocked` on the
+    /// `account_gate`'s `FableWeekly` push must agree with `model_blocked` on the
     /// same account under both an absent and a set `fableWeeklyThreshold` — two
     /// independently-resolved copies is exactly how the panel and routing can
     /// drift; see [`effective_fable_threshold`], the one resolver both consume.

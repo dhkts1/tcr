@@ -546,7 +546,7 @@ struct ConnectionFailure {
 
 impl ConnectionFailure {
     /// A refusal from before the handshake completed.
-    fn unauthenticated(error: anyhow::Error) -> Self {
+    const fn unauthenticated(error: anyhow::Error) -> Self {
         Self {
             authenticated: false,
             error,
@@ -554,7 +554,7 @@ impl ConnectionFailure {
     }
 
     /// A failure on a session that had already proved who it was.
-    fn authenticated(error: anyhow::Error) -> Self {
+    const fn authenticated(error: anyhow::Error) -> Self {
         Self {
             authenticated: true,
             error,
@@ -731,7 +731,7 @@ impl Admission {
     }
 
     /// How many connections across all addresses have not authenticated yet.
-    pub fn live_unauthenticated_total(&self) -> usize {
+    pub const fn live_unauthenticated_total(&self) -> usize {
         self.live_total
     }
 
@@ -1055,14 +1055,14 @@ impl SessionContext {
     }
 
     /// This node's per-boot instance id, what it announces and knocks under.
-    pub fn instance_id(&self) -> InstanceId {
+    pub const fn instance_id(&self) -> InstanceId {
         self.instance_id
     }
 
     /// The shared caps, so a gate can read a token count or a live-socket
     /// count off the same state the accept loop decides on. Reading a copy
     /// would prove nothing about what the listener did.
-    pub fn admission(&self) -> &Arc<Mutex<Admission>> {
+    pub const fn admission(&self) -> &Arc<Mutex<Admission>> {
         &self.admission
     }
 
@@ -1171,7 +1171,7 @@ pub fn is_carrier_grade_nat(addr: Ipv4Addr) -> bool {
 }
 
 /// The IPv6 half of [`is_lan_scope`].
-fn is_lan_scope_v6(addr: Ipv6Addr) -> bool {
+const fn is_lan_scope_v6(addr: Ipv6Addr) -> bool {
     if addr.is_loopback() {
         return true;
     }
@@ -1288,7 +1288,7 @@ pub fn internet_admission(
 /// IPv4-mapped form is unwrapped first, because a dual-stack listener reports
 /// `::ffff:127.0.0.1` for a socket bound to `127.0.0.1` and reading that as a
 /// global address would refuse the machine's own traffic.
-fn is_loopback_bind(bind: IpAddr) -> bool {
+const fn is_loopback_bind(bind: IpAddr) -> bool {
     match bind {
         IpAddr::V4(v4) => v4.is_loopback(),
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -2217,9 +2217,8 @@ where
                 "peer listener: a first pairing arrived from {addr} as instance {instance_id} \
                  and no window is open for it, so nothing was answered. A window exists only \
                  after the operator accepts a pairing request on THIS Mac \
-                 (`tcr peer pending`, then `tcr peer accept <instance|addr>`), it lasts {} \
-                 seconds, and it admits that one instance at that one address",
-                ACCEPTED_WINDOW_SECS
+                 (`tcr peer pending`, then `tcr peer accept <instance|addr>`), it lasts {ACCEPTED_WINDOW_SECS} \
+                 seconds, and it admits that one instance at that one address"
             );
         }
         let session = noise::finish_responder(stream, claimed.state, Handshake::Pair, |_| {
@@ -2403,39 +2402,39 @@ impl StreamOrigin {
     /// Built once per stream, from the accepted socket and the header's
     /// `via`: non-empty means the frame's own origin stamped a carrier in, so
     /// nothing after this point may treat `from` as the peer's address.
-    fn from_header(from: SocketAddr, via: &[PeerId]) -> Self {
+    const fn from_header(from: SocketAddr, via: &[PeerId]) -> Self {
         match via.first() {
-            Some(&carrier) => StreamOrigin::Carried {
+            Some(&carrier) => Self::Carried {
                 socket: from,
                 carrier,
             },
-            None => StreamOrigin::Direct(from),
+            None => Self::Direct(from),
         }
     }
 
     /// The socket to treat as evidence about the peer: `Some` only when this
     /// stream's own transport connection is the peer's, never a carrier's.
-    fn observed_socket(&self) -> Option<SocketAddr> {
+    const fn observed_socket(&self) -> Option<SocketAddr> {
         match self {
-            StreamOrigin::Direct(addr) => Some(*addr),
-            StreamOrigin::Carried { .. } => None,
+            Self::Direct(addr) => Some(*addr),
+            Self::Carried { .. } => None,
         }
     }
 
     /// The raw transport socket, for a log line that wants to say which
     /// connection the bytes arrived on, whichever kind it is.
-    fn socket(&self) -> SocketAddr {
+    const fn socket(&self) -> SocketAddr {
         match self {
-            StreamOrigin::Direct(addr) => *addr,
-            StreamOrigin::Carried { socket, .. } => *socket,
+            Self::Direct(addr) => *addr,
+            Self::Carried { socket, .. } => *socket,
         }
     }
 
     /// The carrier's id, for a log line; `None` for a direct arrival.
-    fn carrier(&self) -> Option<PeerId> {
+    const fn carrier(&self) -> Option<PeerId> {
         match self {
-            StreamOrigin::Direct(_) => None,
-            StreamOrigin::Carried { carrier, .. } => Some(*carrier),
+            Self::Direct(_) => None,
+            Self::Carried { carrier, .. } => Some(*carrier),
         }
     }
 }
@@ -2664,14 +2663,13 @@ where
                 .row(&accepted_peer)
                 .and_then(|row| row.locator_from(from))
             {
-                match crate::peer::tunnel::path_meter().lock() {
-                    Ok(mut meter) => {
-                        meter.charge_bytes(&accepted_peer, path, up + down, now_ms());
-                    }
-                    Err(_) => tracing::warn!(
+                if let Ok(mut meter) = crate::peer::tunnel::path_meter().lock() {
+                    meter.charge_bytes(&accepted_peer, path, up + down, now_ms());
+                } else {
+                    tracing::warn!(
                         peer = %accepted_peer.display(),
                         "peer stream: the path meter's lock is poisoned, so this carry is                          not on any path's hour"
-                    ),
+                    );
                 }
             }
             tracing::debug!(
@@ -3054,21 +3052,16 @@ where
                 // A carried Hello has no connection worth pairing: the socket
                 // is the carrier's, so only what the Hello itself claims is
                 // used, through [`config::endpoints_from_hello`].
-                let learned = match origin.observed_socket() {
-                    Some(socket) => config::endpoints_and_connection_from_hello(
-                        &incoming.addrs,
-                        socket,
-                        now_ms(),
-                    ),
-                    None => {
-                        tracing::debug!(
-                            peer = %session.peer.display(),
-                            carrier = ?origin.carrier().map(|carrier| carrier.display()),
-                            "peer control: this Hello arrived through a carrier; only the \
-                             addresses it claims are used, never the carrier's own socket"
-                        );
-                        config::endpoints_from_hello(&incoming.addrs, now_ms())
-                    }
+                let learned = if let Some(socket) = origin.observed_socket() {
+                    config::endpoints_and_connection_from_hello(&incoming.addrs, socket, now_ms())
+                } else {
+                    tracing::debug!(
+                        peer = %session.peer.display(),
+                        carrier = ?origin.carrier().map(|carrier| carrier.display()),
+                        "peer control: this Hello arrived through a carrier; only the \
+                         addresses it claims are used, never the carrier's own socket"
+                    );
+                    config::endpoints_from_hello(&incoming.addrs, now_ms())
                 };
                 // The two reflexive halves of this frame, recorded in memory
                 // and never onto the row: the socket whole is the address a
@@ -3076,16 +3069,15 @@ where
                 // advice for a punch and never an endpoint to dial. A carried
                 // Hello teaches nothing here either: the socket belongs to the
                 // carrier, not the peer.
-                match origin.observed_socket() {
-                    Some(socket) => {
-                        crate::peer::reach::remember_observed_peer(session.peer, socket)
-                    }
-                    None => tracing::debug!(
+                if let Some(socket) = origin.observed_socket() {
+                    crate::peer::reach::remember_observed_peer(session.peer, socket);
+                } else {
+                    tracing::debug!(
                         peer = %session.peer.display(),
                         carrier = ?origin.carrier().map(|carrier| carrier.display()),
                         "peer control: not recording an observed address for a peer reached \
                          through a carrier"
-                    ),
+                    );
                 }
                 let sees_us_at = match incoming.observed_you_at.as_deref() {
                     None => None,
@@ -3498,22 +3490,23 @@ where
                         hint.node.display()
                     );
                 }
-                match crate::peer::reach::learn_from_hint(&session.peer, &hint) {
-                    Some(addr) => tracing::info!(
+                if let Some(addr) = crate::peer::reach::learn_from_hint(&session.peer, &hint) {
+                    tracing::info!(
                         peer = %session.peer.display(),
                         addr = %addr,
                         carried_on = %origin.socket(),
                         carrier = ?origin.carrier().map(|carrier| carrier.display()),
                         "peer control: this peer named where it is now, so a punch has \
                          somewhere to aim"
-                    ),
-                    None => tracing::debug!(
+                    );
+                } else {
+                    tracing::debug!(
                         peer = %session.peer.display(),
                         carried_on = %origin.socket(),
                         carrier = ?origin.carrier().map(|carrier| carrier.display()),
                         "peer control: nothing this peer named is an address anything can \
                          dial, so it stays reachable at whatever was already recorded"
-                    ),
+                    );
                 }
                 // Answered whether anything was learned or not: the asker
                 // needs this Mac's addresses to aim at, and a peer whose own
@@ -3553,7 +3546,7 @@ where
 /// That is exactly why the rule is written as a value a test can ask about:
 /// the day a pattern is added, or one of those early returns becomes a
 /// fall-through, this answers the same way it does today.
-pub fn handoff_is_permitted(handshake: Handshake) -> bool {
+pub const fn handoff_is_permitted(handshake: Handshake) -> bool {
     match handshake {
         Handshake::Return => true,
         Handshake::Pair | Handshake::Enrol | Handshake::Knock | Handshake::KnockPsk => false,
@@ -3604,7 +3597,7 @@ pub fn peer_stream_gate(
 
 /// Checks 1 to 3 against the pinned row itself: `None` is an unpinned peer,
 /// which is the same answer as "not authorized for anything".
-pub fn peer_stream_gate_rows(
+pub const fn peer_stream_gate_rows(
     header: &StreamHeader,
     row: Option<&PeerRow>,
 ) -> Result<(), StreamRefusal> {
@@ -3700,7 +3693,7 @@ pub struct RequestDedup {
 
 impl RequestDedup {
     /// An empty cache.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             seen: VecDeque::new(),
         }

@@ -686,7 +686,7 @@ mod lender {
     const LEASE: u128 = 0x1eaf_0000_0000_0001;
 
     /// What one relayed request came back as.
-    pub struct Served {
+    pub(crate) struct Served {
         pub status: u16,
         /// The BORROWER's own id, as the lender's log line spells it.
         ///
@@ -704,7 +704,7 @@ mod lender {
     /// inspection of the lender's intent: the proxy substitutes the serving
     /// account's own pooled Bearer on the way out, so the credential that
     /// arrived upstream names which account actually paid for the request.
-    pub type Credentials = Arc<std::sync::Mutex<Vec<String>>>;
+    pub(crate) type Credentials = Arc<std::sync::Mutex<Vec<String>>>;
 
     /// A fake upstream that answers a canned body, so the lender's own proxy
     /// has something to serve from without reaching Anthropic.
@@ -865,7 +865,7 @@ mod lender {
 
     /// Borrow once against a lease scoped to group `work`, and return every
     /// credential the upstream saw.
-    pub async fn serve_one_request_scoped_to_work() -> (Served, Vec<String>) {
+    pub(crate) async fn serve_one_request_scoped_to_work() -> (Served, Vec<String>) {
         let seen: Credentials = Arc::new(std::sync::Mutex::new(Vec::new()));
         let upstream = spawn_upstream_recording(Arc::clone(&seen)).await;
         let manager = two_group_manager(&upstream);
@@ -885,7 +885,7 @@ mod lender {
     }
 
     /// Borrow once against a lease scoped to `account:work-fake`.
-    pub async fn serve_one_request_scoped_to_one_account() -> (Served, Vec<String>) {
+    pub(crate) async fn serve_one_request_scoped_to_one_account() -> (Served, Vec<String>) {
         let seen: Credentials = Arc::new(std::sync::Mutex::new(Vec::new()));
         let upstream = spawn_upstream_recording(Arc::clone(&seen)).await;
         let manager = two_group_manager(&upstream);
@@ -919,7 +919,8 @@ mod lender {
     /// Returns what the borrower got, the credential the PRE-PINNING request
     /// was served on (the instrument: no pin, no test) and every credential
     /// the upstream saw after it.
-    pub async fn serve_one_request_scoped_to_work_after_a_pin() -> (Served, String, Vec<String>) {
+    pub(crate) async fn serve_one_request_scoped_to_work_after_a_pin()
+    -> (Served, String, Vec<String>) {
         let seen: Credentials = Arc::new(std::sync::Mutex::new(Vec::new()));
         let upstream = spawn_upstream_recording(Arc::clone(&seen)).await;
         let manager = two_group_manager(&upstream);
@@ -973,7 +974,7 @@ mod lender {
 
     /// Stand up a lender on the real accept loop, borrow once, and return what
     /// the borrower's client got.
-    pub async fn serve_one_relayed_request() -> Served {
+    pub(crate) async fn serve_one_relayed_request() -> Served {
         let upstream = spawn_upstream().await;
         let manager = lending_manager(&upstream);
         let lender_proxy = spawn_proxy(Arc::clone(&manager)).await;
@@ -1047,7 +1048,7 @@ mod lender {
         .with_lease_serving(Some(LeaseServing {
             ledger,
             upstream: lender_proxy,
-            utilization: manager.clone(),
+            utilization: std::sync::Arc::<tcr::manager::Manager>::clone(&manager),
             manager,
         }));
         tokio::spawn(async move {

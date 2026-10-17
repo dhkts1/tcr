@@ -65,7 +65,7 @@ pub enum RequestKeyMode {
 impl RequestKeyMode {
     /// The wire spelling on `GET /_tcr/status` (`requestKeyMode`). Its PRESENCE
     /// is the contract a launcher reads: "this server understands keys".
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Log => "log",
         }
@@ -215,7 +215,7 @@ impl UaFamily {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::ClaudeCli => "claude-cli",
             Self::Codex => "codex",
@@ -240,7 +240,7 @@ pub enum ConnectClass {
 }
 
 impl ConnectClass {
-    pub fn of(host: &str) -> Self {
+    pub const fn of(host: &str) -> Self {
         if host.eq_ignore_ascii_case("api.anthropic.com") {
             Self::AnthropicApi
         } else if host.eq_ignore_ascii_case("platform.claude.com") {
@@ -252,7 +252,7 @@ impl ConnectClass {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::AnthropicApi => "api.anthropic.com",
             Self::ClaudePlatform => "platform.claude.com",
@@ -291,7 +291,7 @@ impl PathClass {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Messages => "messages",
             Self::V1Other => "v1-other",
@@ -310,14 +310,14 @@ pub enum Unkeyed {
 }
 
 impl Unkeyed {
-    fn kind(self) -> &'static str {
+    const fn kind(self) -> &'static str {
         match self {
             Self::Connect(_) => "connect",
             Self::Request(_) => "request",
         }
     }
 
-    fn class(self) -> &'static str {
+    const fn class(self) -> &'static str {
         match self {
             Self::Connect(class) => class.as_str(),
             Self::Request(class) => class.as_str(),

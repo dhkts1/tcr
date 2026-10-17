@@ -364,8 +364,8 @@ impl Manager {
         let (mut unpriced, mut priced) = (0, 0);
         let nanos: u64 = by_model
             .iter()
-            .filter_map(|(model, tally)| match usage.price_for(model) {
-                Some(price) => {
+            .filter_map(|(model, tally)| {
+                if let Some(price) = usage.price_for(model) {
                     priced += tally.requests;
                     Some(crate::pricing::cost_nanos(
                         &price,
@@ -375,8 +375,7 @@ impl Manager {
                         tally.cache_read,
                         tally.output,
                     ))
-                }
-                None => {
+                } else {
                     unpriced += tally.requests;
                     None
                 }

@@ -128,7 +128,7 @@ fn parse_reset_ms(value: &Value) -> Option<i64> {
     }
 }
 
-fn to_ms(v: i64) -> i64 {
+const fn to_ms(v: i64) -> i64 {
     if v < 1_000_000_000_000 { v * 1000 } else { v }
 }
 
@@ -393,7 +393,7 @@ impl Plan {
     /// Whether this reading carries anything at all worth recording. A fetch
     /// that came back empty must not trigger a config write or overwrite a
     /// runtime field with a `None` we did not learn.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.organization_type.is_none()
             && self.rate_limit_tier.is_none()
             && self.seat_tier.is_none()
@@ -470,14 +470,14 @@ pub enum ProbeStatus {
 }
 
 impl ProbeStatus {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            ProbeStatus::Never => "never",
-            ProbeStatus::Ok => "ok",
-            ProbeStatus::Error => "error",
-            ProbeStatus::Timeout => "timeout",
-            ProbeStatus::RateLimited => "rate-limited",
-            ProbeStatus::UpstreamDown => "upstream-down",
+            Self::Never => "never",
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Timeout => "timeout",
+            Self::RateLimited => "rate-limited",
+            Self::UpstreamDown => "upstream-down",
         }
     }
 }

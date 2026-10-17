@@ -27,7 +27,7 @@ const MAX_IN_FLIGHT: usize = 512;
 
 /// One request's outcome, as the client saw it.
 #[derive(Debug, Clone)]
-pub struct Record {
+pub(crate) struct Record {
     /// What went wrong below HTTP: a refused connection, a reset, a cut stream.
     pub error: Option<String>,
     pub kind: Kind,
@@ -39,14 +39,14 @@ pub struct Record {
     pub added_ms: Option<f64>,
 }
 
-pub struct Session {
+pub(crate) struct Session {
     user_id: String,
     last: Mutex<Option<(String, String)>>,
     /// The long conversation this session sends in a big-body phase, serialized once.
     history: Option<History>,
 }
 
-pub struct Driver {
+pub(crate) struct Driver {
     client: reqwest::Client,
     base: String,
     stub: Arc<Stub>,
@@ -57,7 +57,7 @@ pub struct Driver {
 }
 
 impl Driver {
-    pub fn new(
+    pub(crate) fn new(
         proxy_port: u16,
         stub: Arc<Stub>,
         sessions: usize,
@@ -130,7 +130,7 @@ impl Driver {
     }
 
     /// Send one request and read its whole answer.
-    pub async fn send(self: &Arc<Self>, session_index: usize, kind: Kind) -> Record {
+    pub(crate) async fn send(self: &Arc<Self>, session_index: usize, kind: Kind) -> Record {
         let session = &self.sessions[session_index % self.sessions.len()];
         let tag = self.next_tag.fetch_add(1, Ordering::Relaxed);
         let path = match kind {
@@ -228,7 +228,7 @@ impl Driver {
 
     /// Open loop: send each planned request at its time, whatever is still in flight, and
     /// wait up to `drain` after the last send for the stragglers.
-    pub async fn run_schedule(
+    pub(crate) async fn run_schedule(
         self: &Arc<Self>,
         plan: &[Planned],
         drain: Duration,
@@ -254,7 +254,7 @@ impl Driver {
 
     /// Closed loop: `workers` sessions each send their next request when the last one ends,
     /// until `duration` is up.
-    pub async fn run_closed(
+    pub(crate) async fn run_closed(
         self: &Arc<Self>,
         workers: usize,
         duration: Duration,
@@ -283,7 +283,7 @@ impl Driver {
     }
 
     /// A few requests per session before measuring, so connection pools and pins are warm.
-    pub async fn warm_up(self: &Arc<Self>, sessions: usize) {
+    pub(crate) async fn warm_up(self: &Arc<Self>, sessions: usize) {
         let mut tasks = tokio::task::JoinSet::new();
         for s in 0..sessions {
             let me = self.clone();

@@ -7,6 +7,130 @@
 members = [".", "crates/tcr-status-wire", "crates/tcr-fdpass", "crates/tcr-peer-wire"]
 resolver = "2"
 
+# One lint table for every crate (each opts in with `[lints] workspace = true`).
+# A lint whose fixes would make this code worse is turned off HERE with its
+# reason, never silenced at a call site. Settings a lint needs live in
+# clippy.toml.
+[workspace.lints.rust]
+unused_lifetimes = "warn"
+redundant_lifetimes = "warn"
+unreachable_pub = "warn"
+trivial_numeric_casts = "warn"
+unused_import_braces = "warn"
+meta_variable_misuse = "warn"
+# Deferred, not rejected: 729 hits, and `cargo clippy --fix` cannot apply them
+# here, because it removes a qualification in the lib target that a test
+# module (compiled as a separate target) still needs, so the fixed crate stops
+# compiling. It goes on with a hand pass after the unwrap/expect work lands.
+unused_qualifications = "allow"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Pedantic lints turned off, each with the reason its fixes do not pay here.
+# A binary, not a library: nobody reads a rustdoc `# Errors`/`# Panics`
+# section or relies on `#[must_use]` across a crate boundary, and the three
+# member crates have one consumer each, in this repository.
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# The numeric casts are counts, byte sizes, milliseconds and ratios whose
+# ranges the surrounding code already bounds; `try_from` at each one adds an
+# error branch that cannot be taken, or a behaviour change where it can.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+# Long functions here are long because they are a protocol's steps in order,
+# with the reason for each step beside it; splitting them hides the order.
+too_many_lines = "allow"
+# A constant declared beside the one statement that uses it, with its reason
+# in a comment, reads better than the same constant hoisted away from it.
+items_after_statements = "allow"
+# Names like `req`/`res` and `a`/`b` in tests are the clearest names.
+similar_names = "allow"
+many_single_char_names = "allow"
+# Config and wire structs mirror JSON documents; their bools are the format.
+struct_excessive_bools = "allow"
+# `write!` into a String returns a Result that can never be Err, so the fix
+# trades one allocation for a discarded Result, against the no-`let _` rule.
+format_push_string = "allow"
+# Merging two match arms that do the same thing for different documented
+# reasons loses the reasons.
+match_same_arms = "allow"
+# The `Manager` impl files under src/manager/ share their parent's imports
+# through `use super::*` on purpose. Expanding it lists a dozen names per file,
+# and `cargo clippy --fix` expands it per target, so the test modules that
+# lean on the same glob stopped compiling.
+wildcard_imports = "allow"
+# Its fix turns `assert!(v.is_empty())` into `assert_eq!(v, [] as [T; 0])`,
+# naming the element type at every site; in a test module that type is often
+# not in scope, and the original reads better.
+assert_is_empty = "allow"
+# `Default::default()` here is almost all fixture fields
+# (`provider: Default::default()`), where the field name already says what is
+# built; and the fix is not machine-applicable, so each of 146 sites would be a
+# hand edit naming a type the test module often does not import.
+default_trait_access = "allow"
+# Same reason as format_push_string: the fix is a fold over `write!`, whose
+# Result has to be discarded.
+format_collect = "allow"
+# An explicit `continue` in a loop's match arm says the arm skips the rest;
+# the lint asks for it to be removed.
+needless_continue = "allow"
+# The flagged `_name` bindings are guards and handles held for their drop
+# (`drop(_writing)` ends a write lock on purpose).
+used_underscore_binding = "allow"
+# `(2..).find(..)` and friends: finite because of what follows, which the lint
+# cannot see.
+maybe_infinite_iter = "allow"
+# The flagged sites are tests that panic on a poisoned lock; naming the error
+# adds nothing to a message that already says what failed.
+match_wild_err_arm = "allow"
+# A test float compared exactly is the point of the test.
+float_cmp = "allow"
+# Deferred, not rejected: each fix changes a function signature and every
+# caller, by hand (`cargo clippy --fix` applies none of them). They go on
+# after the unwrap/expect work, which rewrites many of the same functions.
+needless_pass_by_value = "allow"
+unnecessary_wraps = "allow"
+ref_option = "allow"
+trivially_copy_pass_by_ref = "allow"
+option_option = "allow"
+unused_async = "allow"
+# Both hits are test fakes of an async trait; an `async fn` reads as the trait
+# it implements, a hand-written `std::future::ready` does not.
+unused_async_trait_impl = "allow"
+unused_self = "allow"
+implicit_hasher = "allow"
+return_self_not_must_use = "allow"
+struct_field_names = "allow"
+# Nursery lints that find slower or larger code. The rest of the nursery group
+# stays off. Counted and left off as noise or as disagreeing with code here:
+# significant_drop_tightening, option_if_let_else, redundant_pub_crate,
+# future_not_send, too_long_first_doc_paragraph, branches_sharing_code (its
+# fix hoists a log line out of the branch that explains it), needless_collect
+# and collection_is_never_read (every hit is a test collecting join handles
+# before awaiting them, or a Vec that holds connections open by owning them).
+redundant_clone = "warn"
+missing_const_for_fn = "warn"
+or_fun_call = "warn"
+use_self = "warn"
+equatable_if_let = "warn"
+iter_on_single_items = "warn"
+# Deferred like the pedantic group above: three hits, each a signature change.
+needless_pass_by_ref_mut = "allow"
+# Restriction lints, each with a hit or a hazard that justifies it.
+dbg_macro = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+needless_raw_strings = "warn"
+empty_structs_with_brackets = "warn"
+# clone_on_ref_ptr is wanted but not on yet: 181 sites, and clippy's own
+# suggestion names the unstable `Atomic<T>` alias, so `cargo clippy --fix`
+# cannot apply it and every site is a hand edit. It lands after the
+# unwrap/expect pass, which rewrites the same lines.
+clone_on_ref_ptr = "allow"
+
 [package]
 name = "tcr"
 version = "1.2.10"
@@ -40,6 +164,9 @@ path = "src/main.rs"
 name = "load_test"
 path = "examples/load_test/main.rs"
 test = true
+
+[lints]
+workspace = true
 
 [dependencies]
 # The shared `tcr status --json` wire type (`AccountStatusRow`), consumed by

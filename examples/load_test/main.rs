@@ -148,7 +148,7 @@ fn main() -> anyhow::Result<()> {
                 result.errors + result.unfinished,
                 result
                     .cpu_s_per_1k
-                    .map_or("n/a".into(), |v| format!("{v:.2} s")),
+                    .map_or_else(|| "n/a".into(), |v| format!("{v:.2} s")),
                 result.peak_footprint_mb
             );
             if !failures.is_empty() {
@@ -547,9 +547,10 @@ fn spread_table(runs: &[PathBuf]) -> anyhow::Result<String> {
             } else {
                 2
             };
-            report::spread(&values).map_or("n/a".into(), |(lo, mid, hi)| {
-                format!("{lo:.places$} / {mid:.places$} / {hi:.places$}")
-            })
+            report::spread(&values).map_or_else(
+                || "n/a".into(),
+                |(lo, mid, hi)| format!("{lo:.places$} / {mid:.places$} / {hi:.places$}"),
+            )
         };
         md.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",

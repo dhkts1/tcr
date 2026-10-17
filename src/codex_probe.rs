@@ -282,7 +282,7 @@ fn reached_type_from_payload(value: Option<&Value>) -> Option<String> {
 ///
 /// Only a string, because that is what the backend sends (the measured payload's `balance` is
 /// a string, `scripts/codex-contract-probe.sh`), and because the wire promises the backend's
-/// own text: a JSON number would come back re-rendered by serde_json, `12.50` as `"12.5"`,
+/// own text: a JSON number would come back re-rendered by `serde_json`, `12.50` as `"12.5"`,
 /// which is not what ChatGPT wrote.
 fn credits_from_payload(value: Option<&Value>) -> Option<tcr_status_wire::CodexCredits> {
     let credits = value?.as_object()?;

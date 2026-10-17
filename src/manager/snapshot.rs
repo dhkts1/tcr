@@ -417,7 +417,7 @@ impl Manager {
         };
 
         let wire_sessions = self.wire_sessions_snapshot(now);
-        let wire_sessions_summary = Manager::wire_sessions_summary(&wire_sessions);
+        let wire_sessions_summary = Self::wire_sessions_summary(&wire_sessions);
 
         StatsSnapshot {
             accounts: account_snaps,

@@ -133,10 +133,10 @@ pub enum ErrorKind {
 
 impl ErrorKind {
     /// The `error.type` string CodexBar shows as "claude-swap reported <type>".
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            ErrorKind::ConfigUnreadable => "config_unreadable",
-            ErrorKind::RenderFailed => "render_failed",
+            Self::ConfigUnreadable => "config_unreadable",
+            Self::RenderFailed => "render_failed",
         }
     }
 }

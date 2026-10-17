@@ -201,7 +201,7 @@ impl FakeOrigin {
 /// same map the proxy's own seam would produce: that is what makes the
 /// forwarding assertions below a measurement rather than an absence over an
 /// empty map.
-fn ask<'a>(body: &'a bytes::Bytes) -> Ask<'a> {
+fn ask(body: &bytes::Bytes) -> Ask<'_> {
     let mut headers = axum::http::HeaderMap::new();
     for (name, value) in [
         ("content-type", "application/json"),
@@ -226,7 +226,7 @@ fn ask<'a>(body: &'a bytes::Bytes) -> Ask<'a> {
     }
 }
 
-fn lease(lease_id: u128, expires_at_ms: i64, until: Option<u64>) -> Lease {
+const fn lease(lease_id: u128, expires_at_ms: i64, until: Option<u64>) -> Lease {
     Lease {
         lease_id,
         window: Window::SevenDay,
@@ -1238,7 +1238,7 @@ async fn owner_lending_expiring(
     }
     let context = SessionContext::new(&key, store.path(), &state_path).with_lease_serving(Some(
         LeaseServing {
-            ledger: ledger.clone(),
+            ledger: std::sync::Arc::<std::sync::Mutex<tcr::peer::lease::Ledger>>::clone(&ledger),
             upstream: "http://127.0.0.1:1".to_string(),
             utilization: Arc::new(tcr::peer::serve::NoFleetUtilization),
             manager,

@@ -94,7 +94,7 @@ fn t0() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(1_767_225_600).expect("fixed epoch is valid")
 }
 
-fn to_ms(at: OffsetDateTime) -> i64 {
+const fn to_ms(at: OffsetDateTime) -> i64 {
     (at.unix_timestamp_nanos() / 1_000_000) as i64
 }
 
@@ -127,7 +127,7 @@ fn account(name: &str, priority: i64) -> Account {
 
 /// Per-account pacing with the production cap and no min-spacing (see the module
 /// header for why min-spacing stays off).
-fn pacing(cap: u32) -> PacingConfig {
+const fn pacing(cap: u32) -> PacingConfig {
     PacingConfig {
         max_in_flight_per_account: Some(cap),
         min_spacing_ms: None,
@@ -401,9 +401,7 @@ impl Fleet {
     }
 
     fn account_name(&self, idx: usize) -> &str {
-        self.account_names
-            .get(idx)
-            .map_or("?", std::string::String::as_str)
+        self.account_names.get(idx).map_or("?", String::as_str)
     }
 
     /// The accounts that served `key`, in order.

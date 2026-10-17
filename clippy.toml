@@ -1,0 +1,25 @@
+# Settings for the lints turned on in the root Cargo.toml's
+# [workspace.lints.clippy].
+
+# Product, protocol and vendor names that `doc_markdown` would otherwise want
+# in backticks as if they were code. `..` keeps clippy's own default list.
+doc-valid-idents = [
+    "..",
+    "ChatGPT",
+    "OpenAI",
+    "TcrBar",
+    "TcrBarCore",
+    "CodexBar",
+    "UPnP",
+    "WANIPConnection",
+    "FedRAMP",
+    "ClientHello",
+    "SplitMix64",
+    "OKLab",
+    "AppKit",
+    "TSan",
+    "ThreadSanitizer",
+    "WireGuard",
+    "SipHash",
+    "DoS",
+]

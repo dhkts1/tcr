@@ -82,14 +82,14 @@ fn codexbar_parse(doc: &Value) -> Result<(), String> {
         let active = row
             .get("active")
             .and_then(Value::as_bool)
-            .ok_or(format!("6: slot {number} has no active flag"))?;
+            .ok_or_else(|| format!("6: slot {number} has no active flag"))?;
         if active {
             active_slots.push(number);
         }
         // 7. `usageStatus` is a string (236-238).
         row.get("usageStatus")
             .and_then(Value::as_str)
-            .ok_or(format!("7: slot {number} has no usageStatus"))?;
+            .ok_or_else(|| format!("7: slot {number} has no usageStatus"))?;
         // 8. A present `fiveHour`/`sevenDay` is an object with a finite `pct`
         //    and, when present, a timestamp `resetsAt` (251-252, 290-306). A
         //    present `null` counts as present: Swift's `guard let raw` passes
@@ -312,7 +312,7 @@ fn the_guard_port_refuses_what_codexbar_refuses() {
         ("4:", |d| d["supportsAccountSwitching"] = "no".into()),
         ("5:", |d| d["accounts"][1]["number"] = 1.into()),
         ("8:", |d| {
-            d["accounts"][0]["usage"]["fiveHour"] = Value::Null
+            d["accounts"][0]["usage"]["fiveHour"] = Value::Null;
         }),
         ("9:", |d| d["accounts"][0]["active"] = true.into()),
     ];

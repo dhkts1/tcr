@@ -17,22 +17,22 @@ use axum::response::Response;
 use serde_json::{Value, json};
 
 /// The header the driver tags each request with, read back here to pair the two clocks.
-pub const TAG_HEADER: &str = "x-load-test-id";
+pub(crate) const TAG_HEADER: &str = "x-load-test-id";
 
 /// Input and output token counts every reply reports, so the proxy's usage parsing has
 /// real numbers to read.
-pub const INPUT_TOKENS: u64 = 1_200;
-pub const CACHE_READ_TOKENS: u64 = 48_000;
-pub const OUTPUT_TOKENS: u64 = 350;
+pub(crate) const INPUT_TOKENS: u64 = 1_200;
+pub(crate) const CACHE_READ_TOKENS: u64 = 48_000;
+pub(crate) const OUTPUT_TOKENS: u64 = 350;
 
 /// When the stub began and finished one request.
 #[derive(Debug, Clone, Copy)]
-pub struct Span {
+pub(crate) struct Span {
     pub start: Instant,
     pub end: Instant,
 }
 
-pub struct Stub {
+pub(crate) struct Stub {
     /// Time from a `/v1/messages` arrival to its last byte. 40% of it passes before the
     /// first byte, the rest between the stream's chunks.
     pub reply_time: Duration,
@@ -44,7 +44,7 @@ pub struct Stub {
 }
 
 impl Stub {
-    pub fn new(reply_time: Duration) -> Arc<Self> {
+    pub(crate) fn new(reply_time: Duration) -> Arc<Self> {
         Arc::new(Self {
             reply_time,
             spans: Mutex::new(HashMap::new()),
@@ -56,20 +56,20 @@ impl Stub {
     }
 
     /// The span recorded for the request tagged `id`, removed so the map stays small.
-    pub fn take_span(&self, id: u64) -> Option<Span> {
+    pub(crate) fn take_span(&self, id: u64) -> Option<Span> {
         lock(&self.spans).remove(&id)
     }
 
     /// Every `/v1/messages` and `count_tokens` arrival since the last call.
-    pub fn take_arrivals(&self) -> Vec<Instant> {
+    pub(crate) fn take_arrivals(&self) -> Vec<Instant> {
         std::mem::take(&mut *lock(&self.arrivals))
     }
 
-    pub fn unexpected(&self) -> BTreeMap<String, usize> {
+    pub(crate) fn unexpected(&self) -> BTreeMap<String, usize> {
         lock(&self.unexpected).clone()
     }
 
-    pub fn untagged(&self) -> u64 {
+    pub(crate) fn untagged(&self) -> u64 {
         self.untagged.load(Ordering::Relaxed)
     }
 
@@ -85,7 +85,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Bind the stub and serve it until the process exits. Returns its port.
-pub async fn start(stub: Arc<Stub>) -> anyhow::Result<u16> {
+pub(crate) async fn start(stub: Arc<Stub>) -> anyhow::Result<u16> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     // axum refuses a body over 2 MB by default; the big-body phases send 4 MiB.
@@ -229,8 +229,7 @@ fn json_response(status: StatusCode, value: &Value, n: u64) -> Response {
 fn rate_limit_headers(headers: &mut HeaderMap, n: u64) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let five_hour_reset = (now + 3 * 3_600).to_string();
     let week_reset = (now + 4 * 86_400).to_string();
     let pairs: [(&'static str, String); 9] = [
@@ -262,11 +261,11 @@ fn rate_limit_headers(headers: &mut HeaderMap, n: u64) {
 
 /// A fake thinking signature: long, like a real one, and unique per reply so every reply
 /// mints new bound tokens.
-pub fn signature(n: u64) -> String {
+pub(crate) fn signature(n: u64) -> String {
     format!("sig_fake_{n:012}_{}", "A".repeat(320))
 }
 
-pub fn message_id(n: u64) -> String {
+pub(crate) fn message_id(n: u64) -> String {
     format!("msg_fake_{n:012}")
 }
 
@@ -282,7 +281,7 @@ fn usage() -> Value {
 }
 
 /// A buffered `/v1/messages` reply: a signed thinking block and a text block.
-pub fn message_json(n: u64) -> Value {
+pub(crate) fn message_json(n: u64) -> Value {
     json!({
         "id": message_id(n),
         "type": "message",
@@ -300,7 +299,7 @@ pub fn message_json(n: u64) -> Value {
 
 /// A streamed reply as SSE chunks, in the order and shape Anthropic sends them: the message,
 /// a signed thinking block, a text block in three deltas, then the closing usage.
-pub fn sse_chunks(n: u64) -> Vec<Bytes> {
+pub(crate) fn sse_chunks(n: u64) -> Vec<Bytes> {
     let event = |name: &str, data: Value| Bytes::from(format!("event: {name}\ndata: {data}\n\n"));
     let mut start_usage = usage();
     start_usage["output_tokens"] = json!(1);

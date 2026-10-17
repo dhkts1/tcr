@@ -269,7 +269,7 @@ async fn dropping_the_handle_stops_the_accept_loop_and_every_background_loop() {
     assert_eq!(handle.background_task_count(), 4);
 
     // Every task `serve` spawned captured one of these.
-    let manager = handle.manager().clone();
+    let manager = std::sync::Arc::<tcr::manager::Manager>::clone(handle.manager());
     let live_tasks = || std::sync::Arc::strong_count(&manager) - 1;
     assert!(
         live_tasks() >= 4,

@@ -666,7 +666,7 @@ impl PeerState {
     /// reader are two processes: `Instant` is not comparable across them and
     /// has no serialized form, so the honest cross-process version of "the
     /// clock did not move" is "both stamps still bracket now".
-    pub fn pairing_window(&self, now_ms: i64) -> PairingDeadline {
+    pub const fn pairing_window(&self, now_ms: i64) -> PairingDeadline {
         let (Some(opened_at_ms), Some(until_ms)) = (
             self.pairing_window_opened_at_ms,
             self.pairing_window_until_ms,
@@ -681,7 +681,7 @@ impl PeerState {
     }
 
     /// Open the window at `now_ms` and report its deadline.
-    pub fn open_pairing_window(&mut self, now_ms: i64, window_secs: i64) -> i64 {
+    pub const fn open_pairing_window(&mut self, now_ms: i64, window_secs: i64) -> i64 {
         let until_ms = now_ms.saturating_add(window_secs.saturating_mul(1000));
         self.pairing_window_opened_at_ms = Some(now_ms);
         self.pairing_window_until_ms = Some(until_ms);
@@ -1179,7 +1179,7 @@ impl PeerState {
         self.banned.len() != before
     }
 
-    pub fn close_pairing_window(&mut self) -> bool {
+    pub const fn close_pairing_window(&mut self) -> bool {
         let was_open =
             self.pairing_window_until_ms.is_some() || self.pairing_window_opened_at_ms.is_some();
         self.pairing_window_until_ms = None;
@@ -1562,7 +1562,7 @@ pub fn save_borrowed(path: &Path, borrowed: &[BorrowedRow]) -> Result<()> {
 pub fn save_paths(path: &Path, paths: &[crate::peer::probe::PathStat]) -> Result<()> {
     let paths = paths.to_vec();
     replace_section(path, "measured path costs", move |state| {
-        state.paths = paths
+        state.paths = paths;
     })
 }
 

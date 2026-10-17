@@ -437,7 +437,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Metered<S> {
     ) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &poll {
+        if matches!(&poll, Poll::Ready(Ok(()))) {
             let read = buf.filled().len().saturating_sub(before);
             if read > 0 && !self.spend(read) {
                 return Poll::Ready(Err(over_budget()));
@@ -1083,16 +1083,14 @@ struct CarryReservation<'a> {
 
 impl Drop for CarryReservation<'_> {
     fn drop(&mut self) {
-        match self.budget.lock() {
-            Ok(mut budget) => budget.close(self.id, &self.peer, self.spent, self.now_ms),
-            // Never silent: a poisoned ledger means this peer's slice stays
-            // held, which an operator sees as a gateway that refuses carries,
-            // and this line is the only thing that explains it.
-            Err(_) => tracing::error!(
+        if let Ok(mut budget) = self.budget.lock() {
+            budget.close(self.id, &self.peer, self.spent, self.now_ms);
+        } else {
+            tracing::error!(
                 peer = %self.peer.display(),
                 "peer tunnel: the byte ledger lock is poisoned, so this carry's reservation \
                  could not be released; carries for this peer will be refused until restart"
-            ),
+            );
         }
     }
 }
@@ -1595,19 +1593,22 @@ where
     // answered an error because a counter is unreadable would be trading the
     // service for the statistic.
     match reached {
-        ReachedTarget::Direct(addr) => match path_meter().lock() {
-            Ok(mut meter) => meter.charge_bytes(
-                &plan.target.node,
-                Locator::Direct { addr },
-                up.saturating_add(down),
-                carry.now_ms,
-            ),
-            Err(_) => tracing::error!(
-                onward = %plan.target.node.display(),
-                "peer forward: the per-path meter's lock is poisoned, so this forward's bytes \
-                 are missing from every per-path figure until restart"
-            ),
-        },
+        ReachedTarget::Direct(addr) => {
+            if let Ok(mut meter) = path_meter().lock() {
+                meter.charge_bytes(
+                    &plan.target.node,
+                    Locator::Direct { addr },
+                    up.saturating_add(down),
+                    carry.now_ms,
+                );
+            } else {
+                tracing::error!(
+                    onward = %plan.target.node.display(),
+                    "peer forward: the per-path meter's lock is poisoned, so this forward's bytes \
+                     are missing from every per-path figure until restart"
+                );
+            }
+        }
         // A carrier the target parked here is not one of ITS endpoints, and
         // the meter keys on a [`Locator`], which has two arms, an address and
         // a Mac that carried. Neither is this path, so these bytes are charged
@@ -1939,16 +1940,15 @@ pub fn park_reverse_carry(
         );
         return ParkOutcome::Refused(ParkRefusal::NotPinned);
     }
-    let outcome = match reverse_desk().lock() {
-        Ok(mut desk) => desk.park(peer, stream, now_ms),
-        Err(_) => {
-            tracing::error!(
-                peer = %peer.display(),
-                "peer reverse: the carrier desk's lock is poisoned, so this carrier is dropped \
-                 and that peer stays unreachable from here until restart"
-            );
-            ParkOutcome::Refused(ParkRefusal::DeskFull { open: 0 })
-        }
+    let outcome = if let Ok(mut desk) = reverse_desk().lock() {
+        desk.park(peer, stream, now_ms)
+    } else {
+        tracing::error!(
+            peer = %peer.display(),
+            "peer reverse: the carrier desk's lock is poisoned, so this carrier is dropped \
+             and that peer stays unreachable from here until restart"
+        );
+        ParkOutcome::Refused(ParkRefusal::DeskFull { open: 0 })
     };
     match outcome {
         ParkOutcome::Parked { open } => tracing::debug!(
@@ -1981,7 +1981,7 @@ pub enum ReachedTarget {
 
 impl ReachedTarget {
     /// The one word a log line names this path by.
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Direct(_) => "direct",
             Self::Reverse => "reverse",
@@ -2004,22 +2004,21 @@ async fn reach_target(
     row: &PeerRow,
     now_ms: i64,
 ) -> Option<(ReachedTarget, crate::peer::serve::PeerStream)> {
-    match reverse_desk().lock() {
-        Ok(mut desk) => {
-            if let Some(parked) = desk.take(&row.node, now_ms) {
-                tracing::debug!(
-                    peer = %row.node.display(),
-                    "peer forward: this target parked a carrier here, so the forward rides back \
-                     out over it and nothing is dialled"
-                );
-                return Some((ReachedTarget::Reverse, parked));
-            }
+    if let Ok(mut desk) = reverse_desk().lock() {
+        if let Some(parked) = desk.take(&row.node, now_ms) {
+            tracing::debug!(
+                peer = %row.node.display(),
+                "peer forward: this target parked a carrier here, so the forward rides back \
+                 out over it and nothing is dialled"
+            );
+            return Some((ReachedTarget::Reverse, parked));
         }
-        Err(_) => tracing::error!(
+    } else {
+        tracing::error!(
             peer = %row.node.display(),
             "peer forward: the carrier desk's lock is poisoned, so a parked carrier cannot be \
              read and this forward falls back to dialling the row"
-        ),
+        );
     }
     let (addr, stream) = dial_pinned_peer(row).await?;
     Some((ReachedTarget::Direct(addr), stream))
@@ -2055,7 +2054,7 @@ pub enum ReverseNotWanted {
 /// either one alone means a peer can open a socket to this Mac, and a node
 /// that asked a friend to carry anyway would be spending a third Mac's bytes
 /// on a path it does not need.
-pub fn reverse_carry_is_wanted(
+pub const fn reverse_carry_is_wanted(
     held: Option<&crate::peer::reach::Mapping>,
     global_v6: &[std::net::Ipv6Addr],
 ) -> ReverseNeed {
@@ -2119,7 +2118,7 @@ pub enum ReverseStep {
 /// friend it had, seconds before it became dialable. The boot test binds
 /// loopback, where no mapping is ever asked for, so the ordering was
 /// unobserved.
-pub fn reverse_step(need: ReverseNeed, parked: bool) -> ReverseStep {
+pub const fn reverse_step(need: ReverseNeed, parked: bool) -> ReverseStep {
     match (need, parked) {
         (ReverseNeed::Wanted, false) => ReverseStep::Park,
         (ReverseNeed::NotWanted(_), true) => ReverseStep::Release,

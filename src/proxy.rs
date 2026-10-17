@@ -163,7 +163,7 @@ pub(crate) const MAX_SAME_ACCOUNT_429: u32 = 2;
 /// Hold applied to a transient 429 that carries NO retry-after / reset header
 /// (σ5, 2026-07-18 live capture: Anthropic burst 429s carry neither). Short so a
 /// cold-fan-out that trips every account recovers in seconds instead of the ~60s
-/// fleet blackout the old unwrap_or(60) default caused. Rotates rather than
+/// fleet blackout the old `unwrap_or(60)` default caused. Rotates rather than
 /// inline-retrying the limited account.
 const NO_GUIDANCE_HOLD_SECS: i64 = 15;
 /// Max random jitter (seconds) added to the no-guidance hold: desync the un-park
@@ -181,7 +181,7 @@ const QUOTA_HOLD_JITTER_MAX_SECS: i64 = 90;
 /// Ceiling for soft-waiting out a *transient* all-parked fleet at the exhausted
 /// branch instead of firing the hard 429. Set to the maximum no-guidance park
 /// (`NO_GUIDANCE_HOLD_SECS + NO_GUIDANCE_JITTER_MAX_SECS` = 20s): a burst park
-/// falls at/under it, while a real quota rejection (mark_rate_limited clamped up
+/// falls at/under it, while a real quota rejection (`mark_rate_limited` clamped up
 /// to 3600s) or a quota window (hours) sits far above it — so real exhaustion is
 /// NEVER soft-waited and still hard-fails immediately.
 const EXHAUSTION_SOFT_WAIT_MAX_SECS: i64 = NO_GUIDANCE_HOLD_SECS + NO_GUIDANCE_JITTER_MAX_SECS;
@@ -364,7 +364,7 @@ pub(crate) fn jittered_quota_hold(retry_after: i64, nanos: u32) -> i64 {
     if clamped < MAX_QUOTA_HOLD_SECS {
         return clamped;
     }
-    let jitter = (nanos as i64) % (QUOTA_HOLD_JITTER_MAX_SECS + 1);
+    let jitter = i64::from(nanos) % (QUOTA_HOLD_JITTER_MAX_SECS + 1);
     (clamped - jitter).max(1)
 }
 
@@ -429,9 +429,9 @@ fn carries_beta_flag(path_and_query: &str) -> bool {
 /// Decide whether an all-accounts-unavailable state is a *transient* fleet-park
 /// worth soft-waiting (Some(secs) to sleep) vs genuine exhaustion (None → hard 429).
 /// `soonest_free_secs` is `Manager::retry_after_hint`; `already_waited` caps us to
-/// ONE soft-wait per client request. Real exhaustion has soonest_free far above the
+/// ONE soft-wait per client request. Real exhaustion has `soonest_free` far above the
 /// transient ceiling → None. Kept pure so it is unit-tested without timing.
-fn soft_wait_secs(soonest_free_secs: i64, already_waited: bool) -> Option<u64> {
+const fn soft_wait_secs(soonest_free_secs: i64, already_waited: bool) -> Option<u64> {
     if already_waited || soonest_free_secs <= 0 || soonest_free_secs > EXHAUSTION_SOFT_WAIT_MAX_SECS
     {
         None
@@ -1387,7 +1387,7 @@ fn host_path_disagreement(
     path: &str,
     path_provider: crate::provider::Provider,
 ) -> String {
-    fn kind(provider: crate::provider::Provider) -> &'static str {
+    const fn kind(provider: crate::provider::Provider) -> &'static str {
         match provider {
             crate::provider::Provider::Anthropic => "an Anthropic",
             crate::provider::Provider::Codex => "a Codex",
@@ -2893,14 +2893,14 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
 /// `try_send` on that request would latch `evidence_dropped`, making the
 /// classifier silently abstain on a turn whose evidence it never actually
 /// lost — an unrelated bug quietly disabling this feature.
-fn is_genuine_evidence_loss<T>(err: &tokio::sync::mpsc::error::TrySendError<T>) -> bool {
+const fn is_genuine_evidence_loss<T>(err: &tokio::sync::mpsc::error::TrySendError<T>) -> bool {
     matches!(err, tokio::sync::mpsc::error::TrySendError::Full(_))
 }
 
 /// Whether a Codex 403 actually rejects the pooled login. Codex only attempts authentication
 /// recovery for a 401 (`model-provider/src/provider.rs`); its 403s also include Cloudflare and
 /// policy blocks (`codex-api/src/api_bridge.rs`). Require the explicit JSON authentication
-/// signals CLIProxyAPI recognizes (`codex_executor_terminal.go`), and let a challenge header
+/// signals `CLIProxyAPI` recognizes (`codex_executor_terminal.go`), and let a challenge header
 /// override even an authentication-shaped body. Unknown errors are passed through unchanged.
 fn codex_forbidden_is_auth_error(headers: &HeaderMap, body: &[u8]) -> bool {
     if headers
@@ -3015,7 +3015,7 @@ struct RequestTiming {
 }
 
 impl RequestTiming {
-    fn starting_at(arrived: Instant) -> Self {
+    const fn starting_at(arrived: Instant) -> Self {
         Self {
             arrived,
             armed: false,
@@ -3047,7 +3047,7 @@ impl RequestTiming {
 
     /// Moves the clock out, leaving a disarmed copy behind, so the streamed body
     /// owns the one line this request logs.
-    fn hand_off(&mut self) -> Self {
+    const fn hand_off(&mut self) -> Self {
         let arrived = self.arrived;
         std::mem::replace(self, Self::starting_at(arrived))
     }
@@ -3720,7 +3720,7 @@ async fn handle_request(
         },
         None => (None, SessionKind::Fallback),
     };
-    timing.model = request_model.clone();
+    timing.model.clone_from(&request_model);
     timing.session = session_key;
 
     // Whether THIS request asked Anthropic's cache for the extended 1h window, read
@@ -4122,17 +4122,18 @@ async fn handle_request(
         let now = OffsetDateTime::now_utc();
         let idx = match next_idx.take() {
             Some(i) => i,
-            None => match manager.select_with_group(
-                &tried,
-                now,
-                request_model.as_deref(),
-                session_key,
-                &path,
-                conn_key,
-                request_group.as_deref(),
-            ) {
-                Some(idx) => idx,
-                None => {
+            None => {
+                if let Some(idx) = manager.select_with_group(
+                    &tried,
+                    now,
+                    request_model.as_deref(),
+                    session_key,
+                    &path,
+                    conn_key,
+                    request_group.as_deref(),
+                ) {
+                    idx
+                } else {
                     // A RESERVED group is strict: this request may only ever be
                     // served by one of its members, so every answer below — the
                     // wait it sizes, the revalidation it might attempt, the 429 it
@@ -4316,7 +4317,7 @@ async fn handle_request(
                     // JS original's inline-wait-retry (L3). Real exhaustion (quota
                     // windows / long holds) has soonest_free >> the ceiling →
                     // soft_wait_secs returns None → fall through to the honest 429.
-                    match soft_wait_secs(
+                    if let Some(secs) = soft_wait_secs(
                         match (bound_to, strict_group) {
                             // Bound history: the one account it may use is the only
                             // clock that matters, for the same reason as the group arm.
@@ -4346,220 +4347,214 @@ async fn handle_request(
                         },
                         soft_waited_exhaustion,
                     ) {
-                        Some(secs) => {
-                            soft_waited_exhaustion = true;
-                            // Desync concurrent waiters: without this, every request
-                            // sleeping the same integer-ceil `secs` wakes on the SAME
-                            // second and races for the single earliest-freeing account,
-                            // re-synchronizing the herd NO_GUIDANCE_JITTER (:555) spreads
-                            // and re-bursting that account. Waking `jitter` seconds later
-                            // still serves (the account already freed at `secs`); worst
-                            // case adds NO_GUIDANCE_JITTER_MAX_SECS (5s) → total ≤ 25s.
-                            let jitter = (now.nanosecond() as i64
-                                % (NO_GUIDANCE_JITTER_MAX_SECS + 1))
-                                as u64;
-                            let wait = secs + jitter;
-                            tracing::info!(
-                                wait_secs = wait,
-                                "fleet transiently parked — soft-waiting once before exhausted"
-                            );
-                            tokio::time::sleep(Duration::from_secs(wait)).await;
-                            // Re-admit exactly what the sleep was timed for.
-                            // `Transient429::Park` benches an account TWICE — a
-                            // hold via `mark_rate_limited` AND an entry in
-                            // `tried` — and both `pick_eligible` and
-                            // `pick_least_loaded` test `tried` BEFORE they ever
-                            // evaluate eligibility. So clearing only the hold
-                            // leaves the account this sleep was timed for still
-                            // skipped: select() returns `None` a second time, the
-                            // one-shot guard blocks another wait, and the wait
-                            // buys nothing. Dropping the now-expired parks from
-                            // `tried` is what makes the recovery path actually
-                            // reach the account it was built to preserve.
-                            //
-                            // Precision matters more than reach here: an account
-                            // whose hold is still running stays parked, and one
-                            // benched for any NON-hold reason was never in
-                            // `parked_transient` to begin with.
-                            let now_ms = crate::now_ms();
-                            let freed: Vec<usize> = parked_transient
-                                .iter()
-                                .copied()
-                                .filter(|&i| manager.hold_expired(i, now_ms))
-                                .collect();
-                            for i in &freed {
-                                tried.remove(i);
-                                parked_transient.remove(i);
-                            }
-                            tracing::info!(
-                                readmitted = freed.len(),
-                                still_parked = parked_transient.len(),
-                                "soft-wait over — re-admitted the accounts whose hold expired"
-                            );
-                            continue; // re-run select(); the re-admitted accounts are eligible again
+                        soft_waited_exhaustion = true;
+                        // Desync concurrent waiters: without this, every request
+                        // sleeping the same integer-ceil `secs` wakes on the SAME
+                        // second and races for the single earliest-freeing account,
+                        // re-synchronizing the herd NO_GUIDANCE_JITTER (:555) spreads
+                        // and re-bursting that account. Waking `jitter` seconds later
+                        // still serves (the account already freed at `secs`); worst
+                        // case adds NO_GUIDANCE_JITTER_MAX_SECS (5s) → total ≤ 25s.
+                        let jitter = (i64::from(now.nanosecond())
+                            % (NO_GUIDANCE_JITTER_MAX_SECS + 1))
+                            as u64;
+                        let wait = secs + jitter;
+                        tracing::info!(
+                            wait_secs = wait,
+                            "fleet transiently parked — soft-waiting once before exhausted"
+                        );
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        // Re-admit exactly what the sleep was timed for.
+                        // `Transient429::Park` benches an account TWICE — a
+                        // hold via `mark_rate_limited` AND an entry in
+                        // `tried` — and both `pick_eligible` and
+                        // `pick_least_loaded` test `tried` BEFORE they ever
+                        // evaluate eligibility. So clearing only the hold
+                        // leaves the account this sleep was timed for still
+                        // skipped: select() returns `None` a second time, the
+                        // one-shot guard blocks another wait, and the wait
+                        // buys nothing. Dropping the now-expired parks from
+                        // `tried` is what makes the recovery path actually
+                        // reach the account it was built to preserve.
+                        //
+                        // Precision matters more than reach here: an account
+                        // whose hold is still running stays parked, and one
+                        // benched for any NON-hold reason was never in
+                        // `parked_transient` to begin with.
+                        let now_ms = crate::now_ms();
+                        let freed: Vec<usize> = parked_transient
+                            .iter()
+                            .copied()
+                            .filter(|&i| manager.hold_expired(i, now_ms))
+                            .collect();
+                        for i in &freed {
+                            tried.remove(i);
+                            parked_transient.remove(i);
                         }
-                        None => {
-                            // A hard account lock has no failover. Normal selection
-                            // returned None because that one account already failed
-                            // this request. Revalidation must not escape the lock and
-                            // send the request through another pooled credential.
-                            //
-                            // **And neither may a lease.** This arm was changed to
-                            // `exhausted_or_fallback` when the fallback seam landed,
-                            // which consults a provider that never reads
-                            // `locked_account_name`: a request the operator pinned to
-                            // ONE account was then served on a PEER's credential the
-                            // moment that account 429'd, which is the same escape the
-                            // revalidation serve is refused for and a wider one, the
-                            // credential is not even this Mac's. The refusal is
-                            // written once, inside `exhausted_or_fallback`, so it
-                            // holds for this arm and for the two below it rather
-                            // than only for the arm somebody remembered.
-                            if manager.locked_account_for(provider).is_some() {
-                                return exhausted_or_fallback(
-                                    &manager,
+                        tracing::info!(
+                            readmitted = freed.len(),
+                            still_parked = parked_transient.len(),
+                            "soft-wait over — re-admitted the accounts whose hold expired"
+                        );
+                        continue; // re-run select(); the re-admitted accounts are eligible again
+                    }
+                    // A hard account lock has no failover. Normal selection
+                    // returned None because that one account already failed
+                    // this request. Revalidation must not escape the lock and
+                    // send the request through another pooled credential.
+                    //
+                    // **And neither may a lease.** This arm was changed to
+                    // `exhausted_or_fallback` when the fallback seam landed,
+                    // which consults a provider that never reads
+                    // `locked_account_name`: a request the operator pinned to
+                    // ONE account was then served on a PEER's credential the
+                    // moment that account 429'd, which is the same escape the
+                    // revalidation serve is refused for and a wider one, the
+                    // credential is not even this Mac's. The refusal is
+                    // written once, inside `exhausted_or_fallback`, so it
+                    // holds for this arm and for the two below it rather
+                    // than only for the arm somebody remembered.
+                    if manager.locked_account_for(provider).is_some() {
+                        return exhausted_or_fallback(
+                            &manager,
+                            now,
+                            provider_account_count,
+                            request_is_fable,
+                            provider,
+                            strict_group,
+                            bound_to,
+                            fallback_ask.as_ref(),
+                        )
+                        .await;
+                    }
+                    // Not a transient park — the whole fleet reads over the
+                    // SOFT switch threshold. Before synthesizing a 429, try a
+                    // last-resort revalidation serve on the least-utilized
+                    // account Anthropic still allows (default ON; disable via
+                    // top-level `revalidationServe: false`). An upstream 200
+                    // refreshes stale quota; a 429 arms a real hold via the
+                    // existing inline-429 handling. `None` (throttled, or
+                    // nothing servable) keeps the honest exhausted 429.
+                    // `strict_group.is_none()` guards the THIRD spill door,
+                    // and the least visible one. `select_revalidation`
+                    // passes `group: None` to its hard gate, which by
+                    // `Manager::reserved_blocks` EXCLUDES every account
+                    // carrying a reserved group — so for a strict request
+                    // it can only ever return a NON-member. Left ungated it
+                    // would hand the request to precisely the account the
+                    // reservation exists to keep it off, moments after the
+                    // strict arm in `select_with_group` refused to. A
+                    // reserved group falls straight through to the honest
+                    // 429 instead.
+                    //
+                    // HELD HISTORY IS NOT A FLEET QUESTION. A request held to
+                    // its bound account has every other account benched, so
+                    // "the whole fleet is over the threshold" here means only
+                    // "that one account is", and the fleet's revalidation
+                    // window (one serve per 2 s, shared by every session) is
+                    // the wrong gate for it: the turn that lost the race got
+                    // a 429 naming the account's 5-hour window, which Claude
+                    // Code shows as "You've hit your session limit"
+                    // (2026-09-24). `bound_account_holds` already decided the
+                    // soft threshold does not release this conversation, so
+                    // the serve agrees with it: `Manager::select_bound`.
+                    //
+                    // And when the held account went out DURING this request
+                    // (an upstream rejection on it just turned
+                    // `bound_account_holds` to no), this is the same move the
+                    // top of the handler makes on a later turn, so it gets the
+                    // same answer now instead of a 429 that waits for that
+                    // turn: the warning once, then the fleet.
+                    if let Some(bound) = bound_to
+                        && !manager.bound_account_holds(
+                            bound,
+                            now,
+                            request_is_fable,
+                            request_group.as_deref(),
+                            manager.warm_window(session_key),
+                        )
+                    {
+                        if let Some(warning) = switch_warning(
+                            &manager,
+                            session_key,
+                            bound,
+                            now,
+                            request_is_fable,
+                            request_group.as_deref(),
+                        ) {
+                            return warning;
+                        }
+                        tracing::info!(
+                            account = manager.account_name(bound).as_deref().unwrap_or("?"),
+                            "bound history's account went out during the request; \
+                             releasing the request to the fleet"
+                        );
+                        // Re-admit only what the hold benched: a lease's
+                        // account-set scope stays benched (see
+                        // `benched_for_hold`), and so does `bound`, which
+                        // failed this request.
+                        for idx in benched_for_hold.drain(..) {
+                            tried.remove(&idx);
+                        }
+                        bound_to = None;
+                        next_idx = same_org_release(
+                            &manager,
+                            bound,
+                            &tried,
+                            request_model.as_deref(),
+                            |narrowed| {
+                                manager.select_with_group(
+                                    narrowed,
                                     now,
-                                    provider_account_count,
-                                    request_is_fable,
-                                    provider,
-                                    strict_group,
-                                    bound_to,
-                                    fallback_ask.as_ref(),
-                                )
-                                .await;
-                            }
-                            // Not a transient park — the whole fleet reads over the
-                            // SOFT switch threshold. Before synthesizing a 429, try a
-                            // last-resort revalidation serve on the least-utilized
-                            // account Anthropic still allows (default ON; disable via
-                            // top-level `revalidationServe: false`). An upstream 200
-                            // refreshes stale quota; a 429 arms a real hold via the
-                            // existing inline-429 handling. `None` (throttled, or
-                            // nothing servable) keeps the honest exhausted 429.
-                            // `strict_group.is_none()` guards the THIRD spill door,
-                            // and the least visible one. `select_revalidation`
-                            // passes `group: None` to its hard gate, which by
-                            // `Manager::reserved_blocks` EXCLUDES every account
-                            // carrying a reserved group — so for a strict request
-                            // it can only ever return a NON-member. Left ungated it
-                            // would hand the request to precisely the account the
-                            // reservation exists to keep it off, moments after the
-                            // strict arm in `select_with_group` refused to. A
-                            // reserved group falls straight through to the honest
-                            // 429 instead.
-                            //
-                            // HELD HISTORY IS NOT A FLEET QUESTION. A request held to
-                            // its bound account has every other account benched, so
-                            // "the whole fleet is over the threshold" here means only
-                            // "that one account is", and the fleet's revalidation
-                            // window (one serve per 2 s, shared by every session) is
-                            // the wrong gate for it: the turn that lost the race got
-                            // a 429 naming the account's 5-hour window, which Claude
-                            // Code shows as "You've hit your session limit"
-                            // (2026-09-24). `bound_account_holds` already decided the
-                            // soft threshold does not release this conversation, so
-                            // the serve agrees with it: `Manager::select_bound`.
-                            //
-                            // And when the held account went out DURING this request
-                            // (an upstream rejection on it just turned
-                            // `bound_account_holds` to no), this is the same move the
-                            // top of the handler makes on a later turn, so it gets the
-                            // same answer now instead of a 429 that waits for that
-                            // turn: the warning once, then the fleet.
-                            if let Some(bound) = bound_to
-                                && !manager.bound_account_holds(
-                                    bound,
-                                    now,
-                                    request_is_fable,
-                                    request_group.as_deref(),
-                                    manager.warm_window(session_key),
-                                )
-                            {
-                                if let Some(warning) = switch_warning(
-                                    &manager,
-                                    session_key,
-                                    bound,
-                                    now,
-                                    request_is_fable,
-                                    request_group.as_deref(),
-                                ) {
-                                    return warning;
-                                }
-                                tracing::info!(
-                                    account = manager.account_name(bound).as_deref().unwrap_or("?"),
-                                    "bound history's account went out during the request; \
-                                         releasing the request to the fleet"
-                                );
-                                // Re-admit only what the hold benched: a lease's
-                                // account-set scope stays benched (see
-                                // `benched_for_hold`), and so does `bound`, which
-                                // failed this request.
-                                for idx in benched_for_hold.drain(..) {
-                                    tried.remove(&idx);
-                                }
-                                bound_to = None;
-                                next_idx = same_org_release(
-                                    &manager,
-                                    bound,
-                                    &tried,
                                     request_model.as_deref(),
-                                    |narrowed| {
-                                        manager.select_with_group(
-                                            narrowed,
-                                            now,
-                                            request_model.as_deref(),
-                                            session_key,
-                                            &path,
-                                            conn_key,
-                                            request_group.as_deref(),
-                                        )
-                                    },
-                                );
-                                continue;
-                            }
-                            let served = match bound_to {
-                                Some(bound) => manager.select_bound(
-                                    bound,
-                                    &tried,
-                                    now,
-                                    request_is_fable,
+                                    session_key,
+                                    &path,
+                                    conn_key,
                                     request_group.as_deref(),
-                                    strict_group,
-                                    manager.warm_window(session_key),
-                                ),
-                                None if strict_group.is_none()
-                                    && manager.revalidation_serve_enabled() =>
-                                {
-                                    manager.select_revalidation(
-                                        &tried,
-                                        now,
-                                        request_model.as_deref(),
-                                        session_key,
-                                        &path,
-                                    )
-                                }
-                                None => None,
-                            };
-                            match served {
-                                Some(idx) => idx,
-                                None => {
-                                    return exhausted_or_fallback(
-                                        &manager,
-                                        now,
-                                        provider_account_count,
-                                        request_is_fable,
-                                        provider,
-                                        strict_group,
-                                        bound_to,
-                                        fallback_ask.as_ref(),
-                                    )
-                                    .await;
-                                }
-                            }
+                                )
+                            },
+                        );
+                        continue;
+                    }
+                    let served = match bound_to {
+                        Some(bound) => manager.select_bound(
+                            bound,
+                            &tried,
+                            now,
+                            request_is_fable,
+                            request_group.as_deref(),
+                            strict_group,
+                            manager.warm_window(session_key),
+                        ),
+                        None if strict_group.is_none() && manager.revalidation_serve_enabled() => {
+                            manager.select_revalidation(
+                                &tried,
+                                now,
+                                request_model.as_deref(),
+                                session_key,
+                                &path,
+                            )
+                        }
+                        None => None,
+                    };
+                    match served {
+                        Some(idx) => idx,
+                        None => {
+                            return exhausted_or_fallback(
+                                &manager,
+                                now,
+                                provider_account_count,
+                                request_is_fable,
+                                provider,
+                                strict_group,
+                                bound_to,
+                                fallback_ask.as_ref(),
+                            )
+                            .await;
                         }
                     }
                 }
-            },
+            }
         };
 
         // RAII in-flight accounting for per-account pacing: bump this account's
@@ -5131,24 +5126,21 @@ async fn handle_request(
                 Provider::Anthropic => RATE_LIMIT_BODY_CAP,
                 Provider::Codex => MAX_BODY_BYTES,
             };
-            let body = match tokio::time::timeout(
+            let body = if let Ok(Ok(body)) = tokio::time::timeout(
                 Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
                 read_capped_body(resp.bytes_stream(), body_cap),
             )
             .await
             {
-                Ok(Ok(body)) => {
-                    log_upstream_error_body(idx, account_name.as_deref(), status, &body);
-                    Some(body)
-                }
-                Ok(Err(_)) | Err(_) => {
-                    tracing::warn!(
-                        account = account_name.as_deref().unwrap_or("?"),
-                        account_index = idx,
-                        "upstream 403 body could not be read within the cap"
-                    );
-                    None
-                }
+                log_upstream_error_body(idx, account_name.as_deref(), status, &body);
+                Some(body)
+            } else {
+                tracing::warn!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    "upstream 403 body could not be read within the cap"
+                );
+                None
             };
             match provider {
                 Provider::Codex => {
@@ -5287,23 +5279,20 @@ async fn handle_request(
                 crate::provider::Provider::Anthropic | crate::provider::Provider::Codex => {
                     // Read the bounded body before deciding whether Codex refused quota. Some
                     // quota errors carry no reached-type header at all.
-                    let refusal_body = match tokio::time::timeout(
+                    let refusal_body = if let Ok(Ok(body)) = tokio::time::timeout(
                         Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
                         read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
                     )
                     .await
                     {
-                        Ok(Ok(body)) => {
-                            log_upstream_error_body(idx, account_name.as_deref(), status, &body);
-                            body
-                        }
-                        Ok(Err(_)) | Err(_) => {
-                            tracing::warn!(
-                                account_index = idx,
-                                "upstream 429 body could not be read within the cap"
-                            );
-                            Bytes::new()
-                        }
+                        log_upstream_error_body(idx, account_name.as_deref(), status, &body);
+                        body
+                    } else {
+                        tracing::warn!(
+                            account_index = idx,
+                            "upstream 429 body could not be read within the cap"
+                        );
+                        Bytes::new()
                     };
                     let retry_after = retry_after_raw.unwrap_or(60);
                     // Codex quota bodies name the reset in Unix seconds; prefer it to header
@@ -5388,7 +5377,7 @@ async fn handle_request(
                     let count = retried_429.entry(idx).or_insert(0);
                     // Desync the no-guidance un-park across accounts that tripped together;
                     // derive the jitter from the loop clock so no `rand` dependency is needed.
-                    let jitter = (now.nanosecond() as i64) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
+                    let jitter = i64::from(now.nanosecond()) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
                     match classify_transient_429(retry_after_raw, *count, jitter) {
                         Transient429::InlineWait(wait) => {
                             *count += 1;
@@ -5711,16 +5700,15 @@ async fn handle_request(
                 // here or about to be. A parse that stopped early on a malformed
                 // frame waits here for the stream to finish, which is when
                 // `total_ms` is known.
-                let timing = match timing_rx.await {
-                    Ok(fields) => Some(fields),
-                    Err(_) => {
-                        tracing::warn!(
-                            account_index = idx,
-                            "streamed request's timing was dropped unsent; \
-                             its request usage line carries no timing"
-                        );
-                        None
-                    }
+                let timing = if let Ok(fields) = timing_rx.await {
+                    Some(fields)
+                } else {
+                    tracing::warn!(
+                        account_index = idx,
+                        "streamed request's timing was dropped unsent; \
+                         its request usage line carries no timing"
+                    );
+                    None
                 };
                 if parsed.input_total > 0 || parsed.output > 0 {
                     // The REQUEST's model whenever its body named one. `response_model` is set
@@ -6150,7 +6138,7 @@ pub(crate) fn key_matches(provided: Option<&str>, expected: &str) -> bool {
     let (a, b) = (provided.as_bytes(), expected.as_bytes());
     // Seed the accumulator with the length mismatch instead of branching on it
     // (a bare `as u8` truncation would alias e.g. 256 vs 0, so reduce to 0/1).
-    let mut diff: u8 = (a.len() != b.len()) as u8;
+    let mut diff: u8 = u8::from(a.len() != b.len());
     for (i, &x) in a.iter().enumerate() {
         // Read past the configured key's end as 0 rather than short-circuiting;
         // the length delta above already forces a non-match in that case.
@@ -6239,7 +6227,7 @@ fn log_upstream_error_body(
 /// would defeat SSE usage parsing). Sets our own `Bearer`.
 fn build_upstream_headers(req_headers: &HeaderMap, token: &str) -> HeaderMap {
     let mut out = HeaderMap::new();
-    for (name, value) in req_headers.iter() {
+    for (name, value) in req_headers {
         // `as_str`, and named for what it is. It was called `lower`, which
         // claimed a lowercasing this line does not do: it holds only because
         // `HeaderName` is already lowercase, so the name promised a property
@@ -6599,7 +6587,7 @@ pub(crate) fn build_handed_bearer_headers(
 /// NOT one of ours is the client's own and passes through.
 fn build_passthrough_headers(req_headers: &HeaderMap, secrets: ProxySecrets<'_>) -> HeaderMap {
     let mut out = HeaderMap::new();
-    for (name, value) in req_headers.iter() {
+    for (name, value) in req_headers {
         // Named for what it is, not for a lowercasing this line does not do.
         // See `build_upstream_headers`.
         let name_str = name.as_str();
@@ -6865,17 +6853,14 @@ async fn relay_request(
                     Body::from_stream(futures::stream::unfold(
                         (resp.bytes_stream(), clock),
                         |(mut inner, mut clock)| async move {
-                            match inner.next().await {
-                                Some(item) => {
-                                    if item.is_err() {
-                                        clock.mark_ended();
-                                    }
-                                    Some((item, (inner, clock)))
-                                }
-                                None => {
+                            if let Some(item) = inner.next().await {
+                                if item.is_err() {
                                     clock.mark_ended();
-                                    None
                                 }
+                                Some((item, (inner, clock)))
+                            } else {
+                                clock.mark_ended();
+                                None
                             }
                         },
                     ))
@@ -7039,7 +7024,7 @@ fn build_response(
     let mut response = Response::new(body);
     *response.status_mut() = status;
     let headers = response.headers_mut();
-    for (name, value) in up_headers.iter() {
+    for (name, value) in up_headers {
         if is_response_skip(name.as_str()) {
             continue;
         }
@@ -7219,7 +7204,7 @@ struct JsonParse {
 }
 
 /// Every reading from one buffered 2xx body. Only Anthropic mints its bound-token
-/// kinds and tool_use blocks; Codex reads Responses usage and its response model.
+/// kinds and `tool_use` blocks; Codex reads Responses usage and its response model.
 #[derive(Debug, Default)]
 struct NonStreamedResponse {
     usage: ParsedUsage,
@@ -8419,7 +8404,7 @@ fn advertised_retry_after(hint: &ExhaustionHint) -> i64 {
 /// Claude Code client maps to its limit types (`five_hour`, `seven_day`); the
 /// Fable weekly is reported as the plain weekly claim because the client has no
 /// Fable-specific one and a weekly reset is what it is.
-fn unified_claim_for(reason: GateReason) -> Option<&'static str> {
+const fn unified_claim_for(reason: GateReason) -> Option<&'static str> {
     match reason {
         GateReason::FiveHour => Some("five_hour"),
         GateReason::SevenDay | GateReason::FableWeekly => Some("seven_day"),
@@ -8556,7 +8541,7 @@ fn switch_warning(
 }
 
 /// What a gate means, in words a person reads after an account count or after "out".
-fn gate_phrase(reason: GateReason) -> &'static str {
+const fn gate_phrase(reason: GateReason) -> &'static str {
     match reason {
         GateReason::Ok => "in rotation",
         GateReason::Hold => "on an upstream hold",
@@ -8598,7 +8583,7 @@ fn describe_gates_with(
 /// account's gate means something else. ChatGPT's own refusal is no Claude "rejected", and a
 /// Codex account in a reserved group is unreachable, because a Codex request carries no group
 /// that could reach it.
-fn codex_gate_phrase(reason: GateReason) -> &'static str {
+const fn codex_gate_phrase(reason: GateReason) -> &'static str {
     match reason {
         GateReason::Rejected => "refused by ChatGPT",
         GateReason::Reserved => "unreachable in a reserved group",
@@ -8636,7 +8621,10 @@ pub fn at_utc(at: OffsetDateTime, now: OffsetDateTime) -> String {
 /// works and that the right verdict for this request is quota exhaustion (or a
 /// forwarded status), never "upstream unreachable". Keeping the two counts apart
 /// is what lets one blip rotate away instead of collapsing the recovery ladder.
-fn every_attempt_transport_failed(transport_failures: usize, upstream_responses: usize) -> bool {
+const fn every_attempt_transport_failed(
+    transport_failures: usize,
+    upstream_responses: usize,
+) -> bool {
     transport_failures > 0 && upstream_responses == 0
 }
 
@@ -9383,7 +9371,7 @@ mod tests {
     /// `select` offering another account.
     #[test]
     fn overloaded_529_failover_worst_case_latency_is_bounded() {
-        let accounts_walked = 1 + MAX_529_FAILOVERS_PER_REQUEST as u64;
+        let accounts_walked = 1 + u64::from(MAX_529_FAILOVERS_PER_REQUEST);
         let ladder = |hint: Option<i64>| -> u64 {
             (0..MAX_SAME_ACCOUNT_529_RETRIES)
                 .map(|n| backoff_529_secs(n, hint))
@@ -9687,7 +9675,7 @@ mod tests {
     }
 
     /// The cacheable-prefix body used by every tier-3 scope-gating test below —
-    /// no x-api-key, no user_id, so tier 3 is the only tier that could fire.
+    /// no x-api-key, no `user_id`, so tier 3 is the only tier that could fire.
     const PREFIX_ONLY_BODY: &[u8] = br#"{"system":"You are a helpful assistant."}"#;
 
     #[test]
@@ -10079,7 +10067,7 @@ mod tests {
     /// non-Messages endpoint that happens to share `text/event-stream` looks
     /// exactly like this from inside `parse_sse_usage`. This is the only
     /// shape that earns the exemption. A round-4 fix (see the sibling test
-    /// below) narrowed this from "no message_start" to "no message_start
+    /// below) narrowed this from "no `message_start`" to "no `message_start`
     /// AND at least one other event arrived" — a stream with ZERO events is
     /// a different, indistinguishable-from-severed-early shape and must NOT
     /// share this exemption; conflating the two was exactly the round-4 bug.
@@ -10156,7 +10144,7 @@ mod tests {
     /// byte (`0xFF`) that can never resolve into valid UTF-8 no matter what
     /// follows, and nothing follows. `parse_sse_usage`'s `break` on that `Err`
     /// must still leave `saw_message_start` set, so the post-loop check
-    /// classifies it exactly like the ordinary "no message_stop" case.
+    /// classifies it exactly like the ordinary "no `message_stop`" case.
     #[tokio::test]
     async fn sse_stream_with_malformed_utf8_after_message_start_records_truncation() {
         let head = concat!(
@@ -11177,7 +11165,7 @@ mod tests {
             // A tool_use with no id, a thinking block with no signature.
             r#"{"id":"msg_fake_7","content":[{"type":"tool_use","name":"Grep"},{"type":"thinking","thinking":"x"}],"usage":{"input_tokens":2}}"#,
             // Not an object, and not JSON.
-            r#"[1,2,3]"#,
+            "[1,2,3]",
             "not json at all",
             "",
         ];
@@ -11925,7 +11913,7 @@ mod tests {
             "the body really is a populated status payload: {text}"
         );
         // Headers are part of the response too — nothing credential-shaped there.
-        for (name, value) in headers.iter() {
+        for (name, value) in &headers {
             let rendered = format!("{name}: {}", value.to_str().unwrap_or_default());
             assert!(
                 !rendered.contains("at-dummy")
@@ -13934,7 +13922,7 @@ mod tests {
     fn account_count_in_file(path: &std::path::Path) -> usize {
         let raw = std::fs::read_to_string(path).expect("read the test config");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
-        doc["accounts"].as_array().map_or(0, |a| a.len())
+        doc["accounts"].as_array().map_or(0, std::vec::Vec::len)
     }
 
     /// THE BITING TEST for the append half: a brand-new identity lands at the END
@@ -14588,7 +14576,7 @@ mod tests {
     }
 
     /// SEAM TEST. `oauth::probe_add_route` (unit 3)
-    /// decides whether `tcr login` takes the LIVE route by POSTing this exact
+    /// decides whether `tcr login` takes the LIVE route by `POSTing` this exact
     /// deliberately-blank body to `ADD_ACCOUNT_PATH` via
     /// `cli::post_add_account` and reading whether the reply is a STAMPED
     /// 400. An unstamped answer, or a different (non-400) status, reads as
@@ -17294,7 +17282,7 @@ mod tests {
         );
     }
 
-    /// key_matches behaviour is preserved after the length side-channel fix:
+    /// `key_matches` behaviour is preserved after the length side-channel fix:
     /// equal ⇔ true, and any mismatch (byte or length) ⇔ false.
     #[test]
     fn key_matches_equal_keys_true() {
@@ -17338,7 +17326,7 @@ mod tests {
         );
     }
 
-    /// The response-body cap rejects an over-cap stream (BAD_GATEWAY path) while
+    /// The response-body cap rejects an over-cap stream (`BAD_GATEWAY` path) while
     /// buffering a within-cap body verbatim and surfacing transport errors.
     #[tokio::test]
     async fn read_capped_body_rejects_oversized() {
@@ -17734,7 +17722,7 @@ mod tests {
     }
 
     impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-        type Writer = SharedBuf;
+        type Writer = Self;
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
@@ -18730,7 +18718,7 @@ mod tests {
     /// turn. The fixture is deliberately the SAME shape that would have been
     /// misclassified as truncated before this fix (a `message_start` with no
     /// `message_stop`), on a 400 instead of a 200, to prove the status gate
-    /// — not the message_start gate above — is what suppresses it here.
+    /// — not the `message_start` gate above — is what suppresses it here.
     #[tokio::test]
     async fn non_2xx_sse_body_records_no_stream_error() {
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -18950,7 +18938,7 @@ mod tests {
     /// is thoroughly UNIT-tested, but the proxy wiring at the call site is not — every
     /// other integration test posts a bare `{}`, so the rewrite branch never fires on
     /// a real request. Drive one whose `metadata.user_id` blob carries a DIFFERENT
-    /// account_uuid and assert, from what the UPSTREAM actually received, that the
+    /// `account_uuid` and assert, from what the UPSTREAM actually received, that the
     /// serving account's uuid was substituted, the client's is gone, and the body
     /// length is unchanged (the whole point of the same-length patch — it keeps the
     /// buffered request's Content-Length valid in flight).
@@ -19592,7 +19580,7 @@ mod tests {
         let leaked: Vec<&str> = response
             .headers()
             .keys()
-            .map(|k| k.as_str())
+            .map(axum::http::HeaderName::as_str)
             .filter(|k| k.starts_with("anthropic-ratelimit"))
             .collect();
         assert!(
@@ -20390,7 +20378,7 @@ mod tests {
 
         RELAY_CLIENT
             .detector()
-            .inject_sleep(Duration::from_secs(900));
+            .inject_sleep(Duration::from_mins(15));
         let woken = relay_client().expect("the relay client builds");
         assert!(
             !Arc::ptr_eq(&first, &woken),
@@ -20452,8 +20440,8 @@ mod tests {
 
     /// **The seam the arm actually calls**: `recycle_client_after_reset` swaps
     /// the account's client `Arc` (so the retry that follows genuinely lands on
-    /// a fresh connection), and only the StreamReset arm calls it, a
-    /// ConnectPhase failure must leave the client untouched, matching the live
+    /// a fresh connection), and only the `StreamReset` arm calls it, a
+    /// `ConnectPhase` failure must leave the client untouched, matching the live
     /// arm's own gating (`err.is_connect()` never reaches the recycle call).
     #[tokio::test]
     async fn recycle_client_after_reset_swaps_the_arc_only_when_called() {

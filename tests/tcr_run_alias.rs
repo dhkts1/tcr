@@ -89,7 +89,7 @@ fn tcr_run_alias_passes_every_argument_like_tcr_run() {
         vec!["--model", "opus", "-p", "two words"],
         vec!["--", "-p", "hi"],
     ] {
-        let through_run: Vec<&str> = ["run"].into_iter().chain(args.iter().copied()).collect();
+        let through_run: Vec<&str> = std::iter::once("run").chain(args.iter().copied()).collect();
         let (run_code, run_out, run_err) = run(&s, &tcr, &through_run);
         let (alias_code, alias_out, alias_err) = run(&s, &link, &args);
         assert_eq!(run_code, 0, "tcr run {args:?}: {run_err}");

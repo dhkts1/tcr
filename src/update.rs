@@ -179,18 +179,18 @@ pub fn parse_pull_stdout(stdout: &str) -> PullOutcome {
 }
 
 /// Pure argv for the pull — asserted in tests without spawning git.
-pub fn git_pull_argv() -> [&'static str; 2] {
+pub const fn git_pull_argv() -> [&'static str; 2] {
     ["pull", "--ff-only"]
 }
 
 /// Pure argv for the release build — asserted in tests without spawning cargo.
-pub fn cargo_build_argv() -> [&'static str; 2] {
+pub const fn cargo_build_argv() -> [&'static str; 2] {
     ["build", "--release"]
 }
 
 /// Pure argv for the target-directory query — asserted in tests without
 /// spawning cargo.
-pub fn cargo_metadata_argv() -> [&'static str; 4] {
+pub const fn cargo_metadata_argv() -> [&'static str; 4] {
     ["metadata", "--format-version", "1", "--no-deps"]
 }
 
@@ -749,7 +749,7 @@ const OPEN_BIN: &str = "/usr/bin/open";
 /// Pure argv for the handoff — asserted in tests without spawning anything.
 /// `-g` keeps the request in the background so `tcr update` does not steal
 /// focus; `open` launches TcrBar first if it is not already running.
-pub fn open_handoff_argv() -> [&'static str; 2] {
+pub const fn open_handoff_argv() -> [&'static str; 2] {
     ["-g", TCRBAR_UPDATE_URL]
 }
 
@@ -865,7 +865,7 @@ fn print_manual_app_instructions(bundle: &Path) {
 /// Update an `.app` copy by asking the app's own Sparkle updater to check.
 ///
 /// This arm deliberately does NOT become a fourth download path. Sparkle
-/// verifies an EdDSA signature over the archive it installs and the app is
+/// verifies an `EdDSA` signature over the archive it installs and the app is
 /// notarized; the [`InstallKind::Installed`] arm above is protected by "TLS and
 /// nothing else" (see the module doc). Handing the app channel to the code that
 /// owns it is therefore strictly stronger than re-implementing a download here,

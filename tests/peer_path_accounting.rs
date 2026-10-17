@@ -127,7 +127,7 @@ fn peers_file(tag: &str, rows: Vec<PeerRow>) -> std::path::PathBuf {
 
 /// The header a requester writes for a forward, with the one field the wire
 /// cannot carry left out (`tests/peer_forward.rs` holds that defect's record).
-fn forward_header(hops_remaining: u8) -> StreamHeader {
+const fn forward_header(hops_remaining: u8) -> StreamHeader {
     StreamHeader {
         kind: StreamKind::Tunnel,
         target: None,

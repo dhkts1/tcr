@@ -234,7 +234,7 @@ pub struct DiscoveredGateway {
 
 /// The real SSDP multicast group (UPnP Device Architecture § 1.2.2): all
 /// UPnP control points and devices, port 1900.
-fn multicast_destination() -> SocketAddr {
+const fn multicast_destination() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 255, 250)), 1900)
 }
 
@@ -253,17 +253,17 @@ pub struct Discoverer {
 impl Discoverer {
     /// Point a search at an explicit destination: a test's fake responder, or
     /// an operator who knows a gateway's unicast address.
-    pub fn at(destination: SocketAddr) -> Self {
+    pub const fn at(destination: SocketAddr) -> Self {
         Self { destination }
     }
 
     /// Point a search at the real SSDP multicast group.
-    pub fn multicast() -> Self {
+    pub const fn multicast() -> Self {
         Self::at(multicast_destination())
     }
 
     /// Who this search is sent to.
-    pub fn destination(&self) -> SocketAddr {
+    pub const fn destination(&self) -> SocketAddr {
         self.destination
     }
 
@@ -272,7 +272,7 @@ impl Discoverer {
     /// answer: a search sent to the multicast group or to a LAN address
     /// accepts only a private IPv4 description host, and only a search
     /// deliberately aimed at loopback accepts a loopback one.
-    pub fn location_policy(&self) -> LocationPolicy {
+    pub const fn location_policy(&self) -> LocationPolicy {
         if self.destination.ip().is_loopback() {
             LocationPolicy::Loopback
         } else {
@@ -497,12 +497,12 @@ pub struct XmlNode {
     /// child elements.
     pub text: String,
     /// Child elements, in document order.
-    pub children: Vec<XmlNode>,
+    pub children: Vec<Self>,
 }
 
 impl XmlNode {
     /// The first direct child with this tag name.
-    pub fn child(&self, tag: &str) -> Option<&XmlNode> {
+    pub fn child(&self, tag: &str) -> Option<&Self> {
         self.children.iter().find(|child| child.tag == tag)
     }
 
@@ -510,7 +510,7 @@ impl XmlNode {
     /// document order. Used for a value that a reader cares about regardless
     /// of how deep the document nested it, such as `<service>` anywhere under
     /// a `<serviceList>` anywhere under a `<device>`.
-    pub fn find_all<'a>(&'a self, tag: &str, out: &mut Vec<&'a XmlNode>) {
+    pub fn find_all<'a>(&'a self, tag: &str, out: &mut Vec<&'a Self>) {
         if self.tag == tag {
             out.push(self);
         }
@@ -855,7 +855,7 @@ impl UpnpClient {
         answer.refuse_redirect(&found.location)?;
         if answer.status >= 400 {
             return Err(UpnpError::UnreadableResponse {
-                url: found.location.clone(),
+                url: found.location,
                 reason: format!("it answered HTTP {} to a description fetch", answer.status),
             });
         }
@@ -963,10 +963,12 @@ impl UpnpClient {
         let status = answer.status;
         let text = answer.body;
         if status >= 400 {
-            let (code, description) = parse_soap_fault(&text).unwrap_or((
-                status,
-                "the gateway returned an error with no readable UPnP fault".to_string(),
-            ));
+            let (code, description) = parse_soap_fault(&text).unwrap_or_else(|| {
+                (
+                    status,
+                    "the gateway returned an error with no readable UPnP fault".to_string(),
+                )
+            });
             return Err(UpnpError::Refused {
                 action: action.to_string(),
                 code,
@@ -1076,7 +1078,7 @@ fn fetch(
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
-                .map(|value| value.to_string());
+                .map(std::string::ToString::to_string);
             // The sender's own claim first: an answer that says it is larger
             // than the ceiling is refused before a byte of it is read.
             if let Some(promised) = response.content_length()

@@ -136,9 +136,7 @@ fn emit_rerun_triggers() {
     let Some(git_dir) = git(&["rev-parse", "--git-dir"]).map(resolve) else {
         return;
     };
-    let common = git(&["rev-parse", "--git-common-dir"])
-        .map(resolve)
-        .unwrap_or_else(|| git_dir.clone());
+    let common = git(&["rev-parse", "--git-common-dir"]).map_or_else(|| git_dir.clone(), resolve);
 
     rerun_if_present(&git_dir.join("HEAD"));
     rerun_if_present(&common.join("packed-refs"));

@@ -7,6 +7,9 @@ license = "PolyForm-Noncommercial-1.0.0"
 publish = false
 description = "SCM_RIGHTS listening-socket passing, isolated so the main crate keeps #![forbid(unsafe_code)]"
 
+[lints]
+workspace = true
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["socket", "uio"] }
 

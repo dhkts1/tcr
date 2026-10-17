@@ -46,7 +46,7 @@ fn run_tcr(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, Strin
     if args.first() == Some(&"status") {
         let explicit = args
             .windows(2)
-            .find_map(|pair| (pair[0] == "--config").then(|| std::path::PathBuf::from(pair[1])));
+            .find_map(|pair| (pair[0] == "--config").then(|| PathBuf::from(pair[1])));
         let path = explicit.clone().unwrap_or_else(|| config_path_in(home));
         if path.exists() {
             let config: serde_json::Value =

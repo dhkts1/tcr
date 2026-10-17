@@ -194,16 +194,16 @@ pub fn serve_is_allowed_for_path(path: &str) -> bool {
 /// neither blames a credential for the Codex refusal or for a path the parser
 /// would have rewritten.
 pub fn refused_path_kind(path: &str) -> &'static str {
-    if !relay_path_is_routable(path) {
-        "an unroutable path (one the upstream URL parser would read differently than it is \
-         spelled)"
-    } else {
+    if relay_path_is_routable(path) {
         match crate::provider::Provider::of_path(path) {
             crate::provider::Provider::Anthropic => "a client-credential or local-control path",
             crate::provider::Provider::Codex => {
                 "a Codex path (Codex is not lent over the mesh in this version)"
             }
         }
+    } else {
+        "an unroutable path (one the upstream URL parser would read differently than it is \
+         spelled)"
     }
 }
 
@@ -382,7 +382,7 @@ pub fn lender_forwards_header(name: &str) -> bool {
 /// The one HTTP method a relayed request may carry.
 ///
 /// [`ServeRequest::method`] used to be built as the literal `"POST"` and read
-/// by nobody, so a borrower that sent `GET` had it silently POSTed on the
+/// by nobody, so a borrower that sent `GET` had it silently `POSTed` on the
 /// lender's account. The field is honoured instead of removed because the
 /// borrower's client really does choose the method and a lender must be able to
 /// say which one it will serve. See [`handle_serve_on`], which refuses
@@ -2455,14 +2455,10 @@ where
     loop {
         tokio::select! {
             Some((candidate, outcome)) = running.next(), if !running.is_empty() => {
-                match outcome {
-                    Some(value) => return RaceOutcome { won: Some((candidate, value)), failed },
-                    None => {
-                        failed.push(candidate);
-                        if running.is_empty() && next_start.is_none() {
-                            return RaceOutcome { won: None, failed };
-                        }
-                    }
+                if let Some(value) = outcome { return RaceOutcome { won: Some((candidate, value)), failed } }
+                failed.push(candidate);
+                if running.is_empty() && next_start.is_none() {
+                    return RaceOutcome { won: None, failed };
                 }
             }
             () = async {
@@ -2904,10 +2900,12 @@ pub fn forwarders_for(target: &PeerId, store: &PeerStore) -> Vec<PeerId> {
                 crate::peer::probe::carrier_key(&row.node, seen, table),
             )
         })
-        .unwrap_or((
-            0,
-            (0, u32::MAX, std::cmp::Reverse(seen.unwrap_or(i64::MIN))),
-        ))
+        .unwrap_or_else(|_| {
+            (
+                0,
+                (0, u32::MAX, std::cmp::Reverse(seen.unwrap_or(i64::MIN))),
+            )
+        })
     };
     chosen.sort_by_key(|row| order(row));
     chosen.into_iter().map(|row| row.node).collect()
@@ -3427,26 +3425,23 @@ async fn exchange_addresses(row: &PeerRow, store: &PeerStore, borrow_timeout_ms:
         );
         return false;
     }
-    match crate::peer::reach::learn_from_hint(&row.node, &theirs) {
-        Some(addr) => {
-            tracing::info!(
-                peer = %row.node.display(),
-                via = %carrier.display(),
-                addr = %addr,
-                "peer aim: that peer named where it is now, over a friend they both still \
-                 reach"
-            );
-            true
-        }
-        None => {
-            tracing::debug!(
-                peer = %row.node.display(),
-                via = %carrier.display(),
-                "peer aim: nothing that peer named is an address anything can dial, so this \
-                 node still has nowhere to aim"
-            );
-            false
-        }
+    if let Some(addr) = crate::peer::reach::learn_from_hint(&row.node, &theirs) {
+        tracing::info!(
+            peer = %row.node.display(),
+            via = %carrier.display(),
+            addr = %addr,
+            "peer aim: that peer named where it is now, over a friend they both still \
+             reach"
+        );
+        true
+    } else {
+        tracing::debug!(
+            peer = %row.node.display(),
+            via = %carrier.display(),
+            "peer aim: nothing that peer named is an address anything can dial, so this \
+             node still has nowhere to aim"
+        );
+        false
     }
 }
 

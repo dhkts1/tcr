@@ -79,13 +79,13 @@ pub enum CodexBinSource {
 
 impl CodexBinSource {
     /// How the doctor names the rule.
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
-            CodexBinSource::TcrCodexBin => TCR_CODEX_BIN_ENV,
-            CodexBinSource::CodexBin => CODEX_BIN_ENV,
-            CodexBinSource::Path => "PATH",
-            CodexBinSource::SearchDirs => "TcrBar's directories",
-            CodexBinSource::NpmPrefix => "npm's global prefix",
+            Self::TcrCodexBin => TCR_CODEX_BIN_ENV,
+            Self::CodexBin => CODEX_BIN_ENV,
+            Self::Path => "PATH",
+            Self::SearchDirs => "TcrBar's directories",
+            Self::NpmPrefix => "npm's global prefix",
         }
     }
 }
@@ -107,8 +107,8 @@ impl CodexSearch {
     /// Every place searched, joined with `, `; empty for a variable that decided.
     pub fn list(&self) -> String {
         match self {
-            CodexSearch::NotFound { searched } => searched.join(", "),
-            CodexSearch::BadVariable { .. } => String::new(),
+            Self::NotFound { searched } => searched.join(", "),
+            Self::BadVariable { .. } => String::new(),
         }
     }
 
@@ -116,12 +116,12 @@ impl CodexSearch {
     /// --codex` writes nothing in any case, and a login adds that it wrote nothing.
     pub fn sentence(&self) -> String {
         match self {
-            CodexSearch::NotFound { .. } => format!(
+            Self::NotFound { .. } => format!(
                 "could not find the codex CLI (searched {}). Install it, or set TCR_CODEX_BIN to \
                  its path.",
                 self.list()
             ),
-            CodexSearch::BadVariable {
+            Self::BadVariable {
                 var,
                 value,
                 bare: false,
@@ -129,7 +129,7 @@ impl CodexSearch {
                 "{var} is {value}, which is not an executable file. Point it at the codex \
                  executable, or unset it."
             ),
-            CodexSearch::BadVariable {
+            Self::BadVariable {
                 var,
                 value,
                 bare: true,

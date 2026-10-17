@@ -542,7 +542,7 @@ mod tests {
             let answer = keyed(&[(ACCOUNT_A, entry)]);
             match judge_accounts_check(&answer, Some(ACCOUNT_A)) {
                 Err(WorkspaceRefusal::NotPoolable(why)) => {
-                    assert!(why.contains(named), "{named}: {why}")
+                    assert!(why.contains(named), "{named}: {why}");
                 }
                 other => panic!("{answer} must be refused as not poolable, got {other:?}"),
             }

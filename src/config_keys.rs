@@ -93,7 +93,7 @@ const KNOWN_KEYS: &[KnownKey] = &[
 ];
 
 /// Every key this build recognises at the top level of the config.
-pub fn known_keys() -> &'static [KnownKey] {
+pub const fn known_keys() -> &'static [KnownKey] {
     KNOWN_KEYS
 }
 
@@ -327,13 +327,13 @@ mod tests {
             crate::provider::Provider::Codex
         );
         assert_eq!(
-            unknown_keys(&Value::Object(config.extra.clone())),
+            unknown_keys(&Value::Object(config.extra)),
             Vec::new(),
             "the unmodelled map doctor and the boot line read"
         );
     }
 
-    /// The camelCase name serde gives a snake_case field under
+    /// The camelCase name serde gives a `snake_case` field under
     /// `rename_all = "camelCase"`.
     fn camel_case(snake: &str) -> String {
         let mut out = String::new();

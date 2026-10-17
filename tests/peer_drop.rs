@@ -32,7 +32,7 @@ use tcr::peer::drop::{
 use tcr_peer_wire::PeerId;
 
 /// A peer id that is plainly not a real one: 32 copies of one byte.
-fn peer_id(fill: u8) -> PeerId {
+const fn peer_id(fill: u8) -> PeerId {
     PeerId([fill; 32])
 }
 

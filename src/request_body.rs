@@ -145,12 +145,12 @@ impl RequestBody {
     }
 
     /// The body to forward, before any per-account patch. A refcount clone, never a copy.
-    pub fn bytes(&self) -> &Bytes {
+    pub const fn bytes(&self) -> &Bytes {
         &self.bytes
     }
 
     /// The client's body length when the rewrite changed it, else `None`.
-    pub fn rewritten_from(&self) -> Option<usize> {
+    pub const fn rewritten_from(&self) -> Option<usize> {
         self.rewritten_from
     }
 
@@ -178,12 +178,12 @@ impl RequestBody {
     }
 
     /// What the session peek reads.
-    pub fn wire(&self) -> &WireFacts {
+    pub const fn wire(&self) -> &WireFacts {
         &self.wire
     }
 
     /// Whether a breakpoint in a legal position asks for the 1-hour window.
-    pub fn extended_ttl(&self) -> bool {
+    pub const fn extended_ttl(&self) -> bool {
         self.extended_ttl
     }
 
@@ -778,7 +778,7 @@ impl<'de> DeserializeSeed<'de> for MessagesSeed<'_, 'de> {
 
 impl MessagesSeed<'_, '_> {
     /// A `messages` that is neither null nor a list.
-    fn not_a_list(self) {
+    const fn not_a_list(self) {
         self.scan.ttl.shape_ok = false;
     }
 }
@@ -881,7 +881,7 @@ impl<'de> DeserializeSeed<'de> for MessageSeed<'_, 'de> {
 
 impl<'de> MessageSeed<'_, 'de> {
     /// A message that is not an object.
-    fn not_an_object(self) -> MessageSpans<'de> {
+    const fn not_an_object(self) -> MessageSpans<'de> {
         self.scan.ttl.shape_ok = false;
         MessageSpans {
             is_object: false,
@@ -1001,7 +1001,7 @@ impl<'de> DeserializeSeed<'de> for BlockList<'_, 'de> {
 }
 
 impl BlockList<'_, '_> {
-    fn other(self) -> ListShape {
+    const fn other(self) -> ListShape {
         self.scan.ttl.shape_ok = false;
         ListShape::Other
     }
@@ -1066,7 +1066,7 @@ impl<'de> DeserializeSeed<'de> for BlockSeed<'_, 'de> {
 }
 
 impl<'de> BlockSeed<'_, 'de> {
-    fn not_an_object(self) -> BlockSpans<'de> {
+    const fn not_an_object(self) -> BlockSpans<'de> {
         self.scan.ttl.shape_ok = false;
         BlockSpans {
             is_object: false,
@@ -1555,7 +1555,7 @@ mod tests {
     /// Claude Code shaped body of about 4 MB. Run with
     /// `cargo test --release --lib request_body -- --ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "a timing measurement, run by hand with --release"]
     fn one_parse_on_a_long_conversation_costs() {
         let body = conversation(4_000, true);
         assert_same("long", &body);

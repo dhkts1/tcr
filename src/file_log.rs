@@ -443,11 +443,8 @@ mod tests {
     #[test]
     fn a_sync_after_close_returns_false_while_the_writer_is_still_alive() {
         let (file, entered, release) = held_file();
-        let (queue, file_log) = start(file);
-        queue
-            .clone()
-            .write_all(b"held line\n")
-            .expect("queue a line");
+        let (mut queue, file_log) = start(file);
+        queue.write_all(b"held line\n").expect("queue a line");
         entered
             .recv_timeout(Duration::from_secs(10))
             .expect("the writer reached the file");

@@ -119,12 +119,12 @@ impl NodeKey {
     }
 
     /// This node's own id, the public half, as every peer sees it.
-    pub fn id(&self) -> PeerId {
+    pub const fn id(&self) -> PeerId {
         PeerId(self.public)
     }
 
     /// The private static, for `snow`'s builder and no other caller.
-    pub fn secret_bytes(&self) -> &[u8; 32] {
+    pub const fn secret_bytes(&self) -> &[u8; 32] {
         &self.secret
     }
 }
