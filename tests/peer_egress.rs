@@ -3125,7 +3125,9 @@ fn attempt<'a>(
         method,
         path_and_query: "/v1/messages",
         headers: axum::http::HeaderMap::new(),
-        body: bytes::Bytes::from_static(b"{\"model\":\"claude-opus-4-6\",\"messages\":[]}"),
+        body: Some(bytes::Bytes::from_static(
+            b"{\"model\":\"claude-opus-4-6\",\"messages\":[]}",
+        )),
         peers_path: peers,
         session_key: None,
         session_kind: tcr::stats::SessionKind::Fallback,

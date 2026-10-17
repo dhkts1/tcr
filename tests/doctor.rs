@@ -24,16 +24,10 @@ use std::path::{Path, PathBuf};
 /// refreshes, probes or rotates, so the row is only ever read.
 const ALICE: &str = r#"{ "name": "alice@example.com", "accessToken": "at-alice", "refreshToken": "rt-alice", "expiresAt": 4102444800000 }"#;
 
-/// A port nothing is listening on: bound from the kernel's ephemeral range and
-/// released immediately.
-///
-/// Never a literal. The live proxy on this machine serves on the configured
-/// default port, and a test that wrote that number would have `tcr status` and
+/// A port nothing is listening on. Never a literal: the live proxy on this machine serves on the
+/// configured default port, and a test that wrote that number would have `tcr status` and
 /// `tcr doctor` talk to it.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
-    listener.local_addr().expect("local addr").port()
-}
+use tcr::test_support::loopback::unused_port as free_port;
 
 /// A config with no accounts and one port. `tcr doctor` never rotates, probes
 /// or refreshes, so an empty fleet is the honest fixture: the verb's subject is
