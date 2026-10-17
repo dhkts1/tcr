@@ -353,28 +353,10 @@ mod tests {
         }
     }
 
-    /// The shape the real backend sent, measured 2026-10-12 on two Pro logins, one exhausted
-    /// (`used_percent` 100) and one idle (0), with `scripts/codex-contract-probe.sh`: ONLY the
-    /// weekly window, in the PRIMARY slot, and `secondary_window` null. Beside `rate_limit` are
-    /// thirteen other top-level keys, every nested key as the probe printed it for the exhausted
-    /// login. Four of them (`plan_type`, `credits`, `spend_control`, `rate_limit_reached_type`)
-    /// are read into the probe's facts, and none into a window.
-    /// The probe printed a leaf's type, not its value
-    /// (save `plan_type`, `allowed`, `limit_reached`, `used_percent` and
-    /// `limit_window_seconds`), so each other leaf is a placeholder of that type and the three
-    /// identity keys are fixtures. Of an array it printed only the length, so the two items
-    /// of each are guesses. `rate_limit_upsell` holds a `reset_at` of its own, a later instant
-    /// than the window's, which a parser that searched the payload for any `reset_at` could
-    /// report instead.
-    /// By length the primary slot is the weekly bucket; by position it would put a weekly
-    /// number and a days-away reset into `five_hour`. In both states `five_hour` stays absent
-    /// rather than a fabricated 0%, and no other window is filled.
-    ///
-    /// Watched red: map by position alone, ignoring `limit_window_seconds`, and the weekly
-    /// reading lands in `five_hour`.
-    #[test]
-    fn the_measured_weekly_only_payload_fills_seven_day_from_the_primary_slot_and_nothing_else() {
-        for (used, allowed, limit_reached) in [(100, false, true), (0, true, false)] {
+    /// The measured Pro payload described on the test below, in both measured states:
+    /// (`used_percent`, payload) for the exhausted login (100, refused) and the idle one (0).
+    fn measured_pro_payloads() -> [(i32, Value); 2] {
+        [(100, false, true), (0, true, false)].map(|(used, allowed, limit_reached)| {
             let payload = serde_json::json!({
                 "user_id": "user-fixture",
                 "account_id": "11111111-1111-4111-8111-111111111111",
@@ -425,6 +407,32 @@ mod tests {
                     "applicable_available_count": 0,
                 },
             });
+            (used, payload)
+        })
+    }
+
+    /// The shape the real backend sent, measured 2026-10-12 on two Pro logins, one exhausted
+    /// (`used_percent` 100) and one idle (0), with `scripts/codex-contract-probe.sh`: ONLY the
+    /// weekly window, in the PRIMARY slot, and `secondary_window` null. Beside `rate_limit` are
+    /// thirteen other top-level keys, every nested key as the probe printed it for the exhausted
+    /// login. Four of them (`plan_type`, `credits`, `spend_control`, `rate_limit_reached_type`)
+    /// are read into the probe's facts, and none into a window.
+    /// The probe printed a leaf's type, not its value
+    /// (save `plan_type`, `allowed`, `limit_reached`, `used_percent` and
+    /// `limit_window_seconds`), so each other leaf is a placeholder of that type and the three
+    /// identity keys are fixtures. Of an array it printed only the length, so the two items
+    /// of each are guesses. `rate_limit_upsell` holds a `reset_at` of its own, a later instant
+    /// than the window's, which a parser that searched the payload for any `reset_at` could
+    /// report instead.
+    /// By length the primary slot is the weekly bucket; by position it would put a weekly
+    /// number and a days-away reset into `five_hour`. In both states `five_hour` stays absent
+    /// rather than a fabricated 0%, and no other window is filled.
+    ///
+    /// Watched red: map by position alone, ignoring `limit_window_seconds`, and the weekly
+    /// reading lands in `five_hour`.
+    #[test]
+    fn the_measured_weekly_only_payload_fills_seven_day_from_the_primary_slot_and_nothing_else() {
+        for (used, payload) in measured_pro_payloads() {
             let usage = usage_from_payload(&payload);
             let weekly = usage
                 .seven_day
@@ -557,57 +565,7 @@ mod tests {
     #[test]
     fn a_pro_probe_reports_the_weekly_window_only() {
         use crate::quota::{CodexWindow, CodexWindows};
-        for (used, allowed, limit_reached) in [(100, false, true), (0, true, false)] {
-            let payload = serde_json::json!({
-                "user_id": "user-fixture",
-                "account_id": "11111111-1111-4111-8111-111111111111",
-                "email": "alice@example.com",
-                "plan_type": "pro",
-                "rate_limit": {
-                    "allowed": allowed,
-                    "limit_reached": limit_reached,
-                    "primary_window": {
-                        "used_percent": used,
-                        "limit_window_seconds": 604_800,
-                        "reset_after_seconds": 345_600,
-                        "reset_at": 1_800_345_600,
-                    },
-                    "secondary_window": null,
-                },
-                "code_review_rate_limit": null,
-                "additional_rate_limits": null,
-                "model_usage": {
-                    "gpt-6-astra": {
-                        "available": false,
-                        "available_at": "fixture",
-                        "credits_would_enable": false,
-                    },
-                },
-                "credits": {
-                    "has_credits": false,
-                    "unlimited": false,
-                    "overage_limit_reached": false,
-                    "balance": "0",
-                    "approx_local_messages": [0, 0],
-                    "approx_cloud_messages": [0, 0],
-                },
-                "spend_control": { "reached": false, "individual_limit": null },
-                "rate_limit_reached_type": { "type": "fixture", "details": "fixture" },
-                "rate_limit_upsell": {
-                    "banner_type": "fixture",
-                    "title": "fixture",
-                    "description": "fixture",
-                    "ctas": [{}, {}],
-                    "reset_at": 1_800_900_000,
-                    "referral": null,
-                    "request_url": null,
-                },
-                "promo": null,
-                "rate_limit_reset_credits": {
-                    "available_count": 0,
-                    "applicable_available_count": 0,
-                },
-            });
+        for (used, payload) in measured_pro_payloads() {
             let facts = facts(&payload);
             assert_eq!(
                 facts.windows,

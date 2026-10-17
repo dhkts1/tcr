@@ -5135,15 +5135,7 @@ mod tests {
     /// permanently erase the entry.
     #[test]
     fn load_reports_quarantined_account_names() {
-        let path = tmp_path("load-quarantine-names");
-        fs::write(
-            &path,
-            r#"{ "accounts": [
-                 { "name": "acct-good", "accessToken": "at-good" },
-                 { "name": "acct-import", "importFrom": "/some/other/file.json" }
-               ] }"#,
-        )
-        .unwrap();
+        let path = tmp_file("load-quarantine-names", GOOD_ROW_AND_IMPORT_ROW);
 
         let config = load(&path).unwrap();
         assert_eq!(config.quarantined_accounts, vec!["acct-import".to_string()]);
@@ -5157,17 +5149,13 @@ mod tests {
     /// unusable row and the rest of the config loads.
     #[test]
     fn load_quarantines_an_api_key_account() {
-        let path = tmp_path("load-quarantine-apikey");
-        fs::write(
-            &path,
+        let path = tmp_file(
+            "load-quarantine-apikey",
             r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"key","type":"apikey","apiKey":"sk-ant-api-fake"}]}"#,
-        )
-        .unwrap();
+        );
 
         let config = load(&path).expect("one API-key row must not fail the whole load");
-        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["ok"], "only `ok` may be usable");
-        assert_eq!(config.quarantined_accounts, vec!["key".to_string()]);
+        assert_only_ok_loads_and_quarantined_is(&config, "key");
         fs::remove_file(&path).ok();
     }
 
@@ -5176,17 +5164,13 @@ mod tests {
     /// an API key authenticates.
     #[test]
     fn load_quarantines_an_api_key_account_that_also_has_an_access_token() {
-        let path = tmp_path("load-quarantine-apikey-token");
-        fs::write(
-            &path,
+        let path = tmp_file(
+            "load-quarantine-apikey-token",
             r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"key","type":"apikey","accessToken":"sk-ant-api-fake"}]}"#,
-        )
-        .unwrap();
+        );
 
         let config = load(&path).unwrap();
-        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["ok"]);
-        assert_eq!(config.quarantined_accounts, vec!["key".to_string()]);
+        assert_only_ok_loads_and_quarantined_is(&config, "key");
         fs::remove_file(&path).ok();
     }
 
@@ -5194,17 +5178,13 @@ mod tests {
     /// fail the whole load; now only that row is set aside.
     #[test]
     fn load_quarantines_an_account_whose_type_is_not_a_string() {
-        let path = tmp_path("load-quarantine-type-number");
-        fs::write(
-            &path,
+        let path = tmp_file(
+            "load-quarantine-type-number",
             r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"odd","type":5,"accessToken":"b"}]}"#,
-        )
-        .unwrap();
+        );
 
         let config = load(&path).unwrap();
-        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["ok"]);
-        assert_eq!(config.quarantined_accounts, vec!["odd".to_string()]);
+        assert_only_ok_loads_and_quarantined_is(&config, "odd");
         fs::remove_file(&path).ok();
     }
 
@@ -5466,15 +5446,7 @@ mod tests {
     /// exists purely for the in-process caller, never the file.
     #[test]
     fn quarantined_accounts_do_not_serialize() {
-        let path = tmp_path("load-quarantine-serialize");
-        fs::write(
-            &path,
-            r#"{ "accounts": [
-                 { "name": "acct-good", "accessToken": "at-good" },
-                 { "name": "acct-import", "importFrom": "/some/other/file.json" }
-               ] }"#,
-        )
-        .unwrap();
+        let path = tmp_file("load-quarantine-serialize", GOOD_ROW_AND_IMPORT_ROW);
         let config = load(&path).unwrap();
         assert_eq!(config.quarantined_accounts, vec!["acct-import".to_string()]);
 
@@ -6394,6 +6366,27 @@ mod tests {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("tcr-{tag}-{}-{seq}.json", std::process::id()))
+    }
+
+    /// `json` written to a fresh [`tmp_path`] tagged `tag`, and that path.
+    fn tmp_file(tag: &str, json: &str) -> PathBuf {
+        let path = tmp_path(tag);
+        fs::write(&path, json).unwrap();
+        path
+    }
+
+    /// A usable row, `acct-good`, beside `acct-import`, which only names another file to
+    /// import from and so is quarantined.
+    const GOOD_ROW_AND_IMPORT_ROW: &str = r#"{ "accounts": [
+                 { "name": "acct-good", "accessToken": "at-good" },
+                 { "name": "acct-import", "importFrom": "/some/other/file.json" }
+               ] }"#;
+
+    /// Only the row named `ok` loaded, and the one row set aside is `quarantined`.
+    fn assert_only_ok_loads_and_quarantined_is(config: &Config, quarantined: &str) {
+        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["ok"], "only `ok` may be usable");
+        assert_eq!(config.quarantined_accounts, vec![quarantined.to_string()]);
     }
 
     fn read_json(path: &Path) -> Value {
@@ -7526,34 +7519,37 @@ mod tests {
         fs::remove_file(&malformed).ok();
     }
 
+    /// `me@example.com` logged into two orgs, A and B, as one person (`uuid-person`).
+    const ONE_EMAIL_IN_TWO_ORGS: &str = r#"{ "accounts": [
+                { "name": "me@example.com", "accessToken": "at-a", "accountUuid": "uuid-person",
+                  "orgUuid": "org-a", "orgName": "Org A" },
+                { "name": "me@example.com", "accessToken": "at-b", "accountUuid": "uuid-person",
+                  "orgUuid": "org-b", "orgName": "Org B" }
+            ] }"#;
+
+    /// Disable `me@example.com` in the org `org_uuid` (named `org_name`) in the file at `path`,
+    /// and assert the write updated a row.
+    fn disable_me_in(org_uuid: &str, org_name: &str, path: &Path) {
+        let target = crate::identity::probe(
+            crate::provider::Provider::Anthropic,
+            "me@example.com",
+            Some("uuid-person".to_string()),
+            Some(org_uuid.to_string()),
+            Some(org_name.to_string()),
+        );
+        assert_eq!(
+            save_disabled(path, &target, true).unwrap(),
+            DisabledWrite::Updated
+        );
+    }
+
     /// The flag lands on the right ORG when one email is logged into two — the
     /// same identity matching `merge_tokens` uses, so a rotated credential and a
     /// disabled flag can never land on two different entries.
     #[test]
     fn disable_picks_the_right_entry_when_one_email_has_two_orgs() {
-        let path = tmp_path("disable-two-orgs");
-        fs::write(
-            &path,
-            r#"{ "accounts": [
-                { "name": "me@example.com", "accessToken": "at-a", "accountUuid": "uuid-person",
-                  "orgUuid": "org-a", "orgName": "Org A" },
-                { "name": "me@example.com", "accessToken": "at-b", "accountUuid": "uuid-person",
-                  "orgUuid": "org-b", "orgName": "Org B" }
-            ] }"#,
-        )
-        .unwrap();
-
-        let target = crate::identity::probe(
-            crate::provider::Provider::Anthropic,
-            "me@example.com",
-            Some("uuid-person".to_string()),
-            Some("org-b".to_string()),
-            Some("Org B".to_string()),
-        );
-        assert_eq!(
-            save_disabled(&path, &target, true).unwrap(),
-            DisabledWrite::Updated
-        );
+        let path = tmp_file("disable-two-orgs", ONE_EMAIL_IN_TWO_ORGS);
+        disable_me_in("org-b", "Org B", &path);
 
         let after = read_json(&path);
         assert!(
@@ -7628,29 +7624,8 @@ mod tests {
     /// identity work exists to support would stop being writable.
     #[test]
     fn two_orgs_under_one_name_are_not_ambiguous() {
-        let path = tmp_path("disable-two-orgs-unambiguous");
-        fs::write(
-            &path,
-            r#"{ "accounts": [
-                { "name": "me@example.com", "accessToken": "at-a", "accountUuid": "uuid-person",
-                  "orgUuid": "org-a", "orgName": "Org A" },
-                { "name": "me@example.com", "accessToken": "at-b", "accountUuid": "uuid-person",
-                  "orgUuid": "org-b", "orgName": "Org B" }
-            ] }"#,
-        )
-        .unwrap();
-
-        let target = crate::identity::probe(
-            crate::provider::Provider::Anthropic,
-            "me@example.com",
-            Some("uuid-person".to_string()),
-            Some("org-a".to_string()),
-            Some("Org A".to_string()),
-        );
-        assert_eq!(
-            save_disabled(&path, &target, true).unwrap(),
-            DisabledWrite::Updated
-        );
+        let path = tmp_file("disable-two-orgs-unambiguous", ONE_EMAIL_IN_TWO_ORGS);
+        disable_me_in("org-a", "Org A", &path);
         let after = read_json(&path);
         assert_eq!(after["accounts"][0]["disabled"], json!(true));
         assert!(after["accounts"][1].get("disabled").is_none());
@@ -8323,12 +8298,10 @@ mod tests {
         );
     }
 
-    /// A Codex row's folder loads into its field, not into `extra`, and survives a save and a
-    /// reload unchanged.
-    ///
-    /// Watched red: without the field, the key lives in `extra` and the struct reads `None`.
-    #[test]
-    fn codex_home_round_trips_on_codex_rows() {
+    /// A config file in a fresh temp dir holding one Codex row, bob's, imported from
+    /// `/Users/example/.codex`; the dir (kept alive by the caller), the path and the loaded
+    /// config.
+    fn bob_codex_row_with_a_codex_home() -> (tempfile::TempDir, PathBuf, Config) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(
@@ -8343,6 +8316,16 @@ mod tests {
         )
         .unwrap();
         let (config, _) = load_or_init(&path).expect("loads");
+        (dir, path, config)
+    }
+
+    /// A Codex row's folder loads into its field, not into `extra`, and survives a save and a
+    /// reload unchanged.
+    ///
+    /// Watched red: without the field, the key lives in `extra` and the struct reads `None`.
+    #[test]
+    fn codex_home_round_trips_on_codex_rows() {
+        let (_dir, path, config) = bob_codex_row_with_a_codex_home();
         let row = &config.accounts[0];
         assert_eq!(row.codex_home.as_deref(), Some("/Users/example/.codex"));
         assert!(
@@ -8364,20 +8347,7 @@ mod tests {
     /// `/Users/example/.codex` in place.
     #[test]
     fn a_codex_save_without_codex_home_removes_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(crate::paths::CONFIG_FILE);
-        std::fs::write(
-            &path,
-            r#"{ "accounts": [
-                { "name": "bob@example.com", "type": "oauth", "provider": "codex",
-                  "accountUuid": "55555555-5555-4555-8555-555555555555",
-                  "orgUuid": "66666666-6666-4666-8666-666666666666",
-                  "accessToken": "at-b", "refreshToken": "rt-b", "expiresAt": 1789000000000,
-                  "credentialVersion": 2, "codexHome": "/Users/example/.codex" }
-            ] }"#,
-        )
-        .unwrap();
-        let (config, _) = load_or_init(&path).expect("loads");
+        let (_dir, path, config) = bob_codex_row_with_a_codex_home();
         let codex_home_on_disk = |path: &Path| -> Value {
             let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
             doc["accounts"][0]

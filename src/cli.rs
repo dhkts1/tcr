@@ -2879,7 +2879,7 @@ impl StatusSource {
 ///
 /// It renders no Codex route or traffic: every Codex row comes out without
 /// `codexRoute` and `codexTraffic`, as from a CLI that predates them. `tcr status
-/// --json` itself renders through [`render_accounts_json_at`], with both.
+/// --json` itself renders through [`account_status_rows_at`], with both.
 #[cfg(test)]
 fn render_accounts_json(
     snapshot: &StatsSnapshot,
@@ -2890,8 +2890,7 @@ fn render_accounts_json(
     control: Option<&str>,
     group_colors: &std::collections::BTreeMap<String, String>,
 ) -> String {
-    render_accounts_json_at(
-        OffsetDateTime::now_utc(),
+    status_rows_json(account_status_rows(
         snapshot,
         thresholds,
         source,
@@ -2899,57 +2898,22 @@ fn render_accounts_json(
         http1_only,
         control,
         group_colors,
-        None,
-        None,
-    )
+    ))
 }
 
-/// [`render_accounts_json`] at a given clock, with the fleet's Codex route and
-/// traffic.
-///
-/// `now` is the clock that `held[].minutesUntilReset` and `secondsUntilFree`
-/// are computed against. Taking it as a parameter lets a test compare a fixed
-/// instant with a committed fixture, with no normalisation layer between them.
-///
-/// `codex_route` and `codex_traffic` are fleet-wide facts, repeated on every
-/// Codex row the way `serverSha` and `groupColors` are repeated on every row.
-///
-/// No Codex key ever reaches an Anthropic row — neither these two nor the
-/// account's own Codex facts — so such a row is the bytes it always was.
-#[allow(clippy::too_many_arguments)]
-fn render_accounts_json_at(
-    now: OffsetDateTime,
-    snapshot: &StatsSnapshot,
-    thresholds: &[f64],
-    source: StatusSource,
-    server: Option<&BuildInfo>,
-    http1_only: bool,
-    control: Option<&str>,
-    group_colors: &std::collections::BTreeMap<String, String>,
-    codex_route: Option<&tcr_status_wire::CodexRoute>,
-    codex_traffic: Option<&tcr_status_wire::CodexTraffic>,
-) -> String {
-    let rows: Vec<serde_json::Value> = account_status_rows_at(
-        now,
-        snapshot,
-        thresholds,
-        source,
-        server,
-        http1_only,
-        control,
-        group_colors,
-        codex_route,
-        codex_traffic,
-    )
-    .into_iter()
-    // Round-trip through `Value` rather than serializing the struct
-    // directly: `serde_json::Value`'s map is a `BTreeMap`, so keys come
-    // out alphabetically ordered. That matches this wire's output before
-    // this struct existed (the committed fixture's key order), while
-    // `AccountStatusRow`'s own field order stays whatever reads best in
-    // this source file.
-    .map(|row| serde_json::to_value(row).unwrap_or(serde_json::Value::Null))
-    .collect();
+/// The `tcr status --json` text of `rows`, as [`account_status_rows_at`] built
+/// them.
+fn status_rows_json(rows: Vec<tcr_status_wire::AccountStatusRow>) -> String {
+    let rows: Vec<serde_json::Value> = rows
+        .into_iter()
+        // Round-trip through `Value` rather than serializing the struct
+        // directly: `serde_json::Value`'s map is a `BTreeMap`, so keys come
+        // out alphabetically ordered. That matches this wire's output before
+        // this struct existed (the committed fixture's key order), while
+        // `AccountStatusRow`'s own field order stays whatever reads best in
+        // this source file.
+        .map(|row| serde_json::to_value(row).unwrap_or(serde_json::Value::Null))
+        .collect();
     serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -2983,7 +2947,18 @@ fn account_status_rows(
 }
 
 /// [`account_status_rows`] at a given clock, with the fleet's Codex route and
-/// traffic: the typed rows [`render_accounts_json_at`] prints.
+/// traffic: the typed rows `tcr status --json` prints through
+/// [`status_rows_json`].
+///
+/// `now` is the clock that `held[].minutesUntilReset` and `secondsUntilFree`
+/// are computed against. Taking it as a parameter lets a test compare a fixed
+/// instant with a committed fixture, with no normalisation layer between them.
+///
+/// `codex_route` and `codex_traffic` are fleet-wide facts, repeated on every
+/// Codex row the way `serverSha` and `groupColors` are repeated on every row.
+///
+/// No Codex key ever reaches an Anthropic row — neither these two nor the
+/// account's own Codex facts — so such a row is the bytes it always was.
 #[allow(clippy::too_many_arguments)]
 fn account_status_rows_at(
     now: OffsetDateTime,
@@ -3949,7 +3924,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
     if json {
         println!(
             "{}",
-            render_accounts_json_at(
+            status_rows_json(account_status_rows_at(
                 OffsetDateTime::now_utc(),
                 &snapshot,
                 &thresholds,
@@ -3960,7 +3935,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                 &group_colors,
                 wire_route.as_ref(),
                 wire_traffic.as_ref(),
-            )
+            ))
         );
     } else {
         // The route problem goes ABOVE the fleet, because it outranks it: a
@@ -4514,6 +4489,29 @@ mod tests {
         }
     }
 
+    /// `snapshot` as `tcr status --json` renders it from `source`, with no server build, no
+    /// `http1Only`, no control account and no group colours.
+    fn status_json(snapshot: &StatsSnapshot, thresholds: &[f64], source: StatusSource) -> String {
+        render_accounts_json(
+            snapshot,
+            thresholds,
+            source,
+            None,
+            false,
+            None,
+            &Default::default(),
+        )
+    }
+
+    /// The row named `name` in the `tcr status --json` text `json`.
+    fn status_row(json: &str, name: &str) -> serde_json::Value {
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(json).expect("json is a bare array");
+        rows.into_iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("no row named {name} in {json}"))
+    }
+
     /// A unique temp config path per call so parallel tests never collide.
     fn temp_config_path(tag: &str) -> std::path::PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -4652,20 +4650,15 @@ mod tests {
     /// also gone.
     #[tokio::test]
     async fn remove_parks_the_account_in_the_running_proxy_before_deleting() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let path = config_on_a_dead_port("live-remove").await;
         let mut config = load(&path);
         config.proxy.port = port;
 
-        let manager = Manager::with_live_refresher(config.clone(), Some(path.clone()));
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager =
+            crate::test_support::live_proxy::serve(listener, config.clone(), Some(path.clone()));
 
-        let raw = fs::read_to_string(&path).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        point_at_port(&path, port);
 
         remove_account(&path, "alice@example.com").await.unwrap();
 
@@ -4707,8 +4700,7 @@ mod tests {
     /// delete is refused as ambiguous and changes nothing.
     #[tokio::test]
     async fn remove_takes_a_codex_account_out_and_leaves_its_anthropic_twin() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let path = write_config(
             "live-remove-codex",
             &format!(
@@ -4723,9 +4715,8 @@ mod tests {
                    ] }}"#
             ),
         );
-        let manager = Manager::with_live_refresher(load(&path), Some(path.clone()));
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager =
+            crate::test_support::live_proxy::serve(listener, load(&path), Some(path.clone()));
 
         remove_account(&path, "alice@example.com/codex")
             .await
@@ -4783,14 +4774,12 @@ mod tests {
     /// alone confirm parked the account — keeps rotating it, permanently.
     #[tokio::test]
     async fn remove_refuses_on_unauthorized_without_writing() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let server_config: Config = serde_json::from_str(&format!(
             r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }}, "accounts": [] }}"#
         ))
         .unwrap();
-        let manager = Manager::with_live_refresher(server_config, None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, server_config, None);
 
         let path = config_on_a_dead_port("remove-unauth").await;
         let raw = fs::read_to_string(&path).unwrap();
@@ -4820,23 +4809,13 @@ mod tests {
     /// is unrecoverable, unlike a mis-applied disable.
     #[tokio::test]
     async fn remove_refuses_an_ambiguous_query_without_writing() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let path = config_on_a_dead_port("remove-ambiguous").await;
-        let raw = fs::read_to_string(&path).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let (path, listener) = config_on_a_scratch_port("remove-ambiguous").await;
 
         // The ambiguity is in the LIVE rotation only: the file keeps unique
         // names (the loader guarantees that), and the running fleet is broken by
         // hand afterwards. That is the split this test is about — the CLI must
         // not resolve against the file when the server refused.
-        let mut config = load(&path);
-        config.accounts[1].name = "alice@example.com".to_string();
-        let before = fs::read_to_string(&path).unwrap();
-        let manager = Manager::with_live_refresher(config, Some(path.clone()));
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let before = serve_a_fleet_with_two_alices(&path, listener);
 
         let err = remove_account(&path, "alice@example.com")
             .await
@@ -4911,17 +4890,10 @@ mod tests {
     /// the running rotation kept picking alice until a restart.
     #[tokio::test]
     async fn set_priority_reorders_the_running_proxy_and_the_file() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let path = config_on_a_dead_port("live-priority").await;
-        let raw = fs::read_to_string(&path).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let (path, listener) = config_on_a_scratch_port("live-priority").await;
 
-        let manager = Manager::with_live_refresher(load(&path), Some(path.clone()));
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager =
+            crate::test_support::live_proxy::serve(listener, load(&path), Some(path.clone()));
 
         let fresh_pick = |m: &Manager| {
             m.select(
@@ -4956,19 +4928,9 @@ mod tests {
     /// neither the file nor the running proxy's order.
     #[tokio::test]
     async fn set_priority_refuses_an_ambiguous_live_query_without_writing() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let path = config_on_a_dead_port("live-priority-ambiguous").await;
-        let raw = fs::read_to_string(&path).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let (path, listener) = config_on_a_scratch_port("live-priority-ambiguous").await;
 
-        let mut config = load(&path);
-        config.accounts[1].name = "alice@example.com".to_string();
-        let before = fs::read_to_string(&path).unwrap();
-        let manager = Manager::with_live_refresher(config, Some(path.clone()));
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let before = serve_a_fleet_with_two_alices(&path, listener);
 
         let err = set_priority(&path, "alice@example.com", PriorityArg::First)
             .await
@@ -4986,14 +4948,30 @@ mod tests {
     /// A fixture whose port is a scratch listener's, bound here and handed back
     /// for the test to serve on.
     async fn config_on_a_scratch_port(tag: &str) -> (std::path::PathBuf, tokio::net::TcpListener) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let path = config_on_a_dead_port(tag).await;
-        let mut doc: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        point_at_port(&path, port);
         (path, listener)
+    }
+
+    /// Serve the config at `path` on `listener` with its second account renamed to
+    /// `alice@example.com`, so the RUNNING fleet holds two alices while the file keeps unique
+    /// names (the loader guarantees that). Answers the file's text from before the proxy started.
+    fn serve_a_fleet_with_two_alices(path: &Path, listener: tokio::net::TcpListener) -> String {
+        let mut config = load(path);
+        config.accounts[1].name = "alice@example.com".to_string();
+        let before = fs::read_to_string(path).unwrap();
+        crate::test_support::live_proxy::serve(listener, config, Some(path.to_path_buf()));
+        before
+    }
+
+    /// Rewrite the config file at `path` so its `proxy.port` is `port`, the way a CLI pointed at a
+    /// test's live proxy finds it.
+    fn point_at_port(path: &Path, port: u16) {
+        let raw = fs::read_to_string(path).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        doc["proxy"]["port"] = serde_json::json!(port);
+        fs::write(path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
     }
 
     fn file_value(path: &Path, key: &str) -> serde_json::Value {
@@ -5016,9 +4994,8 @@ mod tests {
         let served = cli_path.with_extension("served.json");
         fs::copy(&cli_path, &served).unwrap();
         let cli_before = fs::read_to_string(&cli_path).unwrap();
-        let manager = Manager::with_live_refresher(load(&served), Some(served.clone()));
-        let serving = Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, serving, None).await });
+        let manager =
+            crate::test_support::live_proxy::serve(listener, load(&served), Some(served.clone()));
 
         set_config(&cli_path, "switchThreshold", "90%")
             .await
@@ -5084,8 +5061,7 @@ mod tests {
         let offline = config_on_a_dead_port("config-set-refused").await;
         let (live, listener) = config_on_a_scratch_port("config-set-refused-live").await;
         // A proxy with no config file behind it: its route refuses every set.
-        let manager = Manager::with_live_refresher(load(&live), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, load(&live), None);
 
         for path in [&offline, &live] {
             let before = fs::read_to_string(path).unwrap();
@@ -5125,8 +5101,8 @@ mod tests {
         assert!(shown.waiting().is_empty());
 
         let (path, listener) = config_on_a_scratch_port("config-show-live").await;
-        let manager = Manager::with_live_refresher(load(&path), Some(path.clone()));
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, load(&path), Some(path.clone()));
+
         let shown = config_show_document(&path).await.unwrap();
         assert_eq!(shown.waiting(), Vec::<&str>::new(), "nothing waits at boot");
 
@@ -5230,7 +5206,7 @@ mod tests {
     /// finds no proxy and the file is the whole truth.
     #[tokio::test]
     async fn priority_on_a_codex_row_writes_its_own_providers_value() {
-        let port = dead_port().await;
+        let port = crate::test_support::loopback::unused_port();
         let json = serde_json::json!({
             "proxy": { "port": port },
             "accounts": [
@@ -6135,22 +6111,25 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    /// The row for group `name` in `tcr group ls --json` over `config`.
+    fn group_row(config: &Config, name: &str) -> serde_json::Value {
+        let value: serde_json::Value =
+            serde_json::from_str(&render_groups_json(config).unwrap()).unwrap();
+        value["groups"]
+            .as_array()
+            .expect("groups array")
+            .iter()
+            .find(|r| r["group"] == name)
+            .expect("group row")
+            .clone()
+    }
+
     /// Same fact on the JSON surface, which the panel and scripts read.
     #[test]
     fn ls_json_carries_routes_and_route_block() {
         let path = write_config("routes-json", CONTROL_ONLY_GROUP);
         let config = load(&path);
-        let value: serde_json::Value =
-            serde_json::from_str(&render_groups_json(&config).unwrap()).unwrap();
-        let row = |name: &str| -> serde_json::Value {
-            value["groups"]
-                .as_array()
-                .expect("groups array")
-                .iter()
-                .find(|r| r["group"] == name)
-                .expect("group row")
-                .clone()
-        };
+        let row = |name: &str| group_row(&config, name);
         assert_eq!(row("research")["routes"], serde_json::json!(false));
         assert_eq!(
             row("research")["routeBlock"],
@@ -6190,7 +6169,8 @@ mod tests {
     /// refuses a Codex account the way the live route does, so `tcr control` cannot
     /// persist a `controlAccount` the next boot would ignore. The file is left as it was.
     ///
-    /// The config names a port nothing listens on ([`dead_port`]): an edit asks whether a
+    /// The config names a port nothing listens on (`test_support::loopback::unused_port`): an
+    /// edit asks whether a
     /// server is running on the config's port, and without one that is 3456, where a live
     /// tcr may be serving.
     ///
@@ -6198,7 +6178,7 @@ mod tests {
     /// names the Codex row.
     #[tokio::test]
     async fn write_control_account_refuses_a_codex_account_and_writes_nothing() {
-        let port = dead_port().await;
+        let port = crate::test_support::loopback::unused_port();
         let path = write_config(
             "control-codex",
             &serde_json::json!({
@@ -6241,7 +6221,7 @@ mod tests {
     /// whether a server is running on the config's port, and without one that is
     /// 3456, where a live tcr may be serving. `bob_extra` is merged into bob's row.
     async fn alice_and_codex_bob(tag: &str, bob_extra: serde_json::Value) -> std::path::PathBuf {
-        let port = dead_port().await;
+        let port = crate::test_support::loopback::unused_port();
         let mut bob = serde_json::json!({
             "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
             "accessToken": "at-b", "refreshToken": "rt-b", "credentialVersion": 2
@@ -6400,17 +6380,7 @@ mod tests {
         assert!(!solo.contains("codex_members"), "{solo}");
         assert!(solo.contains(" routes=yes "), "{solo}");
 
-        let value: serde_json::Value =
-            serde_json::from_str(&render_groups_json(&config).unwrap()).unwrap();
-        let row = |name: &str| -> serde_json::Value {
-            value["groups"]
-                .as_array()
-                .expect("groups array")
-                .iter()
-                .find(|r| r["group"] == name)
-                .expect("group row")
-                .clone()
-        };
+        let row = |name: &str| group_row(&config, name);
         assert_eq!(row("mixed")["codexMembers"], serde_json::json!(1));
         assert_eq!(row("mixed")["routes"], serde_json::json!(true));
         assert_eq!(row("mixed")["routeBlock"], serde_json::Value::Null);
@@ -6671,37 +6641,12 @@ mod tests {
 
     // --- enable / disable --------------------------------------------------
 
-    /// A free port nothing is listening on: bound, then dropped.
-    /// An ephemeral port nothing is listening on — and **never 3456**.
-    ///
-    /// Drawing 3456 here is not a cosmetic collision. `TWO_ACCOUNTS` names 3456
-    /// and [`config_on_a_dead_port`] substitutes it away precisely so a test can
-    /// never POST an account-control command at the REAL proxy; if the draw IS
-    /// 3456 the substitution is a no-op, and the assert that guards it fires.
-    ///
-    /// This only ever reproduces in CI, which is what made it look like a flake
-    /// and then like a regression. On a developer Mac a live tcr holds 3456, so
-    /// the OS cannot offer it; on a Linux runner the port is free and gets drawn
-    /// occasionally. Measured 2026-08-14: two consecutive runs of the same
-    /// commit failed on two DIFFERENT tests of this family, which is the
-    /// signature of a shared helper losing a dice roll rather than of a broken
-    /// assertion.
-    ///
-    /// Bounded rather than `loop`: an unbounded retry against an OS that somehow
-    /// only offers 3456 would hang the suite with no diagnosis, and a test that
-    /// hangs is strictly worse than one that fails with a reason.
-    async fn dead_port() -> u16 {
-        for _ in 0..64 {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            if port != 3456 {
-                return port;
-            }
-        }
-        panic!("could not draw an ephemeral port other than 3456 in 64 attempts");
-    }
-
     /// `TWO_ACCOUNTS` pointed at a port nothing serves, written to a temp file.
+    ///
+    /// The port is `test_support::loopback::unused_port`, which never draws 3456: `TWO_ACCOUNTS`
+    /// names 3456 and this substitutes it away precisely so a test can never POST an
+    /// account-control command at the REAL proxy, and a draw of 3456 would make the
+    /// substitution a no-op.
     ///
     /// Load-bearing safety, not tidiness: `set_enabled` is live-first now, and
     /// `TWO_ACCOUNTS` names port **3456** — the port a REAL tcr serves Gil's fleet
@@ -6709,7 +6654,7 @@ mod tests {
     /// live proxy. The substitution is asserted below because a silent no-op here
     /// would aim every one of these tests at the running server.
     async fn config_on_a_dead_port(tag: &str) -> std::path::PathBuf {
-        let port = dead_port().await;
+        let port = crate::test_support::loopback::unused_port();
         let json = TWO_ACCOUNTS.replace("\"port\": 3456 }", &format!("\"port\": {port} }}"));
         // Compare the PARSED value, not the text: a substring check for
         // `"port": 3456` also matched a drawn port of 34560–34569 and tripped
@@ -6761,23 +6706,18 @@ mod tests {
     /// defect; the in-memory one does not.
     #[tokio::test]
     async fn set_enabled_parks_the_account_in_the_running_proxy() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let path = config_on_a_dead_port("live-disable").await;
         let mut config = load(&path);
         config.proxy.port = port;
 
         // The server owns the SAME config file the CLI is pointed at, exactly as
         // the real proxy does — so the durable half lands where `tcr` looks.
-        let manager = Manager::with_live_refresher(config.clone(), Some(path.clone()));
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager =
+            crate::test_support::live_proxy::serve(listener, config.clone(), Some(path.clone()));
 
         // Point the CLI at the live port by rewriting the file it will load.
-        let raw = fs::read_to_string(&path).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        point_at_port(&path, port);
 
         set_enabled(&path, "alice@example.com", true).await.unwrap();
 
@@ -6829,19 +6769,9 @@ mod tests {
     /// makes the byte-identical assertion below mean what it says.
     #[tokio::test]
     async fn set_enabled_refuses_an_ambiguous_query_without_writing() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let path = config_on_a_dead_port("live-ambiguous").await;
-        let raw = fs::read_to_string(&path).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        doc["proxy"]["port"] = serde_json::json!(port);
-        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let (path, listener) = config_on_a_scratch_port("live-ambiguous").await;
 
-        let mut config = load(&path);
-        config.accounts[1].name = "alice@example.com".to_string();
-        let before = fs::read_to_string(&path).unwrap();
-        let manager = Manager::with_live_refresher(config, Some(path.clone()));
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let before = serve_a_fleet_with_two_alices(&path, listener);
 
         let err = set_enabled(&path, "alice@example.com", true)
             .await
@@ -6881,11 +6811,9 @@ mod tests {
 
     #[tokio::test]
     async fn post_add_account_reads_a_stamped_400_as_rejected() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let config = add_route_config(port);
-        let manager = Manager::with_live_refresher(config.clone(), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, config.clone(), None);
 
         let err = post_add_account(&config, &blank_account())
             .await
@@ -6901,11 +6829,9 @@ mod tests {
     /// tcr's catch-all, anything that is not this route — is no proof of anything and is not read.
     #[tokio::test]
     async fn post_add_account_with_providers_reads_them_off_a_stamped_answer_only() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let config = add_route_config(port);
-        let manager = Manager::with_live_refresher(config.clone(), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, config.clone(), None);
 
         let (answer, providers) = post_add_account_with_providers(&config, &blank_account()).await;
         assert!(
@@ -6920,8 +6846,7 @@ mod tests {
             ]
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         tokio::spawn(async move {
             let unstamped = axum::Router::new().fallback(|| async {
                 (
@@ -6951,8 +6876,7 @@ mod tests {
         // An "older tcr": something answers, but not on this route — no
         // `ENDPOINT_HEADER`, unlike every response this crate's own router
         // produces (even its 404s and 405s).
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         tokio::spawn(async move {
             axum::serve(listener, axum::Router::new())
                 .await
@@ -6971,14 +6895,12 @@ mod tests {
 
     #[tokio::test]
     async fn post_add_account_wrong_api_key_is_unauthorized() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let server_config: Config = serde_json::from_str(&format!(
             r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#
         ))
         .unwrap();
-        let manager = Manager::with_live_refresher(server_config, None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, server_config, None);
 
         let client_config: Config = serde_json::from_str(&format!(
             r#"{{ "proxy": {{ "port": {port}, "apiKey": "wrong-key" }} }}"#
@@ -6997,12 +6919,9 @@ mod tests {
     /// the SERVING rotation — not just in the response body.
     #[tokio::test]
     async fn post_add_account_adds_a_new_account_to_the_live_rotation() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let config = add_route_config(port);
-        let manager = Manager::with_live_refresher(config.clone(), None);
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager = crate::test_support::live_proxy::serve(listener, config.clone(), None);
 
         let account = Account {
             access_token: "at-new".to_string(),
@@ -7031,8 +6950,7 @@ mod tests {
     /// guessed onto one of the candidates.
     #[tokio::test]
     async fn post_add_account_ambiguous_identity_is_rejected_not_guessed() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         // Two live accounts share a name and neither carries an org — the
         // legacy shape `same_identity`/`match_one` cannot break a tie on.
         let seed = format!(
@@ -7044,8 +6962,7 @@ mod tests {
             ] }}"#
         );
         let config: Config = serde_json::from_str(&seed).unwrap();
-        let manager = Manager::with_live_refresher(config.clone(), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, config.clone(), None);
 
         let account = Account {
             access_token: "at-new".to_string(),
@@ -7153,6 +7070,21 @@ mod tests {
 
     // --- tcr list --json ----------------------------------------------------
 
+    /// `tcr list --json` over the config at `path` with a [`CountingProber`], which file is then
+    /// removed: the document, the exit code, and how many probes reached the prober.
+    async fn list_v1_counting_probes(path: &Path) -> (String, i32, Arc<AtomicU64>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let (document, code) = render_list_v1(
+            path,
+            Arc::new(CountingProber {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .await;
+        fs::remove_file(path).ok();
+        (document, code, calls)
+    }
+
     /// A prober that only counts: `tcr list` must never reach it.
     struct CountingProber {
         calls: Arc<AtomicU64>,
@@ -7175,29 +7107,18 @@ mod tests {
         }
     }
 
-    /// A loopback port nothing listens on: bound by the OS, then released.
-    fn unused_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-        listener.local_addr().expect("local addr").port()
-    }
-
     /// With no server, `tcr list --json` lists every configured account as
     /// `unavailable`, in file order, and the prober sees ZERO calls. Both
     /// accounts carry an unexpired token, so a path that probed would reach
     /// the prober twice.
     #[tokio::test]
     async fn list_v1_with_no_server_never_probes_and_lists_every_account_unavailable() {
-        let json = TWO_ACCOUNTS.replace("3456", &unused_port().to_string());
+        let json = TWO_ACCOUNTS.replace(
+            "3456",
+            &crate::test_support::loopback::unused_port().to_string(),
+        );
         let path = write_config("list-v1-no-server", &json);
-        let calls = Arc::new(AtomicU64::new(0));
-        let (document, code) = render_list_v1(
-            &path,
-            Arc::new(CountingProber {
-                calls: Arc::clone(&calls),
-            }),
-        )
-        .await;
-        fs::remove_file(&path).ok();
+        let (document, code, calls) = list_v1_counting_probes(&path).await;
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -7238,15 +7159,7 @@ mod tests {
     #[tokio::test]
     async fn list_v1_reports_an_unreadable_config_in_the_error_envelope() {
         let path = write_config("list-v1-bad", "{ not json");
-        let calls = Arc::new(AtomicU64::new(0));
-        let (document, code) = render_list_v1(
-            &path,
-            Arc::new(CountingProber {
-                calls: Arc::clone(&calls),
-            }),
-        )
-        .await;
-        fs::remove_file(&path).ok();
+        let (document, code, calls) = list_v1_counting_probes(&path).await;
 
         assert_eq!(code, 1);
         let doc: serde_json::Value = serde_json::from_str(&document).expect("one JSON document");
@@ -7281,18 +7194,10 @@ mod tests {
                  {{ "name": "bob@example.com", "type": "oauth", "accessToken": "at-b",
                     "refreshToken": "rt-b", "expiresAt": 4102444800000 }}
                ] }}"#,
-            unused_port()
+            crate::test_support::loopback::unused_port()
         );
         let path = write_config("list-v1-codex", &json);
-        let calls = Arc::new(AtomicU64::new(0));
-        let (document, code) = render_list_v1(
-            &path,
-            Arc::new(CountingProber {
-                calls: Arc::clone(&calls),
-            }),
-        )
-        .await;
-        fs::remove_file(&path).ok();
+        let (document, code, calls) = list_v1_counting_probes(&path).await;
 
         assert_eq!(code, 0, "{document}");
         assert_eq!(calls.load(Ordering::SeqCst), 0, "it still never probes");
@@ -7436,15 +7341,7 @@ mod tests {
         )
         .await;
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let json = status_json(&snapshot, &thresholds, StatusSource::Offline);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         assert_eq!(rows.len(), 2, "one row per account");
         for (i, row) in rows.iter().enumerate() {
@@ -7490,15 +7387,7 @@ mod tests {
         counted.accounts[0].requests = CACHE_SIGNAL_FLOOR_REQUESTS;
         counted.accounts[0].input_tokens = 1_000;
         counted.accounts[0].cache_read_tokens = 750;
-        let live = render_accounts_json(
-            &counted,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let live = status_json(&counted, &thresholds, StatusSource::Live);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["cacheHitRatio"], serde_json::json!(0.75));
         assert_eq!(rows[0]["source"], "live");
@@ -7557,15 +7446,7 @@ mod tests {
         sparse.accounts[0].input_tokens = 42_000;
         sparse.accounts[0].cache_read_tokens = 100;
 
-        let live = render_accounts_json(
-            &sparse,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let live = status_json(&sparse, &thresholds, StatusSource::Live);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert!(
             rows[0]["cacheHitRatio"].is_null(),
@@ -7596,15 +7477,7 @@ mod tests {
         // suppression of light accounts.
         let mut at_floor = sparse.clone();
         at_floor.accounts[0].requests = CACHE_SIGNAL_FLOOR_REQUESTS;
-        let live = render_accounts_json(
-            &at_floor,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let live = status_json(&at_floor, &thresholds, StatusSource::Live);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(
             rows[0]["cacheHitRatio"],
@@ -7631,15 +7504,7 @@ mod tests {
         )
         .await;
 
-        let offline = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let offline = status_json(&snapshot, &thresholds, StatusSource::Offline);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&offline).expect("valid json");
         for row in &rows {
             // `get`, not `row[...]`: indexing a MISSING key also yields Null, so
@@ -7658,15 +7523,7 @@ mod tests {
         }
 
         // Measured and genuinely clean is a DIFFERENT state, and renders as 0.
-        let live = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let live = status_json(&snapshot, &thresholds, StatusSource::Live);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["streamErrorCount"], serde_json::json!(0));
 
@@ -7674,15 +7531,7 @@ mod tests {
         let mut errored = snapshot.clone();
         errored.accounts[0].stream_error_count = 3;
         errored.accounts[0].last_stream_error = Some("overloaded_error".to_string());
-        let live = render_accounts_json(
-            &errored,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let live = status_json(&errored, &thresholds, StatusSource::Live);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["streamErrorCount"], serde_json::json!(3));
         assert_eq!(
@@ -7727,12 +7576,11 @@ mod tests {
     /// overrides the config's 3456, so this never touches a real running proxy.
     #[tokio::test]
     async fn live_status_reads_the_running_servers_counters() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let mut config = load_from(TWO_ACCOUNTS);
         config.proxy.port = port;
 
-        let manager = Manager::with_live_refresher(config.clone(), None);
+        let manager = crate::test_support::live_proxy::serve(listener, config.clone(), None);
         // 750 of 1000 input tokens were prompt-cache reads: a real 75% hit ratio,
         // held in this process only. `record_served` clears
         // `CACHE_SIGNAL_FLOOR_REQUESTS` so the ratio below is a reported number,
@@ -7743,7 +7591,6 @@ mod tests {
         for _ in 0..CACHE_SIGNAL_FLOOR_REQUESTS {
             manager.record_served(0, now, None, crate::stats::SessionKind::Fallback);
         }
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
         let payload = match fetch_live_status(&config).await {
             Ok(p) => p,
@@ -7802,8 +7649,7 @@ mod tests {
     /// Binds port 0, never the config's 3456.
     #[tokio::test]
     async fn live_status_shows_a_codex_accounts_provider_and_chatgpt_plan() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let mut config = load_from(
             r#"{
               "accounts": [
@@ -7818,8 +7664,7 @@ mod tests {
             }"#,
         );
         config.proxy.port = port;
-        let manager = Manager::with_live_refresher(config.clone(), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, config.clone(), None);
 
         let payload = match fetch_live_status(&config).await {
             Ok(p) => p,
@@ -7828,15 +7673,7 @@ mod tests {
         };
         let (snapshot, thresholds) = payload.into_snapshot();
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let json = status_json(&snapshot, &thresholds, StatusSource::Live);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         let (claude, codex) = (&rows[0], &rows[1]);
         assert_eq!(codex["provider"], "codex", "{codex}");
@@ -7878,15 +7715,7 @@ mod tests {
         )
         .await;
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let json = status_json(&snapshot, &thresholds, StatusSource::Offline);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         for row in &rows {
             assert!(
@@ -8176,10 +8005,7 @@ mod tests {
         let mut lost = 0;
         loop {
             // Bind and immediately drop, so the port is free and refuses.
-            let port = {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                listener.local_addr().unwrap().port()
-            };
+            let port = crate::test_support::loopback::unused_port();
             let mut config = load_from(TWO_ACCOUNTS);
             config.proxy.port = port;
 
@@ -8210,14 +8036,12 @@ mod tests {
     /// fine. The liveness verdict is what separates them.
     #[tokio::test]
     async fn a_rejected_api_key_is_an_answering_incumbent_not_a_wedged_one() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let mut served = load_from(TWO_ACCOUNTS);
         served.proxy.port = port;
         served.proxy.api_key = Some("the-real-key".to_string());
 
-        let manager = Manager::with_live_refresher(served.clone(), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        crate::test_support::live_proxy::serve(listener, served.clone(), None);
 
         // Same port, WRONG key — what an operator with a stale config has.
         let mut probing = served.clone();
@@ -8246,8 +8070,7 @@ mod tests {
     #[tokio::test]
     async fn a_listener_that_never_answers_is_silent_not_answering() {
         // Bound and never accepted: connections queue in the backlog forever.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_support::loopback::listener().await;
         let mut config = load_from(TWO_ACCOUNTS);
         config.proxy.port = port;
 
@@ -8796,15 +8619,7 @@ mod tests {
             assert!(secs > 0, "a promised instant is in the future: {line}");
         }
         // JSON mirrors it for machine consumers, in ms like every other instant.
-        let json = render_accounts_json(
-            &gated,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let json = status_json(&gated, &thresholds, StatusSource::Live);
         assert!(
             json.contains("\"freeAtMs\""),
             "json carries freeAtMs: {json}"
@@ -8916,15 +8731,7 @@ mod tests {
         );
 
         // JSON mirrors the held fields for machine consumers.
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let json = status_json(&snapshot, &thresholds, StatusSource::Offline);
         assert!(json.contains("\"held\""), "json carries held array: {json}");
         assert!(
             json.contains("\"window\": \"5h\""),
@@ -8988,21 +8795,8 @@ mod tests {
         )
         .await;
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> =
-            serde_json::from_str(&json).expect("json is a bare array");
-        let alice_row = rows
-            .iter()
-            .find(|r| r["name"] == "alice@example.com")
-            .expect("alice row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Offline);
+        let alice_row = status_row(&json, "alice@example.com");
         // 0.3 is far under the 0.9 default threshold, so alice's 5h window is
         // never a binding hold, yet its reset must still reach the wire.
         assert!(
@@ -9037,20 +8831,8 @@ mod tests {
         )
         .await;
         let render = |snapshot: &StatsSnapshot, source: StatusSource| {
-            let json = render_accounts_json(
-                snapshot,
-                &thresholds,
-                source,
-                None,
-                false,
-                None,
-                &Default::default(),
-            );
-            let rows: Vec<serde_json::Value> =
-                serde_json::from_str(&json).expect("json is a bare array");
-            rows.into_iter()
-                .find(|r| r["name"] == "alice@example.com")
-                .expect("alice row")
+            let json = status_json(snapshot, &thresholds, source);
+            status_row(&json, "alice@example.com")
         };
 
         let offline = render(&snapshot, StatusSource::Offline);
@@ -9072,15 +8854,7 @@ mod tests {
         let wire = serde_json::to_string(&payload).expect("serialize");
         let back: crate::status::StatusPayload = serde_json::from_str(&wire).expect("deserialize");
         let (rebuilt, rebuilt_thresholds) = back.into_snapshot();
-        let live_json = render_accounts_json(
-            &rebuilt,
-            &rebuilt_thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
+        let live_json = status_json(&rebuilt, &rebuilt_thresholds, StatusSource::Live);
         let live: Vec<serde_json::Value> = serde_json::from_str(&live_json).expect("json");
         let live = live
             .iter()
@@ -9104,21 +8878,8 @@ mod tests {
         )
         .await;
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> =
-            serde_json::from_str(&json).expect("json is a bare array");
-        let bob_row = rows
-            .iter()
-            .find(|r| r["name"] == "bob@example.com")
-            .expect("bob row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Offline);
+        let bob_row = status_row(&json, "bob@example.com");
         assert_eq!(
             bob_row["fiveHourResetAtMs"],
             serde_json::Value::Null,
@@ -9140,21 +8901,8 @@ mod tests {
         let thresholds = resolve_thresholds(&config);
         let snapshot =
             snapshot_offline(config, Arc::new(NoRefresh), Arc::new(WindowProber), true).await;
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Offline,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> =
-            serde_json::from_str(&json).expect("json is a bare array");
-        let alice_row = rows
-            .iter()
-            .find(|r| r["name"] == "alice@example.com")
-            .expect("alice row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Offline);
+        let alice_row = status_row(&json, "alice@example.com");
         let held = alice_row["held"].as_array().expect("held is an array");
         assert_eq!(
             held.len(),
@@ -9853,9 +9601,8 @@ mod tests {
     /// included.
     #[test]
     fn claude_only_status_text_is_unchanged() {
-        assert_eq!(
-            claude_only_status_text(None),
-            "status source=live server_sha=abc1234 server_dirty=false \
+        /// The pinned bytes, below any verdict line.
+        const FLEET: &str = "status source=live server_sha=abc1234 server_dirty=false \
              server_built_at=2026-01-01T00:00:00Z client_sha=def5678 http1Only=false \
              groupColors=codereview:#63cbfe,dev:#0a84ff\n\
              account alice@example.com priority=0 plan=Max 20x 5h=4% wk=1% fable=0% cache=75% \
@@ -9868,29 +9615,17 @@ mod tests {
              cache=75% state=spent status=throttled probe=error stream_errors=2 \
              last_stream_error=overloaded_error\n\
              account dave@example.com priority=3 5h=n/a wk=n/a cache=n/a state=ok status=active \
-             probe=never stream_errors=0 disabled\n"
-        );
+             probe=never stream_errors=0 disabled\n";
+        assert_eq!(claude_only_status_text(None), FLEET);
         assert_eq!(
             claude_only_status_text(Some(
                 "verdict: this proxy is not on Claude's route: \
                  /Users/example/.claude/settings.json sets https://gateway.example.com"
             )),
-            "verdict: this proxy is not on Claude's route: \
-             /Users/example/.claude/settings.json sets https://gateway.example.com\n\
-             status source=live server_sha=abc1234 server_dirty=false \
-             server_built_at=2026-01-01T00:00:00Z client_sha=def5678 http1Only=false \
-             groupColors=codereview:#63cbfe,dev:#0a84ff\n\
-             account alice@example.com priority=0 plan=Max 20x 5h=4% wk=1% fable=0% cache=75% \
-             state=ok status=active probe=ok stream_errors=2 last_stream_error=overloaded_error \
-             groups=codereview,dev\n\
-             account bob@example.com priority=1 plan=Team 5x 5h=95% wk=91% fable=10% cache=75% \
-             state=near status=active probe=rate-limited stream_errors=2 \
-             last_stream_error=overloaded_error\n\
-             account carol@example.com priority=2 plan=Team Standard 5h=100% wk=100% fable=50% \
-             cache=75% state=spent status=throttled probe=error stream_errors=2 \
-             last_stream_error=overloaded_error\n\
-             account dave@example.com priority=3 5h=n/a wk=n/a cache=n/a state=ok status=active \
-             probe=never stream_errors=0 disabled\n"
+            format!(
+                "verdict: this proxy is not on Claude's route: \
+                 /Users/example/.claude/settings.json sets https://gateway.example.com\n{FLEET}"
+            )
         );
     }
 
@@ -10150,7 +9885,7 @@ mod tests {
             dirty: Some(false),
             built_at: "2026-01-01T00:00:00Z".to_string(),
         };
-        let rendered = render_accounts_json_at(
+        let rendered = status_rows_json(account_status_rows_at(
             OffsetDateTime::from_unix_timestamp(1_767_225_600).expect("a valid instant"),
             &snapshot,
             &thresholds,
@@ -10161,7 +9896,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             route.as_ref(),
             traffic.as_ref(),
-        );
+        ));
         let rows: Vec<serde_json::Value> = serde_json::from_str(&rendered).expect("an array");
         assert_eq!(rows.len(), 5);
         let mut anthropic = 0;
@@ -11034,7 +10769,7 @@ mod tests {
         vec![claude, codex]
     }
 
-    /// `render_accounts_json_at`, given the facts behind `codex-status.json`, emits exactly
+    /// `status_rows_json(account_status_rows_at(..))`, given the facts behind `codex-status.json`, emits exactly
     /// the rows TcrBar decodes from that file: every key and every derived value, compared
     /// as `serde_json::Value`s with no normalisation and no rounding.
     ///
@@ -11052,7 +10787,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let rendered = render_accounts_json_at(
+        let rendered = status_rows_json(account_status_rows_at(
             fixture_instant(CANONICAL_NOW_MS),
             &snapshot,
             &thresholds,
@@ -11063,7 +10798,7 @@ mod tests {
             &group_colors,
             Some(&route),
             Some(&traffic),
-        );
+        ));
         let rendered: Vec<serde_json::Value> =
             serde_json::from_str(&rendered).expect("the renderer emits a JSON array");
         let serde_json::Value::Array(fixture) = canonical_fixture("codex-status.json") else {
@@ -11162,7 +10897,7 @@ mod tests {
                 wire_sessions: Vec::new(),
                 wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
             };
-            let json = render_accounts_json_at(
+            let json = status_rows_json(account_status_rows_at(
                 now,
                 &snapshot,
                 &[0.85],
@@ -11173,7 +10908,7 @@ mod tests {
                 &std::collections::BTreeMap::new(),
                 None,
                 None,
-            );
+            ));
             let rows: Vec<serde_json::Value> =
                 serde_json::from_str(&json).expect("the renderer emits a JSON array");
             let held = rows[0]["held"]
@@ -11251,7 +10986,7 @@ mod tests {
         .collect();
         let (route, traffic) = canonical_codex_route_and_traffic();
         let render = |snapshot: &StatsSnapshot| -> Vec<serde_json::Value> {
-            let json = render_accounts_json_at(
+            let json = status_rows_json(account_status_rows_at(
                 // After every instant in the contract sample, so each clock-derived field
                 // clamps exactly as it does in the committed file.
                 fixture_instant(1_767_398_400_000),
@@ -11264,7 +10999,7 @@ mod tests {
                 &group_colors,
                 Some(&route),
                 Some(&traffic),
-            );
+            ));
             serde_json::from_str(&json).expect("the renderer emits a JSON array")
         };
         let check = |pass: &str, rows: Vec<serde_json::Value>| {
@@ -11330,29 +11065,14 @@ mod tests {
     #[test]
     fn groups_render_as_array_never_null() {
         let (snapshot, thresholds) = status_contract_snapshot();
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
-        let alice = rows
-            .iter()
-            .find(|r| r["name"] == "alice@example.com")
-            .expect("alice row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Live);
+        let alice = status_row(&json, "alice@example.com");
         assert_eq!(
             alice["groups"],
             serde_json::json!(["codereview", "dev"]),
             "labelled account carries its groups: {alice}"
         );
-        let dave = rows
-            .iter()
-            .find(|r| r["name"] == "dave@example.com")
-            .expect("dave row");
+        let dave = status_row(&json, "dave@example.com");
         assert_eq!(
             dave["groups"],
             serde_json::json!([]),
@@ -11385,11 +11105,7 @@ mod tests {
             None,
             &group_colors,
         );
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
-        let dave = rows
-            .iter()
-            .find(|r| r["name"] == "dave@example.com")
-            .expect("dave row");
+        let dave = status_row(&json, "dave@example.com");
         assert_eq!(
             dave["groups"],
             serde_json::json!([]),
@@ -11578,20 +11294,8 @@ mod tests {
         snapshot.accounts[1].seven_day_oi = None;
         snapshot.accounts[1].seven_day_oi_reset = None;
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
-        let alice = rows
-            .iter()
-            .find(|r| r["name"] == "alice@example.com")
-            .expect("alice row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Live);
+        let alice = status_row(&json, "alice@example.com");
         assert_eq!(
             alice["sevenDayOiState"],
             serde_json::json!("near"),
@@ -11602,10 +11306,7 @@ mod tests {
             serde_json::json!(learned_reset.unix_timestamp_nanos() as i64 / 1_000_000),
             "learned window's reset reaches the wire: {alice}"
         );
-        let dave = rows
-            .iter()
-            .find(|r| r["name"] == "dave@example.com")
-            .expect("dave row");
+        let dave = status_row(&json, "dave@example.com");
         assert_eq!(
             dave["sevenDayOiState"],
             serde_json::Value::Null,
@@ -11696,30 +11397,15 @@ mod tests {
     #[test]
     fn reserved_groups_render_as_array_never_null() {
         let (snapshot, thresholds) = reserved_groups_snapshot();
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
-        let alice = rows
-            .iter()
-            .find(|r| r["name"] == "alice@example.com")
-            .expect("alice row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Live);
+        let alice = status_row(&json, "alice@example.com");
         assert_eq!(
             alice["reservedGroups"],
             serde_json::json!(["codereview"]),
             "reserved subset of alice's groups: {alice}"
         );
         assert_eq!(alice["gate"], serde_json::json!("reserved"));
-        let dave = rows
-            .iter()
-            .find(|r| r["name"] == "dave@example.com")
-            .expect("dave row");
+        let dave = status_row(&json, "dave@example.com");
         assert_eq!(
             dave["reservedGroups"],
             serde_json::json!([]),
@@ -11766,30 +11452,15 @@ mod tests {
         snapshot.accounts[0].reserved_groups = Vec::new();
         snapshot.accounts[0].parked_groups = vec!["codereview".to_string()];
 
-        let json = render_accounts_json(
-            &snapshot,
-            &thresholds,
-            StatusSource::Live,
-            None,
-            false,
-            None,
-            &Default::default(),
-        );
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
-        let alice = rows
-            .iter()
-            .find(|r| r["name"] == "alice@example.com")
-            .expect("alice row");
+        let json = status_json(&snapshot, &thresholds, StatusSource::Live);
+        let alice = status_row(&json, "alice@example.com");
         assert_eq!(
             alice["parkedGroups"],
             serde_json::json!(["codereview"]),
             "parked subset of alice's groups: {alice}"
         );
         assert_eq!(alice["gate"], serde_json::json!("parked"));
-        let dave = rows
-            .iter()
-            .find(|r| r["name"] == "dave@example.com")
-            .expect("dave row");
+        let dave = status_row(&json, "dave@example.com");
         assert_eq!(
             dave["parkedGroups"],
             serde_json::json!([]),
