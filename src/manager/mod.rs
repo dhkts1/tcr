@@ -70,6 +70,7 @@ mod throttle;
 mod usage;
 mod warm;
 mod wire_sessions;
+mod write_through;
 
 // Re-exported so unit F's replay harness (`tests/`) can call the SAME
 // production predicate rather than a reimplementation — see
@@ -3094,36 +3095,26 @@ impl Manager {
         let Some(path) = &self.config_path else {
             return DisablePersist::NoConfigFile;
         };
-        // INV1 — held across `save_disabled`'s whole read + modify + sync + rename.
-        let _writing = self
-            .config_write
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        // INV2 — no `self.config` guard is alive on this line, so the file I/O
-        // cannot block a per-connection config read.
-        let outcome = config::save_disabled(path, target, disabled);
-        // INV3 — memory is touched only on the arms where the FILE now carries the
-        // desired state. `Unchanged` qualifies: it means the document already said
-        // exactly this, so nothing was written precisely because nothing needed to
-        // be. Every other arm leaves the snapshot alone.
-        if matches!(
-            outcome,
-            Ok(config::DisabledWrite::Updated) | Ok(config::DisabledWrite::Unchanged)
-        ) {
-            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
-            // Resolved by identity, through the one `identity::resolve` that
-            // `persist_tokens` and `save_disabled` resolve through, with the provider
-            // riding on `target` (`set_disabled` builds it from the row), so all three
-            // land on the same record and never on a row of another provider. An
-            // unbreakable tie writes nothing: `save_disabled` refuses one too, and
-            // memory must not drift onto a record the file was not allowed to touch.
-            if let crate::identity::Resolved::One(position) =
-                crate::identity::resolve(config.accounts.iter().enumerate(), target)
-                && let Some(account) = config.accounts.get_mut(position)
-            {
-                account.disabled = if disabled { Some(true) } else { None };
-            }
-        }
+        // INV1 to INV3 live in `write_through`.
+        let outcome = self.write_through(
+            path,
+            |path| config::save_disabled(path, target, disabled),
+            |config| {
+                // Resolved by identity, through the one `identity::resolve` that
+                // `persist_tokens` and `save_disabled` resolve through, with the
+                // provider riding on `target` (`set_disabled` builds it from the row),
+                // so all three land on the same record and never on a row of another
+                // provider. An unbreakable tie writes nothing: `save_disabled` refuses
+                // one too, and memory must not drift onto a record the file was not
+                // allowed to touch.
+                if let crate::identity::Resolved::One(position) =
+                    crate::identity::resolve(config.accounts.iter().enumerate(), target)
+                    && let Some(account) = config.accounts.get_mut(position)
+                {
+                    account.disabled = if disabled { Some(true) } else { None };
+                }
+            },
+        );
         match outcome {
             Ok(config::DisabledWrite::Updated) => {
                 tracing::info!(
@@ -3416,23 +3407,14 @@ impl Manager {
         let Some(path) = &self.config_path else {
             return ControlPersist::NoConfigFile;
         };
-        // INV1 — held across `save_control_account`'s whole read + modify +
-        // sync + rename.
-        let _writing = self
-            .config_write
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        // INV2 — no `self.config` guard is alive on this line.
-        let outcome = config::save_control_account(path, target.as_ref());
-        // INV3 — memory is touched only on the arms where the FILE now carries
-        // the desired state.
-        if matches!(
-            outcome,
-            Ok(config::ControlWrite::Updated) | Ok(config::ControlWrite::Unchanged)
-        ) {
-            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
-            config.control_account = target.as_ref().map(config::ControlAccountRef::from);
-        }
+        // INV1 to INV3 live in `write_through`.
+        let outcome = self.write_through(
+            path,
+            |path| config::save_control_account(path, target.as_ref()),
+            |config| {
+                config.control_account = target.as_ref().map(config::ControlAccountRef::from);
+            },
+        );
         let name = target.as_ref().map(|a| a.name.as_str());
         match outcome {
             Ok(config::ControlWrite::Updated) => {
