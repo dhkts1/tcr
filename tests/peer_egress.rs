@@ -32,6 +32,10 @@
     reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
 )]
 
+/// The environment every launch of the built `tcr` starts from.
+#[path = "support/tcr_env.rs"]
+mod tcr_env;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -2424,10 +2428,8 @@ fn run_tcr_peer(peers: &std::path::Path, args: &[&str]) -> (String, String, bool
         std::fs::write(&default_config, r#"{"proxy":{"port":9},"accounts":[]}"#)
             .expect("write the fixture's offline default config");
     }
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut command = tcr_env::tcr(&home);
     command
-        .env("HOME", &home)
-        .env("CFFIXED_USER_HOME", &home)
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .env("CODEX_HOME", &codex_home)
@@ -2436,16 +2438,6 @@ fn run_tcr_peer(peers: &std::path::Path, args: &[&str]) -> (String, String, bool
             "TCR_CLAUDE_CODE_CREDENTIALS",
             home.join("claude-credentials.json"),
         );
-    for name in [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ] {
-        command.env_remove(name);
-    }
     let output = command
         .arg("peer")
         .args(args)

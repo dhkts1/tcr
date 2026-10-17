@@ -59,20 +59,13 @@ fn listening_port(text: &str) -> Option<u16> {
 #[test]
 fn the_log_file_holds_the_boot_and_the_last_shutdown_line_with_stdout_on_the_null_device() {
     let home = tempfile::tempdir().expect("a scratch HOME");
-    let bin = env!("CARGO_BIN_EXE_tcr");
-    let mut child = Command::new(bin)
+    let mut child = crate::tcr_env::tcr(home.path())
         .args(["--headless", "--port", "0", "--no-replace"])
-        .env("HOME", home.path())
-        .env(
-            "TCR_CLAUDE_CODE_CREDENTIALS",
-            home.path().join("no-such-claude-code-credentials.json"),
-        )
-        .env_remove("XDG_CACHE_HOME")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap_or_else(|err| panic!("spawning {bin} failed: {err}"));
+        .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
 
     let deadline = Instant::now() + BOOT_TIMEOUT;
     let port = loop {

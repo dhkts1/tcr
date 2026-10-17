@@ -72,9 +72,15 @@ fn write_two_peer_fixture(dir: &Path) -> std::path::PathBuf {
     path
 }
 
+/// The built `tcr` with its `HOME` the directory holding `file`, so no call reaches the
+/// operator's files.
+fn tcr_beside(file: &Path) -> std::process::Command {
+    crate::tcr_env::tcr(file.parent().expect("a fixture file has a directory"))
+}
+
 /// Run `tcr peer graph` with the given extra args: `(stdout, stderr, ok)`.
 fn run_graph(peers: &Path, extra: &[&str]) -> (String, String, bool) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_beside(peers)
         .args(["peer", "graph"])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
         .args(extra)
@@ -207,7 +213,7 @@ async fn tcr_peer_graph_serve_answers_the_page_and_the_json_on_loopback() {
     // with a sibling test binary running at the same instant is the same
     // non-issue `peer_reach.rs`'s port picks already accept.
     let addr = "127.0.0.1:18081";
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let mut child = tcr_beside(&peers)
         .args(["peer", "graph", "--serve", "--addr", addr])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
         .spawn()
@@ -273,7 +279,7 @@ async fn tcr_peer_graph_serve_403s_a_non_loopback_host_header_and_200s_a_loopbac
     let peers = write_two_peer_fixture(&dir);
 
     let addr = "127.0.0.1:18082";
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let mut child = tcr_beside(&peers)
         .args(["peer", "graph", "--serve", "--addr", addr])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
         .spawn()

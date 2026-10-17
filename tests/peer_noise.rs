@@ -1534,7 +1534,7 @@ fn peer_find_off_stores_announce_name_and_exits_zero() {
     let peers = dir.path().join("tcr-peers.json");
 
     for (flag, expected) in [("off", false), ("on", true)] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+        let output = crate::tcr_env::tcr(dir.path())
             .args([
                 "peer",
                 "find",

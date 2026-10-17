@@ -36,6 +36,10 @@
 #[path = "tools/api_contract.rs"]
 mod api_contract;
 
+/// The environment every launch of the built `tcr` starts from.
+#[path = "support/tcr_env.rs"]
+mod tcr_env;
+
 use std::path::{Path, PathBuf};
 use tcr::log_err::LogErr as _;
 
@@ -5506,9 +5510,15 @@ fn lent_to_carries_the_real_scope_the_real_end_and_whether_it_has_passed() {
 // the proxy on 127.0.0.1:3456.
 // ---------------------------------------------------------------------------
 
+/// The built `tcr` with its `HOME` the directory holding `file`, so every call on one fixture
+/// shares the files the verbs write by default and no call reaches the operator's.
+fn tcr_beside(file: &Path) -> std::process::Command {
+    tcr_env::tcr(file.parent().expect("a fixture file has a directory"))
+}
+
 /// Run `tcr peer <args> --peers <path>` and return `(stdout, stderr, success)`.
 fn run_tcr_peer(peers: &Path, args: &[&str]) -> (String, String, bool) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_beside(peers)
         .arg("peer")
         .args(args)
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
@@ -5566,7 +5576,7 @@ fn peer_lend_and_share_on_refuse_a_codex_scope() {
     .expect("the config fixture writes");
     let refusal = "'work' is a Codex account, and Codex accounts stay on this Mac: only a Claude account can be lent. Nothing was changed.";
     let run = |config: &Path, args: &[&str]| -> std::process::Output {
-        std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+        tcr_beside(&peers)
             .arg("peer")
             .args(args)
             .args(["--peers", peers.to_str().expect("a utf-8 path")])
@@ -5900,7 +5910,7 @@ fn peer_ls_json_carries_the_lent_to_line_keyed_by_account_label() {
     );
     assert!(ok, "lend: {out}{err}");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_beside(&peers)
         .args(["peer", "ls", "--json"])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
         .args(["--config", config.to_str().expect("a utf-8 path")])
@@ -6015,7 +6025,7 @@ fn peer_ls_json_carries_the_mode_the_handed_key_the_switch_and_the_exits() {
     let (out, err, ok) = run_tcr_peer(&peers, &["internet", "on"]);
     assert!(ok, "internet on: {out}{err}");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_beside(&peers)
         .args(["peer", "ls", "--json"])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
         .args(["--config", config.to_str().expect("a utf-8 path")])
@@ -6143,7 +6153,7 @@ fn peer_ls_json_keeps_an_account_whose_name_is_not_a_label() {
     );
     assert!(ok, "lend: {out}{err}");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_beside(&peers)
         .args(["peer", "ls", "--json"])
         .args(["--peers", peers.to_str().expect("a utf-8 path")])
         .args(["--config", config.to_str().expect("a utf-8 path")])
@@ -6400,7 +6410,7 @@ fn a_peer_ls_json_row_carries_until_and_ended() {
     // `--for 2h` on the real CLI, so this covers argv → file → JSON and not
     // only the writer.
     let before = unix_seconds();
-    let lent = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let lent = tcr_beside(&peers_path)
         .args(["peer", "lend", &borrower.to_wire()])
         .args(["--peers", &peers_path.display().to_string()])
         .args(["--window", "7d", "--fraction", "0.2", "--for", "2h"])
@@ -6451,7 +6461,7 @@ fn a_peer_ls_json_row_carries_until_and_ended() {
 
 /// The whole `tcr peer ls --json` document, from the binary this build made.
 fn ls_json(peers_path: &Path, config_path: &Path) -> serde_json::Value {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let out = tcr_beside(peers_path)
         .args(["peer", "ls", "--json"])
         .args(["--peers", &peers_path.display().to_string()])
         .args(["--config", &config_path.display().to_string()])

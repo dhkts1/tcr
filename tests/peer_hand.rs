@@ -2047,7 +2047,7 @@ fn run_tcr_peer(
     config: &std::path::Path,
     args: &[&str],
 ) -> (String, bool) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = crate::tcr_env::tcr(peers.parent().expect("a fixture file has a directory"))
         .arg("peer")
         .args(args)
         .args(["--peers", peers.to_str().expect("a utf-8 path")])

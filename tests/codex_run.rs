@@ -127,35 +127,13 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = crate::tcr_env::tcr(self.home.path());
         command
-            .env("HOME", self.home.path())
             .env("CODEX_HOME", self.home.path().join(".codex"))
             .env("TCR_CODEX_AUTH", self.home.path().join("no-such-auth.json"))
-            .env(
-                "TCR_CLAUDE_CODE_CREDENTIALS",
-                self.home.path().join("no-such-claude-login.json"),
-            )
             .env("TCR_CODEX_BIN", self.home.path().join("fake-codex"))
             .env("NO_COLOR", "1")
-            .env_remove("XDG_CACHE_HOME")
-            .env_remove("XDG_CONFIG_HOME")
-            .env_remove("CODEX_CA_CERTIFICATE")
-            .env_remove("SSL_CERT_FILE")
-            .env_remove("NODE_EXTRA_CA_CERTS")
             .current_dir(self.home.path());
-        for key in [
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "NO_PROXY",
-            "no_proxy",
-        ] {
-            command.env_remove(key);
-        }
         command
     }
 }

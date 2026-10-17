@@ -61,19 +61,13 @@ impl ConnectGuard {
             serde_json::json!({"proxy": {"port": port}, "accounts": []}).to_string(),
         )
         .unwrap();
-        let mut proof = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut proof = crate::tcr_env::tcr(home);
         proof
             .args(["status", "--json", "--config"])
             .arg(&config)
             .current_dir(directory.path())
-            .env("HOME", home)
             .env("CODEX_HOME", directory.path().join("codex"))
-            .env(
-                "TCR_CLAUDE_CODE_CREDENTIALS",
-                directory.path().join("no-claude.json"),
-            )
-            .env("TCR_CODEX_AUTH", directory.path().join("no-codex.json"))
-            .env_remove("XDG_CACHE_HOME");
+            .env("TCR_CODEX_AUTH", directory.path().join("no-codex.json"));
         guarded(&mut proof, port);
         assert!(
             proof

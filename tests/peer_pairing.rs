@@ -71,10 +71,8 @@ fn tcr_command(home: &std::path::Path) -> std::process::Command {
         std::fs::write(&default_config, r#"{"proxy":{"port":9},"accounts":[]}"#)
             .expect("write the fixture's offline default config");
     }
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut command = crate::tcr_env::tcr(home);
     command
-        .env("HOME", home)
-        .env("CFFIXED_USER_HOME", home)
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .env("CODEX_HOME", &codex_home)
@@ -83,16 +81,6 @@ fn tcr_command(home: &std::path::Path) -> std::process::Command {
             "TCR_CLAUDE_CODE_CREDENTIALS",
             home.join("claude-credentials.json"),
         );
-    for name in [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ] {
-        command.env_remove(name);
-    }
     command
 }
 

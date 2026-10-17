@@ -355,7 +355,8 @@ impl Mac {
         }
     }
 
-    fn env(&self, command: &mut Command) {
+    fn command(&self) -> Command {
+        let mut command = crate::tcr_env::tcr(self.home.path());
         command
             // Colour off at the source. A child that inherits an unset
             // `NO_COLOR` writes escape codes into its boot log even though the
@@ -365,14 +366,8 @@ impl Mac {
             // is load-bearing; this half also keeps the logs readable when a
             // failing run prints one.
             .env("NO_COLOR", "1")
-            .env("HOME", self.home.path())
-            .env("XDG_CACHE_HOME", self.home.path().join(".cache"))
-            .env(
-                "TCR_CLAUDE_CODE_CREDENTIALS",
-                self.home
-                    .path()
-                    .join("no-such-claude-code-credentials.json"),
-            );
+            .env("XDG_CACHE_HOME", self.home.path().join(".cache"));
+        command
     }
 
     /// Boot this Mac's proxy and wait until both of its sockets are up.
@@ -451,12 +446,11 @@ impl Mac {
         self.log = self.home.path().join(format!("boot-{}.log", self.boots));
         let out = std::fs::File::create(&self.log).expect("the boot log opens");
         let err = out.try_clone().expect("the boot log clones for stderr");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = self.command();
         command
             .args(["--headless", "--port", "0", "--no-replace"])
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err));
-        self.env(&mut command);
         let child = command.spawn().unwrap_or_else(|err| {
             panic!(
                 "spawning the tcr this build produced ({}) failed: {err}",
@@ -579,12 +573,11 @@ impl Mac {
     /// Run `tcr peer <args> --peers <this Mac's peers file>` and hand back
     /// (stdout, stderr, success).
     fn peer(&self, args: &[&str]) -> (String, String, bool) {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = self.command();
         command
             .arg("peer")
             .args(args)
             .args(["--peers", self.peers.to_str().expect("a utf-8 peers path")]);
-        self.env(&mut command);
         let out = command
             .output()
             .unwrap_or_else(|err| panic!("{}: spawning `tcr peer {args:?}`: {err}", self.label));
@@ -628,7 +621,7 @@ impl Mac {
         )
         .expect("the asking config writes");
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        let mut command = self.command();
         command.args([
             "peer",
             "status",
@@ -636,7 +629,6 @@ impl Mac {
             "--config",
             asking.to_str().expect("a utf-8 config path"),
         ]);
-        self.env(&mut command);
         let out = command
             .output()
             .unwrap_or_else(|err| panic!("{}: spawning `tcr status --json`: {err}", self.label));
@@ -1360,14 +1352,13 @@ fn spawn_pair(mac: &Mac, addr: &str) -> PairProcess {
     let out = mac.home.path().join("pair.out");
     let file = std::fs::File::create(&out).expect("the pair log opens");
     let err = file.try_clone().expect("the pair log clones for stderr");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut command = mac.command();
     command
         .args(["peer", "pair", addr])
         .args(["--peers", mac.peers.to_str().expect("a utf-8 peers path")])
         .stdin(Stdio::piped())
         .stdout(Stdio::from(file))
         .stderr(Stdio::from(err));
-    mac.env(&mut command);
     let child = command
         .spawn()
         .unwrap_or_else(|err| panic!("{}: spawning `tcr peer pair`: {err}", mac.label));
@@ -1614,14 +1605,13 @@ async fn a_borrowed_request_reaches_the_lender_and_never_carries_the_borrowers_c
 /// `tcr peer join --stdin`, which is the path the panel and the `tcr://` handler
 /// use: the key is piped, so it never enters an argument vector.
 fn join_with_stdin(mac: &Mac, key: &str) -> String {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut command = mac.command();
     command
         .args(["peer", "join", "--stdin", "--label", "borrower-mac"])
         .args(["--peers", mac.peers.to_str().expect("a utf-8 peers path")])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    mac.env(&mut command);
     let mut child = command
         .spawn()
         .unwrap_or_else(|err| panic!("{}: spawning `tcr peer join`: {err}", mac.label));
@@ -2362,18 +2352,13 @@ fn boot_cost_once(with_peers: bool) -> f64 {
     let log = home.path().join("boot.log");
     let out = std::fs::File::create(&log).expect("the boot log opens");
     let err = out.try_clone().expect("the boot log clones for stderr");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    let mut command = crate::tcr_env::tcr(home.path());
     command
         .args(["--headless", "--port", "0", "--no-replace"])
-        // The same colour-off contract as `Mac::env`; this sample owns no
+        // The same colour-off contract as `Mac::command`; this sample owns no
         // `Mac` to borrow it from.
         .env("NO_COLOR", "1")
-        .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join(".cache"))
-        .env(
-            "TCR_CLAUDE_CODE_CREDENTIALS",
-            home.path().join("no-such-claude-code-credentials.json"),
-        )
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
 
