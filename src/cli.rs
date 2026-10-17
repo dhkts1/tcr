@@ -353,48 +353,17 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
     let target = config.accounts[idx].clone();
     let name = target.name.clone();
 
-    let live = post_set_disabled(&config, &name, true).await;
-    let parked_live = live.is_ok();
-    let warning = match live {
-        Ok(_) => None,
-        // Nothing is listening: no live rotation to disagree with the file.
-        Err(LiveControlError::NoServer) => None,
-        // A server is there and refused our key. Deleting the record now
-        // would leave the running proxy still rotating an account that no
-        // longer exists on disk — worse than the disable case, because
-        // there is no record left to reconcile against on restart.
-        Err(LiveControlError::Unauthorized) => {
-            bail!(
-                "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because deleting it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
-                config.proxy.port,
-                config_path.display()
-            );
-        }
-        // The route resolved our query to nothing, or to more than one
-        // account. The file's own resolution could land on a different
-        // row than the server matched — a removal applied to the wrong
-        // account is unrecoverable, so this bails rather than falling back.
-        Err(LiveControlError::Rejected(message)) => {
-            bail!(
-                "the proxy running on :{} refused this: {message} Nothing was changed.",
-                config.proxy.port
-            );
-        }
-        // An older tcr with no account-control route. The file half is all
-        // we can do; say loudly that the proxy keeps using the account
-        // until it restarts.
-        Err(LiveControlError::NoRoute) => Some(format!(
-            "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP routing to '{name}' until it restarts. {}",
-            config.proxy.port,
-            crate::proxy::DISABLED_PATH,
-            RESTART_HINT,
-        )),
-        // It answered something we cannot use, or did not answer at all.
-        Err(other) => Some(format!(
-            "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP routing to '{name}' until it restarts.",
-            config.proxy.port,
-            other.why(),
-        )),
+    let site = LiveSite {
+        config: &config,
+        config_path,
+        words: &REMOVE_WORDS,
+    };
+    let (parked_live, warning) = match site.decide(post_set_disabled(&config, &name, true).await)? {
+        Live::Applied(_) => (true, None),
+        Live::FileOnly(stale) => (
+            false,
+            stale.map(|stale| site.warning(&stale, Some(&format!("routing to '{name}'")))),
+        ),
     };
 
     let failed = match config::remove_account_entry(config_path, &target)
@@ -511,8 +480,13 @@ pub async fn set_priority(
     let provider = config.accounts[idx].provider;
     let value = priority_value(&config, provider, priority);
 
-    match post_set_priority(&config, query, value).await {
-        Ok(applied) => {
+    let site = LiveSite {
+        config: &config,
+        config_path,
+        words: &PRIORITY_WORDS,
+    };
+    match site.decide(post_set_priority(&config, query, value).await)? {
+        Live::Applied(applied) => {
             write_priority(config_path, query, value).with_context(|| {
                 format!(
                     "the running proxy already ranks '{}' at {value}, but the config file was not updated, so a restart will undo it",
@@ -523,49 +497,15 @@ pub async fn set_priority(
                 "{}",
                 priority_message(&applied.name, value, provider, priority)
             );
-            return Ok(());
         }
-        // Nothing is listening: the file is the whole truth.
-        Err(LiveControlError::NoServer) => {}
-        Err(LiveControlError::Unauthorized) => {
-            bail!(
-                "the proxy on :{} rejected the api-key in {}, so the config was NOT changed, because writing it would leave the running proxy on the old order. Fix `proxy.apiKey` and retry.",
-                config.proxy.port,
-                config_path.display()
-            );
-        }
-        // The server matched our query to nothing or to several accounts. The
-        // file's resolution could land on a different row, so do not fall back.
-        Err(LiveControlError::Rejected(message)) => {
-            bail!(
-                "the proxy running on :{} refused this: {message} Nothing was changed.",
-                config.proxy.port
-            );
-        }
-        Err(LiveControlError::NoRoute) => {
+        Live::FileOnly(stale) => {
             let name = write_priority(config_path, query, value)?;
-            eprintln!(
-                "[tcr] WARNING: the proxy running on :{} is too old to accept a live priority change (no {} route), so only the config file was changed. It will KEEP the old order until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
-                config.proxy.port,
-                crate::proxy::PRIORITY_PATH,
-            );
+            if let Some(stale) = stale {
+                eprintln!("{}", site.warning(&stale, Some("the old order")));
+            }
             println!("{}", priority_message(&name, value, provider, priority));
-            return Ok(());
-        }
-        Err(other) => {
-            let name = write_priority(config_path, query, value)?;
-            eprintln!(
-                "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP the old order until it restarts.",
-                config.proxy.port,
-                other.why(),
-            );
-            println!("{}", priority_message(&name, value, provider, priority));
-            return Ok(());
         }
     }
-
-    let name = write_priority(config_path, query, value)?;
-    println!("{}", priority_message(&name, value, provider, priority));
     Ok(())
 }
 
@@ -1377,8 +1317,13 @@ pub async fn set_config(config_path: &Path, key: &str, value: &str) -> anyhow::R
     };
 
     if let Ok(config) = config::load(config_path) {
-        match post_set_config(&config, &setting).await {
-            Ok(applied) => {
+        let site = LiveSite {
+            config: &config,
+            config_path,
+            words: &CONFIG_SET_WORDS,
+        };
+        match site.decide(post_set_config(&config, &setting).await)? {
+            Live::Applied(applied) => {
                 println!(
                     "{} The proxy on :{} keeps its current value until it restarts.",
                     saved_line(applied.changed),
@@ -1386,37 +1331,10 @@ pub async fn set_config(config_path: &Path, key: &str, value: &str) -> anyhow::R
                 );
                 return Ok(());
             }
-            Err(LiveControlError::NoServer) => {}
-            Err(LiveControlError::Unauthorized) => bail!(
-                "the proxy on :{} rejected the api-key in {}, so nothing was changed: writing the file beside a running proxy can lose the change to its own next write. Fix `proxy.apiKey` and retry.",
-                config.proxy.port,
-                config_path.display()
-            ),
-            Err(LiveControlError::Rejected(message)) => bail!(
-                "the proxy running on :{} refused this: {message}",
-                config.proxy.port
-            ),
-            Err(LiveControlError::NoRoute) => {
+            Live::FileOnly(None) => {}
+            Live::FileOnly(Some(stale)) => {
                 let write = write_setting(config_path, &setting)?;
-                eprintln!(
-                    "[tcr] WARNING: the proxy running on :{} is too old to save settings itself (no {} route), so this process wrote the file beside it. {}",
-                    config.proxy.port,
-                    crate::proxy::CONFIG_PATH,
-                    RESTART_HINT,
-                );
-                println!(
-                    "{}",
-                    saved_line(write == crate::config_set::SettingWrite::Updated)
-                );
-                return Ok(());
-            }
-            Err(other) => {
-                let write = write_setting(config_path, &setting)?;
-                eprintln!(
-                    "[tcr] WARNING: could not hand this to the proxy running on :{} ({}), so this process wrote the file beside it.",
-                    config.proxy.port,
-                    other.why(),
-                );
+                eprintln!("{}", site.warning(&stale, None));
                 println!(
                     "{}",
                     saved_line(write == crate::config_set::SettingWrite::Updated)
@@ -1648,8 +1566,15 @@ pub async fn set_enabled(config_path: &Path, query: &str, disabled: bool) -> any
     // fall through to the file path, which reports the load failure as it always
     // has. Never a silent skip of the live attempt for any other reason.
     if let Ok(config) = config::load(config_path) {
-        match post_set_disabled(&config, query, disabled).await {
-            Ok(applied) => {
+        // A missing route is HALF a disable, the arm that used to be the whole
+        // function, silently; the warning says so.
+        let site = LiveSite {
+            config: &config,
+            config_path,
+            words: &ENABLE_WORDS,
+        };
+        match site.decide(post_set_disabled(&config, query, disabled).await)? {
+            Live::Applied(applied) => {
                 println!(
                     "{} account '{}'.",
                     if disabled { "Disabled" } else { "Enabled" },
@@ -1660,54 +1585,14 @@ pub async fn set_enabled(config_path: &Path, query: &str, disabled: bool) -> any
                 }
                 return Ok(());
             }
-            // Nothing is listening: the historical case, and the only quiet one.
-            // There is no live rotation to disagree with the file.
-            Err(LiveControlError::NoServer) => {}
-            // A server is there and REFUSED us. Writing the file here would be the
-            // old lie in a new place: the config would say benched while the proxy
-            // we could not talk to keeps rotating. Change nothing, exit non-zero.
-            Err(LiveControlError::Unauthorized) => {
-                bail!(
-                    "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because writing it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
-                    config.proxy.port,
-                    config_path.display()
-                );
-            }
-            // The route is missing: an older tcr is serving. The file write is all
-            // we can do, and it is HALF a disable — say so loudly. This arm is the
-            // one that used to be the whole function, silently.
-            Err(LiveControlError::NoRoute) => {
+            Live::FileOnly(None) => {}
+            Live::FileOnly(Some(stale)) => {
                 let name = write_disabled_flag(config_path, query, disabled)?;
-                eprintln!(
-                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP {} '{name}' until it restarts. {}",
-                    config.proxy.port,
-                    crate::proxy::DISABLED_PATH,
-                    if disabled { "routing to" } else { "benching" },
-                    RESTART_HINT,
+                let keeps = format!(
+                    "{} '{name}'",
+                    if disabled { "routing to" } else { "benching" }
                 );
-                return Ok(());
-            }
-            // The route ran and refused the QUERY: it matched no live account, or
-            // matched several. Do not fall back — the file's own resolution could
-            // land on a different account than the one the server was talking
-            // about, and a disable applied to the wrong row is worse than none.
-            Err(LiveControlError::Rejected(message)) => {
-                bail!(
-                    "the proxy running on :{} refused this: {message} Nothing was changed.",
-                    config.proxy.port
-                );
-            }
-            // It answered something we cannot use, or did not answer at all. Same
-            // shape of consequence as the arm above, different cause, and equally
-            // never silent.
-            Err(other) => {
-                let name = write_disabled_flag(config_path, query, disabled)?;
-                eprintln!(
-                    "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP {} '{name}' until it restarts.",
-                    config.proxy.port,
-                    other.why(),
-                    if disabled { "routing to" } else { "benching" },
-                );
+                eprintln!("{}", site.warning(&stale, Some(&keeps)));
                 return Ok(());
             }
         }
@@ -1749,6 +1634,164 @@ fn write_disabled_flag(config_path: &Path, query: &str, disabled: bool) -> anyho
 /// subcommand that never existed, and four copies is how that happened. `main.rs`'s `restart_hint_names_only_commands_that_parse` parses
 /// every backticked `tcr` command in this text with the real clap definition.
 pub const RESTART_HINT: &str = "Restart it when a cold prompt cache is acceptable: if TcrBar runs the proxy, use Restart in TcrBar's Settings > General; otherwise run `tcr server --replace`.";
+
+/// What a verb that asks the running proxy first may do with its file.
+enum Live<T> {
+    /// The running proxy applied it, and wrote the file if it owns that half.
+    Applied(T),
+    /// Write the file here. `None` when nothing is listening, the ordinary
+    /// offline case, which says nothing. `Some` when a proxy is there and the
+    /// change did not reach it, which is never silent: see [`LiveSite::warning`].
+    FileOnly(Option<Stale>),
+}
+
+/// Why a running proxy did not take a change the file is about to get.
+enum Stale {
+    /// An older tcr with no route for it.
+    NoRoute,
+    /// It answered something unusable, or nothing in time; the reason.
+    Failed(String),
+}
+
+/// The words one verb's refusals and warnings use for its own consequence.
+/// The policy around them is [`LiveSite::decide`], one copy for every verb.
+struct LiveWords {
+    /// The route the verb calls, named in the "too old" warning.
+    route_path: &'static str,
+    /// Follows "rejected the api-key in <path>": why nothing was written.
+    unauthorized: &'static str,
+    /// Follows the server's own refusal message.
+    rejected: &'static str,
+    /// Follows "is too old to".
+    too_old_to: &'static str,
+    /// Follows "could not".
+    could_not: &'static str,
+    /// Follows "so": what happened to the file.
+    file_written: &'static str,
+}
+
+/// After a refusal, on the verbs whose file half changes one account row.
+const NOTHING_CHANGED: &str = " Nothing was changed.";
+/// After a fallback write, on the same verbs.
+const ONLY_THE_FILE: &str = "only the config file was changed";
+
+/// `tcr rm`. Deleting the record beside a proxy that refused our key would
+/// leave it rotating an account that no longer exists on disk, with no record
+/// left to reconcile against on restart.
+const REMOVE_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::DISABLED_PATH,
+    unauthorized: " — the config was NOT changed, because deleting it would leave the running proxy still rotating this account.",
+    rejected: NOTHING_CHANGED,
+    too_old_to: "accept live account control",
+    could_not: "apply this to",
+    file_written: ONLY_THE_FILE,
+};
+
+/// `tcr priority`.
+const PRIORITY_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::PRIORITY_PATH,
+    unauthorized: ", so the config was NOT changed, because writing it would leave the running proxy on the old order.",
+    rejected: NOTHING_CHANGED,
+    too_old_to: "accept a live priority change",
+    could_not: "apply this to",
+    file_written: ONLY_THE_FILE,
+};
+
+/// `tcr config set`. The proxy owns the file while it runs, so a fallback
+/// write is this process writing beside it, and a refusal carries the
+/// server's message alone.
+const CONFIG_SET_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::CONFIG_PATH,
+    unauthorized: ", so nothing was changed: writing the file beside a running proxy can lose the change to its own next write.",
+    rejected: "",
+    too_old_to: "save settings itself",
+    could_not: "hand this to",
+    file_written: "this process wrote the file beside it",
+};
+
+/// `tcr enable` and `tcr disable`. Writing the file beside a proxy that
+/// refused our key would be the config saying benched while the proxy keeps
+/// rotating.
+const ENABLE_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::DISABLED_PATH,
+    unauthorized: " — the config was NOT changed, because writing it would leave the running proxy still rotating this account.",
+    rejected: NOTHING_CHANGED,
+    too_old_to: "accept live account control",
+    could_not: "apply this to",
+    file_written: ONLY_THE_FILE,
+};
+
+/// `tcr control`. The running proxy is the one that resolves identity
+/// traffic, so a file naming a new control account beside it is a lie.
+const CONTROL_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::CONTROL_PATH,
+    unauthorized: " — the config was NOT changed, because writing it would leave the running proxy still resolving identity traffic against its old control account.",
+    rejected: NOTHING_CHANGED,
+    too_old_to: "accept live account control",
+    could_not: "apply this to",
+    file_written: ONLY_THE_FILE,
+};
+
+/// One verb's "running proxy first, file second" decision, at one config.
+struct LiveSite<'a> {
+    config: &'a Config,
+    config_path: &'a Path,
+    words: &'static LiveWords,
+}
+
+impl LiveSite<'_> {
+    /// The decision table. Nothing listening writes the file quietly. A
+    /// rejected api-key or a refused query changes nothing: the file's own
+    /// resolution could land on a different row than the server matched, and a
+    /// file written beside a proxy we could not talk to says one thing while the
+    /// proxy does another. A missing route or an unusable answer writes the file
+    /// and warns.
+    fn decide<T>(&self, answer: Result<T, LiveControlError>) -> anyhow::Result<Live<T>> {
+        let port = self.config.proxy.port;
+        match answer {
+            Ok(applied) => Ok(Live::Applied(applied)),
+            Err(LiveControlError::NoServer) => Ok(Live::FileOnly(None)),
+            Err(LiveControlError::Unauthorized) => bail!(
+                "the proxy on :{port} rejected the api-key in {}{} Fix `proxy.apiKey` and retry.",
+                self.config_path.display(),
+                self.words.unauthorized,
+            ),
+            Err(LiveControlError::Rejected(message)) => bail!(
+                "the proxy running on :{port} refused this: {message}{}",
+                self.words.rejected
+            ),
+            Err(LiveControlError::NoRoute) => Ok(Live::FileOnly(Some(Stale::NoRoute))),
+            Err(other) => Ok(Live::FileOnly(Some(Stale::Failed(other.why())))),
+        }
+    }
+
+    /// The warning for a file written beside a proxy that did not take the
+    /// change. `keeps` names what the running proxy goes on using, as in "It
+    /// will KEEP <keeps> until it restarts"; `None` leaves that sentence out.
+    fn warning(&self, stale: &Stale, keeps: Option<&str>) -> String {
+        let port = self.config.proxy.port;
+        let words = self.words;
+        match stale {
+            Stale::NoRoute => format!(
+                "[tcr] WARNING: the proxy running on :{port} is too old to {} (no {} route), so {}.{} {RESTART_HINT}",
+                words.too_old_to,
+                words.route_path,
+                words.file_written,
+                keeps
+                    .map(|k| format!(" It will KEEP {k} until it restarts."))
+                    .unwrap_or_default(),
+            ),
+            Stale::Failed(why) => format!(
+                "[tcr] WARNING: could not {} the proxy running on :{port} ({why}), so {}.{}",
+                words.could_not,
+                words.file_written,
+                keeps
+                    .map(|k| format!(" It may KEEP {k} until it restarts."))
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+}
 
 /// Why a live account-control request did not apply.
 ///
@@ -2231,8 +2274,13 @@ pub async fn set_control(config_path: &Path, query: Option<&str>) -> anyhow::Res
     // it always has. Never a silent skip of the live attempt for any other
     // reason.
     if let Ok(config) = config::load(config_path) {
-        match post_set_control(&config, query).await {
-            Ok(applied) => {
+        let site = LiveSite {
+            config: &config,
+            config_path,
+            words: &CONTROL_WORDS,
+        };
+        match site.decide(post_set_control(&config, query).await)? {
+            Live::Applied(applied) => {
                 match &applied.name {
                     Some(name) => println!("Set control account to '{name}'."),
                     None => println!("Cleared the control account."),
@@ -2242,51 +2290,10 @@ pub async fn set_control(config_path: &Path, query: Option<&str>) -> anyhow::Res
                 }
                 return Ok(());
             }
-            // Nothing is listening: the historical case, and the only quiet
-            // one. There is no live rotation to disagree with the file.
-            Err(LiveControlError::NoServer) => {}
-            // A server is there and REFUSED us. Writing the file here would
-            // be the old lie in a new place: the config would name a new
-            // control account while the running proxy — the one that actually
-            // resolves identity traffic — keeps using its old one (or none).
-            Err(LiveControlError::Unauthorized) => {
-                bail!(
-                    "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because writing it would leave the running proxy still resolving identity traffic against its old control account. Fix `proxy.apiKey` and retry.",
-                    config.proxy.port,
-                    config_path.display()
-                );
-            }
-            // The route is missing: an older tcr is serving. The file write
-            // is all we can do, and it is HALF a control-account change — say
-            // so loudly.
-            Err(LiveControlError::NoRoute) => {
+            Live::FileOnly(None) => {}
+            Live::FileOnly(Some(stale)) => {
                 write_control_account(config_path, query)?;
-                eprintln!(
-                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP its OLD control account until it restarts. {}",
-                    config.proxy.port,
-                    crate::proxy::CONTROL_PATH,
-                    RESTART_HINT,
-                );
-                return Ok(());
-            }
-            // The route ran and refused the QUERY: it matched no live
-            // account, or matched several. Do not fall back — the file's own
-            // offline resolution could land on a different account than the
-            // one the server was talking about.
-            Err(LiveControlError::Rejected(message)) => {
-                bail!(
-                    "the proxy running on :{} refused this: {message} Nothing was changed.",
-                    config.proxy.port
-                );
-            }
-            // It answered something we cannot use, or did not answer at all.
-            Err(other) => {
-                write_control_account(config_path, query)?;
-                eprintln!(
-                    "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP its OLD control account until it restarts.",
-                    config.proxy.port,
-                    other.why(),
-                );
+                eprintln!("{}", site.warning(&stale, Some("its OLD control account")));
                 return Ok(());
             }
         }
@@ -8325,6 +8332,178 @@ mod tests {
             ),
             Ok(response) => panic!("TEST-NET-3 answered: HTTP {}", response.status()),
         }
+    }
+
+    /// Every verb that asks the running proxy first says what it said when each
+    /// verb spelled out its own refusals and warnings, word for word. The one
+    /// planned difference is `tcr priority`'s "too old" warning, which named a
+    /// `tcr restart` subcommand that does not exist and now ends in
+    /// [`RESTART_HINT`] like the rest.
+    #[test]
+    fn each_live_verb_keeps_its_own_refusal_and_warning_words() {
+        let mut config = load_from(TWO_ACCOUNTS);
+        config.proxy.port = 3456;
+        let path = Path::new("/x/config.json");
+        let refusal = |words: &'static LiveWords, error: LiveControlError| {
+            let site = LiveSite {
+                config: &config,
+                config_path: path,
+                words,
+            };
+            match site.decide::<()>(Err(error)) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("a rejected key or a refused query must not reach the file"),
+            }
+        };
+        let warning = |words: &'static LiveWords, stale: Stale, keeps: Option<&str>| {
+            LiveSite {
+                config: &config,
+                config_path: path,
+                words,
+            }
+            .warning(&stale, keeps)
+        };
+        let message = "no account matches 'zed'.";
+        let why = "HTTP 500 Internal Server Error";
+
+        struct Case {
+            words: &'static LiveWords,
+            keeps: Option<&'static str>,
+            unauthorized: &'static str,
+            rejected: String,
+            too_old: String,
+            failed: String,
+        }
+        let cases = [
+            Case {
+                words: &REMOVE_WORDS,
+                keeps: Some("routing to 'alice'"),
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json — the config was NOT changed, because deleting it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
+                rejected: format!(
+                    "the proxy running on :3456 refused this: {message} Nothing was changed."
+                ),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to accept live account control (no /_tcr/accounts/disabled route), so only the config file was changed. It will KEEP routing to 'alice' until it restarts. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :3456 ({why}), so only the config file was changed. It may KEEP routing to 'alice' until it restarts."
+                ),
+            },
+            Case {
+                words: &PRIORITY_WORDS,
+                keeps: Some("the old order"),
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json, so the config was NOT changed, because writing it would leave the running proxy on the old order. Fix `proxy.apiKey` and retry.",
+                rejected: format!(
+                    "the proxy running on :3456 refused this: {message} Nothing was changed."
+                ),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to accept a live priority change (no /_tcr/accounts/priority route), so only the config file was changed. It will KEEP the old order until it restarts. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :3456 ({why}), so only the config file was changed. It may KEEP the old order until it restarts."
+                ),
+            },
+            Case {
+                words: &CONFIG_SET_WORDS,
+                keeps: None,
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json, so nothing was changed: writing the file beside a running proxy can lose the change to its own next write. Fix `proxy.apiKey` and retry.",
+                rejected: format!("the proxy running on :3456 refused this: {message}"),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to save settings itself (no /_tcr/config route), so this process wrote the file beside it. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not hand this to the proxy running on :3456 ({why}), so this process wrote the file beside it."
+                ),
+            },
+            Case {
+                words: &ENABLE_WORDS,
+                keeps: Some("benching 'alice'"),
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json — the config was NOT changed, because writing it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
+                rejected: format!(
+                    "the proxy running on :3456 refused this: {message} Nothing was changed."
+                ),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to accept live account control (no /_tcr/accounts/disabled route), so only the config file was changed. It will KEEP benching 'alice' until it restarts. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :3456 ({why}), so only the config file was changed. It may KEEP benching 'alice' until it restarts."
+                ),
+            },
+            Case {
+                words: &CONTROL_WORDS,
+                keeps: Some("its OLD control account"),
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json — the config was NOT changed, because writing it would leave the running proxy still resolving identity traffic against its old control account. Fix `proxy.apiKey` and retry.",
+                rejected: format!(
+                    "the proxy running on :3456 refused this: {message} Nothing was changed."
+                ),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to accept live account control (no /_tcr/accounts/control route), so only the config file was changed. It will KEEP its OLD control account until it restarts. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :3456 ({why}), so only the config file was changed. It may KEEP its OLD control account until it restarts."
+                ),
+            },
+        ];
+        for case in cases {
+            let route = case.words.route_path;
+            assert_eq!(
+                refusal(case.words, LiveControlError::Unauthorized),
+                case.unauthorized,
+                "{route}"
+            );
+            assert_eq!(
+                refusal(case.words, LiveControlError::Rejected(message.to_string())),
+                case.rejected,
+                "{route}"
+            );
+            assert_eq!(
+                warning(case.words, Stale::NoRoute, case.keeps),
+                case.too_old,
+                "{route}"
+            );
+            assert_eq!(
+                warning(case.words, Stale::Failed(why.to_string()), case.keeps),
+                case.failed,
+                "{route}"
+            );
+        }
+    }
+
+    /// The decision itself: nothing listening is a quiet file write, a missing
+    /// route and an unusable answer are a warned one, and an answer is applied.
+    #[test]
+    fn the_live_decision_writes_the_file_only_where_it_may() {
+        let config = load_from(TWO_ACCOUNTS);
+        let site = LiveSite {
+            config: &config,
+            config_path: Path::new("/x/config.json"),
+            words: &ENABLE_WORDS,
+        };
+        assert!(matches!(site.decide(Ok(7)), Ok(Live::Applied(7))));
+        assert!(matches!(
+            site.decide::<()>(Err(LiveControlError::NoServer)),
+            Ok(Live::FileOnly(None))
+        ));
+        assert!(matches!(
+            site.decide::<()>(Err(LiveControlError::NoRoute)),
+            Ok(Live::FileOnly(Some(Stale::NoRoute)))
+        ));
+        assert!(matches!(
+            site.decide::<()>(Err(LiveControlError::NoAnswer("late".into()))),
+            Ok(Live::FileOnly(Some(Stale::Failed(why)))) if why == "late"
+        ));
+        assert!(matches!(
+            site.decide::<()>(Err(LiveControlError::Unusable("HTTP 500".into()))),
+            Ok(Live::FileOnly(Some(Stale::Failed(why)))) if why == "HTTP 500"
+        ));
+        assert!(
+            site.decide::<()>(Err(LiveControlError::Unauthorized))
+                .is_err()
+        );
+        assert!(
+            site.decide::<()>(Err(LiveControlError::Rejected("no".into())))
+                .is_err()
+        );
     }
 
     /// The classification the two tests above exercise, pinned directly so a
