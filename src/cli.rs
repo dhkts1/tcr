@@ -1796,90 +1796,218 @@ impl LiveControlError {
     }
 }
 
-/// Ask the running proxy to park/unpark an account. Mirrors [`fetch_live_status`]:
-/// same `no_proxy()` client (`HTTP_PROXY` commonly points AT tcr, so honouring it
-/// would send this command through the proxy it is about), same timeouts, same
-/// api-key header — the control route has no loopback exemption either.
-async fn post_set_disabled(
+impl From<Unreached> for LiveControlError {
+    fn from(unreached: Unreached) -> Self {
+        match unreached {
+            Unreached::Refused => LiveControlError::NoServer,
+            Unreached::Silent(why) => LiveControlError::NoAnswer(why),
+            Unreached::Unbuilt(why) => LiveControlError::Unusable(why),
+        }
+    }
+}
+
+/// Why a call to the running proxy came back with no HTTP response at all.
+#[derive(Debug)]
+enum Unreached {
+    /// The connection was refused: nothing is listening on the port.
+    Refused,
+    /// Something holds the port and sent nothing back in time, or dropped the
+    /// connection mid-read.
+    Silent(String),
+    /// The HTTP client could not be built, so nothing was sent.
+    Unbuilt(String),
+}
+
+/// Sort a failed send. `is_timeout()` comes first: a connect TIMEOUT (a
+/// blackholed address, or a SYN dropped rather than refused) reports
+/// `is_connect() == true` as well, so asking `is_connect()` first would call a
+/// wedged proxy "nothing is listening" when the truer reading is "something is
+/// there but not answering".
+fn unreached(e: &reqwest::Error) -> Unreached {
+    if e.is_timeout() {
+        Unreached::Silent("the server did not answer within 5s".to_string())
+    } else if e.is_connect() {
+        Unreached::Refused
+    } else {
+        Unreached::Silent(e.to_string())
+    }
+}
+
+/// Send one request to the running proxy at `path` on 127.0.0.1 and the
+/// configured port. Every call to a `/_tcr/` route goes through here.
+///
+/// The client never honours a system proxy: `HTTP_PROXY` commonly points AT
+/// tcr, so honouring it would send this request through the proxy it is about.
+/// The api-key goes on every request, because no local route has a loopback
+/// exemption. 2s to connect, 5s in total.
+async fn send_loopback(
     config: &Config,
-    query: &str,
-    disabled: bool,
-) -> Result<crate::proxy::SetDisabledResponse, LiveControlError> {
+    path: &str,
+    build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, Unreached> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
         .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::DISABLED_PATH
-    );
-    let mut request = client.post(&url).json(&serde_json::json!({
-        "query": query,
-        "disabled": disabled,
-    }));
+        .map_err(|e| Unreached::Unbuilt(format!("http client: {e}")))?;
+    let url = format!("http://127.0.0.1:{}{path}", config.proxy.port);
+    let mut request = build(&client, &url);
     if let Some(key) = config.proxy.api_key.as_deref() {
         request = request.header("x-api-key", key);
     }
+    request.send().await.map_err(|e| unreached(&e))
+}
 
-    let response = match request.send().await {
-        Ok(r) => r,
-        // `is_timeout()` first: a connect TIMEOUT (a blackholed address, SYN
-        // dropped rather than refused) reports `is_connect() == true` as
-        // well, so checking `is_connect()` first would misclassify it as
-        // `NoServer` — "nothing is listening" — when the truer reading is
-        // "something is there but not answering", `NoAnswer` below.
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
+/// One local mutating route on the running proxy, as data: where it is, the
+/// [`crate::proxy::ENDPOINT_HEADER`] value it stamps on its answers, and which
+/// stamped statuses mean "the route refused this request".
+struct ControlRoute {
+    path: &'static str,
+    endpoint: &'static str,
+    /// Stamped statuses that are the route saying no, carried to the caller as
+    /// [`LiveControlError::Rejected`] with the server's own message. Per route,
+    /// because each route refuses with its own codes: 404 is "no such account"
+    /// on the account routes, 400 is request validation on the add and settings
+    /// routes, and 409 is an ambiguous match everywhere.
+    refusals: &'static [u16],
+    /// What the 2xx body is, for the error when it does not parse.
+    noun: &'static str,
+    /// Whether a 2xx counts only when the route stamped it.
+    success_needs_stamp: bool,
+}
+
+const DISABLED_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::DISABLED_PATH,
+    endpoint: crate::proxy::DISABLED_ENDPOINT,
+    refusals: &[404, 409],
+    noun: "account-control",
+    success_needs_stamp: false,
+};
+
+/// 400 is the route's own request validation (a blank name or token), the
+/// positive capability signal `oauth::probe_add_route` looks for; 409 is a
+/// submitted identity that matched more than one live account.
+const ADD_ACCOUNT_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::ADD_ACCOUNT_PATH,
+    endpoint: crate::proxy::ADD_ACCOUNT_ENDPOINT,
+    refusals: &[400, 409],
+    noun: "account-add",
+    success_needs_stamp: false,
+};
+
+const CONTROL_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::CONTROL_PATH,
+    endpoint: crate::proxy::CONTROL_ENDPOINT,
+    refusals: &[404, 409],
+    noun: "control-account",
+    success_needs_stamp: false,
+};
+
+const PRIORITY_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::PRIORITY_PATH,
+    endpoint: crate::proxy::PRIORITY_ENDPOINT,
+    refusals: &[404, 409],
+    noun: "priority",
+    success_needs_stamp: false,
+};
+
+/// Both halves of [`crate::proxy::CONFIG_PATH`], the `GET` and the `POST`.
+const CONFIG_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::CONFIG_PATH,
+    endpoint: crate::proxy::CONFIG_ENDPOINT,
+    refusals: &[400, 409],
+    noun: "settings",
+    success_needs_stamp: true,
+};
+
+/// What [`call_route`] read: the sorted answer, and the response headers when
+/// the route stamped the answer, so a caller can read a second header off the
+/// same response with no second round trip.
+struct RouteAnswer<T> {
+    result: Result<T, LiveControlError>,
+    stamped: Option<reqwest::header::HeaderMap>,
+}
+
+/// Send one request to `route` and sort the answer.
+///
+/// Whether THIS route produced the answer is decided ONLY by
+/// [`crate::proxy::ENDPOINT_HEADER`], never by status code or error text: a 404
+/// from a tcr without the route and a 404 meaning "no such account" are the same
+/// status with opposite consequences, and the header is the only difference that
+/// is not a matched error string. So an unstamped 404 or 405 is
+/// [`LiveControlError::NoRoute`], and a stamped refusal status is
+/// [`LiveControlError::Rejected`] carrying the server's message.
+async fn call_route<T: serde::de::DeserializeOwned>(
+    config: &Config,
+    route: &ControlRoute,
+    build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> RouteAnswer<T> {
+    let response = match send_loopback(config, route.path, build).await {
+        Ok(response) => response,
+        Err(unreached) => {
+            return RouteAnswer {
+                result: Err(unreached.into()),
+                stamped: None,
+            };
         }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
     };
-
     let status = response.status();
-    // Whether THIS route produced the answer, decided structurally. A 404 from a
-    // tcr without the route and a 404 meaning "no such account" are the same status
-    // code with opposite consequences, and the header is the only difference that
-    // is not a matched error string.
     let from_route = response
         .headers()
         .get(crate::proxy::ENDPOINT_HEADER)
         .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::DISABLED_ENDPOINT);
-    let body = response.text().await.unwrap_or_default();
+        == Some(route.endpoint);
+    let stamped = from_route.then(|| response.headers().clone());
+    let body = response.text().await;
+    let message = || body.as_deref().ok().and_then(error_message_of);
 
-    if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!(
-                "the response was not a tcr account-control payload ({e})"
-            ))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    if from_route && matches!(status.as_u16(), 404 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+    let result = if status.is_success() && (from_route || !route.success_needs_stamp) {
+        match &body {
+            Ok(body) => serde_json::from_str(body).map_err(|e| {
+                LiveControlError::Unusable(format!(
+                    "the response was not a tcr {} payload ({e})",
+                    route.noun
+                ))
+            }),
+            Err(e) => Err(LiveControlError::Unusable(format!(
+                "reading the answer: {e}"
+            ))),
+        }
+    } else if status.as_u16() == 401 {
+        Err(LiveControlError::Unauthorized)
+    } else if !from_route && matches!(status.as_u16(), 404 | 405) {
+        Err(LiveControlError::NoRoute)
+    } else if from_route && route.refusals.contains(&status.as_u16()) {
+        Err(LiveControlError::Rejected(
+            message().unwrap_or_else(|| format!("HTTP {status}")),
+        ))
+    } else {
+        Err(LiveControlError::Unusable(format!(
+            "HTTP {status}{}",
+            message().map(|m| format!(": {m}")).unwrap_or_default()
+        )))
+    };
+    RouteAnswer { result, stamped }
+}
+
+/// Ask the running proxy to park/unpark an account.
+async fn post_set_disabled(
+    config: &Config,
+    query: &str,
+    disabled: bool,
+) -> Result<crate::proxy::SetDisabledResponse, LiveControlError> {
+    let body = serde_json::json!({ "query": query, "disabled": disabled });
+    call_route(config, &DISABLED_ROUTE, |client, url| {
+        client.post(url).json(&body)
+    })
+    .await
+    .result
 }
 
 /// Ask the running proxy to add an account to the live rotation, or — when the
 /// submitted identity already matches one — replace its credentials in place.
-/// No restart, so no session pin is invalidated. Mirrors [`post_set_disabled`]:
-/// same `no_proxy()` client (`HTTP_PROXY` commonly points AT tcr), same
-/// timeouts, same api-key header — the control route has no loopback
-/// exemption either.
+/// No restart, so no session pin is invalidated.
 ///
 /// `account` is POSTed directly as the request body: [`config::Account`]
 /// already serializes to the exact wire shape
@@ -1888,13 +2016,9 @@ async fn post_set_disabled(
 /// for a real login, or `crate::oauth::probe_add_route`'s deliberately
 /// blank probe — and this function never re-lists its fields.
 ///
-/// Reuses [`LiveControlError`] rather than a parallel enum, extended with one
-/// more structural case [`post_set_disabled`] never needs: a `400` FROM the
-/// route (stamped) is this route's own request-validation failure — e.g. a
-/// blank name or token — and is exactly as much a "the route said no" signal
-/// as the `404`/`409` [`post_set_disabled`] already treats that way. The
-/// [`crate::proxy::ENDPOINT_HEADER`] stamp remains the only thing that
-/// decides "no such route" vs "the route said no" — never error text.
+/// A stamped `400` is this route's own request-validation failure (a blank
+/// name or token), and reads as [`LiveControlError::Rejected`] like a stamped
+/// `409`; see [`ADD_ACCOUNT_ROUTE`].
 pub(crate) async fn post_add_account(
     config: &Config,
     account: &Account,
@@ -1918,99 +2042,22 @@ pub(crate) async fn post_add_account_with_providers(
     Result<crate::proxy::AddAccountResponse, LiveControlError>,
     Vec<crate::provider::Provider>,
 ) {
-    let mut providers = Vec::new();
-    let result = post_add_account_reading(config, account, &mut providers).await;
-    (result, providers)
-}
-
-/// The request [`post_add_account_with_providers`] makes, with `providers` filled
-/// from a stamped answer's [`crate::proxy::PROVIDERS_HEADER`].
-async fn post_add_account_reading(
-    config: &Config,
-    account: &Account,
-    providers: &mut Vec<crate::provider::Provider>,
-) -> Result<crate::proxy::AddAccountResponse, LiveControlError> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::ADD_ACCOUNT_PATH
-    );
-    let mut request = client.post(&url).json(account);
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-
-    let response = match request.send().await {
-        Ok(r) => r,
-        // `is_timeout()` first: a connect TIMEOUT (a blackholed address, SYN
-        // dropped rather than refused) reports `is_connect() == true` as
-        // well, so checking `is_connect()` first would misclassify it as
-        // `NoServer` — "nothing is listening" — when the truer reading is
-        // "something is there but not answering", `NoAnswer` below.
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
-    };
-
-    let status = response.status();
-    // Same structural discriminator `post_set_disabled` uses: whether THIS
-    // route produced the answer, decided by the header, never by status code
-    // or error text alone.
-    let from_route = response
-        .headers()
-        .get(crate::proxy::ENDPOINT_HEADER)
+    let answer: RouteAnswer<crate::proxy::AddAccountResponse> =
+        call_route(config, &ADD_ACCOUNT_ROUTE, |client, url| {
+            client.post(url).json(account)
+        })
+        .await;
+    let providers = answer
+        .stamped
+        .as_ref()
+        .and_then(|headers| headers.get(crate::proxy::PROVIDERS_HEADER))
         .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::ADD_ACCOUNT_ENDPOINT);
-    if from_route
-        && let Some(advertised) = response
-            .headers()
-            .get(crate::proxy::PROVIDERS_HEADER)
-            .and_then(|v| v.to_str().ok())
-    {
-        *providers = crate::proxy::providers_in_header(advertised);
-    }
-    let body = response.text().await.unwrap_or_default();
-
-    if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!(
-                "the response was not a tcr account-add payload ({e})"
-            ))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    // 400: the route's own request validation (blank name/token) — the
-    // positive capability signal `oauth::probe_add_route` looks for. 409: the
-    // submitted identity matched more than one live account.
-    if from_route && matches!(status.as_u16(), 400 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+        .map(crate::proxy::providers_in_header)
+        .unwrap_or_default();
+    (answer.result, providers)
 }
 
 /// Ask the running proxy to set or clear the identity-bound control account.
-/// Cloned from [`post_set_disabled`]: same `no_proxy()` client, same timeouts,
-/// same api-key header, same `is_timeout()`-before-`is_connect()` ordering,
-/// and `from_route` decided ONLY by [`crate::proxy::ENDPOINT_HEADER`] ==
-/// [`crate::proxy::CONTROL_ENDPOINT`] — never by status code or error text.
 ///
 /// `query = None` is the CLEAR request; it is sent through exactly like a
 /// name, since [`crate::proxy::SetControlRequest`] treats `query: null` as a
@@ -2019,203 +2066,26 @@ async fn post_set_control(
     config: &Config,
     query: Option<&str>,
 ) -> Result<crate::proxy::SetControlResponse, LiveControlError> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::CONTROL_PATH
-    );
-    let mut request = client
-        .post(&url)
-        .json(&serde_json::json!({ "query": query }));
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-
-    let response = match request.send().await {
-        Ok(r) => r,
-        // `is_timeout()` first — see `post_set_disabled`'s identical comment
-        // on why checking `is_connect()` first would misclassify a blackholed
-        // address as `NoServer`.
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
-    };
-
-    let status = response.status();
-    let from_route = response
-        .headers()
-        .get(crate::proxy::ENDPOINT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::CONTROL_ENDPOINT);
-    let body = response.text().await.unwrap_or_default();
-
-    if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!(
-                "the response was not a tcr control-account payload ({e})"
-            ))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    if from_route && matches!(status.as_u16(), 404 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+    let body = serde_json::json!({ "query": query });
+    call_route(config, &CONTROL_ROUTE, |client, url| {
+        client.post(url).json(&body)
+    })
+    .await
+    .result
 }
 
 /// Ask the running proxy to set one account's priority in its live rotation.
-/// Cloned from [`post_set_disabled`]: same `no_proxy()` client, same timeouts,
-/// same api-key header, same `is_timeout()`-before-`is_connect()` ordering,
-/// and `from_route` decided ONLY by [`crate::proxy::ENDPOINT_HEADER`] ==
-/// [`crate::proxy::PRIORITY_ENDPOINT`].
 async fn post_set_priority(
     config: &Config,
     query: &str,
     priority: i64,
 ) -> Result<crate::proxy::SetPriorityResponse, LiveControlError> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::PRIORITY_PATH
-    );
-    let mut request = client.post(&url).json(&serde_json::json!({
-        "query": query,
-        "priority": priority,
-    }));
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-
-    let response = match request.send().await {
-        Ok(r) => r,
-        // `is_timeout()` first: see `post_set_disabled`'s identical comment.
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
-    };
-
-    let status = response.status();
-    let from_route = response
-        .headers()
-        .get(crate::proxy::ENDPOINT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::PRIORITY_ENDPOINT);
-    let body = response.text().await.unwrap_or_default();
-
-    if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!("the response was not a tcr priority payload ({e})"))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    if from_route && matches!(status.as_u16(), 404 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!("HTTP {status}")))
-}
-
-/// The client every call to [`crate::proxy::CONFIG_PATH`] uses: the same
-/// `no_proxy()` client and timeouts as [`post_set_disabled`].
-fn config_route_client() -> Result<reqwest::Client, LiveControlError> {
-    reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))
-}
-
-/// Send one request to [`crate::proxy::CONFIG_PATH`] and sort the answer the
-/// way [`post_set_priority`] does: `is_timeout()` before `is_connect()`, and
-/// "the route answered" decided ONLY by [`crate::proxy::ENDPOINT_HEADER`] ==
-/// [`crate::proxy::CONFIG_ENDPOINT`]. A stamped 400 or 409 is the route
-/// refusing; the 200 body is parsed as `T`.
-async fn config_route_call<T: serde::de::DeserializeOwned>(
-    config: &Config,
-    request: reqwest::RequestBuilder,
-) -> Result<T, LiveControlError> {
-    let mut request = request;
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-    let response = match request.send().await {
-        Ok(r) => r,
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
-    };
-    let status = response.status();
-    let from_route = response
-        .headers()
-        .get(crate::proxy::ENDPOINT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::CONFIG_ENDPOINT);
-    let body = response
-        .text()
-        .await
-        .map_err(|e| LiveControlError::Unusable(format!("reading the answer: {e}")))?;
-    if status.is_success() && from_route {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!("the response was not a tcr settings payload ({e})"))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    if from_route && matches!(status.as_u16(), 400 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!(
-        "HTTP {status}{}",
-        error_message_of(&body)
-            .map(|m| format!(": {m}"))
-            .unwrap_or_default()
-    )))
+    let body = serde_json::json!({ "query": query, "priority": priority });
+    call_route(config, &PRIORITY_ROUTE, |client, url| {
+        client.post(url).json(&body)
+    })
+    .await
+    .result
 }
 
 /// Hand one setting to the running proxy, which writes it to its config file.
@@ -2223,16 +2093,15 @@ async fn post_set_config(
     config: &Config,
     setting: &crate::config_set::Setting,
 ) -> Result<crate::proxy::SetConfigResponse, LiveControlError> {
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::CONFIG_PATH
-    );
-    let request = config_route_client()?.post(&url).json(&serde_json::json!({
+    let body = serde_json::json!({
         "key": setting.key().as_str(),
         "value": setting.value_text(),
-    }));
-    config_route_call(config, request).await
+    });
+    call_route(config, &CONFIG_ROUTE, |client, url| {
+        client.post(url).json(&body)
+    })
+    .await
+    .result
 }
 
 /// The settings the running proxy is using: its `GET` on
@@ -2240,13 +2109,9 @@ async fn post_set_config(
 async fn fetch_running_settings(
     config: &Config,
 ) -> Result<crate::config_show::ConfigSettings, LiveControlError> {
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::CONFIG_PATH
-    );
-    let request = config_route_client()?.get(&url);
-    config_route_call(config, request).await
+    call_route(config, &CONFIG_ROUTE, |client, url| client.get(url))
+        .await
+        .result
 }
 
 /// The file half of `tcr control`: resolve OFFLINE (when `query` is `Some`) →
@@ -3558,6 +3423,16 @@ pub enum LiveStatusError {
     Unusable(String),
 }
 
+impl From<Unreached> for LiveStatusError {
+    fn from(unreached: Unreached) -> Self {
+        match unreached {
+            Unreached::Refused => LiveStatusError::NoServer,
+            Unreached::Silent(why) => LiveStatusError::NoAnswer(why),
+            Unreached::Unbuilt(why) => LiveStatusError::Unusable(why),
+        }
+    }
+}
+
 impl LiveStatusError {
     /// Did an HTTP response come back at all?
     ///
@@ -3659,38 +3534,10 @@ fn parse_live_status(body: &str) -> Result<StatusPayload, LiveStatusError> {
 /// The transport half of [`fetch_live_status`]: one GET, every failure mode
 /// classified, the body handed back unparsed.
 async fn fetch_live_status_body(config: &Config) -> Result<String, LiveStatusError> {
-    let client = reqwest::Client::builder()
-        // Never route our own loopback read through a system proxy: `HTTP_PROXY`
-        // very commonly points AT tcr, so honouring it would send this query
-        // through the endpoint it is asking about.
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveStatusError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::STATUS_PATH
-    );
-    let mut request = client.get(&url);
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-
-    let response = match request.send().await {
-        Ok(r) => r,
-        Err(e) if e.is_connect() => return Err(LiveStatusError::NoServer),
-        Err(e) if e.is_timeout() => {
-            return Err(LiveStatusError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        // No response object came back, and it was neither a refused connect nor
-        // the deadline: a reset or a truncated read. Nothing was served.
-        Err(e) => return Err(LiveStatusError::NoAnswer(e.to_string())),
-    };
+    let response = send_loopback(config, crate::proxy::STATUS_PATH, |client, url| {
+        client.get(url)
+    })
+    .await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -8448,6 +8295,36 @@ mod tests {
             }
         }
         drop(listener);
+    }
+
+    /// The other WEDGED shape: the connect itself runs into its 2s deadline,
+    /// because the SYN is dropped rather than refused. reqwest reports that
+    /// error as BOTH `is_connect()` and `is_timeout()`, so a sort that asks
+    /// `is_connect()` first files a wedged proxy as "nothing is listening", and
+    /// `tcr status` falls back offline without a word. The status read had that
+    /// order until it shared [`send_loopback`] with the control routes.
+    ///
+    /// A loopback port cannot stage it: a full accept queue on macOS answers
+    /// with a reset, not silence. So the request goes to a TEST-NET-3 address
+    /// (RFC 5737), which nobody answers, and costs the 2s connect deadline.
+    #[tokio::test]
+    async fn a_connect_timeout_is_no_answer_not_no_server() {
+        let config = load_from(TWO_ACCOUNTS);
+        let started = std::time::Instant::now();
+        let sent = send_loopback(&config, crate::proxy::STATUS_PATH, |client, _| {
+            client.get("http://203.0.113.10:41000/_tcr/status")
+        })
+        .await;
+        let waited = started.elapsed();
+        match sent.map_err(LiveStatusError::from) {
+            Err(LiveStatusError::NoAnswer(_)) => {}
+            Err(other) => panic!(
+                "a connect that ran into its deadline must be NoAnswer, got {other:?} after \
+                 {waited:?} (well under 2s means this box has no route to TEST-NET-3, which \
+                 refuses instead of blackholing)"
+            ),
+            Ok(response) => panic!("TEST-NET-3 answered: HTTP {}", response.status()),
+        }
     }
 
     /// The classification the two tests above exercise, pinned directly so a
