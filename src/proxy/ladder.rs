@@ -12,11 +12,11 @@ use time::OffsetDateTime;
 use crate::manager::Manager;
 use crate::provider::Provider;
 
+use super::client_error::{ClientError, ErrorKind};
 use super::{
     ServedBy, bad_gateway, build_response, codex_credential_refused_message, codex_error_body,
     codex_error_response, codex_model_unavailable_response, codex_refused_pool_response,
-    credential_refused_response, error_response, every_attempt_transport_failed,
-    offline_unavailable,
+    credential_refused_response, every_attempt_transport_failed, offline_unavailable,
 };
 
 /// What every attempt of one request came back with, counted across the whole ladder.
@@ -88,9 +88,10 @@ impl Tally {
             // Reachable only if the offline arm's own bound was not what ended the walk (a
             // mixed request that rotated for another reason first).
             if self.offline_failures > 0 {
-                return Some(offline_unavailable(self.offline_failures));
+                return Some(offline_unavailable(provider, self.offline_failures));
             }
             return Some(bad_gateway(
+                provider,
                 self.transport_failures,
                 self.unknown_outcome_transport_failure,
             ));
@@ -106,12 +107,14 @@ impl Tally {
         if self.codex_access_read_failures > 0
             && self.codex_access_read_failures == self.upstream_responses
         {
-            return Some(error_response(
-                StatusCode::BAD_GATEWAY,
-                "proxy_error",
-                "Could not read the upstream access-denied responses. The affected Codex accounts are held briefly; retry shortly.",
-                None,
-            ));
+            return Some(
+                ClientError::new(
+                    StatusCode::BAD_GATEWAY,
+                    ErrorKind::Proxy,
+                    "Could not read the upstream access-denied responses. The affected Codex accounts are held briefly; retry shortly.",
+                )
+                .respond(provider),
+            );
         }
         if self.account_access_blocks > 0
             && self.account_access_blocks + self.refused_403.len() == self.upstream_responses

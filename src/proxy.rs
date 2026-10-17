@@ -61,8 +61,10 @@ use crate::provider::Provider;
 use crate::quota::{UnifiedRejectionKind, quota_rejections};
 use crate::stats::{GateReason, RequestLogEntry, SessionKind};
 
+mod client_error;
 mod ladder;
 
+use client_error::{ClientError, ErrorKind};
 use ladder::Tally;
 
 /// Cap on a buffered request body (256 MiB) — a single-user localhost proxy has
@@ -1596,17 +1598,20 @@ async fn refuse_foreign_client(manager: &Manager, bearer: &str) -> Option<Respon
     if mode == ControlIdentityMode::Warn {
         return None;
     }
-    Some(error_response(
-        StatusCode::FORBIDDEN,
-        "permission_error",
-        &format!(
-            "tcr: this client is signed in as {client_shown}, but controlAccount is {control_email}, \
-             so its connectors, plugins and settings would come from the wrong account. \
-             Run /logout, then /login as {control_email} — or set \"controlIdentity\": \"warn\" \
-             (or \"off\") in the tcr config to serve it anyway."
-        ),
-        None,
-    ))
+    // Anthropic requests only: see the call site in `handle_request`.
+    Some(
+        ClientError::new(
+            StatusCode::FORBIDDEN,
+            ErrorKind::Permission,
+            format!(
+                "tcr: this client is signed in as {client_shown}, but controlAccount is {control_email}, \
+                 so its connectors, plugins and settings would come from the wrong account. \
+                 Run /logout, then /login as {control_email} — or set \"controlIdentity\": \"warn\" \
+                 (or \"off\") in the tcr config to serve it anyway."
+            ),
+        )
+        .respond(Provider::Anthropic),
+    )
 }
 
 /// Build the proxy router. Every method and path funnels through the single
@@ -3325,12 +3330,12 @@ async fn handle_request(
     {
         let provided = req_headers.get("x-api-key").and_then(|v| v.to_str().ok());
         if !key_matches(provided, expected) {
-            return error_response(
+            return ClientError::new(
                 StatusCode::UNAUTHORIZED,
-                "authentication_error",
+                ErrorKind::Authentication,
                 "Missing or invalid x-api-key.",
-                None,
-            );
+            )
+            .respond(provider);
         }
     }
 
@@ -3363,12 +3368,12 @@ async fn handle_request(
     //     Placed AFTER the api-key gate, like the guards below it: a request that
     //     cannot authenticate learns nothing here it would not learn anywhere else.
     if path_is_ambiguous(&path) {
-        return error_response(
+        return ClientError::new(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Request path must not contain a dot segment or a backslash.",
-            None,
-        );
+        )
+        .respond(provider);
     }
 
     // 1b. Everything under `/_tcr/` is OURS. The router matches the registered
@@ -3383,12 +3388,12 @@ async fn handle_request(
     //     miss it and are forwarded (measured). See [`LOCAL_PREFIX`] for why that is
     //     a forwarded 404 rather than a hole, and why it is left as it is.
     if path_is_under(&path, LOCAL_PREFIX) {
-        return error_response(
+        return ClientError::new(
             StatusCode::NOT_FOUND,
-            "not_found_error",
+            ErrorKind::NotFound,
             "Unknown tcr endpoint.",
-            None,
-        );
+        )
+        .respond(provider);
     }
 
     // 1c. Host guard: tcr is a credential-injecting reverse proxy for
@@ -3422,12 +3427,12 @@ async fn handle_request(
         // mean", on both paths.
         if !host_is_loopback(host) && !crate::mitm::host_allowed(host) {
             tracing::debug!(target_host = %host, "rejected misrouted forward-proxy request");
-            return error_response(
+            return ClientError::new(
                 StatusCode::MISDIRECTED_REQUEST,
-                "invalid_request_error",
+                ErrorKind::InvalidRequest,
                 "This proxy only serves its configured upstream hosts (Anthropic and Codex); refusing to forward a request for a different host.",
-                None,
-            );
+            )
+            .respond(provider);
         }
     }
     // A decrypted request stays on its CONNECT host. Marked ChatGPT connections may
@@ -3455,12 +3460,12 @@ async fn handle_request(
             .map(|host| host_path_disagreement(host, &path, provider)),
     };
     if let Some(message) = refusal {
-        return error_response(
+        return ClientError::new(
             StatusCode::MISDIRECTED_REQUEST,
-            "invalid_request_error",
-            &message,
-            None,
-        );
+            ErrorKind::InvalidRequest,
+            message,
+        )
+        .respond(provider);
     }
 
     // 1c'. A WebSocket upgrade on the Codex inference path is answered here, never forwarded.
@@ -3568,15 +3573,15 @@ async fn handle_request(
 
     // 2. Buffer the body once so it can be re-sent verbatim on every rotation.
     let Ok(body_bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error_response(
+        return ClientError::new(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Failed to read request body.",
-            None,
-        );
+        )
+        .respond(provider);
     };
 
-    // The body is parsed ONCE, here, into every answer the rest of the handler reads
+    //The body is parsed ONCE, here, into every answer the rest of the handler reads
     // from it: the model, the wire session and its tool events, the account-bound
     // tokens, the affinity key's inputs, the extended-cache-window answer and the
     // account-uuid splice point. See `crate::request_body` for why one walk, and how
@@ -3946,6 +3951,7 @@ async fn handle_request(
             // Told first, once: the client's retry of this 429 is the request that moves.
             if let Some(warning) = switch_warning(
                 &manager,
+                provider,
                 session_key,
                 bound_idx,
                 now,
@@ -4358,6 +4364,7 @@ async fn handle_request(
                             {
                                 if let Some(warning) = switch_warning(
                                     &manager,
+                                    provider,
                                     session_key,
                                     bound,
                                     now,
@@ -4796,7 +4803,7 @@ async fn handle_request(
                         tokio::time::sleep(Duration::from_secs(OFFLINE_WAIT_SECS)).await;
                         continue;
                     }
-                    return offline_unavailable(tally.offline_failures);
+                    return offline_unavailable(provider, tally.offline_failures);
                 }
                 // Past the connect phase: a connection existed and the request may
                 // already be in flight on the wire, so this attempt's outcome upstream
@@ -5069,12 +5076,12 @@ async fn handle_request(
                                 Body::from(body),
                                 ServedBy::PooledAccount,
                             ),
-                            None => error_response(
+                            None => ClientError::new(
                                 StatusCode::BAD_GATEWAY,
-                                "proxy_error",
+                                ErrorKind::Proxy,
                                 "Failed to read the upstream access-denied response.",
-                                None,
-                            ),
+                            )
+                            .respond(provider),
                         };
                     }
                 }
@@ -5862,20 +5869,20 @@ async fn handle_request(
         let bytes = match read_capped_body(resp.bytes_stream(), MAX_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(BodyReadError::Transport) => {
-                return error_response(
+                return ClientError::new(
                     StatusCode::BAD_GATEWAY,
-                    "proxy_error",
+                    ErrorKind::Proxy,
                     "Failed to read upstream response body.",
-                    None,
-                );
+                )
+                .respond(provider);
             }
             Err(BodyReadError::TooLarge) => {
-                return error_response(
+                return ClientError::new(
                     StatusCode::BAD_GATEWAY,
-                    "proxy_error",
+                    ErrorKind::Proxy,
                     "Upstream response body exceeded the size cap.",
-                    None,
-                );
+                )
+                .respond(provider);
             }
         };
         let buffered_at = Instant::now();
@@ -6173,12 +6180,12 @@ pub(crate) fn wants_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Built QUIETLY ([`quiet_error_response`]): every Codex session opens with an upgrade, so a
 /// warn here would be one false alarm per session. `handle` logs it at debug.
 pub(crate) fn upgrade_required_response() -> Response {
-    quiet_error_response(
+    ClientError::new(
         StatusCode::UPGRADE_REQUIRED,
-        "upgrade_required",
+        ErrorKind::UpgradeRequired,
         "tcr relays Codex over HTTP streaming only; the client falls back to SSE for this session.",
-        None,
     )
+    .respond_quiet(Provider::Codex)
 }
 
 /// Does this Codex request name a workspace routing of its own
@@ -6635,20 +6642,20 @@ async fn relay_request(
     timing: &mut Option<RelayTiming>,
 ) -> Response {
     let Some(client) = relay_client() else {
-        return error_response(
+        return ClientError::new(
             StatusCode::BAD_GATEWAY,
-            "proxy_error",
+            ErrorKind::Proxy,
             "Could not build the relay HTTP client.",
-            None,
-        );
+        )
+        .respond(provider);
     };
     let Ok(body_bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error_response(
+        return ClientError::new(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Failed to read request body.",
-            None,
-        );
+        )
+        .respond(provider);
     };
 
     let headers = match mode {
@@ -6696,17 +6703,17 @@ async fn relay_request(
             // 502 with no `x-should-retry`: telling a client to retry it is a
             // decision about relayed paths this arm does not make.
             if is_offline_error(&err) {
-                return offline_unavailable(1);
+                return offline_unavailable(provider, 1);
             }
             if err.is_connect() {
-                return bad_gateway(1, false);
+                return bad_gateway(provider, 1, false);
             }
-            return error_response(
+            return ClientError::new(
                 StatusCode::BAD_GATEWAY,
-                "proxy_error",
+                ErrorKind::Proxy,
                 "Upstream unreachable.",
-                None,
-            );
+            )
+            .respond(provider);
         }
     };
 
@@ -6773,18 +6780,18 @@ async fn relay_request(
         }
         RelayMode::Raw => match read_capped_body(resp.bytes_stream(), MAX_BODY_BYTES).await {
             Ok(bytes) => build_response(status, &up_headers, Body::from(bytes), ServedBy::Caller),
-            Err(BodyReadError::Transport) => error_response(
+            Err(BodyReadError::Transport) => ClientError::new(
                 StatusCode::BAD_GATEWAY,
-                "proxy_error",
+                ErrorKind::Proxy,
                 "Failed to read upstream response body.",
-                None,
-            ),
-            Err(BodyReadError::TooLarge) => error_response(
+            )
+            .respond(provider),
+            Err(BodyReadError::TooLarge) => ClientError::new(
                 StatusCode::BAD_GATEWAY,
-                "proxy_error",
+                ErrorKind::Proxy,
                 "Upstream response body exceeded the size cap.",
-                None,
-            ),
+            )
+            .respond(provider),
         },
     }
 }
@@ -8254,12 +8261,10 @@ fn exhausted_response(
         bound_to = bound_name.as_deref().unwrap_or("-"),
         "returning exhausted 429 to client"
     );
-    let mut response = error_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        "rate_limit_error",
-        &detail,
-        Some(advertised_retry_after),
-    );
+    let mut response =
+        ClientError::new(StatusCode::TOO_MANY_REQUESTS, ErrorKind::RateLimit, detail)
+            .retry_after(advertised_retry_after)
+            .respond(provider);
     // Held history never carries a claim. The held account's window is not this user's limit:
     // an account that is really out releases the conversation to the fleet
     // (`Manager::bound_account_holds`), so a 429 that reaches here for held history is a wait
@@ -8394,6 +8399,7 @@ const SWITCH_WARNING_RETRY_AFTER_SECS: i64 = 3;
 /// Names no account, because the body can travel to a borrowing peer.
 fn switch_warning(
     manager: &Manager,
+    provider: Provider,
     session_key: Option<u64>,
     bound_idx: usize,
     now: OffsetDateTime,
@@ -8431,15 +8437,18 @@ fn switch_warning(
         retry_after = SWITCH_WARNING_RETRY_AFTER_SECS,
         "held conversation's account is out; warning the client once before moving it"
     );
-    Some(error_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        "rate_limit_error",
-        &format!(
-            "tcr: the account holding this conversation is out ({why}{until}); the retry moves \
-             it to another account, where its prompt cache starts cold."
-        ),
-        Some(SWITCH_WARNING_RETRY_AFTER_SECS),
-    ))
+    Some(
+        ClientError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorKind::RateLimit,
+            format!(
+                "tcr: the account holding this conversation is out ({why}{until}); the retry moves \
+                 it to another account, where its prompt cache starts cold."
+            ),
+        )
+        .retry_after(SWITCH_WARNING_RETRY_AFTER_SECS)
+        .respond(provider),
+    )
 }
 
 /// What a gate means, in words a person reads after an account count or after "out".
@@ -8547,7 +8556,7 @@ fn every_attempt_transport_failed(transport_failures: usize, upstream_responses:
 /// both are "a network hiccup, not a durable fault, come back in a few
 /// seconds", and that number is already the one a live measurement
 /// (2026-08-10, see its doc-comment) established for exactly that recommendation.
-fn bad_gateway(transport_failures: usize, unknown_outcome: bool) -> Response {
+fn bad_gateway(provider: Provider, transport_failures: usize, unknown_outcome: bool) -> Response {
     if unknown_outcome {
         tracing::warn!(
             transport_failures,
@@ -8555,20 +8564,17 @@ fn bad_gateway(transport_failures: usize, unknown_outcome: bool) -> Response {
              got past the connect phase, so its outcome upstream is unknown; telling the \
              client not to retry automatically"
         );
-        let mut response = error_response(
+        ClientError::new(
             StatusCode::BAD_GATEWAY,
-            "proxy_error",
-            &format!(
+            ErrorKind::Proxy,
+            format!(
                 "Upstream unreachable: all {transport_failures} attempt(s) failed in transport, \
                  and at least one may have reached the upstream before failing. Its outcome is \
                  unknown — do not retry this request automatically."
             ),
-            None,
-        );
-        response
-            .headers_mut()
-            .insert("x-should-retry", HeaderValue::from_static("false"));
-        response
+        )
+        .should_retry(false)
+        .respond(provider)
     } else {
         tracing::warn!(
             transport_failures,
@@ -8576,19 +8582,17 @@ fn bad_gateway(transport_failures: usize, unknown_outcome: bool) -> Response {
             "returning 503 to client — every attempt failed at the connect phase; nothing \
              reached an upstream, so retrying is safe"
         );
-        let mut response = error_response(
+        ClientError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "proxy_error",
-            &format!(
+            ErrorKind::Proxy,
+            format!(
                 "Upstream unreachable: all {transport_failures} attempt(s) failed before a \
                  connection was made. Safe to retry in {OFFLINE_RETRY_AFTER_SECS}s."
             ),
-            Some(OFFLINE_RETRY_AFTER_SECS),
-        );
-        response
-            .headers_mut()
-            .insert("x-should-retry", HeaderValue::from_static("true"));
-        response
+        )
+        .retry_after(OFFLINE_RETRY_AFTER_SECS)
+        .should_retry(true)
+        .respond(provider)
     }
 }
 
@@ -8600,22 +8604,23 @@ fn bad_gateway(transport_failures: usize, unknown_outcome: bool) -> Response {
 /// upstream when the fault is local, and it carries no `retry-after`, so a client
 /// has no guidance beyond "give up". The account pool is NOT rotated on this path
 /// and the session keeps its pin.
-fn offline_unavailable(dns_failures: usize) -> Response {
+fn offline_unavailable(provider: Provider, dns_failures: usize) -> Response {
     tracing::warn!(
         dns_failures,
         retry_after = OFFLINE_RETRY_AFTER_SECS,
         "returning 503 to client — name resolution is failing, this machine is offline; \
          the account pool was NOT rotated"
     );
-    error_response(
+    ClientError::new(
         StatusCode::SERVICE_UNAVAILABLE,
-        "proxy_error",
-        &format!(
+        ErrorKind::Proxy,
+        format!(
             "Name resolution failed on {dns_failures} attempt(s) — this machine appears to be \
              offline. No account was rotated. Retry in {OFFLINE_RETRY_AFTER_SECS}s."
         ),
-        Some(OFFLINE_RETRY_AFTER_SECS),
     )
+    .retry_after(OFFLINE_RETRY_AFTER_SECS)
+    .respond(provider)
 }
 
 /// The answer when every upstream answer this request got was a 403 refusing OUR pooled
@@ -8667,16 +8672,16 @@ fn credential_refused_response(
         "returning 502 to client — every account tried was refused with a 403; \
          re-login is likely required"
     );
-    error_response(
+    ClientError::new(
         StatusCode::BAD_GATEWAY,
-        "proxy_error",
-        &format!(
+        ErrorKind::Proxy,
+        format!(
             "Account credential(s) refused by upstream: {}. Re-login to the account \
              (`tcr login` or the TcrBar UI) — retrying will not help.",
             account_list.join(", ")
         ),
-        None,
     )
+    .respond(provider)
 }
 
 /// While every eligible account remains refused, preserve the access-denied status.
