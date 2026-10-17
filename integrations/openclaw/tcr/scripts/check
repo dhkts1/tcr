@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Smoke test: one Claude turn and one ChatGPT turn through the running Gateway, then tcr's view.
+# Usage: check [claude model] [openai model]
+set -uo pipefail
+
+claude_model=${1:-anthropic/claude-opus-5-5}
+openai_model=${2:-openai/gpt-6.1-sol}
+stamp=$(date +%s)
+
+codex_requests() {
+  tcr status --json 2>/dev/null | jq '[.[] | select((.provider // "") == "codex") | .requests // 0] | add // 0'
+}
+
+before=$(codex_requests)
+
+claude_out=$(openclaw agent --session-id "tcr-check-claude-$stamp" --model "$claude_model" --thinking low --json \
+  --message "Reply with exactly: tcr check ok" 2>/dev/null)
+claude_text=$(jq -r '(.result // .).payloads[0].text // empty' <<<"$claude_out")
+claude_session=$(jq -r '(.result // .).meta.agentMeta.sessionId // empty' <<<"$claude_out")
+
+openai_out=$(openclaw agent --session-id "tcr-check-openai-$stamp" --model "$openai_model" --thinking low --json \
+  --message "Reply with exactly: tcr check ok" 2>/dev/null)
+openai_text=$(jq -r '(.result // .).payloads[0].text // empty' <<<"$openai_out")
+
+after=$(codex_requests)
+
+echo "claude turn: ${claude_text:-NO REPLY}"
+if [ -n "$claude_session" ]; then
+  row=$(tcr sessions --json 2>/dev/null | jq -r --arg s "$claude_session" \
+    '.sessions[] | select(.sessionId == $s) | "account=\(.account) requests=\(.requests)"')
+  echo "  tcr session: ${row:-NOT SEEN BY TCR}"
+fi
+echo "chatgpt turn: ${openai_text:-NO REPLY}"
+echo "  tcr codex requests: $before -> $after"
+
+[ -n "$claude_text" ] && [ -n "${row:-}" ] && [ -n "$openai_text" ] && [ "$after" -gt "$before" ]

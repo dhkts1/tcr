@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Run openclaw on the tcr pool: Claude turns through `claude`, ChatGPT turns through Node's fetch,
+# both via tcr. Usage: openclaw-on-tcr <openclaw args>, e.g. openclaw-on-tcr gateway run
+set -euo pipefail
+
+port=${TCR_PORT:-3456}
+ca="$HOME/.config/tcr-ca.pem"
+
+command -v tcr >/dev/null || { echo "openclaw-on-tcr: tcr is not on PATH; see https://github.com/dhkts1/tcr#install" >&2; exit 2; }
+command -v openclaw >/dev/null || { echo "openclaw-on-tcr: openclaw is not on PATH" >&2; exit 2; }
+tcr sessions --json >/dev/null 2>&1 || { echo "openclaw-on-tcr: no tcr proxy is running; start it with \`tcr server\` (or open TcrBar)" >&2; exit 3; }
+[ -r "$ca" ] || { echo "openclaw-on-tcr: tcr's CA is missing at $ca; start \`tcr server\` once to create it" >&2; exit 3; }
+
+key=$(tcr request-key 2>/dev/null || true)
+if [ -n "$key" ]; then
+  proxy="http://tcr-codex:${key}@127.0.0.1:${port}"
+else
+  echo "openclaw-on-tcr: no request key in tcr's config; launching unkeyed" >&2
+  proxy="http://tcr-codex@127.0.0.1:${port}"
+fi
+unset key
+
+export HTTPS_PROXY="$proxy" https_proxy="$proxy"
+export NODE_EXTRA_CA_CERTS="$ca"
+export NODE_USE_ENV_PROXY=1
+exec openclaw "$@"
