@@ -26,78 +26,18 @@
     reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
 )]
 
-use std::collections::BTreeMap;
+/// The tracing capture layer the `peer_*` files share.
+#[path = "support/peer.rs"]
+mod peer_support;
+
+use peer_support::CaptureLayer;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::{Arc, Mutex};
 use tcr::log_err::LogErr as _;
 
 use tcr::pricing::PricingTable;
 use tcr::usage::{LedgerAccount, UsageRecord, UsageTracker};
 use tracing_subscriber::layer::SubscriberExt;
-
-/// One captured event: its formatted message and every field tracing handed
-/// us, so a test can assert on `dropped_lines` without re-deriving tracing's
-/// own formatting.
-#[derive(Debug, Clone)]
-struct CapturedEvent {
-    message: String,
-    fields: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Default)]
-struct CaptureLayer {
-    events: Arc<Mutex<Vec<CapturedEvent>>>,
-}
-
-struct FieldVisitor(BTreeMap<String, String>);
-
-impl tracing::field::Visit for FieldVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0
-            .insert(field.name().to_string(), format!("{value:?}"));
-    }
-
-    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.0.insert(field.name().to_string(), value.to_string());
-    }
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut visitor = FieldVisitor(BTreeMap::new());
-        event.record(&mut visitor);
-        let message = visitor
-            .0
-            .get("message")
-            .cloned()
-            .unwrap_or_else(|| "<no message field>".to_string());
-        self.events
-            .lock()
-            .expect("capture lock")
-            .push(CapturedEvent {
-                message,
-                fields: visitor.0,
-            });
-    }
-}
-
-impl CaptureLayer {
-    fn events(&self) -> Vec<CapturedEvent> {
-        self.events.lock().expect("capture lock").clone()
-    }
-
-    fn matching(&self, needle: &str) -> Vec<CapturedEvent> {
-        self.events()
-            .into_iter()
-            .filter(|e| e.message.contains(needle))
-            .collect()
-    }
-}
 
 /// A scratch directory named after this process and thread, so concurrent
 /// test runs never collide on it — same shape as `usage.rs`'s own `scratch`
