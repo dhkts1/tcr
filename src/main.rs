@@ -10394,37 +10394,9 @@ mod tests {
         );
     }
 
-    /// A `MakeWriter` that keeps what was written, so a test can inspect the
-    /// stdout sink without capturing the process's real stdout.
-    #[derive(Clone, Default)]
-    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl SharedBuf {
-        fn contents(&self) -> String {
-            let bytes = self.0.lock().expect("shared buffer poisoned").clone();
-            String::from_utf8_lossy(&bytes).into_owned()
-        }
-    }
-
-    impl std::io::Write for SharedBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("shared buffer poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-        type Writer = SharedBuf;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
+    // A `MakeWriter` that keeps what was written, so a test can inspect the
+    // stdout sink without capturing the process's real stdout.
+    use tcr::test_support::log_capture::SharedBuf;
 
     /// Reads back whatever `open_log_appender` actually wrote inside `dir` —
     /// there is exactly one matching file after a single, unrotated write.
