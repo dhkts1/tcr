@@ -11,6 +11,8 @@
 
 use std::collections::HashMap;
 use std::io::{self};
+
+use crate::log_err::LogErr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,8 +66,9 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste);
+        disable_raw_mode().log_warn("leaving raw mode");
+        execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste)
+            .log_warn("leaving the alternate screen");
     }
 }
 
@@ -197,8 +200,9 @@ fn install_panic_hook() {
         std::panic::set_hook(Box::new(move |info| {
             let thread = std::thread::current();
             if panic_takes_the_process_down(thread.name()) {
-                let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste);
+                disable_raw_mode().log_warn("leaving raw mode after a panic");
+                execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste)
+                    .log_warn("leaving the alternate screen after a panic");
                 previous(info);
                 return;
             }

@@ -96,7 +96,10 @@ impl Manager {
         // config lock, and holding both at once here would invert the order
         // `set_disabled` takes them in (accounts, then config).
         let awaiting_first_probe = self.probe_interval_seconds() > 0;
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         accounts
             .iter()
             .enumerate()
@@ -217,7 +220,10 @@ impl Manager {
     /// doc-comment for why a MISS that happens during the one retry the
     /// cooldown just granted must re-arm it too.
     fn record_warm_without_evidence(&self, idx: usize) -> bool {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = self
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(account) = accounts.get_mut(idx) else {
             return false;
         };
@@ -237,7 +243,10 @@ impl Manager {
     /// cooldown when the account is already excluded, via
     /// [`rearm_warm_evidence_cooldown_if_excluded`].
     fn record_warm_failure(&self, idx: usize) {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = self
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(account) = accounts.get_mut(idx) else {
             return;
         };

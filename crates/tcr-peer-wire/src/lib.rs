@@ -347,11 +347,17 @@ fn crockford_encoding() -> &'static Encoding {
     ENCODING.get_or_init(|| {
         let mut spec = Specification::new();
         spec.symbols
-            .push_str(std::str::from_utf8(CROCKFORD_ALPHABET).expect("ascii alphabet"));
+            .extend(CROCKFORD_ALPHABET.iter().map(|&byte| char::from(byte)));
         spec.translate.from.push_str("abcdefghjkmnpqrstvwxyz");
         spec.translate.to.push_str("ABCDEFGHJKMNPQRSTVWXYZ");
-        spec.encoding()
-            .expect("the Crockford alphabet is a valid data-encoding specification")
+        #[expect(
+            clippy::expect_used,
+            reason = "the alphabet is a fixed constant, and the OnceLock initialiser has no error channel"
+        )]
+        let encoding = spec
+            .encoding()
+            .expect("the Crockford alphabet is a valid data-encoding specification");
+        encoding
     })
 }
 

@@ -540,7 +540,10 @@ impl ServerHandle {
     /// (so `Drop` still aborts them), and may simply call it again — the counters
     /// carry over and the flushes are idempotent.
     pub async fn shutdown_within(&mut self, grace: Duration) -> ShutdownReport {
-        let _ = self.shutdown.send(true);
+        crate::log_err::LogErr::log_debug(
+            self.shutdown.send(true),
+            "signalling shutdown to a stopped server",
+        );
         let deadline = tokio::time::Instant::now() + grace;
 
         if let Some(server) = self.server.as_mut() {
@@ -740,7 +743,10 @@ impl ServerHandle {
 /// a library caller has nothing else to fall back on.
 impl Drop for ServerHandle {
     fn drop(&mut self) {
-        let _ = self.shutdown.send(true);
+        crate::log_err::LogErr::log_debug(
+            self.shutdown.send(true),
+            "signalling shutdown to a stopped server",
+        );
         if let Some(server) = &self.server {
             server.abort();
         }
@@ -2607,7 +2613,10 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let mut stop = shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
         mitm::serve_with_shutdown(listener, serve_manager, tls, async move {
-            let _ = stop.changed().await;
+            crate::log_err::LogErr::log_debug(
+                stop.changed().await,
+                "waiting for the shutdown signal",
+            );
         })
         .await;
     });
@@ -2975,7 +2984,10 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::log_err::LogErr::log_debug(
+            std::fs::remove_dir_all(&dir),
+            "removing a test temp dir",
+        );
         let (shutdown, _rx) = watch::channel(false);
         let manager = inert_manager();
         manager.attach_usage_ledger(dir.clone(), 90);
@@ -3011,7 +3023,10 @@ mod tests {
         // The drain is still running on the blocking pool, which is the point:
         // freeing the writer lets it finish on its own.
         drop(wedge);
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::log_err::LogErr::log_debug(
+            std::fs::remove_dir_all(&dir),
+            "removing a test temp dir",
+        );
     }
 
     /// A FAILED final pin write must be distinguishable from affinity being off.

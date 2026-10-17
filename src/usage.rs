@@ -409,21 +409,30 @@ fn with_account<R>(
     f: impl FnOnce(&mut AccountUsage) -> R,
 ) -> R {
     {
-        let list = accounts.read().expect("usage list lock poisoned");
+        let list = accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(account) = list.get(idx) {
-            return f(&mut account.lock().expect("usage lock poisoned"));
+            return f(&mut account
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner));
         }
     }
-    let mut list = accounts.write().expect("usage list lock poisoned");
+    let mut list = accounts
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if idx >= list.len() {
         list.resize_with(idx + 1, Mutex::default);
     }
-    let account = list
-        .get_mut(idx)
-        .expect("the list was just grown past idx")
-        .get_mut()
-        .expect("usage lock poisoned");
-    f(account)
+    match list.get_mut(idx) {
+        Some(slot) => f(slot
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)),
+        None => {
+            tracing::error!("a usage slot was missing right after the list grew past it");
+            f(&mut AccountUsage::default())
+        }
+    }
 }
 
 fn add_into(map: &mut BTreeMap<String, Totals>, model: &str, totals: &Totals) {
@@ -1331,7 +1340,7 @@ impl UsageTracker {
         let tx = self
             .ledger
             .read()
-            .expect("ledger lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|handle| handle.tx.clone());
         let deadline = std::time::Instant::now() + budget;
@@ -1363,7 +1372,12 @@ impl UsageTracker {
     pub fn shutdown_ledger(&self, budget: std::time::Duration) -> LedgerShutdown {
         let flush_deadline = std::time::Instant::now() + budget;
         self.attached.store(false, Ordering::Relaxed);
-        let Some(handle) = self.ledger.write().expect("ledger lock poisoned").take() else {
+        let Some(handle) = self
+            .ledger
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
             return LedgerShutdown::NotAttached;
         };
         let flushed = handle.flush_within(flush_deadline);
@@ -1374,7 +1388,12 @@ impl UsageTracker {
         // One mapping, at one exit: a second copy of "which bool means which
         // outcome" is how a shutdown report comes to disagree with itself
         // depending on the path it took.
-        let drained = match self.writer.lock().expect("writer lock poisoned").take() {
+        let drained = match self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
             // No writer thread to join (it never started, or a previous
             // shutdown already took it), so the flush is all the evidence there
             // is.
@@ -1554,7 +1573,12 @@ impl UsageTracker {
                 o: record.output,
                 rt: record.reasoning,
             };
-            if let Some(ledger) = self.ledger.read().expect("ledger lock poisoned").as_ref() {
+            if let Some(ledger) = self
+                .ledger
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
                 ledger.queue(line);
             }
         }
@@ -1619,8 +1643,14 @@ impl UsageTracker {
             // The thread handle is KEPT, not dropped: `shutdown_ledger` joins it
             // so the file is closed before the process exits.
             Ok(handle) => {
-                *self.writer.lock().expect("writer lock poisoned") = Some(handle);
-                *self.ledger.write().expect("ledger lock poisoned") = Some(LedgerHandle {
+                *self
+                    .writer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+                *self
+                    .ledger
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(LedgerHandle {
                     tx,
                     dropped: Arc::clone(&self.dropped),
                     dropping: Arc::clone(&self.dropping),
@@ -1907,6 +1937,7 @@ fn prune(dir: &Path, today: Date, retention_days: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_err::LogErr as _;
 
     fn tracker() -> UsageTracker {
         UsageTracker::new(2, PricingTable::default())
@@ -1933,7 +1964,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
         dir
     }
 
@@ -2117,7 +2148,7 @@ mod tests {
             "the second account's line was attributed to it, not to the first"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// A ledger line carrying a key this build does not read parses through the one real
@@ -2205,7 +2236,7 @@ mod tests {
         let quiet: serde_json::Value = serde_json::from_str(lines[2]).expect("a JSON line");
         assert_eq!(quiet["p"], "codex");
         assert!(quiet.get("rt").is_none(), "no reasoning, no key");
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// A line written before the ledger knew its provider still parses, as no provider and no
@@ -2234,7 +2265,7 @@ mod tests {
             (Some("codex"), 1, 3),
             "rt is reasoning; r stays the cache read"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// One live Codex account with no org.
@@ -2347,7 +2378,7 @@ mod tests {
             report.pruned, 2,
             "every file older than yesterday goes, as before"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// A Codex account's 5-hour `window` is still the ring every Claude row reads. The weekly
@@ -2403,7 +2434,7 @@ mod tests {
         assert_eq!(report.replayed, 0);
         assert_eq!(report.unresolved, 1);
         assert_eq!(replayed.row(0, now, None).today.requests, 0);
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// FINDING 4. The same email in two orgs is TWO accounts (`identity.rs`),
@@ -2482,7 +2513,7 @@ mod tests {
         );
         assert_eq!(report.unresolved, 4);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// FINDING 6. A ledger whose writes fail must say so on every transition
@@ -2528,7 +2559,7 @@ mod tests {
             "the in-memory day is unaffected by the file failing"
         );
 
-        let _ = std::fs::remove_file(&blocker);
+        std::fs::remove_file(&blocker).log_debug("removing a test file");
     }
 
     /// T4 (bridge unit 2): the write-failure policy — warn once per health
@@ -2657,7 +2688,7 @@ mod tests {
             "recovery must not retroactively count the failed lines as dropped either"
         );
 
-        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::remove_dir_all(&blocker).log_debug("removing a test directory");
     }
 
     /// FINDING 1. The ledger write is not on the request path: with the writer
@@ -2725,7 +2756,7 @@ mod tests {
             "every request is still counted in memory, whatever the file did"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// Wedge the writer thread: send it a flush it cannot answer, and hand back
@@ -2798,7 +2829,7 @@ mod tests {
             "and the tracker stops claiming a ledger it has just closed"
         );
         releaser.join().expect("the releasing thread finished");
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// FINDING 1 (round 2). A FULL queue and a DEAD writer both lose lines
@@ -2847,7 +2878,7 @@ mod tests {
             tracker.is_persisting(),
             "and a successful write says so again"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// FINDING 3 (round 2). `flush_ledger` held the ledger mutex across a
@@ -2927,7 +2958,7 @@ mod tests {
              request path never waits on the ledger"
         );
         drop(ack_rx);
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// FINDING 2 (round 2). A line that CARRIES an org and matches no live
@@ -3013,8 +3044,8 @@ mod tests {
             "control: an org-less line still resolves by a unique name"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
+        std::fs::remove_dir_all(&dir2).log_debug("removing a test directory");
     }
 
     /// An account with the full identity, written the way
@@ -3121,7 +3152,7 @@ mod tests {
                     "bob's own line"
                 );
             }
-            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
         }
     }
 
@@ -3200,8 +3231,8 @@ mod tests {
              backfill"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
+        std::fs::remove_dir_all(&dir2).log_debug("removing a test directory");
     }
 
     /// FINDING 1 (round 3), the other half: what the account uuid must NOT buy.
@@ -3265,7 +3296,7 @@ mod tests {
             "a unique name is not evidence about a uuid nobody in this fleet carries"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// FINDING 0 (round 3). The flush and the writer JOIN had one deadline
@@ -3325,7 +3356,7 @@ mod tests {
             "and it is still bounded: waited {waited:?}"
         );
         releaser.join().expect("the releasing thread finished");
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// FINDING 0 (round 3), the other side of the same budget: a writer that
@@ -3364,7 +3395,7 @@ mod tests {
         );
 
         drop(ack_rx);
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// FINDINGS 4 and 7 (round 3). `healthy` had two writers — the writer thread
@@ -3441,7 +3472,7 @@ mod tests {
             tracker.is_persisting(),
             "a ledger that caught up says so again"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// FINDING 5 (round 3). `shutdown_ledger`'s `drop(handle)` is the ONLY thing
@@ -3491,7 +3522,7 @@ mod tests {
         assert_eq!(lines_in(&dir, now), 4);
         flusher.join().expect("the flushing thread finished");
         releaser.join().expect("the releasing thread finished");
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// FINDING 3. The rotation grows at runtime (`tcr login`, TcrBar's
@@ -3640,7 +3671,7 @@ mod tests {
         assert!(exists(today) && exists(yesterday));
         assert!(!exists(older));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// Retention deletes old day files and leaves everything else in the
@@ -3664,7 +3695,7 @@ mod tests {
             dir.join("notes.txt").exists(),
             "unrelated files are untouched"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// A compressed day ages out like a plain one.
@@ -3681,7 +3712,7 @@ mod tests {
         assert_eq!(prune(&dir, today, 90), 1);
         assert!(!gz_day_path(&dir, old).exists());
         assert!(gz_day_path(&dir, recent).exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// One fake ledger line, in the shape the writer serializes.
@@ -3801,7 +3832,7 @@ mod tests {
 
         // A second pass finds nothing left to do.
         assert_eq!(compress_closed_days(&dir, today, || {}).days, 0);
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// The size a compressed day saves, on a generated day of ledger lines in the writer's
@@ -3832,7 +3863,7 @@ mod tests {
             report.gz_bytes,
             report.gz_bytes as f64 / report.plain_bytes as f64 * 100.0
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// The quota counter's input figure must be reproducible from a record, or

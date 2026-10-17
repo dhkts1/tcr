@@ -214,7 +214,7 @@ impl ShardedBoundTokens {
     fn shard(&self, hash: &str) -> std::sync::MutexGuard<'_, BoundTokenMap> {
         self.shards[shard_of(hash, self.shards.len())]
             .lock()
-            .expect("bound tokens shard lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[cfg(test)]
@@ -224,7 +224,7 @@ impl ShardedBoundTokens {
             .map(|shard| {
                 shard
                     .lock()
-                    .expect("bound tokens shard lock poisoned")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .len()
             })
             .sum()
@@ -274,7 +274,9 @@ impl ShardedBoundTokens {
     pub(super) fn entries(&self) -> Vec<(String, Minted)> {
         let mut out = Vec::new();
         for shard in &*self.shards {
-            let shard = shard.lock().expect("bound tokens shard lock poisoned");
+            let shard = shard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             out.extend(
                 shard
                     .iter()
@@ -457,7 +459,10 @@ impl Manager {
         let now_ms = super::odt_to_ms(now);
         let reserved = self.reserved_groups();
         let parked = self.parked_groups();
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         accounts.get(idx).is_some_and(|account| {
             Self::account_hard_ok(account, now_ms, group, &reserved, &parked, warm)
                 // "Holds" means this account answers the next request itself and every
@@ -510,7 +515,7 @@ impl Manager {
         let provider = self
             .accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(idx)?
             .provider;
         let unsupported_exit = match provider {
@@ -525,7 +530,10 @@ impl Manager {
         let now_ms = super::odt_to_ms(now);
         let reserved = self.reserved_groups();
         let parked = self.parked_groups();
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = self
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let account = accounts.get_mut(idx)?;
         let outside_strict_group =
             strict_group.is_some_and(|g| !account.groups.iter().any(|carried| carried == g));
@@ -565,7 +573,10 @@ impl Manager {
     /// When `idx` names no account, or its organization is unknown, no account can be shown to
     /// share it, so the set is every index and nothing is left to select.
     pub fn outside_org_of(&self, idx: usize) -> HashSet<usize> {
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let org = accounts
             .get(idx)
             .and_then(|a| identity::org_key_of(a.org_uuid.as_deref(), a.org_name.as_deref()));
@@ -609,7 +620,7 @@ impl Manager {
         let mut seen = self
             .bound_history_logged
             .lock()
-            .expect("bound history log set poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if seen.len() >= BOUND_TOKEN_CAP {
             seen.clear();
         }
@@ -633,7 +644,7 @@ impl Manager {
         let mut warned = self
             .bound_switch_warned
             .lock()
-            .expect("bound switch warned map poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         warned.retain(|_, &mut at| now_ms.saturating_sub(at) < SWITCH_WARNING_TTL_MS);
         if warned.len() >= BOUND_TOKEN_CAP {
             warned.clear();
@@ -653,7 +664,7 @@ impl Manager {
     pub(crate) fn expire_switch_warnings(&self) {
         self.bound_switch_warned
             .lock()
-            .expect("bound switch warned map poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
     }
 
@@ -668,7 +679,7 @@ impl Manager {
     pub fn switch_warned(&self, session_key: u64, idx: usize, now_ms: i64) -> bool {
         self.bound_switch_warned
             .lock()
-            .expect("bound switch warned map poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(session_key, idx))
             .is_some_and(|&at| now_ms.saturating_sub(at) < SWITCH_WARNING_TTL_MS)
     }
@@ -690,7 +701,10 @@ impl Manager {
         if entries.is_empty() {
             return snapshot;
         }
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut slots: Vec<Option<bound_tokens::AccountSlot>> = vec![None; accounts.len()];
         for (hash, index, kind, minted_at_ms) in entries {
             let (Some(account), Some(cell)) = (accounts.get(index), slots.get_mut(index)) else {
@@ -748,7 +762,10 @@ impl Manager {
     /// a response served between boot and this call is fresher than anything on disk.
     pub fn restore_bound_tokens(&self, path: &Path, ttl_ms: i64) -> LoadReport {
         let candidates: Vec<crate::config::Account> = {
-            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            let accounts = self
+                .accounts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             accounts
                 .iter()
                 .map(|a| {
@@ -1211,7 +1228,10 @@ mod tests {
             "a healthy account holds its conversation"
         );
         {
-            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = manager
+                .accounts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             accounts[0].quota.status = Some("rejected".to_string());
             // Utilization UNDER every threshold on purpose: headers go stale by
             // minutes, so a rejection can arrive while the stored window still reads
@@ -1225,7 +1245,10 @@ mod tests {
         {
             // Positive control for the premise: the PIN predicate does let this
             // account through, so the refusal below is the terminal check's alone.
-            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            let accounts = manager
+                .accounts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert!(
                 Manager::account_hard_ok(
                     &accounts[0],

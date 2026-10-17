@@ -1217,7 +1217,7 @@ mod tests {
             let refusal =
                 CodexQuotaRefusal::parse(&headers, body.as_bytes(), OffsetDateTime::now_utc())
                     .expect("body quota refusal");
-            let _ = quota.update_from_codex_refusal(&headers, 429, Some(&refusal));
+            let _changed = quota.update_from_codex_refusal(&headers, 429, Some(&refusal));
 
             assert_eq!(quota.status.as_deref(), Some("rejected"));
             assert_eq!(
@@ -1863,7 +1863,7 @@ mod tests {
             ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
         ]);
         let mut quota = Quota::default();
-        let _ = quota.update_from_headers(&headers);
+        let _changed = quota.update_from_headers(&headers);
         quota.reject_model_weekly(&headers);
 
         assert!(
@@ -1903,7 +1903,7 @@ mod tests {
             ("anthropic-ratelimit-unified-7d-status", "allowed"),
             ("anthropic-ratelimit-unified-7d_oi-status", "allowed"),
         ]);
-        let _ = quota.update_from_headers(&allowed);
+        let _changed = quota.update_from_headers(&allowed);
 
         assert!(
             !quota.model_weekly_exhausted(0.90, now),
@@ -2026,7 +2026,7 @@ mod tests {
             ),
         ] {
             q.updated_at = Some(stale);
-            let _ = q.update_from_codex_refusal(
+            let _changed = q.update_from_codex_refusal(
                 &silence,
                 status,
                 (status == 429)
@@ -2040,7 +2040,7 @@ mod tests {
         q.updated_at = Some(stale);
         let before = OffsetDateTime::now_utc();
         let refusal = TestHeaders::new(&[(CODEX_REACHED_TYPE_HEADER, "primary")]);
-        let _ = q.update_from_codex_refusal(
+        let _changed = q.update_from_codex_refusal(
             &refusal,
             429,
             CodexQuotaRefusal::parse(&refusal, &[], OffsetDateTime::now_utc()).as_ref(),
@@ -2255,9 +2255,9 @@ mod tests {
         let secs = OffsetDateTime::now_utc().unix_timestamp();
         let h = codex_headers("30", "100", secs + 600, secs + 50_000);
         let mut q = Quota::default();
-        let _ = q.update_from_codex_refusal(&h, 200, None);
+        let _changed = q.update_from_codex_refusal(&h, 200, None);
         assert_eq!(q.status.as_deref(), Some("allowed"), "precondition");
-        let _ = q.update_from_codex_refusal(
+        let _changed = q.update_from_codex_refusal(
             &h,
             429,
             CodexQuotaRefusal::parse(&h, &[], OffsetDateTime::now_utc()).as_ref(),
@@ -2268,7 +2268,7 @@ mod tests {
             "a 429 that is not a quota refusal leaves the status as it was"
         );
         let mut fresh = Quota::default();
-        let _ = fresh.update_from_codex_refusal(
+        let _changed = fresh.update_from_codex_refusal(
             &h,
             429,
             CodexQuotaRefusal::parse(&h, &[], OffsetDateTime::now_utc()).as_ref(),
@@ -2493,7 +2493,7 @@ mod tests {
     fn codex_headers_record_which_windows_carried_a_value() {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let mut two = Quota::default();
-        let _ = two.update_from_codex_refusal(
+        let _changed = two.update_from_codex_refusal(
             &codex_headers("25", "3", now + 3600, now + 86_400),
             200,
             None,
@@ -2501,10 +2501,10 @@ mod tests {
         assert_eq!(carried(&two), names(&["fiveHour", "sevenDay"]));
 
         let mut pro = Quota::default();
-        let _ = pro.update_from_codex_refusal(&pro_codex_headers(now + 86_400), 200, None);
+        let _changed = pro.update_from_codex_refusal(&pro_codex_headers(now + 86_400), 200, None);
         assert_eq!(carried(&pro), names(&["sevenDay"]));
 
-        let _ = pro.update_from_codex_refusal(
+        let _changed = pro.update_from_codex_refusal(
             &TestHeaders::new(&[("content-type", "text/event-stream")]),
             200,
             None,
@@ -2539,7 +2539,7 @@ mod tests {
             let mut h = pro_codex_headers(now + 86_400);
             h.push("x-codex-secondary-used-percent", placeholder);
             let mut q = Quota::default();
-            let _ = q.update_from_codex_refusal(&h, 200, None);
+            let _changed = q.update_from_codex_refusal(&h, 200, None);
             assert_eq!(carried(&q), names(&["sevenDay"]), "{label}");
             assert!(q.five_hour.is_none(), "{label}: {:?}", q.five_hour);
 
@@ -2550,7 +2550,7 @@ mod tests {
             ]);
             h.push("x-codex-primary-used-percent", placeholder);
             let mut q = Quota::default();
-            let _ = q.update_from_codex_refusal(&h, 200, None);
+            let _changed = q.update_from_codex_refusal(&h, 200, None);
             assert_eq!(
                 carried(&q),
                 names(&["sevenDay"]),
@@ -2574,7 +2574,7 @@ mod tests {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let read = |h: &TestHeaders| {
             let mut q = Quota::default();
-            let _ = q.update_from_codex_refusal(h, 200, None);
+            let _changed = q.update_from_codex_refusal(h, 200, None);
             q.codex.windows().expect("the reading carried a window")
         };
         let window = |minutes: Option<u32>| Some(CodexWindow { minutes });
@@ -2640,7 +2640,7 @@ mod tests {
         refusal.push("x-codex-credits-unlimited", "false");
         refusal.push("x-codex-credits-balance", "12.50");
         let mut q = Quota::default();
-        let _ = q.update_from_codex_refusal(
+        let _changed = q.update_from_codex_refusal(
             &refusal,
             429,
             CodexQuotaRefusal::parse(&refusal, &[], OffsetDateTime::now_utc()).as_ref(),
@@ -2654,7 +2654,7 @@ mod tests {
         });
         assert_eq!(q.codex.credits, credits);
 
-        let _ = q.update_from_codex_refusal(
+        let _changed = q.update_from_codex_refusal(
             &codex_headers("10", "5", now + 1800, now + 86_400),
             200,
             None,
@@ -2670,7 +2670,7 @@ mod tests {
             "a response without the credits headers leaves the last reading alone"
         );
 
-        let _ = q.update_from_codex_refusal(
+        let _changed = q.update_from_codex_refusal(
             &TestHeaders::new(&[("x-codex-credits-has-credits", "FALSE")]),
             200,
             None,
@@ -2685,7 +2685,7 @@ mod tests {
             "the flag is read in any case, unlimited is false when absent, and no balance is none"
         );
 
-        let _ = q.update_from_codex_refusal(
+        let _changed = q.update_from_codex_refusal(
             &TestHeaders::new(&[(CODEX_REACHED_TYPE_HEADER, "primary")]),
             200,
             None,

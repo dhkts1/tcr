@@ -247,6 +247,7 @@ impl ClientIdentityCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_err::LogErr as _;
 
     fn control(name: &str, uuid: Option<&str>) -> ControlIdentity {
         ControlIdentity {
@@ -395,7 +396,9 @@ mod tests {
             .route("/api/oauth/profile", get(profile))
             .with_state(fake.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .log_debug("serving a test profile endpoint");
         });
         let url = format!("http://{addr}/api/oauth/profile");
 
@@ -469,7 +472,9 @@ mod tests {
             .route("/api/oauth/profile", get(profile))
             .with_state(fake.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .log_debug("serving a test profile endpoint");
         });
         let url = format!("http://{addr}/api/oauth/profile");
         let cache = ClientIdentityCache::new();

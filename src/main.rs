@@ -2769,7 +2769,8 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 let now_ms = tcr::peer::pair::now_ms();
                 let until_ms = now_ms.saturating_add(600_000);
                 let id_bytes = tcr::peer::noise::random_secret()?;
-                let id = u64::from_be_bytes(id_bytes[..8].try_into().expect("checked length"));
+                let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = id_bytes;
+                let id = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
                 tcr::peer::state::add_ask(
                     &peer_state_path(&path),
                     tcr::peer::state::PendingAsk {
@@ -8056,7 +8057,7 @@ fn load_config(path: &Path) -> anyhow::Result<(Config, Option<PathBuf>)> {
                 "[tcr] no config at {} and it could not be created ({err}) — starting with defaults",
                 path.display()
             );
-            Ok((default_config(), Some(path.to_path_buf())))
+            Ok((parse_default_config()?, Some(path.to_path_buf())))
         }
         Err(err) => anyhow::bail!(
             "config at {} is unreadable/corrupt: {err} — refusing to start rather than \
@@ -8069,8 +8070,13 @@ fn load_config(path: &Path) -> anyhow::Result<(Config, Option<PathBuf>)> {
 /// A default config with every serde default applied (correct `upstream` and
 /// `switchThreshold`, empty accounts) — parsing `{}` reuses the config's own
 /// `#[serde(default)]` wiring instead of a hand-rolled `Default`.
+fn parse_default_config() -> anyhow::Result<Config> {
+    serde_json::from_str("{}").context("build the default config")
+}
+
+#[cfg(test)]
 fn default_config() -> Config {
-    serde_json::from_str("{}").expect("an empty JSON object is always a valid default config")
+    parse_default_config().expect("an empty JSON object is always a valid default config")
 }
 
 /// The one shared, well-known, non-private directory both modes log into:
@@ -11107,7 +11113,7 @@ mod tests {
             "booting with no config must create {}",
             path.display()
         );
-        let _ = std::fs::remove_file(&path);
+        let _removed = std::fs::remove_file(&path);
     }
 
     /// The behaviour this task changed: a config that exists and fails to

@@ -256,10 +256,14 @@ pub fn mint_name(
     if !taken.contains(&base) {
         return base;
     }
-    (2..)
-        .map(|n| format!("{base}-{n}"))
-        .find(|candidate| !taken.contains(candidate))
-        .expect("an unbounded range always yields a free name")
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// The one field a user-supplied account query is matched against.

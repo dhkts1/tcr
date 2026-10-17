@@ -59,7 +59,10 @@ impl Manager {
         refusal: Option<&crate::quota::CodexQuotaRefusal>,
     ) -> bool {
         let (newly_known, read_five_hour) = {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match accounts.get_mut(idx) {
                 Some(account) => {
                     let read_five_hour = match account.provider {
@@ -156,7 +159,10 @@ impl Manager {
     /// requests here is bug #4. That count happens in [`Manager::record_served`].
     pub fn record_usage(&self, idx: usize, mut record: crate::usage::UsageRecord) {
         let (name, (uuid, org)) = {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match accounts.get_mut(idx) {
                 Some(account) => {
                     // The serving account's provider, which files the ledger line (`p`) and
@@ -221,7 +227,7 @@ impl Manager {
         let accounts: Vec<crate::usage::LedgerAccount> = self
             .accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|a| crate::usage::LedgerAccount {
                 name: a.name.clone(),
@@ -260,7 +266,7 @@ impl Manager {
     pub fn usage_retention_days(&self) -> u32 {
         self.config
             .lock()
-            .expect("config lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .usage_retention_days
     }
 
@@ -327,7 +333,10 @@ impl Manager {
     /// bounded by policy rather than by how often the fleet happens to probe.
     pub fn apply_usage(&self, idx: usize, usage: &Usage) {
         let newly_known = {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match accounts.get_mut(idx) {
                 Some(account) => {
                     let was_codex_refused = match account.provider {
@@ -404,7 +413,10 @@ impl Manager {
     /// and the rejection frees at its own reset with no second deadline to
     /// reconcile. See [`crate::quota::Quota::reject_model_weekly`].
     pub fn mark_model_weekly_rejected(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = self
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             account.quota.reject_model_weekly(headers);
             tracing::info!(
@@ -417,7 +429,10 @@ impl Manager {
     pub fn mark_rate_limited(&self, idx: usize, seconds: i64) {
         let hold = seconds.clamp(0, MAX_RATE_LIMIT_HOLD_SECONDS);
         let until = crate::now_ms() + hold * 1000;
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = self
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             account.status = AccountStatus::Throttled;
             account.rate_limited_until_ms = Some(until);
@@ -430,7 +445,10 @@ impl Manager {
     /// retry delay so a spend cap cannot bench an account until an unrelated reset.
     /// A successful probe also releases the hold when it reads the refusal as over.
     pub fn mark_codex_quota_limited(&self, idx: usize, seconds: i64) {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = self
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             let now = OffsetDateTime::now_utc();
             let hold = account
@@ -456,7 +474,10 @@ impl Manager {
     /// `rate_limited_until_ms` whatever the status, so the hold binds the same.
     pub fn mark_refused(&self, idx: usize) {
         let until = crate::now_ms() + REFUSED_HOLD_SECONDS * 1000;
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = self
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             account.rate_limited_until_ms = Some(until);
             account.hold_cause = HoldCause::Refused;
@@ -471,7 +492,10 @@ impl Manager {
     /// Clear a hold after live proof it no longer binds (any non-429): a
     /// rate-limit hold, or a 403 refusal hold, since the account just answered.
     pub fn clear_rate_limited(&self, idx: usize) {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = self
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             if account.status == AccountStatus::Throttled {
                 account.status = AccountStatus::Active;
@@ -498,7 +522,10 @@ impl Manager {
     /// premortem'd change.
     pub fn record_stream_error(&self, idx: usize, kind: &str) {
         let now_ms = crate::now_ms();
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = self
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             tracing::warn!(
                 account = %account.name,

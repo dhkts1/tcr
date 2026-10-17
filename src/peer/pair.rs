@@ -332,8 +332,14 @@ impl JoinToken {
         if addrs.is_empty() {
             bail!("peer join: this key carries no address to dial");
         }
-        let registrar = PeerId(rest[..32].try_into().expect("checked length"));
-        let secret: [u8; 32] = rest[32..64].try_into().expect("checked length");
+        let registrar = PeerId(
+            rest[..32]
+                .try_into()
+                .context("peer join: the registrar bytes are the wrong length")?,
+        );
+        let secret: [u8; 32] = rest[32..64]
+            .try_into()
+            .context("peer join: the secret bytes are the wrong length")?;
         Ok(Self::new(addrs, registrar, secret))
     }
 
