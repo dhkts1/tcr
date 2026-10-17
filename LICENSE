@@ -11,6 +11,10 @@ This is a source-available license, not an open source license. It is not
 approved by the Open Source Initiative, and it permits use for noncommercial
 purposes only, as defined in the terms below.
 
+One folder is the exception: the OpenClaw skill in `integrations/openclaw/tcr`
+is licensed under MIT No Attribution (MIT-0), the license it is published under
+on ClawHub. Its own LICENSE file holds that text.
+
 The full text of the PolyForm Noncommercial License 1.0.0 follows, reproduced
 verbatim from https://polyformproject.org/licenses/noncommercial/1.0.0.txt.
 
