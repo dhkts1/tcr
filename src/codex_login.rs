@@ -658,7 +658,7 @@ mod tests {
     async fn codex_workspace_import_check_identifies_tcr_in_the_user_agent() {
         let (base, captured) = codex_header_stub(200).await;
         let login = parse_auth_json(&fake_auth_json()).unwrap().unwrap();
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = crate::http_client::builder().no_proxy().build().unwrap();
         check_workspace_routing(&client, &base, &login)
             .await
             .unwrap();
@@ -673,7 +673,7 @@ mod tests {
         let (base, _) = codex_header_stub(401).await;
         let mut login = parse_auth_json(&fake_auth_json()).unwrap().unwrap();
         login.expires_at_ms = Some(0);
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = crate::http_client::builder().no_proxy().build().unwrap();
         let Err(WorkspaceRefusal::Unconfirmed(why)) =
             check_workspace_routing(&client, &base, &login).await
         else {

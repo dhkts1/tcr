@@ -64,7 +64,7 @@ impl Driver {
         body_kb: usize,
         big_body_bytes: Option<usize>,
     ) -> anyhow::Result<Arc<Self>> {
-        let client = reqwest::Client::builder()
+        let client = tcr::http_client::builder()
             // The driver talks to the proxy on loopback and nowhere else; an inherited
             // HTTPS_PROXY must not reroute it.
             .no_proxy()

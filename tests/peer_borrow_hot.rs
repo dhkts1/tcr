@@ -193,7 +193,7 @@ async fn a_disclose_grant_written_after_boot_is_borrowed_on_without_a_restart() 
 
     // Moment 3: one POST at a fleet with no account, which is the only
     // condition under which a provider is consulted at all.
-    let client = reqwest::Client::builder()
+    let client = tcr::http_client::builder()
         .no_proxy()
         .build()
         .expect("a loopback client");

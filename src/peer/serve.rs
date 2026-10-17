@@ -1679,7 +1679,7 @@ async fn serve_on_own_account(
     restriction: &ScopeRestriction,
     request_key: Option<&str>,
 ) -> Result<ServedResponse> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .no_proxy()
         .build()
         .context("peer serve: could not build the loopback client")?;

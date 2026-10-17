@@ -1768,7 +1768,7 @@ async fn send_through(
     host: &str,
     splice_port: u16,
 ) -> Result<reqwest::Response> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .no_proxy()
         .resolve(host, SocketAddr::from(([127, 0, 0, 1], splice_port)))
         .build()

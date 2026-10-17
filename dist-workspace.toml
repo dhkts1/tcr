@@ -11,7 +11,9 @@ ci = "github"
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 # musl (not gnu): static binary runs on alpine AND glibc distros. Deps are musl-clean
-# (rustls/ring, reqwest with rustls-tls; no openssl/native-tls, no system C libs to link).
+# (rustls/ring, reqwest with rustls-no-provider; no openssl/native-tls, no system C libs to link).
+# Since reqwest 0.13 the Linux binary checks servers against the system CA bundle
+# (rustls-platform-verifier), so the host needs one (`ca-certificates` on alpine).
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]
 
 # Ship the Sparkle appcast on EVERY release, including a CLI-only one.

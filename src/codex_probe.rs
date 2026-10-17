@@ -927,7 +927,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = crate::http_client::builder().no_proxy().build().unwrap();
 
         fetch_usage(&client, &base, "test-access-token", None)
             .await
@@ -987,7 +987,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = crate::http_client::builder().no_proxy().build().unwrap();
         let usage = fetch_usage(
             &client,
             &base,

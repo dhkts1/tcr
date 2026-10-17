@@ -644,7 +644,7 @@ impl HttpsTemplateStore {
         if !template.contains("{name}") {
             bail!("dead drop: the store template has no {{name}} placeholder: {template}");
         }
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10))

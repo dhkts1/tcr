@@ -180,7 +180,7 @@ impl FakeOrigin {
     /// A client that can reach THIS origin and no other: the hostname resolves
     /// to this origin's port and nothing else is routable.
     fn client(&self) -> reqwest::Client {
-        reqwest::Client::builder()
+        tcr::http_client::builder()
             .no_proxy()
             // A hang would otherwise turn a red gate into a wait: a loopback
             // origin that has not answered in ten seconds has failed.

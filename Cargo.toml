@@ -133,7 +133,10 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 # (hyper_util::server::conn::auto::Builder) used in src/mitm.rs so base-URL/MITM
 # clients can negotiate h2 instead of being forced to h1.
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
-reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls", "http2"] }
+# `rustls-no-provider`, not `rustls`: the latter compiles aws-lc-rs, a C library, beside the ring
+# provider rustls and tokio-rustls already use here. Every client is built through
+# `tcr::http_client::builder`, which installs ring first (a build without it panics).
+reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "rustls-no-provider", "http2"] }
 tower = "0.5"
 bytes = "1"
 futures = "0.3"

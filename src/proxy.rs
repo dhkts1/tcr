@@ -6237,7 +6237,7 @@ fn relay_client() -> Option<Arc<reqwest::Client>> {
 
 /// [`RELAY_CLIENT`]'s settings, before `build`.
 fn relay_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    crate::http_client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
@@ -19244,7 +19244,7 @@ mod tests {
     /// `manager/mod.rs`'s tests: a hand-built stub would prove nothing about
     /// what the LIVE h2 error's `source()` chain actually renders.
     async fn h2_transport_error_for(url: &str) -> reqwest::Error {
-        reqwest::Client::builder()
+        crate::http_client::builder()
             .http2_prior_knowledge()
             .timeout(Duration::from_secs(5))
             .build()
@@ -20663,7 +20663,7 @@ mod tests {
     /// `reqwest::Error`. A hand-built stub would prove nothing here: the whole
     /// question is what the LIVE error's `source()` chain looks like.
     async fn transport_error_for(url: &str) -> reqwest::Error {
-        reqwest::Client::builder()
+        crate::http_client::builder()
             .timeout(Duration::from_secs(5))
             .build()
             .expect("client builds")

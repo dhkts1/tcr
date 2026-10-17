@@ -212,7 +212,7 @@ async fn tcr_peer_graph_serve_answers_the_page_and_the_json_on_loopback() {
         .spawn()
         .expect("spawn tcr peer graph --serve");
 
-    let client = reqwest::Client::new();
+    let client = tcr::http_client::builder().build().unwrap();
     let mut last_err = None;
     let mut page = None;
     for _ in 0..50 {
@@ -278,7 +278,7 @@ async fn tcr_peer_graph_serve_403s_a_non_loopback_host_header_and_200s_a_loopbac
         .spawn()
         .expect("spawn tcr peer graph --serve");
 
-    let client = reqwest::Client::new();
+    let client = tcr::http_client::builder().build().unwrap();
     let mut ready = false;
     for _ in 0..50 {
         if client.get(format!("http://{addr}/")).send().await.is_ok() {

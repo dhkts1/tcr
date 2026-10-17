@@ -517,7 +517,7 @@ fn fake_origin_on(
 /// A client that trusts the fake origin's CA and resolves [`ORIGIN`] to the
 /// loopback splice. Everything else is what `src/peer/egress.rs` builds.
 fn carried_client(origin: &Origin, splice_port: u16) -> reqwest::Client {
-    reqwest::Client::builder()
+    tcr::http_client::builder()
         .no_proxy()
         // A carry that is broken rather than refused would otherwise hang this
         // suite: a mutation that dropped the first record turned a red test
@@ -664,7 +664,7 @@ async fn a_carried_response_never_hands_the_client_the_serving_accounts_headers(
         stream.flush().await.expect("flush");
     });
 
-    let response = reqwest::Client::builder()
+    let response = tcr::http_client::builder()
         .no_proxy()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -1034,7 +1034,7 @@ async fn a_mismatched_sni_closes_the_carry() {
     // A real ClientHello for the WRONG name, produced by a real client: the
     // point is a handshake this gateway was not asked to carry, not a
     // hand-written byte string only this parser would accept.
-    let wrong = reqwest::Client::builder()
+    let wrong = tcr::http_client::builder()
         .no_proxy()
         .resolve(
             "platform.claude.com",
@@ -1112,7 +1112,7 @@ async fn a_carry_that_sends_no_client_hello_is_closed_on() {
 async fn the_sni_parser_reads_a_real_client_hello() {
     let listener = loopback().await;
     let port = listener.local_addr().expect("the address").port();
-    let client = reqwest::Client::builder()
+    let client = tcr::http_client::builder()
         .no_proxy()
         .resolve(ORIGIN, SocketAddr::from(([127, 0, 0, 1], port)))
         .build()
@@ -3088,9 +3088,9 @@ fn local_exit(listener: TcpListener) -> Arc<std::sync::atomic::AtomicUsize> {
 /// is WHICH process opened the connection to the origin, which is the whole of
 /// the exit lock. A completed 200 through the production carry cannot be
 /// observed in this process at all, and the reason is structural rather than an
-/// omission: `send_through` builds its client with this crate's `rustls-tls`
-/// feature, which carries the bundled webpki roots, so there is no root store a
-/// test can add a fixture CA to and no `SSL_CERT_FILE` that would be read. The
+/// omission: `send_through` builds its client with no extra roots, so it checks
+/// the origin against the system trust store (`rustls-platform-verifier`, see
+/// `tcr::http_client`), and a test cannot add a fixture CA to the macOS one. The
 /// body half of a carry is already measured, against a real TLS origin, by
 /// `a_carry_delivers_the_canned_messages_body_through_a_gateway`.
 fn origin_exit(listener: TcpListener) -> Arc<std::sync::atomic::AtomicUsize> {

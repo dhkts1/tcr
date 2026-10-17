@@ -327,7 +327,7 @@ impl LiveUsageProber {
             // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
             // proxy — an ambient proxy env var would route the quota probe through
             // another proxy and silently fail every probe (frozen quota bars).
-            client: reqwest::Client::builder()
+            client: crate::http_client::builder()
                 .no_proxy()
                 .build()
                 .log_warn("building the usage probe HTTP client"),
@@ -516,7 +516,7 @@ mod tests {
                 .unwrap();
         });
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = crate::http_client::builder().no_proxy().build().unwrap();
         let error = fetch_usage_at(&client, "test-token", &format!("http://{address}/usage"))
             .await
             .unwrap_err();
