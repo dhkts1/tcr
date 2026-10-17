@@ -30,7 +30,7 @@
 //!   `offline_unavailable` (DNS/name-resolution failure — a fact about this
 //!   machine, not any account) is unaffected and stays a `503`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -59,7 +59,15 @@ use crate::manager::{
 };
 use crate::provider::Provider;
 use crate::quota::{UnifiedRejectionKind, quota_rejections};
-use crate::stats::{GateReason, RequestLogEntry, SessionKind};
+use crate::stats::{GateReason, SessionKind};
+
+mod client_error;
+mod ladder;
+pub(crate) mod served;
+
+use client_error::{ClientError, ErrorKind};
+use ladder::Ladder;
+use served::{ServedRequest, ServedTurn, WireFold, record_served_request};
 
 /// Cap on a buffered request body (256 MiB) — a single-user localhost proxy has
 /// no legitimate payload near this, but an unbounded read is a DoS surface. The
@@ -1592,17 +1600,20 @@ async fn refuse_foreign_client(manager: &Manager, bearer: &str) -> Option<Respon
     if mode == ControlIdentityMode::Warn {
         return None;
     }
-    Some(error_response(
-        StatusCode::FORBIDDEN,
-        "permission_error",
-        &format!(
-            "tcr: this client is signed in as {client_shown}, but controlAccount is {control_email}, \
-             so its connectors, plugins and settings would come from the wrong account. \
-             Run /logout, then /login as {control_email} — or set \"controlIdentity\": \"warn\" \
-             (or \"off\") in the tcr config to serve it anyway."
-        ),
-        None,
-    ))
+    // Anthropic requests only: see the call site in `handle_request`.
+    Some(
+        ClientError::new(
+            StatusCode::FORBIDDEN,
+            ErrorKind::Permission,
+            format!(
+                "tcr: this client is signed in as {client_shown}, but controlAccount is {control_email}, \
+                 so its connectors, plugins and settings would come from the wrong account. \
+                 Run /logout, then /login as {control_email} — or set \"controlIdentity\": \"warn\" \
+                 (or \"off\") in the tcr config to serve it anyway."
+            ),
+        )
+        .respond(Provider::Anthropic),
+    )
 }
 
 /// Build the proxy router. Every method and path funnels through the single
@@ -3199,12 +3210,12 @@ async fn handle_request(
     {
         let provided = req_headers.get("x-api-key").and_then(|v| v.to_str().ok());
         if !key_matches(provided, expected) {
-            return error_response(
+            return ClientError::new(
                 StatusCode::UNAUTHORIZED,
-                "authentication_error",
+                ErrorKind::Authentication,
                 "Missing or invalid x-api-key.",
-                None,
-            );
+            )
+            .respond(provider);
         }
     }
 
@@ -3237,12 +3248,12 @@ async fn handle_request(
     //     Placed AFTER the api-key gate, like the guards below it: a request that
     //     cannot authenticate learns nothing here it would not learn anywhere else.
     if path_is_ambiguous(&path) {
-        return error_response(
+        return ClientError::new(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Request path must not contain a dot segment or a backslash.",
-            None,
-        );
+        )
+        .respond(provider);
     }
 
     // 1b. Everything under `/_tcr/` is OURS. The router matches the registered
@@ -3257,12 +3268,12 @@ async fn handle_request(
     //     miss it and are forwarded (measured). See [`LOCAL_PREFIX`] for why that is
     //     a forwarded 404 rather than a hole, and why it is left as it is.
     if path_is_under(&path, LOCAL_PREFIX) {
-        return error_response(
+        return ClientError::new(
             StatusCode::NOT_FOUND,
-            "not_found_error",
+            ErrorKind::NotFound,
             "Unknown tcr endpoint.",
-            None,
-        );
+        )
+        .respond(provider);
     }
 
     // 1c. Host guard: tcr is a credential-injecting reverse proxy for
@@ -3296,12 +3307,12 @@ async fn handle_request(
         // mean", on both paths.
         if !host_is_loopback(host) && !crate::mitm::host_allowed(host) {
             tracing::debug!(target_host = %host, "rejected misrouted forward-proxy request");
-            return error_response(
+            return ClientError::new(
                 StatusCode::MISDIRECTED_REQUEST,
-                "invalid_request_error",
+                ErrorKind::InvalidRequest,
                 "This proxy only serves its configured upstream hosts (Anthropic and Codex); refusing to forward a request for a different host.",
-                None,
-            );
+            )
+            .respond(provider);
         }
     }
     // A decrypted request stays on its CONNECT host. Marked ChatGPT connections may
@@ -3329,12 +3340,12 @@ async fn handle_request(
             .map(|host| host_path_disagreement(host, &path, provider)),
     };
     if let Some(message) = refusal {
-        return error_response(
+        return ClientError::new(
             StatusCode::MISDIRECTED_REQUEST,
-            "invalid_request_error",
-            &message,
-            None,
-        );
+            ErrorKind::InvalidRequest,
+            message,
+        )
+        .respond(provider);
     }
 
     // 1c'. A WebSocket upgrade on the Codex inference path is answered here, never forwarded.
@@ -3442,15 +3453,15 @@ async fn handle_request(
 
     // 2. Buffer the body once so it can be re-sent verbatim on every rotation.
     let Ok(body_bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error_response(
+        return ClientError::new(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Failed to read request body.",
-            None,
-        );
+        )
+        .respond(provider);
     };
 
-    // The body is parsed ONCE, here, into every answer the rest of the handler reads
+    //The body is parsed ONCE, here, into every answer the rest of the handler reads
     // from it: the model, the wire session and its tool events, the account-bound
     // tokens, the affinity key's inputs, the extended-cache-window answer and the
     // account-uuid splice point. See `crate::request_body` for why one walk, and how
@@ -3622,7 +3633,8 @@ async fn handle_request(
     // fleet-wide count: in a mixed fleet the other provider's accounts are never tried for
     // this request, so counting them would read a spent Anthropic rotation as unspent.
     let provider_account_count = manager.provider_account_count(provider);
-    let mut tried: HashSet<usize> = HashSet::new();
+    // Every piece of per-request rotation state, changed only through its methods.
+    let mut ladder = Ladder::default();
     // THE BORROWED-REQUEST PATH, and nothing else reaches it: a lease's
     // account-set scope, as the header the lender's own serving leg wrote onto
     // this loopback request (see [`ACCOUNTS_HEADER_NAME`]).
@@ -3673,12 +3685,12 @@ async fn handle_request(
                 tcr_peer_wire::sanitize_label(&name).is_ok_and(|label| labels.contains(&label))
             });
             if !inside {
-                tried.insert(idx);
+                ladder.bench(idx);
             }
         }
         tracing::debug!(
             accounts = %labels.join(","),
-            benched = tried.len(),
+            benched = ladder.tried().len(),
             of = account_count,
             "account-set scope: this request may be served only by the accounts it names"
         );
@@ -3772,14 +3784,8 @@ async fn handle_request(
         same_provider
     });
     let mut bound_to: Option<usize> = None;
-    // The accounts the hold benched, and only those, so a release mid-request can re-admit
-    // them without re-admitting what another rule benched: `tried` already carries the
-    // account-set scope of a borrowed request (above), and that bench is the lease's only
-    // enforcement on this path. Clearing `tried` wholesale served a lease scoped to one
-    // account on another (found in review, 2026-09-24).
-    let mut benched_for_hold: Vec<usize> = Vec::new();
     // A same-organization sibling a released conversation is sent to first (`same_org_release`),
-    // already selected, so it seeds `next_idx` below.
+    // already selected, so it seeds the ladder's next attempt below.
     let mut released_to: Option<usize> = None;
     if let Some((bound_idx, via)) = bound_candidate {
         let now = OffsetDateTime::now_utc();
@@ -3798,8 +3804,8 @@ async fn handle_request(
         {
             bound_to = Some(bound_idx);
             for idx in 0..account_count {
-                if idx != bound_idx && tried.insert(idx) {
-                    benched_for_hold.push(idx);
+                if idx != bound_idx {
+                    ladder.bench_for_hold(idx);
                 }
             }
             if via == "session-pin" {
@@ -3820,6 +3826,7 @@ async fn handle_request(
             // Told first, once: the client's retry of this 429 is the request that moves.
             if let Some(warning) = switch_warning(
                 &manager,
+                provider,
                 session_key,
                 bound_idx,
                 now,
@@ -3839,7 +3846,7 @@ async fn handle_request(
             released_to = same_org_release(
                 &manager,
                 bound_idx,
-                &tried,
+                ladder.tried(),
                 request_model.as_deref(),
                 |narrowed| {
                     manager.select_with_group(
@@ -3855,115 +3862,11 @@ async fn handle_request(
             );
         }
     }
-    // Accounts that already got their one force-refresh on a 401.
-    let mut forced_401: HashSet<usize> = HashSet::new();
-    // Per-account inline-429 retry counters.
-    let mut retried_429: HashMap<usize, u32> = HashMap::new();
-    // Per-account in-place 529 retry counters. Separate from `retried_429`: a 429
-    // is "this account is over quota" and may rotate, a 529 is "the upstream is
-    // busy" and must not — sharing one counter would let one status spend the
-    // other's budget.
-    let mut retried_529: HashMap<usize, u32> = HashMap::new();
-    // How many times THIS request has failed over to a DIFFERENT account on a 529.
-    // Per-REQUEST, deliberately not per-account like the counter above: what needs
-    // bounding is how much of the fleet one client request may walk, so it must not
-    // reset when the account changes.
-    let mut failovers_529 = 0u32;
-    // Distinguishes "no account available" (429) from "every attempt hit a
-    // transport failure" once the loop can no longer make progress. The latter is
-    // a 502 — EXCEPT when `offline_failures` below says the transport failures
-    // were this machine's resolver, which is a 503.
-    //
-    // These were ONE BOOL, and that was the bug: any single `send()` failure
-    // latched it for the rest of the request, and the check sits BEFORE both the
-    // soft-wait and the revalidation-serve — so one transport blip on one account
-    // disabled the entire recovery ladder and returned a 502 whose message ("every
-    // account transport-failed") was simply false. Observed live 09:16:46: the 502
-    // fired while two accounts had already answered with honest 429s and a third
-    // served a 200 1.6s later. Counting BOTH outcomes keeps the 502 for the only
-    // case it actually describes — nothing ever reached an upstream at all.
-    let mut transport_failures = 0usize;
-    let mut upstream_responses = 0usize;
-    // Set the moment any transport failure fails PAST the connect phase
-    // (`!err.is_connect()`, offline/DNS excluded — that is machine-level, not
-    // this). A connect-phase failure never left this box, so replaying it is
-    // free; a non-connect failure means a connection existed and the request
-    // may already have been written to it, so whether the upstream received or
-    // acted on it is unknown. One such attempt anywhere in the ladder taints the
-    // terminal answer for the whole request — see [`bad_gateway`]'s two shapes.
-    let mut unknown_outcome_transport_failure = false;
-    // Blind peer egress is offered ONCE per request, and this is the bound.
-    //
-    // It sits beside `unknown_outcome_transport_failure` because it is the same
-    // fact read the other way round: a carry is only ever offered while that
-    // flag is still false, nothing this request sent has left this box, so a
-    // resend down another path cannot double-send a POST. `src/peer/egress.rs`
-    // documents the seam; the offer itself is in the transport-failure arm
-    // below, above both the resolver arm's sleep and the exhausted-transport
-    // terminal, so both entry points the design names are one call site rather
-    // than two that can drift.
-    let mut peer_egress_tried = false;
-    // Accounts upstream refused with a 403 on OUR pooled credential, in the order
-    // seen. Every entry here is also an `upstream_responses` and a `tried` — a 403
-    // is a real answer, not a transport gap, and there is nothing to retry on the
-    // same account (unlike 401, a fresh token does not change WHICH account this
-    // is). Kept as `(idx, name)` rather than folded into a bare counter because the
-    // fast-fail response below must name the refused account(s), not just count
-    // them.
-    let mut refused_403: Vec<(usize, Option<String>)> = Vec::new();
-    // Model access can differ between ChatGPT plans. A rejection benches the account
-    // for this request only: it may still serve another model on the very next turn.
-    let mut model_refusals: Vec<(Option<String>, String)> = Vec::new();
-    let mut account_access_blocks = 0;
-    let mut codex_access_read_failures = 0;
-    let mut last_account_access_block: Option<(HeaderMap, Bytes)> = None;
     // Bound the total attempts so per-account 401/429 retries can never loop.
     let max_attempts = max_attempts_for(account_count);
-    // The account the NEXT iteration must use, bypassing select(). Three producers:
-    //
-    //  - A genuine SAME-account retry (401 force-refresh, transient-429 inline wait,
-    //    529 in-place backoff), which select() would otherwise rotate AWAY from the
-    //    very account the retry means to keep.
-    //  - The 529 FAILOVER below, which parks the DIFFERENT account its availability
-    //    probe already chose. That probe IS this iteration's selection: re-running
-    //    select() next iteration would double its side effects (LRU stamp, divert
-    //    log) and could race to a `None` after we already benched the 529'd account
-    //    in `tried` — turning a forwardable 529 into a synthesized 429.
-    //  - A released conversation's same-organization sibling (`same_org_release`, here
-    //    and at the mid-request release), selected for the same reason as the failover.
-    let mut next_idx: Option<usize> = released_to;
-    // One-shot guard: at most one transient-fleet-park soft-wait per client request.
-    let mut soft_waited_exhaustion = false;
-    // The subset of `tried` that is held out by a TRANSIENT 429 park and nothing
-    // else — the only entries the soft-wait below is allowed to re-admit.
-    //
-    // `tried` alone cannot answer that question: it also carries accounts benched
-    // by a 401, a transport blip, a dead token, and a durable quota rejection.
-    // Only the transient park is a TIMER, so only it un-does itself when the clock
-    // runs out; re-admitting any of the others would re-send this request to an
-    // account that already failed it, in a loop. An account leaves this set the
-    // moment it is re-admitted, so membership always means "currently parked".
-    // A Codex 429 that is not a quota refusal parks the same way: its hold is a
-    // timer on the 429's own `retry-after` (the Codex arm below).
-    let mut parked_transient: HashSet<usize> = HashSet::new();
-    // Same-account transport retries this request has spent, per account. The
-    // failing resource in a transport error is the CONNECTION, not the account:
-    // reqwest pools by `(scheme, authority)` and the account is only a Bearer
-    // header, so it is not in the pool key at all. Benching the account for
-    // the whole request therefore fails over on the wrong axis — and with a small
-    // eligible pool a single blip walks it to empty and answers a 502 (measured:
-    // 42 of 205 client-visible 502s fired at `transport_failures == 1`). A dead
-    // connection is evicted from the pool by the error itself, so the retry gets a
-    // fresh one.
-    //
-    // Bounded by `MAX_SAME_ACCOUNT_TRANSPORT_RETRIES`, not by one. This used to
-    // stop after a single retry because "the second failure IS evidence about the
-    // account"; a day's live log says otherwise — the first retry succeeds 94.7%
-    // of the time, so a second failure is overwhelmingly the SAME aging-connection
-    // fault recurring, not a sick account. Rotating instead costs a cold prompt
-    // cache, which is the expensive outcome this whole arm exists to avoid.
-    //
-    // Gated on the error KIND. The transport-failure branch below is THREE arms,
+    ladder.set_next(released_to);
+    // The same-account transport retry (`Ladder::spend_transport_retry`) is gated on the
+    // error KIND. The transport-failure branch below is THREE arms,
     // evaluated in this order — read them as narrowing scope, machine → connection
     // → account:
     //
@@ -3971,37 +3874,22 @@ async fn handle_request(
     //     the MACHINE. Every account resolves the same hostname, so there is
     //     nothing to bench and nowhere to rotate to. Holds the pin, waits, retries
     //     the same account, and after `MAX_OFFLINE_WAITS_PER_REQUEST` answers 503.
-    //  2. SAME-ACCOUNT RETRY (this map): a non-CONNECT failure, i.e. a pooled
+    //  2. SAME-ACCOUNT RETRY: a non-CONNECT failure, i.e. a pooled
     //     CONNECTION died. Up to `MAX_SAME_ACCOUNT_TRANSPORT_RETRIES` per account
-    //     per request, per the rationale above. Deliberately not taken for a
+    //     per request (the rationale is on `Ladder`'s field). Deliberately not taken for a
     //     CONNECT failure — there was no connection to evict, nothing is
     //     refreshed by trying again, and the retry only buys a second connect
     //     timeout on a route already not answering.
     //  3. ROTATE: everything else — a route to a resolvable host that is refused,
     //     blackholed or timing out. That IS evidence about this route, so bench the
     //     account and let the rotation do its job.
-    let mut transport_retried: HashMap<usize, u32> = HashMap::new();
-    // Accounts whose client has already been recycled for a stream reset THIS
-    // request. An h2 stream reset leaves the connection pooled (unlike a
-    // connection-level death), so the same-account retry above would otherwise
-    // check out the identical broken connection every time, this recycles it
-    // once before the retry, not on every retry, so a burst of resets on one
-    // account rebuilds the client a single time rather than once per attempt.
-    let mut reset_recycled: HashSet<usize> = HashSet::new();
-    // In-place waits this request has spent on a name-resolution failure, and how
-    // many such failures it saw at all. Per-REQUEST: an offline machine is one
-    // condition shared by every account, so there is nothing to count per account.
-    // `offline_failures` outlives the waits so the terminal answer can be the
-    // honest 503 even if the request later rotates for an unrelated reason.
-    let mut offline_waits = 0u32;
-    let mut offline_failures = 0usize;
 
     for _ in 0..max_attempts {
         let now = OffsetDateTime::now_utc();
-        let idx = match next_idx.take() {
+        let idx = match ladder.take_next() {
             Some(i) => i,
             None => match manager.select_with_group(
-                &tried,
+                ladder.tried(),
                 now,
                 request_model.as_deref(),
                 session_key,
@@ -4087,106 +3975,19 @@ async fn handle_request(
                         model: request_model.as_deref(),
                         group: request_group.as_deref(),
                         affinity: session_key,
-                        tried_local: tried.len(),
+                        tried_local: ladder.tried().len(),
                         body: body_bytes.clone(),
                         headers: fallback::Ask::scrubbed(&req_headers),
                     });
-                    if every_attempt_transport_failed(transport_failures, upstream_responses) {
-                        // Nothing reached an upstream — but WHY decides the status.
-                        // If any attempt died in the resolver, the honest answer is
-                        // the recoverable 503, not a 502 asserting the upstream is
-                        // unreachable when it is this machine that is off the
-                        // network. Reachable here only if the offline arm's own
-                        // bound was not what ended the walk (a mixed request that
-                        // rotated for another reason first).
-                        if offline_failures > 0 {
-                            return offline_unavailable(offline_failures);
-                        }
-                        return bad_gateway(transport_failures, unknown_outcome_transport_failure);
-                    }
-                    // Every upstream answer this request got was a 403 refusing OUR
-                    // credential — refusals are the WHOLE story, not one dead
-                    // account among others still worth a 429/quota wait. Fast-fail
-                    // here, before the soft-wait and revalidation-serve below: those
-                    // exist to ride out a transient PARK, and a 403'd credential is
-                    // not coming back on a timer. Gated on `upstream_responses`
-                    // (mirroring `every_attempt_transport_failed` above), not on
-                    // `account_count`, so this fires equally for a pinned request
-                    // that only ever tried its one pin. Mixed outcomes — some
-                    // accounts refused, others merely exhausted — fall through
-                    // unchanged to the existing exhaustion handling, which can still
-                    // recover on the accounts that were not refused.
-                    if !model_refusals.is_empty() {
-                        return codex_model_unavailable_response(
-                            &manager,
-                            request_model.as_deref(),
-                            &model_refusals,
-                            &refused_403,
-                        );
-                    }
-                    if codex_access_read_failures > 0
-                        && codex_access_read_failures == upstream_responses
-                    {
-                        return error_response(
-                            StatusCode::BAD_GATEWAY,
-                            "proxy_error",
-                            "Could not read the upstream access-denied responses. The affected Codex accounts are held briefly; retry shortly.",
-                            None,
-                        );
-                    }
-                    if account_access_blocks > 0
-                        && account_access_blocks + refused_403.len() == upstream_responses
-                        && let Some((headers, body)) = last_account_access_block.take()
-                    {
-                        if !refused_403.is_empty() {
-                            let mut combined: Value =
-                                serde_json::from_slice(&body).unwrap_or_else(|_| {
-                                    codex_error_body(
-                                        CodexRefusalKind::CredentialRefused,
-                                        "ChatGPT refused workspace access.",
-                                    )
-                                });
-                            let message = combined
-                                .pointer("/error/message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("ChatGPT refused workspace access.");
-                            let message = format!(
-                                "{message} {}",
-                                codex_credential_refused_message(&refused_403)
-                            );
-                            if !combined.get("error").is_some_and(Value::is_object) {
-                                combined["error"] = serde_json::json!({});
-                            }
-                            combined["error"]["message"] = message.into();
-                            return codex_error_response(
-                                StatusCode::FORBIDDEN,
-                                combined.to_string(),
-                                None,
-                            );
-                        }
-                        return build_response(
-                            StatusCode::FORBIDDEN,
-                            &headers,
-                            Body::from(body),
-                            ServedBy::PooledAccount,
-                        );
-                    }
-                    if !refused_403.is_empty() && refused_403.len() == upstream_responses {
-                        return credential_refused_response(provider, &refused_403);
-                    }
-                    // A refused pool is an access problem, not a rate-limit retry. Keep
-                    // that status throughout the short revalidation hold, even near its end.
-                    match provider {
-                        Provider::Codex => {
-                            if manager.codex_pool_is_refused(now, bound_to, strict_group) {
-                                manager.note_codex_refusal(
-                                    CodexRefusalKind::CredentialRefused,
-                                    crate::now_ms(),
-                                );
-                                return codex_refused_pool_response();
-                            }
-                        }
-                        Provider::Anthropic => {}
+                    if let Some(answer) = ladder.verdict(
+                        &manager,
+                        provider,
+                        request_model.as_deref(),
+                        now,
+                        bound_to,
+                        strict_group,
+                    ) {
+                        return answer;
                     }
                     // A cold shared-limiter burst parks the whole fleet for ~15-20s.
                     // Rather than telling the client "all exhausted" for a transient
@@ -4222,10 +4023,10 @@ async fn handle_request(
                                 manager.retry_after_hint(now, request_is_fable, provider)
                             }
                         },
-                        soft_waited_exhaustion,
+                        ladder.soft_waited_exhaustion(),
                     ) {
                         Some(secs) => {
-                            soft_waited_exhaustion = true;
+                            ladder.spend_soft_wait();
                             // Desync concurrent waiters: without this, every request
                             // sleeping the same integer-ceil `secs` wakes on the SAME
                             // second and races for the single earliest-freeing account,
@@ -4259,19 +4060,11 @@ async fn handle_request(
                             // whose hold is still running stays parked, and one
                             // benched for any NON-hold reason was never in
                             // `parked_transient` to begin with.
-                            let now_ms = crate::now_ms();
-                            let freed: Vec<usize> = parked_transient
-                                .iter()
-                                .copied()
-                                .filter(|&i| manager.hold_expired(i, now_ms))
-                                .collect();
-                            for i in &freed {
-                                tried.remove(i);
-                                parked_transient.remove(i);
-                            }
+                            let (readmitted, still_parked) =
+                                ladder.readmit_expired_parks(&manager, crate::now_ms());
                             tracing::info!(
-                                readmitted = freed.len(),
-                                still_parked = parked_transient.len(),
+                                readmitted,
+                                still_parked,
                                 "soft-wait over — re-admitted the accounts whose hold expired"
                             );
                             continue; // re-run select(); the re-admitted accounts are eligible again
@@ -4355,6 +4148,7 @@ async fn handle_request(
                             {
                                 if let Some(warning) = switch_warning(
                                     &manager,
+                                    provider,
                                     session_key,
                                     bound,
                                     now,
@@ -4370,16 +4164,14 @@ async fn handle_request(
                                 );
                                 // Re-admit only what the hold benched: a lease's
                                 // account-set scope stays benched (see
-                                // `benched_for_hold`), and so does `bound`, which
+                                // `Ladder::release_hold`), and so does `bound`, which
                                 // failed this request.
-                                for idx in benched_for_hold.drain(..) {
-                                    tried.remove(&idx);
-                                }
+                                ladder.release_hold();
                                 bound_to = None;
-                                next_idx = same_org_release(
+                                let released = same_org_release(
                                     &manager,
                                     bound,
-                                    &tried,
+                                    ladder.tried(),
                                     request_model.as_deref(),
                                     |narrowed| {
                                         manager.select_with_group(
@@ -4393,12 +4185,13 @@ async fn handle_request(
                                         )
                                     },
                                 );
+                                ladder.set_next(released);
                                 continue;
                             }
                             let served = match bound_to {
                                 Some(bound) => manager.select_bound(
                                     bound,
-                                    &tried,
+                                    ladder.tried(),
                                     now,
                                     request_is_fable,
                                     request_group.as_deref(),
@@ -4409,7 +4202,7 @@ async fn handle_request(
                                     && manager.revalidation_serve_enabled() =>
                                 {
                                     manager.select_revalidation(
-                                        &tried,
+                                        ladder.tried(),
                                         now,
                                         request_model.as_deref(),
                                         session_key,
@@ -4453,11 +4246,11 @@ async fn handle_request(
         // requests). If the refresh proved the credential dead, skip now.
         manager.ensure_fresh(idx).await;
         if manager.account_status(idx) == Some(AccountStatus::Error) {
-            tried.insert(idx);
+            ladder.bench(idx);
             continue;
         }
         let Some(token) = manager.access_token(idx) else {
-            tried.insert(idx);
+            ladder.bench(idx);
             continue;
         };
         // The upstream headers for THIS account, built once and handed to every route this
@@ -4476,6 +4269,27 @@ async fn handle_request(
                 build_codex_upstream_headers(&req_headers, &token, id.as_deref())
             }
         };
+        // The body THIS account sends, built once beside its headers and for the same reason:
+        // the exit lock, the direct send and the blind carry all take this one value, so a
+        // carried request is the same request the direct path would have sent.
+        //
+        // `None` for a GET or a HEAD, which carry no body. Anthropic: the body's
+        // `metadata.user_id.account_uuid` is rewritten to the serving account's own UUID
+        // (rotation changes the account each attempt, so this is recomputed from the pristine
+        // `body_bytes` per attempt), at the splice point the one parse found; the patch is
+        // same-length, so content-length is unaffected, and `build_upstream_headers` strips
+        // content-length regardless. Absent a configured 36-char UUID, the body is sent
+        // unchanged. Codex: the identity is the header set above; the body is opaque (usually
+        // zstd). Every no-change path forwards the buffered `Bytes` handle by O(1) refcount
+        // clone; only a genuine differing-UUID rewrite allocates.
+        let upstream_body: Option<Bytes> =
+            (method != Method::GET && method != Method::HEAD).then(|| match provider {
+                crate::provider::Provider::Anthropic => match manager.account_uuid(idx) {
+                    Some(uuid) if uuid.len() == 36 => request.for_account(&uuid),
+                    _ => body_bytes.clone(),
+                },
+                crate::provider::Provider::Codex => body_bytes.clone(),
+            });
         // **The exit lock, before the direct attempt and not inside its failure
         // arm.** An account the operator locked to one Mac leaves from that Mac
         // on EVERY request, working direct path or not: the whole point is that
@@ -4500,7 +4314,7 @@ async fn handle_request(
                 method: &method,
                 path_and_query: &path_and_query,
                 headers: upstream_headers.clone(),
-                body: body_bytes.clone(),
+                body: upstream_body.clone(),
                 peers_path: &crate::peer::egress::peers_path(),
                 session_key,
                 session_kind,
@@ -4526,7 +4340,7 @@ async fn handle_request(
         // `AccountRuntime::http` exists to fix: every account collapsing onto
         // one shared connection pool regardless of which one is serving.
         let Some(http) = manager.http_client(idx) else {
-            tried.insert(idx);
+            ladder.bench(idx);
             continue;
         };
 
@@ -4538,29 +4352,9 @@ async fn handle_request(
         let mut builder = http
             .request(method.clone(), &url)
             .headers(upstream_headers.clone());
-        if method != Method::GET && method != Method::HEAD {
-            // Rewrite the body's metadata.user_id.account_uuid to the serving
-            // account's own UUID (rotation changes the account each attempt, so
-            // this is recomputed from the pristine `body_bytes` per attempt). The
-            // patch is same-length, so content-length is unaffected — and
-            // `build_upstream_headers` strips content-length regardless. Absent a
-            // configured 36-char UUID, the body is sent unchanged.
-            // Forward the buffered `Bytes` handle by O(1) refcount clone on every
-            // no-change path; only a genuine differing-UUID rewrite allocates (it
-            // already owns a fresh Vec). `body_bytes` is immutable and re-read
-            // pristine each rotation attempt, so cloning the handle is correct, and
-            // reqwest's `Body: From<Bytes>` is O(1) — no full-body copy per request.
-            let out_body: bytes::Bytes = match provider {
-                // Anthropic: the existing metadata.user_id.account_uuid splice, unchanged.
-                crate::provider::Provider::Anthropic => match manager.account_uuid(idx) {
-                    // The splice point was found by the one parse; nothing re-reads the body.
-                    Some(uuid) if uuid.len() == 36 => request.for_account(&uuid),
-                    _ => body_bytes.clone(),
-                },
-                // Codex: the identity is the header set above; the body is opaque (usually zstd).
-                crate::provider::Provider::Codex => body_bytes.clone(),
-            };
-            builder = builder.body(out_body);
+        // reqwest's `Body: From<Bytes>` is O(1): no full-body copy per attempt.
+        if let Some(body) = upstream_body.clone() {
+            builder = builder.body(body);
         }
 
         // Fetch the serving account's name once per iteration — reused by the
@@ -4598,7 +4392,7 @@ async fn handle_request(
                 // so a 502 assembled out of these failures had no line anywhere to
                 // attribute it to; `is_connect` / `is_timeout` separate "never
                 // reached the host" from "the host went quiet mid-request".
-                transport_failures += 1;
+                ladder.transport_failed();
                 // **Blind peer egress, the one offer per request.**
                 //
                 // Four conjuncts, and the first two are what stop a carry
@@ -4639,9 +4433,12 @@ async fn handle_request(
                 // `is_offline_error`, `every_attempt_transport_failed` or
                 // either terminal status is widened.
                 let machine_level = is_offline_error(&err);
-                let nothing_ever_left_this_box = !unknown_outcome_transport_failure
+                let nothing_ever_left_this_box = !ladder.tally().unknown_outcome_transport_failure
                     && (err.is_connect() || machine_level)
-                    && every_attempt_transport_failed(transport_failures, upstream_responses);
+                    && every_attempt_transport_failed(
+                        ladder.tally().transport_failures,
+                        ladder.tally().upstream_responses,
+                    );
                 // `tried` never contains `idx` yet (it is inserted on the way
                 // out of this arm), so this account plus the benched ones is
                 // the whole of this request's provider's accounts exactly when
@@ -4657,7 +4454,8 @@ async fn handle_request(
                 // offered the carry it gets on the same fleet without them. They
                 // are filtered out of `tried` too, because the scope header
                 // benches every account outside its set, whatever its provider.
-                let tried_of_provider = tried
+                let tried_of_provider = ladder
+                    .tried()
                     .iter()
                     .filter(|&&i| manager.live_provider(i) == Some(provider))
                     .count();
@@ -4667,7 +4465,7 @@ async fn handle_request(
                 // neither lent nor carried), and a carry offers the request to a
                 // peer's gateway as surely as a lease does. A Codex request keeps the
                 // answer it had before the mesh existed.
-                if !peer_egress_tried
+                if !ladder.peer_egress_tried()
                     && nothing_ever_left_this_box
                     && rotation_is_spent
                     && match provider {
@@ -4675,27 +4473,14 @@ async fn handle_request(
                         crate::provider::Provider::Codex => false,
                     }
                 {
-                    peer_egress_tried = true;
-                    // The body is rebuilt here rather than shared with the
-                    // direct attempt's `out_body` above, because the two hunks
-                    // are built separately. The
-                    // two must agree: a carried request is the SAME request,
-                    // and the account-uuid patch is part of what the upstream
-                    // sees.
-                    let carried_body =
-                        (method != Method::GET && method != Method::HEAD).then(|| {
-                            match manager.account_uuid(idx) {
-                                Some(uuid) if uuid.len() == 36 => request.for_account(&uuid),
-                                _ => body_bytes.clone(),
-                            }
-                        });
+                    ladder.spend_peer_egress();
                     let peers_path = crate::peer::egress::peers_path();
                     let carry = crate::peer::egress::retry_through_peer(
                         crate::peer::egress::CarriedRequest {
                             url: &url,
                             method: &method,
                             headers: upstream_headers.clone(),
-                            body: carried_body,
+                            body: upstream_body.clone(),
                             peers_path: &peers_path,
                         },
                     )
@@ -4774,49 +4559,51 @@ async fn handle_request(
                 // possibly help — it only unpins the session and burns the fleet.
                 // Hold the pin, wait briefly, retry the SAME account.
                 if is_offline_error(&err) {
-                    offline_failures += 1;
-                    if offline_waits < MAX_OFFLINE_WAITS_PER_REQUEST {
-                        offline_waits += 1;
+                    let offline_failures = ladder.offline_failed();
+                    if let Some(offline_wait) =
+                        ladder.take_offline_wait(MAX_OFFLINE_WAITS_PER_REQUEST)
+                    {
                         tracing::warn!(
                             account_index = idx,
                             account = account_name.as_deref().unwrap_or("?"),
-                            offline_wait = offline_waits,
+                            offline_wait,
                             max_offline_waits = MAX_OFFLINE_WAITS_PER_REQUEST,
                             error = ?err,
                             "name resolution failed — this machine is offline; \
                              holding the pinned account and waiting"
                         );
-                        next_idx = Some(idx);
+                        ladder.retry_same(idx);
                         tokio::time::sleep(Duration::from_secs(OFFLINE_WAIT_SECS)).await;
                         continue;
                     }
-                    return offline_unavailable(offline_failures);
+                    return offline_unavailable(provider, offline_failures);
                 }
                 // Past the connect phase: a connection existed and the request may
                 // already be in flight on the wire, so this attempt's outcome upstream
                 // is unknown regardless of whether it now gets retried in place or the
                 // ladder rotates away from it. See `unknown_outcome_transport_failure`.
                 if !err.is_connect() {
-                    unknown_outcome_transport_failure = true;
+                    ladder.unknown_outcome();
                 }
                 // Classified ONCE per attempt, see `TransportFailureReason`'s own
                 // doc for why a stream reset needs different handling than a
                 // connection-level death even though both are `!is_connect()`.
                 let transport_reason = classify_transport_failure(&err);
                 if transport_reason == TransportFailureReason::StreamReset
-                    && reset_recycled.insert(idx)
+                    && ladder.first_reset_recycle(idx)
                 {
                     // The h2 connection survives a stream reset (unlike a
                     // connection-level death, which reqwest's own error already
                     // evicted from the pool), so without this the retry below
                     // would check out the SAME broken connection. Recycle once per
                     // account per request, a second reset here finds `idx`
-                    // already in `reset_recycled` and goes straight to the retry,
+                    // already recycled and goes straight to the retry,
                     // which by then really is on the fresh connection.
                     manager.recycle_client_after_reset(idx);
                 }
-                let transport_attempt = transport_retried.entry(idx).or_insert(0);
-                if !err.is_connect() && *transport_attempt < MAX_SAME_ACCOUNT_TRANSPORT_RETRIES {
+                if !err.is_connect()
+                    && ladder.transport_retries(idx) < MAX_SAME_ACCOUNT_TRANSPORT_RETRIES
+                {
                     // A blip on this account this request: retry it on a fresh
                     // connection rather than benching an account that is probably fine.
                     // A connection-level death is already evicted from the pool by
@@ -4824,7 +4611,7 @@ async fn handle_request(
                     // either way each retry genuinely gets a new connection, which
                     // is why repeating is worth more than rotating (94.7% land a
                     // 200).
-                    *transport_attempt += 1;
+                    let transport_retry = ladder.spend_transport_retry(idx);
                     // Message text unchanged — `scripts/` parses it. The attempt
                     // fields are ADDED alongside, never a replacement, so an existing
                     // grep keeps matching while a new one can see the ladder.
@@ -4833,12 +4620,12 @@ async fn handle_request(
                         account = account_name.as_deref().unwrap_or("?"),
                         is_connect = err.is_connect(),
                         is_timeout = err.is_timeout(),
-                        transport_retry = *transport_attempt,
+                        transport_retry,
                         max_transport_retries = MAX_SAME_ACCOUNT_TRANSPORT_RETRIES,
                         error = ?err,
                         "upstream transport failure — retrying the SAME account on a fresh connection"
                     );
-                    next_idx = Some(idx);
+                    ladder.retry_same(idx);
                     continue;
                 }
                 tracing::warn!(
@@ -4849,13 +4636,13 @@ async fn handle_request(
                     error = ?err,
                     "upstream transport failure — rotating to another account"
                 );
-                tried.insert(idx);
+                ladder.bench(idx);
                 continue;
             }
         };
         // This attempt reached an upstream and got an HTTP status back, whatever it
         // was. That fact alone disproves "every account transport-failed".
-        upstream_responses += 1;
+        ladder.upstream_answered();
 
         let status = resp.status();
         // One greppable line per upstream response, tagged with the true serving
@@ -4919,12 +4706,12 @@ async fn handle_request(
                     "upstream 401 on an account with no refresh token — credential rejected, re-login needed"
                 );
                 manager.mark_error(idx);
-                tried.insert(idx);
+                ladder.bench(idx);
                 continue;
             }
-            if forced_401.insert(idx) {
+            if ladder.first_forced_refresh(idx) {
                 if manager.ensure_fresh_force(idx).await {
-                    next_idx = Some(idx);
+                    ladder.retry_same(idx);
                     continue; // retry the same account with the fresh token
                 }
                 // The forced refresh produced no new token — it was coalesced /
@@ -4932,7 +4719,7 @@ async fn handle_request(
                 // refresh failed. Retrying would just 401 again on the same dead
                 // token. Rotate away; the account stays Active and the cooldown
                 // self-clears for the next request.
-                tried.insert(idx);
+                ladder.bench(idx);
                 continue;
             }
             // A SECOND 401: the retry with a freshly-minted token ALSO 401'd. That is
@@ -4953,7 +4740,7 @@ async fn handle_request(
             // A genuinely dead credential is still caught at the source: its refresh
             // 400s and the AuthRejected arm sets `Error` there. Here we just rotate —
             // this request fails over and the account stays eligible for the next one.
-            tried.insert(idx);
+            ladder.bench(idx);
             continue;
         }
 
@@ -5034,8 +4821,8 @@ async fn handle_request(
                         let hold = NO_GUIDANCE_HOLD_SECS
                             + i64::from(now.nanosecond()) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
                         manager.mark_rate_limited(idx, hold);
-                        codex_access_read_failures += 1;
-                        tried.insert(idx);
+                        ladder.codex_access_unread();
+                        ladder.bench(idx);
                         continue;
                     }
                     let auth_error = body
@@ -5047,9 +4834,8 @@ async fn handle_request(
                             .is_some_and(|body| codex_forbidden_is_account_error(&up_headers, body))
                         {
                             manager.mark_refused(idx);
-                            account_access_blocks += 1;
-                            last_account_access_block = body.map(|body| (up_headers, body));
-                            tried.insert(idx);
+                            ladder.account_access_blocked(body.map(|body| (up_headers, body)));
+                            ladder.bench(idx);
                             continue;
                         }
                         tracing::warn!(
@@ -5063,12 +4849,12 @@ async fn handle_request(
                                 Body::from(body),
                                 ServedBy::PooledAccount,
                             ),
-                            None => error_response(
+                            None => ClientError::new(
                                 StatusCode::BAD_GATEWAY,
-                                "proxy_error",
+                                ErrorKind::Proxy,
                                 "Failed to read the upstream access-denied response.",
-                                None,
-                            ),
+                            )
+                            .respond(provider),
                         };
                     }
                 }
@@ -5080,8 +4866,8 @@ async fn handle_request(
                 "upstream 403 Forbidden — credential refused, rotating to another account"
             );
             manager.mark_refused(idx);
-            refused_403.push((idx, account_name.clone()));
-            tried.insert(idx);
+            ladder.refused_403(idx, account_name.clone());
+            ladder.bench(idx);
             continue;
         }
 
@@ -5213,19 +4999,19 @@ async fn handle_request(
                             if quota_refusal {
                                 manager.mark_codex_quota_limited(idx, hold);
                             } else {
-                                let count = retried_429.entry(idx).or_insert(0);
+                                let count = ladder.retries_429(idx);
                                 let jitter = i64::from(clock.nanosecond())
                                     % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
-                                match classify_transient_429(retry_after_raw, *count, jitter) {
+                                match classify_transient_429(retry_after_raw, count, jitter) {
                                     Transient429::InlineWait(wait) => {
-                                        *count += 1;
+                                        ladder.spend_429_retry(idx);
                                         tokio::time::sleep(Duration::from_secs(wait as u64)).await;
-                                        next_idx = Some(idx);
+                                        ladder.retry_same(idx);
                                         continue;
                                     }
                                     Transient429::Park(wait) => {
                                         manager.mark_rate_limited(idx, wait);
-                                        parked_transient.insert(idx);
+                                        ladder.park(idx);
                                     }
                                 }
                             }
@@ -5234,7 +5020,7 @@ async fn handle_request(
                                 quota_refusal,
                                 "Codex 429: holding the account and rotating"
                             );
-                            tried.insert(idx);
+                            ladder.bench(idx);
                             continue;
                         }
                         crate::provider::Provider::Anthropic => {}
@@ -5260,28 +5046,27 @@ async fn handle_request(
                                 jittered_quota_hold(retry_after, now.nanosecond()),
                             );
                         }
-                        tried.insert(idx);
+                        ladder.bench(idx);
                         continue;
                     }
-                    let count = retried_429.entry(idx).or_insert(0);
+                    let count = ladder.retries_429(idx);
                     // Desync the no-guidance un-park across accounts that tripped together;
                     // derive the jitter from the loop clock so no `rand` dependency is needed.
                     let jitter = (now.nanosecond() as i64) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
-                    match classify_transient_429(retry_after_raw, *count, jitter) {
+                    match classify_transient_429(retry_after_raw, count, jitter) {
                         Transient429::InlineWait(wait) => {
-                            *count += 1;
+                            ladder.spend_429_retry(idx);
                             tokio::time::sleep(Duration::from_secs(wait as u64)).await;
-                            next_idx = Some(idx);
+                            ladder.retry_same(idx);
                             continue; // retry the same account after the bounded wait
                         }
                         Transient429::Park(wait) => {
                             manager.mark_rate_limited(idx, wait);
-                            tried.insert(idx);
-                            // Record WHY this entry is in `tried`: a timer that expires on
-                            // its own, so the soft-wait above may take it back. The Codex
-                            // arm above records its non-quota hold the same way; every other
-                            // `tried.insert` in this loop deliberately omits this.
-                            parked_transient.insert(idx);
+                            // Benched AND re-admittable: a timer that expires on its own, so
+                            // the soft-wait above may take it back. The Codex arm above parks
+                            // its non-quota hold the same way; every other bench in this loop
+                            // is `Ladder::bench`, which is not re-admitted.
+                            ladder.park(idx);
                             continue;
                         }
                     }
@@ -5306,7 +5091,7 @@ async fn handle_request(
         // off it got a 200 from a sibling 2s later). See
         // [`MAX_529_FAILOVERS_PER_REQUEST`].
         //
-        // The failover mechanism is exactly one line — `tried.insert(idx)` — because
+        // The failover mechanism is benching `idx` in `tried` (`Ladder::fail_over_529`), because
         // `select` already has the branch for it: a PINNED session whose pin is in
         // `tried` takes the documented "pin-tried" path, which diverts THIS REQUEST
         // and KEEPS THE PIN (`src/manager/select.rs`). So the session comes home to
@@ -5338,32 +5123,32 @@ async fn handle_request(
         // the terminal-outcome arm below, so the client sees the 529 forwarded
         // verbatim — byte-identical to the behaviour before this arm existed.
         if status.as_u16() == STATUS_OVERLOADED {
-            let retried = retried_529.entry(idx).or_insert(0);
-            if *retried < MAX_SAME_ACCOUNT_529_RETRIES {
-                let backoff = backoff_529_secs(*retried, parse_retry_after(&up_headers));
-                *retried += 1;
+            let retried = ladder.retries_529(idx);
+            if retried < MAX_SAME_ACCOUNT_529_RETRIES {
+                let backoff = backoff_529_secs(retried, parse_retry_after(&up_headers));
+                let retry = ladder.spend_529_retry(idx);
                 tracing::warn!(
                     account = account_name.as_deref().unwrap_or("?"),
                     account_index = idx,
-                    retry = *retried,
+                    retry,
                     max_retries = MAX_SAME_ACCOUNT_529_RETRIES,
                     backoff_secs = backoff,
                     "upstream 529 Overloaded — backing off and retrying the SAME account"
                 );
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
-                next_idx = Some(idx);
+                ladder.retry_same(idx);
                 continue; // retry the same account after the bounded backoff
             }
             // This account's in-place budget is spent. Fail the request over while
             // the per-request failover budget lasts AND another account is free.
-            let attempts = *retried + 1;
-            if failovers_529 < MAX_529_FAILOVERS_PER_REQUEST {
+            let attempts = retried + 1;
+            if ladder.failovers_529() < MAX_529_FAILOVERS_PER_REQUEST {
                 // Ask for the replacement BEFORE benching this account, and pass the
                 // `tried` set the next iteration WOULD have passed. A fresh clock,
                 // not the loop's `now`: the backoffs above have made that value up to
                 // several seconds stale, and an account whose hold expired during
                 // them is a legitimate target.
-                let mut with_this_one = tried.clone();
+                let mut with_this_one = ladder.tried().clone();
                 with_this_one.insert(idx);
                 let failover_now = OffsetDateTime::now_utc();
                 if let Some(other) = manager.select_with_group(
@@ -5379,21 +5164,19 @@ async fn handle_request(
                         other, idx,
                         "select must honour `tried`, or the failover re-sends to the overloaded account"
                     );
-                    tried.insert(idx);
-                    failovers_529 += 1;
+                    // The probe above IS this failover's selection; consume it rather
+                    // than re-selecting (see `Ladder`'s `next_idx`).
+                    ladder.fail_over_529(idx, other);
                     tracing::warn!(
                         account = account_name.as_deref().unwrap_or("?"),
                         account_index = idx,
                         attempts,
-                        failover = failovers_529,
+                        failover = ladder.failovers_529(),
                         max_failovers = MAX_529_FAILOVERS_PER_REQUEST,
                         next_account = manager.account_name(other).as_deref().unwrap_or("?"),
                         next_account_index = other,
                         "upstream 529 Overloaded — in-place budget spent, failing this request over to another account"
                     );
-                    // The probe above IS this failover's selection; consume it rather
-                    // than re-selecting (see `next_idx`).
-                    next_idx = Some(other);
                     continue;
                 }
             }
@@ -5404,15 +5187,39 @@ async fn handle_request(
                 // Distinguishes the two give-up shapes in the log: 0 means nothing
                 // else was eligible to fail over to, `MAX_529_FAILOVERS_PER_REQUEST`
                 // means the fleet was walked and every account was overloaded too.
-                failovers = failovers_529,
+                failovers = ladder.failovers_529(),
                 "upstream 529 Overloaded — retry and failover budgets spent, forwarding 529 to the client"
             );
         }
 
         // Terminal outcome (2xx, or a 3xx/4xx/5xx forwarded verbatim). Count the
         // request once against the true serving account and log it.
-        let served_at = OffsetDateTime::now_utc();
-        manager.record_served(idx, served_at, session_key, session_kind);
+        // F1: the wire-session table (`tcr status --json`'s `sessions` array) gets this
+        // request's session id, model and tool events. Cloned, not moved: the usage-recording
+        // arms below (streamed and non-streamed) still need `account_name`/`request_model`.
+        record_served_request(
+            &manager,
+            ServedRequest {
+                idx,
+                served_at: OffsetDateTime::now_utc(),
+                session_key,
+                session_kind,
+                wire_session_id: wire_session_id.as_deref(),
+                account: account_name.clone(),
+                method: method.to_string(),
+                path_and_query: path_and_query.clone(),
+                status: status.as_u16(),
+                // The provider this request was routed on, decided once from its path.
+                wire: match provider {
+                    crate::provider::Provider::Codex => WireFold::Codex { path: &path },
+                    crate::provider::Provider::Anthropic => WireFold::Anthropic {
+                        model: request_model.clone(),
+                        tool_uses: &wire_tool_uses,
+                        tool_results: &wire_tool_results,
+                    },
+                },
+            },
+        );
         // A history bound elsewhere and answered here has moved here: re-bind its tokens, or the
         // next full-history request is held back to the old account's cold cache once it
         // recovers (`Manager::rebind_served_history`).
@@ -5424,43 +5231,6 @@ async fn handle_request(
                 crate::now_ms(),
             );
         }
-        // F1: fold this request's session id, model and tool events into the wire-session
-        // table (`tcr status --json`'s `sessions` array) — a no-op when `wire_session_id` is
-        // `None`. Cloned, not moved: the usage-recording arms below (streamed and
-        // non-streamed) still need `account_name`/`request_model`/`wire_session_id`.
-        // Codex request bodies carry no tool events here. Only a Responses turn closes
-        // calls started by the previous response; auxiliary model calls leave them running.
-        match provider {
-            crate::provider::Provider::Codex => {
-                manager.record_codex_wire_request(
-                    wire_session_id.as_deref(),
-                    account_name.clone(),
-                    &path,
-                    served_at,
-                );
-            }
-            crate::provider::Provider::Anthropic => {
-                manager.record_wire_session(
-                    wire_session_id.as_deref(),
-                    account_name.clone(),
-                    request_model.clone(),
-                    served_at,
-                    &wire_tool_uses,
-                    &wire_tool_results,
-                );
-            }
-        }
-        manager.push_log(RequestLogEntry {
-            time: served_at,
-            method: method.to_string(),
-            path: path_and_query.clone(),
-            status: status.as_u16(),
-            // Cloned, not moved: the streaming arm below still needs
-            // `account_name` to log a mid-stream transport failure by name.
-            account: account_name.clone().unwrap_or_default(),
-            // The provider this request was routed on, decided once from its path.
-            provider,
-        });
 
         let is_stream = up_headers
             .get(CONTENT_TYPE)
@@ -5500,23 +5270,20 @@ async fn handle_request(
             let evidence_dropped_reader = Arc::clone(&evidence_dropped);
             let manager_side = manager.clone();
             let status_is_success = status.is_success();
-            // Cloned, not moved: `account_name` (the original) is still moved
-            // into `TeeState` further below, in this same iteration — see the
-            // comment there. This clone is ONLY for the per-request usage log
-            // line inside the spawned parser task.
-            let account_name_for_log = account_name.clone();
-            // Cloned for the same reason and in the same place as
-            // `account_name_for_log` above: the model this request targeted is
-            // parsed once per request (`request_model`) and the spawned parser
-            // task below outlives this iteration. A `String` clone per streamed
-            // request, so the ledger can attribute tokens to a model at all.
-            let request_model_for_usage = request_model.clone();
-            // Same reasoning, for F1's wire-session token counts: the spawned parser task
-            // outlives this iteration, so it needs its own clone of the session id.
-            let wire_session_id_for_usage = wire_session_id.clone();
-            // The answer, a `bool`: the spawned task never holds the body.
-            let extended_ttl_for_usage = extended_ttl;
-            let stream_path = path.clone();
+            // Cloned, not moved: the spawned parser task below outlives this iteration, and
+            // `account_name` (the original) is still moved into `TeeState` further below, in
+            // this same iteration (see the comment there). `extended_ttl` is the answer, a
+            // `bool`: the spawned task never holds the body.
+            let turn = ServedTurn {
+                provider,
+                idx,
+                account_name: account_name.clone(),
+                path: path.clone(),
+                session_key,
+                wire_session_id: wire_session_id.clone(),
+                request_model: request_model.clone(),
+                extended_ttl,
+            };
             // The request's clock moves into the passthrough body (`StreamTiming`),
             // which finishes it when the body ends and sends the fields here, to
             // the task that owns the `request usage` line.
@@ -5544,7 +5311,7 @@ async fn handle_request(
                     bound_tokens,
                     codex_tool_calls,
                     codex_stream_limit,
-                } = parse_sse_usage(byte_stream, provider, &stream_path).await;
+                } = parse_sse_usage(byte_stream, provider, &turn.path).await;
                 // A 200 can carry a quota refusal in its SSE body. The client has
                 // already received that stream, so never replay it here; bench the
                 // serving account before its next pinned turn is selected.
@@ -5572,7 +5339,7 @@ async fn handle_request(
                 // no usage still has tools running.
                 let stream_ended = OffsetDateTime::now_utc();
                 manager_side.record_wire_session_tool_uses(
-                    wire_session_id_for_usage.as_deref(),
+                    turn.wire_session_id.as_deref(),
                     stream_ended,
                     &response_tool_uses,
                 );
@@ -5580,7 +5347,7 @@ async fn handle_request(
                 // running from the same instant with their own timeouts. Empty on an
                 // Anthropic stream.
                 manager_side.record_codex_wire_session_calls(
-                    wire_session_id_for_usage.as_deref(),
+                    turn.wire_session_id.as_deref(),
                     stream_ended,
                     &codex_tool_calls,
                 );
@@ -5601,80 +5368,13 @@ async fn handle_request(
                     }
                 };
                 if parsed.input_total > 0 || parsed.output > 0 {
-                    // The REQUEST's model whenever its body named one. `response_model` is set
-                    // only on a Codex stream, so an Anthropic record is exactly what it was; a
-                    // Codex body is usually zstd and then does not parse, so its turn is filed
-                    // under the model its own terminal event named instead of under "unknown".
-                    let record = usage_record(
+                    turn.finish(
+                        &manager_side,
+                        status,
                         &parsed,
-                        request_model_for_usage.or(response_model),
-                        session_key,
-                        || extended_ttl_for_usage,
+                        response_model,
+                        timing.as_ref(),
                     );
-                    // One line per terminal request, never per SSE event — a
-                    // per-event log here would be the same flood vector the
-                    // stream-error path above is careful to avoid on a long
-                    // erroring stream. It carries the request's timing too,
-                    // rather than a second INFO line per request.
-                    let t = timing.as_ref();
-                    // `account_index`, `path` and `status` are the fields the DEBUG
-                    // `serving request` and `upstream response` lines carry, so this one
-                    // line is a served request's whole INFO record.
-                    tracing::info!(
-                        account = account_name_for_log.as_deref().unwrap_or("?"),
-                        account_index = idx,
-                        path = %stream_path,
-                        status = status.as_u16(),
-                        session = ?session_key,
-                        model = record.model.as_deref().unwrap_or("?"),
-                        cache_read_tokens = parsed.cache_read,
-                        cache_creation_tokens = parsed.cache_creation,
-                        cache_creation_1h_tokens = record.cache_1h,
-                        input_tokens = parsed.input_total,
-                        output_tokens = parsed.output,
-                        wait_ms = t.and_then(|t| t.wait_ms),
-                        throttle_ms = t.map(|t| t.throttle_ms),
-                        upstream_ms = t.and_then(|t| t.upstream_ms),
-                        first_byte_ms = t.and_then(|t| t.first_byte_ms),
-                        total_ms = t.map(|t| t.total_ms),
-                        attempts = t.map(|t| t.attempts),
-                        switched = t.map(|t| t.switched),
-                        completed = t.map(|t| t.completed),
-                        "request usage"
-                    );
-                    if let Some(t) = t {
-                        t.log_if_held();
-                    }
-                    // A Codex session also keeps the turn's reasoning tokens, and its model is
-                    // the one the ledger files the turn under: the stream's, in practice, since
-                    // a Codex body is usually zstd and names none tcr can read.
-                    match provider {
-                        crate::provider::Provider::Codex => {
-                            manager_side.record_codex_wire_session_usage(
-                                wire_session_id_for_usage.as_deref(),
-                                record.model.as_deref(),
-                                record.input,
-                                record.cache_5m,
-                                record.cache_1h,
-                                record.cache_read,
-                                record.output,
-                                parsed.reasoning,
-                                record.ts_ms,
-                            );
-                        }
-                        crate::provider::Provider::Anthropic => {
-                            manager_side.record_wire_session_usage(
-                                wire_session_id_for_usage.as_deref(),
-                                record.model.as_deref(),
-                                record.input,
-                                record.cache_5m,
-                                record.cache_1h,
-                                record.cache_read,
-                                record.output,
-                            );
-                        }
-                    }
-                    manager_side.record_usage(idx, record);
                 } else if let Some(t) = &timing {
                     // No usage, so no `request usage` line to ride on.
                     t.log_alone();
@@ -5856,20 +5556,20 @@ async fn handle_request(
         let bytes = match read_capped_body(resp.bytes_stream(), MAX_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(BodyReadError::Transport) => {
-                return error_response(
+                return ClientError::new(
                     StatusCode::BAD_GATEWAY,
-                    "proxy_error",
+                    ErrorKind::Proxy,
                     "Failed to read upstream response body.",
-                    None,
-                );
+                )
+                .respond(provider);
             }
             Err(BodyReadError::TooLarge) => {
-                return error_response(
+                return ClientError::new(
                     StatusCode::BAD_GATEWAY,
-                    "proxy_error",
+                    ErrorKind::Proxy,
                     "Upstream response body exceeded the size cap.",
-                    None,
-                );
+                )
+                .respond(provider);
             }
         };
         let buffered_at = Instant::now();
@@ -5879,8 +5579,8 @@ async fn handle_request(
                     && let Some(detail) = codex_model_refusal_detail(&bytes)
                 {
                     log_upstream_error_body(idx, account_name.as_deref(), status, &bytes);
-                    model_refusals.push((account_name.clone(), detail));
-                    tried.insert(idx);
+                    ladder.model_refused(account_name.clone(), detail);
+                    ladder.bench(idx);
                     continue;
                 }
             }
@@ -5904,71 +5604,23 @@ async fn handle_request(
             let parsed = response.usage;
             let response_model = response.model;
             if parsed.input_total > 0 || parsed.output > 0 {
-                // As on the streaming arm: the REQUEST's model whenever its body named one,
-                // else, for a Codex body only, the model its Responses object names.
-                let record = usage_record(
-                    &parsed,
-                    request_model.clone().or(response_model),
-                    session_key,
-                    || extended_ttl,
-                );
-                // One line per terminal (non-streamed) request — see the
-                // matching log line on the streaming arm above. It carries the
-                // timing, so `handle` must not log it a second time: disarmed.
+                // The `request usage` line carries the timing, so `handle` must not log it a
+                // second time: disarmed. No Codex tool calls are read here: codex streams its
+                // turns, so a non-streamed Responses object comes only from a client that is
+                // not codex.
                 let t = timing.finish(status.as_u16(), Instant::now(), true);
                 timing.armed = false;
-                tracing::info!(
-                    account = account_name.as_deref().unwrap_or("?"),
-                    account_index = idx,
-                    path = %path,
-                    status = status.as_u16(),
-                    session = ?session_key,
-                    model = record.model.as_deref().unwrap_or("?"),
-                    cache_read_tokens = parsed.cache_read,
-                    cache_creation_tokens = parsed.cache_creation,
-                    cache_creation_1h_tokens = record.cache_1h,
-                    input_tokens = parsed.input_total,
-                    output_tokens = parsed.output,
-                    wait_ms = t.wait_ms,
-                    throttle_ms = t.throttle_ms,
-                    upstream_ms = t.upstream_ms,
-                    first_byte_ms = t.first_byte_ms,
-                    total_ms = t.total_ms,
-                    attempts = t.attempts,
-                    switched = t.switched,
-                    completed = t.completed,
-                    "request usage"
-                );
-                t.log_if_held();
-                // No Codex tool calls are read here: codex streams its turns, so a
-                // non-streamed Responses object comes only from a client that is not codex.
-                match provider {
-                    crate::provider::Provider::Codex => {
-                        manager.record_codex_wire_session_usage(
-                            wire_session_id.as_deref(),
-                            record.model.as_deref(),
-                            record.input,
-                            record.cache_5m,
-                            record.cache_1h,
-                            record.cache_read,
-                            record.output,
-                            parsed.reasoning,
-                            record.ts_ms,
-                        );
-                    }
-                    crate::provider::Provider::Anthropic => {
-                        manager.record_wire_session_usage(
-                            wire_session_id.as_deref(),
-                            record.model.as_deref(),
-                            record.input,
-                            record.cache_5m,
-                            record.cache_1h,
-                            record.cache_read,
-                            record.output,
-                        );
-                    }
+                ServedTurn {
+                    provider,
+                    idx,
+                    account_name: account_name.clone(),
+                    path: path.clone(),
+                    session_key,
+                    wire_session_id: wire_session_id.clone(),
+                    request_model: request_model.clone(),
+                    extended_ttl,
                 }
-                manager.record_usage(idx, record);
+                .finish(&manager, status, &parsed, response_model, Some(&t));
             }
         } else {
             // The "upstream response" line above (:2587) has never carried a
@@ -5988,36 +5640,35 @@ async fn handle_request(
         );
     }
 
-    if !model_refusals.is_empty() {
-        return codex_model_unavailable_response(
-            &manager,
-            request_model.as_deref(),
-            &model_refusals,
-            &refused_403,
-        );
+    // Ran out of attempts while still rotating: the same verdict the select-found-nothing
+    // arm reads off the tallies, and otherwise an upstream did answer us and the honest
+    // verdict is exhausted quota.
+    let now = OffsetDateTime::now_utc();
+    // The MIRROR of the refusal arm above, and the same fix: a strict ask is
+    // `reserved || !spill`, so this terminal's own scoping has to ask the same
+    // question the picker did.
+    let strict_group = request_group
+        .as_deref()
+        .filter(|g| manager.is_group_strict(g));
+    if let Some(answer) = ladder.verdict(
+        &manager,
+        provider,
+        request_model.as_deref(),
+        now,
+        bound_to,
+        strict_group,
+    ) {
+        return answer;
     }
-
-    // Ran out of attempts while still rotating — a bad gateway only if transport
-    // failure was the WHOLE story (same rule as the mid-loop check above);
-    // otherwise an upstream did answer us and the honest verdict is exhausted quota.
-    if every_attempt_transport_failed(transport_failures, upstream_responses) {
-        bad_gateway(transport_failures, unknown_outcome_transport_failure)
-    } else {
-        exhausted_response(
-            &manager,
-            OffsetDateTime::now_utc(),
-            provider_account_count,
-            request_is_fable,
-            provider,
-            // The MIRROR of the refusal arm above, and the same fix: a
-            // strict ask is `reserved || !spill`, so this terminal's own
-            // scoping has to ask the same question the picker did.
-            request_group
-                .as_deref()
-                .filter(|g| manager.is_group_strict(g)),
-            bound_to,
-        )
-    }
+    exhausted_response(
+        &manager,
+        now,
+        provider_account_count,
+        request_is_fable,
+        provider,
+        strict_group,
+        bound_to,
+    )
 }
 
 /// Length-independent comparison of the presented key against the configured
@@ -6168,12 +5819,12 @@ pub(crate) fn wants_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Built QUIETLY ([`quiet_error_response`]): every Codex session opens with an upgrade, so a
 /// warn here would be one false alarm per session. `handle` logs it at debug.
 pub(crate) fn upgrade_required_response() -> Response {
-    quiet_error_response(
+    ClientError::new(
         StatusCode::UPGRADE_REQUIRED,
-        "upgrade_required",
+        ErrorKind::UpgradeRequired,
         "tcr relays Codex over HTTP streaming only; the client falls back to SSE for this session.",
-        None,
     )
+    .respond_quiet(Provider::Codex)
 }
 
 /// Does this Codex request name a workspace routing of its own
@@ -6630,20 +6281,20 @@ async fn relay_request(
     timing: &mut Option<RelayTiming>,
 ) -> Response {
     let Some(client) = relay_client() else {
-        return error_response(
+        return ClientError::new(
             StatusCode::BAD_GATEWAY,
-            "proxy_error",
+            ErrorKind::Proxy,
             "Could not build the relay HTTP client.",
-            None,
-        );
+        )
+        .respond(provider);
     };
     let Ok(body_bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
-        return error_response(
+        return ClientError::new(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Failed to read request body.",
-            None,
-        );
+        )
+        .respond(provider);
     };
 
     let headers = match mode {
@@ -6691,17 +6342,17 @@ async fn relay_request(
             // 502 with no `x-should-retry`: telling a client to retry it is a
             // decision about relayed paths this arm does not make.
             if is_offline_error(&err) {
-                return offline_unavailable(1);
+                return offline_unavailable(provider, 1);
             }
             if err.is_connect() {
-                return bad_gateway(1, false);
+                return bad_gateway(provider, 1, false);
             }
-            return error_response(
+            return ClientError::new(
                 StatusCode::BAD_GATEWAY,
-                "proxy_error",
+                ErrorKind::Proxy,
                 "Upstream unreachable.",
-                None,
-            );
+            )
+            .respond(provider);
         }
     };
 
@@ -6768,18 +6419,18 @@ async fn relay_request(
         }
         RelayMode::Raw => match read_capped_body(resp.bytes_stream(), MAX_BODY_BYTES).await {
             Ok(bytes) => build_response(status, &up_headers, Body::from(bytes), ServedBy::Caller),
-            Err(BodyReadError::Transport) => error_response(
+            Err(BodyReadError::Transport) => ClientError::new(
                 StatusCode::BAD_GATEWAY,
-                "proxy_error",
+                ErrorKind::Proxy,
                 "Failed to read upstream response body.",
-                None,
-            ),
-            Err(BodyReadError::TooLarge) => error_response(
+            )
+            .respond(provider),
+            Err(BodyReadError::TooLarge) => ClientError::new(
                 StatusCode::BAD_GATEWAY,
-                "proxy_error",
+                ErrorKind::Proxy,
                 "Upstream response body exceeded the size cap.",
-                None,
-            ),
+            )
+            .respond(provider),
         },
     }
 }
@@ -7946,12 +7597,7 @@ fn error_response(
     message: &str,
     retry_after: Option<i64>,
 ) -> Response {
-    tracing::warn!(
-        status = status.as_u16(),
-        error.r#type = err_type,
-        error.message = message,
-        "proxy-generated error response"
-    );
+    client_error::warn_refusal(status, err_type, message);
     quiet_error_response(status, err_type, message, retry_after)
 }
 
@@ -8249,12 +7895,10 @@ fn exhausted_response(
         bound_to = bound_name.as_deref().unwrap_or("-"),
         "returning exhausted 429 to client"
     );
-    let mut response = error_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        "rate_limit_error",
-        &detail,
-        Some(advertised_retry_after),
-    );
+    let mut response =
+        ClientError::new(StatusCode::TOO_MANY_REQUESTS, ErrorKind::RateLimit, detail)
+            .retry_after(advertised_retry_after)
+            .respond(provider);
     // Held history never carries a claim. The held account's window is not this user's limit:
     // an account that is really out releases the conversation to the fleet
     // (`Manager::bound_account_holds`), so a 429 that reaches here for held history is a wait
@@ -8389,6 +8033,7 @@ const SWITCH_WARNING_RETRY_AFTER_SECS: i64 = 3;
 /// Names no account, because the body can travel to a borrowing peer.
 fn switch_warning(
     manager: &Manager,
+    provider: Provider,
     session_key: Option<u64>,
     bound_idx: usize,
     now: OffsetDateTime,
@@ -8426,15 +8071,18 @@ fn switch_warning(
         retry_after = SWITCH_WARNING_RETRY_AFTER_SECS,
         "held conversation's account is out; warning the client once before moving it"
     );
-    Some(error_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        "rate_limit_error",
-        &format!(
-            "tcr: the account holding this conversation is out ({why}{until}); the retry moves \
-             it to another account, where its prompt cache starts cold."
-        ),
-        Some(SWITCH_WARNING_RETRY_AFTER_SECS),
-    ))
+    Some(
+        ClientError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorKind::RateLimit,
+            format!(
+                "tcr: the account holding this conversation is out ({why}{until}); the retry moves \
+                 it to another account, where its prompt cache starts cold."
+            ),
+        )
+        .retry_after(SWITCH_WARNING_RETRY_AFTER_SECS)
+        .respond(provider),
+    )
 }
 
 /// What a gate means, in words a person reads after an account count or after "out".
@@ -8542,7 +8190,7 @@ fn every_attempt_transport_failed(transport_failures: usize, upstream_responses:
 /// both are "a network hiccup, not a durable fault, come back in a few
 /// seconds", and that number is already the one a live measurement
 /// (2026-08-10, see its doc-comment) established for exactly that recommendation.
-fn bad_gateway(transport_failures: usize, unknown_outcome: bool) -> Response {
+fn bad_gateway(provider: Provider, transport_failures: usize, unknown_outcome: bool) -> Response {
     if unknown_outcome {
         tracing::warn!(
             transport_failures,
@@ -8550,20 +8198,17 @@ fn bad_gateway(transport_failures: usize, unknown_outcome: bool) -> Response {
              got past the connect phase, so its outcome upstream is unknown; telling the \
              client not to retry automatically"
         );
-        let mut response = error_response(
+        ClientError::new(
             StatusCode::BAD_GATEWAY,
-            "proxy_error",
-            &format!(
+            ErrorKind::Proxy,
+            format!(
                 "Upstream unreachable: all {transport_failures} attempt(s) failed in transport, \
                  and at least one may have reached the upstream before failing. Its outcome is \
                  unknown — do not retry this request automatically."
             ),
-            None,
-        );
-        response
-            .headers_mut()
-            .insert("x-should-retry", HeaderValue::from_static("false"));
-        response
+        )
+        .should_retry(false)
+        .respond(provider)
     } else {
         tracing::warn!(
             transport_failures,
@@ -8571,19 +8216,17 @@ fn bad_gateway(transport_failures: usize, unknown_outcome: bool) -> Response {
             "returning 503 to client — every attempt failed at the connect phase; nothing \
              reached an upstream, so retrying is safe"
         );
-        let mut response = error_response(
+        ClientError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "proxy_error",
-            &format!(
+            ErrorKind::Proxy,
+            format!(
                 "Upstream unreachable: all {transport_failures} attempt(s) failed before a \
                  connection was made. Safe to retry in {OFFLINE_RETRY_AFTER_SECS}s."
             ),
-            Some(OFFLINE_RETRY_AFTER_SECS),
-        );
-        response
-            .headers_mut()
-            .insert("x-should-retry", HeaderValue::from_static("true"));
-        response
+        )
+        .retry_after(OFFLINE_RETRY_AFTER_SECS)
+        .should_retry(true)
+        .respond(provider)
     }
 }
 
@@ -8595,22 +8238,23 @@ fn bad_gateway(transport_failures: usize, unknown_outcome: bool) -> Response {
 /// upstream when the fault is local, and it carries no `retry-after`, so a client
 /// has no guidance beyond "give up". The account pool is NOT rotated on this path
 /// and the session keeps its pin.
-fn offline_unavailable(dns_failures: usize) -> Response {
+fn offline_unavailable(provider: Provider, dns_failures: usize) -> Response {
     tracing::warn!(
         dns_failures,
         retry_after = OFFLINE_RETRY_AFTER_SECS,
         "returning 503 to client — name resolution is failing, this machine is offline; \
          the account pool was NOT rotated"
     );
-    error_response(
+    ClientError::new(
         StatusCode::SERVICE_UNAVAILABLE,
-        "proxy_error",
-        &format!(
+        ErrorKind::Proxy,
+        format!(
             "Name resolution failed on {dns_failures} attempt(s) — this machine appears to be \
              offline. No account was rotated. Retry in {OFFLINE_RETRY_AFTER_SECS}s."
         ),
-        Some(OFFLINE_RETRY_AFTER_SECS),
     )
+    .retry_after(OFFLINE_RETRY_AFTER_SECS)
+    .respond(provider)
 }
 
 /// The answer when every upstream answer this request got was a 403 refusing OUR pooled
@@ -8662,16 +8306,16 @@ fn credential_refused_response(
         "returning 502 to client — every account tried was refused with a 403; \
          re-login is likely required"
     );
-    error_response(
+    ClientError::new(
         StatusCode::BAD_GATEWAY,
-        "proxy_error",
-        &format!(
+        ErrorKind::Proxy,
+        format!(
             "Account credential(s) refused by upstream: {}. Re-login to the account \
              (`tcr login` or the TcrBar UI) — retrying will not help.",
             account_list.join(", ")
         ),
-        None,
     )
+    .respond(provider)
 }
 
 /// While every eligible account remains refused, preserve the access-denied status.
@@ -21521,6 +21165,97 @@ mod tests {
         assert!(
             !every_attempt_transport_failed(0, 0),
             "no attempt made → exhausted, not unreachable"
+        );
+    }
+
+    /// Both terminals (select finding nothing, and the attempt budget running out) read one
+    /// verdict off the tallies. The budget terminal used to answer a transport-only walk with a
+    /// 502 whatever the resolver said, and an all-refused walk with the exhausted 429.
+    #[tokio::test]
+    async fn the_terminal_verdict_reads_every_arm_off_the_tallies() {
+        use super::ladder::Tally;
+
+        struct NoRefresh;
+        impl crate::oauth::TokenRefresher for NoRefresh {
+            fn refresh(
+                &self,
+                _provider: crate::provider::Provider,
+                _t: String,
+            ) -> crate::oauth::RefreshFuture {
+                Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+            }
+        }
+        let manager = Manager::new(
+            dummy_config(None, "http://127.0.0.1:9"),
+            Arc::new(NoRefresh),
+            Arc::new(crate::probe::LiveUsageProber::new()),
+            Arc::new(crate::warmer::LiveWarmer::new()),
+            None,
+        );
+        let now = OffsetDateTime::now_utc();
+        // The status and `x-should-retry`, which tell the four shapes apart: the offline 503
+        // carries none, `bad_gateway`'s 503 says `true`, its 502 says `false`, and the
+        // credential-refused 502 carries none.
+        let verdict = |mut tally: Tally| {
+            tally
+                .verdict(&manager, Provider::Anthropic, None, now, None, None)
+                .map(|response| {
+                    let should_retry = response
+                        .headers()
+                        .get("x-should-retry")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    (response.status(), should_retry)
+                })
+        };
+
+        let offline = Tally {
+            transport_failures: 2,
+            offline_failures: 1,
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(offline),
+            Some((StatusCode::SERVICE_UNAVAILABLE, None)),
+            "a resolver failure in a transport-only walk is the offline 503"
+        );
+        let connect_only = Tally {
+            transport_failures: 2,
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(connect_only),
+            Some((StatusCode::SERVICE_UNAVAILABLE, Some("true".into())))
+        );
+        let unknown_outcome = Tally {
+            transport_failures: 1,
+            unknown_outcome_transport_failure: true,
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(unknown_outcome),
+            Some((StatusCode::BAD_GATEWAY, Some("false".into())))
+        );
+        let all_refused = Tally {
+            upstream_responses: 2,
+            refused_403: vec![(0, Some("a".into())), (1, Some("b".into()))],
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(all_refused),
+            Some((StatusCode::BAD_GATEWAY, None)),
+            "every answer a refused 403 is the credential-refused 502"
+        );
+        let answered = Tally {
+            transport_failures: 1,
+            upstream_responses: 2,
+            refused_403: vec![(0, None)],
+            ..Tally::default()
+        };
+        assert_eq!(
+            verdict(answered),
+            None,
+            "an upstream that answered other than with a refusal leaves the caller's last resort"
         );
     }
 
