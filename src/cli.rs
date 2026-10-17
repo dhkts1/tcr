@@ -32,7 +32,9 @@ use crate::manager::Manager;
 use crate::oauth::{NoRefresh, TokenRefresher};
 use crate::probe::{LiveUsageProber, ProbeStatus, UsageProber};
 use crate::provider::Provider;
-use crate::stats::{AccountSnapshot, CodexFacts, QuotaState, StatsSnapshot};
+#[cfg(test)]
+use crate::stats::CACHE_SIGNAL_FLOOR_REQUESTS;
+use crate::stats::{AccountSnapshot, CodexFacts, QuotaState, StatsSnapshot, window_length_label};
 use crate::status::{STATUS_KIND, StatusPayload};
 
 /// Reject a group label whose CONTENT could corrupt header composition
@@ -2540,19 +2542,6 @@ struct HeldWindow {
     reset: OffsetDateTime,
 }
 
-/// A window's label from its length in minutes, the rule TcrBar labels a Codex window's row
-/// by: whole days read `{n}d`, whole hours `{n}h`, anything else `{n}m`. So 300 is `5h`, 10080
-/// is `7d`, and a 30-day window, 43200, is `30d`.
-fn window_length_label(minutes: u32) -> String {
-    if minutes.is_multiple_of(24 * 60) {
-        format!("{}d", minutes / (24 * 60))
-    } else if minutes.is_multiple_of(60) {
-        format!("{}h", minutes / 60)
-    } else {
-        format!("{minutes}m")
-    }
-}
-
 /// The windows holding account `a` out of rotation, evaluated against its own
 /// `threshold`. `a.five_hour`/`a.seven_day` are already the EFFECTIVE utilizations
 /// and `*_reset` the live (future-only) resets — both baked in at snapshot time —
@@ -2665,22 +2654,6 @@ fn render_window(
     }
 }
 
-/// Minimum served requests before [`cache_hit_ratio`] reports a number rather
-/// than no-signal.
-///
-/// Grounded in two read measurements, not taste. A measurement of hold
-/// episodes put the median distinct divert destinations at 2.0, so
-/// an account whose only traffic is "a few cold diverts" sits at single-digit
-/// requests; a live read of the running fleet on 2026-08-15 (`tcr status
-/// --json`) showed every account with a real, sustained cache ratio at 376+
-/// requests, three orders of magnitude above that. 20 sits comfortably above
-/// the divert-only noise floor and nowhere near real serving volume, so it
-/// cannot suppress an actual measurement while it reliably catches the
-/// near-empty-denominator case this constant exists to silence. This is a
-/// design judgment (σ2 — architecturally grounded in real data, not a
-/// controlled A/B against the incident it targets), not a derived fact.
-const CACHE_SIGNAL_FLOOR_REQUESTS: u64 = 20;
-
 /// The account's prompt-cache hit ratio, or `None` when there is nothing
 /// reliable to report — never a placeholder number.
 ///
@@ -2721,10 +2694,7 @@ fn cache_hit_ratio(a: &AccountSnapshot, source: StatusSource) -> Option<f64> {
     if source == StatusSource::Offline {
         return None;
     }
-    if a.input_tokens == 0 || a.requests < CACHE_SIGNAL_FLOOR_REQUESTS {
-        return None;
-    }
-    Some(a.cache_read_tokens as f64 / a.input_tokens as f64)
+    a.cache_hit_ratio()
 }
 
 /// Render a [`StatsSnapshot`] as plain text — ONE LINE PER ACCOUNT — so the

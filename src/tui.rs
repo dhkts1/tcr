@@ -49,6 +49,7 @@ use crate::probe::ProbeStatus;
 use crate::provider::Provider;
 use crate::stats::{
     AccountSnapshot, GateReason, QuotaState, SessionKind, SessionSnapshot, StatsSnapshot,
+    window_length_label,
 };
 
 /// Restores the terminal to a sane state whenever it is dropped — normal exit,
@@ -1614,10 +1615,7 @@ fn account_row(
                 },
                 reqs,
                 input,
-                Cell::from(fmt_cache_ratio(
-                    account.cache_read_tokens,
-                    account.input_tokens,
-                )),
+                Cell::from(fmt_cache_ratio(account.cache_hit_ratio())),
                 output,
                 last,
                 // Stream failures — in-band SSE `error` events plus streams
@@ -2206,13 +2204,10 @@ fn codex_gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> Option<(St
 /// A usage window's chip prefix from its length in minutes: whole days read `{n}D`, whole hours
 /// `{n}H`, anything else `{n}M`. With no length reported, `fallback`.
 fn window_label(minutes: Option<u32>, fallback: &str) -> String {
-    const DAY: u32 = 24 * 60;
-    match minutes {
-        Some(m) if m > 0 && m % DAY == 0 => format!("{}D", m / DAY),
-        Some(m) if m > 0 && m % 60 == 0 => format!("{}H", m / 60),
-        Some(m) if m > 0 => format!("{m}M"),
-        _ => fallback.to_string(),
-    }
+    minutes.map_or_else(
+        || fallback.to_string(),
+        |m| window_length_label(m).to_uppercase(),
+    )
 }
 
 fn status_style(status: &str) -> Style {
@@ -2245,15 +2240,11 @@ fn fmt_tokens(count: u64) -> String {
     }
 }
 
-/// Format the prompt-cache hit ratio (`cache_read / input_total`) as a whole
-/// percentage. R3 GATE: `input_total == 0` renders "-" (never NaN / no divide),
-/// so a never-served account shows a dash rather than a bogus 0%.
-fn fmt_cache_ratio(cache_read: u64, input_total: u64) -> String {
-    if input_total == 0 {
-        "-".to_string()
-    } else {
-        format!("{:.0}%", cache_read as f64 / input_total as f64 * 100.0)
-    }
+/// Format [`AccountSnapshot::cache_hit_ratio`] as a whole percentage; no signal
+/// (never served, or under the request floor `tcr status` also hides it below)
+/// renders "-".
+fn fmt_cache_ratio(ratio: Option<f64>) -> String {
+    ratio.map_or_else(|| "-".to_string(), |r| format!("{:.0}%", r * 100.0))
 }
 
 /// Age of an optional instant relative to `now`, or an em-dash when absent —
@@ -5266,5 +5257,50 @@ mod tests {
             !rows.iter().any(|row| row.to_lowercase().contains("codex")),
             "an empty fleet with no codex login says nothing about codex:\n{screen}"
         );
+    }
+
+    /// A row with the given served-request count and a 78% cache read share.
+    fn cache_row(requests: u64) -> AccountSnapshot {
+        AccountSnapshot {
+            requests,
+            input_tokens: 1_000,
+            cache_read_tokens: 780,
+            ..snap_gate("cachey", GateReason::Ok, None)
+        }
+    }
+
+    /// The cache column follows `tcr status`: under the request floor it reads "-", not the
+    /// ratio of a few cold diverts. Fails on the old TUI calculation, which showed 78%.
+    #[test]
+    fn cache_column_hides_the_ratio_under_the_request_floor() {
+        use crate::stats::CACHE_SIGNAL_FLOOR_REQUESTS;
+        for (requests, shown) in [
+            (2, false),
+            (CACHE_SIGNAL_FLOOR_REQUESTS - 1, false),
+            (CACHE_SIGNAL_FLOOR_REQUESTS, true),
+        ] {
+            let snapshot = snapshot_of(vec![cache_row(requests)]);
+            let rows = buffer_rows(&accounts_buffer(&snapshot, FULL_LAYOUT_MIN_WIDTH, 6, 0));
+            let (_, row) = row_holding(&rows, "cachey");
+            assert_eq!(
+                row.contains("78%"),
+                shown,
+                "{requests} requests:\n{}",
+                rows.join("\n")
+            );
+        }
+        assert_eq!(fmt_cache_ratio(cache_row(2).cache_hit_ratio()), "-");
+        assert_eq!(fmt_cache_ratio(cache_row(20).cache_hit_ratio()), "78%");
+    }
+
+    /// A Codex window length of zero minutes reads `0D` as `tcr status` reads `0d`, rather than
+    /// falling back to the fixed `5H`/`7D`. Fails on the old TUI calculation.
+    #[test]
+    fn window_label_follows_the_status_label_for_zero_minutes() {
+        assert_eq!(window_label(Some(0), "5H"), "0D");
+        assert_eq!(window_label(None, "5H"), "5H");
+        assert_eq!(window_label(Some(300), "7D"), "5H");
+        assert_eq!(window_label(Some(10_080), "5H"), "7D");
+        assert_eq!(window_label(Some(90), "5H"), "90M");
     }
 }

@@ -355,7 +355,50 @@ pub struct CodexFacts {
     pub token_sync_pending: bool,
 }
 
+/// Minimum served requests before [`AccountSnapshot::cache_hit_ratio`] reports a
+/// number rather than no-signal.
+///
+/// Grounded in two read measurements, not taste. A measurement of hold
+/// episodes put the median distinct divert destinations at 2.0, so
+/// an account whose only traffic is "a few cold diverts" sits at single-digit
+/// requests; a live read of the running fleet on 2026-08-15 (`tcr status
+/// --json`) showed every account with a real, sustained cache ratio at 376+
+/// requests, three orders of magnitude above that. 20 sits comfortably above
+/// the divert-only noise floor and nowhere near real serving volume, so it
+/// cannot suppress an actual measurement while it reliably catches the
+/// near-empty-denominator case this constant exists to silence. This is a
+/// design judgment (σ2 — architecturally grounded in real data, not a
+/// controlled A/B against the incident it targets), not a derived fact.
+pub const CACHE_SIGNAL_FLOOR_REQUESTS: u64 = 20;
+
+/// A window's label from its length in minutes, the rule TcrBar labels a Codex window's row
+/// by: whole days read `{n}d`, whole hours `{n}h`, anything else `{n}m`. So 300 is `5h`, 10080
+/// is `7d`, and a 30-day window, 43200, is `30d`. Zero reads `0d`. `tcr status` prints it as
+/// is and the TUI upper-cases it.
+pub fn window_length_label(minutes: u32) -> String {
+    if minutes.is_multiple_of(24 * 60) {
+        format!("{}d", minutes / (24 * 60))
+    } else if minutes.is_multiple_of(60) {
+        format!("{}h", minutes / 60)
+    } else {
+        format!("{minutes}m")
+    }
+}
+
 impl AccountSnapshot {
+    /// The prompt-cache hit ratio (`cache_read_tokens / input_tokens`), or `None`
+    /// when there is nothing reliable to report: no input tokens to divide by, or
+    /// fewer than [`CACHE_SIGNAL_FLOOR_REQUESTS`] served requests (a handful of cold
+    /// diverts reads as "the cache is broken"). `tcr status` and the TUI both ask
+    /// this, so they cannot disagree. `tcr status` adds a check that its snapshot is
+    /// not an offline one.
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        if self.input_tokens == 0 || self.requests < CACHE_SIGNAL_FLOOR_REQUESTS {
+            return None;
+        }
+        Some(self.cache_read_tokens as f64 / self.input_tokens as f64)
+    }
+
     /// The customer-facing plan label every surface shows: the `plan` key of
     /// `tcr status --json`, the `plan=` token of its text form and the TUI's dim
     /// suffix, so the three cannot disagree. An Anthropic account is labelled from
