@@ -40,6 +40,10 @@ mod api_contract;
 #[path = "support/tcr_env.rs"]
 mod tcr_env;
 
+/// `Account` and `Config` fixtures for struct-update syntax.
+#[path = "support/fixtures.rs"]
+mod fixtures;
+
 use std::path::{Path, PathBuf};
 use tcr::log_err::LogErr as _;
 
@@ -1802,7 +1806,7 @@ mod fleet {
     use axum::body::Body;
     use axum::response::Response;
     use axum::routing::any;
-    use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
+    use tcr::config::{Account, Config, ProxyConfig, ThrottleConfig};
     use tcr::log_err::LogErr as _;
     use tcr::manager::Manager;
     use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
@@ -1854,62 +1858,26 @@ mod fleet {
 
     fn account() -> Account {
         Account {
-            name: "lender-fake".to_string(),
-            account_type: tcr::config::AccountType::OAuth,
-            provider: Default::default(),
             account_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
             // One org, so every borrowed request lands in ONE per-org GCRA
             // bucket: which is the bucket the pacing gate measures.
             org_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
-            org_name: None,
             access_token: LENDER_TOKEN.to_string(),
             refresh_token: Some("rt-fake-lender".to_string()),
-            expires_at: Some(tcr::now_ms() + 3_600_000),
-            priority: Some(0),
-            switch_threshold: None,
-            disabled: None,
-            groups: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-            egress: tcr::config::Egress::Local,
-            egress_strict: false,
-            codex_home: None,
-            extra: serde_json::Map::new(),
+            ..crate::fixtures::fixture_account("lender-fake")
         }
     }
 
     fn config(upstream: &str, accounts: Vec<Account>, account_throttle: ThrottleConfig) -> Config {
         Config {
-            quarantined_accounts: Vec::new(),
-            migrated_legacy_throttle: false,
-            renamed_accounts: Vec::new(),
-            rename_write_error: None,
             proxy: ProxyConfig {
                 port: 0,
-                api_key: None,
-                request_key: None,
-                extra: serde_json::Map::new(),
+                ..ProxyConfig::default()
             },
             upstream: upstream.to_string(),
-            codex_upstream: tcr::provider::CODEX_UPSTREAM.to_string(),
             switch_threshold: 0.98,
-            fable_weekly_threshold: None,
-            pacing: PacingConfig::default(),
             account_throttle,
-            fleet_throttle: ThrottleConfig::default(),
-            lock_account: None,
-            control_account: None,
-            control_reserve: 0.05,
-            control_pooled: false,
-            control_identity: Default::default(),
-            reset_urgency_tier_hours: 24,
-            http1_only: false,
-            accounts,
-            group_settings: std::collections::HashMap::new(),
-            pricing: Default::default(),
-            usage_retention_days: 90,
-            extra: serde_json::Map::new(),
+            ..crate::fixtures::fixture_config(accounts)
         }
     }
 

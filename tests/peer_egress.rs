@@ -36,6 +36,10 @@
 #[path = "support/tcr_env.rs"]
 mod tcr_env;
 
+/// `Account` and `Config` fixtures for struct-update syntax.
+#[path = "support/fixtures.rs"]
+mod fixtures;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -43,7 +47,7 @@ use tcr::log_err::LogErr as _;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
+use tcr::config::{Account, Config};
 use tcr::manager::Manager;
 use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
 use tcr::peer::config::{Allow, Endpoint, EndpointSource, PeerFile, PeerRow};
@@ -1582,26 +1586,11 @@ impl AccountWarmer for NeverWarms {
 /// One fake account. No real email, no real uuid: this repository is public.
 fn fake_account() -> Account {
     Account {
-        name: "alice@example.com".to_string(),
-        account_type: tcr::config::AccountType::OAuth,
-        provider: Default::default(),
         account_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
-        org_uuid: None,
-        org_name: None,
         access_token: "at-alice".to_string(),
         refresh_token: Some("rt-alice".to_string()),
         expires_at: Some(4_102_444_800_000),
-        priority: Some(0),
-        switch_threshold: None,
-        disabled: None,
-        groups: None,
-        organization_type: None,
-        rate_limit_tier: None,
-        seat_tier: None,
-        egress: tcr::config::Egress::Local,
-        egress_strict: false,
-        codex_home: None,
-        extra: serde_json::Map::new(),
+        ..fixtures::fixture_account("alice@example.com")
     }
 }
 
@@ -1633,33 +1622,9 @@ fn fleet_of(upstream: &str, names: &[&str]) -> Arc<Manager> {
 /// A fleet pointed at `upstream`, carrying exactly `accounts`.
 fn fleet_with(upstream: &str, accounts: Vec<Account>) -> Arc<Manager> {
     let config = Config {
-        quarantined_accounts: Vec::new(),
-        migrated_legacy_throttle: false,
-        renamed_accounts: Vec::new(),
-        rename_write_error: None,
-        proxy: ProxyConfig::default(),
         upstream: upstream.to_string(),
-        codex_upstream: tcr::provider::CODEX_UPSTREAM.to_string(),
         switch_threshold: 0.95,
-        fable_weekly_threshold: None,
-        pacing: PacingConfig {
-            max_in_flight_per_account: None,
-            min_spacing_ms: None,
-        },
-        account_throttle: ThrottleConfig::default(),
-        fleet_throttle: ThrottleConfig::default(),
-        lock_account: None,
-        control_account: None,
-        control_reserve: 0.05,
-        control_pooled: false,
-        control_identity: Default::default(),
-        reset_urgency_tier_hours: 24,
-        http1_only: false,
-        accounts,
-        group_settings: std::collections::HashMap::new(),
-        pricing: Default::default(),
-        usage_retention_days: 90,
-        extra: serde_json::Map::new(),
+        ..fixtures::fixture_config(accounts)
     };
     Manager::new(
         config,

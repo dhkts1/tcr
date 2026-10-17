@@ -25,6 +25,11 @@ mod connect_guard;
 #[path = "../support/tcr_env.rs"]
 mod tcr_env;
 
+/// Shared by `peer_props`, `throttle_exempt` and `workload_scenarios` (and compiled into the
+/// separate `peer_egress` and `peer_lease` too).
+#[path = "../support/fixtures.rs"]
+mod fixtures;
+
 /// Shared by `codex_e2e` and `peer_e2e` (and compiled into the separate `peer_lease` too).
 #[path = "../tools/api_contract.rs"]
 mod api_contract;

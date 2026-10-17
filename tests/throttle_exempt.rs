@@ -48,7 +48,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::response::Response;
 use axum::routing::any;
-use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
+use tcr::config::{Account, Config, ProxyConfig, ThrottleConfig};
 use tcr::manager::Manager;
 use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
 use tcr::probe::{ProbeError, ProbeFuture, UsageProber};
@@ -119,15 +119,10 @@ fn fake_org_uuid(i: usize) -> String {
 /// path that actually ships.
 fn account(i: usize) -> Account {
     Account {
-        name: format!("acct{i}"),
-        account_type: tcr::config::AccountType::OAuth,
-        provider: Default::default(),
         account_uuid: Some(fake_uuid(i)),
         org_uuid: (i > 0).then(|| fake_org_uuid(i)),
-        org_name: None,
         access_token: format!("at-fake-{i}"),
         refresh_token: Some(format!("rt-fake-{i}")),
-        expires_at: Some(tcr::now_ms() + 3_600_000),
         // ALL accounts share one priority so they form a single rotation tier.
         //
         // This used to be `Some(i as i64)` — 13 distinct priorities, i.e. 13 tiers
@@ -138,16 +133,7 @@ fn account(i: usize) -> Account {
         // keyed per-org: `spread_burst_across_orgs_is_not_paced` measured exactly
         // `(8-4)*350 = 1400ms`, the closed form for a single bucket.
         priority: Some(0),
-        switch_threshold: None,
-        disabled: None,
-        groups: None,
-        organization_type: None,
-        rate_limit_tier: None,
-        seat_tier: None,
-        egress: tcr::config::Egress::Local,
-        egress_strict: false,
-        codex_home: None,
-        extra: serde_json::Map::new(),
+        ..crate::fixtures::fixture_account(&format!("acct{i}"))
     }
 }
 
@@ -165,35 +151,16 @@ fn config(
         serde_json::Value::Bool(throttle_exempt_noise),
     );
     Config {
-        quarantined_accounts: Vec::new(),
-        migrated_legacy_throttle: false,
-        renamed_accounts: Vec::new(),
-        rename_write_error: None,
         proxy: ProxyConfig {
             port: 0,
-            api_key: None,
-            request_key: None,
-            extra: serde_json::Map::new(),
+            ..ProxyConfig::default()
         },
         upstream: upstream.to_string(),
-        codex_upstream: tcr::provider::CODEX_UPSTREAM.to_string(),
         switch_threshold: 0.98,
-        fable_weekly_threshold: None,
-        pacing: PacingConfig::default(),
         account_throttle,
         fleet_throttle,
-        lock_account: None,
-        control_account: None,
-        control_reserve: 0.05,
-        control_pooled: false,
-        control_identity: Default::default(),
-        reset_urgency_tier_hours: 24,
-        http1_only: false,
-        accounts: (0..POOL).map(account).collect(),
-        group_settings: std::collections::HashMap::new(),
-        pricing: Default::default(),
-        usage_retention_days: 90,
         extra,
+        ..crate::fixtures::fixture_config((0..POOL).map(account).collect())
     }
 }
 
