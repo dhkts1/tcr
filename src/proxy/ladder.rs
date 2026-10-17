@@ -181,6 +181,35 @@ impl Tally {
     }
 }
 
+/// What one attempt decided, applied by the loop in [`super::handle_request`] in one `match`.
+///
+/// The transport-failure arm and every status arm (401, 403, 429, 529) evaluate to one of
+/// these instead of changing the ladder and jumping themselves, so every move of the ladder is
+/// spelled once, at the one place that applies it. A wait an arm takes (an inline 429 wait, a
+/// 529 backoff, an offline wait) is taken inside the arm, where it always was, before it hands
+/// back [`Step::RetrySame`].
+pub(super) enum Step {
+    /// The next attempt uses the same account ([`Ladder::retry_same`]).
+    RetrySame,
+    /// The account is benched for the rest of this request and the next attempt selects
+    /// afresh ([`Ladder::bench`]).
+    Rotate,
+    /// The account is parked on a timer: benched, and re-admittable by the soft wait
+    /// ([`Ladder::park`]).
+    Park,
+    /// The overloaded account is benched and the request fails over to this one, which the
+    /// availability probe already selected ([`Ladder::fail_over_529`]).
+    FailOver(usize),
+    /// The client gets this answer now.
+    Answer(Response),
+    /// Upstream's answer goes to the terminal outcome: served, or forwarded verbatim.
+    Forward {
+        resp: reqwest::Response,
+        status: StatusCode,
+        up_headers: HeaderMap,
+    },
+}
+
 /// The per-request state of the rotation ladder: which accounts are benched, which one the
 /// next attempt must use, every per-account and per-request retry budget, and the [`Tally`].
 ///
