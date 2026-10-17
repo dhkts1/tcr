@@ -15,10 +15,16 @@
 //! Everything binds `127.0.0.1:0` with temp files at 0600 and reads no real
 //! config. Nothing here touches the proxy on `127.0.0.1:3456`.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tcr::log_err::LogErr as _;
 
 use tcr::peer::config::{self, PeerFile};
 use tcr::peer::id::NodeKey;
@@ -35,7 +41,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     std::fs::create_dir_all(&dir).expect("create the scratch dir");
     dir
 }
@@ -47,7 +53,9 @@ async fn serve(context: SessionContext) -> SocketAddr {
         .expect("bind a kernel-chosen port on loopback");
     let addr = listener.local_addr().expect("the bound address");
     tokio::spawn(async move {
-        let _ = listener::serve_on_with(listener, context).await;
+        listener::serve_on_with(listener, context)
+            .await
+            .log_debug("serving a test peer listener");
     });
     addr
 }

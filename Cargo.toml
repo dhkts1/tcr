@@ -7,6 +7,16 @@
 members = [".", "crates/tcr-status-wire", "crates/tcr-fdpass", "crates/tcr-peer-wire"]
 resolver = "2"
 
+# Gil's rules for production code. `clippy.toml` sets allow-unwrap-in-tests and
+# allow-expect-in-tests, so `#[test]` functions and `#[cfg(test)]` modules may unwrap and expect;
+# integration-test crates carry one crate-level `#[expect]` for their helpers instead.
+[workspace.lints.clippy]
+# No `.unwrap()` or `.expect()` outside tests.
+unwrap_used = "deny"
+expect_used = "deny"
+# No `let _ = <must_use expr>`: a dropped `Result` goes through `tcr::log_err::LogErr` instead.
+let_underscore_must_use = "deny"
+
 [package]
 name = "tcr"
 version = "1.2.10"
@@ -24,6 +34,9 @@ homepage = "https://github.com/dhkts1/tcr"
 # Integration tests are declared below rather than one crate per `tests/*.rs`: every test crate
 # links the whole `tcr` library, so 53 of them meant 53 links per `cargo test`.
 autotests = false
+
+[lints]
+workspace = true
 
 # `publish = false` above hides this package from cargo-dist, which reads it to
 # decide what is distributable, so v0.2.4's release job failed with "This

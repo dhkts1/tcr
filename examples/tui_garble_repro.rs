@@ -34,6 +34,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use tcr::log_err::LogErr;
 
 static SCREEN_DIRTIED_BY_PANIC: AtomicBool = AtomicBool::new(false);
 
@@ -50,9 +51,9 @@ fn scribble_over_the_screen() {
         "  none of which ratatui knows about",
         "  so none of which it will ever repaint",
     ] {
-        let _ = writeln!(out, "{line}");
+        writeln!(out, "{line}").log_warn("scribbling over the screen");
     }
-    let _ = out.flush();
+    out.flush().log_warn("flushing the scribble");
 }
 
 /// `broken` is the hook as it shipped: restore on ANY thread's panic.
@@ -66,8 +67,9 @@ fn install_panic_hook(broken: bool) {
         std::panic::set_hook(Box::new(move |info| {
             let is_tui_thread = std::thread::current().name() == Some("main");
             if broken || is_tui_thread {
-                let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                disable_raw_mode().log_warn("leaving raw mode in the panic hook");
+                execute!(io::stdout(), LeaveAlternateScreen)
+                    .log_warn("leaving the alternate screen in the panic hook");
                 previous(info);
                 return;
             }
@@ -112,7 +114,9 @@ async fn main() -> io::Result<()> {
             }
         }
         if SCREEN_DIRTIED_BY_PANIC.swap(false, Ordering::SeqCst) {
-            let _ = terminal.clear();
+            terminal
+                .clear()
+                .log_warn("clearing the terminal for a repaint");
         }
         terminal.draw(|frame| {
             let chunks = Layout::default()

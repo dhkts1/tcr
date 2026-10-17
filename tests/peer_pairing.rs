@@ -29,6 +29,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tcr::log_err::LogErr as _;
 use tcr::peer::config::{self, NetworkKey, PeerFile};
 use tcr::peer::id::NodeKey;
 use tcr::peer::listener::{self, SessionContext};
@@ -52,7 +53,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     std::fs::create_dir_all(&dir).expect("create the scratch dir");
     dir
 }
@@ -155,7 +156,9 @@ async fn serve(context: SessionContext) -> SocketAddr {
     tokio::spawn(async move {
         // The loop only returns on an accept failure, which is the harness
         // shutting down at the end of the test.
-        let _ = listener::serve_on_with(listener, context).await;
+        listener::serve_on_with(listener, context)
+            .await
+            .log_debug("serving a test peer listener");
     });
     addr
 }
@@ -544,7 +547,7 @@ fn two_concurrent_joiners_on_one_use_invite_leave_exactly_one_ok() {
             "trial {trial}: the spent invite is still on disk, which is still a live PSK"
         );
 
-        let _ = std::fs::remove_dir_all(&node.dir);
+        std::fs::remove_dir_all(&node.dir).log_debug("removing a test directory");
     }
 }
 
@@ -3884,7 +3887,7 @@ fn a_concurrent_revoke_and_enrolment_never_resurrect_or_drop_a_row() {
             );
         }
 
-        let _ = std::fs::remove_dir_all(&node.dir);
+        std::fs::remove_dir_all(&node.dir).log_debug("removing a test directory");
     }
 }
 

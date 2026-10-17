@@ -23,6 +23,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::log_err::LogErr;
+
 /// Anthropic OAuth usage endpoint (zero message-quota spend).
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// `anthropic-beta` header value required by the usage endpoint.
@@ -313,7 +315,9 @@ pub trait UsageProber: Send + Sync {
 /// provider, Anthropic's [`USAGE_URL`] or Codex's under the base
 /// [`LiveUsageProber::with_codex_base`] sets ([`crate::codex_probe`]).
 pub struct LiveUsageProber {
-    client: reqwest::Client,
+    /// `None` when the HTTP client could not be built (a TLS backend that failed to
+    /// initialise); every probe then reports that as a [`ProbeError`].
+    client: Option<reqwest::Client>,
     codex_base: String,
 }
 
@@ -326,7 +330,7 @@ impl LiveUsageProber {
             client: reqwest::Client::builder()
                 .no_proxy()
                 .build()
-                .expect("build reqwest client"),
+                .log_warn("building the usage probe HTTP client"),
             codex_base: crate::provider::CODEX_UPSTREAM.to_string(),
         }
     }
@@ -348,7 +352,15 @@ impl Default for LiveUsageProber {
 
 impl UsageProber for LiveUsageProber {
     fn probe(&self, credential: ProbeCredential) -> ProbeFuture {
-        let client = self.client.clone();
+        let Some(client) = self.client.clone() else {
+            return Box::pin(async {
+                Err(ProbeError {
+                    status: None,
+                    message: "the usage probe HTTP client could not be built".to_owned(),
+                    retry_after_secs: None,
+                })
+            });
+        };
         match credential.provider {
             crate::provider::Provider::Anthropic => {
                 Box::pin(async move { fetch_usage(&client, &credential.access_token).await })

@@ -26,6 +26,7 @@
 
 use std::net::SocketAddr;
 use std::time::Duration;
+use tcr::log_err::LogErr as _;
 
 use tcr::peer::config::{self as peer_config, PeerFile, PeerRow};
 use tcr::peer::id::NodeKey;
@@ -43,7 +44,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     std::fs::create_dir_all(&dir).expect("create the scratch dir");
     dir
 }
@@ -162,7 +163,11 @@ async fn hello_from(
     .expect("the target answers within the deadline")
     .expect("the answer decodes");
     drop(theirs);
-    let _ = timeout(Duration::from_secs(5), served).await;
+    timeout(Duration::from_secs(5), served)
+        .await
+        .log_debug("waiting for the test serve to end")
+        .and_then(|joined| joined.log_debug("joining the test serve"))
+        .and_then(|served| served.log_debug("serving the carried control"));
 
     let Control::Hello(answered) = answer else {
         panic!("the target answered a Hello with {answer:?}, not a Hello");

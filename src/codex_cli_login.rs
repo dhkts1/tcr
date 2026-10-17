@@ -55,12 +55,13 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 
 use crate::config::Account;
+use crate::log_err::LogErr as _;
 use crate::oauth::{self, LoginEvent, LoginRefusal, LoginUi};
 
 /// Whether `codex login` opens the browser itself, which makes the `browser` event carry
@@ -327,7 +328,10 @@ async fn run_codex_login(
             "could not record codex login process identity; cancellation cannot signal an unverified PID"
         );
     }
-    *session.codex_process.lock().expect("process lock poisoned") = identity;
+    *session
+        .codex_process
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = identity;
 
     let output = Arc::new(Output::default());
     let (done, drained) = std::sync::mpsc::channel::<()>();
@@ -387,8 +391,17 @@ struct Output {
 impl Output {
     /// The last non-empty line codex wrote to stderr, else to stdout.
     fn said(&self) -> Option<String> {
-        let err = self.last_err.lock().expect("output lock poisoned").clone();
-        err.or_else(|| self.last_out.lock().expect("output lock poisoned").clone())
+        let err = self
+            .last_err
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        err.or_else(|| {
+            self.last_out
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        })
     }
 }
 
@@ -415,7 +428,9 @@ fn spawn_reader(
             if session.quiet.load(Ordering::SeqCst) {
                 continue;
             }
-            let _ = std::io::stderr().write_all(&raw);
+            std::io::stderr()
+                .write_all(&raw)
+                .log_debug("echoing codex output to stderr");
             let line = String::from_utf8_lossy(&raw);
             let cleaned: String = line.chars().filter(|c| !c.is_control()).collect();
             let cleaned = cleaned.trim();
@@ -424,7 +439,7 @@ fn spawn_reader(
                     Stream::Out => &output.last_out,
                     Stream::Err => &output.last_err,
                 };
-                *last.lock().expect("output lock poisoned") = Some(cleaned.to_string());
+                *last.lock().unwrap_or_else(PoisonError::into_inner) = Some(cleaned.to_string());
             }
             if let Some(url) = line
                 .split_whitespace()
@@ -439,7 +454,7 @@ fn spawn_reader(
                 ui.emit(LoginEvent::Waiting);
             }
         }
-        let _ = done.send(());
+        done.send(()).log_debug("reader-done receiver already gone");
     });
 }
 
@@ -493,7 +508,11 @@ impl Session {
     /// `std::process::exit` runs no destructor, and a failed delete must be said rather than
     /// dropped, since the folder may hold a live login.
     fn close_folder(&self) -> anyhow::Result<()> {
-        let folder = self.folder.lock().expect("folder lock poisoned").take();
+        let folder = self
+            .folder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         match folder {
             Some(folder) => folder.close().with_context(|| {
                 format!(
@@ -578,7 +597,10 @@ impl Caught {
 /// a live credential behind. It never returns.
 async fn stop_and_exit(session: &Session, caught: Caught) -> std::convert::Infallible {
     session.quiet.store(true, Ordering::SeqCst);
-    let root = *session.codex_process.lock().expect("process lock poisoned");
+    let root = *session
+        .codex_process
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let reaped = || session.reaped.load(Ordering::SeqCst);
     if let Some(root) = root.filter(|_| !reaped()) {
         let family = family_of(root);

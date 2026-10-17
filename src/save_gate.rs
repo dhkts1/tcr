@@ -91,7 +91,10 @@ impl SaveGate {
     /// What a save of content hashing to (`shape`, `content`) at `now` should do: `None` to
     /// write, `Some(outcome)` to skip it with that outcome. Nothing written yet always writes.
     pub fn skip(&self, shape: u64, content: u64, now: Instant) -> Option<SaveOutcome> {
-        let last = *self.last.lock().expect("save gate lock poisoned");
+        let last = *self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let last = last?;
         if last.content == content {
             return Some(SaveOutcome::Unchanged);
@@ -105,7 +108,10 @@ impl SaveGate {
 
     /// Record a successful write of content hashing to (`shape`, `content`) at `now`.
     pub fn wrote(&self, shape: u64, content: u64, now: Instant) {
-        *self.last.lock().expect("save gate lock poisoned") = Some(Written {
+        *self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Written {
             shape,
             content,
             at: now,

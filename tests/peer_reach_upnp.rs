@@ -7,6 +7,11 @@
 //! to `127.0.0.1:0`, exactly as `tests/peer_reach.rs` points
 //! [`tcr::peer::reach::NatPmp::at`] at a fake NAT-PMP gateway.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

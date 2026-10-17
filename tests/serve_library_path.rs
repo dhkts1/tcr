@@ -17,7 +17,13 @@
 //! on the configured default. Nothing here signals, restarts or probes a live
 //! proxy.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 use std::time::Duration;
+use tcr::log_err::LogErr as _;
 
 use tcr::config::Config;
 use tcr::proxy::STATUS_PATH;
@@ -476,7 +482,7 @@ async fn shutting_down_drains_the_usage_ledger_and_says_it_did() {
         "and once the ledger is closed the proxy stops claiming today's totals will survive"
     );
 
-    let _ = std::fs::remove_dir_all(&usage_dir);
+    std::fs::remove_dir_all(&usage_dir).log_debug("removing a test directory");
 }
 
 /// The default incumbent policy — what `..Default::default()`, a struct literal

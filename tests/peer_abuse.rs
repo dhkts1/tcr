@@ -42,6 +42,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tcr::log_err::LogErr as _;
 
 use tcr::peer::config::{self, Allow, Endpoint, EndpointSource, PeerFile, PeerRow};
 use tcr::peer::discovery::{self, Discovered, FoundList};
@@ -256,7 +257,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     std::fs::create_dir_all(&dir).expect("create the scratch dir");
     dir
 }
@@ -320,7 +321,9 @@ async fn serve(context: SessionContext) -> SocketAddr {
     tokio::spawn(async move {
         // The loop returns only on an accept failure, which is the harness
         // going away at the end of the test.
-        let _ = listener::serve_on_with(listener, context).await;
+        listener::serve_on_with(listener, context)
+            .await
+            .log_debug("serving a test peer listener");
     });
     addr
 }
@@ -411,7 +414,7 @@ async fn count_written(addr: SocketAddr, message_1: &[u8]) -> usize {
     if stream.write_all(&framed).await.is_err() {
         return 0;
     }
-    let _ = stream.flush().await;
+    stream.flush().await.log_debug("flushing a test stream");
 
     let mut back = Vec::new();
     let read = tokio::time::timeout(
@@ -2327,7 +2330,9 @@ async fn a_hello_arriving_while_the_peers_file_is_locked_leaves_the_runtime_free
         std::thread::sleep(Duration::from_millis(500));
         let spawned = std::time::Instant::now();
         handle.spawn(async move {
-            let _ = waited.send(spawned.elapsed());
+            waited
+                .send(spawned.elapsed())
+                .log_debug("reporting the probe's wait");
         });
     });
 
@@ -2344,7 +2349,10 @@ async fn a_hello_arriving_while_the_peers_file_is_locked_leaves_the_runtime_free
     prober.join().expect("the prober finishes");
     for hello in hellos {
         // Answered or refused is not what this test is about: the runtime is.
-        let _ = hello.await;
+        hello
+            .await
+            .log_debug("joining a test hello")
+            .and_then(|answered| answered.log_debug("saying hello under the held lock"));
     }
     holder.join().expect("the lock holder finishes");
 }

@@ -4,6 +4,7 @@
 //! account data anywhere here: this repository is public.
 
 use std::sync::{Arc, Mutex};
+use tcr::log_err::LogErr as _;
 
 use axum::Router;
 use axum::body::Body;
@@ -35,7 +36,9 @@ async fn spawn_upstream_recording(seen: Bodies) -> String {
         .expect("bind the fake upstream");
     let addr = listening.local_addr().expect("upstream addr");
     tokio::spawn(async move {
-        let _ = axum::serve(listening, app).await;
+        axum::serve(listening, app)
+            .await
+            .log_debug("serving a test server");
     });
     format!("http://{addr}")
 }

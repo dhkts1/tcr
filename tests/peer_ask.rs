@@ -13,6 +13,7 @@
 //! `127.0.0.1:3456`. Every state file is a fresh temp file this test writes
 //! and cleans up itself.
 
+use tcr::log_err::LogErr as _;
 use tcr::peer::ask::{self, Ask};
 use tcr::peer::noise;
 use tcr::peer::pair::{self, JoinToken};
@@ -25,7 +26,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     std::fs::create_dir_all(&dir).expect("create the scratch dir");
     dir.join("peer-state.json")
 }

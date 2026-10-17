@@ -81,6 +81,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tcr::log_err::LogErr as _;
 
 use axum::Router;
 use axum::body::Body;
@@ -169,7 +170,9 @@ async fn spawn_upstream() -> (String, Upstream) {
             // answered after the arrival is recorded: see
             // `tests/tools/api_contract.rs`.
             let refusal = api_contract::refuse_if_incomplete(req.method(), req.headers());
-            let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+            axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                .await
+                .log_debug("reading a test request body");
             if let Ok(mut seen) = recorder.seen.lock() {
                 seen.push((path, format!("{credential}{api_key}")));
             }
@@ -194,7 +197,9 @@ async fn spawn_upstream() -> (String, Upstream) {
         .expect("bind the fake upstream");
     let addr = listening.local_addr().expect("the fake upstream's address");
     tokio::spawn(async move {
-        let _ = axum::serve(listening, app).await;
+        axum::serve(listening, app)
+            .await
+            .log_debug("serving a test server");
     });
     (format!("http://{addr}"), upstream)
 }
@@ -693,8 +698,8 @@ impl Mac {
 
     fn shutdown(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.kill().log_debug("killing a test child");
+            child.wait().log_debug("reaping a test child");
         }
     }
 }
@@ -1700,7 +1705,9 @@ async fn spawn_upstream_with_trip(trip_credential: String) -> (String, Upstream,
             // answered after the arrival is recorded: see
             // `tests/tools/api_contract.rs`.
             let refusal = api_contract::refuse_if_incomplete(req.method(), req.headers());
-            let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+            axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                .await
+                .log_debug("reading a test request body");
             let full_credential = format!("{credential}{api_key}");
             if let Ok(mut seen) = recorder.seen.lock() {
                 seen.push((path, full_credential.clone()));
@@ -1738,7 +1745,9 @@ async fn spawn_upstream_with_trip(trip_credential: String) -> (String, Upstream,
         .expect("bind the fake upstream");
     let addr = listening.local_addr().expect("the fake upstream's address");
     tokio::spawn(async move {
-        let _ = axum::serve(listening, app).await;
+        axum::serve(listening, app)
+            .await
+            .log_debug("serving a test server");
     });
     (format!("http://{addr}"), upstream, armed)
 }
@@ -2116,7 +2125,9 @@ async fn spawn_slow_upstream(delay: Duration) -> (String, Upstream) {
             // answered after the arrival is recorded: see
             // `tests/tools/api_contract.rs`.
             let refusal = api_contract::refuse_if_incomplete(req.method(), req.headers());
-            let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+            axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                .await
+                .log_debug("reading a test request body");
             if let Ok(mut seen) = recorder.seen.lock() {
                 seen.push((path, format!("{credential}{api_key}")));
             }
@@ -2142,7 +2153,9 @@ async fn spawn_slow_upstream(delay: Duration) -> (String, Upstream) {
         .expect("bind the fake upstream");
     let addr = listening.local_addr().expect("the fake upstream's address");
     tokio::spawn(async move {
-        let _ = axum::serve(listening, app).await;
+        axum::serve(listening, app)
+            .await
+            .log_debug("serving a test server");
     });
     (format!("http://{addr}"), upstream)
 }
@@ -2384,8 +2397,8 @@ fn boot_cost_once(with_peers: bool) -> f64 {
     }
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill().log_debug("killing a test child");
+    child.wait().log_debug("reaping a test child");
     elapsed
 }
 

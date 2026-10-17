@@ -7,6 +7,9 @@ license = "PolyForm-Noncommercial-1.0.0"
 publish = false
 description = "Serde types for the `tcr status --json` wire contract, shared between the CLI and the macOS app"
 
+[lints]
+workspace = true
+
 # Serde only. This crate is built by `cargo test --all` / `cargo clippy --all-targets`
 # on the ubuntu CI runner (see .github/workflows/ci.yml, `--all` = `--workspace`),
 # so it must stay Linux-clean forever: no macOS-only dependency, no `unsafe`.

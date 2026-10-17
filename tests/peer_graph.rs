@@ -14,6 +14,7 @@
 //! port for the loopback-refusal check, which never actually binds).
 
 use std::path::Path;
+use tcr::log_err::LogErr as _;
 
 /// A scratch directory of this test's own, so a sibling test binary running at
 /// the same instant cannot read or write this one's peers file. Same shape as
@@ -24,7 +25,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     std::fs::create_dir_all(&dir).expect("create the scratch dir");
     dir
 }
@@ -254,8 +255,8 @@ async fn tcr_peer_graph_serve_answers_the_page_and_the_json_on_loopback() {
         "the same fixture --json would have reported: {json}"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill().log_debug("killing a test child");
+    child.wait().log_debug("reaping a test child");
 }
 
 /// **The DNS-rebinding gate**: binding on
@@ -313,6 +314,6 @@ async fn tcr_peer_graph_serve_403s_a_non_loopback_host_header_and_200s_a_loopbac
         "a loopback Host must still be served"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill().log_debug("killing a test child");
+    child.wait().log_debug("reaping a test child");
 }

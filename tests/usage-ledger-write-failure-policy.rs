@@ -21,10 +21,16 @@
 //! after it is set. This file has exactly one test, so "global for the whole
 //! binary" and "global for this test" are the same thing.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
+use tcr::log_err::LogErr as _;
 
 use tcr::pricing::PricingTable;
 use tcr::usage::{LedgerAccount, UsageRecord, UsageTracker};
@@ -103,7 +109,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = fs::remove_dir_all(&dir);
+    fs::remove_dir_all(&dir).log_debug("removing a test directory");
     dir
 }
 
@@ -242,5 +248,5 @@ fn write_failure_warns_once_per_transition_and_never_touches_the_drop_count() {
         tracker.shutdown_ledger(std::time::Duration::from_secs(2));
     }
 
-    let _ = fs::remove_dir_all(&dir);
+    fs::remove_dir_all(&dir).log_debug("removing a test directory");
 }

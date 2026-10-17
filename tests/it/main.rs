@@ -11,6 +11,12 @@
 //! the reason beside it. A file added here must not install any of those: a sibling module in this
 //! process would see it, and its tests run at the same time as yours.
 
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 /// Shared by `delete_account_live`, `first_run_no_config` and `migrate_names`.
 #[path = "../support/connect_guard.rs"]
 mod connect_guard;

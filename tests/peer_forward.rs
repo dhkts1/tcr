@@ -33,8 +33,14 @@
 //! process-and-thread-unique scratch directory, no account or address is real,
 //! and nothing touches the proxy on `127.0.0.1:3456`.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tcr::log_err::LogErr as _;
 
 use tcr::peer::config::{self, Allow, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore};
 use tcr::peer::listener;
@@ -55,7 +61,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     std::fs::create_dir_all(&dir).expect("create the scratch dir");
     dir
 }

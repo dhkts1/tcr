@@ -18,7 +18,10 @@ impl Manager {
         // the borrow ordering in `tracing::info!` stays simple.
         let sid = session_key.map(short_session_id);
         {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(account) = accounts.get_mut(idx) {
                 account.requests += 1;
                 account.last_used_ms = Some(odt_to_ms(now));
@@ -35,7 +38,10 @@ impl Manager {
         // pin map, so routing is unaffected.
         if let Some(key) = session_key {
             let now_ms = odt_to_ms(now);
-            let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+            let mut sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let stat = sessions.entry(key).or_insert(SessionStat {
                 account_idx: idx,
                 requests: 0,
@@ -62,7 +68,10 @@ impl Manager {
 
     /// Append a served-request entry to the ring buffer (most-recent-last).
     pub fn push_log(&self, entry: RequestLogEntry) {
-        let mut log = self.log.lock().expect("log lock poisoned");
+        let mut log = self
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if log.len() >= REQUEST_LOG_CAPACITY {
             log.pop_front();
         }
@@ -81,7 +90,7 @@ impl Manager {
     pub fn thresholds(&self) -> Vec<f64> {
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             // The same rows `Self::snapshot` lists, in the same order: the
             // status endpoint zips the two by position.
@@ -97,14 +106,21 @@ impl Manager {
     /// edited (or the process not yet restarted to pick it up) since the
     /// server actually booted its clients.
     pub fn http1_only(&self) -> bool {
-        self.config.lock().expect("config lock poisoned").http1_only
+        self.config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .http1_only
     }
 
     /// The port this server listens on, as its config holds it: `server::serve` writes a
     /// `--port` override into the config before it builds the manager. The dashboard passes it
     /// to the in-process Codex route, whose reasons name the port.
     pub fn proxy_port(&self) -> u16 {
-        self.config.lock().expect("config lock poisoned").proxy.port
+        self.config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .proxy
+            .port
     }
 
     /// What this process's MITM listener can intercept by its policy and leaf — see
@@ -125,7 +141,9 @@ impl Manager {
     /// after its TLS load; a later call is ignored, because the listener's
     /// leaf is never reloaded and so what it can intercept never changes.
     pub fn record_mitm_status(&self, status: crate::status::MitmStatus) {
-        let _ = self.mitm.set(status);
+        if self.mitm.set(status).is_err() {
+            tracing::debug!("MITM status already recorded; later call ignored");
+        }
     }
 
     /// Every group on the fleet mapped to its resolved color — hot-reloaded
@@ -136,7 +154,7 @@ impl Manager {
     pub fn group_colors(&self) -> BTreeMap<String, String> {
         self.group_colors
             .read()
-            .expect("group_colors lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -159,14 +177,20 @@ impl Manager {
         // only who SERVED last, which a divert deliberately moves while the pin
         // stays put.
         let pins: HashMap<u64, usize> = {
-            let affinity = self.affinity.lock().expect("affinity lock poisoned");
+            let affinity = self
+                .affinity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             affinity
                 .iter()
                 .map(|(&key, &(idx, _))| (key, idx))
                 .collect()
         };
         // (2) UNDER THE ACCOUNTS LOCK: everything below resolves indices to names.
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A row deleted from the config while this process ran keeps its slot
         // (see `AccountRuntime::removed`) and is left out of everything a
         // reader sees. `current` is re-counted over the rows that remain, so
@@ -176,13 +200,16 @@ impl Manager {
             (!accounts.get(idx)?.removed)
                 .then(|| accounts[..idx].iter().filter(|a| !a.removed).count())
         };
-        let current =
-            (*self.current.lock().expect("current lock poisoned")).and_then(listed_position);
+        let current = (*self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .and_then(listed_position);
         let current_by_provider = {
             let serving = *self
                 .current_by_provider
                 .lock()
-                .expect("current_by_provider lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             crate::stats::CurrentByProvider {
                 anthropic: serving.anthropic.and_then(listed_position),
                 codex: serving.codex.and_then(listed_position),
@@ -365,7 +392,7 @@ impl Manager {
         let recent = self
             .log
             .lock()
-            .expect("log lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .rev()
             .cloned()
@@ -378,7 +405,10 @@ impl Manager {
         // session pinned to a row deleted from the config keeps that row's provider
         // as it keeps that row's name.
         let sessions = {
-            let map = self.sessions.lock().expect("sessions lock poisoned");
+            let map = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let name_of = |idx: usize| {
                 accounts
                     .get(idx)

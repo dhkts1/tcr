@@ -219,12 +219,15 @@ impl Manager {
         let pins: Vec<crate::config::EgressPin> = self
             .config
             .lock()
-            .expect("config lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .accounts
             .iter()
             .map(crate::config::Account::egress_pin)
             .collect();
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         accounts
             .iter()
             .enumerate()
@@ -410,7 +413,10 @@ impl Manager {
         window: tcr_peer_wire::Window,
         now: OffsetDateTime,
     ) -> Vec<Option<f64>> {
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         accounts
             .iter()
             .map(|account| window_utilization(&account.quota, window, now))
@@ -538,7 +544,10 @@ impl crate::peer::serve::WindowUtilization for Manager {
         // nothing measured to lend.
         self.reload_groups_if_changed();
         let anything_measured = {
-            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            let accounts = self
+                .accounts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             accounts
                 .iter()
                 // Lending a Codex account over the mesh is unmeasured (the borrower's proxy would need the chatgpt-account-id swap too), so this version never lends one.
@@ -623,7 +632,10 @@ impl crate::peer::serve::WindowUtilization for Manager {
                 // carries; both read the SAME sanitized label, which is what
                 // keeps the two in step.
                 let named: Vec<String> = {
-                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    let accounts = self
+                        .accounts
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     accounts
                         .iter()
                         .filter_map(|account| tcr_peer_wire::sanitize_label(&account.name).ok())
@@ -644,7 +656,10 @@ impl crate::peer::serve::WindowUtilization for Manager {
                     return ScopeRestriction::Unenforceable;
                 }
                 let members = {
-                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    let accounts = self
+                        .accounts
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     accounts
                         .iter()
                         .filter(|account| account.groups.iter().any(|group| group == name))

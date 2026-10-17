@@ -6,10 +6,16 @@
 //! is the whole reason [`tcr::peer::reach::NatPmp::at`] takes an
 //! address instead of always finding its own.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tcr::log_err::LogErr as _;
 
 use tcr::peer::noise;
 use tcr::peer::reach::{
@@ -849,7 +855,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     std::fs::create_dir_all(&dir).expect("create the scratch dir");
     dir
 }
@@ -1263,7 +1269,10 @@ async fn offer_from(
     theirs.flush().await.expect("flush message 1");
 
     let mut back = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(5), theirs.read_to_end(&mut back)).await;
+    tokio::time::timeout(Duration::from_secs(5), theirs.read_to_end(&mut back))
+        .await
+        .log_debug("waiting for the handler's reply")
+        .and_then(|read| read.log_debug("reading the handler's reply"));
     let outcome = match served.await.expect("the handler task") {
         Ok(()) => Ok(()),
         Err(err) => Err(format!("{err:#}")),
@@ -1547,7 +1556,9 @@ async fn a_real_loopback_knock_is_answered_through_the_accept_loop() {
     let addr = bound.local_addr().expect("the bound address");
     let context = node.context();
     tokio::spawn(async move {
-        let _ = listener::serve_on_with(bound, context).await;
+        listener::serve_on_with(bound, context)
+            .await
+            .log_debug("serving a test peer listener");
     });
 
     let message_1 = knock_message_1();
@@ -1565,7 +1576,10 @@ async fn a_real_loopback_knock_is_answered_through_the_accept_loop() {
     stream.flush().await.expect("flush message 1");
 
     let mut back = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut back)).await;
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut back))
+        .await
+        .log_debug("waiting for the knock's answer")
+        .and_then(|read| read.log_debug("reading the knock's answer"));
     assert!(
         !back.is_empty(),
         "a knock from 127.0.0.1 is on the LAN and must be answered through the real accept \

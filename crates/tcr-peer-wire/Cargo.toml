@@ -7,6 +7,9 @@ license = "PolyForm-Noncommercial-1.0.0"
 publish = false
 description = "Serde types for the tcr peer-mesh wire contract, shared by both ends of a peer stream"
 
+[lints]
+workspace = true
+
 # Serde only, and deliberately no crypto: the handshake lives in the main crate
 # (`src/peer/noise.rs`), so this crate stays a pure description of what two peers
 # say to each other. Built by `cargo test --all` / `cargo clippy --all-targets`

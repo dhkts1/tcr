@@ -41,6 +41,7 @@ pub mod file_log;
 pub mod handoff;
 pub mod identity;
 pub mod legacy_names;
+pub mod log_err;
 pub mod manager;
 pub mod migrate;
 pub mod mint;

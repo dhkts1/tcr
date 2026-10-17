@@ -266,6 +266,16 @@ pub struct LiveRefresher {
 
 impl LiveRefresher {
     pub fn new() -> Self {
+        // Building fails only when the TLS backend cannot initialise. A refresher without
+        // its client cannot exist, and a default client would honour ambient proxies.
+        #[expect(
+            clippy::expect_used,
+            reason = "reqwest's builder has no infallible form, and the constructor returns no Result"
+        )]
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build reqwest client");
         Self {
             // A dedicated client: the upstream proxy client must NOT carry a
             // total timeout (streams run long), but a refresh must not hang.
@@ -275,10 +285,7 @@ impl LiveRefresher {
             // teamclaude on :3456) loops us through the very thing we replace and fails
             // as "upstream unreachable". Always reach the token endpoint directly,
             // Anthropic's and Codex's alike.
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .expect("build reqwest client"),
+            client,
             endpoint: TOKEN_ENDPOINT.to_string(),
             codex_endpoint: crate::codex_oauth::TOKEN_ENDPOINT.to_string(),
         }
@@ -372,6 +379,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 use tokio::net::TcpListener;
 
 use crate::config::{self, Account, Config};
+use crate::log_err::LogErr as _;
 use crate::singleton;
 
 /// Authorize endpoint (from the JS `OAUTH_AUTHORIZE`).
@@ -804,7 +812,10 @@ fn open_browser(url: &str) {
     } else {
         "xdg-open"
     };
-    let _ = std::process::Command::new(cmd).arg(url).spawn();
+    std::process::Command::new(cmd)
+        .arg(url)
+        .spawn()
+        .log_warn("opening the browser for login");
 }
 
 /// Minimal local callback server on `listener` (already bound to 127.0.0.1).
@@ -831,30 +842,39 @@ async fn run_callback_server(
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
 
         if path != "/callback" {
-            let _ = stream
+            stream
                 .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot found")
-                .await;
+                .await
+                .log_debug("answering a stray callback request");
             continue;
         }
 
         let (code, state, error) = parse_oauth_query(query);
         match resolve_callback_code(code, state, error, expected_state) {
             Ok(code) => {
-                let _ = stream
+                stream
                     .write_all(
                         b"HTTP/1.1 302 Found\r\nLocation: https://platform.claude.com/oauth/code/success?app=claude-code\r\nContent-Length: 0\r\n\r\n",
                     )
-                    .await;
-                let _ = stream.flush().await;
+                    .await
+                    .log_debug("redirecting the browser after login");
+                stream
+                    .flush()
+                    .await
+                    .log_debug("flushing the login redirect");
                 return Ok(code);
             }
             Err(err) => {
-                let _ = stream
+                stream
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body><h2>Authentication failed</h2><p>You can close this tab.</p></body></html>",
                     )
-                    .await;
-                let _ = stream.flush().await;
+                    .await
+                    .log_debug("telling the browser the login failed");
+                stream
+                    .flush()
+                    .await
+                    .log_debug("flushing the login failure page");
                 return Err(err);
             }
         }
@@ -868,7 +888,7 @@ async fn run_callback_server(
 /// `isTTY` guard).
 async fn read_stdin_code(expected_state: &str) -> anyhow::Result<String> {
     eprint!("Paste authorization code here (or wait for browser callback): ");
-    let _ = std::io::stderr().flush();
+    std::io::stderr().flush().log_debug("flushing the prompt");
 
     let mut reader = BufReader::new(tokio::io::stdin());
     loop {
@@ -1242,7 +1262,7 @@ pub async fn try_fetch_profile_at(
 /// input or unreadable stdin.
 fn prompt_account_name(fallback: &str) -> String {
     eprint!("Name this account [{fallback}]: ");
-    let _ = std::io::stderr().flush();
+    std::io::stderr().flush().log_debug("flushing the prompt");
     let mut line = String::new();
     match std::io::stdin().read_line(&mut line) {
         Ok(_) => {
@@ -1385,12 +1405,10 @@ pub fn upsert_account(
 /// file is missing or unreadable), so the guard checks the SAME port `tcr server`
 /// takes over.
 fn login_target_port(config_path: &Path) -> u16 {
-    config::load(config_path)
-        .unwrap_or_else(|_| {
-            serde_json::from_str("{}").expect("empty object is a valid default config")
-        })
-        .proxy
-        .port
+    config::load(config_path).map_or_else(
+        |_| config::ProxyConfig::default().port,
+        |config| config.proxy.port,
+    )
 }
 
 /// What `login()` should do with the finished credential, decided purely from
@@ -1931,7 +1949,7 @@ const SETUP_TOKEN_ASSUMED_LIFETIME_MS: i64 = 365 * 24 * 60 * 60 * 1000;
 fn read_setup_token() -> anyhow::Result<String> {
     if std::io::stdin().is_terminal() {
         eprint!("Paste the token from `claude setup-token`: ");
-        let _ = std::io::stderr().flush();
+        std::io::stderr().flush().log_debug("flushing the prompt");
     }
     let mut line = String::new();
     std::io::stdin()
@@ -1990,10 +2008,14 @@ fn unnamed_fallback(accounts: &[Account]) -> String {
     }
     // Start at 2: `unnamed` itself is the first, so the next one a human reads
     // should be `unnamed-2`, not `unnamed-1`.
-    (2..)
-        .map(|n| format!("{BASE}-{n}"))
-        .find(|candidate| !accounts.iter().any(|a| &a.name == candidate))
-        .expect("an unbounded range always yields a free name")
+    let mut n: u64 = 2;
+    loop {
+        let candidate = format!("{BASE}-{n}");
+        if !accounts.iter().any(|a| a.name == candidate) {
+            return candidate;
+        }
+        n = n.saturating_add(1);
+    }
 }
 
 /// What one authenticated call said about a pasted setup token, before it is
@@ -2396,9 +2418,10 @@ pub fn first_codex_account_notice(
 /// It follows a save that already happened, so it cannot fail the login: a config it cannot read
 /// is read as the default one, as [`login_target_port`] reads it.
 pub(crate) async fn read_first_codex_account_notice(config_path: &Path) -> String {
-    let config = config::load(config_path).unwrap_or_else(|_| {
-        serde_json::from_str("{}").expect("empty object is a valid default config")
-    });
+    let Ok(config) = config::load(config_path).or_else(|_| serde_json::from_str::<Config>("{}"))
+    else {
+        return CODEX_FIRST_ACCOUNT_NOTICE.to_string();
+    };
     let live = crate::cli::fetch_live_status(&config).await;
     let ca = crate::mitm::minted_ca_path();
     let dir = config::default_path()
@@ -2799,10 +2822,17 @@ fn mint_codex_login_name(
         return Ok(email.to_string());
     }
     let base = format!("{email}{}codex", crate::identity::ORG_SEPARATOR);
-    Ok(std::iter::once(base.clone())
-        .chain((2..).map(|n| format!("{base}-{n}")))
-        .find(|candidate| free(candidate))
-        .expect("an unbounded range always yields a free name"))
+    if free(&base) {
+        return Ok(base);
+    }
+    let mut n: u64 = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if free(&candidate) {
+            return Ok(candidate);
+        }
+        n = n.saturating_add(1);
+    }
 }
 
 /// Import this machine's Claude Code login on a first run, if there is one.
@@ -3245,7 +3275,7 @@ fn persist_via_file(config_path: &Path, account: Account) -> anyhow::Result<Stri
         Err(config::ConfigError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
             let name = account.name.clone();
             let mut fresh: Config =
-                serde_json::from_str("{}").expect("empty object is a valid default config");
+                serde_json::from_str("{}").context("build a default config after login")?;
             let mut first_account = account;
             first_account.priority = Some(0);
             fresh.accounts.push(first_account);
@@ -3922,7 +3952,9 @@ mod tests {
                 field("redirect_uri"),
                 field("state")
             );
-            let _ = reqwest::get(&callback).await;
+            reqwest::get(&callback)
+                .await
+                .log_debug("calling the test callback");
         });
 
         let collected = recorded.clone();
@@ -4167,7 +4199,9 @@ mod tests {
                     }))
                 }),
             );
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .log_debug("serving a test server");
         });
 
         let client = reqwest::Client::new();
@@ -4938,7 +4972,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, axum::Router::new()).await;
+            axum::serve(listener, axum::Router::new())
+                .await
+                .log_debug("serving a test server");
         });
         let config: Config =
             serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
@@ -6346,7 +6382,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, axum::Router::new()).await;
+            axum::serve(listener, axum::Router::new())
+                .await
+                .log_debug("serving a test server");
         });
 
         let path = std::env::temp_dir().join(format!(
@@ -6702,15 +6740,17 @@ mod tests {
                 };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
-                    let _ = sock.read(&mut buf).await;
-                    let _ = sock
-                        .write_all(
-                            format!(
-                                "HTTP/1.1 {status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                            )
-                            .as_bytes(),
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
+                    sock.write_all(
+                        format!(
+                            "HTTP/1.1 {status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                         )
-                        .await;
+                        .as_bytes(),
+                    )
+                    .await
+                    .log_debug("writing a test response");
                 });
             }
         });
@@ -7349,7 +7389,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, origin).await;
+            axum::serve(listener, origin)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), seen)
     }
@@ -7432,7 +7474,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, route).await;
+            axum::serve(listener, route)
+                .await
+                .log_debug("serving a test server");
         });
         (port, seen)
     }
@@ -8047,7 +8091,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, origin).await;
+            axum::serve(listener, origin)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), seen)
     }

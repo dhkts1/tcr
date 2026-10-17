@@ -85,6 +85,10 @@ pub struct LiveWarmer {
 }
 
 impl LiveWarmer {
+    #[expect(
+        clippy::expect_used,
+        reason = "construction is infallible by signature; the builder fails only when no TLS backend initializes, which no request could survive"
+    )]
     pub fn new() -> Self {
         Self {
             // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the

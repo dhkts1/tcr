@@ -30,7 +30,10 @@ impl Manager {
         retry_after_secs: Option<u64>,
     ) {
         let gave_up_waiting = {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(account) = accounts.get_mut(idx) else {
                 return;
             };
@@ -95,7 +98,10 @@ impl Manager {
     /// count AFTER this update, so the caller compares it to
     /// [`SUSTAINED_5XX_THRESHOLD`] in the same breath.
     fn note_5xx_probe(&self, idx: usize, is_5xx: bool) -> u32 {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = self
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(account) = accounts.get_mut(idx) else {
             return 0;
         };
@@ -141,8 +147,14 @@ impl Manager {
     /// row.
     pub fn probeable_indices(&self) -> Vec<usize> {
         let now_ms = crate::now_ms();
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
-        let control = *self.control_idx.read().expect("control lock poisoned");
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let control = *self
+            .control_idx
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         accounts
             .iter()
             .enumerate()
@@ -347,7 +359,10 @@ impl Manager {
             Some(crate::provider::Provider::Codex) | None => return,
         }
         let (already_known, token) = {
-            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            let accounts = self
+                .accounts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(account) = accounts.get(idx) else {
                 return;
             };
@@ -361,7 +376,10 @@ impl Manager {
         }
 
         let prober = {
-            let guard = self.plan_prober.read().expect("plan prober lock poisoned");
+            let guard = self
+                .plan_prober
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.clone()
         };
         let plan = prober.plan(token).await;
@@ -375,7 +393,10 @@ impl Manager {
         // trusting `idx` is what keeps a concurrent removal from stamping one
         // account's plan onto another's row.
         let target = {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(account) = accounts.get_mut(idx) else {
                 return;
             };
@@ -429,7 +450,10 @@ impl Manager {
     /// row carries the plan for this process's life, and the next start probes it again.
     async fn record_codex_plan(&self, idx: usize, plan_type: &str) {
         let target = {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(account) = accounts.get_mut(idx) else {
                 return;
             };
@@ -479,7 +503,9 @@ impl Manager {
         if let Err(error) = tokio::task::spawn_blocking(move || {
             // INV1: taken after releasing accounts, and held across the whole read,
             // modify, sync and rename. The async worker waits on neither it nor disk.
-            let _writing = config_write.lock().expect("config write lock poisoned");
+            let _writing = config_write
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match config::save_plan(
                 &path,
                 &target,
@@ -511,13 +537,17 @@ impl Manager {
     /// profile endpoint. Not a runtime knob: call it before the manager serves
     /// anything.
     pub fn set_plan_prober(&self, prober: Arc<dyn crate::probe::PlanProber>) {
-        *self.plan_prober.write().expect("plan prober lock poisoned") = prober;
+        *self
+            .plan_prober
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = prober;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_err::LogErr as _;
 
     struct NoNetwork;
 
@@ -606,7 +636,9 @@ mod tests {
         let holder = std::thread::spawn(move || {
             let writing = holder_manager.config_write.lock().unwrap();
             ready_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(2));
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .log_debug("waiting for the test to release the config lock");
             holder_flag.store(false, Ordering::SeqCst);
             drop(writing);
         });
@@ -616,7 +648,9 @@ mod tests {
         let (_, responsive) = tokio::join!(manager.probe_account(0), async {
             tokio::task::yield_now().await;
             let responsive = still_held.load(Ordering::SeqCst);
-            let _ = release_tx.send(());
+            release_tx
+                .send(())
+                .log_debug("releasing the config lock holder");
             responsive
         });
         holder.join().unwrap();

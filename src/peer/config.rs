@@ -1842,7 +1842,10 @@ impl PeerStore {
         };
 
         {
-            let last = self.mtime.lock().expect("peer store mtime lock poisoned");
+            let last = self
+                .mtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if *last == Some(current_mtime) {
                 return;
             }
@@ -1863,8 +1866,14 @@ impl PeerStore {
         // the last policy this program trusted.
         match read_or_default(&self.path) {
             Ok(fresh) => {
-                *self.file.lock().expect("peer store file lock poisoned") = fresh;
-                *self.mtime.lock().expect("peer store mtime lock poisoned") = Some(current_mtime);
+                *self
+                    .file
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
+                *self
+                    .mtime
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(current_mtime);
             }
             Err(err) => {
                 tracing::warn!(
@@ -1887,7 +1896,7 @@ impl PeerStore {
         let now_s = now_unix_secs();
         self.file
             .lock()
-            .expect("peer store file lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .peers
             .iter()
             .cloned()
@@ -1901,7 +1910,7 @@ impl PeerStore {
         let now_s = now_unix_secs();
         self.file
             .lock()
-            .expect("peer store file lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .peers
             .iter()
             .find(|row| &row.node == node)
@@ -1933,7 +1942,7 @@ impl PeerStore {
         let mut file = self
             .file
             .lock()
-            .expect("peer store file lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         file.peers = file
             .peers
@@ -1954,7 +1963,10 @@ impl PeerStore {
     /// [`crate::peer::state::load`] itself; this accessor is for the READ path
     /// only and says so rather than pretending to be fresh.
     pub fn state(&self, now_ms: i64) -> Result<crate::peer::state::PeerState> {
-        let mut cached = self.state.lock().expect("peer store state lock poisoned");
+        let mut cached = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(state) = cached.as_ref() {
             return Ok(state.clone());
         }
@@ -2167,7 +2179,7 @@ fn count_peers_file_open(path: &Path) {
     let mut counts = PEERS_FILE_OPENS
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
         .lock()
-        .expect("peers-file open counter lock poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     *counts.entry(path.to_path_buf()).or_insert(0) += 1;
 }
 
@@ -2176,7 +2188,7 @@ pub fn peers_file_opens(path: &Path) -> u64 {
     PEERS_FILE_OPENS
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
         .lock()
-        .expect("peers-file open counter lock poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(path)
         .copied()
         .unwrap_or(0)

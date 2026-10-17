@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tcr::log_err::LogErr as _;
 
 /// `{"alg":"none","typ":"JWT"}`.
 const JWT_HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
@@ -88,12 +89,13 @@ fn serve_codex_upstream(
                 line.clear();
             }
             counter.fetch_add(1, Ordering::SeqCst);
-            let _ = write!(
+            write!(
                 stream,
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
                  connection: close\r\n\r\n{answer}",
                 answer.len()
-            );
+            )
+            .log_debug("writing a test response");
         }
     });
     (format!("http://{addr}"), answered)

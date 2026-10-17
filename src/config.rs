@@ -2298,18 +2298,21 @@ fn plan_renames(accounts: &[Account]) -> Vec<(usize, AccountRename)> {
             .filter(|(_, a)| a.name == name)
             .map(|(i, _)| i)
             .collect();
-        let keeper = rows
+        let Some(keeper) = rows
             .iter()
             .copied()
             .find(|&i| is_personal_plan(accounts[i].organization_type.as_deref()))
-            .unwrap_or_else(|| {
+            .or_else(|| {
                 // `min_by_key` keeps the FIRST row on a tie, which is the file
                 // order this falls back to when no priority distinguishes them.
                 rows.iter()
                     .copied()
                     .min_by_key(|&i| accounts[i].priority.unwrap_or(0))
-                    .expect("a duplicated name has at least two rows")
-            });
+            })
+        else {
+            // A duplicated name has at least two rows, so this is unreachable.
+            continue;
+        };
         for index in rows {
             if index == keeper {
                 continue;
@@ -3831,7 +3834,10 @@ fn merge_group_reserved(
     if !settings.is_object() {
         *settings = Value::Object(Map::new());
     }
-    let settings_obj = settings.as_object_mut().expect("just ensured object");
+    let Some(settings_obj) = settings.as_object_mut() else {
+        // Unreachable: the guard above just made it an object.
+        return GroupReserveWrite::Unchanged;
+    };
 
     if reserved {
         let entry = settings_obj
@@ -3840,10 +3846,9 @@ fn merge_group_reserved(
         if !entry.is_object() {
             *entry = Value::Object(Map::new());
         }
-        entry
-            .as_object_mut()
-            .expect("just ensured object")
-            .insert("reserved".to_string(), Value::Bool(true));
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("reserved".to_string(), Value::Bool(true));
+        }
     } else if let Some(entry) = settings_obj.get_mut(group)
         && let Some(obj) = entry.as_object_mut()
     {
@@ -3913,7 +3918,10 @@ fn merge_group_parked(doc: &mut Map<String, Value>, group: &str, parked: bool) -
     if !settings.is_object() {
         *settings = Value::Object(Map::new());
     }
-    let settings_obj = settings.as_object_mut().expect("just ensured object");
+    let Some(settings_obj) = settings.as_object_mut() else {
+        // Unreachable: the guard above just made it an object.
+        return GroupParkWrite::Unchanged;
+    };
 
     if parked {
         let entry = settings_obj
@@ -3922,10 +3930,9 @@ fn merge_group_parked(doc: &mut Map<String, Value>, group: &str, parked: bool) -
         if !entry.is_object() {
             *entry = Value::Object(Map::new());
         }
-        entry
-            .as_object_mut()
-            .expect("just ensured object")
-            .insert("parked".to_string(), Value::Bool(true));
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("parked".to_string(), Value::Bool(true));
+        }
     } else if let Some(entry) = settings_obj.get_mut(group)
         && let Some(obj) = entry.as_object_mut()
     {
@@ -4000,7 +4007,10 @@ fn merge_group_allow_control(
     if !settings.is_object() {
         *settings = Value::Object(Map::new());
     }
-    let settings_obj = settings.as_object_mut().expect("just ensured object");
+    let Some(settings_obj) = settings.as_object_mut() else {
+        // Unreachable: the guard above just made it an object.
+        return GroupControlWrite::Unchanged;
+    };
 
     if allow {
         let entry = settings_obj
@@ -4009,10 +4019,9 @@ fn merge_group_allow_control(
         if !entry.is_object() {
             *entry = Value::Object(Map::new());
         }
-        entry
-            .as_object_mut()
-            .expect("just ensured object")
-            .insert("allowControlAccount".to_string(), Value::Bool(true));
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("allowControlAccount".to_string(), Value::Bool(true));
+        }
     } else if let Some(entry) = settings_obj.get_mut(group)
         && let Some(obj) = entry.as_object_mut()
     {
@@ -4090,7 +4099,10 @@ fn merge_group_color(
     if !settings.is_object() {
         *settings = Value::Object(Map::new());
     }
-    let settings_obj = settings.as_object_mut().expect("just ensured object");
+    let Some(settings_obj) = settings.as_object_mut() else {
+        // Unreachable: the guard above just made it an object.
+        return GroupColorWrite::Unchanged;
+    };
 
     match color {
         Some(hex) => {
@@ -4100,10 +4112,9 @@ fn merge_group_color(
             if !entry.is_object() {
                 *entry = Value::Object(Map::new());
             }
-            entry
-                .as_object_mut()
-                .expect("just ensured object")
-                .insert("color".to_string(), Value::String(hex.to_string()));
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("color".to_string(), Value::String(hex.to_string()));
+            }
         }
         None => {
             if let Some(entry) = settings_obj.get_mut(group)
@@ -4131,10 +4142,17 @@ fn merge_control_account(doc: &mut Map<String, Value>, target: Option<&Account>)
     {
         return ControlWrite::Ambiguous;
     }
-    let desired = target.map(|account| {
-        serde_json::to_value(ControlAccountRef::from(account))
-            .expect("ControlAccountRef always serializes")
-    });
+    let desired = match target {
+        Some(account) => match serde_json::to_value(ControlAccountRef::from(account)) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                // Unreachable: a name always serializes. Leave the file alone.
+                tracing::warn!(%error, "controlAccount reference did not serialize");
+                return ControlWrite::Unchanged;
+            }
+        },
+        None => None,
+    };
     if doc.get("controlAccount").cloned() == desired {
         return ControlWrite::Unchanged;
     }
@@ -6304,7 +6322,7 @@ mod tests {
             before,
             "loading must never rewrite the file it read"
         );
-        let _ = fs::remove_file(&path);
+        crate::log_err::LogErr::log_debug(fs::remove_file(&path), "removing a test temp file");
     }
 
     #[test]
@@ -6322,7 +6340,7 @@ mod tests {
             "{ not json",
             "a corrupt file must never be overwritten by the defaults"
         );
-        let _ = fs::remove_file(&path);
+        crate::log_err::LogErr::log_debug(fs::remove_file(&path), "removing a test temp file");
     }
 
     #[test]

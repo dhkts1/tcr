@@ -42,6 +42,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tcr::log_err::LogErr as _;
 
 use axum::Router;
 use axum::body::Body;
@@ -293,7 +294,7 @@ async fn spawn_json_upstream_recording() -> (String, Arc<AtomicUsize>, ServedBy)
                 .unwrap_or("<none>")
                 .trim_start_matches("Bearer ")
                 .to_string();
-            let _ = axum::body::to_bytes(req.into_body(), 256 * 1024 * 1024).await;
+            axum::body::to_bytes(req.into_body(), 256 * 1024 * 1024).await.log_debug("reading a test request body");
             counter.fetch_add(1, Ordering::SeqCst);
             recorder
                 .lock()
@@ -311,7 +312,9 @@ async fn spawn_json_upstream_recording() -> (String, Arc<AtomicUsize>, ServedBy)
         .expect("bind json upstream");
     let addr = listener.local_addr().expect("json upstream addr");
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        axum::serve(listener, app)
+            .await
+            .log_debug("serving a test server");
     });
     (format!("http://{addr}"), hits, served)
 }

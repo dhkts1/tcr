@@ -33,7 +33,7 @@ impl Manager {
         let mut tracker = self
             .wire_sessions
             .lock()
-            .expect("wire sessions lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tracker.record_request(session_id, account, model, now_ms, tool_uses, tool_results);
         drop(tracker);
         self.mark_wire_sessions_dirty();
@@ -64,7 +64,7 @@ impl Manager {
         let mut tracker = self
             .wire_sessions
             .lock()
-            .expect("wire sessions lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tracker.record_response_tool_uses(session_id, now_ms, tool_uses);
         drop(tracker);
         self.mark_wire_sessions_dirty();
@@ -99,7 +99,7 @@ impl Manager {
         let mut tracker = self
             .wire_sessions
             .lock()
-            .expect("wire sessions lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tracker.record_usage(
             session_id,
             model,
@@ -151,7 +151,7 @@ impl Manager {
         let mut tracker = self
             .wire_sessions
             .lock()
-            .expect("wire sessions lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tracker.record_codex_model_request(session_id, account, path, now_ms);
         drop(tracker);
         self.mark_wire_sessions_dirty();
@@ -177,7 +177,7 @@ impl Manager {
         let mut tracker = self
             .wire_sessions
             .lock()
-            .expect("wire sessions lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tracker.record_codex_tool_calls(session_id, now_ms, calls);
         drop(tracker);
         self.mark_wire_sessions_dirty();
@@ -208,7 +208,7 @@ impl Manager {
         let mut tracker = self
             .wire_sessions
             .lock()
-            .expect("wire sessions lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tracker.record_codex_usage(
             session_id,
             model,
@@ -234,7 +234,7 @@ impl Manager {
         let tracker = self
             .wire_sessions
             .lock()
-            .expect("wire sessions lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tracker
             .snapshot(now_ms)
             .into_iter()
@@ -484,7 +484,7 @@ impl Manager {
         let tracker = self
             .wire_sessions
             .lock()
-            .expect("wire sessions lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tracker.snapshot(now_ms).into_iter().collect()
     }
 
@@ -503,7 +503,7 @@ impl Manager {
             let mut tracker = self
                 .wire_sessions
                 .lock()
-                .expect("wire sessions lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             tracker.restore(report.sessions.clone());
         }
         report

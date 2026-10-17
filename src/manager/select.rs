@@ -414,7 +414,7 @@ impl Manager {
     pub(crate) fn codex_accounts_with_unsupported_exit(&self) -> HashSet<usize> {
         self.config
             .lock()
-            .expect("config lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .accounts
             .iter()
             .enumerate()
@@ -437,7 +437,7 @@ impl Manager {
         }
         self.affinity
             .lock()
-            .expect("affinity lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|_, (idx, _)| !unsupported.contains(idx));
         let mut excluded = tried.clone();
         excluded.extend(unsupported);
@@ -589,7 +589,10 @@ impl Manager {
         if let Some(li) = self.locked_account_for(provider) {
             if let Some(g) = strict_group {
                 let in_group = {
-                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    let accounts = self
+                        .accounts
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     accounts
                         .get(li)
                         .is_some_and(|a| a.groups.iter().any(|carried| carried == g))
@@ -650,7 +653,10 @@ impl Manager {
             // the accounts lock — the two are NEVER held simultaneously (the
             // documented deadlock).
             let (pinned, counts) = {
-                let pins = self.affinity.lock().expect("affinity lock poisoned");
+                let pins = self
+                    .affinity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let pinned = pins.get(&key).map(|&(idx, touched_ms)| (idx, touched_ms));
                 // Only pins that are plausibly LIVE count as load — a days-dead pin
                 // must not make its account read as busy. See `PIN_LOAD_IDLE_MS`.
@@ -680,7 +686,10 @@ impl Manager {
                 // is served by its own provider's pool and the pin stays where
                 // the session it belongs to is warm.
                 let other_provider = {
-                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    let accounts = self
+                        .accounts
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     accounts.get(idx).is_some_and(|a| a.provider != provider)
                 };
                 // A STRICT GROUP ASK OUTRANKS AN EXISTING PIN, and once it
@@ -710,13 +719,19 @@ impl Manager {
                 // returns `None`, which is the honest refusal a strict ask is
                 // owed, never a serve on the out-of-group pin.
                 let out_of_strict_group = strict_group.is_some_and(|g| {
-                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    let accounts = self
+                        .accounts
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     !accounts
                         .get(idx)
                         .is_some_and(|a| a.groups.iter().any(|carried| carried == g))
                 });
                 if other_provider {
-                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    let accounts = self
+                        .accounts
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     keep_pin = Some(idx);
                     divert_reason = Some("other-provider");
                     divert_until_ms = accounts
@@ -724,7 +739,10 @@ impl Manager {
                         .and_then(|a| a.rate_limited_until_ms)
                         .unwrap_or(0);
                 } else if out_of_strict_group {
-                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    let accounts = self
+                        .accounts
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     keep_pin = Some(idx);
                     divert_reason = Some("group-strict");
                     divert_until_ms = accounts
@@ -742,7 +760,10 @@ impl Manager {
                     // `account_hard_ok`, not `hard_ok`: the model-class gate is about
                     // THIS request, so a Fable-exhausted pin that a Fable request
                     // already tried still keeps its pin for the session's Opus turns.
-                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    let accounts = self
+                        .accounts
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if accounts.get(idx).is_some_and(|a| {
                         Self::account_hard_ok(
                             a,
@@ -779,7 +800,10 @@ impl Manager {
                     // `None` means `X` is ineligible → fall through to the normal
                     // pick/re-pin path (which already handles a dead pin).
                     let decision: Option<(usize, Option<(String, String)>)> = {
-                        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+                        let mut accounts = self
+                            .accounts
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         // The full (soft-inclusive) gate. Failing it does NOT bench the
                         // pin — it only means we drop into the hard-gate re-test below,
                         // which decides serve-anyway vs durable re-key.
@@ -1097,7 +1121,10 @@ impl Manager {
                         // accounts lock is taken here (the re-check needs only the
                         // affinity-map counts + the already-chosen target; the next
                         // select re-checks eligibility anyway).
-                        let mut pins = self.affinity.lock().expect("affinity lock poisoned");
+                        let mut pins = self
+                            .affinity
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         let mut committed = target;
                         if target != idx {
                             let still_pinned_x = pins.get(&key).map(|&(i, _)| i) == Some(idx);
@@ -1169,7 +1196,10 @@ impl Manager {
                         && !tried.contains(&idx)
                     {
                         let usable = {
-                            let accounts = self.accounts.read().expect("accounts lock poisoned");
+                            let accounts = self
+                                .accounts
+                                .read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             accounts.get(idx).is_some_and(|a| {
                                 Self::eligible(
                                     a,
@@ -1194,8 +1224,10 @@ impl Manager {
                             })
                         };
                         if usable {
-                            let mut accounts =
-                                self.accounts.write().expect("accounts lock poisoned");
+                            let mut accounts = self
+                                .accounts
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
                             if let Some(account) = accounts.get_mut(idx) {
                                 account.last_selected_seq = tick;
@@ -1219,7 +1251,10 @@ impl Manager {
                         && !tried.contains(&control_idx)
                     {
                         let usable = {
-                            let accounts = self.accounts.read().expect("accounts lock poisoned");
+                            let accounts = self
+                                .accounts
+                                .read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             accounts.get(control_idx).is_some_and(|a| {
                                 // `control_eligible` deliberately bypasses `disabled` and
                                 // every other narrowing gate (see its own doc), it is NOT
@@ -1242,8 +1277,10 @@ impl Manager {
                             })
                         };
                         if usable {
-                            let mut accounts =
-                                self.accounts.write().expect("accounts lock poisoned");
+                            let mut accounts = self
+                                .accounts
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
                             if let Some(account) = accounts.get_mut(control_idx) {
                                 account.last_selected_seq = tick;
@@ -1281,13 +1318,16 @@ impl Manager {
             let episode = affinity.and_then(|key| {
                 self.divert_ledger
                     .lock()
-                    .expect("divert ledger lock poisoned")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&key)
                     .copied()
             });
             match divert_verdict(episode, pin_idx, divert_until_ms, 0) {
                 DivertVerdict::Sticky(sticky) if !tried.contains(&sticky) => {
-                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    let accounts = self
+                        .accounts
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let usable = accounts.get(sticky).is_some_and(|a| {
                         Self::eligible(
                             a,
@@ -1329,14 +1369,20 @@ impl Manager {
         // control account is set). The accounts lock is scoped so it is released
         // before we touch the affinity lock again for the re-pin below.
         let best = if let Some(sticky) = sticky_pick {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
             if let Some(account) = accounts.get_mut(sticky) {
                 account.last_selected_seq = tick;
             }
             Some(sticky)
         } else {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             // By default inference NEVER selects the control account, so that
             // inference load can never burn the one identity the control plane
@@ -1588,7 +1634,10 @@ impl Manager {
             // heavily-diverted session the eviction victim.
             let pin_idx = keep_pin.unwrap_or(idx);
             let moved_off = {
-                let mut pins = self.affinity.lock().expect("affinity lock poisoned");
+                let mut pins = self
+                    .affinity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let previous = pins.get(&key).map(|&(i, _)| i);
                 pins.insert(key, (pin_idx, now_ms));
                 self.mark_affinity_dirty();
@@ -1614,7 +1663,10 @@ impl Manager {
             // The accounts lock is taken ONLY after the affinity lock has dropped
             // above; the two are never held simultaneously.
             if let Some(previous) = moved_off {
-                let accounts = self.accounts.read().expect("accounts lock poisoned");
+                let accounts = self
+                    .accounts
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let old_name = accounts.get(previous).map_or("?", |a| a.name.as_str());
                 let new_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
                 tracing::info!(
@@ -1633,7 +1685,10 @@ impl Manager {
             // honest lines about one request, not a defect. The accounts lock is taken
             // only after the affinity lock dropped above — never nested.
             if let Some(reason) = divert_reason {
-                let accounts = self.accounts.read().expect("accounts lock poisoned");
+                let accounts = self
+                    .accounts
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let pin_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
                 let serve_name = accounts.get(idx).map_or("?", |a| a.name.as_str());
                 tracing::info!(
@@ -1792,11 +1847,17 @@ impl Manager {
         // the pin's HARD gates under the accounts lock (never nested). No throttle.
         if let Some(key) = affinity {
             let pinned = {
-                let pins = self.affinity.lock().expect("affinity lock poisoned");
+                let pins = self
+                    .affinity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 pins.get(&key).map(|&(idx, _)| idx)
             };
             if let Some(idx) = pinned {
-                let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+                let mut accounts = self
+                    .accounts
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 // `tried` gates SERVING and nothing else: the pin already failed THIS
                 // request upstream, so it cannot answer it. Whether the PIN MOVES is
                 // decided below, on ACCOUNT-level evidence alone — see the comment
@@ -1869,7 +1930,7 @@ impl Manager {
             let episode = affinity.and_then(|key| {
                 self.divert_ledger
                     .lock()
-                    .expect("divert ledger lock poisoned")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&key)
                     .copied()
             });
@@ -1882,7 +1943,10 @@ impl Manager {
         // (B) FALLBACK — least-utilized surviving account, throttled, then re-pinned.
         let via_sticky;
         let idx = {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             let sticky_usable = sticky_pick.filter(|&s| accounts.get(s).is_some_and(hard_ok));
             via_sticky = sticky_usable.is_some();
@@ -1955,7 +2019,10 @@ impl Manager {
         if let Some(key) = affinity {
             let pin_idx = keep_pin.unwrap_or(idx);
             let previous = {
-                let mut pins = self.affinity.lock().expect("affinity lock poisoned");
+                let mut pins = self
+                    .affinity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let previous = pins.get(&key).map(|&(i, _)| i);
                 pins.insert(key, (pin_idx, now_ms));
                 self.mark_affinity_dirty();
@@ -1979,7 +2046,10 @@ impl Manager {
             // pin stayed and another account served; `keep_pin` unset means the
             // fallback account became the new pin. The accounts lock is taken only
             // after the affinity lock has dropped above — never simultaneously.
-            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            let accounts = self
+                .accounts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let pin_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
             let serve_name = accounts.get(idx).map_or("?", |a| a.name.as_str());
             tracing::info!(
@@ -2022,7 +2092,10 @@ impl Manager {
     /// the safe direction, since the only caller uses a `true` to re-admit an
     /// account into a request's rotation.
     pub fn hold_expired(&self, idx: usize, now_ms: i64) -> bool {
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         accounts
             .get(idx)
             .is_some_and(|account| Self::hold_remaining_ms(account, now_ms).is_none())
@@ -3062,7 +3135,7 @@ impl Manager {
         let map = self
             .conn_affinity
             .lock()
-            .expect("conn affinity lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get(&conn_key).and_then(|&(idx, touch)| {
             if now_ms.saturating_sub(touch) < CONN_AFFINITY_TTL_MS {
                 Some(idx)
@@ -3082,7 +3155,7 @@ impl Manager {
         let mut map = self
             .conn_affinity
             .lock()
-            .expect("conn affinity lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.insert(conn_key, (idx, now_ms));
         if map.len() > CONN_AFFINITY_CAP
             && let Some((&oldest, _)) = map.iter().min_by_key(|&(_, &(_, touch))| touch)
@@ -3130,7 +3203,7 @@ impl Manager {
         let mut ledger = self
             .divert_ledger
             .lock()
-            .expect("divert ledger lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = ledger
             .entry(session_key)
             .and_modify(|e| {
@@ -3405,7 +3478,7 @@ mod revalidation_sticky_tests {
         let episode = manager
             .divert_ledger
             .lock()
-            .expect("divert ledger lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
             .copied()
             .expect("episode recorded");
@@ -3570,7 +3643,7 @@ mod sticky_divert_replay_tests {
         let episode = manager
             .divert_ledger
             .lock()
-            .expect("divert ledger lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
             .copied()
             .expect("episode recorded");
@@ -3808,7 +3881,10 @@ mod strict_group_door_tests {
         // answer is `None`. The sticky destination is in the other group, and
         // serving it would be the out-of-scope serve.
         let pin_group = {
-            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            let accounts = manager
+                .accounts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             accounts[pin].groups[0].clone()
         };
         let answer = manager.select_with_group(
@@ -3890,7 +3966,7 @@ mod strict_group_door_tests {
         manager
             .affinity
             .lock()
-            .expect("affinity lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key, (idx, touched_ms));
     }
 
@@ -3898,7 +3974,7 @@ mod strict_group_door_tests {
         manager
             .affinity
             .lock()
-            .expect("affinity lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
             .map(|&(idx, _)| idx)
     }
@@ -4570,7 +4646,10 @@ mod reset_urgency_tests {
     /// ranked but never gated — this suite is about ORDER, and an account held
     /// out by quota would prove nothing about it.
     fn set_weekly(manager: &Manager, idx: usize, hours: i64, now: OffsetDateTime) {
-        let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = manager
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         accounts[idx].quota.seven_day = Some(QuotaWindow {
             utilization: 0.10,
             reset: Some(now + time::Duration::hours(hours)),
@@ -4578,7 +4657,10 @@ mod reset_urgency_tests {
     }
 
     fn set_seq(manager: &Manager, idx: usize, seq: u64) {
-        let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = manager
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         accounts[idx].last_selected_seq = seq;
     }
 
@@ -4699,7 +4781,10 @@ mod reset_urgency_tests {
 
         let tier = |hours: i64| {
             set_weekly(&manager, 0, hours, now);
-            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            let accounts = manager
+                .accounts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             manager.reset_urgency_tier(&accounts[0], now)
         };
 
@@ -4711,11 +4796,17 @@ mod reset_urgency_tests {
 
         // Unknown reset → the minimum, ahead of every bucket.
         {
-            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = manager
+                .accounts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             accounts[0].quota.seven_day = None;
         }
         {
-            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            let accounts = manager
+                .accounts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(
                 manager.reset_urgency_tier(&accounts[0], now),
                 i64::MIN,
@@ -4726,7 +4817,10 @@ mod reset_urgency_tests {
         // Disabled → a constant tie for everyone, including the unknown arm.
         let off = build_manager(config_with(vec![account("a")], 0));
         {
-            let accounts = off.accounts.read().expect("accounts lock poisoned");
+            let accounts = off
+                .accounts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(
                 off.reset_urgency_tier(&accounts[0], now),
                 0,
@@ -4827,7 +4921,10 @@ mod fable_last_resort_tests {
     /// in the future for the lifetime of a unit test).
     fn set_seven_day_oi(manager: &Manager, idx: usize, utilization: f64) {
         let now = OffsetDateTime::now_utc();
-        let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = manager
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         accounts[idx].quota.seven_day_oi = Some(QuotaWindow {
             utilization,
             reset: Some(now + Duration::hours(2)),
@@ -4844,7 +4941,10 @@ mod fable_last_resort_tests {
         let manager = build_manager(config_with(vec![account("acct-a")], 0.95));
         set_seven_day_oi(&manager, 0, 0.96);
         let now = OffsetDateTime::now_utc();
-        let accounts = manager.accounts.read().expect("accounts lock poisoned");
+        let accounts = manager
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             Manager::model_blocked(
                 &accounts[0],
@@ -4871,7 +4971,10 @@ mod fable_last_resort_tests {
         set_seven_day_oi(&manager, 0, 0.96); // predicted-over, never rejected
         set_seven_day_oi(&manager, 1, 1.0); // genuinely rejected upstream
         let now = OffsetDateTime::now_utc();
-        let accounts = manager.accounts.read().expect("accounts lock poisoned");
+        let accounts = manager
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             !Manager::model_blocked(
                 &accounts[0],
@@ -4908,7 +5011,10 @@ mod fable_last_resort_tests {
             set_seven_day_oi(&manager, 0, 0.96);
             let now = OffsetDateTime::now_utc();
             let now_ms = odt_to_ms(now);
-            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            let accounts = manager
+                .accounts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let blocked = Manager::model_blocked(
                 &accounts[0],
                 manager.global_threshold,
@@ -5212,7 +5318,7 @@ mod stale_pin_load_tests {
         manager
             .affinity
             .lock()
-            .expect("affinity lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key, (idx, touched_ms));
     }
 
@@ -5220,7 +5326,7 @@ mod stale_pin_load_tests {
         manager
             .affinity
             .lock()
-            .expect("affinity lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
             .map(|&(idx, _)| idx)
     }
@@ -5332,7 +5438,10 @@ mod stale_pin_load_tests {
             Some(1),
             "the returning session is served on its own pinned account"
         );
-        let pins = manager.affinity.lock().expect("affinity lock poisoned");
+        let pins = manager
+            .affinity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(pins.len(), 7, "no stale pin was evicted by the filter");
         assert!((1..=6).all(|k| pins.get(&k).map(|&(i, _)| i) == Some(1)));
     }
@@ -5549,7 +5658,7 @@ mod provider_filter_tests {
         manager
             .affinity
             .lock()
-            .expect("affinity lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key, (idx, touched_ms));
     }
 
@@ -5557,7 +5666,7 @@ mod provider_filter_tests {
         manager
             .affinity
             .lock()
-            .expect("affinity lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
             .map(|&(idx, _)| idx)
     }
@@ -5570,7 +5679,10 @@ mod provider_filter_tests {
         utilization: f64,
     ) {
         let now = OffsetDateTime::now_utc();
-        let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = manager
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *window(&mut accounts[idx].quota) = Some(QuotaWindow {
             utilization,
             reset: Some(now + Duration::hours(2)),

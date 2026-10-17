@@ -574,7 +574,12 @@ mod tests {
             // A panic that does not unwind through the owner, then an exit that runs no
             // destructor: only the panic hook stands between the queue and the floor.
             "panic-then-exit" => {
-                let _joined = std::thread::spawn(|| panic!("child panics on purpose")).join();
+                assert!(
+                    std::thread::spawn(|| panic!("child panics on purpose"))
+                        .join()
+                        .is_err(),
+                    "the child thread panics"
+                );
                 std::mem::forget(file_log);
                 std::process::exit(7);
             }

@@ -8,6 +8,7 @@
 //! Trust, which is why a first pairing is always `Noise_XX` with a six-digit
 //! compare.
 
+use tcr::log_err::LogErr as _;
 use tcr::peer::config::NetworkKey;
 use tcr::peer::discovery::{self, Discovered, FoundList};
 use tcr_peer_wire::{INSTANCE_ID_BYTES, InstanceId, PeerId};
@@ -472,7 +473,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     std::fs::create_dir_all(&dir).expect("create the scratch dir");
     dir
 }

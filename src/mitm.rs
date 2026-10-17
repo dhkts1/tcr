@@ -356,7 +356,12 @@ pub fn existing_ca_path_in(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
 /// `ServerConfig::builder()` panic when no default is set; installing one first
 /// (ignoring "already installed") makes the builder deterministic.
 fn ensure_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        tracing::debug!("a rustls crypto provider was already installed");
+    }
 }
 
 /// The CA + leaf tcr mints for itself. Named in exactly one place so the loader
@@ -1279,6 +1284,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_err::LogErr as _;
 
     /// `write_file`'s `mode` must be enforced when the destination ALREADY exists,
     /// not only when it is created. `OpenOptionsExt::mode()` applies solely to the
@@ -1312,7 +1318,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"fresh key material");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     #[test]
@@ -1354,7 +1360,7 @@ mod tests {
     #[test]
     fn load_tls_reuses_a_minted_chain_across_restarts() {
         let dir = std::env::temp_dir().join(format!("tcr-mitm-reuse-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
 
         let first = load_tls_in(&dir).expect("first load mints a chain");
         let advertised_ca = first.ca_path.expect("a minted chain advertises its CA");
@@ -1373,7 +1379,7 @@ mod tests {
             "the persisted leaf must be reused, not re-minted"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// Each [`load_tls_in`] branch names the leaf it loaded, and what that leaf
@@ -1452,7 +1458,7 @@ mod tests {
     #[test]
     fn load_tls_prefers_the_preexisting_js_leaf() {
         let dir = std::env::temp_dir().join(format!("tcr-mitm-jsleaf-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
         std::fs::create_dir_all(&dir).expect("mkdir");
 
         let (_ca, leaf, key, _ca_key) =
@@ -1480,7 +1486,7 @@ mod tests {
             "the JS leaf path must not mint a competing chain"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// Reusing the JS leaf must advertise the CA sitting beside it. This is the
@@ -1490,7 +1496,7 @@ mod tests {
     #[test]
     fn load_tls_advertises_the_companion_ca_next_to_a_reused_leaf() {
         let dir = std::env::temp_dir().join(format!("tcr-mitm-jsca-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
         std::fs::create_dir_all(&dir).expect("mkdir");
 
         let (ca, leaf, key, _ca_key) =
@@ -1521,7 +1527,7 @@ mod tests {
             "the CA beside the reused leaf must be advertised"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     #[test]
@@ -1736,14 +1742,18 @@ mod tests {
             let holder = std::thread::spawn(move || {
                 held.with_config_write_for_test(|| {
                     ready.send(()).unwrap();
-                    let _ = released.recv_timeout(std::time::Duration::from_secs(2));
+                    released
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .log_debug("waiting for the test's release signal");
                 })
             });
             acquired.recv().unwrap();
             let start = std::time::Instant::now();
             assert_eq!(intercepts_now(&manager, host, marked), expected);
             let elapsed = start.elapsed();
-            let _ = release.send(());
+            release
+                .send(())
+                .log_debug("releasing the test's config writer");
             holder.join().unwrap();
             assert!(
                 elapsed < std::time::Duration::from_millis(500),
@@ -1777,7 +1787,7 @@ mod tests {
     #[test]
     fn platform_claude_com_is_intercepted_when_the_loaded_leaf_covers_it() {
         let dir = std::env::temp_dir().join(format!("tcr-mitm-covers-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
 
         let assets = load_tls_in(&dir).expect("mints a fresh chain covering FALLBACK_LEAF_SANS");
         assert!(
@@ -1790,7 +1800,7 @@ mod tests {
             assets.covered_hosts
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// The anti-outage property, and the most important test in this file: a
@@ -1800,7 +1810,7 @@ mod tests {
     #[test]
     fn platform_claude_com_is_not_intercepted_when_the_loaded_leaf_lacks_it() {
         let dir = std::env::temp_dir().join(format!("tcr-mitm-uncovered-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
         std::fs::create_dir_all(&dir).expect("mkdir");
 
         // Stand in for a foreign/JS leaf whose SAN coverage tcr cannot verify —
@@ -1835,7 +1845,7 @@ mod tests {
             "branch A's one known-safe claim must still hold"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// A persisted leaf whose sidecar SAN set does not match what we require
@@ -1845,7 +1855,7 @@ mod tests {
     fn a_stale_or_missing_sidecar_forces_a_remint() {
         let dir =
             std::env::temp_dir().join(format!("tcr-mitm-stale-sidecar-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
 
         let first = load_tls_in(&dir).expect("first load mints a chain");
         let leaf_before = std::fs::read(dir.join("tcr-leaf.pem")).expect("leaf persisted");
@@ -1884,7 +1894,7 @@ mod tests {
         );
         assert!(leaf_covers(&third.covered_hosts, "platform.claude.com"));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// The upgrade path for every existing install: a sidecar written before
@@ -1920,7 +1930,7 @@ mod tests {
     fn a_matching_sidecar_is_reused_without_a_remint() {
         let dir =
             std::env::temp_dir().join(format!("tcr-mitm-fresh-sidecar-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
 
         let _first = load_tls_in(&dir).expect("first load mints a chain + matching sidecar");
         let leaf_before = std::fs::read(dir.join("tcr-leaf.pem")).expect("leaf persisted");
@@ -1940,7 +1950,7 @@ mod tests {
             "no CA rotation should happen when nothing drifted"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// Branch D end-to-end: after a SAN-drift re-mint, the CA cert stays byte-
@@ -1951,7 +1961,7 @@ mod tests {
     #[tokio::test]
     async fn remint_after_san_drift_reuses_the_persisted_ca_key() {
         let dir = std::env::temp_dir().join(format!("tcr-mitm-ca-reuse-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
 
         let first = load_tls_in(&dir).expect("first load mints CA + leaf");
         let ca_pem_before = std::fs::read(dir.join("tcr-ca.pem")).expect("CA cert persisted");
@@ -2005,7 +2015,7 @@ mod tests {
         drop(client_tls);
         server.await.expect("server task must complete");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 
     /// The blind tunnel pipes bytes to the requested upstream and back, and first
@@ -2021,7 +2031,9 @@ mod tests {
             if let Ok((mut s, _)) = echo.accept().await {
                 let mut buf = [0u8; 64];
                 if let Ok(n) = s.read(&mut buf).await {
-                    let _ = s.write_all(&buf[..n]).await;
+                    s.write_all(&buf[..n])
+                        .await
+                        .log_debug("echoing in a test upstream");
                 }
             }
         });
@@ -2034,13 +2046,14 @@ mod tests {
 
         // Tunnel the accepted (tcr) side out to the echo upstream.
         tokio::spawn(async move {
-            let _ = tunnel(
+            tunnel(
                 server_side,
                 "127.0.0.1",
                 echo_port,
                 &direct_tunnel_connector(),
             )
-            .await;
+            .await
+            .log_debug("tunnelling in a test");
         });
 
         // The tunnel first writes the CONNECT-OK line.

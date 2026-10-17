@@ -916,7 +916,7 @@ mod tests {
         let weekly_only = Some(vec!["sevenDay".to_string()]);
 
         let mut control = Quota::default();
-        let _ = control.update_from_codex_refusal(&headers, 200, None);
+        assert!(control.update_from_codex_refusal(&headers, 200, None));
         assert_eq!(
             names(&control),
             both,
@@ -924,7 +924,7 @@ mod tests {
         );
 
         let mut headers_first = Quota::default();
-        let _ = headers_first.update_from_codex_refusal(&headers, 200, None);
+        assert!(headers_first.update_from_codex_refusal(&headers, 200, None));
         headers_first.apply_usage(&usage_from_payload(&pro_payload));
         assert_eq!(
             names(&headers_first),
@@ -947,7 +947,7 @@ mod tests {
 
         let mut probe_first = Quota::default();
         probe_first.apply_usage(&usage_from_payload(&pro_payload));
-        let _ = probe_first.update_from_codex_refusal(&headers, 200, None);
+        assert!(probe_first.update_from_codex_refusal(&headers, 200, None));
         assert_eq!(names(&probe_first), weekly_only, "the probe, then headers");
     }
 

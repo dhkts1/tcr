@@ -5937,8 +5937,10 @@ async fn handle_request(
                             "upstream transport failure mid-stream — forwarding the \
                              severed connection to the client"
                         );
-                        if let Some(ended) = state.ended.take() {
-                            let _ = ended.send(());
+                        if let Some(ended) = state.ended.take()
+                            && ended.send(()).is_err()
+                        {
+                            tracing::debug!("stream-end receiver already dropped");
                         }
                         state.timing.mark_ended();
                         Some((Err(err), state))
@@ -5950,8 +5952,10 @@ async fn handle_request(
                         // body (hence this whole stream, mid-poll) instead of
                         // ever seeing it reach `None`, which drops `state` —
                         // and `state.ended` along with it — unfired.
-                        if let Some(ended) = state.ended.take() {
-                            let _ = ended.send(());
+                        if let Some(ended) = state.ended.take()
+                            && ended.send(()).is_err()
+                        {
+                            tracing::debug!("stream-end receiver already dropped");
                         }
                         // `state` drops as this arm returns, and with it
                         // `StreamTiming`, which reads this as the end.
@@ -8840,6 +8844,7 @@ fn codex_credential_refused_message(refused: &[(usize, Option<String>)]) -> Stri
 mod tests {
     use super::*;
     use crate::config::{Account, Config, ProxyConfig};
+    use crate::log_err::LogErr;
 
     /// **This Mac's own routing marker never leaves it.**
     ///
@@ -9924,14 +9929,20 @@ mod tests {
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = upstream.accept().await {
                 let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf).await;
+                sock.read(&mut buf)
+                    .await
+                    .log_debug("reading a test request");
                 let body = br#"{"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}"#;
                 let head = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     body.len()
                 );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body).await;
+                sock.write_all(head.as_bytes())
+                    .await
+                    .log_debug("writing a test response");
+                sock.write_all(body)
+                    .await
+                    .log_debug("writing a test response");
             }
         });
 
@@ -11640,7 +11651,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app(manager)).await;
+            axum::serve(listener, app(manager))
+                .await
+                .log_debug("serving a test server");
         });
 
         let client = reqwest::Client::new();
@@ -14747,7 +14760,9 @@ mod tests {
             .expect("bind echo upstream");
         let addr = listener.local_addr().expect("echo upstream addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, upstream).await;
+            axum::serve(listener, upstream)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), hits)
     }
@@ -15050,7 +15065,9 @@ mod tests {
             .route("/api/claude_cli/bootstrap", get(bootstrap))
             .with_state(seen.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(listener, fake).await;
+            axum::serve(listener, fake)
+                .await
+                .log_debug("serving a test server");
         });
 
         let manager_with = |mode: crate::config::ControlIdentityMode| {
@@ -15916,7 +15933,9 @@ mod tests {
             .expect("bind advisor upstream");
         let addr = listener.local_addr().expect("advisor upstream addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, upstream).await;
+            axum::serve(listener, upstream)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), hits, seen)
     }
@@ -16409,7 +16428,9 @@ mod tests {
             .expect("bind upstream");
         let addr = listener.local_addr().expect("upstream addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, upstream).await;
+            axum::serve(listener, upstream)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), hits_first, hits_other)
     }
@@ -16860,7 +16881,9 @@ mod tests {
             .expect("bind upstream");
         let addr = listener.local_addr().expect("upstream addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, upstream).await;
+            axum::serve(listener, upstream)
+                .await
+                .log_debug("serving a test server");
         });
         let manager =
             Manager::with_live_refresher(two_orgs_over(&format!("http://{addr}"), false), None);
@@ -17415,12 +17438,10 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
-                    let _ = sock
-                        .write_all(
-                            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                        )
-                        .await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
+                    sock.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",).await.log_debug("writing a test response");
                 });
             }
         });
@@ -17438,7 +17459,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = manager.clone();
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -17487,12 +17510,10 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
-                    let _ = sock
-                        .write_all(
-                            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                        )
-                        .await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
+                    sock.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",).await.log_debug("writing a test response");
                 });
             }
         });
@@ -17511,7 +17532,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = manager.clone();
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -17572,12 +17595,10 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
-                    let _ = sock
-                        .write_all(
-                            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                        )
-                        .await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
+                    sock.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",).await.log_debug("writing a test response");
                 });
             }
         });
@@ -17594,7 +17615,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = manager.clone();
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -17650,7 +17673,9 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
                     let body = concat!(
                         "event: error\n",
                         "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
@@ -17660,7 +17685,9 @@ mod tests {
                         body.len(),
                         body
                     );
-                    let _ = sock.write_all(response.as_bytes()).await;
+                    sock.write_all(response.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
                 });
             }
         });
@@ -17672,7 +17699,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = Arc::clone(&manager);
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -17759,14 +17788,20 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
                     let body = br#"{"usage":{"input_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":90,"output_tokens":11}}"#;
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                         body.len()
                     );
-                    let _ = sock.write_all(response.as_bytes()).await;
-                    let _ = sock.write_all(body).await;
+                    sock.write_all(response.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
+                    sock.write_all(body)
+                        .await
+                        .log_debug("writing a test response");
                 });
             }
         });
@@ -17778,7 +17813,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = Arc::clone(&manager);
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
 
         let sink = SharedBuf::default();
@@ -17834,14 +17871,20 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
                     let body = br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content: unexpected field wombat"}}"#;
                     let response = format!(
                         "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                         body.len()
                     );
-                    let _ = sock.write_all(response.as_bytes()).await;
-                    let _ = sock.write_all(body).await;
+                    sock.write_all(response.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
+                    sock.write_all(body)
+                        .await
+                        .log_debug("writing a test response");
                 });
             }
         });
@@ -17853,7 +17896,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = Arc::clone(&manager);
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
 
         let sink = SharedBuf::default();
@@ -17903,9 +17948,13 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 4096];
-                    let _ = sock.read(&mut buf).await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
                     tokio::time::sleep(Duration::from_millis(HEADER_DELAY_MS)).await;
-                    let _ = sock.write_all(response.as_bytes()).await;
+                    sock.write_all(response.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
                 });
             }
         });
@@ -17918,7 +17967,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = Arc::clone(manager);
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
         proxy_addr
     }
@@ -18292,15 +18343,21 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
                     let event = concat!(
                         "event: message_start\n",
                         "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
                     );
                     let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
                     let chunk = format!("{:x}\r\n{event}\r\n", event.len());
-                    let _ = sock.write_all(headers.as_bytes()).await;
-                    let _ = sock.write_all(chunk.as_bytes()).await;
+                    sock.write_all(headers.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
+                    sock.write_all(chunk.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
                     tokio::time::sleep(Duration::from_secs(3600)).await;
                 });
             }
@@ -18470,7 +18527,9 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
                     let body = concat!(
                         "event: message_start\n",
                         "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
@@ -18482,7 +18541,9 @@ mod tests {
                         body.len(),
                         body
                     );
-                    let _ = sock.write_all(response.as_bytes()).await;
+                    sock.write_all(response.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
                 });
             }
         });
@@ -18494,7 +18555,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = Arc::clone(&manager);
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -18543,7 +18606,9 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
                     let body = concat!(
                         "event: message_start\n",
                         "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
@@ -18557,7 +18622,9 @@ mod tests {
                         body.len(),
                         body
                     );
-                    let _ = sock.write_all(response.as_bytes()).await;
+                    sock.write_all(response.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
                 });
             }
         });
@@ -18569,7 +18636,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = Arc::clone(&manager);
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -18633,7 +18702,9 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
                     let event = concat!(
                         "event: message_start\n",
                         "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
@@ -18647,8 +18718,12 @@ mod tests {
                     // `message_stop` or EOF on its own.
                     let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
                     let chunk = format!("{:x}\r\n{event}\r\n", event.len());
-                    let _ = sock.write_all(headers.as_bytes()).await;
-                    let _ = sock.write_all(chunk.as_bytes()).await;
+                    sock.write_all(headers.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
+                    sock.write_all(chunk.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
                     tokio::time::sleep(Duration::from_secs(3600)).await;
                 });
             }
@@ -18664,7 +18739,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = Arc::clone(&manager);
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
 
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -18743,7 +18820,9 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
                     let body = concat!(
                         "event: message_start\n",
                         "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
@@ -18753,7 +18832,9 @@ mod tests {
                         body.len(),
                         body
                     );
-                    let _ = sock.write_all(response.as_bytes()).await;
+                    sock.write_all(response.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
                 });
             }
         });
@@ -18765,7 +18846,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = Arc::clone(&manager);
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -18827,12 +18910,16 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
                     // Headers claim an SSE body, then the connection closes
                     // having sent NOT ONE byte of it — severed before the
                     // stream could ever produce its first parseable event.
                     let response = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-                    let _ = sock.write_all(response.as_bytes()).await;
+                    sock.write_all(response.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
                 });
             }
         });
@@ -18844,7 +18931,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = Arc::clone(&manager);
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -18893,7 +18982,9 @@ mod tests {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf).await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
                     let body = concat!(
                         "event: error\n",
                         "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad\"}}\n\n",
@@ -18903,7 +18994,9 @@ mod tests {
                         body.len(),
                         body
                     );
-                    let _ = sock.write_all(response.as_bytes()).await;
+                    sock.write_all(response.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
                 });
             }
         });
@@ -18915,7 +19008,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = Arc::clone(&manager);
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -19000,11 +19095,11 @@ mod tests {
                     }
                 }
                 *cap.lock().await = buf;
-                let _ = sock
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
-                    )
-                    .await;
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                )
+                .await
+                .log_debug("writing a test response");
             }
         });
 
@@ -19021,7 +19116,9 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let served = manager.clone();
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(served)).await;
+            axum::serve(proxy, app(served))
+                .await
+                .log_debug("serving a test server");
         });
 
         let inner = format!(r#"{{"account_uuid":"{CLIENT_UUID}","subscriptionType":"pro"}}"#);
@@ -19102,14 +19199,20 @@ mod tests {
                 };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
-                    let _ = sock.read(&mut buf).await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
                     let body = br#"{"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":500,"output_tokens":20}}"#;
                     let head = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                         body.len()
                     );
-                    let _ = sock.write_all(head.as_bytes()).await;
-                    let _ = sock.write_all(body).await;
+                    sock.write_all(head.as_bytes())
+                        .await
+                        .log_debug("writing a test response");
+                    sock.write_all(body)
+                        .await
+                        .log_debug("writing a test response");
                 });
             }
         });
@@ -19151,7 +19254,9 @@ mod tests {
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, affinity_app).await;
+            axum::serve(proxy, affinity_app)
+                .await
+                .log_debug("serving a test server");
         });
 
         let body = serde_json::to_vec(&serde_json::json!({
@@ -19235,10 +19340,14 @@ mod tests {
                 counter.store(n, std::sync::atomic::Ordering::SeqCst);
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
-                    let _ = sock.read(&mut buf).await;
+                    sock.read(&mut buf)
+                        .await
+                        .log_debug("reading a test request");
                     match reply {
                         Some(raw) => {
-                            let _ = sock.write_all(raw.as_bytes()).await;
+                            sock.write_all(raw.as_bytes())
+                                .await
+                                .log_debug("writing a test response");
                         }
                         // Drop with no reply: "connection closed before message
                         // completed" on the client side — a transport error.
@@ -19429,7 +19538,9 @@ mod tests {
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(manager)).await;
+            axum::serve(proxy, app(manager))
+                .await
+                .log_debug("serving a test server");
         });
         let body = serde_json::to_vec(&serde_json::json!({ "model": "claude-x", "messages": [] }))
             .unwrap();
@@ -19450,7 +19561,9 @@ mod tests {
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(manager)).await;
+            axum::serve(proxy, app(manager))
+                .await
+                .log_debug("serving a test server");
         });
         let body = serde_json::to_vec(&serde_json::json!({ "model": "claude-x", "messages": [] }))
             .unwrap();
@@ -19472,7 +19585,9 @@ mod tests {
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, app(manager)).await;
+            axum::serve(proxy, app(manager))
+                .await
+                .log_debug("serving a test server");
         });
         let body =
             serde_json::to_vec(&serde_json::json!({ "model": model, "messages": [] })).unwrap();
@@ -19514,7 +19629,9 @@ mod tests {
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(proxy, affinity_app).await;
+            axum::serve(proxy, affinity_app)
+                .await
+                .log_debug("serving a test server");
         });
         let body = serde_json::to_vec(&serde_json::json!({
             "model": "claude-x",
@@ -20314,11 +20431,12 @@ mod tests {
                             ))
                         },
                     );
-                    let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::server::conn::auto::Builder::new(
                         hyper_util::rt::TokioExecutor::new(),
                     )
                     .serve_connection(hyper_util::rt::TokioIo::new(sock), service)
-                    .await;
+                    .await
+                    .log_debug("serving a test connection");
                 });
             }
         });
@@ -21682,7 +21800,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app(manager)).await;
+            axum::serve(listener, app(manager))
+                .await
+                .log_debug("serving a test server");
         });
 
         let resp = reqwest::Client::new()
@@ -21836,7 +21956,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app(manager)).await;
+            axum::serve(listener, app(manager))
+                .await
+                .log_debug("serving a test server");
         });
         addr
     }
@@ -22281,7 +22403,9 @@ mod tests {
                 .expect("bind capturing upstream");
             let addr = listener.local_addr().expect("capturing upstream addr");
             tokio::spawn(async move {
-                let _ = axum::serve(listener, upstream).await;
+                axum::serve(listener, upstream)
+                    .await
+                    .log_debug("serving a test server");
             });
             Self {
                 url: format!("http://{addr}"),
@@ -23121,7 +23245,9 @@ mod tests {
             .expect("bind fixed origin");
         let addr = listener.local_addr().expect("fixed origin addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, origin).await;
+            axum::serve(listener, origin)
+                .await
+                .log_debug("serving a test server");
         });
         format!("http://{addr}")
     }
@@ -23476,7 +23602,9 @@ mod tests {
             .expect("bind Codex origin");
         let addr = listener.local_addr().expect("Codex origin addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, origin).await;
+            axum::serve(listener, origin)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), refused, served)
     }
@@ -23657,7 +23785,9 @@ mod tests {
             .expect("bind Codex origin");
         let addr = listener.local_addr().expect("Codex origin addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, origin).await;
+            axum::serve(listener, origin)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), refused, served)
     }
@@ -23961,7 +24091,9 @@ mod tests {
             listener.local_addr().expect("Codex origin addr")
         );
         tokio::spawn(async move {
-            let _ = axum::serve(listener, origin).await;
+            axum::serve(listener, origin)
+                .await
+                .log_debug("serving a test server");
         });
         let manager =
             Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_url), None);
@@ -24047,7 +24179,9 @@ mod tests {
             listener.local_addr().expect("Codex origin addr")
         );
         tokio::spawn(async move {
-            let _ = axum::serve(listener, origin).await;
+            axum::serve(listener, origin)
+                .await
+                .log_debug("serving a test server");
         });
         let manager =
             Manager::with_live_refresher(codex_fleet("http://127.0.0.1:9", &codex_url), None);
@@ -24158,7 +24292,9 @@ mod tests {
             listener.local_addr().expect("Codex origin addr")
         );
         tokio::spawn(async move {
-            let _ = axum::serve(listener, origin).await;
+            axum::serve(listener, origin)
+                .await
+                .log_debug("serving a test server");
         });
         let manager =
             Manager::with_live_refresher(codex_fleet("http://127.0.0.1:9", &codex_url), None);
@@ -25316,7 +25452,9 @@ mod tests {
             .expect("bind Codex origin");
         let addr = listener.local_addr().expect("Codex origin addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, origin).await;
+            axum::serve(listener, origin)
+                .await
+                .log_debug("serving a test server");
         });
         let anthropic_echo = CapturingUpstream::spawn().await;
         let manager = Manager::with_live_refresher(
@@ -25937,7 +26075,9 @@ mod tests {
             .expect("bind Codex origin");
         let addr = listener.local_addr().expect("Codex origin addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, origin).await;
+            axum::serve(listener, origin)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), refused)
     }

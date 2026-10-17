@@ -34,6 +34,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tcr::log_err::LogErr as _;
 
 use tcr::peer::config::{
     self, Allow, Endpoint, EndpointSource, Locator, PeerFile, PeerRow, PeerStore,
@@ -64,7 +65,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     std::fs::create_dir_all(&dir).expect("create the scratch dir");
     dir
 }
@@ -711,7 +712,9 @@ async fn listener_on(
     let context =
         listener::SessionContext::new(&key, store.path(), &key_dir.join("peer-state.json"));
     tokio::spawn(async move {
-        let _ = listener::serve_on_with(listening, context).await;
+        listener::serve_on_with(listening, context)
+            .await
+            .log_debug("serving a test peer listener");
     });
     (addr, id)
 }
@@ -806,7 +809,10 @@ async fn a_carry_is_charged_to_the_path_it_arrived_over() {
     let mut asked = ask_to_forward(addr, &requester, &keeper, &header).await;
     asked.write_all(&[7_u8; 32]).await.ok();
     let mut back = [0_u8; 16];
-    let _ = asked.read_exact(&mut back).await;
+    asked
+        .read_exact(&mut back)
+        .await
+        .log_debug("reading the forwarded reply");
     asked.finish().await.ok();
 
     assert!(

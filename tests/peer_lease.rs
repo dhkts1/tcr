@@ -26,12 +26,18 @@
 //! DEFAULT, and nothing in between would stop it. These tests are what stands
 //! where the existing code does not reach.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 /// What the real API refuses a request without, shared by every fake upstream
 /// in this tree. See that module's docs for why a fake upstream is strict.
 #[path = "tools/api_contract.rs"]
 mod api_contract;
 
 use std::path::{Path, PathBuf};
+use tcr::log_err::LogErr as _;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
@@ -520,7 +526,11 @@ fn the_ledger_does_not_grow_without_bound_on_peer_driven_input() {
     // a borrower can send.
     for nth in 0..(lease::SERVED_CAPACITY as u128 + 64) {
         ledger.leave_relay(LEASE);
-        let _ = ledger.enter_relay(LEASE, &grantee, REQUEST + 1 + nth, now);
+        assert_eq!(
+            ledger.enter_relay(LEASE, &grantee, REQUEST + 1 + nth, now),
+            Ok(()),
+            "a released slot admits the next request"
+        );
     }
     assert!(
         ledger.served_len() <= lease::SERVED_CAPACITY,
@@ -1789,6 +1799,7 @@ mod fleet {
     use axum::response::Response;
     use axum::routing::any;
     use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
+    use tcr::log_err::LogErr as _;
     use tcr::manager::Manager;
     use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
     use tcr::probe::{ProbeError, ProbeFuture, UsageProber};
@@ -1940,7 +1951,9 @@ mod fleet {
         let app = Router::new().fallback(any(move |req: axum::extract::Request| {
             let counter = counter.clone();
             async move {
-                let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+                axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .log_debug("reading a test request body");
                 counter.fetch_add(1, Ordering::SeqCst);
                 Response::builder()
                     .status(200)
@@ -1957,7 +1970,9 @@ mod fleet {
             .expect("bind the oversized upstream");
         let addr = listener.local_addr().expect("upstream addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), hits)
     }
@@ -1971,7 +1986,9 @@ mod fleet {
         let app = Router::new().fallback(any(move |req: axum::extract::Request| {
             let counter = counter.clone();
             async move {
-                let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+                axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .log_debug("reading a test request body");
                 // Counted on ARRIVAL, before the delay: the question this
                 // upstream answers is how many times the fleet sent one
                 // request, and a request still in flight has already been paid
@@ -1993,7 +2010,9 @@ mod fleet {
             .expect("bind the slow upstream");
         let addr = listener.local_addr().expect("upstream addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), hits)
     }
@@ -2007,7 +2026,9 @@ mod fleet {
         let app = Router::new().fallback(any(move |req: axum::extract::Request| {
             let counter = counter.clone();
             async move {
-                let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+                axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .log_debug("reading a test request body");
                 counter.fetch_add(1, Ordering::SeqCst);
                 Response::builder()
                     .status(429)
@@ -2026,7 +2047,9 @@ mod fleet {
             .expect("bind the rejecting upstream");
         let addr = listener.local_addr().expect("upstream addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), hits)
     }
@@ -2142,7 +2165,9 @@ mod fleet {
                         )
                     })
                     .collect();
-                let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+                axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .log_debug("reading a test request body");
                 counter.fetch_add(1, Ordering::SeqCst);
                 recorder.lock().expect("served-by lock").push(SeenRequest {
                     token,
@@ -2167,7 +2192,9 @@ mod fleet {
             .expect("bind the fake upstream");
         let addr = listener.local_addr().expect("upstream addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .log_debug("serving a test server");
         });
         (format!("http://{addr}"), hits, served)
     }
@@ -2214,6 +2241,7 @@ mod mesh {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
+    use tcr::log_err::LogErr as _;
     use tcr::manager::Manager;
     use tcr::peer::config::PeerStore;
     use tcr::peer::id::NodeKey;
@@ -2311,7 +2339,9 @@ mod mesh {
         tokio::spawn(async move {
             // The loop only ever ends by the listener failing, which in this
             // binary means the test finished and the socket was dropped.
-            let _ = listener::serve_on_with(listening, context).await;
+            listener::serve_on_with(listening, context)
+                .await
+                .log_debug("serving a test peer listener");
         });
         addr
     }
@@ -2369,7 +2399,9 @@ mod mesh {
                     // The request frame, read exactly as a lender reads it, and
                     // then nothing: no ack, no reply, and the stream held open
                     // so the borrower's own deadline is what ends this.
-                    let _ = noise::recv_encrypted(&mut stream, &mut session.transport).await;
+                    noise::recv_encrypted(&mut stream, &mut session.transport)
+                        .await
+                        .log_debug("reading the request frame");
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 });
             }
@@ -4288,14 +4320,18 @@ async fn an_answer_that_cannot_be_carried_back_is_never_retryable() {
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut scratch = vec![0_u8; 8192];
-                let _ = stream.read(&mut scratch).await;
-                let _ = stream
+                stream
+                    .read(&mut scratch)
+                    .await
+                    .log_debug("reading a test request");
+                stream
                     .write_all(
                         b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
                           content-length: 4096\r\n\r\ntruncate",
                     )
-                    .await;
-                let _ = stream.flush().await;
+                    .await
+                    .log_debug("writing a test response");
+                stream.flush().await.log_debug("flushing a test stream");
             });
         }
     });

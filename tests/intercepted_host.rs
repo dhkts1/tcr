@@ -29,10 +29,17 @@
 //! interception decision regresses or a leaf does not cover the host. Every listener binds
 //! `127.0.0.1:0`.
 
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
+)]
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tcr::log_err::LogErr as _;
 
 use axum::Router;
 use axum::body::Body;
@@ -156,7 +163,9 @@ async fn spawn_origin(origin: Origin) -> String {
         .expect("bind a fake origin");
     let addr = listener.local_addr().expect("the origin's address");
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        axum::serve(listener, app)
+            .await
+            .log_debug("serving a test server");
     });
     format!("http://{addr}")
 }
@@ -235,7 +244,9 @@ async fn start() -> Tcr {
         while let Ok((stream, _)) = blind_listener.accept().await {
             tokio::spawn(async move {
                 let (mut reader, mut writer) = stream.into_split();
-                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                tokio::io::copy(&mut reader, &mut writer)
+                    .await
+                    .log_debug("echoing in the blind tunnel's stub");
             });
         }
     });

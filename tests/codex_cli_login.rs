@@ -34,6 +34,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tcr::log_err::LogErr as _;
 
 /// `{"alg":"none","typ":"JWT"}`.
 const JWT_HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
@@ -146,12 +147,13 @@ fn spawn_upstream(
             }
             seen();
             counter.fetch_add(1, Ordering::SeqCst);
-            let _ = write!(
+            write!(
                 stream,
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
                  connection: close\r\n\r\n{answer}",
                 answer.len()
-            );
+            )
+            .log_debug("writing a test response");
         }
     });
     (format!("http://{addr}"), answered)
@@ -219,7 +221,7 @@ impl Scratch {
         match auth {
             Some(auth) => std::fs::write(&login, auth).expect("the fake's login"),
             None => {
-                let _ = std::fs::remove_file(&login);
+                std::fs::remove_file(&login).log_debug("removing a test file");
             }
         }
         write_script(
@@ -858,7 +860,7 @@ fn fixture_cleanup_stops_an_owned_process_even_without_signal_forwarding() {
     let cleaned = within(Duration::from_millis(500), || gone(identity));
     // The red control must clean up as well; assertions never leave a looping fixture.
     kill_hard(identity);
-    let _ = process.wait();
+    process.wait().log_debug("reaping a test child");
     assert!(
         cleaned,
         "dropping fixture cleanup must stop its exact owned process"
@@ -917,7 +919,9 @@ fn login_codex_stops_codex_and_removes_its_folder_when_cancelled() {
         let (lines, received) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let _ = lines.send(line);
+                lines
+                    .send(line)
+                    .log_debug("forwarding a child's stdout line");
             }
         });
         let browser = received
@@ -977,8 +981,8 @@ fn login_codex_stops_codex_and_removes_its_folder_when_cancelled() {
             kill_hard(pid);
         }
         if !exited {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.kill().log_debug("killing a test child");
+            child.wait().log_debug("reaping a test child");
         }
         assert!(exited, "group={group}: tcr exits within 5 s");
         let status = status.expect("an exit status");
@@ -1046,8 +1050,8 @@ fn cancelling_codex_login_reports_a_throwaway_folder_it_could_not_delete() {
         cleanup.remember(pid);
     }
     if !ready {
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill().log_debug("killing a test child");
+        child.wait().log_debug("reaping a test child");
         panic!(
             "fake codex never became ready: stderr={} stdout={}",
             std::fs::read_to_string(&error_log).unwrap_or_default(),
@@ -1066,8 +1070,8 @@ fn cancelling_codex_login_reports_a_throwaway_folder_it_could_not_delete() {
         status.is_some()
     });
     if !exited {
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill().log_debug("killing a test child");
+        child.wait().log_debug("reaping a test child");
     }
     let stderr = std::fs::read_to_string(&error_log).unwrap();
     std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1291,16 +1295,19 @@ fn proxy_without_providers() -> u16 {
                 line.clear();
             }
             let mut body = vec![0u8; length];
-            let _ = reader.read_exact(&mut body);
+            reader
+                .read_exact(&mut body)
+                .log_debug("reading a test request body");
             let refusal = r#"{"type":"error","error":{"type":"invalid_request_error","message":"\"name\" (string) is required and must not be empty."}}"#;
-            let _ = write!(
+            write!(
                 stream,
                 "HTTP/1.1 400 Bad Request\r\n{}: {}\r\ncontent-type: application/json\r\n\
                  content-length: {}\r\nconnection: close\r\n\r\n{refusal}",
                 tcr::proxy::ENDPOINT_HEADER,
                 tcr::proxy::ADD_ACCOUNT_ENDPOINT,
                 refusal.len()
-            );
+            )
+            .log_debug("writing a test response");
         }
     });
     port
