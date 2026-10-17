@@ -4160,7 +4160,7 @@ mod tests {
                 }))
             }),
         );
-        let endpoint = format!("http://{}/", serve_router(app).await);
+        let endpoint = format!("{}/", crate::test_support::stub_upstream::http(app).url());
 
         let client = reqwest::Client::new();
         let tokens = refresh_access_token_at(&client, "rt-original", &endpoint)
@@ -4209,7 +4209,7 @@ mod tests {
                 "/codex",
                 axum::routing::post(recorder("codex", seen.clone())),
             );
-        let addr = serve_router(app).await;
+        let addr = crate::test_support::stub_upstream::http(app);
 
         let mut refresher =
             LiveRefresher::new().with_codex_endpoint(format!("http://{addr}/codex"));
@@ -4910,7 +4910,8 @@ mod tests {
     }
 
     /// Serve `app` on its own ephemeral loopback port for the rest of the test, and return the
-    /// address. The one `axum::serve` of the per-test stubs below.
+    /// address. Only for code that dials a bare PORT (a live proxy's `proxy.port`); a stub reached
+    /// by a base URL is a route on `test_support::stub_upstream` instead, with no port of its own.
     async fn serve_router(app: axum::Router) -> std::net::SocketAddr {
         let (listener, port) = bind_loopback().await;
         tokio::spawn(async move {
@@ -4919,6 +4920,43 @@ mod tests {
                 .log_debug("serving a test server");
         });
         std::net::SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// Serve a live proxy on `listener` whose config is the JSON `seed`, with `config_path` as
+    /// the file behind it, for the rest of the test. Answers its manager.
+    fn serve_live_proxy(
+        listener: TcpListener,
+        seed: &str,
+        config_path: Option<std::path::PathBuf>,
+    ) -> std::sync::Arc<crate::manager::Manager> {
+        let config: Config = serde_json::from_str(seed).unwrap();
+        let manager = crate::manager::Manager::with_live_refresher(config, config_path);
+        let served = std::sync::Arc::clone(&manager);
+        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        manager
+    }
+
+    /// A live proxy, with no config file, that admits only requests carrying `api_key`.
+    /// Answers its port.
+    async fn live_proxy_requiring_the_api_key(api_key: &str) -> u16 {
+        let (listener, port) = bind_loopback().await;
+        let seed = format!(r#"{{ "proxy": {{ "port": {port}, "apiKey": "{api_key}" }} }}"#);
+        serve_live_proxy(listener, &seed, None);
+        port
+    }
+
+    /// A live proxy, and a temp config file tagged `tag` that names its port and nothing else.
+    /// The proxy itself runs with no config file behind it. Answers the file's path and the port.
+    async fn a_live_proxy_and_its_config_file(tag: &str) -> (std::path::PathBuf, u16) {
+        let (listener, port) = bind_loopback().await;
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-route-{tag}-{}-{port}.json",
+            std::process::id()
+        ));
+        let seed = format!(r#"{{ "proxy": {{ "port": {port} }} }}"#);
+        std::fs::write(&path, &seed).unwrap();
+        serve_live_proxy(listener, &seed, None);
+        (path, port)
     }
 
     /// Serve `app` on a loopback port for the life of the test binary, from a thread and runtime
@@ -4970,10 +5008,9 @@ mod tests {
     #[tokio::test]
     async fn probe_add_capability_reads_a_stamped_400_as_present() {
         let (listener, port) = bind_loopback().await;
-        let config: Config =
-            serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
-        let manager = crate::manager::Manager::with_live_refresher(config.clone(), None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let seed = format!(r#"{{ "proxy": {{ "port": {port} }} }}"#);
+        serve_live_proxy(listener, &seed, None);
+        let config: Config = serde_json::from_str(&seed).unwrap();
 
         assert_eq!(probe_add_capability(&config).await, AddCapability::Present);
     }
@@ -5027,13 +5064,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_add_capability_wrong_api_key_is_unauthorized_not_absent() {
-        let (listener, port) = bind_loopback().await;
-        let server_config: Config = serde_json::from_str(&format!(
-            r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#
-        ))
-        .unwrap();
-        let manager = crate::manager::Manager::with_live_refresher(server_config, None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let port = live_proxy_requiring_the_api_key("correct-key").await;
 
         // The caller's config carries the WRONG key.
         let client_config: Config = serde_json::from_str(&format!(
@@ -5061,17 +5092,7 @@ mod tests {
     /// `WriteRoute::File` beside a real, answering server.
     #[tokio::test]
     async fn admit_login_proceeds_live_even_when_incumbent_detection_missed_a_real_server() {
-        let (listener, port) = bind_loopback().await;
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-route-missed-incumbent-{}-{port}.json",
-            std::process::id()
-        ));
-        let seed = format!(r#"{{ "proxy": {{ "port": {port} }} }}"#);
-        std::fs::write(&path, &seed).unwrap();
-
-        let server_config: Config = serde_json::from_str(&seed).unwrap();
-        let manager = crate::manager::Manager::with_live_refresher(server_config, None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let (path, port) = a_live_proxy_and_its_config_file("missed-incumbent").await;
 
         let route =
             admit_login_against(&path, &cfg(&path), None, port, false, LoginCommand::Browser)
@@ -5091,17 +5112,7 @@ mod tests {
     /// skip straight to `File` the way the pre-fix early-return did.
     #[tokio::test]
     async fn admit_login_prefers_live_over_force_when_a_real_server_confirms_the_route() {
-        let (listener, port) = bind_loopback().await;
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-route-force-live-{}-{port}.json",
-            std::process::id()
-        ));
-        let seed = format!(r#"{{ "proxy": {{ "port": {port} }} }}"#);
-        std::fs::write(&path, &seed).unwrap();
-
-        let server_config: Config = serde_json::from_str(&seed).unwrap();
-        let manager = crate::manager::Manager::with_live_refresher(server_config, None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let (path, port) = a_live_proxy_and_its_config_file("force-live").await;
 
         let route =
             admit_login_against(&path, &cfg(&path), None, port, true, LoginCommand::Browser)
@@ -5212,13 +5223,7 @@ mod tests {
     /// under `--force`, and nothing along the way may touch the config file.
     #[tokio::test]
     async fn admit_login_refuses_unauthorized_even_under_force() {
-        let (listener, port) = bind_loopback().await;
-        let server_config: Config = serde_json::from_str(&format!(
-            r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#
-        ))
-        .unwrap();
-        let manager = crate::manager::Manager::with_live_refresher(server_config, None);
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let port = live_proxy_requiring_the_api_key("correct-key").await;
 
         // The file `admit_login_against` reads carries the WRONG key.
         let path = std::env::temp_dir().join(format!(
@@ -5305,18 +5310,32 @@ mod tests {
             .to_string()
     }
 
+    /// One person (`uuid-person`) in two orgs, Corp and Personal, one row each.
+    const ONE_PERSON_IN_TWO_ORGS: &str = r#"{ "accounts": [
+            { "name": "me@example.com (Corp)", "type": "oauth", "accessToken": "at-corp",
+              "refreshToken": "rt-corp-DEAD", "expiresAt": 1893456000000, "priority": 0,
+              "accountUuid": "uuid-person", "orgUuid": "org-corp", "orgName": "Corp" },
+            { "name": "me@example.com (Personal)", "type": "oauth", "accessToken": "at-pers",
+              "refreshToken": "rt-personal-ALIVE", "expiresAt": 1893456000000, "priority": 1,
+              "accountUuid": "uuid-person", "orgUuid": "org-personal", "orgName": "Personal" }
+        ] }"#;
+
+    /// `seed` written to a fresh temp config file tagged `tag`, and its path.
+    fn login_file(tag: &str, seed: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("tcr-oauth-{tag}-{}-{seq}.json", std::process::id()));
+        std::fs::write(&path, seed).unwrap();
+        path
+    }
+
     /// A mismatch between the requested account and the identity that came
     /// back writes NOTHING — the config file is byte-identical afterwards —
     /// and the error names both sides.
     #[tokio::test]
     async fn finish_login_checked_mismatch_writes_nothing() {
-        let seed = two_account_seed();
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-mismatch-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, &seed).unwrap();
+        let path = login_file("account-mismatch", &two_account_seed());
         let mut config = load_or_default(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
@@ -5346,13 +5365,7 @@ mod tests {
     /// today's no-`--account` flow.
     #[tokio::test]
     async fn finish_login_checked_match_writes_normally() {
-        let seed = two_account_seed();
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-match-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, &seed).unwrap();
+        let path = login_file("account-match", &two_account_seed());
         let mut config = load_or_default(&path).unwrap();
 
         let name = finish_login_checked(
@@ -5382,13 +5395,7 @@ mod tests {
     /// evaluated is not evidence of a match.
     #[tokio::test]
     async fn finish_login_checked_all_none_profile_refuses() {
-        let seed = two_account_seed();
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-allnone-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, &seed).unwrap();
+        let path = login_file("account-allnone", &two_account_seed());
         let mut config = load_or_default(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
@@ -5442,12 +5449,7 @@ mod tests {
               "refreshToken": "rt-2", "expiresAt": 1893456000000, "priority": 1,
               "orgUuid": "org-b", "orgName": "Corp B" }
         ] }"#;
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-ambiguous-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, seed).unwrap();
+        let path = login_file("account-ambiguous", seed);
         // Migrates: the two rows become `dup@example.com` and
         // `dup@example.com/corp-b`. `corp-b` on its own names neither.
         let mut config = load_or_default(&path).unwrap();
@@ -5494,12 +5496,7 @@ mod tests {
               "refreshToken": "rt-2", "expiresAt": 1893456000000, "priority": 1,
               "accountUuid": "uuid-dup", "orgUuid": "org-b", "orgName": "Corp B" }
         ] }"#;
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-org-disambig-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, seed).unwrap();
+        let path = login_file("account-org-disambig", seed);
         // Loading migrates the duplicate: Corp A keeps the bare email (lower
         // priority number), Corp B takes its org's slug.
         let mut config = load_or_default(&path).unwrap();
@@ -5576,20 +5573,7 @@ mod tests {
     /// before erroring would also produce.
     #[tokio::test]
     async fn finish_login_checked_same_uuid_different_org_is_a_mismatch() {
-        let seed = r#"{ "accounts": [
-            { "name": "me@example.com (Corp)", "type": "oauth", "accessToken": "at-corp",
-              "refreshToken": "rt-corp-DEAD", "expiresAt": 1893456000000, "priority": 0,
-              "accountUuid": "uuid-person", "orgUuid": "org-corp", "orgName": "Corp" },
-            { "name": "me@example.com (Personal)", "type": "oauth", "accessToken": "at-pers",
-              "refreshToken": "rt-personal-ALIVE", "expiresAt": 1893456000000, "priority": 1,
-              "accountUuid": "uuid-person", "orgUuid": "org-personal", "orgName": "Personal" }
-        ] }"#;
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-same-uuid-diff-org-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, seed).unwrap();
+        let path = login_file("account-same-uuid-diff-org", ONE_PERSON_IN_TWO_ORGS);
         let mut config = load_or_default(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
@@ -5756,20 +5740,7 @@ mod tests {
     /// exactly as permissive as `upsert_account`'s own write-time resolution.
     #[tokio::test]
     async fn finish_login_checked_same_uuid_same_org_matches() {
-        let seed = r#"{ "accounts": [
-            { "name": "me@example.com (Corp)", "type": "oauth", "accessToken": "at-corp",
-              "refreshToken": "rt-corp-DEAD", "expiresAt": 1893456000000, "priority": 0,
-              "accountUuid": "uuid-person", "orgUuid": "org-corp", "orgName": "Corp" },
-            { "name": "me@example.com (Personal)", "type": "oauth", "accessToken": "at-pers",
-              "refreshToken": "rt-personal-ALIVE", "expiresAt": 1893456000000, "priority": 1,
-              "accountUuid": "uuid-person", "orgUuid": "org-personal", "orgName": "Personal" }
-        ] }"#;
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-same-uuid-same-org-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, seed).unwrap();
+        let path = login_file("account-same-uuid-same-org", ONE_PERSON_IN_TWO_ORGS);
         let mut config = load_or_default(&path).unwrap();
 
         let right_profile = profile_with_identity(
@@ -5828,12 +5799,7 @@ mod tests {
             { "name": "work", "type": "oauth", "accessToken": "at-work",
               "refreshToken": "rt-work-DEAD", "expiresAt": 1893456000000, "priority": 0 }
         ] }"#;
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-non-email-name-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, seed).unwrap();
+        let path = login_file("account-non-email-name", seed);
         let mut config = load_or_default(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
@@ -5871,13 +5837,7 @@ mod tests {
     /// cannot satisfy).
     #[tokio::test]
     async fn finish_login_checked_no_account_skips_the_check() {
-        let seed = two_account_seed();
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-account-none-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, &seed).unwrap();
+        let path = login_file("account-none", &two_account_seed());
         let mut config = load_or_default(&path).unwrap();
 
         let name = finish_login_checked(
@@ -5931,11 +5891,7 @@ mod tests {
             ] }}"#
         );
         std::fs::write(&path, &seed).unwrap();
-
-        let server_config: Config = serde_json::from_str(&seed).unwrap();
-        let manager =
-            crate::manager::Manager::with_live_refresher(server_config, Some(path.clone()));
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        serve_live_proxy(listener, &seed, Some(path.clone()));
 
         // The stale snapshot: what `login()` would have loaded before its own
         // async window (profile fetch / stdin prompt) opened.
@@ -6015,11 +5971,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&path, &seed).unwrap();
-
-        let server_config: Config = serde_json::from_str(&seed).unwrap();
-        let manager =
-            crate::manager::Manager::with_live_refresher(server_config, Some(path.clone()));
-        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        serve_live_proxy(listener, &seed, Some(path.clone()));
 
         // The caller's config carries the WRONG key.
         let mut client_config: Config = serde_json::from_str(&format!(
@@ -6086,6 +6038,72 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A temp config file tagged `tag` holding alice on a proxy at `port`, and the stale
+    /// snapshot of it: what `login()` would have loaded before its own async window (profile
+    /// fetch / stdin prompt) opened.
+    fn alice_on_a_proxy_port(tag: &str, port: u16) -> (std::path::PathBuf, Config) {
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-{tag}-{}-{port}.json",
+            std::process::id()
+        ));
+        let seed = format!(
+            r#"{{ "proxy": {{ "port": {port} }}, "accounts": [
+                {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
+                  "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 }}
+            ] }}"#
+        );
+        std::fs::write(&path, &seed).unwrap();
+        let snapshot = load_or_default(&path).unwrap();
+        (path, snapshot)
+    }
+
+    /// Rotate alice's tokens on disk through `config::save_account`, the live server's own
+    /// surgical persist path, and check the rotation landed.
+    fn rotate_alice_on_disk(path: &std::path::Path) {
+        let rotated_alice = Account {
+            access_token: "at-alice-ROTATED".to_string(),
+            refresh_token: Some("rt-alice-ROTATED".to_string()),
+            expires_at: Some(1_893_456_000_000),
+            priority: None,
+            ..Account::fixture("alice@example.com")
+        };
+        config::save_account(path, &rotated_alice).expect("the rotation must land on disk");
+        let after_rotation = std::fs::read_to_string(path).unwrap();
+        assert!(
+            after_rotation.contains("rt-alice-ROTATED"),
+            "setup: the rotation must be on disk first: {after_rotation}"
+        );
+    }
+
+    /// The file at `path` still holds alice's rotated refresh token, so `route` did not
+    /// whole-file-write a stale snapshot back over `rotation`, and `<added>@example.com`
+    /// was added.
+    fn assert_the_rotation_survived_and_one_was_added(
+        path: &std::path::Path,
+        route: &str,
+        rotation: &str,
+        added: &str,
+    ) {
+        let final_doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let accounts = final_doc["accounts"].as_array().unwrap();
+        let alice = accounts
+            .iter()
+            .find(|a| a["name"] == "alice@example.com")
+            .expect("alice must still be on disk");
+        assert_eq!(
+            alice["refreshToken"],
+            serde_json::json!("rt-alice-ROTATED"),
+            "{route} must NOT whole-file-write a stale snapshot back over {rotation}: {final_doc}"
+        );
+        assert!(
+            accounts
+                .iter()
+                .any(|a| a["name"] == format!("{added}@example.com").as_str()),
+            "{added} was added: {final_doc}"
+        );
+    }
+
     /// THE σ5 EXPERIMENT bridge item A calls for. The WEDGED shape
     /// `cli::probe_incumbent`'s own tests document as measured and real
     /// (`a_listener_that_never_answers_is_silent_not_answering`): bound, the
@@ -6114,38 +6132,12 @@ mod tests {
         // and the connect succeeds, but nothing is ever written back —
         // `post_add_account` times out at its own 5s deadline.
         let port = wedged_port();
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-live-timeout-{}-{port}.json",
-            std::process::id()
-        ));
-        let seed = format!(
-            r#"{{ "proxy": {{ "port": {port} }}, "accounts": [
-                {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
-                  "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 }}
-            ] }}"#
-        );
-        std::fs::write(&path, &seed).unwrap();
-
-        // The stale snapshot: what `login()` would have loaded before its own
-        // async window (profile fetch / stdin prompt) opened.
-        let mut client_config = load_or_default(&path).unwrap();
+        let (path, mut client_config) = alice_on_a_proxy_port("live-timeout", port);
 
         // A rotation lands on disk AFTER that snapshot was taken — the live
         // server's own persist path, used directly since the port itself is
         // silent in this scenario and cannot carry a real round-trip.
-        let rotated_alice = Account {
-            access_token: "at-alice-ROTATED".to_string(),
-            refresh_token: Some("rt-alice-ROTATED".to_string()),
-            expires_at: Some(1_893_456_000_000),
-            priority: None,
-            ..Account::fixture("alice@example.com")
-        };
-        config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
-        let after_rotation = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            after_rotation.contains("rt-alice-ROTATED"),
-            "setup: the rotation must be on disk first: {after_rotation}"
-        );
+        rotate_alice_on_disk(&path);
 
         let name = finish_login(
             &path,
@@ -6158,23 +6150,11 @@ mod tests {
         .await
         .expect("a timed-out live add must still fall back to a file write");
         assert_eq!(name, "carol@example.com");
-
-        let final_doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let accounts = final_doc["accounts"].as_array().unwrap();
-        let alice = accounts
-            .iter()
-            .find(|a| a["name"] == "alice@example.com")
-            .expect("alice must still be on disk");
-        assert_eq!(
-            alice["refreshToken"],
-            serde_json::json!("rt-alice-ROTATED"),
-            "the timed-out live add must NOT whole-file-write a stale snapshot back over \
-             alice's rotation: {final_doc}"
-        );
-        assert!(
-            accounts.iter().any(|a| a["name"] == "carol@example.com"),
-            "carol was added: {final_doc}"
+        assert_the_rotation_survived_and_one_was_added(
+            &path,
+            "the timed-out live add",
+            "alice's rotation",
+            "carol",
         );
 
         std::fs::remove_file(&path).ok();
@@ -6199,39 +6179,12 @@ mod tests {
         // was live a moment ago (mirroring the capability probe having
         // confirmed it), but by the time `finish_login` runs, nothing is
         // listening and a connect is refused outright.
-        let dead_port = DEAD_PORT;
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-live-noserver-clobber-{}-{dead_port}.json",
-            std::process::id()
-        ));
-        let seed = format!(
-            r#"{{ "proxy": {{ "port": {dead_port} }}, "accounts": [
-                {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
-                  "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 }}
-            ] }}"#
-        );
-        std::fs::write(&path, &seed).unwrap();
-
-        // The stale snapshot: what `login()` would have loaded before its own
-        // async window (profile fetch / stdin prompt) opened.
-        let mut client_config = load_or_default(&path).unwrap();
+        let (path, mut client_config) = alice_on_a_proxy_port("live-noserver-clobber", DEAD_PORT);
 
         // A rotation lands on disk AFTER that snapshot was taken — the
         // (now-gone) server's own persist path, used directly since the port
         // is silent for the whole test and cannot carry a real round-trip.
-        let rotated_alice = Account {
-            access_token: "at-alice-ROTATED".to_string(),
-            refresh_token: Some("rt-alice-ROTATED".to_string()),
-            expires_at: Some(1_893_456_000_000),
-            priority: None,
-            ..Account::fixture("alice@example.com")
-        };
-        config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
-        let after_rotation = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            after_rotation.contains("rt-alice-ROTATED"),
-            "setup: the rotation must be on disk first: {after_rotation}"
-        );
+        rotate_alice_on_disk(&path);
 
         let name = finish_login(
             &path,
@@ -6244,23 +6197,11 @@ mod tests {
         .await
         .expect("a NoServer live add must still fall back to a surgical write");
         assert_eq!(name, "carol@example.com");
-
-        let final_doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let accounts = final_doc["accounts"].as_array().unwrap();
-        let alice = accounts
-            .iter()
-            .find(|a| a["name"] == "alice@example.com")
-            .expect("alice must still be on disk");
-        assert_eq!(
-            alice["refreshToken"],
-            serde_json::json!("rt-alice-ROTATED"),
-            "the NoServer live add must NOT whole-file-write a stale snapshot back over \
-             alice's rotation: {final_doc}"
-        );
-        assert!(
-            accounts.iter().any(|a| a["name"] == "carol@example.com"),
-            "carol was added: {final_doc}"
+        assert_the_rotation_survived_and_one_was_added(
+            &path,
+            "the NoServer live add",
+            "alice's rotation",
+            "carol",
         );
 
         std::fs::remove_file(&path).ok();
@@ -6338,20 +6279,11 @@ mod tests {
             "the File route must NOT whole-file-write a stale snapshot back over an \
              out-of-band top-level key: {final_doc}"
         );
-        let accounts = final_doc["accounts"].as_array().unwrap();
-        let alice = accounts
-            .iter()
-            .find(|a| a["name"] == "alice@example.com")
-            .expect("alice must still be on disk");
-        assert_eq!(
-            alice["refreshToken"],
-            serde_json::json!("rt-alice-ROTATED"),
-            "the File route must NOT whole-file-write a stale snapshot back over an \
-             out-of-band rotation: {final_doc}"
-        );
-        assert!(
-            accounts.iter().any(|a| a["name"] == "carol@example.com"),
-            "carol was added: {final_doc}"
+        assert_the_rotation_survived_and_one_was_added(
+            &path,
+            "the File route",
+            "an out-of-band rotation",
+            "carol",
         );
 
         std::fs::remove_file(&path).ok();
@@ -6369,35 +6301,13 @@ mod tests {
     #[tokio::test]
     async fn finish_login_no_route_does_not_clobber_other_accounts() {
         let port = empty_router_port();
-
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-live-noroute-{}-{port}.json",
-            std::process::id()
-        ));
-        let seed = format!(
-            r#"{{ "proxy": {{ "port": {port} }}, "accounts": [
-                {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
-                  "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 }}
-            ] }}"#
-        );
-        std::fs::write(&path, &seed).unwrap();
-
-        // The stale snapshot: what `login()` would have loaded before its own
-        // async window (profile fetch / stdin prompt) opened.
-        let mut client_config = load_or_default(&path).unwrap();
+        let (path, mut client_config) = alice_on_a_proxy_port("live-noroute", port);
 
         // A rotation lands on disk AFTER that snapshot was taken — this
         // "older tcr" has no add-account route to have produced it, standing
         // in for any other writer that touched the file in the window, same
         // as every sibling clobber test in this file.
-        let rotated_alice = Account {
-            access_token: "at-alice-ROTATED".to_string(),
-            refresh_token: Some("rt-alice-ROTATED".to_string()),
-            expires_at: Some(1_893_456_000_000),
-            priority: None,
-            ..Account::fixture("alice@example.com")
-        };
-        config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
+        rotate_alice_on_disk(&path);
 
         let name = finish_login(
             &path,
@@ -6410,23 +6320,11 @@ mod tests {
         .await
         .expect("a NoRoute live add must still fall back to a surgical write");
         assert_eq!(name, "dana@example.com");
-
-        let final_doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let accounts = final_doc["accounts"].as_array().unwrap();
-        let alice = accounts
-            .iter()
-            .find(|a| a["name"] == "alice@example.com")
-            .expect("alice must still be on disk");
-        assert_eq!(
-            alice["refreshToken"],
-            serde_json::json!("rt-alice-ROTATED"),
-            "the NoRoute live add must NOT whole-file-write a stale snapshot back over \
-             alice's rotation: {final_doc}"
-        );
-        assert!(
-            accounts.iter().any(|a| a["name"] == "dana@example.com"),
-            "dana was added: {final_doc}"
+        assert_the_rotation_survived_and_one_was_added(
+            &path,
+            "the NoRoute live add",
+            "alice's rotation",
+            "dana",
         );
 
         std::fs::remove_file(&path).ok();
@@ -6508,12 +6406,7 @@ mod tests {
     /// Restored, it passes.
     #[tokio::test]
     async fn setup_token_account_writes_with_refresh_token_absent_and_expires_at_set() {
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-setup-token-write-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, r#"{ "accounts": [] }"#).unwrap();
+        let path = login_file("setup-token-write", r#"{ "accounts": [] }"#);
         let mut config = load_or_default(&path).unwrap();
 
         let setup_tokens = Tokens {
@@ -7176,11 +7069,7 @@ mod tests {
             ] }}"#
         );
         std::fs::write(&path, &seed).unwrap();
-        let server_config: Config = serde_json::from_str(&seed).unwrap();
-        let manager =
-            crate::manager::Manager::with_live_refresher(server_config, Some(path.clone()));
-        let served = std::sync::Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager = serve_live_proxy(listener, &seed, Some(path.clone()));
 
         let login = crate::codex_login::CodexLogin {
             access_token: "at-codex".to_string(),
@@ -7249,6 +7138,20 @@ mod tests {
 
     // --- import_codex_login: the provider gate, the echo, the re-import rules --
 
+    /// Import alice's Codex login (bearer `at-codex`) into the config at `path` with no flags:
+    /// no `--force`, no name, no `--account`, no `CODEX_HOME`.
+    async fn import_alices_login(path: &std::path::Path) -> anyhow::Result<String> {
+        import_codex_login(
+            path,
+            false,
+            None,
+            None,
+            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+            None,
+        )
+        .await
+    }
+
     /// alice's Codex login for account A, expiring at `expires_at_ms`, with these
     /// fake tokens.
     fn alice_codex_login(
@@ -7306,12 +7209,28 @@ mod tests {
         status: u16,
         body: &str,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<SeenCheck>>>) {
+        recording_stub(
+            axum::http::StatusCode::from_u16(status).unwrap(),
+            axum::http::header::CONTENT_TYPE,
+            "application/json",
+            body,
+        )
+    }
+
+    /// A stub that answers every request `status` with the one header `name: value` and
+    /// `body`, and records each request as a [`SeenCheck`]. Returns its base URL and the record.
+    fn recording_stub(
+        status: axum::http::StatusCode,
+        name: axum::http::HeaderName,
+        value: &str,
+        body: &str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<SeenCheck>>>) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = std::sync::Arc::clone(&seen);
-        let body = body.to_string();
+        let (value, body) = (value.to_string(), body.to_string());
         let origin = axum::Router::new().fallback(move |req: axum::extract::Request| {
             let recorded = std::sync::Arc::clone(&recorded);
-            let body = body.clone();
+            let (name, value, body) = (name.clone(), value.clone(), body.clone());
             async move {
                 let header = |name: &str| {
                     req.headers()
@@ -7324,14 +7243,10 @@ mod tests {
                     bearer: header("authorization"),
                     account_id: header(crate::provider::CODEX_ACCOUNT_HEADER),
                 });
-                (
-                    axum::http::StatusCode::from_u16(status).unwrap(),
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    body,
-                )
+                (status, [(name, value)], body)
             }
         });
-        let addr = serve_router(origin).await;
+        let addr = crate::test_support::stub_upstream::http(origin);
         (format!("http://{addr}"), seen)
     }
 
@@ -7484,23 +7399,15 @@ mod tests {
                       "expiresAt": 1893456000000, "priority": 0 }}]"#
             ),
         );
-        let server_config: Config =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let manager =
-            crate::manager::Manager::with_live_refresher(server_config, Some(path.clone()));
-        let served = std::sync::Arc::clone(&manager);
-        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+        let manager = serve_live_proxy(
+            listener,
+            &std::fs::read_to_string(&path).unwrap(),
+            Some(path.clone()),
+        );
 
-        let saved = import_codex_login(
-            &path,
-            false,
-            None,
-            None,
-            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-            None,
-        )
-        .await
-        .expect("a server that names codex takes the import live");
+        let saved = import_alices_login(&path)
+            .await
+            .expect("a server that names codex takes the import live");
         assert_eq!(saved, "alice@example.com/codex");
 
         let codex = (0..manager.account_count())
@@ -7525,16 +7432,9 @@ mod tests {
             let (port, seen) = stub_add_route(true, echo).await;
             let (_dir, path) = import_config(port, &unconstrained_upstream().await, "[]");
 
-            let err = import_codex_login(
-                &path,
-                false,
-                None,
-                None,
-                alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-                None,
-            )
-            .await
-            .expect_err("an add not confirmed as Codex must fail loudly");
+            let err = import_alices_login(&path)
+                .await
+                .expect_err("an add not confirmed as Codex must fail loudly");
             let text = err.to_string();
             assert!(
                 text.contains("live, and on disk, as a Claude account")
@@ -7659,6 +7559,34 @@ mod tests {
 
     // --- import_codex_login: `--account` ----------------------------------------
 
+    /// What a recording stub has been asked, one entry per request.
+    type Asked<T> = std::sync::Arc<std::sync::Mutex<Vec<T>>>;
+
+    /// A live add route that advertises Codex and a `codexUpstream` whose workspace check
+    /// clears account A, both recording what they are asked: the route's port and record, then
+    /// the upstream's base URL and record.
+    async fn recording_route_and_clearing_upstream()
+    -> (u16, Asked<serde_json::Value>, String, Asked<SeenCheck>) {
+        let (port, probes) = stub_add_route(true, Some(crate::provider::Provider::Codex)).await;
+        let (upstream, checks) =
+            accounts_check_stub(200, &workspace_answer("NO_CONSTRAINT", "NO_CONSTRAINT")).await;
+        (port, probes, upstream, checks)
+    }
+
+    /// Neither the add route nor `codexUpstream` was asked anything.
+    fn assert_neither_stub_was_asked(probes: &Asked<serde_json::Value>, checks: &Asked<SeenCheck>) {
+        assert!(
+            probes.lock().unwrap().is_empty(),
+            "not even the route probe: {:?}",
+            probes.lock().unwrap()
+        );
+        assert!(
+            checks.lock().unwrap().is_empty(),
+            "no workspace check: {:?}",
+            checks.lock().unwrap()
+        );
+    }
+
     /// `--account` names the login the user means to import, so a `CODEX_HOME` that holds
     /// another is refused before anything else is asked, naming the account, and nothing is
     /// written. The add route and `codexUpstream` are stubs that record what they are asked, and
@@ -7667,9 +7595,7 @@ mod tests {
     /// Watched red: without the guard, alice's login is imported over the live route.
     #[tokio::test]
     async fn an_import_for_another_account_is_refused_and_writes_nothing() {
-        let (port, probes) = stub_add_route(true, Some(crate::provider::Provider::Codex)).await;
-        let (upstream, checks) =
-            accounts_check_stub(200, &workspace_answer("NO_CONSTRAINT", "NO_CONSTRAINT")).await;
+        let (port, probes, upstream, checks) = recording_route_and_clearing_upstream().await;
         let (_dir, path) = import_config(port, &upstream, "[]");
         let before = std::fs::read(&path).unwrap();
 
@@ -7689,16 +7615,7 @@ mod tests {
             "{text}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
-        assert!(
-            probes.lock().unwrap().is_empty(),
-            "not even the route probe: {:?}",
-            probes.lock().unwrap()
-        );
-        assert!(
-            checks.lock().unwrap().is_empty(),
-            "no workspace check: {:?}",
-            checks.lock().unwrap()
-        );
+        assert_neither_stub_was_asked(&probes, &checks);
     }
 
     /// The control: `--account` naming the login's own email imports it, as any import does.
@@ -7736,9 +7653,7 @@ mod tests {
     /// row, as `carol@example.com`.
     #[tokio::test]
     async fn an_account_import_refuses_a_login_that_names_no_user_or_workspace() {
-        let (port, probes) = stub_add_route(true, Some(crate::provider::Provider::Codex)).await;
-        let (upstream, checks) =
-            accounts_check_stub(200, &workspace_answer("NO_CONSTRAINT", "NO_CONSTRAINT")).await;
+        let (port, probes, upstream, checks) = recording_route_and_clearing_upstream().await;
         let (_dir, path) = import_config(
             port,
             &upstream,
@@ -7792,16 +7707,7 @@ mod tests {
                 "{what}: nothing was written"
             );
         }
-        assert!(
-            probes.lock().unwrap().is_empty(),
-            "not even the route probe: {:?}",
-            probes.lock().unwrap()
-        );
-        assert!(
-            checks.lock().unwrap().is_empty(),
-            "no workspace check: {:?}",
-            checks.lock().unwrap()
-        );
+        assert_neither_stub_was_asked(&probes, &checks);
     }
 
     // --- import_codex_login: logins tcr must not pool -----------------------------
@@ -7815,9 +7721,7 @@ mod tests {
     /// route probe the route stub records the blank probe.
     #[tokio::test]
     async fn a_fedramp_login_is_refused_before_anything_else() {
-        let (port, probes) = stub_add_route(true, Some(crate::provider::Provider::Codex)).await;
-        let (upstream, checks) =
-            accounts_check_stub(200, &workspace_answer("NO_CONSTRAINT", "NO_CONSTRAINT")).await;
+        let (port, probes, upstream, checks) = recording_route_and_clearing_upstream().await;
         let (_dir, path) = import_config(port, &upstream, "[]");
         let before = std::fs::read(&path).unwrap();
         let mut login = alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex");
@@ -7834,16 +7738,7 @@ mod tests {
             "{text}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
-        assert!(
-            probes.lock().unwrap().is_empty(),
-            "not even the route probe: {:?}",
-            probes.lock().unwrap()
-        );
-        assert!(
-            checks.lock().unwrap().is_empty(),
-            "no workspace check: {:?}",
-            checks.lock().unwrap()
-        );
+        assert_neither_stub_was_asked(&probes, &checks);
     }
 
     /// A login whose workspace is served anywhere but chatgpt.com, by another backend origin or
@@ -7866,16 +7761,9 @@ mod tests {
             let (_dir, path) = import_config(0, &upstream, "[]");
             let before = std::fs::read(&path).unwrap();
 
-            let err = import_codex_login(
-                &path,
-                false,
-                None,
-                None,
-                alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-                None,
-            )
-            .await
-            .expect_err("a routed workspace must not be imported");
+            let err = import_alices_login(&path)
+                .await
+                .expect_err("a routed workspace must not be imported");
             let text = err.to_string();
             assert!(
                 text.contains(named)
@@ -7909,16 +7797,9 @@ mod tests {
         let (_dir, path) = import_config(port, &upstream, "[]");
         let before = std::fs::read(&path).unwrap();
 
-        let err = import_codex_login(
-            &path,
-            false,
-            None,
-            None,
-            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-            None,
-        )
-        .await
-        .expect_err("a routed workspace must not be imported over the live route");
+        let err = import_alices_login(&path)
+            .await
+            .expect_err("a routed workspace must not be imported over the live route");
         let text = err.to_string();
         assert!(
             text.contains("https://gov.chatgpt.com")
@@ -7965,16 +7846,9 @@ mod tests {
             let (_dir, path) = import_config(0, &upstream, "[]");
             let before = std::fs::read(&path).unwrap();
 
-            let err = import_codex_login(
-                &path,
-                false,
-                None,
-                None,
-                alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-                None,
-            )
-            .await
-            .expect_err("an unconfirmed workspace must not be imported");
+            let err = import_alices_login(&path)
+                .await
+                .expect_err("an unconfirmed workspace must not be imported");
             let text = err.to_string();
             assert!(
                 text.contains("could not confirm")
@@ -7995,32 +7869,12 @@ mod tests {
     async fn redirecting_stub(
         location: &str,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<SeenCheck>>>) {
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = std::sync::Arc::clone(&seen);
-        let location = location.to_string();
-        let origin = axum::Router::new().fallback(move |req: axum::extract::Request| {
-            let recorded = std::sync::Arc::clone(&recorded);
-            let location = location.clone();
-            async move {
-                let header = |name: &str| {
-                    req.headers()
-                        .get(name)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_string)
-                };
-                recorded.lock().unwrap().push(SeenCheck {
-                    path: req.uri().path().to_string(),
-                    bearer: header("authorization"),
-                    account_id: header(crate::provider::CODEX_ACCOUNT_HEADER),
-                });
-                (
-                    axum::http::StatusCode::FOUND,
-                    [(axum::http::header::LOCATION, location)],
-                )
-            }
-        });
-        let addr = serve_router(origin).await;
-        (format!("http://{addr}"), seen)
+        recording_stub(
+            axum::http::StatusCode::FOUND,
+            axum::http::header::LOCATION,
+            location,
+            "",
+        )
     }
 
     /// A workspace check answered with a redirect refuses the import, and the redirect is never
@@ -8039,16 +7893,9 @@ mod tests {
         let (_dir, path) = import_config(0, &upstream, "[]");
         let before = std::fs::read(&path).unwrap();
 
-        let err = import_codex_login(
-            &path,
-            false,
-            None,
-            None,
-            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-            None,
-        )
-        .await
-        .expect_err("a redirected workspace check must not clear the login");
+        let err = import_alices_login(&path)
+            .await
+            .expect_err("a redirected workspace check must not clear the login");
         let text = err.to_string();
         assert!(
             text.contains("answered HTTP 302") && text.contains("Nothing was written"),
@@ -8080,16 +7927,9 @@ mod tests {
         .await;
         let (_dir, path) = import_config(0, &upstream, "[]");
 
-        let saved = import_codex_login(
-            &path,
-            false,
-            None,
-            None,
-            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-            None,
-        )
-        .await
-        .expect("a workspace served at chatgpt.com is imported");
+        let saved = import_alices_login(&path)
+            .await
+            .expect("a workspace served at chatgpt.com is imported");
         assert_eq!(saved, "alice@example.com");
         let doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -8180,16 +8020,7 @@ mod tests {
         )
         .await;
         let (_dir, path) = import_config(0, &upstream, "[]");
-        let err = import_codex_login(
-            &path,
-            false,
-            None,
-            None,
-            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = import_alices_login(&path).await.unwrap_err();
         assert_eq!(code_of(&err), "codex-routed");
         assert!(
             err.to_string()
@@ -8199,16 +8030,7 @@ mod tests {
 
         let (upstream, _) = accounts_check_stub(500, "{}").await;
         let (_dir, path) = import_config(0, &upstream, "[]");
-        let err = import_codex_login(
-            &path,
-            false,
-            None,
-            None,
-            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = import_alices_login(&path).await.unwrap_err();
         assert_eq!(code_of(&err), "codex-unconfirmed");
         assert!(err.to_string().contains("could not confirm"), "{err}");
     }
@@ -8282,9 +8104,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
 
-        let (port, probes) = stub_add_route(true, Some(crate::provider::Provider::Codex)).await;
-        let (upstream, checks) =
-            accounts_check_stub(200, &workspace_answer("NO_CONSTRAINT", "NO_CONSTRAINT")).await;
+        let (port, probes, upstream, checks) = recording_route_and_clearing_upstream().await;
         let (_dir, claude) = import_config(
             port,
             &upstream,
