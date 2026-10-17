@@ -11,7 +11,7 @@ const LIVE_PROXY_PORT: u16 = 3456;
 /// loopback server and not whatever proxy the shell exports. Add what a test needs (a timeout,
 /// a root certificate, a proxy of its own) before `build`.
 pub fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().no_proxy()
+    crate::http_client::builder().no_proxy()
 }
 
 /// [`client_builder`], built. One per test, not one per binary: a `reqwest::Client` keeps its

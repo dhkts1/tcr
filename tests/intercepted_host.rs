@@ -439,7 +439,7 @@ async fn a_marked_codex_connect_reaches_the_pool_and_relays_other_paths() {
     assert!(tcr.codex.seen().is_empty(), "the upgrade stays local");
     let ca = std::fs::read(&tcr.ca_path).unwrap();
     let proxy = reqwest::Proxy::https(format!("http://tcr-codex@{}", tcr.addr)).unwrap();
-    let client = reqwest::Client::builder()
+    let client = tcr::http_client::builder()
         .no_proxy()
         .proxy(proxy)
         .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())

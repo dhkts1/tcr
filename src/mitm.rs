@@ -352,16 +352,10 @@ pub fn existing_ca_path_in(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
 }
 
 /// Ensure a process-wide rustls crypto provider is installed before building a
-/// `ServerConfig`. Two providers may be compiled (ours + reqwest's), which makes
-/// `ServerConfig::builder()` panic when no default is set; installing one first
-/// (ignoring "already installed") makes the builder deterministic.
+/// `ServerConfig`, whose `builder()` panics when no default is set. The same
+/// install every `reqwest` client needs: [`crate::http_client`].
 fn ensure_crypto_provider() {
-    if rustls::crypto::ring::default_provider()
-        .install_default()
-        .is_err()
-    {
-        tracing::debug!("a rustls crypto provider was already installed");
-    }
+    crate::http_client::install_crypto_provider();
 }
 
 /// The CA + leaf tcr mints for itself. Named in exactly one place so the loader
@@ -2222,7 +2216,7 @@ mod tests {
     #[tokio::test]
     async fn base_url_mode_still_serves_http1() {
         let addr = spawn_base_url_listener().await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = crate::http_client::builder().no_proxy().build().unwrap();
         let resp = client
             .get(format!("http://{addr}/_tcr/status"))
             .send()
@@ -2239,7 +2233,7 @@ mod tests {
     #[tokio::test]
     async fn base_url_mode_negotiates_http2_prior_knowledge() {
         let addr = spawn_base_url_listener().await;
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .no_proxy()
             .http2_prior_knowledge()
             .build()

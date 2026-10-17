@@ -33,6 +33,7 @@ pub mod fallback;
 pub mod file_log;
 #[cfg(unix)]
 pub mod handoff;
+pub mod http_client;
 pub mod identity;
 pub mod legacy_names;
 pub mod log_err;

@@ -2877,7 +2877,7 @@ async fn a_dry_fleet_reaches_the_configured_provider() {
     );
 
     let proxy = fleet::spawn_proxy(fleet::dry_manager()).await;
-    let client = reqwest::Client::builder()
+    let client = tcr::http_client::builder()
         .no_proxy()
         .build()
         .expect("a loopback client");
@@ -6743,7 +6743,7 @@ async fn a_borrow_that_was_delivered_is_never_offered_to_another_lender() {
 /// the walk back to a bare `downcast_ref` and watching this test stay green.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connect_failure_is_not_a_delivery_and_a_timeout_is() {
-    let client = reqwest::Client::builder()
+    let client = tcr::http_client::builder()
         .no_proxy()
         .timeout(std::time::Duration::from_millis(150))
         .build()
@@ -7628,8 +7628,10 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
     // request is the whole instrument: hand mode means these bytes never touch
     // the owner's Mac.
     let (borrower_origin, borrower_hits, borrower_served) = fleet::spawn_origin().await;
-    let provider = PeerLeaseProvider::new(borrower_peers.clone())
-        .with_hand_egress(borrower_origin, reqwest::Client::new());
+    let provider = PeerLeaseProvider::new(borrower_peers.clone()).with_hand_egress(
+        borrower_origin,
+        tcr::http_client::builder().build().unwrap(),
+    );
 
     // The first ask is what mints the lease and opens the session the bearer
     // arrives on, so it is also the one that may reach the fork early. Its
@@ -7936,7 +7938,7 @@ async fn a_handed_request_carries_its_query_string_to_the_owners_upstream() {
         .expect("the handed-token store")
         .put(lease_id, "not-a-real-owner-token".to_string(), now + 60_000);
 
-    let client = reqwest::Client::builder()
+    let client = tcr::http_client::builder()
         .no_proxy()
         .build()
         .expect("a client");
@@ -8065,7 +8067,7 @@ async fn a_relay_outside_the_grants_hours_is_refused_rather_than_served() {
 async fn the_account_set_header_is_ignored_on_a_request_that_crossed_no_mac() {
     let (upstream, hits, _served) = fleet::spawn_upstream().await;
     let proxy = fleet::spawn_proxy(fleet::lending_manager(&upstream, Default::default())).await;
-    let client = reqwest::Client::builder()
+    let client = tcr::http_client::builder()
         .no_proxy()
         .build()
         .expect("a loopback client");

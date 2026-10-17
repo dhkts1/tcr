@@ -1898,7 +1898,7 @@ async fn send_loopback(
     path: &str,
     build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, Unreached> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))

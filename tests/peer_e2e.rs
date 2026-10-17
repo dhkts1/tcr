@@ -806,7 +806,7 @@ fn tail(body: &str, lines: usize) -> String {
 
 /// One POST at a proxy, answered or not. Returns (status, body).
 async fn post_messages(proxy: &str) -> (u16, String) {
-    let client = reqwest::Client::builder()
+    let client = tcr::http_client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(30))
         .build()

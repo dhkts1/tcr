@@ -272,7 +272,7 @@ impl LiveRefresher {
             clippy::expect_used,
             reason = "reqwest's builder has no infallible form, and the constructor returns no Result"
         )]
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .no_proxy()
             .build()
             .expect("build reqwest client");
@@ -984,7 +984,7 @@ async fn exchange_code(
     state: &str,
     redirect_uri: &str,
 ) -> anyhow::Result<Exchanged> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .no_proxy()
         .build()
         .context("build OAuth token-exchange client")?;
@@ -1208,7 +1208,7 @@ pub async fn try_fetch_profile_at(
     }
 
     async fn inner(url: &str, access_token: &str) -> Result<ProfileResponse, ProfileFetchError> {
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .no_proxy()
             .build()
             .map_err(|_| ProfileFetchError::Transport)?;
@@ -2604,7 +2604,7 @@ pub(crate) async fn import_codex_login_as(
     // The check carries the login's bearer and account id, so it follows no redirect: a 3xx
     // would carry the account id (reqwest drops only the bearer across origins) to an origin
     // whose answer would then decide the import. A redirect is refused as an unconfirmed check.
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -3913,7 +3913,11 @@ mod tests {
                 field("redirect_uri"),
                 field("state")
             );
-            reqwest::get(&callback)
+            crate::http_client::builder()
+                .build()
+                .unwrap()
+                .get(&callback)
+                .send()
                 .await
                 .log_debug("calling the test callback");
         });
@@ -4158,7 +4162,7 @@ mod tests {
         );
         let endpoint = format!("{}/", crate::test_support::stub_upstream::http(app).url());
 
-        let client = reqwest::Client::new();
+        let client = crate::http_client::builder().build().unwrap();
         let tokens = refresh_access_token_at(&client, "rt-original", &endpoint)
             .await
             .expect("a refresh with no rotated refresh_token must still succeed");

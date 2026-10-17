@@ -568,12 +568,12 @@ fn fetch_bytes(url: &str, accept: &str) -> anyhow::Result<Vec<u8>> {
             .build()
             .context("could not start a runtime for the download")?;
         rt.block_on(async move {
-            let client = reqwest::Client::builder()
+            let client = crate::http_client::builder()
                 // GitHub's API rejects requests without a User-Agent.
                 .user_agent(concat!("tcr/", env!("CARGO_PKG_VERSION")))
                 // Both URLs this ever fetches are HTTPS, so refusing plaintext
                 // costs nothing and closes the one hop that is not obviously
-                // covered: reqwest 0.12 defaults `https_only` to FALSE and its
+                // covered: reqwest defaults `https_only` to FALSE and its
                 // redirect policy only rejects schemes that are not http(s), so
                 // an https→http redirect is FOLLOWED. The installer script is
                 // executed and is published with no checksum or signature (see
