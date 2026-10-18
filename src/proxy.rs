@@ -1110,7 +1110,7 @@ pub const CONFIG_ENDPOINT: &str = "config";
 /// Who can call it: anyone who passes [`local_endpoint_gate`], the same class
 /// of caller that can already save a setting or add an account. What that
 /// caller gets is a validated mode; root clamps every rpm to the fan's own
-/// range, and the hot guard runs in every manual mode.
+/// range, and the hot guard runs in Follow CPU (Fixed holds exactly the rpm asked).
 pub const FAN_PATH: &str = "/_tcr/fan";
 
 /// The [`ENDPOINT_HEADER`] value [`FAN_PATH`] stamps.

@@ -25,6 +25,11 @@ struct Machine {
     requests: Vec<Request>,
     opened: Vec<Generation>,
     closed: usize,
+    /// How long the first reply on each new connection takes: launchd
+    /// starting the helper late. Past that call's deadline it is `NoReply`.
+    first_reply_after: Duration,
+    /// No request sent yet on the current connection.
+    fresh: bool,
 }
 
 impl Machine {
@@ -96,16 +101,25 @@ struct FakeHelper {
 
 impl Helper for FakeHelper {
     fn open(&mut self, generation: Generation) -> Result<(), Fault> {
-        self.world.lock().opened.push(generation);
+        let mut machine = self.world.lock();
+        machine.opened.push(generation);
+        machine.fresh = true;
         Ok(())
     }
 
-    fn send(&mut self, request: &Request, _deadline: Duration) -> Result<Reply, Fault> {
+    fn send(&mut self, request: &Request, deadline: Duration) -> Result<Reply, Fault> {
         if self.hook.is_none() {
             self.hook = self.hooks.lock().unwrap().take();
         }
         let mut machine = self.world.lock();
         machine.requests.push(*request);
+        if std::mem::take(&mut machine.fresh) && !machine.first_reply_after.is_zero() {
+            let waited = machine.first_reply_after.min(deadline);
+            self.clock.advance(waited);
+            if machine.first_reply_after > deadline {
+                return Err(Fault::NoReply);
+            }
+        }
         if let Some(hook) = self.hook.as_mut()
             && let Some(answer) = hook(request, &mut machine, &self.inject, &self.clock)
         {
@@ -208,6 +222,8 @@ fn rig_from(saved: Option<Saved>, reading: Option<HeatReading>) -> Rig {
         requests: Vec::new(),
         opened: Vec::new(),
         closed: 0,
+        first_reply_after: Duration::ZERO,
+        fresh: false,
     })));
     let (tx, rx) = mpsc::channel();
     let clock = FakeClock(Arc::new(Mutex::new((Instant::now(), 1_000_000))));
@@ -376,24 +392,70 @@ fn follow_writes_only_past_the_step() {
 
 #[test]
 fn the_hot_guard_runs_full_until_it_cools() {
-    let mut rig = holding(fixed(3000));
+    // A curve that reaches full only at 100 °C, so between 90 and 100 °C the
+    // guard, not the curve, is what holds full speed.
+    let mut rig = holding(follow(40, 100));
     rig.clear_requests();
     rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(100.0);
     assert_eq!(rig.next_tick(), Some(TickOutcome::Wrote(2)));
     assert!(rig.c.snapshot().hot_guard);
     rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(95.0);
     assert_eq!(rig.next_tick(), Some(TickOutcome::NoChange));
+    assert!(rig.c.snapshot().hot_guard);
     rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(89.0);
     assert_eq!(rig.next_tick(), Some(TickOutcome::Wrote(2)));
+    assert!(!rig.c.snapshot().hot_guard);
+    let cooled = (49.0_f64 / 60.0).mul_add(5777.0 - 1350.0, 1350.0);
     assert_eq!(
         rig.written(),
         vec![
             set_target(0, 5777.0),
             set_target(1, 5777.0),
-            set_target(0, 3000.0),
-            set_target(1, 3000.0),
+            set_target(0, cooled),
+            set_target(1, cooled),
         ]
     );
+}
+
+/// Fixed holds exactly the rpm asked for, however hot (Gil, 2026-10-18: the
+/// guard turned `fixed 5000` into 5777 at 104-106 °C). Entering hot, holding
+/// hot, and switching to Fixed while the guard is on in Follow CPU.
+#[test]
+fn the_hot_guard_never_raises_a_fixed_target() {
+    let mut hot_reading = machine();
+    hot_reading.cpu_celsius = Some(106.0);
+    let mut rig = rig_from(None, Some(hot_reading));
+    rig.send(Command::Set(fixed(5000)));
+    assert_eq!(rig.c.state(), State::Holding);
+    assert_eq!(
+        rig.written(),
+        vec![
+            set_manual(0),
+            set_manual(1),
+            set_target(0, 5000.0),
+            set_target(1, 5000.0),
+        ]
+    );
+    assert!(!rig.c.snapshot().hot_guard);
+    rig.clear_requests();
+    rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(104.0);
+    assert_eq!(rig.next_tick(), Some(TickOutcome::NoChange));
+    assert_eq!(rig.written(), vec![]);
+    assert!(!rig.c.snapshot().hot_guard);
+
+    let mut rig = holding(follow(40, 100));
+    rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(105.0);
+    assert_eq!(rig.next_tick(), Some(TickOutcome::Wrote(2)));
+    assert!(rig.c.snapshot().hot_guard);
+    rig.clear_requests();
+    rig.send(Command::Set(fixed(3000)));
+    assert!(!rig.c.snapshot().hot_guard);
+    assert_eq!(
+        rig.written(),
+        vec![set_target(0, 3000.0), set_target(1, 3000.0)]
+    );
+    assert_eq!(rig.next_tick(), Some(TickOutcome::NoChange));
+    assert_eq!(rig.c.hold().unwrap().fans[0].written_rpm, Some(3000.0));
 }
 
 #[test]
@@ -491,7 +553,9 @@ fn no_write_while_macs_runs() {
 
 #[test]
 fn read_error_writes_nothing() {
-    let mut rig = holding(fixed(3000));
+    // Follow CPU: at 100 °C the curve wants full speed, so every held-back
+    // tick below is a write that was refused, not one with nothing to do.
+    let mut rig = holding(follow(60, 90));
     rig.clear_requests();
     rig.world.lock().fan_mut(fan(1)).unwrap().mode = KeyMode::Unreadable;
     rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(100.0);
@@ -512,9 +576,9 @@ fn read_error_writes_nothing() {
     };
     assert_eq!(probe_failed, Some(TickOutcome::HeldBack(Why::ProbeFailed)));
     assert_eq!(rig.written(), vec![]);
-    // Readable again and still ours: back to holding, and the guard writes.
+    // Readable again and still ours: back to holding, and full speed is written.
     rig.world.lock().macs = Ok(false);
-    rig.world.lock().fan_mut(fan(1)).unwrap().target_rpm = Some(3000.0);
+    rig.world.lock().fan_mut(fan(1)).unwrap().target_rpm = Some(1350.0);
     assert_eq!(rig.next_tick(), Some(TickOutcome::Wrote(2)));
     assert_eq!(rig.c.state(), State::Holding);
 }
@@ -646,6 +710,37 @@ fn a_target_failure_hands_back_too() {
         rig.c.state(),
         State::Unavailable(Unavailable::HelperNoReply)
     );
+}
+
+/// launchd starts the helper no sooner than 10 s after its previous start
+/// (measured 2026-10-18), so the first reply on a new connection can take
+/// 11 s: the version call waits for it and the entry goes on.
+#[test]
+fn a_helper_launchd_starts_late_still_answers_the_version_call() {
+    let mut late = rig();
+    late.world.lock().first_reply_after = Duration::from_secs(11);
+    late.send(Command::Set(fixed(5000)));
+    assert_eq!(late.c.state(), State::Holding);
+    assert_eq!(
+        late.world.lock().requests,
+        vec![
+            Request::Version,
+            set_manual(0),
+            set_manual(1),
+            set_target(0, 5000.0),
+            set_target(1, 5000.0),
+        ]
+    );
+
+    // Past the deadline is still no reply: the wait is bounded.
+    let mut too_late = rig();
+    too_late.world.lock().first_reply_after = VERSION_DEADLINE + Duration::from_secs(1);
+    too_late.send(Command::Set(fixed(5000)));
+    assert_eq!(
+        too_late.c.state(),
+        State::Unavailable(Unavailable::HelperNoReply)
+    );
+    assert_eq!(too_late.written(), vec![]);
 }
 
 #[test]

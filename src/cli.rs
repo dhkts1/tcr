@@ -3658,7 +3658,8 @@ const FAN_ROUTE: ControlRoute = ControlRoute {
     success_needs_stamp: true,
 };
 
-/// How long `tcr fan <mode>` waits for the controller to settle: the version call, then a
+/// How long `tcr fan <mode>` waits for the controller to settle: the version call (up to 15 s,
+/// as launchd may start the helper up to 10 s late), then a
 /// set-manual per fan at its worst (the unlock, up to 15 s each; two fans on the Macs this
 /// was written for), then a set-target per fan. Built from the controller's own deadlines, so
 /// a longer one widens this too.
@@ -8393,11 +8394,13 @@ mod tests {
         ));
     }
 
-    /// The wait covers the version call, two worst-case set-manuals and two set-targets.
+    /// The wait covers the version call (which waits out launchd starting the helper late),
+    /// two worst-case set-manuals and two set-targets.
     #[test]
     fn fan_cli_waits_through_two_worst_case_set_manuals() {
-        assert!(FAN_SETTLE >= 2 * tcr_fan::controller::SET_MANUAL_DEADLINE);
-        assert_eq!(FAN_SETTLE, Duration::from_secs(36));
+        use tcr_fan::controller::{SET_MANUAL_DEADLINE, SET_TARGET_DEADLINE, VERSION_DEADLINE};
+        assert!(FAN_SETTLE >= VERSION_DEADLINE + 2 * SET_MANUAL_DEADLINE + 2 * SET_TARGET_DEADLINE);
+        assert_eq!(FAN_SETTLE, Duration::from_secs(49));
     }
 
     /// The fallback half of the same contract: with nothing listening, the live

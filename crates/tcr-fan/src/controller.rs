@@ -45,8 +45,13 @@ use crate::wire::{HelperError, PROTOCOL_VERSION, Reply, Request};
 /// How often a manual mode is re-checked and re-targeted. A starting value,
 /// not a measured one.
 pub const TICK: Duration = Duration::from_secs(3);
-/// The version call's deadline.
-pub const VERSION_DEADLINE: Duration = Duration::from_secs(2);
+/// The version call's deadline. It is the first call on a new connection, so
+/// it waits for launchd to start the helper, which launchd does no sooner than
+/// 10 s after the helper's previous start (measured 2026-10-18 on an M4 Pro:
+/// starts at 22:40:34.13, 22:40:44.29 and 22:40:54.71), and then about 0.5 s
+/// for the helper to listen. 2 s failed every command sent inside that window
+/// with no reply; 15 s covers it with room.
+pub const VERSION_DEADLINE: Duration = Duration::from_secs(15);
 /// set-manual's deadline: root may wait 3 s for the unlock to settle and then
 /// try the mode write 50 times 100 ms apart, and a launchd cold start comes on
 /// top. Not to be shortened.
@@ -89,9 +94,11 @@ pub const MIN_QUIET_C: u8 = 20;
 /// The narrowest a Follow CPU curve may be, °C.
 pub const MIN_CURVE_SPAN_C: u8 = 5;
 
-/// The hot guard: in any manual mode, full speed from [`Self::ON`] until the
-/// CPU cools below [`Self::OFF`]. Unmeasured starting values; the rule for
-/// setting them from hardware is check H12.
+/// The hot guard: in Follow CPU, full speed from [`Self::ON`] until the CPU
+/// cools below [`Self::OFF`]. Never in Fixed, which holds exactly the rpm
+/// asked for (Gil, 2026-10-18: on his M4 Pro under load the CPU sat at
+/// 104-106 °C and the guard turned `fixed 5000` into 5777). Unmeasured
+/// starting values; the rule for setting them from hardware is check H12.
 pub struct HotGuard;
 
 impl HotGuard {
@@ -206,6 +213,8 @@ impl std::error::Error for ModeError {}
 pub enum FanMode {
     /// macOS has them.
     Auto,
+    /// Exactly this rpm, clamped only by root to each fan's range: no hot
+    /// guard, as Macs Fan Control does (Gil, 2026-10-18).
     Fixed {
         rpm: Rpm,
     },
@@ -217,6 +226,11 @@ pub enum FanMode {
 impl FanMode {
     pub const fn is_manual(self) -> bool {
         !matches!(self, Self::Auto)
+    }
+
+    /// The [`HotGuard`] runs in this mode: Follow CPU only.
+    pub const fn has_hot_guard(self) -> bool {
+        matches!(self, Self::FollowCpu { .. })
     }
 }
 
@@ -708,7 +722,8 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             state: self.state,
-            hot_guard: self.hot,
+            // Off the moment the wish leaves Follow CPU, not at the next tick.
+            hot_guard: self.hot && self.desired.has_hot_guard(),
             targets: self
                 .hold
                 .iter()
@@ -1070,7 +1085,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             }
         }
 
-        self.hot = guard(self.hot, reading.cpu_celsius);
+        self.hot = self.desired.has_hot_guard() && guard(self.hot, reading.cpu_celsius);
         for fan_reading in &reading.fans {
             self.between_steps(generation)?;
             let Some(target) = target_for(self.desired, fan_reading, reading.cpu_celsius, self.hot)
@@ -1387,7 +1402,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// Work out each held fan's target and write the ones past the gate.
     fn write_round(&mut self, reading: &HeatReading, forced: bool) -> TickOutcome {
         let was_hot = self.hot;
-        self.hot = guard(self.hot, reading.cpu_celsius);
+        self.hot = self.desired.has_hot_guard() && guard(self.hot, reading.cpu_celsius);
         let flipped = was_hot != self.hot;
         let mut wrote = 0_u8;
         let mut limits_unknown = false;
@@ -1773,7 +1788,7 @@ fn limits(fan: &FanReading) -> Option<(f64, f64)> {
 /// and it did not read.
 fn target_for(mode: FanMode, fan: &FanReading, celsius: Option<f64>, hot: bool) -> Option<f64> {
     let range = limits(fan);
-    if hot && mode.is_manual() {
+    if hot && mode.has_hot_guard() {
         return range.map(|(_, max)| max);
     }
     match mode {

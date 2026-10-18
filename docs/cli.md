@@ -2528,17 +2528,19 @@ crashes or updates.
   of having set them: the recovery for fans left manual by a run nobody remembers. Neither writes
   while Macs Fan Control runs; Auto then waits ("fans go back to automatic when Macs Fan Control
   quits").
-- `fixed <RPM>` holds every fan at one speed, 1 to 20000, clamped by the helper to each fan's own
-  range.
+- `fixed <RPM>` holds every fan at exactly that speed, 1 to 20000, clamped by the helper to each
+  fan's own range, however hot the CPU runs, as Macs Fan Control does.
 - `follow <QUIET_C> <FULL_C>` runs each fan at its minimum at or below `QUIET_C` and at full speed
   from `FULL_C`, a straight line between. Whole degrees; `QUIET_C` at least 20, `FULL_C` at least
   `QUIET_C + 5` and at most 100.
-- In every manual mode a hot guard runs the fans at full speed from 100 °C until the CPU is below
-  90 °C (starting values, not yet measured).
+- In `follow` a hot guard runs the fans at full speed from 100 °C until the CPU is below 90 °C
+  (starting values, not yet measured). `fixed` has no hot guard, and `hotGuard` is always `false`
+  in it.
 
 A mode command is never optimistic: it sends the mode, then reads the status until the state
-leaves `entering` and `releasing` (at most 36 s: the version call, two set-manuals at their
-15 s worst, and two set-targets), and exits 0 only when the wish is still the mode it sent and
+leaves `entering` and `releasing` (at most 49 s: the version call at its 15 s worst, which waits
+out launchd starting the helper up to 10 s late, two set-manuals at their 15 s worst, and two
+set-targets), and exits 0 only when the wish is still the mode it sent and
 the state is `holding` for `fixed` and `follow`, or `off` for `auto`. Otherwise it prints the
 state and exits 1 with the reason, for example
 `tcr: the fans are foreign (macsFanControl), not holding`; a mode another command set in the
@@ -2606,7 +2608,7 @@ cross-site, `application/json`). The body is exactly one of `{"mode": "auto"}`,
 sentence. Accepted is 202 with the `fanControl` object; a server running no fan controller
 answers 503. `GET` is 405. Any local caller that passes that gate can ask for a fan mode, which
 is the same class of caller that can already save a setting or add an account; what it gets is a
-validated mode, clamped by the helper, with the hot guard on.
+validated mode, clamped by the helper, with the hot guard on in Follow CPU.
 
 ## `tcr fan probe [--label <label>]` (hidden)
 
