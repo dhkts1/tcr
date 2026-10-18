@@ -3375,12 +3375,24 @@ public struct Fleet: Equatable, Sendable {
     /// it is optional (``HeatReading``'s decoder), so only a `heat` that is
     /// not an object, or a key of the wrong type, fails here; that costs the
     /// heat clause and nothing else, the same containment the session rows
-    /// get, and the line draws as it does with no SMC.
-    static func decodeHeat(_ value: Any?) -> HeatReading? {
-        guard let value, JSONSerialization.isValidJSONObject(value),
-            let data = try? JSONSerialization.data(withJSONObject: value, options: [])
-        else { return nil }
-        return try? JSONDecoder().decode(HeatReading.self, from: data)
+    /// get, and the line draws as it does with no SMC. The failure is logged,
+    /// once per distinct message (``HeatDecodeLog``), so a bad object that
+    /// arrives every poll is one line, not one every three seconds.
+    static func decodeHeat(_ value: Any?, log: (String) -> Void = HeatDecodeLog.shared.once)
+        -> HeatReading?
+    {
+        guard let value else { return nil }
+        guard JSONSerialization.isValidJSONObject(value) else {
+            log("TcrBar: the poll's heat reading is not a JSON object; left out")
+            return nil
+        }
+        do {
+            let data = try JSONSerialization.data(withJSONObject: value, options: [])
+            return try JSONDecoder().decode(HeatReading.self, from: data)
+        } catch {
+            log("TcrBar: the poll's heat reading did not decode, so it is left out: \(error)")
+            return nil
+        }
     }
 
     /// Decode `{"supported": Bool, "sessions": [...]}` — `tcr sessions

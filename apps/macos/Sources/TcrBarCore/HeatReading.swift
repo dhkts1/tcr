@@ -69,3 +69,22 @@ public struct HeatReading: Equatable, Sendable, Decodable {
         fans = try c.decodeIfPresent([FanReading].self, forKey: .fans) ?? []
     }
 }
+
+/// Where ``Fleet/decodeHeat(_:log:)`` reports a heat object it could not
+/// read: `NSLog`, as the rest of the app logs, once per distinct message.
+public final class HeatDecodeLog: @unchecked Sendable {
+    public static let shared = HeatDecodeLog()
+
+    /// Guards ``logged``: polls decode off the main thread.
+    private let lock = NSLock()
+    private var logged: Set<String> = []
+
+    /// `NSLog("%@", …)`, never the message as the format: a decoder's words
+    /// can hold a `%`.
+    public func once(_ line: String) {
+        lock.lock()
+        let fresh = logged.insert(line).inserted
+        lock.unlock()
+        if fresh { NSLog("%@", line) }
+    }
+}

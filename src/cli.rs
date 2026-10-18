@@ -3745,14 +3745,24 @@ pub async fn sessions(config_path: &Path, json: bool) -> anyhow::Result<()> {
         eprintln!("{line}");
     }
 
+    // A heat object this build cannot read is left out of the document and
+    // said on stderr, beside the skew line, rather than failing the command.
+    if let Some(crate::status::HeatField::Unreadable(why)) = &payload.heat {
+        eprintln!("tcr: the server's heat reading did not parse, so it is left out: {why}");
+    }
+
     if json {
         // The rows cross verbatim as the wire emitted them — `SessionRow` is
         // the shared `tcr-status-wire` type both the proxy and the panel's
         // Swift decoder are written against, so re-shaping it here would be a
         // second contract to keep in step with the first.
+        let heat = payload
+            .heat
+            .as_ref()
+            .and_then(crate::status::HeatField::reading);
         println!(
             "{}",
-            render_sessions_json(supported, &payload.sessions, payload.heat.as_ref())
+            render_sessions_json(supported, &payload.sessions, heat)
         );
     } else {
         print!("{}", render_sessions_text(supported, &payload.sessions));

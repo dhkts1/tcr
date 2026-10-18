@@ -1,20 +1,26 @@
 //! The serving Mac's heat, for [`crate::status::StatusPayload::heat`]: CPU
 //! temperature and fan speeds, read through AppleSMC by the `tcr-smc` crate.
 //!
-//! # Off the runtime, and briefly cached
+//! # Off the runtime, briefly cached, and never waited on for long
 //!
 //! One read is a handful of kernel calls into AppleSMC (and, on a Mac without
 //! `TCMz`, a one-time walk of a key table thousands of entries long), so it runs
 //! on tokio's blocking pool, never on a runtime worker. The panel polls the
 //! status endpoint every few seconds, and more than one client may poll it, so
 //! a reading is kept for [`MAX_AGE`]: a burst of status requests inside that
-//! window costs one SMC read, and the lock is held across the read so the
-//! requests that queue behind it get its answer rather than starting their own.
+//! window costs one SMC read.
+//!
+//! A read that is already in flight is never queued behind: a second caller
+//! gets the last reading (or none) at once, through `try_lock`. And the caller
+//! that started the read waits at most [`READ_DEADLINE`] for it, then answers
+//! with the last reading too. So an SMC that wedges costs one blocking-pool
+//! thread, the one stuck in the kernel, and never a status request: the
+//! endpoint, and the blocking pool that token refresh shares, keep moving.
 //!
 //! Heat is not a secret, so the endpoint's no-secret invariant
 //! ([`crate::status`]) is unchanged by carrying it.
 
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use tcr_status_wire::{FanRow, HeatRow};
@@ -25,46 +31,80 @@ use tcr_status_wire::{FanRow, HeatRow};
 /// the SMC once.
 pub const MAX_AGE: Duration = Duration::from_secs(2);
 
+/// How long a status request waits for an SMC read before it answers with
+/// the last reading. A starting value, not a measured one: an uncached read
+/// measured 1.4 to 1.7 ms here, so this is hundreds of reads' worth of
+/// patience, and still short enough that a wedged SMC is a slow answer rather
+/// than no answer.
+pub const READ_DEADLINE: Duration = Duration::from_millis(500);
+
 /// What a cache reads with: `None` is "this machine has no AppleSMC".
 pub type Read = Box<dyn FnMut() -> Option<HeatRow> + Send>;
 
-/// One reader and its last answer, behind one lock.
+/// One reader and its last answer.
+///
+/// Two locks on purpose. `reader` is held across the SMC read and only ever
+/// taken with `try_lock`, so nobody waits on it; `last` is held for a clone,
+/// so a caller that finds a read in flight can still answer from it.
 pub struct HeatCache {
     max_age: Duration,
-    state: Mutex<State>,
-}
-
-struct State {
-    read: Read,
-    last: Option<(Instant, Option<HeatRow>)>,
+    reader: Mutex<Read>,
+    last: Mutex<Option<(Instant, Option<HeatRow>)>>,
 }
 
 impl HeatCache {
     pub fn new(max_age: Duration, read: Read) -> Self {
         Self {
             max_age,
-            state: Mutex::new(State { read, last: None }),
+            reader: Mutex::new(read),
+            last: Mutex::new(None),
         }
     }
 
+    /// The last reading, however old, or `None` when there has never been one.
+    pub fn last(&self) -> Option<HeatRow> {
+        self.last_entry().and_then(|(_, reading)| reading)
+    }
+
+    /// A poisoned lock means a read panicked. What it guards is a reader and
+    /// an answer, both still whole, so the next request reads on rather than
+    /// losing heat for the life of the process.
+    fn last_entry(&self) -> Option<(Instant, Option<HeatRow>)> {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn fresh(&self, now: Instant) -> Option<Option<HeatRow>> {
+        let (at, reading) = self.last_entry()?;
+        (now.saturating_duration_since(at) < self.max_age).then_some(reading)
+    }
+
     /// The reading as of `now`: the kept one while it is younger than the
-    /// cache's maximum age, a fresh one otherwise. Blocking: call it off the
-    /// async runtime.
+    /// cache's maximum age, a fresh one otherwise. Blocking while it reads:
+    /// call it off the async runtime.
+    ///
+    /// Never waits on another caller's read: when one is in flight this
+    /// answers with the last reading, however old, or `None`.
     ///
     /// "No AppleSMC" is kept like any other answer, so a VM pays for the
     /// question once per window too.
     pub fn get(&self, now: Instant) -> Option<HeatRow> {
-        // A panic inside a read poisons the lock. The state it guards is a
-        // reader and a cached answer, both still whole, so the next request
-        // reads on rather than losing heat for the life of the process.
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((at, reading)) = &state.last
-            && now.saturating_duration_since(*at) < self.max_age
-        {
-            return reading.clone();
+        if let Some(reading) = self.fresh(now) {
+            return reading;
         }
-        let reading = (state.read)();
-        state.last = Some((now, reading.clone()));
+        let mut read = match self.reader.try_lock() {
+            Ok(read) => read,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return self.last(),
+        };
+        // The read that held the lock a moment ago may have just answered.
+        if let Some(reading) = self.fresh(now) {
+            return reading;
+        }
+        let reading = read();
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some((now, reading.clone()));
         reading
     }
 }
@@ -77,7 +117,7 @@ pub fn to_row(reading: &tcr_smc::HeatReading) -> HeatRow {
             .fans
             .iter()
             .map(|fan| FanRow {
-                index: fan.index,
+                index: fan.index.get(),
                 actual_rpm: fan.actual_rpm,
                 min_rpm: fan.min_rpm,
                 max_rpm: fan.max_rpm,
@@ -87,42 +127,58 @@ pub fn to_row(reading: &tcr_smc::HeatReading) -> HeatRow {
     }
 }
 
-/// The process's one cache, on the process's one AppleSMC connection, opened
-/// on the first status request that asks. The reader reports each distinct
-/// SMC error once, as a warning.
-static PROCESS: LazyLock<HeatCache> = LazyLock::new(|| {
-    let mut source: Option<tcr_smc::HeatSource> = None;
-    HeatCache::new(
+/// The process's one cache, on the process's one AppleSMC source, which opens
+/// on the first status request that asks and, if AppleSMC refuses, again
+/// a minute later (`tcr_smc::HeatSource`). Each distinct SMC error is one
+/// warning.
+static PROCESS: LazyLock<Arc<HeatCache>> = LazyLock::new(|| {
+    let mut source = tcr_smc::HeatSource::open(Box::new(|line| tracing::warn!("{line}")));
+    Arc::new(HeatCache::new(
         MAX_AGE,
-        Box::new(move || {
-            source
-                .get_or_insert_with(|| {
-                    tcr_smc::HeatSource::open(Box::new(|line| tracing::warn!("{line}")))
-                })
-                .read()
-                .as_ref()
-                .map(to_row)
-        }),
-    )
+        Box::new(move || source.read().as_ref().map(to_row)),
+    ))
 });
 
-/// The machine's heat now, read on the blocking pool through the process's
-/// cache. `None` when there is no AppleSMC (a VM, or not a Mac), and when the
-/// blocking task itself failed, which is logged.
+/// The machine's heat now, through the process's cache: see [`read_within`].
 pub async fn current() -> Option<HeatRow> {
-    match tokio::task::spawn_blocking(|| PROCESS.get(Instant::now())).await {
-        Ok(reading) => reading,
-        Err(error) => {
+    read_within(Arc::clone(&PROCESS), Instant::now(), READ_DEADLINE).await
+}
+
+/// `cache.get(now)` on the blocking pool, waited on for at most `deadline`.
+/// Past it, or when the blocking task itself failed (logged), the answer is
+/// the last reading, or `None`. The read that ran over keeps running on its
+/// own thread and fills the cache when it lands.
+pub async fn read_within(
+    cache: Arc<HeatCache>,
+    now: Instant,
+    deadline: Duration,
+) -> Option<HeatRow> {
+    let reading = Arc::clone(&cache);
+    match tokio::time::timeout(
+        deadline,
+        tokio::task::spawn_blocking(move || reading.get(now)),
+    )
+    .await
+    {
+        Ok(Ok(reading)) => reading,
+        Ok(Err(error)) => {
             tracing::warn!(%error, "the heat read did not finish");
-            None
+            cache.last()
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                deadline_ms = deadline.as_millis(),
+                "the SMC read ran past its deadline; answering with the last reading"
+            );
+            cache.last()
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     use super::*;
 
@@ -135,9 +191,9 @@ mod tests {
         })
     }
 
-    fn reading() -> HeatRow {
+    fn reading(celsius: f64) -> HeatRow {
         HeatRow {
-            cpu_celsius: Some(61.5),
+            cpu_celsius: Some(celsius),
             fans: vec![FanRow {
                 index: 0,
                 actual_rpm: 2400.0,
@@ -148,14 +204,34 @@ mod tests {
         }
     }
 
-    /// Eight requests at once, each waiting on a read that takes 50 ms: one
-    /// SMC read between them, and every one of them gets its answer.
+    /// A read that returns `first` at once, then blocks every later call until
+    /// the returned sender sends (or is dropped, which a failing test does on
+    /// its way out, so no blocking-pool thread outlives it). The receiver
+    /// hears each blocked call start.
+    fn first_then_blocking(first: HeatRow) -> (Read, mpsc::Sender<()>, mpsc::Receiver<()>) {
+        let (release, wait) = mpsc::channel::<()>();
+        let (started, blocked) = mpsc::channel::<()>();
+        let mut calls = 0;
+        let read: Read = Box::new(move || {
+            calls += 1;
+            if calls > 1 {
+                started.send(()).ok();
+                // Err is the sender gone: released either way.
+                wait.recv().ok();
+            }
+            Some(first.clone())
+        });
+        (read, release, blocked)
+    }
+
+    /// Eight requests at once, each finding the cache empty and the read
+    /// taking 50 ms: one SMC read between them, and nobody waits on it.
     #[test]
     fn heat_cache_serves_a_burst_with_one_read() {
         let reads = Arc::new(AtomicUsize::new(0));
         let cache = Arc::new(HeatCache::new(
             MAX_AGE,
-            counted(&reads, Some(reading()), Duration::from_millis(50)),
+            counted(&reads, Some(reading(61.0)), Duration::from_millis(50)),
         ));
         let now = Instant::now();
         let answers: Vec<_> = (0..8)
@@ -168,22 +244,86 @@ mod tests {
             .map(|handle| handle.join().unwrap())
             .collect();
         assert_eq!(reads.load(Ordering::SeqCst), 1);
-        assert!(answers.iter().all(|a| *a == Some(reading())), "{answers:?}");
+        assert!(answers.contains(&Some(reading(61.0))), "{answers:?}");
+        assert_eq!(cache.get(now), Some(reading(61.0)));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    /// A read that never comes back does not hold a second caller: it gets the
+    /// last reading straight away instead of queuing behind the stuck one.
+    #[test]
+    fn heat_cache_never_queues_behind_a_read_in_flight() {
+        let (read, release, blocked) = first_then_blocking(reading(50.0));
+        let cache = Arc::new(HeatCache::new(MAX_AGE, read));
+        let start = Instant::now();
+        assert_eq!(cache.get(start), Some(reading(50.0)));
+
+        let stale = start + MAX_AGE;
+        let stuck = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || cache.get(stale))
+        };
+        // The stuck read is inside the SMC, holding the reader lock.
+        blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || tx.send(cache.get(stale)).ok());
+        }
+        let second = rx.recv_timeout(Duration::from_secs(2));
+        release.send(()).ok();
+        assert_eq!(
+            second,
+            Ok(Some(reading(50.0))),
+            "queued behind the stuck read"
+        );
+        assert_eq!(stuck.join().unwrap(), Some(reading(50.0)));
+    }
+
+    /// The caller that starts a read that wedges waits only until the
+    /// deadline, then answers with the last reading.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heat_read_answers_with_the_last_reading_at_its_deadline() {
+        let (read, release, _blocked) = first_then_blocking(reading(50.0));
+        let cache = Arc::new(HeatCache::new(MAX_AGE, read));
+        let start = Instant::now();
+        assert_eq!(
+            read_within(Arc::clone(&cache), start, READ_DEADLINE).await,
+            Some(reading(50.0))
+        );
+
+        let asked = Instant::now();
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_within(
+                Arc::clone(&cache),
+                start + MAX_AGE,
+                Duration::from_millis(50),
+            ),
+        )
+        .await;
+        let waited = asked.elapsed();
+        release.send(()).ok();
+        assert_eq!(answer, Ok(Some(reading(50.0))), "waited on a wedged read");
+        assert!(waited < Duration::from_secs(1), "{waited:?}");
     }
 
     /// A reading answers for less than the maximum age and no longer.
     #[test]
     fn heat_cache_reads_again_once_the_reading_is_old() {
         let reads = Arc::new(AtomicUsize::new(0));
-        let cache = HeatCache::new(MAX_AGE, counted(&reads, Some(reading()), Duration::ZERO));
+        let cache = HeatCache::new(
+            MAX_AGE,
+            counted(&reads, Some(reading(61.0)), Duration::ZERO),
+        );
         let start = Instant::now();
-        assert_eq!(cache.get(start), Some(reading()));
+        assert_eq!(cache.get(start), Some(reading(61.0)));
         assert_eq!(
             cache.get(start + Duration::from_millis(1999)),
-            Some(reading())
+            Some(reading(61.0))
         );
         assert_eq!(reads.load(Ordering::SeqCst), 1);
-        assert_eq!(cache.get(start + MAX_AGE), Some(reading()));
+        assert_eq!(cache.get(start + MAX_AGE), Some(reading(61.0)));
         assert_eq!(reads.load(Ordering::SeqCst), 2);
     }
 
@@ -203,7 +343,7 @@ mod tests {
         let row = to_row(&tcr_smc::HeatReading {
             cpu_celsius: Some(93.25),
             fans: vec![tcr_smc::FanReading {
-                index: 1,
+                index: tcr_smc::FanIndex::new(1).unwrap(),
                 actual_rpm: 5013.0,
                 min_rpm: 1350.0,
                 max_rpm: 5777.0,

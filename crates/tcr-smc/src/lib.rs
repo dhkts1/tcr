@@ -23,12 +23,13 @@
 //! # Linux
 //!
 //! CI builds the workspace on ubuntu. Everything that touches AppleSMC is
-//! `#[cfg(target_os = "macos")]`; elsewhere [`HeatSource::open`] answers
-//! [`HeatSource::Unavailable`], the same answer a Mac VM with no SMC gets.
+//! `#[cfg(target_os = "macos")]`; elsewhere [`HeatSource::read`] answers
+//! `None`, the same answer a Mac VM with no SMC gets.
 //! The codecs and the reader's rules are plain Rust and are tested everywhere.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// A four-character SMC code: a key name (`F0Ac`) or a data type (`flt `).
@@ -340,16 +341,23 @@ pub use macos::SmcConnection;
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::cell::Cell;
     use std::ffi::{c_char, c_void};
+    use std::marker::PhantomData;
 
     use super::{FourCc, KeySource, MAX_VALUE_SIZE, SmcError, SmcKeyInfo, SmcValue, check_write};
 
     type MachPort = u32;
     type KernReturn = i32;
 
+    /// `MACH_PORT_NULL`, which IOKit documents as "the default main port". Not
+    /// the `kIOMainPortDefault` symbol: that exists only from macOS 12, the
+    /// binary's floor is 11, and a strong reference to it stops tcr launching
+    /// there at all.
+    const DEFAULT_MAIN_PORT: MachPort = 0;
+
     #[link(name = "IOKit", kind = "framework")]
     unsafe extern "C" {
-        static kIOMainPortDefault: MachPort;
         fn IOServiceMatching(name: *const c_char) -> *mut c_void;
         /// Consumes one reference to `matching`, so the caller never releases it.
         fn IOServiceGetMatchingService(main_port: MachPort, matching: *mut c_void) -> MachPort;
@@ -402,28 +410,53 @@ mod macos {
         data_size: u32,
         data_type: u32,
         data_attributes: u8,
+        /// The C struct's tail padding, declared so it is zeroed rather than
+        /// left as whatever the stack held.
+        _pad: [u8; 3],
     }
 
     /// The AppleSMC parameter struct, in C layout. The kernel reads the bytes,
-    /// not the declaration, so the layout is the contract.
+    /// not the declaration, so the layout is the contract. Every padding byte
+    /// the C compiler would insert is a declared, zeroed field here, so no
+    /// byte the kernel is sent is uninitialised.
     #[repr(C)]
     #[derive(Default)]
     struct SmcParam {
         key: u32,
         version: SmcVersion,
+        _pad_after_version: [u8; 2],
         power_limit: SmcPowerLimit,
         key_info: SmcKeyInfoData,
         result: u8,
         status: u8,
         data8: u8,
+        _pad_after_data8: u8,
         data32: u32,
         bytes: [u8; MAX_VALUE_SIZE],
     }
 
-    // The size the kernel expects, measured on a Mac16,7 with the probe the C
-    // shim grew out of. A layout that comes out differently fails the build
-    // rather than sending the kernel a struct it misreads.
-    const _: () = assert!(size_of::<SmcParam>() == 80);
+    // The size and offsets the kernel expects, measured on a Mac16,7 with the
+    // probe the C shim grew out of. A layout that comes out differently fails
+    // the build rather than sending the kernel a struct it misreads.
+    const _: () = {
+        assert!(size_of::<SmcVersion>() == 6);
+        assert!(size_of::<SmcPowerLimit>() == 16);
+        assert!(size_of::<SmcKeyInfoData>() == 12);
+        assert!(size_of::<SmcParam>() == 80);
+        assert!(std::mem::offset_of!(SmcParam, key) == 0);
+        assert!(std::mem::offset_of!(SmcParam, version) == 4);
+        assert!(std::mem::offset_of!(SmcParam, power_limit) == 12);
+        assert!(std::mem::offset_of!(SmcParam, key_info) == 28);
+        assert!(std::mem::offset_of!(SmcParam, result) == 40);
+        assert!(std::mem::offset_of!(SmcParam, status) == 41);
+        assert!(std::mem::offset_of!(SmcParam, data8) == 42);
+        assert!(std::mem::offset_of!(SmcParam, data32) == 44);
+        assert!(std::mem::offset_of!(SmcParam, bytes) == 48);
+    };
+
+    /// The most `keys` reserves before it starts: 3,462 on a Mac16,7, so this
+    /// covers every real SMC, and a garbage `#KEY` cannot ask for gigabytes.
+    const KEY_RESERVATION_CAP: usize = 8192;
 
     const USER_CLIENT_METHOD: u32 = 2;
     const READ_BYTES: u8 = 5;
@@ -435,9 +468,22 @@ mod macos {
     /// closed when this value is dropped.
     ///
     /// Not `Sync`: share one through a lock. `Send` because a connection is a
-    /// Mach port name, which any thread of this task may use.
+    /// Mach port name, which any thread of this task may use. The marker field
+    /// is what makes the compiler hold this: `Cell<()>` is `Send` and not
+    /// `Sync`, and a bare `u32` would make the struct both.
+    ///
+    /// ```compile_fail
+    /// fn shared<T: Sync>() {}
+    /// shared::<tcr_smc::SmcConnection>();
+    /// ```
+    ///
+    /// ```
+    /// fn sent<T: Send>() {}
+    /// sent::<tcr_smc::SmcConnection>();
+    /// ```
     pub struct SmcConnection {
         handle: MachPort,
+        _not_sync: PhantomData<Cell<()>>,
     }
 
     impl SmcConnection {
@@ -449,10 +495,10 @@ mod macos {
             if matching.is_null() {
                 return Err(SmcError::Unavailable);
             }
-            // SAFETY: reading an immutable IOKit-exported constant. `matching`
+            // SAFETY: `DEFAULT_MAIN_PORT` is the documented null main port. `matching`
             // is the live dictionary from above, whose one reference this call
             // consumes; it is not used again.
-            let service = unsafe { IOServiceGetMatchingService(kIOMainPortDefault, matching) };
+            let service = unsafe { IOServiceGetMatchingService(DEFAULT_MAIN_PORT, matching) };
             if service == 0 {
                 return Err(SmcError::Unavailable);
             }
@@ -466,7 +512,10 @@ mod macos {
             // nothing about the connection, so its return is not acted on.
             unsafe { IOObjectRelease(service) };
             match kr {
-                0 => Ok(Self { handle }),
+                0 => Ok(Self {
+                    handle,
+                    _not_sync: PhantomData,
+                }),
                 SmcError::NOT_FOUND_CODE => Err(SmcError::Unavailable),
                 SmcError::NOT_PRIVILEGED_CODE => Err(SmcError::NotPrivileged),
                 other => Err(SmcError::Kernel(other)),
@@ -554,7 +603,7 @@ mod macos {
                 key_info: SmcKeyInfoData {
                     data_size: value.bytes.len() as u32,
                     data_type: value.ty.0,
-                    data_attributes: 0,
+                    ..SmcKeyInfoData::default()
                 },
                 data8: WRITE_BYTES,
                 bytes,
@@ -569,7 +618,7 @@ mod macos {
         /// keep the list.
         pub fn keys(&self) -> Result<Vec<FourCc>, SmcError> {
             let count = self.read(FourCc::new(*b"#KEY"))?.uint32_value()?;
-            let mut keys = Vec::with_capacity(count as usize);
+            let mut keys = Vec::with_capacity((count as usize).min(KEY_RESERVATION_CAP));
             for index in 0..count {
                 let input = SmcParam {
                     data8: READ_INDEX,
@@ -611,7 +660,7 @@ mod macos {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FanReading {
     /// 0-based, the `n` in `F{n}Ac`.
-    pub index: u8,
+    pub index: FanIndex,
     pub actual_rpm: f64,
     /// 0 when it did not read this time.
     pub min_rpm: f64,
@@ -653,11 +702,27 @@ pub fn plausible(celsius: f64) -> Option<f64> {
     PLAUSIBLE_CELSIUS.contains(&celsius).then_some(celsius)
 }
 
-/// `F{n}{suffix}`. `fan` is 0 to 9, the only range [`HeatReader`] asks for: a
-/// fan key's index is a single digit.
-pub fn fan_key(fan: u8, suffix: [u8; 2]) -> FourCc {
-    debug_assert!(fan < 10, "a fan key's index is one digit, got {fan}");
-    FourCc::new([b'F', b'0' + fan, suffix[0], suffix[1]])
+/// A fan's index, 0 to 9: the `n` in `F{n}Ac`, which is one ASCII digit, so
+/// ten fans is the most a key can name. Parsed once, by [`Self::new`], so a key
+/// built from a fan index can never name `F:Ac` or worse, whatever number came
+/// in (a root helper builds keys from an index that crossed a wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FanIndex(u8);
+
+impl FanIndex {
+    /// `None` past 9.
+    pub const fn new(index: u8) -> Option<Self> {
+        if index < 10 { Some(Self(index)) } else { None }
+    }
+
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// `F{n}{suffix}`, for a fan index already known to be one digit.
+pub const fn fan_key(fan: FanIndex, suffix: [u8; 2]) -> FourCc {
+    FourCc::new([b'F', b'0' + fan.0, suffix[0], suffix[1]])
 }
 
 /// Where a reader's "now" comes from: time since the reader was made, so a
@@ -684,7 +749,7 @@ pub struct HeatReader<S> {
     enumeration_failed_at: Option<Duration>,
     mode_key_is_lower: Option<bool>,
     /// Each fan's `Mn` and `Mx`, kept once both read: they do not change.
-    fan_limits: HashMap<u8, (f64, f64)>,
+    fan_limits: HashMap<FanIndex, (f64, f64)>,
     /// Every line already reported, so a key that fails on every poll is one
     /// log line, not one a poll.
     reported: HashSet<String>,
@@ -859,13 +924,13 @@ impl<S: KeySource> HeatReader<S> {
         };
         // Ten fans is the most a fan key's single digit can name.
         (0..count.min(10))
-            .filter_map(|fan| self.read_fan(fan))
+            .filter_map(|fan| FanIndex::new(fan).and_then(|fan| self.read_fan(fan)))
             .collect()
     }
 
     /// `None` when the fan's speed does not read, or reads as no speed at all
     /// (not finite, or negative).
-    fn read_fan(&mut self, fan: u8) -> Option<FanReading> {
+    fn read_fan(&mut self, fan: FanIndex) -> Option<FanReading> {
         let actual_rpm = self.rpm(fan, *b"Ac")?;
         let (min_rpm, max_rpm) = self.limits(fan);
         Some(FanReading {
@@ -880,7 +945,7 @@ impl<S: KeySource> HeatReader<S> {
     /// `Mn` and `Mx`, read once both read and then kept. One that does not
     /// read is 0 this poll ([`FanReading::max_rpm`] 0 is "no maximum") and is
     /// asked again next poll.
-    fn limits(&mut self, fan: u8) -> (f64, f64) {
+    fn limits(&mut self, fan: FanIndex) -> (f64, f64) {
         if let Some(known) = self.fan_limits.get(&fan) {
             return *known;
         }
@@ -893,7 +958,7 @@ impl<S: KeySource> HeatReader<S> {
         (low, high)
     }
 
-    fn rpm(&mut self, fan: u8, suffix: [u8; 2]) -> Option<f64> {
+    fn rpm(&mut self, fan: FanIndex, suffix: [u8; 2]) -> Option<f64> {
         let key = fan_key(fan, suffix);
         let value = match self.smc.read(key).and_then(|v| v.numeric_value()) {
             Ok(value) => value,
@@ -907,7 +972,7 @@ impl<S: KeySource> HeatReader<S> {
 
     /// The fan's mode key reads 1. No mode key at all (older Intel Macs keep
     /// the bit in `FS! `) means nothing says another app holds this fan.
-    fn is_manual(&mut self, fan: u8) -> bool {
+    fn is_manual(&mut self, fan: FanIndex) -> bool {
         let Some(suffix) = self.mode_key_suffix() else {
             return false;
         };
@@ -944,46 +1009,124 @@ impl<S: KeySource> HeatReader<S> {
     }
 }
 
-/// A process's one reader, or why there is none.
-pub enum HeatSource {
-    #[cfg(target_os = "macos")]
-    Ready(Box<HeatReader<SmcConnection>>),
-    /// No AppleSMC: a VM, or not a Mac. Nothing about that changes between
-    /// polls.
-    Unavailable,
-    /// AppleSMC is there and would not open. Reported once, by [`Self::open`].
-    Failed(SmcError),
+/// What [`HeatSource::open`] opens: AppleSMC on a Mac.
+#[cfg(target_os = "macos")]
+pub type PlatformSmc = SmcConnection;
+/// What [`HeatSource::open`] opens: nothing, off a Mac.
+#[cfg(not(target_os = "macos"))]
+pub type PlatformSmc = NoSmc;
+
+/// The key source off a Mac. There is none, so no value of this type exists.
+#[cfg(not(target_os = "macos"))]
+pub enum NoSmc {}
+
+#[cfg(not(target_os = "macos"))]
+impl KeySource for NoSmc {
+    fn read(&mut self, _key: FourCc) -> Result<SmcValue, SmcError> {
+        match *self {}
+    }
+
+    fn keys(&mut self) -> Result<Vec<FourCc>, SmcError> {
+        match *self {}
+    }
 }
 
-impl HeatSource {
-    /// Opens AppleSMC once. Every later [`Self::read`] reuses what this found.
-    #[cfg(target_os = "macos")]
-    pub fn open(mut report: Report) -> Self {
-        match SmcConnection::open() {
-            Ok(smc) => Self::Ready(Box::new(HeatReader::new(smc, report))),
-            Err(SmcError::Unavailable) => Self::Unavailable,
+/// How a [`HeatSource`] opens its key source.
+pub type Opener<S> = Box<dyn FnMut() -> Result<S, SmcError> + Send>;
+
+enum Opened<S> {
+    /// Nothing tried yet: the first [`HeatSource::read`] opens.
+    NotYet,
+    Ready(Box<HeatReader<S>>),
+    /// No AppleSMC: a VM, or not a Mac. Nothing about that changes while the
+    /// process runs, so it is never asked again.
+    Unavailable,
+    /// AppleSMC is there and would not open, at this time on the source's
+    /// clock. Tried again [`ENUMERATION_RETRY_DELAY`] later: a refusal at
+    /// boot is not a reason to go without heat for the life of the process.
+    Failed {
+        at: Duration,
+    },
+}
+
+/// A process's one reader, opened on the first read, or why there is none.
+pub struct HeatSource<S> {
+    opened: Opened<S>,
+    open: Opener<S>,
+    /// Shared with the reader once one opens, so both the open failures and
+    /// the reader's own errors go to the one place.
+    report: Arc<Mutex<Report>>,
+    now: Clock,
+    /// The last open failure reported, so one that repeats every retry is
+    /// one line, not one a minute.
+    last_failure: Option<SmcError>,
+}
+
+impl HeatSource<PlatformSmc> {
+    /// The platform's source, with the real clock. Opens nothing yet.
+    pub fn open(report: Report) -> Self {
+        #[cfg(target_os = "macos")]
+        let open: Opener<PlatformSmc> = Box::new(SmcConnection::open);
+        #[cfg(not(target_os = "macos"))]
+        let open: Opener<PlatformSmc> = Box::new(|| Err(SmcError::Unavailable));
+        let start = Instant::now();
+        Self::with_opener(open, report, Box::new(move || start.elapsed()))
+    }
+}
+
+impl<S: KeySource> HeatSource<S> {
+    pub fn with_opener(open: Opener<S>, report: Report, now: Clock) -> Self {
+        Self {
+            opened: Opened::NotYet,
+            open,
+            report: Arc::new(Mutex::new(report)),
+            now,
+            last_failure: None,
+        }
+    }
+
+    fn try_open(&mut self) {
+        match (self.open)() {
+            Ok(smc) => {
+                let shared = Arc::clone(&self.report);
+                let report: Report = Box::new(move |line| {
+                    let mut report = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    report(line);
+                });
+                self.opened = Opened::Ready(Box::new(HeatReader::new(smc, report)));
+                self.last_failure = None;
+            }
+            Err(SmcError::Unavailable) => self.opened = Opened::Unavailable,
             Err(error) => {
-                report(&format!("SMC: AppleSMC would not open: {error}"));
-                Self::Failed(error)
+                if self.last_failure != Some(error) {
+                    let mut report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
+                    report(&format!(
+                        "SMC: AppleSMC would not open (retrying every {} s): {error}",
+                        ENUMERATION_RETRY_DELAY.as_secs()
+                    ));
+                    self.last_failure = Some(error);
+                }
+                self.opened = Opened::Failed { at: (self.now)() };
             }
         }
     }
 
-    /// Not a Mac: there is no AppleSMC to open.
-    #[cfg(not(target_os = "macos"))]
-    pub fn open(report: Report) -> Self {
-        drop(report);
-        Self::Unavailable
-    }
-
-    /// Read now. `None` means one thing: this machine has no AppleSMC.
-    /// An SMC that would not open is an empty reading, not `None`.
+    /// Read now. `None` means one thing: this machine has no AppleSMC. An SMC
+    /// that would not open is an empty reading, not `None`, and is opened
+    /// again once [`ENUMERATION_RETRY_DELAY`] has passed.
     pub fn read(&mut self) -> Option<HeatReading> {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::Ready(reader) => Some(reader.read()),
-            Self::Unavailable => None,
-            Self::Failed(_) => Some(HeatReading::default()),
+        let due = match &self.opened {
+            Opened::NotYet => true,
+            Opened::Failed { at } => (self.now)().saturating_sub(*at) >= ENUMERATION_RETRY_DELAY,
+            Opened::Ready(_) | Opened::Unavailable => false,
+        };
+        if due {
+            self.try_open();
+        }
+        match &mut self.opened {
+            Opened::Ready(reader) => Some(reader.read()),
+            Opened::Unavailable => None,
+            Opened::NotYet | Opened::Failed { .. } => Some(HeatReading::default()),
         }
     }
 }
@@ -1205,7 +1348,7 @@ mod tests {
         assert_eq!(FourCc::parse("flt ").map(|c| c.0), Some(0x666c_7420));
         assert_eq!(FourCc::parse("flt"), None);
         assert_eq!(FourCc::parse("F10Ac"), None);
-        assert_eq!(fan_key(1, *b"md"), code("F1md"));
+        assert_eq!(fan_key(fan_index(1), *b"md"), code("F1md"));
         assert_eq!(FourCc(0x0000_4142).to_string(), "??AB");
     }
 
@@ -1436,15 +1579,20 @@ mod tests {
         smc.set("Tp02", flt(48.0));
         smc.set("FNum", Ok(SmcValue::ui8(3)));
         for fan in 0..3 {
-            smc.values.insert(fan_key(fan, *b"Mn"), flt(1000.0));
-            smc.values.insert(fan_key(fan, *b"Mx"), flt(5000.0));
+            smc.values
+                .insert(fan_key(fan_index(fan), *b"Mn"), flt(1000.0));
+            smc.values
+                .insert(fan_key(fan_index(fan), *b"Mx"), flt(5000.0));
         }
         smc.set("F0Ac", flt(-5.0));
         smc.set("F1Ac", flt(f32::INFINITY));
         smc.set("F2Ac", flt(1200.0));
         let heat = Rig::new(smc).reader.read();
         assert_eq!(heat.cpu_celsius, Some(48.0));
-        assert_eq!(heat.fans.iter().map(|f| f.index).collect::<Vec<_>>(), [2]);
+        assert_eq!(
+            heat.fans.iter().map(|f| f.index.get()).collect::<Vec<_>>(),
+            [2]
+        );
     }
 
     /// `Mn` and `Mx` are read once and kept; `Ac` every poll.
@@ -1537,8 +1685,8 @@ mod tests {
             .expect("a Mac with an SMC has a CPU temperature");
         assert!(PLAUSIBLE_CELSIUS.contains(&cpu), "{cpu}");
         for fan in &heat.fans {
-            assert!(fan.max_rpm > 0.0, "fan {}", fan.index);
-            assert!(fan.actual_rpm >= 0.0, "fan {}", fan.index);
+            assert!(fan.max_rpm > 0.0, "fan {}", fan.index.get());
+            assert!(fan.actual_rpm >= 0.0, "fan {}", fan.index.get());
         }
     }
 
@@ -1547,5 +1695,96 @@ mod tests {
     fn no_smc_off_a_mac() {
         let mut source = HeatSource::open(Box::new(|_| {}));
         assert_eq!(source.read(), None);
+    }
+
+    fn fan_index(index: u8) -> FanIndex {
+        FanIndex::new(index).unwrap()
+    }
+
+    /// A fan index is one digit: 9 parses, 10 and past do not, so no key can
+    /// name `F:Ac` or wrap past it.
+    #[test]
+    fn fan_index_is_one_digit() {
+        assert_eq!(FanIndex::new(0).map(FanIndex::get), Some(0));
+        assert_eq!(fan_key(fan_index(9), *b"Ac"), code("F9Ac"));
+        for past in [10, 11, 42, 255] {
+            assert_eq!(FanIndex::new(past), None, "{past}");
+        }
+    }
+
+    /// An opener that fails `failures` times with `error`, then opens a fake
+    /// SMC with one fan, counting every attempt.
+    fn flaky_opener(
+        error: SmcError,
+        failures: usize,
+        attempts: &Arc<Mutex<usize>>,
+    ) -> Opener<FakeSmc> {
+        let attempts = Arc::clone(attempts);
+        Box::new(move || {
+            let mut n = attempts.lock().unwrap();
+            *n += 1;
+            if *n <= failures {
+                return Err(error);
+            }
+            let mut smc = FakeSmc::default();
+            smc.set("TCMz", flt(61.0));
+            Ok(smc)
+        })
+    }
+
+    /// An SMC that would not open is tried again once the delay is up, not
+    /// before, and its failure is reported once however often it repeats.
+    #[test]
+    fn a_failed_open_is_retried_after_the_delay() {
+        let attempts = Arc::new(Mutex::new(0));
+        let clock = Arc::new(Mutex::new(Duration::ZERO));
+        let reported = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (c, r) = (Arc::clone(&clock), Arc::clone(&reported));
+        let mut source = HeatSource::with_opener(
+            flaky_opener(SmcError::Kernel(5), 2, &attempts),
+            Box::new(move |line| r.lock().unwrap().push(line.to_string())),
+            Box::new(move || *c.lock().unwrap()),
+        );
+        assert_eq!(source.read(), Some(HeatReading::default()));
+        assert_eq!(*attempts.lock().unwrap(), 1);
+
+        *clock.lock().unwrap() = Duration::from_secs(59);
+        assert_eq!(source.read(), Some(HeatReading::default()));
+        assert_eq!(*attempts.lock().unwrap(), 1, "retried before the delay");
+
+        *clock.lock().unwrap() = Duration::from_secs(60);
+        assert_eq!(source.read(), Some(HeatReading::default()));
+        assert_eq!(*attempts.lock().unwrap(), 2);
+        assert_eq!(
+            reported.lock().unwrap().len(),
+            1,
+            "{:?}",
+            reported.lock().unwrap()
+        );
+
+        *clock.lock().unwrap() = Duration::from_secs(120);
+        assert_eq!(source.read().and_then(|h| h.cpu_celsius), Some(61.0));
+        assert_eq!(*attempts.lock().unwrap(), 3);
+        // Once open, it stays open.
+        *clock.lock().unwrap() = Duration::from_secs(1000);
+        source.read();
+        assert_eq!(*attempts.lock().unwrap(), 3);
+    }
+
+    /// No AppleSMC is asked once: a VM does not grow one.
+    #[test]
+    fn no_smc_is_never_asked_again() {
+        let attempts = Arc::new(Mutex::new(0));
+        let clock = Arc::new(Mutex::new(Duration::ZERO));
+        let c = Arc::clone(&clock);
+        let mut source = HeatSource::with_opener(
+            flaky_opener(SmcError::Unavailable, usize::MAX, &attempts),
+            Box::new(|_| {}),
+            Box::new(move || *c.lock().unwrap()),
+        );
+        assert_eq!(source.read(), None);
+        *clock.lock().unwrap() = Duration::from_secs(3600);
+        assert_eq!(source.read(), None);
+        assert_eq!(*attempts.lock().unwrap(), 1);
     }
 }

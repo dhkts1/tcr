@@ -251,4 +251,15 @@ final class MachineStatsTests: XCTestCase {
         XCTAssertEqual(empty.heat, HeatReading(cpuCelsius: nil, fans: []))
         XCTAssertNil(heated(empty.heat).heatClause)
     }
+
+    /// A heat object that will not decode is said, not swallowed.
+    func testUnreadableHeatIsLogged() {
+        var lines: [String] = []
+        XCTAssertNil(Fleet.decodeHeat(["cpuCelsius": "hot"], log: { lines.append($0) }))
+        XCTAssertNil(Fleet.decodeHeat(42, log: { lines.append($0) }))
+        XCTAssertNil(Fleet.decodeHeat(nil, log: { lines.append($0) }))
+        XCTAssertEqual(lines.count, 2, "\(lines)")
+        XCTAssertTrue(lines[0].contains("did not decode"), "\(lines)")
+        XCTAssertTrue(lines[1].contains("not a JSON object"), "\(lines)")
+    }
 }

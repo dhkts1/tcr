@@ -300,8 +300,55 @@ pub struct StatusPayload {
     /// per this struct's `build` doc-comment, NOT a [`STATUS_KIND`] bump: an OLD
     /// client skips the unknown key, and a NEW client reading an OLD server
     /// reads `None`, which draws the line without heat, the truth.
+    ///
+    /// A [`HeatField`], not a bare row, so a `heat` object this build cannot
+    /// read costs the heat and nothing else: a typed field that failed would
+    /// fail the whole payload, and `tcr status` would fall back to the offline
+    /// snapshot over a temperature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub heat: Option<tcr_status_wire::HeatRow>,
+    pub heat: Option<HeatField>,
+}
+
+/// [`StatusPayload::heat`] as a client read it: the reading, or why it did not
+/// parse. The serving process only ever writes [`Self::Reading`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeatField {
+    Reading(tcr_status_wire::HeatRow),
+    /// The `heat` object did not parse as a [`tcr_status_wire::HeatRow`]; the
+    /// parser's own words. The caller says so where its diagnostics go.
+    Unreadable(String),
+}
+
+impl HeatField {
+    pub const fn reading(&self) -> Option<&tcr_status_wire::HeatRow> {
+        match self {
+            Self::Reading(row) => Some(row),
+            Self::Unreadable(_) => None,
+        }
+    }
+}
+
+impl Serialize for HeatField {
+    /// The reading as a [`tcr_status_wire::HeatRow`]. An unreadable one, which
+    /// only a client holds, writes `null`: there is no reading to pass on.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Reading(row) => row.serialize(serializer),
+            Self::Unreadable(_) => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HeatField {
+    /// Never fails on content: any JSON value reads, and one that is not a
+    /// heat object becomes [`Self::Unreadable`].
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(match serde_json::from_value(value) {
+            Ok(row) => Self::Reading(row),
+            Err(error) => Self::Unreadable(error.to_string()),
+        })
+    }
 }
 
 /// One row of [`StatusPayload::unkeyed_connects`] or
@@ -2766,7 +2813,7 @@ mod tests {
                 manual: true,
             }],
         };
-        payload.heat = Some(reading.clone());
+        payload.heat = Some(HeatField::Reading(reading.clone()));
         let wire = serde_json::to_value(&payload).expect("serialize");
         assert_eq!(
             wire["heat"],
@@ -2778,13 +2825,32 @@ mod tests {
             "{wire}"
         );
         let back: StatusPayload = serde_json::from_value(wire).expect("deserialize");
-        assert_eq!(back.heat, Some(reading));
+        assert_eq!(back.heat, Some(HeatField::Reading(reading)));
 
         // A reading with no CPU figure and no fans is still a reading: the SMC
         // opened and nothing read. It crosses as an empty object, not as absent.
-        payload.heat = Some(tcr_status_wire::HeatRow::default());
+        payload.heat = Some(HeatField::Reading(tcr_status_wire::HeatRow::default()));
         let wire = serde_json::to_value(&payload).expect("serialize");
         assert_eq!(wire["heat"], serde_json::json!({"fans": []}));
+    }
+
+    /// A `heat` this build cannot read costs the heat and nothing else: the
+    /// payload still parses, every other field intact, and the parser's words
+    /// are kept for the caller to report. `null` is no reading, as absent is.
+    #[test]
+    fn an_unreadable_heat_does_not_fail_the_payload() {
+        let body = r#"{"kind":"tcr.status.v1","accounts":[],"http1_only":true,
+            "heat":{"cpuCelsius":"hot","fans":[]}}"#;
+        let payload: StatusPayload = serde_json::from_str(body).expect("still a payload");
+        assert!(payload.http1_only);
+        match payload.heat {
+            Some(HeatField::Unreadable(why)) => assert!(why.contains("invalid type"), "{why}"),
+            other => panic!("expected an unreadable heat, got {other:?}"),
+        }
+        let payload: StatusPayload =
+            serde_json::from_str(r#"{"kind":"tcr.status.v1","accounts":[],"heat":null}"#)
+                .expect("parse");
+        assert_eq!(payload.heat, None);
     }
 
     /// Every Codex fact a server knows, the facts its snapshot groups under `codex`,
