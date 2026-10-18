@@ -169,6 +169,8 @@ impl Store for FakeStore {
     }
 }
 
+type Logs = Arc<Mutex<Vec<(Level, String)>>>;
+
 type Under = Controller<FakeHelper, FakeHeat, FakeProbe, FakeClock, FakeStore>;
 
 struct Rig {
@@ -178,6 +180,7 @@ struct Rig {
     clock: FakeClock,
     store: FakeStore,
     hooks: Arc<Mutex<Option<Hook>>>,
+    logs: Logs,
 }
 
 /// Two fans of the Mac16,7 reading, automatic, CPU at 50 °C.
@@ -210,6 +213,8 @@ fn rig_from(saved: Option<Saved>, reading: Option<HeatReading>) -> Rig {
     let clock = FakeClock(Arc::new(Mutex::new((Instant::now(), 1_000_000))));
     let store = FakeStore::default();
     let hooks: Arc<Mutex<Option<Hook>>> = Arc::new(Mutex::new(None));
+    let logs: Logs = Arc::default();
+    let written_logs = Arc::clone(&logs);
     let parts = Parts {
         helper: FakeHelper {
             world: world.clone(),
@@ -223,7 +228,9 @@ fn rig_from(saved: Option<Saved>, reading: Option<HeatReading>) -> Rig {
         clock: clock.clone(),
         store: store.clone(),
         inbox: rx,
-        log: Box::new(|_, _| {}),
+        log: Box::new(move |level, line: &str| {
+            written_logs.lock().unwrap().push((level, line.to_string()));
+        }),
         publish: Box::new(|_| {}),
         pid: 4242,
     };
@@ -234,6 +241,7 @@ fn rig_from(saved: Option<Saved>, reading: Option<HeatReading>) -> Rig {
         clock,
         store,
         hooks,
+        logs,
     }
 }
 
@@ -1019,4 +1027,286 @@ fn auto_with_nothing_held_writes_nothing_and_does_not_tick() {
     assert_eq!(rig.c.state(), State::Off);
     assert_eq!(rig.world.lock().requests, vec![]);
     assert_eq!(rig.c.wait(), None, "no timer while off");
+}
+
+// Review fixes.
+
+impl Rig {
+    fn take_logs(&self) -> Vec<(Level, String)> {
+        std::mem::take(&mut *self.logs.lock().unwrap())
+    }
+}
+
+/// While Macs Fan Control runs, a release that waits on it (or on a failed
+/// probe) says so once, never again on each tick; and with nothing held it
+/// does not wait at all.
+#[test]
+fn a_waiting_release_logs_once_not_every_tick() {
+    // Something held: Auto waits, quietly.
+    let mut rig = holding(fixed(3000));
+    rig.world.lock().macs = Ok(true);
+    rig.send(Command::Set(FanMode::Auto));
+    assert_eq!(rig.c.state(), State::Foreign(ForeignHolder::MacsFanControl));
+    assert!(!rig.take_logs().is_empty(), "the change itself is said");
+    for _ in 0..5 {
+        rig.next_tick();
+    }
+    assert_eq!(rig.take_logs(), vec![], "nothing more while it waits");
+    assert_eq!(rig.c.state(), State::Foreign(ForeignHolder::MacsFanControl));
+    assert_eq!(rig.c.detail(), Some(Detail::WaitingForMacs));
+
+    // A forced hand-back waits the same way.
+    let mut rig = holding(fixed(3000));
+    rig.world.lock().macs = Ok(true);
+    rig.send(Command::ForceHandBack);
+    rig.take_logs();
+    for _ in 0..5 {
+        rig.next_tick();
+    }
+    assert_eq!(rig.take_logs(), vec![]);
+
+    // A probe that keeps failing: one warning, not one per tick.
+    let mut rig = holding(fixed(3000));
+    rig.world.lock().macs = Err("proc_listallpids failed".into());
+    rig.send(Command::Set(FanMode::Auto));
+    assert_eq!(rig.c.state(), State::Unknown);
+    let warnings = |logs: &[(Level, String)]| logs.iter().filter(|l| l.0 == Level::Warn).count();
+    assert_eq!(warnings(&rig.take_logs()), 1);
+    for _ in 0..5 {
+        rig.next_tick();
+    }
+    assert_eq!(rig.take_logs(), vec![]);
+
+    // Nothing held and no connection: Auto is simply off, no tick.
+    let mut rig = rig_from(None, Some(machine()));
+    rig.world.lock().macs = Ok(true);
+    rig.send(Command::Set(fixed(3000)));
+    assert_eq!(rig.c.state(), State::Foreign(ForeignHolder::MacsFanControl));
+    assert_eq!(rig.c.hold(), None);
+    rig.send(Command::Set(FanMode::Auto));
+    assert_eq!(rig.c.state(), State::Off);
+    assert_eq!(rig.c.wait(), None, "no timer while off");
+    rig.take_logs();
+    for _ in 0..5 {
+        rig.next_tick();
+    }
+    assert_eq!(rig.take_logs(), vec![]);
+    assert_eq!(rig.world.lock().requests, vec![]);
+}
+
+/// Macs Fan Control starting (or its probe failing) after the first
+/// set-manual: the fan set manual goes back before the state says why, and
+/// no record is left behind.
+#[test]
+fn a_block_after_the_first_set_manual_hands_back_first() {
+    for (block, state) in [
+        (Ok(true), State::Foreign(ForeignHolder::MacsFanControl)),
+        (Err("probe".to_string()), State::Unknown),
+    ] {
+        // Between the two set-manuals.
+        let mut rig = rig();
+        let during = block.clone();
+        rig.hook(Box::new(move |request, machine, _inject, _clock| {
+            if *request == set_manual(0) {
+                machine.macs = during.clone();
+            }
+            None
+        }));
+        rig.send(Command::Set(fixed(3000)));
+        assert_eq!(rig.written(), vec![set_manual(0), Request::HandBack]);
+        assert_eq!(rig.c.state(), state);
+        assert_eq!(rig.c.hold(), None);
+        assert!(!rig.c.connected());
+
+        // Between two set-targets.
+        let mut rig = rig_from(None, Some(machine()));
+        let during = block.clone();
+        rig.hook(Box::new(move |request, machine, _inject, _clock| {
+            if *request == set_target(0, 3000.0) {
+                machine.macs = during.clone();
+            }
+            None
+        }));
+        rig.send(Command::Set(fixed(3000)));
+        assert_eq!(
+            rig.written(),
+            vec![
+                set_manual(0),
+                set_manual(1),
+                set_target(0, 3000.0),
+                Request::HandBack
+            ]
+        );
+        assert_eq!(rig.c.state(), state);
+        assert_eq!(rig.c.hold(), None);
+    }
+}
+
+/// A record with no target written is ours only inside the entry that wrote
+/// it: at boot, fans in manual against such a record are not taken over.
+#[test]
+fn a_record_without_a_target_is_not_ours_after_entry() {
+    let mut reading = machine();
+    for f in &mut reading.fans {
+        f.mode = KeyMode::Manual;
+        f.target_rpm = Some(2000.0);
+    }
+    let saved = Saved {
+        desired: fixed(5000),
+        hold: Some(Hold {
+            writer_pid: 1,
+            fans: (0..2)
+                .map(|i| HeldFan {
+                    fan: fan(i),
+                    written_rpm: None,
+                })
+                .collect(),
+        }),
+    };
+    let mut rig = rig_from(Some(saved), Some(reading));
+    assert_eq!(rig.c.hold(), None);
+    rig.c.pump();
+    assert_eq!(rig.c.state(), State::Foreign(ForeignHolder::AnotherApp));
+    assert_eq!(rig.written(), vec![]);
+}
+
+/// One held fan back on automatic while the other keeps our target: taken
+/// again (counted), never left reading "holding".
+#[test]
+fn a_held_fan_back_on_automatic_alone_is_retaken() {
+    let mut rig = holding(fixed(3000));
+    rig.clear_requests();
+    rig.world.lock().fan_mut(fan(1)).unwrap().mode = KeyMode::Auto;
+    assert_eq!(
+        rig.next_tick(),
+        Some(TickOutcome::HeldBack(Why::Reentering))
+    );
+    assert_eq!(
+        rig.written(),
+        vec![
+            set_manual(0),
+            set_manual(1),
+            set_target(0, 3000.0),
+            set_target(1, 3000.0)
+        ]
+    );
+    assert_eq!(rig.c.state(), State::Holding);
+    assert_eq!(
+        rig.world.lock().fan_mut(fan(1)).unwrap().mode,
+        KeyMode::Manual
+    );
+    // And it counts toward contention like every fan going back.
+    for _ in 0..REENTRY_LIMIT {
+        rig.world.lock().fan_mut(fan(1)).unwrap().mode = KeyMode::Auto;
+        rig.next_tick();
+    }
+    assert_eq!(rig.c.state(), State::Unavailable(Unavailable::Contended));
+}
+
+/// `FNum` that did not read gives no fans at all; a fan that did not read is
+/// left out. Either, while holding, is unknown: no write, the record kept.
+#[test]
+fn an_empty_or_partial_reading_while_holding_is_unknown() {
+    let mut rig = holding(fixed(3000));
+    rig.clear_requests();
+    let full = rig.world.lock().reading.clone();
+    rig.world.lock().reading.as_mut().unwrap().fans.clear();
+    assert_eq!(
+        rig.next_tick(),
+        Some(TickOutcome::HeldBack(Why::Unreadable))
+    );
+    assert_eq!(rig.c.state(), State::Unknown);
+    // One fan read, automatic, the other missing.
+    {
+        let mut machine = rig.world.lock();
+        let mut partial = full.clone().unwrap();
+        partial.fans.truncate(1);
+        partial.fans[0].mode = KeyMode::Auto;
+        machine.reading = Some(partial);
+    }
+    assert_eq!(
+        rig.next_tick(),
+        Some(TickOutcome::HeldBack(Why::Unreadable))
+    );
+    assert_eq!(rig.c.state(), State::Unknown);
+    assert_eq!(rig.written(), vec![]);
+    assert!(rig.c.hold().is_some(), "no hold dropped");
+    // Whole again: still ours.
+    rig.world.lock().reading = full;
+    assert_eq!(rig.next_tick(), Some(TickOutcome::NoChange));
+    assert_eq!(rig.c.state(), State::Holding);
+}
+
+/// A shutdown drained between two set-manuals is acted on in the same pump:
+/// the loop never goes back to wait on a channel whose stop it took.
+#[test]
+fn a_shutdown_during_entry_is_acted_on() {
+    let mut rig = rig();
+    let mut sent = false;
+    rig.hook(Box::new(move |request, _machine, inject, clock| {
+        if *request == set_manual(0) && !sent {
+            inject
+                .send(Input::Command(Command::Shutdown {
+                    deadline: clock.now() + Duration::from_secs(3),
+                }))
+                .unwrap();
+            sent = true;
+        }
+        None
+    }));
+    assert_eq!(rig.send(Command::Set(fixed(3000))), Flow::Exit);
+    assert_eq!(rig.written(), vec![set_manual(0), Request::HandBack]);
+    assert!(!rig.c.connected());
+    let last = rig.store.0.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        last.desired,
+        fixed(3000),
+        "the wish stays for the next start"
+    );
+    assert_eq!(last.hold, None);
+}
+
+/// A shutdown looks before it writes, as a release does: a failed probe is
+/// not "Macs Fan Control is not running", and fans another program changed
+/// are not handed back.
+#[test]
+fn a_shutdown_checks_as_a_release_does() {
+    let deadline = |rig: &Rig| rig.clock.now() + Duration::from_secs(3);
+
+    let mut rig = holding(fixed(3000));
+    rig.clear_requests();
+    rig.world.lock().macs = Err("probe".into());
+    let at = deadline(&rig);
+    assert_eq!(rig.send(Command::Shutdown { deadline: at }), Flow::Exit);
+    assert_eq!(rig.written(), vec![]);
+    assert!(!rig.c.connected());
+
+    let mut rig = holding(fixed(3000));
+    rig.clear_requests();
+    rig.set_target(0, 4200.0);
+    let at = deadline(&rig);
+    assert_eq!(rig.send(Command::Shutdown { deadline: at }), Flow::Exit);
+    assert_eq!(rig.written(), vec![]);
+    assert_eq!(rig.c.hold(), None);
+}
+
+/// A forced hand-back that waited on Macs Fan Control is for the wish a new
+/// mode replaced: once it quits, the new mode holds and nothing is handed
+/// back.
+#[test]
+fn a_new_mode_drops_a_waiting_hand_back() {
+    let mut rig = holding(fixed(3000));
+    rig.world.lock().macs = Ok(true);
+    rig.send(Command::ForceHandBack);
+    rig.send(Command::Set(fixed(3000)));
+    rig.clear_requests();
+    rig.world.lock().macs = Ok(false);
+    rig.next_tick();
+    rig.next_tick();
+    assert!(
+        !rig.written().contains(&Request::HandBack),
+        "{:?}",
+        rig.written()
+    );
+    assert_eq!(rig.c.state(), State::Holding);
 }

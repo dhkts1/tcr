@@ -492,7 +492,13 @@ impl<K: KeyAccess> Root<K> {
     }
 
     fn judge(&mut self, fans: &[HeldFan]) -> Result<StillOurs, HelperError> {
-        Ok(holder::still_ours(&self.reading()?, fans))
+        // Root put every fan in its record in manual itself, so a fan with
+        // no target yet is still its doing to hand back.
+        Ok(holder::still_ours(
+            &self.reading()?,
+            fans,
+            holder::Unwritten::Ours,
+        ))
     }
 
     /// One attempt of window `id`, which is current.

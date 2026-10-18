@@ -2537,9 +2537,12 @@ crashes or updates.
   90 °C (starting values, not yet measured).
 
 A mode command is never optimistic: it sends the mode, then reads the status until the state
-leaves `entering` and `releasing` (at most 20 s), and exits 0 only when the state is `holding`
-for `fixed` and `follow`, or `off` for `auto`. Otherwise it prints the state and exits 1 with the
-reason, for example `tcr: the fans are foreign (macsFanControl), not holding`.
+leaves `entering` and `releasing` (at most 36 s: the version call, two set-manuals at their
+15 s worst, and two set-targets), and exits 0 only when the wish is still the mode it sent and
+the state is `holding` for `fixed` and `follow`, or `off` for `auto`. Otherwise it prints the
+state and exits 1 with the reason, for example
+`tcr: the fans are foreign (macsFanControl), not holding`; a mode another command set in the
+meantime is `tcr: another command changed the fan mode before this one settled`.
 
 With no action it prints the wish, the state and the reason, then each fan as the server reads it
 (`actual`, `min`, `max`, the mode key, `F{n}Tg` as `target`, and what this server last `written`),
@@ -2550,9 +2553,13 @@ and `ftst`. `--json` prints the `fanControl` object below.
 Whose the fans are is judged on every 3 s tick, never remembered: a fan is this server's only
 while its `F{n}Tg` still reads the target it wrote (within 1 rpm). If Macs Fan Control runs, or
 another program moved a target, the state is `foreign` and nothing is written; a read that fails
-is `unknown` and nothing is written. When every fan reads automatic again (a wake from sleep, or
-someone handed back), the controller takes them again; more than 3 such re-entries in 10 minutes
-is `unavailable / contended`. Follow CPU writes a new target only when it moved at least 5 % of
+is `unknown` and nothing is written, and so is a reading that lost a fan the server holds (when
+the fan count does not read, no fan does). When every fan reads automatic again (a wake from
+sleep, or someone handed back), or one held fan does while the rest keep their targets, the
+controller takes them again; more than 3 such re-entries in 10 minutes is
+`unavailable / contended`. An entry that stops partway (Macs Fan Control starts, its probe fails,
+a call fails, or Auto or a stop arrives) hands back any fan it already set manual before it
+reports why. Follow CPU writes a new target only when it moved at least 5 % of
 the fan's range, reached an end, or the hot guard flipped.
 
 The wish and the hold record live in `~/.cache/tcr/fan.json`, never in the config file. A
@@ -2581,7 +2588,8 @@ file means Auto.
   answering; retried after 5, 10, 20, 40, then every 60 s, stopping after three failed tries in a
   row until the next command), `helperNoReply`, `helperSignature` (never retried on its own),
   `{"helperVersion": {"installed": 2}}`, `{"modeLocked": 1}` (that fan would not leave
-  automatic), `contended`, `helperRefused`. A reason that carries data is a one-key object.
+  automatic), `contended`, `helperRefused`, `controllerStopped` (the controller's thread stopped on
+  an internal error; a restart starts it again). A reason that carries data is a one-key object.
 - `targets`: what this server last wrote to each fan it holds.
 - `detail`: a sentence for a person, or `null`.
 - `sinceMs`: when the state, or the wish it serves, last changed.

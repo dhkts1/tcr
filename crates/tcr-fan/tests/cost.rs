@@ -5,7 +5,12 @@
 //! The controller's own tick runs over fakes (no helper is dialled, nothing is
 //! written), and the real per-tick cost is that plus one reader read and one probe.
 #![cfg(target_os = "macos")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::print_stdout,
+    reason = "a measurement run by hand: a failed setup should stop it, and it prints what it measured"
+)]
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -35,7 +40,9 @@ fn measure(n: u32, mut f: impl FnMut()) -> (Duration, Duration) {
     for _ in 0..n {
         f();
     }
-    ((thread_cpu() - cpu) / n, wall.elapsed() / n)
+    // A thread's CPU clock never runs backwards; saturating keeps a broken one at zero
+    // rather than panicking mid-measurement.
+    (thread_cpu().saturating_sub(cpu) / n, wall.elapsed() / n)
 }
 
 fn show(what: &str, (cpu, wall): (Duration, Duration)) {

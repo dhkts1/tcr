@@ -43,9 +43,12 @@ pub type Read<T = HeatRow> = Box<dyn FnMut() -> Option<T> + Send>;
 
 /// One reader and its last answer.
 ///
-/// Two locks on purpose. `reader` is held across the SMC read and only ever
-/// taken with `try_lock`, so nobody waits on it; `last` is held for a clone,
-/// so a caller that finds a read in flight can still answer from it.
+/// Two locks on purpose. `reader` is held across the SMC read. A status
+/// request takes it with `try_lock` ([`Self::get`]), so a status request never
+/// waits on it; the fan controller's thread takes it with a blocking `lock`
+/// ([`Self::refresh`]), because a tick must judge the fans from a reading
+/// taken now. `last` is held for a clone, so a caller that finds a read in
+/// flight can still answer from it.
 pub struct HeatCache<T = HeatRow> {
     max_age: Duration,
     reader: Mutex<Read<T>>,

@@ -3658,10 +3658,56 @@ const FAN_ROUTE: ControlRoute = ControlRoute {
     success_needs_stamp: true,
 };
 
-/// How long `tcr fan <mode>` waits for the controller to settle: a set-manual may take 15 s
-/// (the unlock), plus the version call and the targets.
-pub const FAN_SETTLE: Duration = Duration::from_secs(20);
+/// How long `tcr fan <mode>` waits for the controller to settle: the version call, then a
+/// set-manual per fan at its worst (the unlock, up to 15 s each; two fans on the Macs this
+/// was written for), then a set-target per fan. Built from the controller's own deadlines, so
+/// a longer one widens this too.
+pub const FAN_SETTLE: Duration = Duration::from_secs(
+    tcr_fan::controller::VERSION_DEADLINE.as_secs()
+        + 2 * tcr_fan::controller::SET_MANUAL_DEADLINE.as_secs()
+        + 2 * tcr_fan::controller::SET_TARGET_DEADLINE.as_secs(),
+);
 const FAN_POLL: Duration = Duration::from_millis(250);
+
+/// Where `tcr fan <mode>` stands after one status read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FanWait {
+    /// The controller has not taken the command yet, or is still entering or releasing.
+    Waiting,
+    /// The command was taken and the state no longer moves.
+    Settled,
+    /// The wish is no longer the one sent: another command replaced it.
+    Replaced,
+}
+
+/// One status read against the command sent at `sent_at` (wall ms).
+fn fan_wait(
+    request: crate::fan::FanRequest,
+    row: &tcr_status_wire::FanControlRow,
+    sent_at: i64,
+) -> FanWait {
+    if row.desired != request.desired_row() {
+        return FanWait::Replaced;
+    }
+    let moving = matches!(
+        row.state,
+        tcr_status_wire::FanStateRow::Entering | tcr_status_wire::FanStateRow::Releasing
+    );
+    if row.since_ms < sent_at || moving {
+        FanWait::Waiting
+    } else {
+        FanWait::Settled
+    }
+}
+
+/// Exit 0 only for the mode this command sent, settled in the state it means.
+fn fan_succeeded(
+    request: crate::fan::FanRequest,
+    row: &tcr_status_wire::FanControlRow,
+    sent_at: i64,
+) -> bool {
+    fan_wait(request, row, sent_at) == FanWait::Settled && row.state == request.settled_state()
+}
 
 fn live_status_why(error: &LiveStatusError, port: u16) -> String {
     match error {
@@ -3704,8 +3750,8 @@ async fn live_fan(
 
 /// `tcr fan`, all of it. With no `request`, print the state; with one, send it, wait for the
 /// state to settle, and say how it ended. Never optimistic: exit 0 only when the server
-/// reports the state the request means (holding for a manual mode, off for automatic), seen
-/// after the command was sent.
+/// reports the state the request means (holding for a manual mode, off for automatic), for
+/// the very mode it sent, seen after the command was sent ([`fan_succeeded`]).
 pub async fn fan(
     config_path: &Path,
     request: Option<crate::fan::FanRequest>,
@@ -3749,12 +3795,7 @@ pub async fn fan(
     let started = std::time::Instant::now();
     let (row, heat) = loop {
         let (row, heat) = live_fan(&config).await?;
-        let seen_after_send = row.since_ms >= sent_at;
-        let moving = matches!(
-            row.state,
-            tcr_status_wire::FanStateRow::Entering | tcr_status_wire::FanStateRow::Releasing
-        );
-        if (seen_after_send && !moving) || started.elapsed() >= FAN_SETTLE {
+        if fan_wait(request, &row, sent_at) != FanWait::Waiting || started.elapsed() >= FAN_SETTLE {
             break (row, heat);
         }
         tokio::time::sleep(FAN_POLL).await;
@@ -3764,8 +3805,12 @@ pub async fn fan(
     } else {
         print!("{}", render_fan_text(&row, heat.as_ref()));
     }
-    if row.state == request.settled_state() && row.since_ms >= sent_at {
+    if fan_succeeded(request, &row, sent_at) {
         return Ok(0);
+    }
+    if fan_wait(request, &row, sent_at) == FanWait::Replaced {
+        eprintln!("tcr: another command changed the fan mode before this one settled");
+        return Ok(1);
     }
     let reason = row
         .reason
@@ -8295,6 +8340,64 @@ mod tests {
             "desired=fixed 5000 rpm\nstate=foreign\nreason=macsFanControl\nhotGuard=off\n\
              cpu=61.0°C\nfan=0 actual=5013 min=1350 max=5777 mode=manual target=5000\nftst=0\n"
         );
+    }
+
+    /// `tcr fan fixed 5000` succeeds only for fixed 5000 itself: holding another mode, even
+    /// one newer than the command, is not its success.
+    #[test]
+    fn fan_cli_succeeds_only_for_the_mode_it_sent() {
+        use crate::fan::FanRequest;
+        use tcr_status_wire::{FanControlRow, FanDesiredRow, FanStateRow};
+        let sent_at = 1_000;
+        let at = |desired, state, since_ms| FanControlRow {
+            desired,
+            state,
+            reason: None,
+            hot_guard: false,
+            targets: vec![],
+            detail: None,
+            since_ms,
+        };
+        let request = FanRequest::Fixed { rpm: 5000 };
+        let ours = FanDesiredRow::Fixed { rpm: 5000 };
+        let other = FanDesiredRow::Fixed { rpm: 3000 };
+
+        let settled = at(ours, FanStateRow::Holding, 1_200);
+        assert_eq!(fan_wait(request, &settled, sent_at), FanWait::Settled);
+        assert!(fan_succeeded(request, &settled, sent_at));
+
+        let replaced = at(other, FanStateRow::Holding, 1_200);
+        assert_eq!(fan_wait(request, &replaced, sent_at), FanWait::Replaced);
+        assert!(!fan_succeeded(request, &replaced, sent_at));
+        let auto_replaced = at(FanDesiredRow::Auto, FanStateRow::Off, 1_200);
+        assert!(!fan_succeeded(request, &auto_replaced, sent_at));
+
+        // Not taken yet, or still entering: wait.
+        let before = at(ours, FanStateRow::Holding, 900);
+        assert_eq!(fan_wait(request, &before, sent_at), FanWait::Waiting);
+        assert!(!fan_succeeded(request, &before, sent_at));
+        let entering = at(ours, FanStateRow::Entering, 1_200);
+        assert_eq!(fan_wait(request, &entering, sent_at), FanWait::Waiting);
+
+        // Settled, but not holding.
+        let foreign = at(ours, FanStateRow::Foreign, 1_200);
+        assert_eq!(fan_wait(request, &foreign, sent_at), FanWait::Settled);
+        assert!(!fan_succeeded(request, &foreign, sent_at));
+
+        // `auto --force` is Auto.
+        let off = at(FanDesiredRow::Auto, FanStateRow::Off, 1_200);
+        assert!(fan_succeeded(
+            FanRequest::Auto { force: true },
+            &off,
+            sent_at
+        ));
+    }
+
+    /// The wait covers the version call, two worst-case set-manuals and two set-targets.
+    #[test]
+    fn fan_cli_waits_through_two_worst_case_set_manuals() {
+        assert!(FAN_SETTLE >= 2 * tcr_fan::controller::SET_MANUAL_DEADLINE);
+        assert_eq!(FAN_SETTLE, Duration::from_secs(36));
     }
 
     /// The fallback half of the same contract: with nothing listening, the live

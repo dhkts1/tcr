@@ -33,9 +33,22 @@ pub struct FanState {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HeldFan {
     pub fan: FanIndex,
-    /// `None` between set-manual and the first set-target: the fan is ours,
-    /// and no target of ours is on it yet.
+    /// `None` between set-manual and the first set-target: no target of ours
+    /// is on it yet. Whether that still makes the fan ours is [`Unwritten`].
     pub written_rpm: Option<f64>,
+}
+
+/// What a manual fan whose record carries no target (`written_rpm: None`)
+/// counts as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unwritten {
+    /// The holder is between its set-manual and its first set-target: root,
+    /// which put the fan in manual itself and judges its own record.
+    Ours,
+    /// The proxy's controller, outside its entry: an entry that ended hands
+    /// back, so a record with no target is a leftover, and a manual fan
+    /// carrying none of our targets is another program's.
+    NotOurs,
 }
 
 /// [`still_ours`]'s answer.
@@ -56,8 +69,11 @@ pub enum StillOurs {
 pub enum Holder {
     /// Every fan reads automatic.
     MacOs,
-    /// Every manual fan is ours ([`StillOurs::Ours`]).
+    /// Every fan held reads manual with our target ([`StillOurs::Ours`]).
     Ours,
+    /// Every manual fan is ours, and a fan we hold reads automatic again:
+    /// something put that one back, so it is not held.
+    PartlyAutomatic,
     /// Macs Fan Control is running: whatever the keys say, write nothing.
     MacsFanControl,
     /// A manual fan that is not ours.
@@ -70,8 +86,9 @@ pub enum Holder {
 ///
 /// A fan reading automatic is fine either way: macOS has it, or someone
 /// already handed it back. A held fan missing from the reading is unknown,
-/// never assumed gone.
-pub fn still_ours(reading: &[FanState], held: &[HeldFan]) -> StillOurs {
+/// never assumed gone. A manual fan whose record has no target yet is
+/// `unwritten`'s call.
+pub fn still_ours(reading: &[FanState], held: &[HeldFan], unwritten: Unwritten) -> StillOurs {
     for state in reading {
         match state.mode {
             FanMode::Unreadable => return StillOurs::Unknown { fan: state.fan },
@@ -80,40 +97,72 @@ pub fn still_ours(reading: &[FanState], held: &[HeldFan]) -> StillOurs {
                 let Some(ours) = held.iter().find(|h| h.fan == state.fan) else {
                     return StillOurs::Changed { fan: state.fan };
                 };
-                if let Some(written) = ours.written_rpm {
-                    let Some(target) = state.target_rpm else {
-                        return StillOurs::Unknown { fan: state.fan };
-                    };
-                    if (target - written).abs() > TARGET_TOLERANCE_RPM {
-                        return StillOurs::Changed { fan: state.fan };
+                match (ours.written_rpm, unwritten) {
+                    (Some(written), _) => {
+                        let Some(target) = state.target_rpm else {
+                            return StillOurs::Unknown { fan: state.fan };
+                        };
+                        if (target - written).abs() > TARGET_TOLERANCE_RPM {
+                            return StillOurs::Changed { fan: state.fan };
+                        }
                     }
+                    (None, Unwritten::Ours) => {}
+                    (None, Unwritten::NotOurs) => return StillOurs::Changed { fan: state.fan },
                 }
             }
         }
     }
-    if let Some(missing) = held
-        .iter()
-        .find(|h| !reading.iter().any(|s| s.fan == h.fan))
-    {
-        return StillOurs::Unknown { fan: missing.fan };
+    if let Some(missing) = missing(reading, held) {
+        return StillOurs::Unknown { fan: missing };
     }
     StillOurs::Ours
 }
 
-/// Who has the fans. `record` is what this program believes it holds (`None`:
-/// nothing). Macs Fan Control running wins over anything the keys say.
-pub fn classify(reading: &[FanState], record: Option<&[HeldFan]>, macs_running: bool) -> Holder {
+/// The first held fan the reading does not carry.
+fn missing(reading: &[FanState], held: &[HeldFan]) -> Option<FanIndex> {
+    held.iter()
+        .find(|h| !reading.iter().any(|s| s.fan == h.fan))
+        .map(|h| h.fan)
+}
+
+/// Who has the fans, for the proxy's controller. `record` is what it believes
+/// it holds (`None`: nothing). Macs Fan Control running wins over anything
+/// the keys say. A reading that lost a fan the record names (an empty one when
+/// `FNum` did not read) is unknown, never "macOS has them". A held fan with
+/// no target is `unwritten`'s call: ours only while the controller is
+/// entering.
+pub fn classify(
+    reading: &[FanState],
+    record: Option<&[HeldFan]>,
+    unwritten: Unwritten,
+    macs_running: bool,
+) -> Holder {
     if macs_running {
         return Holder::MacsFanControl;
     }
     if reading.iter().any(|s| s.mode == FanMode::Unreadable) {
         return Holder::Unknown;
     }
+    let held = record.unwrap_or(&[]);
+    if missing(reading, held).is_some() {
+        return Holder::Unknown;
+    }
     if reading.iter().all(|s| s.mode == FanMode::Auto) {
         return Holder::MacOs;
     }
-    match still_ours(reading, record.unwrap_or(&[])) {
-        StillOurs::Ours => Holder::Ours,
+    match still_ours(reading, held, unwritten) {
+        StillOurs::Ours => {
+            let dropped = held.iter().any(|h| {
+                reading
+                    .iter()
+                    .any(|s| s.fan == h.fan && s.mode == FanMode::Auto)
+            });
+            if dropped {
+                Holder::PartlyAutomatic
+            } else {
+                Holder::Ours
+            }
+        }
         StillOurs::Changed { .. } => Holder::AnotherApp,
         StillOurs::Unknown { .. } => Holder::Unknown,
     }
@@ -142,6 +191,11 @@ mod tests {
         }
     }
 
+    /// Root's judgement: a fan with no target yet is still its own doing.
+    fn by_root(reading: &[FanState], record: &[HeldFan]) -> StillOurs {
+        still_ours(reading, record, Unwritten::Ours)
+    }
+
     #[test]
     fn our_target_within_a_rpm_is_ours() {
         let reading = [
@@ -149,8 +203,11 @@ mod tests {
             state(1, FanMode::Manual, Some(3000.75)),
         ];
         let record = [held(0, Some(3000.0)), held(1, Some(3000.0))];
-        assert_eq!(still_ours(&reading, &record), StillOurs::Ours);
-        assert_eq!(classify(&reading, Some(&record), false), Holder::Ours);
+        assert_eq!(by_root(&reading, &record), StillOurs::Ours);
+        assert_eq!(
+            classify(&reading, Some(&record), Unwritten::NotOurs, false),
+            Holder::Ours
+        );
     }
 
     #[test]
@@ -158,10 +215,13 @@ mod tests {
         let reading = [state(0, FanMode::Manual, Some(4200.0))];
         let record = [held(0, Some(3000.0))];
         assert_eq!(
-            still_ours(&reading, &record),
+            by_root(&reading, &record),
             StillOurs::Changed { fan: fan(0) }
         );
-        assert_eq!(classify(&reading, Some(&record), false), Holder::AnotherApp);
+        assert_eq!(
+            classify(&reading, Some(&record), Unwritten::NotOurs, false),
+            Holder::AnotherApp
+        );
     }
 
     #[test]
@@ -172,35 +232,96 @@ mod tests {
         ];
         let record = [held(0, Some(3000.0))];
         assert_eq!(
-            still_ours(&reading, &record),
+            by_root(&reading, &record),
             StillOurs::Changed { fan: fan(1) }
         );
-        assert_eq!(classify(&reading, None, false), Holder::AnotherApp);
+        assert_eq!(
+            classify(&reading, None, Unwritten::NotOurs, false),
+            Holder::AnotherApp
+        );
     }
 
+    /// Root, between its set-manual and the first set-target, holds the fan;
+    /// the controller outside its entry does not.
     #[test]
-    fn entered_without_a_target_yet_is_ours() {
+    fn a_record_without_a_target_is_ours_only_while_entering() {
         let reading = [state(0, FanMode::Manual, Some(1800.0))];
-        assert_eq!(still_ours(&reading, &[held(0, None)]), StillOurs::Ours);
+        let record = [held(0, None)];
+        assert_eq!(by_root(&reading, &record), StillOurs::Ours);
+        assert_eq!(
+            still_ours(&reading, &record, Unwritten::NotOurs),
+            StillOurs::Changed { fan: fan(0) }
+        );
+        assert_eq!(
+            classify(&reading, Some(&record), Unwritten::NotOurs, false),
+            Holder::AnotherApp
+        );
     }
 
     #[test]
     fn unreadable_is_unknown_never_ours() {
         let record = [held(0, Some(3000.0))];
         assert_eq!(
-            still_ours(&[state(0, FanMode::Unreadable, None)], &record),
+            by_root(&[state(0, FanMode::Unreadable, None)], &record),
             StillOurs::Unknown { fan: fan(0) }
         );
         assert_eq!(
-            still_ours(&[state(0, FanMode::Manual, None)], &record),
+            by_root(&[state(0, FanMode::Manual, None)], &record),
             StillOurs::Unknown { fan: fan(0) }
         );
         assert_eq!(
-            classify(&[state(0, FanMode::Unreadable, None)], Some(&record), false),
+            classify(
+                &[state(0, FanMode::Unreadable, None)],
+                Some(&record),
+                Unwritten::NotOurs,
+                false
+            ),
             Holder::Unknown
         );
         // A held fan the reading lost.
-        assert_eq!(still_ours(&[], &record), StillOurs::Unknown { fan: fan(0) });
+        assert_eq!(by_root(&[], &record), StillOurs::Unknown { fan: fan(0) });
+    }
+
+    /// `FNum` that did not read gives an empty reading, and a fan that did
+    /// not read is left out: with a record, neither is "macOS has the fans".
+    #[test]
+    fn a_reading_missing_a_held_fan_is_unknown_never_macos() {
+        let record = [held(0, Some(3000.0)), held(1, Some(3000.0))];
+        assert_eq!(
+            classify(&[], Some(&record), Unwritten::NotOurs, false),
+            Holder::Unknown
+        );
+        assert_eq!(
+            classify(
+                &[state(0, FanMode::Auto, Some(0.0))],
+                Some(&record),
+                Unwritten::NotOurs,
+                false
+            ),
+            Holder::Unknown
+        );
+        // Without a record an empty reading is still nobody's.
+        assert_eq!(
+            classify(&[], None, Unwritten::NotOurs, false),
+            Holder::MacOs
+        );
+    }
+
+    /// One held fan back on automatic while the other keeps our target: not
+    /// ours to tick as if nothing happened.
+    #[test]
+    fn a_held_fan_back_on_automatic_is_partly_automatic() {
+        let reading = [
+            state(0, FanMode::Manual, Some(3000.0)),
+            state(1, FanMode::Auto, Some(0.0)),
+        ];
+        let record = [held(0, Some(3000.0)), held(1, Some(3000.0))];
+        assert_eq!(
+            classify(&reading, Some(&record), Unwritten::NotOurs, false),
+            Holder::PartlyAutomatic
+        );
+        // Root's disconnect rule still hands that back.
+        assert_eq!(by_root(&reading, &record), StillOurs::Ours);
     }
 
     #[test]
@@ -209,11 +330,11 @@ mod tests {
             state(0, FanMode::Auto, Some(0.0)),
             state(1, FanMode::Auto, Some(0.0)),
         ];
-        assert_eq!(classify(&reading, None, false), Holder::MacOs);
         assert_eq!(
-            still_ours(&reading, &[held(0, Some(3000.0))]),
-            StillOurs::Ours
+            classify(&reading, None, Unwritten::NotOurs, false),
+            Holder::MacOs
         );
+        assert_eq!(by_root(&reading, &[held(0, Some(3000.0))]), StillOurs::Ours);
     }
 
     #[test]
@@ -221,9 +342,12 @@ mod tests {
         let reading = [state(0, FanMode::Manual, Some(3000.0))];
         let record = [held(0, Some(3000.0))];
         assert_eq!(
-            classify(&reading, Some(&record), true),
+            classify(&reading, Some(&record), Unwritten::NotOurs, true),
             Holder::MacsFanControl
         );
-        assert_eq!(classify(&[], None, true), Holder::MacsFanControl);
+        assert_eq!(
+            classify(&[], None, Unwritten::NotOurs, true),
+            Holder::MacsFanControl
+        );
     }
 }

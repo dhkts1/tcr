@@ -132,32 +132,96 @@ impl FanFile {
 
 /// Read `fan.json`. Missing is Auto, quietly; anything else that stops it is
 /// Auto and one warning.
+#[cfg(test)]
 fn load(path: &Path) -> Option<Saved> {
+    load_file(path).0
+}
+
+/// [`load`], and the file as read, for [`FileStore`] to compare against.
+fn load_file(path: &Path) -> (Option<Saved>, Option<FanFile>) {
     match read_cache::<FanFile>(path, FAN_FILE_VERSION) {
-        CacheRead::Missing => None,
+        CacheRead::Missing => (None, None),
         CacheRead::Degraded(why) => {
             tracing::warn!(path = %path.display(), "fan control: ignored the saved fan mode ({why}); starting on automatic");
-            None
+            (None, None)
         }
-        CacheRead::Read(file) => match file.parse() {
-            Ok(saved) => Some(saved),
+        CacheRead::Read(file) => match file.clone().parse() {
+            Ok(saved) => (Some(saved), Some(file)),
             Err(why) => {
                 tracing::warn!(path = %path.display(), "fan control: ignored the saved fan mode ({why}); starting on automatic");
-                None
+                (None, Some(file))
             }
         },
     }
 }
 
+/// `fan.json`, written by one process at a time.
+///
+/// Across `tcr --replace` two proxies overlap: the new one's set-manual makes
+/// it root's holder and it saves a record with its own pid; the old one, on
+/// its way out, must not save over that (a `hold: None` from its shutdown
+/// would make the next start forget fans the new one holds). So a save
+/// checks the file first: when it changed since this process last read or
+/// wrote it, and it now names another process as the writer of a hold, the
+/// file is that process's and this one writes nothing more.
 struct FileStore {
     path: PathBuf,
+    pid: u32,
+    /// The file as this process last read or wrote it.
+    known: Option<FanFile>,
+    /// Said once that the file is another process's now.
+    yielded: bool,
+}
+
+impl FileStore {
+    /// The store for `path`, and the wish saved there.
+    fn open(path: PathBuf, pid: u32) -> (Self, Option<Saved>) {
+        let (saved, known) = load_file(&path);
+        (
+            Self {
+                path,
+                pid,
+                known,
+                yielded: false,
+            },
+            saved,
+        )
+    }
+
+    /// Another process wrote a hold of its own since this one last looked.
+    fn taken_by_another(&self) -> Option<u32> {
+        let CacheRead::Read(on_disk) = read_cache::<FanFile>(&self.path, FAN_FILE_VERSION) else {
+            return None;
+        };
+        if self.known.as_ref() == Some(&on_disk) {
+            return None;
+        }
+        on_disk
+            .hold
+            .map(|hold| hold.writer_pid)
+            .filter(|&writer| writer != self.pid)
+    }
 }
 
 impl Store for FileStore {
     fn save(&mut self, saved: &Saved) {
+        if let Some(writer) = self.taken_by_another() {
+            if !self.yielded {
+                self.yielded = true;
+                tracing::info!(
+                    path = %self.path.display(),
+                    writer,
+                    "fan control: the fan record now belongs to a newer tcr; this one leaves it alone"
+                );
+            }
+            return;
+        }
         let file = FanFile::of(saved, wall_ms());
-        if let Err(error) = write_cache(&self.path, &file, Layout::Pretty) {
-            tracing::warn!(path = %self.path.display(), %error, "fan control: could not save the fan mode");
+        match write_cache(&self.path, &file, Layout::Pretty) {
+            Ok(()) => self.known = Some(file),
+            Err(error) => {
+                tracing::warn!(path = %self.path.display(), %error, "fan control: could not save the fan mode");
+            }
         }
     }
 }
@@ -231,6 +295,22 @@ impl FanRequest {
         })
     }
 
+    /// The wish this request sets, as the status spells it. `auto --force`
+    /// sets Auto too.
+    pub const fn desired_row(self) -> FanDesiredRow {
+        match self {
+            Self::Auto { .. } => FanDesiredRow::Auto,
+            Self::Fixed { rpm } => FanDesiredRow::Fixed { rpm },
+            Self::FollowCpu {
+                quiet_below_c,
+                full_at_c,
+            } => FanDesiredRow::FollowCpu {
+                quiet_below_c,
+                full_at_c,
+            },
+        }
+    }
+
     /// The state that means this request is done: holding for a manual
     /// mode, off for automatic.
     pub const fn settled_state(self) -> FanStateRow {
@@ -290,6 +370,7 @@ const fn reason_row(why: Unavailable) -> FanReasonRow {
         Unavailable::ModeLocked { fan } => FanReasonRow::ModeLocked(fan),
         Unavailable::Contended => FanReasonRow::Contended,
         Unavailable::HelperRefused(_) => FanReasonRow::HelperRefused,
+        Unavailable::ControllerStopped => FanReasonRow::ControllerStopped,
     }
 }
 
@@ -311,6 +392,10 @@ fn detail_text(snapshot: &Snapshot) -> Option<String> {
         State::Unavailable(Unavailable::HelperRefused(error)) => {
             Some(format!("the helper refused: {error}"))
         }
+        State::Unavailable(Unavailable::ControllerStopped) => Some(
+            "the fan controller stopped on an internal error; restart tcr to control the fans again"
+                .to_string(),
+        ),
         _ => None,
     }
 }
@@ -384,7 +469,7 @@ impl FanHandle {
 /// Start the controller on its thread, from the wish saved at `file`. The
 /// binary's call, once the server is bound.
 pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
-    let saved = load(&file);
+    let (store, saved) = FileStore::open(file, std::process::id());
     let desired = saved.as_ref().map_or(FanMode::Auto, |s| s.desired);
     let (tx, rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
@@ -399,27 +484,33 @@ pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
         },
     }));
     let published = Arc::clone(&shown);
+    let after_panic = Arc::clone(&shown);
     let events = tx.clone();
     std::thread::Builder::new()
         .name("tcr-fan".into())
         .spawn(move || {
-            let parts = Parts {
-                helper: platform::helper(events),
-                heat: ProcessHeat(crate::heat::process()),
-                probe: platform::probe(),
-                clock: SystemClock,
-                store: FileStore { path: file },
-                inbox: rx,
-                log: Box::new(log_line),
-                publish: Box::new(move |snapshot: &Snapshot| {
-                    published
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .snapshot = snapshot.clone();
-                }),
-                pid: std::process::id(),
-            };
-            Controller::new(parts, saved).run();
+            run_guarded(
+                move || {
+                    let parts = Parts {
+                        helper: platform::helper(events),
+                        heat: ProcessHeat(crate::heat::process()),
+                        probe: platform::probe(),
+                        clock: SystemClock,
+                        store,
+                        inbox: rx,
+                        log: Box::new(log_line),
+                        publish: Box::new(move |snapshot: &Snapshot| {
+                            published
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .snapshot = snapshot.clone();
+                        }),
+                        pid: std::process::id(),
+                    };
+                    Controller::new(parts, saved).run();
+                },
+                &after_panic,
+            );
             if done_tx.send(()).is_err() {
                 // Nobody waits on the stop: the handle is gone.
             }
@@ -429,6 +520,31 @@ pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
         shown,
         done: Mutex::new(done_rx),
     }))
+}
+
+/// Run the controller; a panic on its thread publishes
+/// `unavailable / controllerStopped` instead of leaving the last snapshot
+/// (say, "holding") standing for a controller that is gone. The panic drops
+/// the helper connection on its way out, so root judges the fans and hands
+/// back what is still its doing.
+fn run_guarded(run: impl FnOnce(), shown: &Mutex<Shown>) {
+    let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) else {
+        return;
+    };
+    let why = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".to_string());
+    tracing::error!(%why, "fan control: the controller stopped; restart tcr to control the fans again");
+    let mut shown = shown.lock().unwrap_or_else(PoisonError::into_inner);
+    shown.snapshot = Snapshot {
+        state: State::Unavailable(Unavailable::ControllerStopped),
+        hot_guard: false,
+        targets: Vec::new(),
+        detail: None,
+        since_ms: wall_ms(),
+    };
 }
 
 /// A handle on a real controller thread that can reach nothing: no SMC, no
@@ -960,7 +1076,7 @@ mod tests {
                 ],
             }),
         };
-        FileStore { path: path.clone() }.save(&saved);
+        FileStore::open(path.clone(), 4242).0.save(&saved);
         assert_eq!(load(&path), Some(saved));
         let text = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -982,5 +1098,92 @@ mod tests {
         assert_eq!(load(&path), None, "an out-of-range wish is not obeyed");
         std::fs::write(&path, "{").unwrap();
         assert_eq!(load(&path), None);
+    }
+
+    fn held_by(pid: u32, hold: bool) -> Saved {
+        Saved {
+            desired: FanMode::Fixed {
+                rpm: Rpm::new(5000).unwrap(),
+            },
+            hold: hold.then(|| Hold {
+                writer_pid: pid,
+                fans: vec![HeldFan {
+                    fan: fan(0),
+                    written_rpm: Some(5000.0),
+                }],
+            }),
+        }
+    }
+
+    /// `tcr --replace`: the new process takes the record over and writes its
+    /// own; the old one's shutdown, clearing its hold, must not save over it.
+    #[test]
+    fn fan_file_an_old_process_never_overwrites_a_newer_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fan.json");
+        let (mut old, _) = FileStore::open(path.clone(), 100);
+        old.save(&held_by(100, true));
+
+        let (mut new, saved) = FileStore::open(path.clone(), 200);
+        assert_eq!(saved, Some(held_by(100, true)));
+        new.save(&held_by(200, true));
+
+        old.save(&held_by(100, false));
+        assert_eq!(
+            load(&path),
+            Some(held_by(200, true)),
+            "the newer record stands"
+        );
+        old.save(&held_by(100, true));
+        assert_eq!(load(&path), Some(held_by(200, true)));
+
+        // The newer process still writes its own file.
+        new.save(&held_by(200, false));
+        assert_eq!(load(&path), Some(held_by(200, false)));
+    }
+
+    /// A record a process now gone left behind, unchanged since this one
+    /// read it at boot, is this one's to clear (the boot drops a record the
+    /// fans no longer match).
+    #[test]
+    fn fan_file_a_record_from_a_process_gone_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fan.json");
+        FileStore::open(path.clone(), 100)
+            .0
+            .save(&held_by(100, true));
+        let (mut next, _) = FileStore::open(path.clone(), 300);
+        next.save(&held_by(300, false));
+        assert_eq!(load(&path), Some(held_by(300, false)));
+    }
+
+    /// A panic on the controller's thread leaves `unavailable /
+    /// controllerStopped`, never the last state it published.
+    #[test]
+    fn fan_status_a_panicked_controller_reads_unavailable() {
+        let fixed = FanMode::Fixed {
+            rpm: Rpm::new(5000).unwrap(),
+        };
+        let holding = || {
+            Mutex::new(Shown {
+                desired: fixed,
+                snapshot: snapshot(State::Holding, &[(0, 5000.0), (1, 5000.0)], None),
+            })
+        };
+        let shown = holding();
+        run_guarded(|| panic!("a controller bug"), &shown);
+        let after = {
+            let shown = shown.lock().unwrap();
+            row(shown.desired, &shown.snapshot)
+        };
+        assert_eq!(after.state, FanStateRow::Unavailable);
+        assert_eq!(after.reason, Some(FanReasonRow::ControllerStopped));
+        assert_eq!(after.targets, vec![]);
+        assert!(after.detail.is_some_and(|d| d.contains("restart tcr")));
+
+        // A run that returns leaves what it published.
+        let shown = holding();
+        run_guarded(|| {}, &shown);
+        assert_eq!(shown.lock().unwrap().snapshot.state, State::Holding);
     }
 }

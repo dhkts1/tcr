@@ -514,6 +514,8 @@ pub enum FanReasonRow {
     ModeLocked(u64),
     Contended,
     HelperRefused,
+    /// The proxy's fan controller stopped on an internal error; a restart starts it again.
+    ControllerStopped,
 }
 
 impl FanReasonRow {
@@ -532,6 +534,7 @@ impl FanReasonRow {
             Self::ModeLocked(_) => "modeLocked",
             Self::Contended => "contended",
             Self::HelperRefused => "helperRefused",
+            Self::ControllerStopped => "controllerStopped",
         }
     }
 }

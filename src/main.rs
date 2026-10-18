@@ -6250,7 +6250,6 @@ async fn run_doctor(args: DoctorArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `tcr sessions [--json]` — the running proxy's live sessions.
 /// `tcr fan [auto [--force] | fixed <RPM> | follow <QUIET_C> <FULL_C>]`.
 async fn run_fan(args: FanArgs) -> anyhow::Result<()> {
     use tcr::fan::FanRequest;
@@ -6271,6 +6270,7 @@ async fn run_fan(args: FanArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `tcr sessions [--json]` — the running proxy's live sessions.
 async fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
     let config_path = args.config.path();
     cli::sessions(&config_path, args.json).await
