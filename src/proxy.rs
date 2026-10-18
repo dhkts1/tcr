@@ -1796,13 +1796,18 @@ async fn status_method_not_allowed() -> Response {
 /// This is an **attack surface on a process holding every account's OAuth access
 /// and refresh token**, so it is gated twice — origin and key, see
 /// [`local_endpoint_gate`] for both and for why bind scope is not authorization —
-/// and reads nothing but state that is already on screen in the TUI.
+/// and reads nothing but state that is already on screen in the TUI, plus the
+/// machine's heat.
 ///
 /// It takes only [`Parts`](axum::http::request::Parts), so the request body is
-/// never read; it touches no `&mut` state, triggers no probe, no token refresh
-/// and no config write; and it returns the [`crate::status`] projection, which
-/// carries no token, no key and no `Authorization` echo (see that module's
-/// no-secret invariant).
+/// never read. It touches no account state, triggers no account probe, no token
+/// refresh and no config write. The one thing it does besides read is the heat:
+/// [`crate::heat::current`] may run an AppleSMC read on the blocking pool and
+/// writes the result into that module's own cache, waiting at most
+/// [`crate::heat::READ_DEADLINE`] for it. It returns the [`crate::status`]
+/// projection, which carries no token, no key and no `Authorization` echo (see
+/// that module's no-secret invariant; a temperature and fan speeds are not
+/// secrets).
 async fn status_handler(
     State(manager): State<Arc<Manager>>,
     parts: axum::http::request::Parts,
@@ -1861,6 +1866,12 @@ async fn status_handler(
         payload.unkeyed_connects = Some(connects);
         payload.unkeyed_requests = Some(requests);
     }
+    // Read on the blocking pool and kept for two seconds (`crate::heat`), so a
+    // burst of status requests costs one SMC read and none of it runs on this
+    // worker. Absent where there is no AppleSMC.
+    payload.heat = crate::heat::current()
+        .await
+        .map(crate::status::HeatField::Reading);
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a
         // proxy never panics on a client request — surface it as a 500 instead.
@@ -11339,6 +11350,48 @@ mod tests {
         let payload: crate::status::StatusPayload =
             serde_json::from_slice(&body).expect("a tcr status payload");
         assert_eq!(payload.mitm, Some(recorded));
+    }
+
+    /// The endpoint carries the machine's heat exactly where there is an
+    /// AppleSMC to read: a reading with a CPU figure on a Mac that has one, no
+    /// key at all in a VM or on Linux.
+    ///
+    /// The process's heat cache is shared with every other status test in this
+    /// binary, and a request that finds a read in flight answers without one
+    /// (`crate::heat`), so the first request may carry none. It asks for up to
+    /// two seconds before concluding there is no heat.
+    #[tokio::test]
+    async fn status_endpoint_carries_heat_where_there_is_an_smc() {
+        let manager = Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
+        let mut smc = tcr_smc::HeatSource::open(Box::new(|_| {}));
+        let has_smc = smc
+            .read()
+            .is_some_and(|reading| reading.cpu_celsius.is_some());
+        let mut wire = Value::Null;
+        for _ in 0..40 {
+            let (status, _, body) = status_request(
+                Arc::clone(&manager),
+                Method::GET,
+                Some(loopback_peer()),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            wire = serde_json::from_slice(&body).expect("json");
+            if wire.get("heat").is_some() || !has_smc {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if has_smc {
+            let cpu = wire["heat"]["cpuCelsius"].as_f64();
+            assert!(
+                cpu.is_some_and(|c| tcr_smc::PLAUSIBLE_CELSIUS.contains(&c)),
+                "{wire}"
+            );
+        } else {
+            assert!(wire.get("heat").is_none(), "no SMC, no key: {wire}");
+        }
     }
 
     /// THE BITING TEST for the whole change: the endpoint reports the counters of

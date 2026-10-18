@@ -3624,8 +3624,22 @@ fn payload_carries_sessions(body: &str) -> bool {
 /// An OBJECT, deliberately, where `tcr status --json` is a bare array: the
 /// `supported` flag has nowhere to live in an array, and putting it there is
 /// what would have forced a breaking change on `status`'s existing contract.
-fn render_sessions_json(supported: bool, sessions: &[tcr_status_wire::SessionRow]) -> String {
-    serde_json::json!({ "supported": supported, "sessions": sessions }).to_string()
+///
+/// `heat` rides here too, as a `heat` key present only when the server read one
+/// ([`crate::status::StatusPayload::heat`]). The panel cannot read the proxy's
+/// endpoint itself (it never holds the proxy key), so it needs a shell-out, and
+/// this object is the one it already makes on every poll that has a top level
+/// for a machine-wide fact; `status --json` is a bare array of accounts.
+fn render_sessions_json(
+    supported: bool,
+    sessions: &[tcr_status_wire::SessionRow],
+    heat: Option<&tcr_status_wire::HeatRow>,
+) -> String {
+    let mut document = serde_json::json!({ "supported": supported, "sessions": sessions });
+    if let Some(heat) = heat {
+        document["heat"] = serde_json::json!(heat);
+    }
+    document.to_string()
 }
 
 /// The `tcr sessions` text form: a `supported=… sessions=…` header, then one line per
@@ -3731,12 +3745,25 @@ pub async fn sessions(config_path: &Path, json: bool) -> anyhow::Result<()> {
         eprintln!("{line}");
     }
 
+    // A heat object this build cannot read is left out of the document and
+    // said on stderr, beside the skew line, rather than failing the command.
+    if let Some(crate::status::HeatField::Unreadable(why)) = &payload.heat {
+        eprintln!("tcr: the server's heat reading did not parse, so it is left out: {why}");
+    }
+
     if json {
         // The rows cross verbatim as the wire emitted them — `SessionRow` is
         // the shared `tcr-status-wire` type both the proxy and the panel's
         // Swift decoder are written against, so re-shaping it here would be a
         // second contract to keep in step with the first.
-        println!("{}", render_sessions_json(supported, &payload.sessions));
+        let heat = payload
+            .heat
+            .as_ref()
+            .and_then(crate::status::HeatField::reading);
+        println!(
+            "{}",
+            render_sessions_json(supported, &payload.sessions, heat)
+        );
     } else {
         print!("{}", render_sessions_text(supported, &payload.sessions));
     }
@@ -7938,7 +7965,7 @@ mod tests {
             unpriced_requests: 0,
             reasoning_tokens: 0,
         };
-        let rendered = render_sessions_json(true, std::slice::from_ref(&row));
+        let rendered = render_sessions_json(true, std::slice::from_ref(&row), None);
         let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
         assert_eq!(value["supported"], serde_json::json!(true));
         // camelCase keys, exactly as the Swift `Session` decoder names them
@@ -7964,9 +7991,40 @@ mod tests {
 
         // The unsupported document still carries both keys, so the client
         // never has to tell "absent" from "false".
-        let empty = render_sessions_json(false, &[]);
+        let empty = render_sessions_json(false, &[], None);
         let value: serde_json::Value = serde_json::from_str(&empty).expect("valid JSON");
         assert_eq!(value["supported"], serde_json::json!(false));
+        assert_eq!(value["sessions"], serde_json::json!([]));
+        assert!(
+            value.get("heat").is_none(),
+            "no heat key without a reading: {value}"
+        );
+    }
+
+    /// The server's heat reading crosses `tcr sessions --json` whole, under the
+    /// camelCase keys `FleetStatus.swift`'s `HeatReading` decodes.
+    #[test]
+    fn sessions_json_carries_the_heat_reading() {
+        let heat = tcr_status_wire::HeatRow {
+            cpu_celsius: Some(61.0),
+            fans: vec![tcr_status_wire::FanRow {
+                index: 1,
+                actual_rpm: 5013.0,
+                min_rpm: 1350.0,
+                max_rpm: 5777.0,
+                manual: false,
+            }],
+        };
+        let rendered = render_sessions_json(true, &[], Some(&heat));
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(
+            value["heat"],
+            serde_json::json!({
+                "cpuCelsius": 61.0,
+                "fans": [{"index": 1, "actualRpm": 5013.0, "minRpm": 1350.0,
+                          "maxRpm": 5777.0, "manual": false}],
+            })
+        );
         assert_eq!(value["sessions"], serde_json::json!([]));
     }
 
@@ -10801,9 +10859,12 @@ mod tests {
     /// whose bytes are the ones it had before Codex existed.
     #[test]
     fn canonical_codex_sessions_match_the_renderer() {
-        let rendered: serde_json::Value =
-            serde_json::from_str(&render_sessions_json(true, &canonical_codex_sessions()))
-                .expect("valid JSON");
+        let rendered: serde_json::Value = serde_json::from_str(&render_sessions_json(
+            true,
+            &canonical_codex_sessions(),
+            None,
+        ))
+        .expect("valid JSON");
         let fixture = canonical_fixture("codex-sessions.json");
         let (Some(got), Some(want)) = (
             rendered["sessions"].as_array(),

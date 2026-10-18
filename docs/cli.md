@@ -1822,6 +1822,40 @@ A server that has the key always sends it, MITM off included, and a server built
 it out. That difference is how `tcr run --codex` tells an older proxy from one running without
 MITM.
 
+### The `heat` object on `GET /_tcr/status`
+
+How hot the serving Mac's CPU runs and how hard its fans work, read by the proxy through AppleSMC
+without root (`crates/tcr-smc`). It is on the raw `/_tcr/status` document and on `tcr sessions
+--json`'s object (see [`tcr sessions`](#tcr-sessions)), never in `tcr status --json`'s array: it
+describes the machine, not an account.
+
+```
+"heat": {
+  "cpuCelsius": 61.3,
+  "fans": [
+    {"index": 0, "actualRpm": 2401.5, "minRpm": 1350.0, "maxRpm": 5777.0, "manual": false},
+    {"index": 1, "actualRpm": 2398.0, "minRpm": 1350.0, "maxRpm": 5777.0, "manual": false}
+  ]
+}
+```
+
+- `cpuCelsius` is the hottest CPU sensor: `TCMz` where the Mac has it, otherwise the hottest `Tp*`
+  sensor. Readings outside 0.5 to 150 °C are dropped as sensors that are not fitted or not powered.
+  The key is absent when no CPU sensor read.
+- `fans` has one entry per fan whose speed read, and is empty on a Mac with no fans. `index` is
+  0-based, the `n` in the SMC's `F{n}Ac`. `minRpm` or `maxRpm` is 0 when it did not read. `manual`
+  says the fan's mode key reads "forced": a program fixed the speed, so it no longer follows the
+  heat.
+- An SMC that opened and read nothing gives `{"fans": []}`. One that refused to open gives the
+  same, and the proxy tries to open it again a minute later.
+
+The whole key is absent where there is no AppleSMC (a virtual machine, Linux), and from a server
+built before it. One reading answers for 2 seconds, so a burst of status requests costs one SMC
+read. A request never queues behind a read that is still running: it waits at most 500 ms, and
+otherwise answers with the last reading, or with no key when there has never been one. A client
+that cannot parse the object (one built for a later shape, say) leaves the heat out and keeps the
+rest of the payload. `tcr sessions` says so on stderr.
+
 ### The request key on `GET /_tcr/status`
 
 Also on the raw `/_tcr/status` document only, like `mitm`: whether the serving process holds a
@@ -2202,6 +2236,11 @@ anything in it. A proxy built before sessions existed and a completely idle one 
 rows, and the panel has a different sentence for each, so the two must stay distinguishable. The
 rows themselves are the same `SessionRow` shape `tcr status --json`'s payload documents above,
 verbatim.
+
+The object also carries the server's [`heat`](#the-heat-object-on-get-_tcrstatus) reading when
+there is one, under a `heat` key. The key is absent when the server read none. TcrBar's machine
+line on the Tools tab reads its CPU and fan figures from here, because the app reads no SMC
+itself.
 
 ```
 $ tcr sessions

@@ -3257,6 +3257,14 @@ public struct Fleet: Equatable, Sendable {
     /// them into one wrong one.
     public let sessionsChannel: SessionsChannel
 
+    /// How hot the serving Mac runs and how hard its fans work, as the proxy
+    /// read them through AppleSMC (`crates/tcr-smc`, `StatusPayload::heat`).
+    /// Arrives on the same `tcr sessions --json` object as ``sessions``, and
+    /// for the same reason: `tcr status --json` is a bare array of accounts
+    /// with no place for a machine-wide fact. Nil when the proxy has no SMC to
+    /// read, predates the key, or the sessions half of the poll failed.
+    public let heat: HeatReading?
+
     /// Whether the CURRENT read populated ``sessions`` at all — distinct from
     /// an empty ``sessions``, which is also true of a server with nothing live
     /// right now. Derived from ``sessionsChannel`` rather than stored beside
@@ -3287,13 +3295,15 @@ public struct Fleet: Equatable, Sendable {
         unreadable: [UnreadableRow] = [],
         sessions: [Session] = [],
         sessionsChannel: SessionsChannel,
-        unreadableSessions: [UnreadableRow] = []
+        unreadableSessions: [UnreadableRow] = [],
+        heat: HeatReading? = nil
     ) {
         self.accounts = accounts
         self.unreadable = unreadable
         self.sessions = sessions
         self.sessionsChannel = sessionsChannel
         self.unreadableSessions = unreadableSessions
+        self.heat = heat
     }
 
     /// What the `tcr sessions --json` half of a poll produced.
@@ -3333,15 +3343,19 @@ public struct Fleet: Equatable, Sendable {
         /// Rows that would not decode, same rule ``decode(_:)`` follows for
         /// accounts: one bad row costs one row, never the tab.
         public let unreadable: [UnreadableRow]
+        /// The document's `heat` object, see ``Fleet/heat``.
+        public let heat: HeatReading?
 
         public init(
             sessions: [Session] = [],
             channel: SessionsChannel,
-            unreadable: [UnreadableRow] = []
+            unreadable: [UnreadableRow] = [],
+            heat: HeatReading? = nil
         ) {
             self.sessions = sessions
             self.channel = channel
             self.unreadable = unreadable
+            self.heat = heat
         }
     }
 
@@ -3353,7 +3367,32 @@ public struct Fleet: Equatable, Sendable {
             unreadable: unreadable,
             sessions: read.sessions,
             sessionsChannel: read.channel,
-            unreadableSessions: read.unreadable)
+            unreadableSessions: read.unreadable,
+            heat: read.heat)
+    }
+
+    /// The document's `heat` object, or nil when there is none. Every key of
+    /// it is optional (``HeatReading``'s decoder), so only a `heat` that is
+    /// not an object, or a key of the wrong type, fails here; that costs the
+    /// heat clause and nothing else, the same containment the session rows
+    /// get, and the line draws as it does with no SMC. The failure is logged,
+    /// once per distinct message (``HeatDecodeLog``), so a bad object that
+    /// arrives every poll is one line, not one every three seconds.
+    static func decodeHeat(_ value: Any?, log: (String) -> Void = HeatDecodeLog.shared.once)
+        -> HeatReading?
+    {
+        guard let value else { return nil }
+        guard JSONSerialization.isValidJSONObject(value) else {
+            log("TcrBar: the poll's heat reading is not a JSON object; left out")
+            return nil
+        }
+        do {
+            let data = try JSONSerialization.data(withJSONObject: value, options: [])
+            return try JSONDecoder().decode(HeatReading.self, from: data)
+        } catch {
+            log("TcrBar: the poll's heat reading did not decode, so it is left out: \(error)")
+            return nil
+        }
     }
 
     /// Decode `{"supported": Bool, "sessions": [...]}` — `tcr sessions
@@ -3385,8 +3424,9 @@ public struct Fleet: Equatable, Sendable {
                 )
             )
         }
+        let heat = decodeHeat(object["heat"])
         guard supported else {
-            return SessionsRead(channel: .serverPredatesSessions)
+            return SessionsRead(channel: .serverPredatesSessions, heat: heat)
         }
 
         let rows = object["sessions"] as? [Any] ?? []
@@ -3409,7 +3449,8 @@ public struct Fleet: Equatable, Sendable {
                 unreadable.append(UnreadableRow(index: index, message: "\(error)"))
             }
         }
-        return SessionsRead(sessions: sessions, channel: .live, unreadable: unreadable)
+        return SessionsRead(
+            sessions: sessions, channel: .live, unreadable: unreadable, heat: heat)
     }
 
     private enum CodingKeys: String, CodingKey {
