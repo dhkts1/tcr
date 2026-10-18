@@ -3,8 +3,9 @@
 //!
 //! Reading needs no privilege. Writing does: a non-root write came back
 //! `kIOReturnNotPrivileged` (0xe00002c1) on 2026-10-18, so
-//! [`SmcConnection::write`] exists for a root helper built on this crate, and
-//! nothing in tcr itself writes a fan.
+//! [`SmcConnection::write`] and [`FanWriter`], the sequence that takes fans
+//! from macOS and gives them back, exist for a root helper built on this
+//! crate, and nothing in tcr itself writes a fan.
 //!
 //! # Where this came from
 //!
@@ -336,6 +337,15 @@ pub trait KeySource {
     fn keys(&mut self) -> Result<Vec<FourCc>, SmcError>;
 }
 
+/// What [`FanWriter`] needs on top of reading: one write. Its own trait, so
+/// the reader's key source cannot write, and a writer's fake can.
+///
+/// An implementation sends nothing unless `value` is the key's own type and
+/// size ([`check_write`]), as [`SmcConnection::write`] does.
+pub trait KeyAccess: KeySource {
+    fn write(&mut self, key: FourCc, value: &SmcValue) -> Result<(), SmcError>;
+}
+
 #[cfg(target_os = "macos")]
 pub use macos::SmcConnection;
 
@@ -345,7 +355,9 @@ mod macos {
     use std::ffi::{c_char, c_void};
     use std::marker::PhantomData;
 
-    use super::{FourCc, KeySource, MAX_VALUE_SIZE, SmcError, SmcKeyInfo, SmcValue, check_write};
+    use super::{
+        FourCc, KeyAccess, KeySource, MAX_VALUE_SIZE, SmcError, SmcKeyInfo, SmcValue, check_write,
+    };
 
     type MachPort = u32;
     type KernReturn = i32;
@@ -652,6 +664,12 @@ mod macos {
 
         fn keys(&mut self) -> Result<Vec<FourCc>, SmcError> {
             Self::keys(self)
+        }
+    }
+
+    impl KeyAccess for SmcConnection {
+        fn write(&mut self, key: FourCc, value: &SmcValue) -> Result<(), SmcError> {
+            Self::write(self, key, value)
         }
     }
 }
@@ -1131,6 +1149,427 @@ impl<S: KeySource> HeatSource<S> {
     }
 }
 
+// The fan writer.
+
+/// Ten fans at most: the `n` in `F{n}Md` is one digit.
+pub const MAX_FANS: u8 = 10;
+/// How long [`FanWriter::set_manual`] waits after raising `Ftst` for macOS's
+/// thermal daemon to let go of the fans. Stats waits the same
+/// (`SMC/smc.swift:590`, `usleep(3_000_000)`). Unmeasured here.
+pub const UNLOCK_SETTLE: Duration = Duration::from_secs(3);
+/// After [`UNLOCK_SETTLE`], the mode write is tried this many times,
+/// [`MODE_RETRY_GAP`] apart. Stats allows 300; 50 bounds a stuck unlock to
+/// about 8 s. Unmeasured.
+pub const MODE_RETRIES: usize = 50;
+pub const MODE_RETRY_GAP: Duration = Duration::from_millis(100);
+/// Every hand-back write is tried this many times, [`HAND_BACK_GAP`] apart, as
+/// Stats' `writeWithRetry` does: it is the write that must not be lost.
+/// Unmeasured.
+pub const HAND_BACK_TRIES: usize = 10;
+pub const HAND_BACK_GAP: Duration = Duration::from_millis(50);
+
+const UNLOCK_KEY: FourCc = FourCc::new(*b"Ftst");
+
+/// Where a [`FanWriter`]'s waits go: [`std::thread::sleep`] in a helper, a
+/// recorder in a test, so the 3 s unlock takes no time and every wait counts.
+pub type Sleeper = Box<dyn FnMut(Duration) + Send>;
+
+/// One fan's own speed range, from `F{n}Mn` and `F{n}Mx`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FanLimits {
+    pub min_rpm: f64,
+    pub max_rpm: f64,
+}
+
+impl FanLimits {
+    /// `rpm` inside the range. NaN and the infinities are refused, never
+    /// clamped: a caller sending one has a bug, and full speed or minimum are
+    /// both guesses about what it meant.
+    pub const fn clamp(self, rpm: f64) -> Result<f64, FanError> {
+        if !rpm.is_finite() {
+            return Err(FanError::NotANumber);
+        }
+        Ok(rpm.max(self.min_rpm).min(self.max_rpm))
+    }
+}
+
+/// A fan's mode key, three ways. Never a `bool`: a read that fails is
+/// `Unreadable`, which a controller treats as "unknown, write nothing", where
+/// a `false` would read as "macOS has it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanMode {
+    /// 0, or 3 (Stats' second automatic value).
+    Auto,
+    /// 1: a program fixed this fan's speed.
+    Manual,
+    /// The key did not read, is not a `ui8`, holds another value, or this Mac
+    /// has no mode key at all.
+    Unreadable,
+}
+
+/// After a hand-back, what still did not read 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandBackIncomplete {
+    /// Bit `n` set: fan `n`'s mode key still reads other than 0, or did not
+    /// read. A fan with no mode key at all has nothing to hand back.
+    pub fans: u16,
+    /// `Ftst` still reads other than 0, or did not read. `false` when absent.
+    pub ftst: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FanError {
+    /// `fan` is not below `count`, this Mac's `FNum` capped at [`MAX_FANS`].
+    NoSuchFan {
+        fan: FanIndex,
+        count: u8,
+    },
+    /// An rpm that is NaN or infinite, refused rather than clamped.
+    NotANumber,
+    /// `Mn` or `Mx` is not finite, or the minimum is above the maximum: no
+    /// range to clamp into, and no guess at one.
+    LimitsUnreadable {
+        fan: FanIndex,
+    },
+    /// The mode key stayed automatic through the whole unlock sequence, or
+    /// was refused on a Mac with no `Ftst` to unlock it with.
+    ModeLocked {
+        fan: FanIndex,
+    },
+    /// A read or write failed: the SMC's own error, kept whole. A wrong type
+    /// or size is a bug in the writer or a Mac it does not know, never a lock.
+    Smc(SmcError),
+    HandBackIncomplete(HandBackIncomplete),
+}
+
+impl fmt::Display for FanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoSuchFan { fan, count } => {
+                write!(f, "no fan {} (this Mac has {count})", fan.get())
+            }
+            Self::NotANumber => write!(f, "rpm is not a finite number"),
+            Self::LimitsUnreadable { fan } => {
+                write!(f, "fan {}'s Mn/Mx are not a usable range", fan.get())
+            }
+            Self::ModeLocked { fan } => write!(f, "fan {} would not leave automatic", fan.get()),
+            Self::Smc(error) => write!(f, "SMC: {error}"),
+            Self::HandBackIncomplete(HandBackIncomplete { fans, ftst }) => write!(
+                f,
+                "hand-back incomplete: fans {fans:#06x} not automatic, Ftst raised: {ftst}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FanError {}
+
+impl From<SmcError> for FanError {
+    fn from(error: SmcError) -> Self {
+        Self::Smc(error)
+    }
+}
+
+/// [`FanWriter::set_manual`] succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Entered {
+    /// This call raised `Ftst` (the mode key refused the direct write).
+    pub unlocked: bool,
+}
+
+/// [`FanWriter::set_manual`] failed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SetManualFailed {
+    pub cause: FanError,
+    /// `None` when the call failed before trying any write (no such fan, or
+    /// `FNum` did not read), so there was nothing to undo. Otherwise every fan
+    /// was handed back before returning, and this is how that went.
+    pub hand_back: Option<Result<(), FanError>>,
+}
+
+/// The writes that take fans out of macOS's hands and give them back, in the
+/// order Apple Silicon wants. A port of `FanWriter` in the Swift
+/// `FanControlPolicy.swift` (`e642c541`), with the hand-back order of Stats
+/// (exelban/stats, MIT, `SMC/smc.swift`: modes first in `setFanMode`, then
+/// `Ftst` in `resetFanControl`), and a re-read after it.
+///
+/// It writes only `F{n}md`/`F{n}Md` (0 or 1), `F{n}Tg` and `Ftst` (0 or 1).
+/// It keeps no record of what it holds: who holds the fans is the caller's
+/// question, answered from the keys themselves.
+///
+/// Not locked: every call takes `&mut self`, and a root helper calls it from
+/// one serial queue.
+pub struct FanWriter<K> {
+    smc: K,
+    sleep: Sleeper,
+    /// `F0md` exists (`Some(true)`), does not (`Some(false)`), or has not been
+    /// asked yet.
+    mode_key_is_lower: Option<bool>,
+}
+
+impl<K: KeyAccess> FanWriter<K> {
+    /// A writer that waits with [`std::thread::sleep`].
+    pub fn new(smc: K) -> Self {
+        Self::with_sleeper(smc, Box::new(std::thread::sleep))
+    }
+
+    pub fn with_sleeper(smc: K, sleep: Sleeper) -> Self {
+        Self {
+            smc,
+            sleep,
+            mode_key_is_lower: None,
+        }
+    }
+
+    /// The key source, for a test that reads what was written.
+    pub const fn source(&self) -> &K {
+        &self.smc
+    }
+
+    pub const fn source_mut(&mut self) -> &mut K {
+        &mut self.smc
+    }
+
+    /// `FNum`, at most [`MAX_FANS`]. 0 on a Mac with no `FNum` (no fans).
+    pub fn fan_count(&mut self) -> Result<u8, FanError> {
+        match self.smc.read(FAN_COUNT_KEY).and_then(|v| v.uint8_value()) {
+            Ok(count) => Ok(count.min(MAX_FANS)),
+            Err(SmcError::KeyNotFound(_)) => Ok(0),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn check_fan(&mut self, fan: FanIndex) -> Result<(), FanError> {
+        let count = self.fan_count()?;
+        if fan.get() < count {
+            Ok(())
+        } else {
+            Err(FanError::NoSuchFan { fan, count })
+        }
+    }
+
+    /// The fan's range, read now and never kept: the call is rare, and a kept
+    /// range is one more thing that could be stale.
+    pub fn limits(&mut self, fan: FanIndex) -> Result<FanLimits, FanError> {
+        self.check_fan(fan)?;
+        let min_rpm = self.smc.read(fan_key(fan, *b"Mn"))?.numeric_value()?;
+        let max_rpm = self.smc.read(fan_key(fan, *b"Mx"))?.numeric_value()?;
+        if !min_rpm.is_finite() || !max_rpm.is_finite() || min_rpm > max_rpm {
+            return Err(FanError::LimitsUnreadable { fan });
+        }
+        Ok(FanLimits { min_rpm, max_rpm })
+    }
+
+    /// `F{n}Tg`, the speed the fan is told to hold.
+    pub fn target_rpm(&mut self, fan: FanIndex) -> Result<f64, FanError> {
+        self.check_fan(fan)?;
+        Ok(self.smc.read(fan_key(fan, *b"Tg"))?.numeric_value()?)
+    }
+
+    /// The fan's mode key, three ways. A fan index past `FNum`, or an `FNum`
+    /// that does not read, is [`FanMode::Unreadable`] too.
+    pub fn mode(&mut self, fan: FanIndex) -> FanMode {
+        if self.check_fan(fan).is_err() {
+            return FanMode::Unreadable;
+        }
+        let Ok(key) = self.mode_key(fan) else {
+            return FanMode::Unreadable;
+        };
+        match self.smc.read(key).and_then(|v| v.uint8_value()) {
+            Ok(0 | 3) => FanMode::Auto,
+            Ok(1) => FanMode::Manual,
+            Ok(_) | Err(_) => FanMode::Unreadable,
+        }
+    }
+
+    /// `Ftst`: `None` on a Mac that has no such key, otherwise whether it
+    /// reads other than 0.
+    pub fn ftst(&mut self) -> Result<Option<bool>, SmcError> {
+        match self.smc.read(UNLOCK_KEY).and_then(|v| v.uint8_value()) {
+            Ok(value) => Ok(Some(value != 0)),
+            Err(SmcError::KeyNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Mode key to 1. If the SMC refuses, `Ftst` to 1 (unless it already
+    /// is), wait [`UNLOCK_SETTLE`], then try the mode write up to
+    /// [`MODE_RETRIES`] times [`MODE_RETRY_GAP`] apart. Stats' order.
+    ///
+    /// Any failure after the fan is found to exist hands every fan back
+    /// before returning (requirement H3): a fan entered by an earlier call is
+    /// not left manual with no one to finish the job.
+    pub fn set_manual(&mut self, fan: FanIndex) -> Result<Entered, SetManualFailed> {
+        if let Err(cause) = self.check_fan(fan) {
+            return Err(SetManualFailed {
+                cause,
+                hand_back: None,
+            });
+        }
+        self.enter(fan).map_err(|cause| SetManualFailed {
+            cause,
+            hand_back: Some(self.hand_back()),
+        })
+    }
+
+    fn enter(&mut self, fan: FanIndex) -> Result<Entered, FanError> {
+        let key = self.mode_key(fan)?;
+        if self.try_write_mode(key, 1)? {
+            return Ok(Entered { unlocked: false });
+        }
+        let unlocked = match self.ftst()? {
+            None => return Err(FanError::ModeLocked { fan }),
+            Some(true) => false,
+            Some(false) => {
+                self.smc.write(UNLOCK_KEY, &SmcValue::ui8(1))?;
+                (self.sleep)(UNLOCK_SETTLE);
+                true
+            }
+        };
+        for attempt in 0..MODE_RETRIES {
+            if self.try_write_mode(key, 1)? {
+                return Ok(Entered { unlocked });
+            }
+            if attempt + 1 < MODE_RETRIES {
+                (self.sleep)(MODE_RETRY_GAP);
+            }
+        }
+        Err(FanError::ModeLocked { fan })
+    }
+
+    /// `true` when the mode write went through, `false` when the SMC refused
+    /// it ([`is_refusal`]: what a held fan answers, and what the unlock is
+    /// for). Anything else, a wrong type or size or a missing key or no
+    /// privilege, is returned as itself and never starts the unlock.
+    fn try_write_mode(&mut self, key: FourCc, mode: u8) -> Result<bool, FanError> {
+        match self.smc.write(key, &SmcValue::ui8(mode)) {
+            Ok(()) => Ok(true),
+            Err(error) if is_refusal(error) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// The fan's target, clamped to its own range read now, written in the
+    /// type the target key already has (`flt ` on Apple Silicon, `fpe2` on
+    /// Intel). Returns the rpm written, as the SMC will read it back (`fpe2`
+    /// keeps quarters).
+    ///
+    /// Does not put the fan in manual and hands nothing back on failure.
+    pub fn set_target(&mut self, fan: FanIndex, rpm: f64) -> Result<f32, FanError> {
+        if !rpm.is_finite() {
+            return Err(FanError::NotANumber);
+        }
+        let clamped = self.limits(fan)?.clamp(rpm)?;
+        let key = fan_key(fan, *b"Tg");
+        let current = self.smc.read(key)?;
+        let value = match current.ty {
+            FourCc::FLT => SmcValue::flt(clamped as f32)?,
+            FourCc::FPE2 => SmcValue::fpe2(clamped)?,
+            other => return Err(SmcError::UnsupportedType(other).into()),
+        };
+        let written = value.numeric_value()? as f32;
+        self.smc.write(key, &value)?;
+        Ok(written)
+    }
+
+    /// Every fan back to macOS: each mode key that reads other than 0 to 0,
+    /// THEN `Ftst` to 0 where present and raised (requirement M3; Stats does
+    /// modes first). Each write is tried [`HAND_BACK_TRIES`] times; a failure
+    /// moves on to the next key rather than stopping. Then every key is read
+    /// again, and anything not 0 is [`FanError::HandBackIncomplete`].
+    ///
+    /// A mode key that did not read is written 0 anyway: the write checks the
+    /// key's own type, and the re-read is the judge.
+    pub fn hand_back(&mut self) -> Result<(), FanError> {
+        let count = self.fan_count()?;
+        let fans: Vec<FanIndex> = (0..count).filter_map(FanIndex::new).collect();
+        let mode_keys: Vec<(FanIndex, FourCc)> = match self.mode_key_suffix() {
+            Ok(suffix) => fans
+                .iter()
+                .map(|&fan| (fan, fan_key(fan, suffix)))
+                .collect(),
+            // The probe failed: try both spellings, the missing one answers
+            // "no such key" and is skipped.
+            Err(_) => fans
+                .iter()
+                .flat_map(|&fan| [(fan, fan_key(fan, *b"md")), (fan, fan_key(fan, *b"Md"))])
+                .collect(),
+        };
+        for &(_, key) in &mode_keys {
+            match self.smc.read(key).and_then(|v| v.uint8_value()) {
+                Ok(0) | Err(SmcError::KeyNotFound(_)) => {}
+                Ok(_) | Err(_) => self.write_retried(key, 0),
+            }
+        }
+        match self.smc.read(UNLOCK_KEY).and_then(|v| v.uint8_value()) {
+            Ok(0) | Err(SmcError::KeyNotFound(_)) => {}
+            Ok(_) | Err(_) => self.write_retried(UNLOCK_KEY, 0),
+        }
+
+        let mut incomplete = HandBackIncomplete {
+            fans: 0,
+            ftst: false,
+        };
+        for &(fan, key) in &mode_keys {
+            match self.smc.read(key).and_then(|v| v.uint8_value()) {
+                Ok(0) | Err(SmcError::KeyNotFound(_)) => {}
+                Ok(_) | Err(_) => incomplete.fans |= 1 << fan.get(),
+            }
+        }
+        incomplete.ftst = !matches!(
+            self.smc.read(UNLOCK_KEY).and_then(|v| v.uint8_value()),
+            Ok(0) | Err(SmcError::KeyNotFound(_))
+        );
+        if incomplete.fans != 0 || incomplete.ftst {
+            return Err(FanError::HandBackIncomplete(incomplete));
+        }
+        Ok(())
+    }
+
+    /// One `ui8` write, tried up to [`HAND_BACK_TRIES`] times while the SMC
+    /// refuses it. Any other error ends the tries at once: a wrong type does
+    /// not get righter. The caller's re-read reports what did not land.
+    fn write_retried(&mut self, key: FourCc, value: u8) {
+        for attempt in 0..HAND_BACK_TRIES {
+            match self.smc.write(key, &SmcValue::ui8(value)) {
+                Ok(()) => return,
+                Err(error) if is_refusal(error) && attempt + 1 < HAND_BACK_TRIES => {
+                    (self.sleep)(HAND_BACK_GAP);
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// `F{n}md` where `F0md` exists, else `F{n}Md`, probed once and kept, as
+    /// [`HeatReader`] does. A probe that fails is not kept.
+    fn mode_key(&mut self, fan: FanIndex) -> Result<FourCc, SmcError> {
+        Ok(fan_key(fan, self.mode_key_suffix()?))
+    }
+
+    fn mode_key_suffix(&mut self) -> Result<[u8; 2], SmcError> {
+        if self.mode_key_is_lower.is_none() {
+            match self.smc.read(LOWER_MODE_PROBE_KEY) {
+                Ok(_) => self.mode_key_is_lower = Some(true),
+                Err(SmcError::KeyNotFound(_)) => self.mode_key_is_lower = Some(false),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(if self.mode_key_is_lower == Some(true) {
+            *b"md"
+        } else {
+            *b"Md"
+        })
+    }
+}
+
+/// The answers a held fan gives a mode write: the SMC's own refusal, or an
+/// IOKit error. Not [`SmcError::NotPrivileged`]: no unlock makes a non-root
+/// caller root.
+const fn is_refusal(error: SmcError) -> bool {
+    matches!(error, SmcError::SmcRefused { .. } | SmcError::Kernel(_))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1383,6 +1822,17 @@ mod tests {
         key_table: Option<Result<Vec<FourCc>, SmcError>>,
         reads: Vec<FourCc>,
         keys_calls: usize,
+        /// Every write that landed, in order.
+        writes: Vec<(FourCc, SmcValue)>,
+        /// Every write asked for, landed or not, in order.
+        attempts: Vec<FourCc>,
+        /// Refuse this many writes to the key (result 0x82), then take them.
+        refusals: HashMap<FourCc, usize>,
+        /// Fail every write to the key with this error, before anything else.
+        failures: HashMap<FourCc, SmcError>,
+        /// Take writes to the key and keep its old value: an SMC that says
+        /// yes and does not change.
+        sticky: HashSet<FourCc>,
     }
 
     impl FakeSmc {
@@ -1421,6 +1871,40 @@ mod tests {
         fn keys(&mut self) -> Result<Vec<FourCc>, SmcError> {
             self.keys_calls += 1;
             self.key_table.clone().unwrap_or(Ok(Vec::new()))
+        }
+    }
+
+    /// What `SmcConnection::write` does: nothing sent unless the value is the
+    /// key's own type and size, a missing key is "no such key".
+    impl KeyAccess for FakeSmc {
+        fn write(&mut self, key: FourCc, value: &SmcValue) -> Result<(), SmcError> {
+            self.attempts.push(key);
+            if let Some(failure) = self.failures.get(&key) {
+                return Err(*failure);
+            }
+            if let Some(left) = self.refusals.get_mut(&key)
+                && *left > 0
+            {
+                *left -= 1;
+                return Err(SmcError::SmcRefused { key, result: 0x82 });
+            }
+            let current = match self.values.get(&key) {
+                Some(Ok(current)) => current.clone(),
+                Some(Err(error)) => return Err(*error),
+                None => return Err(SmcError::KeyNotFound(key)),
+            };
+            check_write(
+                value,
+                SmcKeyInfo {
+                    ty: current.ty,
+                    size: current.bytes.len(),
+                },
+            )?;
+            self.writes.push((key, value.clone()));
+            if !self.sticky.contains(&key) {
+                self.values.insert(key, Ok(value.clone()));
+            }
+            Ok(())
         }
     }
 
@@ -1786,5 +2270,558 @@ mod tests {
         *clock.lock().unwrap() = Duration::from_secs(3600);
         assert_eq!(source.read(), None);
         assert_eq!(*attempts.lock().unwrap(), 1);
+    }
+
+    // The fan writer, against the fake SMC. Every figure is the Mac16,7
+    // reading: two fans, 1,350 to 5,777 rpm, `flt ` targets.
+
+    /// Two fans, mode keys `F{n}Md` at 0, `Ftst` at `ftst` (absent if `None`).
+    fn apple_silicon(ftst: Option<u8>) -> FakeSmc {
+        let mut smc = FakeSmc::default();
+        smc.set("FNum", Ok(SmcValue::ui8(2)));
+        for fan in ["F0", "F1"] {
+            smc.set(&format!("{fan}Mn"), flt(1350.0));
+            smc.set(&format!("{fan}Mx"), flt(5777.0));
+            smc.set(&format!("{fan}Tg"), flt(0.0));
+            smc.set(&format!("{fan}Ac"), flt(2000.0));
+            smc.set(&format!("{fan}Md"), Ok(SmcValue::ui8(0)));
+        }
+        if let Some(ftst) = ftst {
+            smc.set("Ftst", Ok(SmcValue::ui8(ftst)));
+        }
+        smc
+    }
+
+    /// A writer on `smc` whose waits are recorded, not slept.
+    fn writer(smc: FakeSmc) -> (FanWriter<FakeSmc>, Arc<Mutex<Vec<Duration>>>) {
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        let w = Arc::clone(&waits);
+        let writer = FanWriter::with_sleeper(smc, Box::new(move |d| w.lock().unwrap().push(d)));
+        (writer, waits)
+    }
+
+    fn written(writer: &FanWriter<FakeSmc>) -> Vec<String> {
+        writer
+            .source()
+            .writes
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .collect()
+    }
+
+    fn ui8_at(writer: &mut FanWriter<FakeSmc>, key: &str) -> u8 {
+        writer
+            .source_mut()
+            .read(code(key))
+            .unwrap()
+            .uint8_value()
+            .unwrap()
+    }
+
+    fn float_at(writer: &mut FanWriter<FakeSmc>, key: &str) -> f32 {
+        writer
+            .source_mut()
+            .read(code(key))
+            .unwrap()
+            .float_value()
+            .unwrap()
+    }
+
+    #[test]
+    fn set_manual_refuses_fan_past_fnum() {
+        let (mut fans, waits) = writer(apple_silicon(Some(0)));
+        for fan in [2, 9] {
+            let failed = fans.set_manual(fan_index(fan)).unwrap_err();
+            assert_eq!(
+                failed,
+                SetManualFailed {
+                    cause: FanError::NoSuchFan {
+                        fan: fan_index(fan),
+                        count: 2
+                    },
+                    hand_back: None,
+                }
+            );
+            assert_eq!(
+                fans.set_target(fan_index(fan), 3000.0),
+                Err(FanError::NoSuchFan {
+                    fan: fan_index(fan),
+                    count: 2
+                })
+            );
+            assert!(fans.limits(fan_index(fan)).is_err());
+            assert_eq!(fans.mode(fan_index(fan)), FanMode::Unreadable);
+        }
+        assert!(fans.source().attempts.is_empty(), "nothing written");
+        assert!(waits.lock().unwrap().is_empty());
+    }
+
+    /// `FNum` past ten is ten: a fan key's index is one digit.
+    #[test]
+    fn fnum_is_capped_at_ten() {
+        let mut smc = apple_silicon(Some(0));
+        smc.set("FNum", Ok(SmcValue::ui8(15)));
+        smc.set("F9Mn", flt(1000.0));
+        smc.set("F9Mx", flt(4000.0));
+        smc.set("F9Tg", flt(0.0));
+        let (mut fans, _) = writer(smc);
+        assert_eq!(fans.fan_count(), Ok(10));
+        assert_eq!(fans.set_target(fan_index(9), 3000.0), Ok(3000.0));
+        // No `FNum` at all: no fans, not an error.
+        let mut none = FakeSmc::default();
+        none.set("Ftst", Ok(SmcValue::ui8(0)));
+        let (mut fans, _) = writer(none);
+        assert_eq!(fans.fan_count(), Ok(0));
+        assert_eq!(fans.hand_back(), Ok(()));
+    }
+
+    #[test]
+    fn target_is_clamped_to_the_fans_own_range() {
+        let (mut fans, _) = writer(apple_silicon(Some(0)));
+        assert_eq!(fans.set_target(fan_index(0), 9000.0), Ok(5777.0));
+        assert_eq!(float_at(&mut fans, "F0Tg"), 5777.0);
+        assert_eq!(fans.set_target(fan_index(1), 200.0), Ok(1350.0));
+        assert_eq!(float_at(&mut fans, "F1Tg"), 1350.0);
+        assert_eq!(fans.set_target(fan_index(0), -1.0), Ok(1350.0));
+        assert_eq!(fans.set_target(fan_index(0), 5000.0), Ok(5000.0));
+        let last = fans.source().writes.last().unwrap().1.clone();
+        assert_eq!(last.bytes, hex("00409c45"), "5000.0 as measured");
+    }
+
+    /// The range is read from the SMC at the time of each call, never kept.
+    #[test]
+    fn clamp_reads_limits_each_call() {
+        let (mut fans, _) = writer(apple_silicon(Some(0)));
+        assert_eq!(fans.set_target(fan_index(0), 9000.0), Ok(5777.0));
+        fans.source_mut().set("F0Mx", flt(4000.0));
+        assert_eq!(fans.set_target(fan_index(0), 9000.0), Ok(4000.0));
+        assert_eq!(float_at(&mut fans, "F0Tg"), 4000.0);
+        fans.source_mut().set("F0Mn", flt(2500.0));
+        assert_eq!(fans.set_target(fan_index(0), 100.0), Ok(2500.0));
+        assert_eq!(
+            fans.limits(fan_index(0)),
+            Ok(FanLimits {
+                min_rpm: 2500.0,
+                max_rpm: 4000.0
+            })
+        );
+    }
+
+    #[test]
+    fn nan_and_infinity_refused() {
+        let (mut fans, _) = writer(apple_silicon(Some(0)));
+        for rpm in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                fans.set_target(fan_index(0), rpm),
+                Err(FanError::NotANumber)
+            );
+        }
+        assert!(fans.source().attempts.is_empty());
+        assert_eq!(float_at(&mut fans, "F0Tg"), 0.0);
+    }
+
+    /// Limits that are no range are an error, never a guess at one.
+    #[test]
+    fn unusable_limits_are_refused() {
+        for (min, max) in [
+            (6000.0, 5777.0),
+            (f32::NAN, 5777.0),
+            (1350.0, f32::INFINITY),
+        ] {
+            let mut smc = apple_silicon(Some(0));
+            smc.set("F0Mn", flt(min));
+            smc.set("F0Mx", flt(max));
+            let (mut fans, _) = writer(smc);
+            assert_eq!(
+                fans.set_target(fan_index(0), 3000.0),
+                Err(FanError::LimitsUnreadable { fan: fan_index(0) }),
+                "{min}..{max}"
+            );
+            assert!(fans.source().attempts.is_empty());
+        }
+    }
+
+    /// Intel keeps fan speeds in `fpe2`: the target goes back in that type,
+    /// and the answer is what the SMC holds, quarters and all.
+    #[test]
+    fn target_is_written_in_the_keys_own_type() {
+        let mut smc = FakeSmc::default();
+        smc.set("FNum", Ok(SmcValue::ui8(1)));
+        smc.set("F0Mn", SmcValue::fpe2(1200.0));
+        smc.set("F0Mx", SmcValue::fpe2(6200.0));
+        smc.set("F0Tg", SmcValue::fpe2(0.0));
+        let (mut fans, _) = writer(smc);
+        assert_eq!(fans.set_target(fan_index(0), 5000.0), Ok(5000.0));
+        assert_eq!(
+            fans.source().writes.last().unwrap().1,
+            SmcValue::fpe2(5000.0).unwrap()
+        );
+        assert_eq!(fans.set_target(fan_index(0), 3000.1), Ok(3000.0));
+        // A target key of any other type is not written.
+        fans.source_mut().set("F0Tg", Ok(SmcValue::ui16(0)));
+        assert_eq!(
+            fans.set_target(fan_index(0), 3000.0),
+            Err(FanError::Smc(SmcError::UnsupportedType(FourCc::UI16)))
+        );
+        assert_eq!(fans.source().writes.len(), 2);
+    }
+
+    /// Where the mode key takes the write directly, nothing else is touched.
+    #[test]
+    fn manual_writes_the_mode_key_directly_when_allowed() {
+        let (mut fans, waits) = writer(apple_silicon(Some(0)));
+        assert_eq!(
+            fans.set_manual(fan_index(1)),
+            Ok(Entered { unlocked: false })
+        );
+        assert_eq!(written(&fans), ["F1Md"]);
+        assert_eq!(ui8_at(&mut fans, "F1Md"), 1);
+        assert_eq!(fans.mode(fan_index(1)), FanMode::Manual);
+        assert_eq!(fans.mode(fan_index(0)), FanMode::Auto);
+        assert!(waits.lock().unwrap().is_empty());
+    }
+
+    /// Refused: `Ftst` to 1, wait 3 s for thermalmonitord, then the mode again.
+    #[test]
+    fn refused_mode_write_raises_ftst_waits_and_retries() {
+        let mut smc = apple_silicon(Some(0));
+        smc.refusals.insert(code("F0Md"), 1);
+        let (mut fans, waits) = writer(smc);
+        assert_eq!(
+            fans.set_manual(fan_index(0)),
+            Ok(Entered { unlocked: true })
+        );
+        assert_eq!(written(&fans), ["Ftst", "F0Md"]);
+        assert_eq!(fans.ftst(), Ok(Some(true)));
+        assert_eq!(*waits.lock().unwrap(), [UNLOCK_SETTLE]);
+    }
+
+    /// `Ftst` already raised (another fan's unlock): not written again, and
+    /// no settle wait.
+    #[test]
+    fn raised_ftst_is_not_written_again() {
+        let mut smc = apple_silicon(Some(1));
+        smc.refusals.insert(code("F0Md"), 2);
+        let (mut fans, waits) = writer(smc);
+        assert_eq!(
+            fans.set_manual(fan_index(0)),
+            Ok(Entered { unlocked: false })
+        );
+        assert_eq!(written(&fans), ["F0Md"]);
+        assert_eq!(*waits.lock().unwrap(), [MODE_RETRY_GAP]);
+    }
+
+    /// The bounded retries, counted: one settle, then 49 gaps between 50
+    /// tries, and every fan handed back before the error.
+    #[test]
+    fn mode_that_never_unlocks_is_bounded_and_handed_back() {
+        let mut smc = apple_silicon(Some(0));
+        smc.refusals.insert(code("F0Md"), usize::MAX);
+        let (mut fans, waits) = writer(smc);
+        let failed = fans.set_manual(fan_index(0)).unwrap_err();
+        assert_eq!(failed.cause, FanError::ModeLocked { fan: fan_index(0) });
+        assert_eq!(failed.hand_back, Some(Ok(())));
+        let waits = waits.lock().unwrap().clone();
+        assert_eq!(waits.len(), 1 + MODE_RETRIES - 1);
+        assert_eq!(waits[0], UNLOCK_SETTLE);
+        assert!(waits[1..].iter().all(|d| *d == MODE_RETRY_GAP));
+        assert_eq!(
+            fans.source()
+                .attempts
+                .iter()
+                .filter(|k| **k == code("F0Md"))
+                .count(),
+            1 + MODE_RETRIES
+        );
+        assert_eq!(written(&fans), ["Ftst", "Ftst"], "raised, then lowered");
+        assert_eq!(fans.ftst(), Ok(Some(false)));
+    }
+
+    /// A Mac with no `Ftst` has no unlock: a refused mode write is locked.
+    #[test]
+    fn refused_mode_without_ftst_is_locked() {
+        let mut smc = apple_silicon(None);
+        smc.refusals.insert(code("F0Md"), 1);
+        let (mut fans, waits) = writer(smc);
+        let failed = fans.set_manual(fan_index(0)).unwrap_err();
+        assert_eq!(failed.cause, FanError::ModeLocked { fan: fan_index(0) });
+        assert!(fans.source().writes.is_empty());
+        assert!(waits.lock().unwrap().is_empty());
+    }
+
+    /// A wrong type or size is a bug, not a lock: it reaches the caller as
+    /// itself, and the unlock never starts.
+    #[test]
+    fn mode_write_type_mismatch_is_surfaced_not_locked() {
+        for wrong in [
+            SmcError::WrongSize {
+                ty: FourCc::UI8,
+                expected: 1,
+                actual: 4,
+            },
+            SmcError::WrongType {
+                expected: FourCc::FLT,
+                actual: FourCc::UI8,
+            },
+        ] {
+            let mut smc = apple_silicon(Some(0));
+            smc.failures.insert(code("F0Md"), wrong);
+            let (mut fans, waits) = writer(smc);
+            let failed = fans.set_manual(fan_index(0)).unwrap_err();
+            assert_eq!(failed.cause, FanError::Smc(wrong));
+            assert!(fans.source().writes.is_empty(), "no Ftst write");
+            assert!(waits.lock().unwrap().is_empty());
+        }
+        // The real check, not a scripted failure: a mode key that is not a
+        // `ui8` refuses the `ui8` the writer sends.
+        let mut smc = apple_silicon(Some(0));
+        smc.set("F0Md", flt(0.0));
+        let (mut fans, _) = writer(smc);
+        let failed = fans.set_manual(fan_index(0)).unwrap_err();
+        assert_eq!(
+            failed.cause,
+            FanError::Smc(SmcError::WrongType {
+                expected: FourCc::FLT,
+                actual: FourCc::UI8
+            })
+        );
+        assert!(!fans.source().attempts.contains(&code("Ftst")));
+    }
+
+    /// No privilege is no privilege: an unlock would not change it.
+    #[test]
+    fn not_privileged_is_not_a_lock() {
+        let mut smc = apple_silicon(Some(0));
+        smc.failures.insert(code("F0Md"), SmcError::NotPrivileged);
+        let (mut fans, _) = writer(smc);
+        let failed = fans.set_manual(fan_index(0)).unwrap_err();
+        assert_eq!(failed.cause, FanError::Smc(SmcError::NotPrivileged));
+        assert!(!fans.source().attempts.contains(&code("Ftst")));
+    }
+
+    /// `F0md` where the Mac spells it that way (Stats' probe).
+    #[test]
+    fn lower_case_mode_key_is_used_where_it_exists() {
+        let mut smc = apple_silicon(Some(0));
+        smc.set("F0md", Ok(SmcValue::ui8(0)));
+        smc.set("F1md", Ok(SmcValue::ui8(0)));
+        let (mut fans, _) = writer(smc);
+        fans.set_manual(fan_index(1)).unwrap();
+        assert_eq!(written(&fans), ["F1md"]);
+        fans.hand_back().unwrap();
+        assert_eq!(written(&fans), ["F1md", "F1md"]);
+    }
+
+    /// Requirement M3: every mode key to 0 first, THEN `Ftst` to 0, then the
+    /// re-read.
+    #[test]
+    fn hand_back_order_is_modes_then_ftst() {
+        let mut smc = apple_silicon(Some(1));
+        smc.set("F0Md", Ok(SmcValue::ui8(1)));
+        smc.set("F1Md", Ok(SmcValue::ui8(1)));
+        let (mut fans, waits) = writer(smc);
+        assert_eq!(fans.hand_back(), Ok(()));
+        assert_eq!(written(&fans), ["F0Md", "F1Md", "Ftst"]);
+        assert!(
+            fans.source()
+                .writes
+                .iter()
+                .all(|(_, v)| *v == SmcValue::ui8(0))
+        );
+        assert_eq!(fans.mode(fan_index(0)), FanMode::Auto);
+        assert_eq!(fans.mode(fan_index(1)), FanMode::Auto);
+        assert_eq!(fans.ftst(), Ok(Some(false)));
+        assert!(waits.lock().unwrap().is_empty());
+    }
+
+    /// Nothing raised, nothing written: a hand-back on fans macOS already
+    /// has touches no key.
+    #[test]
+    fn hand_back_of_automatic_fans_writes_nothing() {
+        for ftst in [Some(0), None] {
+            let (mut fans, _) = writer(apple_silicon(ftst));
+            assert_eq!(fans.hand_back(), Ok(()));
+            assert!(fans.source().attempts.is_empty(), "{ftst:?}");
+        }
+    }
+
+    /// Requirement H3 on root's side: fan 0 entered, fan 1 would not; fan 0
+    /// and `Ftst` are back at 0 before the error is returned.
+    #[test]
+    fn second_fan_failure_hands_back_before_error() {
+        let mut smc = apple_silicon(Some(0));
+        smc.refusals.insert(code("F1Md"), usize::MAX);
+        let (mut fans, _) = writer(smc);
+        assert_eq!(
+            fans.set_manual(fan_index(0)),
+            Ok(Entered { unlocked: false })
+        );
+        let failed = fans.set_manual(fan_index(1)).unwrap_err();
+        assert_eq!(failed.cause, FanError::ModeLocked { fan: fan_index(1) });
+        assert_eq!(failed.hand_back, Some(Ok(())));
+        assert_eq!(written(&fans), ["F0Md", "Ftst", "F0Md", "Ftst"]);
+        assert_eq!(ui8_at(&mut fans, "F0Md"), 0);
+        assert_eq!(ui8_at(&mut fans, "F1Md"), 0);
+        assert_eq!(ui8_at(&mut fans, "Ftst"), 0);
+    }
+
+    /// The hand-back is the write that must not be lost: a refused write is
+    /// tried again, 50 ms apart.
+    #[test]
+    fn hand_back_retries_a_refused_write() {
+        let mut smc = apple_silicon(Some(1));
+        smc.refusals.insert(code("Ftst"), 3);
+        let (mut fans, waits) = writer(smc);
+        assert_eq!(fans.hand_back(), Ok(()));
+        assert_eq!(ui8_at(&mut fans, "Ftst"), 0);
+        assert_eq!(*waits.lock().unwrap(), [HAND_BACK_GAP; 3]);
+    }
+
+    /// A write that never lands is tried ten times, nine gaps, and the other
+    /// keys are still handed back; the re-read names what did not.
+    #[test]
+    fn hand_back_that_does_not_land_is_reported() {
+        let mut smc = apple_silicon(Some(1));
+        smc.set("F0Md", Ok(SmcValue::ui8(1)));
+        smc.set("F1Md", Ok(SmcValue::ui8(1)));
+        smc.refusals.insert(code("F0Md"), usize::MAX);
+        let (mut fans, waits) = writer(smc);
+        assert_eq!(
+            fans.hand_back(),
+            Err(FanError::HandBackIncomplete(HandBackIncomplete {
+                fans: 0b01,
+                ftst: false
+            }))
+        );
+        assert_eq!(
+            fans.source()
+                .attempts
+                .iter()
+                .filter(|k| **k == code("F0Md"))
+                .count(),
+            HAND_BACK_TRIES
+        );
+        assert_eq!(*waits.lock().unwrap(), [HAND_BACK_GAP; HAND_BACK_TRIES - 1]);
+        assert_eq!(written(&fans), ["F1Md", "Ftst"]);
+    }
+
+    /// An SMC that says yes and does not change is caught by the re-read.
+    #[test]
+    fn hand_back_rereads_what_it_wrote() {
+        let mut smc = apple_silicon(Some(1));
+        smc.set("F1Md", Ok(SmcValue::ui8(1)));
+        smc.sticky.insert(code("Ftst"));
+        smc.sticky.insert(code("F1Md"));
+        let (mut fans, _) = writer(smc);
+        assert_eq!(
+            fans.hand_back(),
+            Err(FanError::HandBackIncomplete(HandBackIncomplete {
+                fans: 0b10,
+                ftst: true
+            }))
+        );
+        assert_eq!(written(&fans), ["F1Md", "Ftst"]);
+    }
+
+    /// If the hand-back after a failed entry fails too, both are returned.
+    #[test]
+    fn failed_hand_back_after_failed_entry_is_reported() {
+        let mut smc = apple_silicon(Some(0));
+        smc.refusals.insert(code("F1Md"), usize::MAX);
+        smc.sticky.insert(code("F0Md"));
+        let (mut fans, _) = writer(smc);
+        fans.set_manual(fan_index(0)).unwrap();
+        fans.source_mut().set("F0Md", Ok(SmcValue::ui8(1)));
+        let failed = fans.set_manual(fan_index(1)).unwrap_err();
+        assert_eq!(failed.cause, FanError::ModeLocked { fan: fan_index(1) });
+        assert_eq!(
+            failed.hand_back,
+            Some(Err(FanError::HandBackIncomplete(HandBackIncomplete {
+                fans: 0b01,
+                ftst: false
+            })))
+        );
+    }
+
+    /// The mode is three-way: a read that fails is never "automatic".
+    #[test]
+    fn mode_is_three_way() {
+        let mut smc = apple_silicon(Some(0));
+        smc.set("F0Md", Ok(SmcValue::ui8(3)));
+        smc.set(
+            "F1Md",
+            Err(SmcError::SmcRefused {
+                key: code("F1Md"),
+                result: 0x85,
+            }),
+        );
+        let (mut fans, _) = writer(smc);
+        assert_eq!(fans.mode(fan_index(0)), FanMode::Auto);
+        assert_eq!(fans.mode(fan_index(1)), FanMode::Unreadable);
+        fans.source_mut().set("F1Md", Ok(SmcValue::ui8(2)));
+        assert_eq!(fans.mode(fan_index(1)), FanMode::Unreadable);
+        fans.source_mut().set("F1Md", flt(1.0));
+        assert_eq!(fans.mode(fan_index(1)), FanMode::Unreadable);
+        fans.source_mut().set("F1Md", Ok(SmcValue::ui8(1)));
+        assert_eq!(fans.mode(fan_index(1)), FanMode::Manual);
+    }
+
+    #[test]
+    fn ftst_and_target_reads() {
+        let (mut fans, _) = writer(apple_silicon(None));
+        assert_eq!(fans.ftst(), Ok(None));
+        fans.source_mut().set("Ftst", Ok(SmcValue::ui8(1)));
+        assert_eq!(fans.ftst(), Ok(Some(true)));
+        let refused = SmcError::Kernel(5);
+        fans.source_mut().set("Ftst", Err(refused));
+        assert_eq!(fans.ftst(), Err(refused));
+        fans.set_target(fan_index(1), 4321.0).unwrap();
+        assert_eq!(fans.target_rpm(fan_index(1)), Ok(4321.0));
+    }
+
+    /// Every operation, on an SMC full of other keys, writes only the mode
+    /// keys (0 or 1), the targets and `Ftst` (0 or 1).
+    #[test]
+    fn writer_writes_only_allowed_keys() {
+        let mut smc = apple_silicon(Some(0));
+        // Keys a careless writer might touch, each answerable.
+        for key in ["F0Ac", "F1Ac", "TCMz", "FS! ", "F0Mn", "F0Mx", "#KEY"] {
+            smc.values
+                .entry(code(key))
+                .or_insert_with(|| Ok(SmcValue::ui8(0)));
+        }
+        smc.refusals.insert(code("F1Md"), 1);
+        let (mut fans, _) = writer(smc);
+        fans.fan_count().unwrap();
+        fans.limits(fan_index(0)).unwrap();
+        fans.mode(fan_index(0));
+        fans.ftst().unwrap();
+        fans.target_rpm(fan_index(0)).unwrap();
+        fans.set_manual(fan_index(0)).unwrap();
+        fans.set_manual(fan_index(1)).unwrap();
+        fans.set_target(fan_index(0), 3000.0).unwrap();
+        fans.set_target(fan_index(1), 9000.0).unwrap();
+        fans.hand_back().unwrap();
+        // And the failure paths.
+        fans.source_mut().refusals.insert(code("F0Md"), usize::MAX);
+        fans.source_mut().set("Ftst", Ok(SmcValue::ui8(0)));
+        fans.set_manual(fan_index(0)).unwrap_err();
+        fans.set_target(fan_index(0), f64::NAN).unwrap_err();
+        fans.set_manual(fan_index(5)).unwrap_err();
+
+        let allowed = ["F0Md", "F1Md", "F0Tg", "F1Tg", "Ftst"].map(code);
+        let attempts = &fans.source().attempts;
+        assert!(attempts.len() > 6, "{attempts:?}");
+        for key in attempts {
+            assert!(allowed.contains(key), "wrote {key}");
+        }
+        for (key, value) in &fans.source().writes {
+            if *key == code("Ftst") || key.to_string().ends_with("Md") {
+                assert!(
+                    *value == SmcValue::ui8(0) || *value == SmcValue::ui8(1),
+                    "{key} = {value:?}"
+                );
+            }
+        }
     }
 }
