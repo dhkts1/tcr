@@ -2594,7 +2594,9 @@ file means Auto.
   an internal error; a restart starts it again). A reason that carries data is a one-key object.
 - `targets`: what this server last wrote to each fan it holds.
 - `detail`: a sentence for a person, or `null`.
-- `sinceMs`: when the state, or the wish it serves, last changed.
+- `sinceMs`: when the state last changed, or the controller last acted on a command. Taking a
+  command does not move it, so `desired` can show a new wish beside an older `sinceMs` until the
+  controller has acted; `tcr fan` waits for a `sinceMs` at or after the moment it sent.
 
 The committed samples are `tests/fixtures/fan-control-contract.json`; TcrBar's popover decodes
 the same file.

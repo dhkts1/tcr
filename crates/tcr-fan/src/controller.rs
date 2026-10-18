@@ -508,7 +508,9 @@ pub struct Snapshot {
     /// What was last written to each fan held.
     pub targets: Vec<(FanIndex, f64)>,
     pub detail: Option<Detail>,
-    /// When the state, or the wish it serves, last changed.
+    /// When the state last changed, or the controller last acted on a
+    /// command. Taking a command does not move it, so a snapshot from before
+    /// the controller acted on a command is older than that command.
     pub since_ms: i64,
 }
 
@@ -774,7 +776,12 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     }
 
     /// How long the loop may wait for input before it has work of its own.
+    /// Zero while a command taken in the middle of a step waits: it is acted
+    /// on at once, not at the next tick.
     fn wait(&self) -> Option<Duration> {
+        if self.fresh {
+            return Some(Duration::ZERO);
+        }
         let now = self.parts.clock.now();
         [self.next_tick, self.retry_at]
             .into_iter()
@@ -815,7 +822,8 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 self.backoff_step = 0;
                 self.retry_at = None;
                 self.reentries.clear();
-                self.since_ms = self.parts.clock.wall_ms();
+                // No `since_ms` here: taking a command is not acting on it
+                // ([`Self::advance`] stamps it once the step for it is done).
                 self.save();
                 self.publish();
             }
@@ -823,7 +831,6 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 self.desired = FanMode::Auto;
                 self.force_pending = true;
                 self.fresh = true;
-                self.since_ms = self.parts.clock.wall_ms();
                 self.save();
                 self.publish();
             }
@@ -879,10 +886,19 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// A stop is acted on whenever it arrived: before the step, or drained in
     /// the middle of one (between two writes of an entry), so the loop never
     /// goes back to waiting on a channel whose stop it already took.
+    ///
+    /// A step for a command ends by stamping `since_ms`, whether it changed
+    /// the state, wrote a round, or found nothing to do (the same Fixed
+    /// again): that stamp is what `tcr fan` waits for. Not when a newer
+    /// command was taken during the step, which the next step acts on.
     pub fn advance(&mut self) -> Flow {
         let fresh = std::mem::take(&mut self.fresh);
         if self.stopping.is_none() {
             self.step(fresh);
+            if fresh && !self.fresh && self.stopping.is_none() {
+                self.since_ms = self.parts.clock.wall_ms();
+                self.publish();
+            }
         }
         if let Some(deadline) = self.stopping {
             self.shut_down(deadline);
@@ -1709,7 +1725,11 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 &format!("fan control: {} -> {}", self.state, state),
             );
             self.state = state;
-            self.since_ms = self.parts.clock.wall_ms();
+            // With a command taken and not yet acted on, a state reached for
+            // the wish before it is not that command's answer.
+            if !self.fresh {
+                self.since_ms = self.parts.clock.wall_ms();
+            }
         }
         self.publish();
     }

@@ -455,8 +455,9 @@ pub struct FanControlRow {
     pub targets: Vec<FanTargetRow>,
     /// A sentence for a person, or `null`.
     pub detail: Option<String>,
-    /// Milliseconds since the Unix epoch when the state, or the wish it serves, last changed.
-    /// `tcr fan` waits for a value at or after the moment it sent its command.
+    /// Milliseconds since the Unix epoch when the state last changed, or the controller last
+    /// acted on a command (taking one does not move it). `tcr fan` waits for a value at or after
+    /// the moment it sent its command.
     pub since_ms: i64,
 }
 

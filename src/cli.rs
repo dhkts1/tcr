@@ -8394,6 +8394,42 @@ mod tests {
         ));
     }
 
+    /// `tcr fan auto` with the fans held at 5000, as the controller now publishes it: the
+    /// snapshot from taking the command keeps the old `sinceMs`, so it waits; releasing waits;
+    /// `off` succeeds. A command that replaces it mid-wait reports Replaced.
+    #[test]
+    fn fan_cli_auto_from_holding_waits_through_the_release() {
+        use crate::fan::FanRequest;
+        use tcr_status_wire::{FanControlRow, FanDesiredRow, FanStateRow};
+        let sent_at = 1_000;
+        let at = |desired, state, since_ms| FanControlRow {
+            desired,
+            state,
+            reason: None,
+            hot_guard: false,
+            targets: vec![],
+            detail: None,
+            since_ms,
+        };
+        let request = FanRequest::Auto { force: false };
+        let taken = at(FanDesiredRow::Auto, FanStateRow::Holding, 400);
+        assert_eq!(fan_wait(request, &taken, sent_at), FanWait::Waiting);
+        assert!(!fan_succeeded(request, &taken, sent_at));
+        let releasing = at(FanDesiredRow::Auto, FanStateRow::Releasing, 1_180);
+        assert_eq!(fan_wait(request, &releasing, sent_at), FanWait::Waiting);
+        let off = at(FanDesiredRow::Auto, FanStateRow::Off, 1_388);
+        assert_eq!(fan_wait(request, &off, sent_at), FanWait::Settled);
+        assert!(fan_succeeded(request, &off, sent_at));
+
+        let replaced = at(
+            FanDesiredRow::Fixed { rpm: 3000 },
+            FanStateRow::Holding,
+            400,
+        );
+        assert_eq!(fan_wait(request, &replaced, sent_at), FanWait::Replaced);
+        assert!(!fan_succeeded(request, &replaced, sent_at));
+    }
+
     /// The wait covers the version call (which waits out launchd starting the helper late),
     /// two worst-case set-manuals and two set-targets.
     #[test]

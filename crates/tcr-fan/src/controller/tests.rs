@@ -195,6 +195,8 @@ struct Rig {
     store: FakeStore,
     hooks: Arc<Mutex<Option<Hook>>>,
     logs: Logs,
+    /// Every snapshot the controller published, in order.
+    published: Arc<Mutex<Vec<Snapshot>>>,
 }
 
 /// Two fans of the Mac16,7 reading, automatic, CPU at 50 °C.
@@ -231,6 +233,8 @@ fn rig_from(saved: Option<Saved>, reading: Option<HeatReading>) -> Rig {
     let hooks: Arc<Mutex<Option<Hook>>> = Arc::new(Mutex::new(None));
     let logs: Logs = Arc::default();
     let written_logs = Arc::clone(&logs);
+    let published: Arc<Mutex<Vec<Snapshot>>> = Arc::default();
+    let shown = Arc::clone(&published);
     let parts = Parts {
         helper: FakeHelper {
             world: world.clone(),
@@ -247,7 +251,9 @@ fn rig_from(saved: Option<Saved>, reading: Option<HeatReading>) -> Rig {
         log: Box::new(move |level, line: &str| {
             written_logs.lock().unwrap().push((level, line.to_string()));
         }),
-        publish: Box::new(|_| {}),
+        publish: Box::new(move |snapshot: &Snapshot| {
+            shown.lock().unwrap().push(snapshot.clone());
+        }),
         pid: 4242,
     };
     Rig {
@@ -258,6 +264,7 @@ fn rig_from(saved: Option<Saved>, reading: Option<HeatReading>) -> Rig {
         store,
         hooks,
         logs,
+        published,
     }
 }
 
@@ -1404,4 +1411,125 @@ fn a_new_mode_drops_a_waiting_hand_back() {
         rig.written()
     );
     assert_eq!(rig.c.state(), State::Holding);
+}
+
+// When a command is acted on: `sinceMs` against the moment it was sent.
+
+/// What `tcr fan` (`fan_wait` in the binary's `src/cli.rs`) reads off a
+/// snapshot for a command sent at `sent_at`: settled once `since_ms` is at
+/// or after it and the state is not on its way somewhere.
+fn reads_settled(snapshot: &Snapshot, sent_at: i64) -> bool {
+    snapshot.since_ms >= sent_at && !matches!(snapshot.state, State::Entering | State::Releasing)
+}
+
+impl Rig {
+    /// A second later than anything so far: the wall time a command is sent
+    /// at. What was published before it is forgotten.
+    fn command_time(&self) -> i64 {
+        self.clock.advance(Duration::from_secs(1));
+        self.published.lock().unwrap().clear();
+        self.clock.wall_ms()
+    }
+
+    /// The first snapshot since [`Self::command_time`] that `tcr fan` would
+    /// stop on.
+    fn first_settled(&self, sent_at: i64) -> Option<Snapshot> {
+        self.published
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| reads_settled(s, sent_at))
+            .cloned()
+    }
+}
+
+/// The sequence Gil's Mac showed: holding at 5000, `auto` sent. The snapshot
+/// published as the command is taken still says holding; `tcr fan auto` must
+/// read it as not yet acted on and stop only on `off`.
+#[test]
+fn auto_from_holding_settles_only_on_off() {
+    let mut rig = holding(fixed(5000));
+    let sent_at = rig.command_time();
+    rig.tx
+        .send(Input::Command(Command::Set(FanMode::Auto)))
+        .unwrap();
+    rig.c.pump();
+    let first = rig.published.lock().unwrap().first().cloned().unwrap();
+    assert_eq!(first.state, State::Holding, "the taking publishes first");
+    assert!(
+        !reads_settled(&first, sent_at),
+        "a snapshot from before the release is not the command's answer: {first:?}"
+    );
+    let settled = rig.first_settled(sent_at).unwrap();
+    assert_eq!(settled.state, State::Off, "{settled:?}");
+}
+
+/// A changed Fixed while holding: settled only once the new target is written.
+#[test]
+fn a_changed_fixed_settles_after_the_write() {
+    let mut rig = holding(fixed(5000));
+    rig.clear_requests();
+    let sent_at = rig.command_time();
+    rig.send(Command::Set(fixed(4000)));
+    assert_eq!(
+        rig.written(),
+        vec![set_target(0, 4000.0), set_target(1, 4000.0)]
+    );
+    let settled = rig.first_settled(sent_at).unwrap();
+    assert_eq!(settled.state, State::Holding);
+    assert_eq!(
+        settled.targets,
+        vec![(fan(0), 4000.0), (fan(1), 4000.0)],
+        "settled before the write: {settled:?}"
+    );
+}
+
+/// The same Fixed again changes nothing on the fans, and still settles: the
+/// controller looked and found nothing to do.
+#[test]
+fn a_repeated_fixed_settles_with_nothing_to_write() {
+    let mut rig = holding(fixed(5000));
+    rig.clear_requests();
+    let sent_at = rig.command_time();
+    rig.send(Command::Set(fixed(5000)));
+    assert_eq!(rig.written(), vec![], "nothing to write");
+    let settled = rig.first_settled(sent_at).unwrap();
+    assert_eq!(settled.state, State::Holding);
+    assert_eq!(settled.targets, vec![(fan(0), 5000.0), (fan(1), 5000.0)]);
+}
+
+/// A command that arrives in the middle of an entry is taken between two
+/// writes, after an earlier fan already got the old target. The entry ending
+/// in `holding` is not that command's answer; the round that writes every fan
+/// for it is, and it runs at once, not a tick later.
+#[test]
+fn a_command_taken_mid_entry_settles_after_its_own_round() {
+    let mut rig = rig();
+    let sent_at = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&sent_at);
+    rig.hook(Box::new(move |request, _machine, inject, clock| {
+        if *request == set_target(0, 5000.0) && seen.lock().unwrap().is_none() {
+            clock.advance(Duration::from_secs(1));
+            *seen.lock().unwrap() = Some(clock.wall_ms());
+            inject
+                .send(Input::Command(Command::Set(fixed(4000))))
+                .unwrap();
+        }
+        None
+    }));
+    rig.send(Command::Set(fixed(5000)));
+    let sent_at = sent_at.lock().unwrap().unwrap();
+    assert_eq!(rig.c.state(), State::Holding);
+    assert_eq!(
+        rig.c.wait(),
+        Some(Duration::ZERO),
+        "a command taken mid-entry is acted on at once"
+    );
+    rig.c.pump();
+    let settled = rig.first_settled(sent_at).unwrap();
+    assert_eq!(
+        settled.targets,
+        vec![(fan(0), 4000.0), (fan(1), 4000.0)],
+        "settled while fan 0 still held the old target: {settled:?}"
+    );
 }
