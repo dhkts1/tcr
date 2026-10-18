@@ -210,7 +210,7 @@ impl std::error::Error for ModeError {}
 
 /// What the fans should do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FanMode {
+pub enum FanDesired {
     /// macOS has them.
     Auto,
     /// Exactly this rpm, clamped only by root to each fan's range: no hot
@@ -223,7 +223,7 @@ pub enum FanMode {
     },
 }
 
-impl FanMode {
+impl FanDesired {
     pub const fn is_manual(self) -> bool {
         !matches!(self, Self::Auto)
     }
@@ -237,7 +237,7 @@ impl FanMode {
 /// A command from the route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
-    Set(FanMode),
+    Set(FanDesired),
     /// `tcr fan auto --force`: hand back without checking the record (never
     /// without checking for Macs Fan Control). The operator's recovery for a
     /// hold no process remembers.
@@ -480,7 +480,7 @@ pub struct Hold {
 /// What persists across a restart: the wish and the hold.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Saved {
-    pub desired: FanMode,
+    pub desired: FanDesired,
     pub hold: Option<Hold>,
 }
 
@@ -509,7 +509,7 @@ pub type Log = Box<dyn FnMut(Level, &str) + Send>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     /// The wish the controller last acted on.
-    pub desired: FanMode,
+    pub desired: FanDesired,
     pub state: State,
     pub hot_guard: bool,
     /// What was last written to each fan held.
@@ -601,7 +601,7 @@ enum Waiting {
 
 pub struct Controller<H, R, P, C, S> {
     parts: Parts<H, R, P, C, S>,
-    desired: FanMode,
+    desired: FanDesired,
     hold: Option<Hold>,
     state: State,
     generation: u64,
@@ -610,7 +610,7 @@ pub struct Controller<H, R, P, C, S> {
     detail: Option<Detail>,
     /// The wish [`Snapshot::desired`] shows: `desired` as of the last
     /// [`Self::stamp`], never ahead of it.
-    shown_desired: FanMode,
+    shown_desired: FanDesired,
     since_ms: i64,
     failed_entries: u32,
     backoff_step: usize,
@@ -634,7 +634,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// dropped.
     pub fn new(parts: Parts<H, R, P, C, S>, saved: Option<Saved>) -> Self {
         let since_ms = parts.clock.wall_ms();
-        let (desired, hold) = saved.map_or((FanMode::Auto, None), |s| (s.desired, s.hold));
+        let (desired, hold) = saved.map_or((FanDesired::Auto, None), |s| (s.desired, s.hold));
         let mut controller = Self {
             parts,
             desired,
@@ -708,7 +708,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         self.state
     }
 
-    pub const fn desired(&self) -> FanMode {
+    pub const fn desired(&self) -> FanDesired {
         self.desired
     }
 
@@ -842,7 +842,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 self.publish();
             }
             Input::Command(Command::ForceHandBack) => {
-                self.desired = FanMode::Auto;
+                self.desired = FanDesired::Auto;
                 self.force_pending = true;
                 self.fresh = true;
                 self.save();
@@ -1827,18 +1827,18 @@ fn limits(fan: &FanReading) -> Option<(f64, f64)> {
 
 /// What this fan should turn at. `None` when the mode needs the fan's range
 /// and it did not read.
-fn target_for(mode: FanMode, fan: &FanReading, celsius: Option<f64>, hot: bool) -> Option<f64> {
+fn target_for(mode: FanDesired, fan: &FanReading, celsius: Option<f64>, hot: bool) -> Option<f64> {
     let range = limits(fan);
     if hot && mode.has_hot_guard() {
         return range.map(|(_, max)| max);
     }
     match mode {
-        FanMode::Auto => None,
-        FanMode::Fixed { rpm } => {
+        FanDesired::Auto => None,
+        FanDesired::Fixed { rpm } => {
             let rpm = f64::from(rpm.get());
             Some(range.map_or(rpm, |(min, max)| rpm.clamp(min, max)))
         }
-        FanMode::FollowCpu { curve } => {
+        FanDesired::FollowCpu { curve } => {
             let (min, max) = range?;
             Some(celsius.map_or(max, |c| curve.share(c).mul_add(max - min, min)))
         }
@@ -1850,7 +1850,7 @@ fn should_write(
     previous: Option<f64>,
     target: f64,
     fan: &FanReading,
-    mode: FanMode,
+    mode: FanDesired,
     forced: bool,
 ) -> bool {
     let Some(previous) = previous else {
@@ -1859,7 +1859,7 @@ fn should_write(
     if (target - previous).abs() <= holder::TARGET_TOLERANCE_RPM {
         return false;
     }
-    if forced || matches!(mode, FanMode::Fixed { .. }) {
+    if forced || matches!(mode, FanDesired::Fixed { .. }) {
         return true;
     }
     let Some((min, max)) = limits(fan) else {

@@ -6,7 +6,7 @@
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tcr_smc::FanMode as KeyMode;
+use tcr_smc::FanMode;
 
 use super::*;
 
@@ -50,7 +50,7 @@ impl Machine {
             },
             Request::SetManual { fan } => {
                 if let Some(f) = self.fan_mut(fan) {
-                    f.mode = KeyMode::Manual;
+                    f.mode = FanMode::Manual;
                 }
                 Reply::Manual { unlocked: false }
             }
@@ -65,7 +65,7 @@ impl Machine {
             Request::HandBack => {
                 if let Some(reading) = self.reading.as_mut() {
                     for f in &mut reading.fans {
-                        f.mode = KeyMode::Auto;
+                        f.mode = FanMode::Auto;
                     }
                 }
                 Reply::HandedBack
@@ -209,7 +209,7 @@ fn machine() -> HeatReading {
                 actual_rpm: 1400.0,
                 min_rpm: 1350.0,
                 max_rpm: 5777.0,
-                mode: KeyMode::Auto,
+                mode: FanMode::Auto,
                 target_rpm: Some(0.0),
             })
             .collect(),
@@ -272,14 +272,14 @@ fn rig() -> Rig {
     rig_from(None, Some(machine()))
 }
 
-fn fixed(rpm: u32) -> FanMode {
-    FanMode::Fixed {
+fn fixed(rpm: u32) -> FanDesired {
+    FanDesired::Fixed {
         rpm: Rpm::new(rpm).unwrap(),
     }
 }
 
-fn follow(quiet: u8, full: u8) -> FanMode {
-    FanMode::FollowCpu {
+fn follow(quiet: u8, full: u8) -> FanDesired {
+    FanDesired::FollowCpu {
         curve: FollowCurve::new(quiet, full).unwrap(),
     }
 }
@@ -314,7 +314,7 @@ impl Rig {
     }
 }
 
-fn holding(mode: FanMode) -> Rig {
+fn holding(mode: FanDesired) -> Rig {
     let mut rig = rig();
     rig.send(Command::Set(mode));
     assert_eq!(rig.c.state(), State::Holding);
@@ -363,7 +363,7 @@ fn fixed_enters_every_fan_then_targets_them() {
 fn auto_hands_back_and_clears_the_record() {
     let mut rig = holding(fixed(5000));
     rig.clear_requests();
-    rig.send(Command::Set(FanMode::Auto));
+    rig.send(Command::Set(FanDesired::Auto));
     assert_eq!(rig.c.state(), State::Off);
     assert_eq!(rig.written(), vec![Request::HandBack]);
     assert_eq!(rig.c.hold(), None);
@@ -539,7 +539,7 @@ fn no_write_while_macs_runs() {
     let mut rig = holding(fixed(3000));
     rig.clear_requests();
     rig.world.lock().macs = Ok(true);
-    rig.send(Command::Set(FanMode::Auto));
+    rig.send(Command::Set(FanDesired::Auto));
     assert_eq!(rig.written(), vec![]);
     assert_eq!(rig.c.state(), State::Foreign(ForeignHolder::MacsFanControl));
     assert_eq!(rig.c.detail(), Some(Detail::WaitingForMacs));
@@ -564,7 +564,7 @@ fn read_error_writes_nothing() {
     // tick below is a write that was refused, not one with nothing to do.
     let mut rig = holding(follow(60, 90));
     rig.clear_requests();
-    rig.world.lock().fan_mut(fan(1)).unwrap().mode = KeyMode::Unreadable;
+    rig.world.lock().fan_mut(fan(1)).unwrap().mode = FanMode::Unreadable;
     rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(100.0);
     assert_eq!(
         rig.next_tick(),
@@ -572,7 +572,7 @@ fn read_error_writes_nothing() {
     );
     assert_eq!(rig.c.state(), State::Unknown);
     rig.world.lock().fan_mut(fan(1)).unwrap().target_rpm = None;
-    rig.world.lock().fan_mut(fan(1)).unwrap().mode = KeyMode::Manual;
+    rig.world.lock().fan_mut(fan(1)).unwrap().mode = FanMode::Manual;
     assert_eq!(
         rig.next_tick(),
         Some(TickOutcome::HeldBack(Why::Unreadable))
@@ -606,7 +606,7 @@ fn holder_rechecked_each_tick() {
     {
         let mut machine = rig.world.lock();
         for f in &mut machine.reading.as_mut().unwrap().fans {
-            f.mode = KeyMode::Auto;
+            f.mode = FanMode::Auto;
         }
     }
     rig.next_tick();
@@ -626,7 +626,7 @@ fn fixed_then_auto_within_unlock_ends_off() {
         if matches!(request, Request::SetManual { .. }) && !sent {
             clock.advance(Duration::from_secs(3));
             inject
-                .send(Input::Command(Command::Set(FanMode::Auto)))
+                .send(Input::Command(Command::Set(FanDesired::Auto)))
                 .unwrap();
             sent = true;
         }
@@ -634,7 +634,7 @@ fn fixed_then_auto_within_unlock_ends_off() {
     }));
     rig.send(Command::Set(fixed(3000)));
     assert_eq!(rig.c.state(), State::Off);
-    assert_eq!(rig.c.desired(), FanMode::Auto);
+    assert_eq!(rig.c.desired(), FanDesired::Auto);
     assert_eq!(rig.written(), vec![set_manual(0), Request::HandBack]);
     assert_eq!(rig.c.hold(), None);
     let machine = rig.world.lock();
@@ -645,7 +645,7 @@ fn fixed_then_auto_within_unlock_ends_off() {
             .unwrap()
             .fans
             .iter()
-            .all(|f| f.mode == KeyMode::Auto)
+            .all(|f| f.mode == FanMode::Auto)
     );
 }
 
@@ -657,7 +657,7 @@ fn the_latest_wish_during_the_unlock_wins() {
     rig.hook(Box::new(move |request, _machine, inject, _clock| {
         if matches!(request, Request::SetManual { .. }) && !sent {
             for rpm in [4000, 4500] {
-                let mode = FanMode::Fixed {
+                let mode = FanDesired::Fixed {
                     rpm: Rpm::new(rpm).unwrap(),
                 };
                 inject.send(Input::Command(Command::Set(mode))).unwrap();
@@ -883,7 +883,7 @@ fn wake_with_every_fan_automatic_reenters_and_says_why() {
     {
         let mut machine = rig.world.lock();
         for f in &mut machine.reading.as_mut().unwrap().fans {
-            f.mode = KeyMode::Auto;
+            f.mode = FanMode::Auto;
         }
     }
     rig.clear_requests();
@@ -900,7 +900,7 @@ fn fans_that_keep_going_automatic_are_contended() {
         {
             let mut machine = rig.world.lock();
             for f in &mut machine.reading.as_mut().unwrap().fans {
-                f.mode = KeyMode::Auto;
+                f.mode = FanMode::Auto;
             }
         }
         rig.next_tick();
@@ -929,7 +929,7 @@ fn another_tcr_taking_over_stops_without_a_hand_back() {
 fn a_matching_record_at_boot_is_taken_over_and_resumed() {
     let mut reading = machine();
     for f in &mut reading.fans {
-        f.mode = KeyMode::Manual;
+        f.mode = FanMode::Manual;
         f.target_rpm = Some(5000.0);
     }
     let saved = Saved {
@@ -954,11 +954,11 @@ fn a_matching_record_at_boot_is_taken_over_and_resumed() {
 fn a_matching_record_with_auto_wanted_is_handed_back_at_boot() {
     let mut reading = machine();
     for f in &mut reading.fans {
-        f.mode = KeyMode::Manual;
+        f.mode = FanMode::Manual;
         f.target_rpm = Some(5000.0);
     }
     let saved = Saved {
-        desired: FanMode::Auto,
+        desired: FanDesired::Auto,
         hold: Some(Hold {
             writer_pid: 1,
             fans: (0..2)
@@ -979,10 +979,10 @@ fn a_matching_record_with_auto_wanted_is_handed_back_at_boot() {
 #[test]
 fn a_record_the_fans_no_longer_match_is_dropped_at_boot() {
     let mut reading = machine();
-    reading.fans[0].mode = KeyMode::Manual;
+    reading.fans[0].mode = FanMode::Manual;
     reading.fans[0].target_rpm = Some(2222.0);
     let saved = Saved {
-        desired: FanMode::Auto,
+        desired: FanDesired::Auto,
         hold: Some(Hold {
             writer_pid: 1,
             fans: vec![HeldFan {
@@ -1020,7 +1020,7 @@ fn a_failing_hand_back_is_stuck_after_three_tries() {
             },
         )))
     }));
-    rig.send(Command::Set(FanMode::Auto));
+    rig.send(Command::Set(FanDesired::Auto));
     assert_eq!(rig.c.state(), State::Stuck);
     assert_eq!(rig.written(), vec![Request::HandBack; RELEASE_TRIES]);
     assert!(!rig.c.connected());
@@ -1079,9 +1079,9 @@ fn every_tick_path_has_an_outcome() {
     rig.world.lock().macs = Ok(true);
     seen.push(rig.next_tick());
     rig.world.lock().macs = Ok(false);
-    rig.world.lock().fan_mut(fan(0)).unwrap().mode = KeyMode::Unreadable;
+    rig.world.lock().fan_mut(fan(0)).unwrap().mode = FanMode::Unreadable;
     seen.push(rig.next_tick());
-    rig.world.lock().fan_mut(fan(0)).unwrap().mode = KeyMode::Manual;
+    rig.world.lock().fan_mut(fan(0)).unwrap().mode = FanMode::Manual;
     rig.world.lock().fan_mut(fan(0)).unwrap().max_rpm = 0.0;
     seen.push(rig.next_tick());
     rig.world.lock().fan_mut(fan(0)).unwrap().max_rpm = 5777.0;
@@ -1095,7 +1095,7 @@ fn every_tick_path_has_an_outcome() {
     {
         let mut machine = rig.world.lock();
         for f in &mut machine.reading.as_mut().unwrap().fans {
-            f.mode = KeyMode::Auto;
+            f.mode = FanMode::Auto;
         }
     }
     seen.push(rig.next_tick());
@@ -1125,7 +1125,7 @@ fn every_tick_path_has_an_outcome() {
 #[test]
 fn auto_with_nothing_held_writes_nothing_and_does_not_tick() {
     let mut rig = rig();
-    rig.send(Command::Set(FanMode::Auto));
+    rig.send(Command::Set(FanDesired::Auto));
     assert_eq!(rig.c.state(), State::Off);
     assert_eq!(rig.world.lock().requests, vec![]);
     assert_eq!(rig.c.wait(), None, "no timer while off");
@@ -1147,7 +1147,7 @@ fn a_waiting_release_logs_once_not_every_tick() {
     // Something held: Auto waits, quietly.
     let mut rig = holding(fixed(3000));
     rig.world.lock().macs = Ok(true);
-    rig.send(Command::Set(FanMode::Auto));
+    rig.send(Command::Set(FanDesired::Auto));
     assert_eq!(rig.c.state(), State::Foreign(ForeignHolder::MacsFanControl));
     assert!(!rig.take_logs().is_empty(), "the change itself is said");
     for _ in 0..5 {
@@ -1170,7 +1170,7 @@ fn a_waiting_release_logs_once_not_every_tick() {
     // A probe that keeps failing: one warning, not one per tick.
     let mut rig = holding(fixed(3000));
     rig.world.lock().macs = Err("proc_listallpids failed".into());
-    rig.send(Command::Set(FanMode::Auto));
+    rig.send(Command::Set(FanDesired::Auto));
     assert_eq!(rig.c.state(), State::Unknown);
     let warnings = |logs: &[(Level, String)]| logs.iter().filter(|l| l.0 == Level::Warn).count();
     assert_eq!(warnings(&rig.take_logs()), 1);
@@ -1185,7 +1185,7 @@ fn a_waiting_release_logs_once_not_every_tick() {
     rig.send(Command::Set(fixed(3000)));
     assert_eq!(rig.c.state(), State::Foreign(ForeignHolder::MacsFanControl));
     assert_eq!(rig.c.hold(), None);
-    rig.send(Command::Set(FanMode::Auto));
+    rig.send(Command::Set(FanDesired::Auto));
     assert_eq!(rig.c.state(), State::Off);
     assert_eq!(rig.c.wait(), None, "no timer while off");
     rig.take_logs();
@@ -1250,7 +1250,7 @@ fn a_block_after_the_first_set_manual_hands_back_first() {
 fn a_record_without_a_target_is_not_ours_after_entry() {
     let mut reading = machine();
     for f in &mut reading.fans {
-        f.mode = KeyMode::Manual;
+        f.mode = FanMode::Manual;
         f.target_rpm = Some(2000.0);
     }
     let saved = Saved {
@@ -1278,7 +1278,7 @@ fn a_record_without_a_target_is_not_ours_after_entry() {
 fn a_held_fan_back_on_automatic_alone_is_retaken() {
     let mut rig = holding(fixed(3000));
     rig.clear_requests();
-    rig.world.lock().fan_mut(fan(1)).unwrap().mode = KeyMode::Auto;
+    rig.world.lock().fan_mut(fan(1)).unwrap().mode = FanMode::Auto;
     assert_eq!(
         rig.next_tick(),
         Some(TickOutcome::HeldBack(Why::Reentering))
@@ -1295,11 +1295,11 @@ fn a_held_fan_back_on_automatic_alone_is_retaken() {
     assert_eq!(rig.c.state(), State::Holding);
     assert_eq!(
         rig.world.lock().fan_mut(fan(1)).unwrap().mode,
-        KeyMode::Manual
+        FanMode::Manual
     );
     // And it counts toward contention like every fan going back.
     for _ in 0..REENTRY_LIMIT {
-        rig.world.lock().fan_mut(fan(1)).unwrap().mode = KeyMode::Auto;
+        rig.world.lock().fan_mut(fan(1)).unwrap().mode = FanMode::Auto;
         rig.next_tick();
     }
     assert_eq!(rig.c.state(), State::Unavailable(Unavailable::Contended));
@@ -1323,7 +1323,7 @@ fn an_empty_or_partial_reading_while_holding_is_unknown() {
         let mut machine = rig.world.lock();
         let mut partial = full.clone().unwrap();
         partial.fans.truncate(1);
-        partial.fans[0].mode = KeyMode::Auto;
+        partial.fans[0].mode = FanMode::Auto;
         machine.reading = Some(partial);
     }
     assert_eq!(
@@ -1451,7 +1451,7 @@ fn auto_from_holding_settles_only_on_off() {
     let mut rig = holding(fixed(5000));
     let sent_at = rig.command_time();
     rig.tx
-        .send(Input::Command(Command::Set(FanMode::Auto)))
+        .send(Input::Command(Command::Set(FanDesired::Auto)))
         .unwrap();
     rig.c.pump();
     let first = rig.published.lock().unwrap().first().cloned().unwrap();

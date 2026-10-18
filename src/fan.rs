@@ -45,8 +45,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tcr_fan::controller::{
-    Clock, Command, Controller, FanMode, FollowCurve, ForeignHolder, Hold, Input, Level, ModeError,
-    Parts, Rpm, Saved, Snapshot, State, Store, Unavailable,
+    Clock, Command, Controller, FanDesired, FollowCurve, ForeignHolder, Hold, Input, Level,
+    ModeError, Parts, Rpm, Saved, Snapshot, State, Store, Unavailable,
 };
 use tcr_fan::holder::HeldFan;
 use tcr_smc::FanIndex;
@@ -234,11 +234,11 @@ impl Store for FileStore {
 // Modes at the edge.
 
 /// A wish as the wire spells it.
-pub const fn desired_row(mode: FanMode) -> FanDesiredRow {
+pub const fn desired_row(mode: FanDesired) -> FanDesiredRow {
     match mode {
-        FanMode::Auto => FanDesiredRow::Auto,
-        FanMode::Fixed { rpm } => FanDesiredRow::Fixed { rpm: rpm.get() },
-        FanMode::FollowCpu { curve } => FanDesiredRow::FollowCpu {
+        FanDesired::Auto => FanDesiredRow::Auto,
+        FanDesired::Fixed { rpm } => FanDesiredRow::Fixed { rpm: rpm.get() },
+        FanDesired::FollowCpu { curve } => FanDesiredRow::FollowCpu {
             quiet_below_c: curve.quiet_below_c(),
             full_at_c: curve.full_at_c(),
         },
@@ -246,16 +246,16 @@ pub const fn desired_row(mode: FanMode) -> FanDesiredRow {
 }
 
 /// A wish from the wire, checked.
-pub fn mode_of(row: FanDesiredRow) -> Result<FanMode, ModeError> {
+pub fn mode_of(row: FanDesiredRow) -> Result<FanDesired, ModeError> {
     Ok(match row {
-        FanDesiredRow::Auto => FanMode::Auto,
-        FanDesiredRow::Fixed { rpm } => FanMode::Fixed {
+        FanDesiredRow::Auto => FanDesired::Auto,
+        FanDesiredRow::Fixed { rpm } => FanDesired::Fixed {
             rpm: Rpm::new(rpm)?,
         },
         FanDesiredRow::FollowCpu {
             quiet_below_c,
             full_at_c,
-        } => FanMode::FollowCpu {
+        } => FanDesired::FollowCpu {
             curve: FollowCurve::new(quiet_below_c, full_at_c)?,
         },
     })
@@ -458,7 +458,7 @@ impl FanHandle {
 /// binary's call, once the server is bound.
 pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
     let (store, saved) = FileStore::open(file, std::process::id());
-    let desired = saved.as_ref().map_or(FanMode::Auto, |s| s.desired);
+    let desired = saved.as_ref().map_or(FanDesired::Auto, |s| s.desired);
     let (tx, rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let shown = Arc::new(Mutex::new(Snapshot {
@@ -558,7 +558,7 @@ fn inert(saved: Option<Saved>) -> (Arc<FanHandle>, Inert) {
     let (tx, rx) = mpsc::channel();
     let (_never, done_rx) = mpsc::channel();
     let shown = Arc::new(Mutex::new(Snapshot {
-        desired: saved.as_ref().map_or(FanMode::Auto, |s| s.desired),
+        desired: saved.as_ref().map_or(FanDesired::Auto, |s| s.desired),
         state: State::Off,
         hot_guard: false,
         targets: Vec::new(),
@@ -827,7 +827,7 @@ mod tests {
 
     fn snapshot(state: State, targets: &[(u8, f64)], detail: Option<Detail>) -> Snapshot {
         Snapshot {
-            desired: FanMode::Auto,
+            desired: FanDesired::Auto,
             state,
             hot_guard: false,
             targets: targets.iter().map(|&(i, rpm)| (fan(i), rpm)).collect(),
@@ -837,7 +837,7 @@ mod tests {
     }
 
     /// The row for `snapshot` with `desired` as its wish.
-    fn row_with(desired: FanMode, snapshot: Snapshot) -> FanControlRow {
+    fn row_with(desired: FanDesired, snapshot: Snapshot) -> FanControlRow {
         row(&Snapshot {
             desired,
             ..snapshot
@@ -849,14 +849,14 @@ mod tests {
     #[test]
     fn fan_status_rows_match_the_committed_contract() {
         let samples = fixture();
-        let fixed = FanMode::Fixed {
+        let fixed = FanDesired::Fixed {
             rpm: Rpm::new(5000).unwrap(),
         };
-        let follow = FanMode::FollowCpu {
+        let follow = FanDesired::FollowCpu {
             curve: FollowCurve::new(60, 90).unwrap(),
         };
         let cases = [
-            ("off", FanMode::Auto, snapshot(State::Off, &[], None)),
+            ("off", FanDesired::Auto, snapshot(State::Off, &[], None)),
             (
                 "holdingFixed5000",
                 fixed,
@@ -874,7 +874,7 @@ mod tests {
             ),
             (
                 "foreignMacsFanControlWaiting",
-                FanMode::Auto,
+                FanDesired::Auto,
                 snapshot(
                     State::Foreign(ForeignHolder::MacsFanControl),
                     &[(0, 5000.0), (1, 5000.0)],
@@ -922,7 +922,7 @@ mod tests {
     #[test]
     fn fan_status_reasons_with_fields_get_a_detail() {
         let locked = row_with(
-            FanMode::Auto,
+            FanDesired::Auto,
             snapshot(
                 State::Unavailable(Unavailable::ModeLocked { fan: 1 }),
                 &[],
@@ -937,7 +937,7 @@ mod tests {
         let wire = serde_json::to_value(&locked).unwrap();
         assert_eq!(wire["reason"], serde_json::json!({"modeLocked": 1}));
         let version = row_with(
-            FanMode::Auto,
+            FanDesired::Auto,
             snapshot(
                 State::Unavailable(Unavailable::HelperVersion { installed: Some(2) }),
                 &[],
@@ -959,12 +959,12 @@ mod tests {
             since_ms: 0,
             ..snapshot(state, targets, detail)
         };
-        let fixed = FanMode::Fixed {
+        let fixed = FanDesired::Fixed {
             rpm: Rpm::new(5000).unwrap(),
         };
         let cases = [
             (
-                FanMode::Auto,
+                FanDesired::Auto,
                 at(State::Off, &[], None),
                 r#"{"desired":{"mode":"auto"},"state":"off","reason":null,"hotGuard":false,"targets":[],"detail":null,"sinceMs":0}"#,
             ),
@@ -974,7 +974,7 @@ mod tests {
                 r#"{"desired":{"mode":"fixed","rpm":5000},"state":"holding","reason":null,"hotGuard":false,"targets":[{"fan":0,"rpm":5000.0},{"fan":1,"rpm":5000.0}],"detail":null,"sinceMs":0}"#,
             ),
             (
-                FanMode::Auto,
+                FanDesired::Auto,
                 at(
                     State::Foreign(ForeignHolder::MacsFanControl),
                     &[],
@@ -1068,7 +1068,7 @@ mod tests {
         let path = dir.path().join("fan.json");
         assert_eq!(load(&path), None, "missing is automatic");
         let saved = Saved {
-            desired: FanMode::Fixed {
+            desired: FanDesired::Fixed {
                 rpm: Rpm::new(5000).unwrap(),
             },
             hold: Some(Hold {
@@ -1111,7 +1111,7 @@ mod tests {
 
     fn held_by(pid: u32, hold: bool) -> Saved {
         Saved {
-            desired: FanMode::Fixed {
+            desired: FanDesired::Fixed {
                 rpm: Rpm::new(5000).unwrap(),
             },
             hold: hold.then(|| Hold {
@@ -1170,7 +1170,7 @@ mod tests {
     /// controllerStopped`, never the last state it published.
     #[test]
     fn fan_status_a_panicked_controller_reads_unavailable() {
-        let fixed = FanMode::Fixed {
+        let fixed = FanDesired::Fixed {
             rpm: Rpm::new(5000).unwrap(),
         };
         let holding = || {
@@ -1203,7 +1203,7 @@ mod tests {
     /// with that state; the wish shows once the controller acted on it.
     #[test]
     fn fan_status_never_pairs_a_new_wish_with_the_old_wishs_state() {
-        let fixed = FanMode::Fixed {
+        let fixed = FanDesired::Fixed {
             rpm: Rpm::new(5000).unwrap(),
         };
         let (handle, mut controller) = inert(Some(Saved {
@@ -1214,7 +1214,7 @@ mod tests {
         assert_eq!(before.desired, FanDesiredRow::Fixed { rpm: 5000 });
         assert_eq!(before.state, FanStateRow::Unavailable, "no SMC here");
 
-        let answer = handle.send(Command::Set(FanMode::Auto)).unwrap();
+        let answer = handle.send(Command::Set(FanDesired::Auto)).unwrap();
         assert_eq!(
             answer, before,
             "the POST answers with the object before the command"
