@@ -19,7 +19,16 @@ let package = Package(
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.5")
     ],
     targets: [
-        .target(name: "TcrBarCore", path: "Sources/TcrBarCore"),
+        // AppleSMC in C, so its 80-byte parameter struct has C layout by
+        // construction; `TcrSMC` is the typed Swift library on top. Both are
+        // framework-free apart from IOKit, which every Mac ships.
+        .target(
+            name: "CSMC",
+            path: "Sources/CSMC",
+            linkerSettings: [.linkedFramework("IOKit")]
+        ),
+        .target(name: "TcrSMC", dependencies: ["CSMC"], path: "Sources/TcrSMC"),
+        .target(name: "TcrBarCore", dependencies: ["TcrSMC"], path: "Sources/TcrBarCore"),
         .executableTarget(
             name: "TcrBar",
             dependencies: [
@@ -38,7 +47,7 @@ let package = Package(
         ),
         .testTarget(
             name: "TcrBarTests",
-            dependencies: ["TcrBarCore"],
+            dependencies: ["TcrBarCore", "TcrSMC"],
             path: "Tests/TcrBarTests"
         ),
     ]
