@@ -388,6 +388,44 @@ pub struct SessionsSummary {
     pub cost_usd: f64,
 }
 
+/// How hot the serving Mac's CPU runs and how hard its fans work, read by the proxy through
+/// AppleSMC (the `tcr-smc` crate). Machine-wide, not per account, so it rides the status
+/// payload's top level and `tcr sessions --json`'s object, never an account row.
+///
+/// Every field defaults, for the same skew reason as [`SessionsSummary`]: a later field must
+/// not fail an older client's parse.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeatRow {
+    /// The hottest CPU sensor in °C, always between 0.5 and 150. Absent when no CPU sensor
+    /// read this time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_celsius: Option<f64>,
+    /// One per fan whose speed read. Empty on a Mac with no fans.
+    #[serde(default)]
+    pub fans: Vec<FanRow>,
+}
+
+/// One fan of [`HeatRow::fans`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanRow {
+    /// 0-based, the `n` in the SMC's `F{n}Ac`.
+    #[serde(default)]
+    pub index: u8,
+    #[serde(default)]
+    pub actual_rpm: f64,
+    /// 0 when it did not read.
+    #[serde(default)]
+    pub min_rpm: f64,
+    /// 0 when it did not read: "no maximum", not a ceiling of 0.
+    #[serde(default)]
+    pub max_rpm: f64,
+    /// The fan's mode key says a program fixed its speed, so it no longer follows the heat.
+    #[serde(default)]
+    pub manual: bool,
+}
+
 /// One live session on the `tcr status --json` wire's `sessions` array (F1,
 /// `docs/design/panel-tabs.md`). One entry per session the proxy has seen in the last hour —
 /// see `src/session_wire.rs` in the main crate for how it is built and bounded.

@@ -1,6 +1,5 @@
 import Darwin
 import Foundation
-import TcrSMC
 
 /// What the box itself is doing — the Tools tab's machine line, "load 7.1/14
 /// · 48/64 GB · 5 compiles · 210 GB free".
@@ -41,8 +40,10 @@ public struct MachineStats: Equatable, Sendable {
     /// own.
     public let compiles: Int
     public let diskFreeBytes: UInt64
-    /// CPU temperature and fans, from AppleSMC without root. Nil where the SMC
-    /// cannot be read (a VM), and the line is then exactly the line without it.
+    /// CPU temperature and fans, as the proxy read them through AppleSMC and
+    /// the last poll carried (``Fleet/heat``). Nil where the proxy reads no
+    /// SMC (a VM), from a proxy too old to say, and with no proxy at all; the
+    /// line is then exactly the line without it.
     public let heat: HeatReading?
 
     public init(
@@ -133,7 +134,7 @@ public struct MachineStats: Equatable, Sendable {
 
     /// The CPU phrase and the fan phrase, each present or not on its own.
     ///
-    /// Never traps: TcrSMC drops non-finite and out-of-band readings at the
+    /// Never traps: the proxy drops non-finite and out-of-band readings at the
     /// source, but a `HeatReading` is a public value anyone can build, and
     /// `Int(_:)` of NaN stops the process. A figure that is not a number is
     /// left out, never drawn as one.
@@ -197,7 +198,7 @@ public struct MachineStats: Equatable, Sendable {
 
     /// Whole rpm with a comma every three digits, "5,013": fixed rather than
     /// the user's locale, like every other figure on the panel. Nil for a
-    /// figure that is not a number. No minus sign: TcrSMC drops negative rpm.
+    /// figure that is not a number. No minus sign: the proxy drops negative rpm.
     static func grouped(_ rpm: Double) -> String? {
         guard let rounded = whole(rpm) else { return nil }
         let digits = String(rounded)
@@ -239,9 +240,12 @@ extension MachineStats {
     /// A reading that fails is a zero in that one field, never a `nil` whole:
     /// `getloadavg` returning -1 does not make the memory figure unknown.
     ///
-    /// Blocking: the process walk and the SMC reads are kernel calls, so the
-    /// panel calls this off the main thread and assigns the result on it.
-    public static func read() -> MachineStats {
+    /// `heat` is not read here. The proxy reads the SMC and the poll carries
+    /// it (``Fleet/heat``); the caller passes the latest one in.
+    ///
+    /// Blocking: the process walk is kernel calls, so the panel calls this
+    /// off the main thread and assigns the result on it.
+    public static func read(heat: HeatReading? = nil) -> MachineStats {
         MachineStats(
             loadAverage: readLoadAverage(),
             cores: ProcessInfo.processInfo.processorCount,
@@ -249,7 +253,7 @@ extension MachineStats {
             memoryTotalBytes: ProcessInfo.processInfo.physicalMemory,
             compiles: readCompileCount(),
             diskFreeBytes: readDiskFree(),
-            heat: HeatReading.read()
+            heat: heat
         )
     }
 

@@ -1534,6 +1534,7 @@ mod tests {
             request_key_mode: None,
             unkeyed_connects: None,
             unkeyed_requests: None,
+            heat: None,
         }
     }
 
