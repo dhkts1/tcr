@@ -134,6 +134,11 @@ impl CacheDir {
         self.root.join("session-wire.json")
     }
 
+    /// The fan mode and hold record: `<root>/fan.json` ([`crate::fan`]).
+    pub fn fan_file(&self) -> PathBuf {
+        self.root.join("fan.json")
+    }
+
     /// Peer runtime state: `<root>/peer-state.json`.
     pub fn peer_state_file(&self) -> PathBuf {
         self.root.join("peer-state.json")

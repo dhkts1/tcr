@@ -3630,16 +3630,225 @@ fn payload_carries_sessions(body: &str) -> bool {
 /// endpoint itself (it never holds the proxy key), so it needs a shell-out, and
 /// this object is the one it already makes on every poll that has a top level
 /// for a machine-wide fact; `status --json` is a bare array of accounts.
+///
+/// `fanControl` rides beside `heat` the same way and for the same reason: the popover reads
+/// what the server's fan controller is doing from this poll.
 fn render_sessions_json(
     supported: bool,
     sessions: &[tcr_status_wire::SessionRow],
     heat: Option<&tcr_status_wire::HeatRow>,
+    fan_control: Option<&tcr_status_wire::FanControlRow>,
 ) -> String {
     let mut document = serde_json::json!({ "supported": supported, "sessions": sessions });
     if let Some(heat) = heat {
         document["heat"] = serde_json::json!(heat);
     }
+    if let Some(fan_control) = fan_control {
+        document["fanControl"] = serde_json::json!(fan_control);
+    }
     document.to_string()
+}
+
+/// [`crate::proxy::FAN_PATH`]. 400 is a refused mode, 503 a server with no fan controller.
+const FAN_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::FAN_PATH,
+    endpoint: crate::proxy::FAN_ENDPOINT,
+    refusals: &[400, 503],
+    noun: "fan",
+    success_needs_stamp: true,
+};
+
+/// How long `tcr fan <mode>` waits for the controller to settle: a set-manual may take 15 s
+/// (the unlock), plus the version call and the targets.
+pub const FAN_SETTLE: Duration = Duration::from_secs(20);
+const FAN_POLL: Duration = Duration::from_millis(250);
+
+fn live_status_why(error: &LiveStatusError, port: u16) -> String {
+    match error {
+        LiveStatusError::NoServer => format!("no tcr is listening on 127.0.0.1:{port}"),
+        LiveStatusError::NoAnswer(why) => {
+            format!("the tcr on 127.0.0.1:{port} did not answer: {why}")
+        }
+        LiveStatusError::Unusable(why) => {
+            format!("the tcr on 127.0.0.1:{port} answered with something unreadable: {why}")
+        }
+    }
+}
+
+/// The server's fan control and heat, or why there is none to show.
+async fn live_fan(
+    config: &Config,
+) -> anyhow::Result<(
+    tcr_status_wire::FanControlRow,
+    Option<tcr_status_wire::HeatRow>,
+)> {
+    let payload = fetch_live_status(config)
+        .await
+        .map_err(|e| anyhow::anyhow!(live_status_why(&e, config.proxy.port)))?;
+    let heat = payload
+        .heat
+        .as_ref()
+        .and_then(crate::status::HeatField::reading)
+        .cloned();
+    match payload.fan_control {
+        Some(crate::status::FanControlField::Reading(row)) => Ok((row, heat)),
+        Some(crate::status::FanControlField::Unreadable(why)) => {
+            bail!("the server's fanControl object did not parse: {why}")
+        }
+        None => bail!(
+            "the tcr on 127.0.0.1:{} runs no fan controller (an older tcr, or one not started as the server)",
+            config.proxy.port
+        ),
+    }
+}
+
+/// `tcr fan`, all of it. With no `request`, print the state; with one, send it, wait for the
+/// state to settle, and say how it ended. Never optimistic: exit 0 only when the server
+/// reports the state the request means (holding for a manual mode, off for automatic), seen
+/// after the command was sent.
+pub async fn fan(
+    config_path: &Path,
+    request: Option<crate::fan::FanRequest>,
+    json: bool,
+) -> anyhow::Result<i32> {
+    let (config, _created) = load_config_with_creation(config_path)?;
+    let Some(request) = request else {
+        let (row, heat) = live_fan(&config).await?;
+        if json {
+            println!("{}", serde_json::to_string(&row)?);
+        } else {
+            print!("{}", render_fan_text(&row, heat.as_ref()));
+        }
+        return Ok(0);
+    };
+    // Refused here first, in the route's own words, so a typo costs no round trip.
+    request
+        .command()
+        .map_err(|e| anyhow::anyhow!("the fan mode was refused: {e}"))?;
+
+    let sent_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let answer: Result<tcr_status_wire::FanControlRow, LiveControlError> =
+        call_route(&config, &FAN_ROUTE, |client, url| {
+            client.post(url).json(&request)
+        })
+        .await
+        .result;
+    match answer {
+        Ok(_accepted) => {}
+        Err(LiveControlError::Rejected(message)) => bail!("{message}"),
+        Err(LiveControlError::NoRoute) => bail!(
+            "the tcr on 127.0.0.1:{} is too old to control fans (no {} route)",
+            config.proxy.port,
+            crate::proxy::FAN_PATH
+        ),
+        Err(other) => bail!("could not reach the fan controller: {}", other.why()),
+    }
+
+    let started = std::time::Instant::now();
+    let (row, heat) = loop {
+        let (row, heat) = live_fan(&config).await?;
+        let seen_after_send = row.since_ms >= sent_at;
+        let moving = matches!(
+            row.state,
+            tcr_status_wire::FanStateRow::Entering | tcr_status_wire::FanStateRow::Releasing
+        );
+        if (seen_after_send && !moving) || started.elapsed() >= FAN_SETTLE {
+            break (row, heat);
+        }
+        tokio::time::sleep(FAN_POLL).await;
+    };
+    if json {
+        println!("{}", serde_json::to_string(&row)?);
+    } else {
+        print!("{}", render_fan_text(&row, heat.as_ref()));
+    }
+    if row.state == request.settled_state() && row.since_ms >= sent_at {
+        return Ok(0);
+    }
+    let reason = row
+        .reason
+        .map(|r| format!(" ({})", r.name()))
+        .unwrap_or_default();
+    let detail = row.detail.map(|d| format!(": {d}")).unwrap_or_default();
+    eprintln!(
+        "tcr: the fans are {}{reason}{detail}, not {}",
+        fan_word(&row.state),
+        fan_word(&request.settled_state()),
+    );
+    Ok(1)
+}
+
+/// A wire enum's own JSON spelling, for a line a person reads and a script greps.
+fn fan_word<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// `tcr fan`'s text: the wish, the state and why, then each fan as heat reads it.
+fn render_fan_text(
+    row: &tcr_status_wire::FanControlRow,
+    heat: Option<&tcr_status_wire::HeatRow>,
+) -> String {
+    use tcr_status_wire::FanDesiredRow;
+    let desired = match row.desired {
+        FanDesiredRow::Auto => "auto".to_string(),
+        FanDesiredRow::Fixed { rpm } => format!("fixed {rpm} rpm"),
+        FanDesiredRow::FollowCpu {
+            quiet_below_c,
+            full_at_c,
+        } => format!("follow cpu {quiet_below_c}-{full_at_c} °C"),
+    };
+    let mut out = format!(
+        "desired={desired}\nstate={}\nreason={}\n",
+        fan_word(&row.state),
+        row.reason
+            .map_or_else(|| "-".to_string(), |r| r.name().to_string()),
+    );
+    if let Some(detail) = &row.detail {
+        out.push_str(&format!("detail={detail}\n"));
+    }
+    out.push_str(&format!(
+        "hotGuard={}\n",
+        if row.hot_guard { "on" } else { "off" }
+    ));
+    let Some(heat) = heat else {
+        out.push_str("fans=unread (no heat reading from the server)\n");
+        return out;
+    };
+    if let Some(cpu) = heat.cpu_celsius {
+        out.push_str(&format!("cpu={cpu:.1}°C\n"));
+    }
+    for fan in &heat.fans {
+        let written = row
+            .targets
+            .iter()
+            .find(|t| t.fan == fan.index)
+            .map(|t| format!(" written={:.0}", t.rpm))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "fan={} actual={:.0} min={:.0} max={:.0} mode={} target={}{written}\n",
+            fan.index,
+            fan.actual_rpm,
+            fan.min_rpm,
+            fan.max_rpm,
+            if fan.manual { "manual" } else { "auto" },
+            fan.target_rpm
+                .map_or_else(|| "-".to_string(), |t| format!("{t:.0}")),
+        ));
+    }
+    out.push_str(&format!(
+        "ftst={}\n",
+        match heat.ftst {
+            Some(true) => "1",
+            Some(false) => "0",
+            None => "-",
+        }
+    ));
+    out
 }
 
 /// The `tcr sessions` text form: a `supported=… sessions=…` header, then one line per
@@ -3750,6 +3959,9 @@ pub async fn sessions(config_path: &Path, json: bool) -> anyhow::Result<()> {
     if let Some(crate::status::HeatField::Unreadable(why)) = &payload.heat {
         eprintln!("tcr: the server's heat reading did not parse, so it is left out: {why}");
     }
+    if let Some(crate::status::FanControlField::Unreadable(why)) = &payload.fan_control {
+        eprintln!("tcr: the server's fanControl object did not parse, so it is left out: {why}");
+    }
 
     if json {
         // The rows cross verbatim as the wire emitted them — `SessionRow` is
@@ -3760,9 +3972,13 @@ pub async fn sessions(config_path: &Path, json: bool) -> anyhow::Result<()> {
             .heat
             .as_ref()
             .and_then(crate::status::HeatField::reading);
+        let fan_control = payload
+            .fan_control
+            .as_ref()
+            .and_then(crate::status::FanControlField::reading);
         println!(
             "{}",
-            render_sessions_json(supported, &payload.sessions, heat)
+            render_sessions_json(supported, &payload.sessions, heat, fan_control)
         );
     } else {
         print!("{}", render_sessions_text(supported, &payload.sessions));
@@ -7965,7 +8181,7 @@ mod tests {
             unpriced_requests: 0,
             reasoning_tokens: 0,
         };
-        let rendered = render_sessions_json(true, std::slice::from_ref(&row), None);
+        let rendered = render_sessions_json(true, std::slice::from_ref(&row), None, None);
         let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
         assert_eq!(value["supported"], serde_json::json!(true));
         // camelCase keys, exactly as the Swift `Session` decoder names them
@@ -7991,7 +8207,7 @@ mod tests {
 
         // The unsupported document still carries both keys, so the client
         // never has to tell "absent" from "false".
-        let empty = render_sessions_json(false, &[], None);
+        let empty = render_sessions_json(false, &[], None, None);
         let value: serde_json::Value = serde_json::from_str(&empty).expect("valid JSON");
         assert_eq!(value["supported"], serde_json::json!(false));
         assert_eq!(value["sessions"], serde_json::json!([]));
@@ -8013,9 +8229,11 @@ mod tests {
                 min_rpm: 1350.0,
                 max_rpm: 5777.0,
                 manual: false,
+                target_rpm: None,
             }],
+            ftst: None,
         };
-        let rendered = render_sessions_json(true, &[], Some(&heat));
+        let rendered = render_sessions_json(true, &[], Some(&heat), None);
         let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
         assert_eq!(
             value["heat"],
@@ -8026,6 +8244,57 @@ mod tests {
             })
         );
         assert_eq!(value["sessions"], serde_json::json!([]));
+        assert!(
+            value.get("fanControl").is_none(),
+            "no key without a controller"
+        );
+    }
+
+    /// `fanControl` crosses `tcr sessions --json` whole, beside `heat`, exactly as the
+    /// committed contract sample spells it: the object TcrBar's popover decodes.
+    #[test]
+    fn fan_status_crosses_sessions_json_as_the_contract_says() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fan-control-contract.json");
+        let samples: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let sample = samples["holdingFixed5000"].clone();
+        let row: tcr_status_wire::FanControlRow = serde_json::from_value(sample.clone()).unwrap();
+        let rendered = render_sessions_json(true, &[], None, Some(&row));
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(value["fanControl"], sample);
+    }
+
+    /// `tcr fan`'s text names the wish, the state, each fan's mode key and target, and
+    /// `Ftst`: what Gil's hardware checks read.
+    #[test]
+    fn fan_status_text_names_every_fact_the_hardware_checks_read() {
+        let row = tcr_status_wire::FanControlRow {
+            desired: tcr_status_wire::FanDesiredRow::Fixed { rpm: 5000 },
+            state: tcr_status_wire::FanStateRow::Foreign,
+            reason: Some(tcr_status_wire::FanReasonRow::MacsFanControl),
+            hot_guard: false,
+            targets: vec![],
+            detail: None,
+            since_ms: 0,
+        };
+        let heat = tcr_status_wire::HeatRow {
+            cpu_celsius: Some(61.0),
+            fans: vec![tcr_status_wire::FanRow {
+                index: 0,
+                actual_rpm: 5013.0,
+                min_rpm: 1350.0,
+                max_rpm: 5777.0,
+                manual: true,
+                target_rpm: Some(5000.0),
+            }],
+            ftst: Some(false),
+        };
+        assert_eq!(
+            render_fan_text(&row, Some(&heat)),
+            "desired=fixed 5000 rpm\nstate=foreign\nreason=macsFanControl\nhotGuard=off\n\
+             cpu=61.0°C\nfan=0 actual=5013 min=1350 max=5777 mode=manual target=5000\nftst=0\n"
+        );
     }
 
     /// The fallback half of the same contract: with nothing listening, the live
@@ -10862,6 +11131,7 @@ mod tests {
         let rendered: serde_json::Value = serde_json::from_str(&render_sessions_json(
             true,
             &canonical_codex_sessions(),
+            None,
             None,
         ))
         .expect("valid JSON");

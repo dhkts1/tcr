@@ -511,8 +511,13 @@ pub trait Service: Send + Sync + 'static {
 /// measured 2026-10-18 when a requirement that does not parse was refused). And
 /// activating it just to cancel it would, for a listener, accept connections
 /// for an instant with no requirement on them. So the one reference is
-/// leaked: this happens at most once per process, on a path that ends in an
-/// error the caller reports (the helper exits on it).
+/// leaked, once per refused call. The helper exits on it, so for the listener
+/// that is once per process. For a [`Client`] it is once per
+/// [`Client::connect`] that fails this way, so a caller must not retry a
+/// [`XpcError::Requirement`]: the proxy's controller turns it into
+/// `Unavailable(HelperSignature)` and never retries that on its own
+/// (`crate::controller`), which bounds the leak to one per command an operator
+/// sends.
 const fn abandon(connection: Owned) {
     std::mem::forget(connection);
 }

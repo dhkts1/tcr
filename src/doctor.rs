@@ -1535,6 +1535,7 @@ mod tests {
             unkeyed_connects: None,
             unkeyed_requests: None,
             heat: None,
+            fan_control: None,
         }
     }
 

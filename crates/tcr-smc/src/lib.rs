@@ -684,9 +684,22 @@ pub struct FanReading {
     pub min_rpm: f64,
     /// 0 when it did not read this time: "no maximum", not a ceiling of 0.
     pub max_rpm: f64,
-    /// The fan's mode key reads 1 (forced): a program fixed its speed, so it
-    /// no longer follows heat. 0 and 3 are both automatic (Stats' `FanMode`).
-    pub is_manual: bool,
+    /// The fan's mode key, three ways: 1 is manual (a program fixed its
+    /// speed, so it no longer follows heat), 0 and 3 are both automatic
+    /// (Stats' `FanMode`), and a key that did not read is
+    /// [`FanMode::Unreadable`], never "automatic". A fan controller judges
+    /// whose the fans are from this, so a failed read must not look like macOS.
+    pub mode: FanMode,
+    /// `F{n}Tg`, the speed the fan is told to hold. `None` when it did not
+    /// read this time.
+    pub target_rpm: Option<f64>,
+}
+
+impl FanReading {
+    /// The mode key reads 1.
+    pub fn is_manual(&self) -> bool {
+        self.mode == FanMode::Manual
+    }
 }
 
 /// How hot the CPU is and how hard the fans work.
@@ -699,6 +712,9 @@ pub struct HeatReading {
     /// Empty on a Mac with no fans (`FNum` 0, a MacBook Air), and missing any
     /// fan whose speed did not read.
     pub fans: Vec<FanReading>,
+    /// `Ftst`, the unlock flag a fan writer raises: `Some(true)` when it reads
+    /// other than 0. `None` on a Mac without it, or when it did not read.
+    pub ftst: Option<bool>,
 }
 
 /// A sensor that reads 0 or below, or past 150 °C, is one not fitted or not
@@ -811,6 +827,20 @@ impl<S: KeySource> HeatReader<S> {
         HeatReading {
             cpu_celsius: self.read_cpu(),
             fans: self.read_fans(),
+            ftst: self.read_ftst(),
+        }
+    }
+
+    /// `Ftst`, one key. Absent is `None` and quiet; any other failure is
+    /// reported once and `None`.
+    fn read_ftst(&mut self) -> Option<bool> {
+        match self.smc.read(UNLOCK_KEY).and_then(|v| v.uint8_value()) {
+            Ok(value) => Some(value != 0),
+            Err(SmcError::KeyNotFound(_)) => None,
+            Err(error) => {
+                self.note(&format!("{UNLOCK_KEY} read"), &error);
+                None
+            }
         }
     }
 
@@ -956,8 +986,24 @@ impl<S: KeySource> HeatReader<S> {
             actual_rpm,
             min_rpm,
             max_rpm,
-            is_manual: self.is_manual(fan),
+            mode: self.mode(fan),
+            target_rpm: self.target(fan),
         })
+    }
+
+    /// `F{n}Tg`, read every time: another program may move it at any moment,
+    /// which is exactly what a fan controller needs to see. Any number reads,
+    /// so a controller compares what was written with what is there.
+    fn target(&mut self, fan: FanIndex) -> Option<f64> {
+        let key = fan_key(fan, *b"Tg");
+        match self.smc.read(key).and_then(|v| v.numeric_value()) {
+            Ok(value) => value.is_finite().then_some(value),
+            Err(SmcError::KeyNotFound(_)) => None,
+            Err(error) => {
+                self.note(&format!("{key} read"), &error);
+                None
+            }
+        }
     }
 
     /// `Mn` and `Mx`, read once both read and then kept. One that does not
@@ -988,19 +1034,22 @@ impl<S: KeySource> HeatReader<S> {
         (value.is_finite() && value >= 0.0).then_some(value)
     }
 
-    /// The fan's mode key reads 1. No mode key at all (older Intel Macs keep
-    /// the bit in `FS! `) means nothing says another app holds this fan.
-    fn is_manual(&mut self, fan: FanIndex) -> bool {
+    /// The fan's mode key, three ways, as [`FanWriter::mode`] reads it. No mode
+    /// key at all (older Intel Macs keep the bit in `FS! `) is
+    /// [`FanMode::Unreadable`]: nothing says who holds the fan, so a
+    /// controller writes nothing to it.
+    fn mode(&mut self, fan: FanIndex) -> FanMode {
         let Some(suffix) = self.mode_key_suffix() else {
-            return false;
+            return FanMode::Unreadable;
         };
         let key = fan_key(fan, suffix);
         match self.smc.read(key).and_then(|v| v.uint8_value()) {
-            Ok(mode) => mode == 1,
-            Err(SmcError::KeyNotFound(_)) => false,
+            Ok(0 | 3) => FanMode::Auto,
+            Ok(1) => FanMode::Manual,
+            Ok(_) | Err(SmcError::KeyNotFound(_)) => FanMode::Unreadable,
             Err(error) => {
                 self.note(&format!("{key} read"), &error);
-                false
+                FanMode::Unreadable
             }
         }
     }
@@ -2147,26 +2196,48 @@ mod tests {
         smc.one_fan(2000.0);
         smc.set("F0md", Ok(SmcValue::ui8(1)));
         assert_eq!(
-            Rig::new(smc)
-                .reader
-                .read()
-                .fans
-                .first()
-                .map(|f| f.is_manual),
-            Some(true)
+            Rig::new(smc).reader.read().fans.first().map(|f| f.mode),
+            Some(FanMode::Manual)
         );
         let mut smc = FakeSmc::default();
         smc.one_fan(2000.0);
         smc.set("F0Md", Ok(SmcValue::ui8(3)));
         assert_eq!(
-            Rig::new(smc)
-                .reader
-                .read()
-                .fans
-                .first()
-                .map(|f| f.is_manual),
-            Some(false)
+            Rig::new(smc).reader.read().fans.first().map(|f| f.mode),
+            Some(FanMode::Auto)
         );
+    }
+
+    /// A mode key that will not read is unknown, never automatic: a fan
+    /// controller that read `false` here would take a held fan for macOS's.
+    #[test]
+    fn a_mode_key_that_fails_is_unreadable_not_auto() {
+        let mut smc = FakeSmc::default();
+        smc.one_fan(2000.0);
+        smc.set("F0md", Err(SmcError::Kernel(SmcError::NOT_PRIVILEGED_CODE)));
+        let reading = Rig::new(smc).reader.read();
+        assert_eq!(
+            reading.fans.first().map(|f| f.mode),
+            Some(FanMode::Unreadable)
+        );
+    }
+
+    /// The target and `Ftst` ride the reading, read every time.
+    #[test]
+    fn the_reading_carries_the_target_and_ftst() {
+        let mut smc = FakeSmc::default();
+        smc.one_fan(2000.0);
+        smc.set("F0Tg", Ok(SmcValue::flt(3000.0).unwrap()));
+        smc.set("Ftst", Ok(SmcValue::ui8(1)));
+        let mut rig = Rig::new(smc);
+        let reading = rig.reader.read();
+        assert_eq!(
+            reading.fans.first().and_then(|f| f.target_rpm),
+            Some(3000.0)
+        );
+        assert_eq!(reading.ftst, Some(true));
+        rig.reader.read();
+        assert_eq!(rig.reader.source().read_count("F0Tg"), 2);
     }
 
     /// The one hardware read. Passes, and says so, only where there is no

@@ -39,21 +39,21 @@ pub const MAX_AGE: Duration = Duration::from_secs(2);
 pub const READ_DEADLINE: Duration = Duration::from_millis(500);
 
 /// What a cache reads with: `None` is "this machine has no AppleSMC".
-pub type Read = Box<dyn FnMut() -> Option<HeatRow> + Send>;
+pub type Read<T = HeatRow> = Box<dyn FnMut() -> Option<T> + Send>;
 
 /// One reader and its last answer.
 ///
 /// Two locks on purpose. `reader` is held across the SMC read and only ever
 /// taken with `try_lock`, so nobody waits on it; `last` is held for a clone,
 /// so a caller that finds a read in flight can still answer from it.
-pub struct HeatCache {
+pub struct HeatCache<T = HeatRow> {
     max_age: Duration,
-    reader: Mutex<Read>,
-    last: Mutex<Option<(Instant, Option<HeatRow>)>>,
+    reader: Mutex<Read<T>>,
+    last: Mutex<Option<(Instant, Option<T>)>>,
 }
 
-impl HeatCache {
-    pub fn new(max_age: Duration, read: Read) -> Self {
+impl<T: Clone> HeatCache<T> {
+    pub fn new(max_age: Duration, read: Read<T>) -> Self {
         Self {
             max_age,
             reader: Mutex::new(read),
@@ -62,21 +62,21 @@ impl HeatCache {
     }
 
     /// The last reading, however old, or `None` when there has never been one.
-    pub fn last(&self) -> Option<HeatRow> {
+    pub fn last(&self) -> Option<T> {
         self.last_entry().and_then(|(_, reading)| reading)
     }
 
     /// A poisoned lock means a read panicked. What it guards is a reader and
     /// an answer, both still whole, so the next request reads on rather than
     /// losing heat for the life of the process.
-    fn last_entry(&self) -> Option<(Instant, Option<HeatRow>)> {
+    fn last_entry(&self) -> Option<(Instant, Option<T>)> {
         self.last
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
-    fn fresh(&self, now: Instant) -> Option<Option<HeatRow>> {
+    fn fresh(&self, now: Instant) -> Option<Option<T>> {
         let (at, reading) = self.last_entry()?;
         (now.saturating_duration_since(at) < self.max_age).then_some(reading)
     }
@@ -90,7 +90,7 @@ impl HeatCache {
     ///
     /// "No AppleSMC" is kept like any other answer, so a VM pays for the
     /// question once per window too.
-    pub fn get(&self, now: Instant) -> Option<HeatRow> {
+    pub fn get(&self, now: Instant) -> Option<T> {
         if let Some(reading) = self.fresh(now) {
             return reading;
         }
@@ -103,6 +103,19 @@ impl HeatCache {
         if let Some(reading) = self.fresh(now) {
             return reading;
         }
+        let reading = read();
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some((now, reading.clone()));
+        reading
+    }
+
+    /// A fresh reading, whatever the kept one's age, kept as the answer for
+    /// the next [`Self::get`]. For the fan controller's tick (`crate::fan`),
+    /// which must judge the fans from what they read NOW, on its own thread:
+    /// it waits for a read already in flight rather than taking an older
+    /// answer, and a status request inside the next [`MAX_AGE`] costs no SMC
+    /// read of its own.
+    pub fn refresh(&self, now: Instant) -> Option<T> {
+        let mut read = self.reader.lock().unwrap_or_else(PoisonError::into_inner);
         let reading = read();
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some((now, reading.clone()));
         reading
@@ -121,38 +134,48 @@ pub fn to_row(reading: &tcr_smc::HeatReading) -> HeatRow {
                 actual_rpm: fan.actual_rpm,
                 min_rpm: fan.min_rpm,
                 max_rpm: fan.max_rpm,
-                manual: fan.is_manual,
+                manual: fan.is_manual(),
+                target_rpm: fan.target_rpm,
             })
             .collect(),
+        ftst: reading.ftst,
     }
 }
 
 /// The process's one cache, on the process's one AppleSMC source, which opens
 /// on the first status request that asks and, if AppleSMC refuses, again
 /// a minute later (`tcr_smc::HeatSource`). Each distinct SMC error is one
-/// warning.
-static PROCESS: LazyLock<Arc<HeatCache>> = LazyLock::new(|| {
+/// warning. It keeps the `tcr-smc` reading itself, with each fan's three-way
+/// mode, because the fan controller reads through it too ([`process`]).
+static PROCESS: LazyLock<Arc<HeatCache<tcr_smc::HeatReading>>> = LazyLock::new(|| {
     let mut source = tcr_smc::HeatSource::open(Box::new(|line| tracing::warn!("{line}")));
-    Arc::new(HeatCache::new(
-        MAX_AGE,
-        Box::new(move || source.read().as_ref().map(to_row)),
-    ))
+    Arc::new(HeatCache::new(MAX_AGE, Box::new(move || source.read())))
 });
+
+/// The process's one cache, for the fan controller: one reader, so the
+/// controller's tick and the status route never read the SMC twice for one
+/// moment.
+pub fn process() -> Arc<HeatCache<tcr_smc::HeatReading>> {
+    Arc::clone(&PROCESS)
+}
 
 /// The machine's heat now, through the process's cache: see [`read_within`].
 pub async fn current() -> Option<HeatRow> {
-    read_within(Arc::clone(&PROCESS), Instant::now(), READ_DEADLINE).await
+    read_within(Arc::clone(&PROCESS), Instant::now(), READ_DEADLINE)
+        .await
+        .as_ref()
+        .map(to_row)
 }
 
 /// `cache.get(now)` on the blocking pool, waited on for at most `deadline`.
 /// Past it, or when the blocking task itself failed (logged), the answer is
 /// the last reading, or `None`. The read that ran over keeps running on its
 /// own thread and fills the cache when it lands.
-pub async fn read_within(
-    cache: Arc<HeatCache>,
+pub async fn read_within<T: Clone + Send + 'static>(
+    cache: Arc<HeatCache<T>>,
     now: Instant,
     deadline: Duration,
-) -> Option<HeatRow> {
+) -> Option<T> {
     let reading = Arc::clone(&cache);
     match tokio::time::timeout(
         deadline,
@@ -200,7 +223,9 @@ mod tests {
                 min_rpm: 1350.0,
                 max_rpm: 5777.0,
                 manual: false,
+                target_rpm: None,
             }],
+            ftst: None,
         }
     }
 
@@ -347,16 +372,43 @@ mod tests {
                 actual_rpm: 5013.0,
                 min_rpm: 1350.0,
                 max_rpm: 5777.0,
-                is_manual: true,
+                mode: tcr_smc::FanMode::Manual,
+                target_rpm: Some(5000.0),
             }],
+            ftst: Some(true),
         });
         assert_eq!(
             serde_json::to_value(&row).unwrap(),
             serde_json::json!({
                 "cpuCelsius": 93.25,
                 "fans": [{"index": 1, "actualRpm": 5013.0, "minRpm": 1350.0,
-                          "maxRpm": 5777.0, "manual": true}],
+                          "maxRpm": 5777.0, "manual": true, "targetRpm": 5000.0}],
+                "ftst": true,
             })
         );
+    }
+
+    /// The controller's read is always fresh and answers the next status
+    /// request, so a manual mode costs no second SMC read per poll.
+    #[test]
+    fn heat_refresh_reads_now_and_feeds_the_next_get() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let cache = HeatCache::new(
+            MAX_AGE,
+            counted(&reads, Some(reading(61.0)), Duration::ZERO),
+        );
+        let start = Instant::now();
+        assert_eq!(cache.get(start), Some(reading(61.0)));
+        assert_eq!(cache.refresh(start), Some(reading(61.0)));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "refresh reads even when fresh"
+        );
+        assert_eq!(
+            cache.get(start + Duration::from_millis(10)),
+            Some(reading(61.0))
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
     }
 }
