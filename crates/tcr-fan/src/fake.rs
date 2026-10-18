@@ -15,6 +15,8 @@ pub(crate) struct State {
     attempts: Vec<FourCc>,
     /// Keys whose writes the SMC refuses (result 0x82), every time.
     refused: HashSet<FourCc>,
+    /// Keys that read this many more times, then fail every read.
+    reads_left: HashMap<FourCc, usize>,
 }
 
 fn code(key: &str) -> FourCc {
@@ -67,8 +69,17 @@ impl Shared {
         self.state().refused.insert(code(key));
     }
 
+    /// Reads of `key` work `ok` more times, then fail with an IOKit timeout
+    /// until [`Self::accept`].
+    pub(crate) fn fail_reads_after(&self, key: &str, ok: usize) {
+        self.state().reads_left.insert(code(key), ok);
+    }
+
+    /// Writes and reads of `key` work again.
     pub(crate) fn accept(&self, key: &str) {
-        self.state().refused.remove(&code(key));
+        let mut state = self.state();
+        state.refused.remove(&code(key));
+        state.reads_left.remove(&code(key));
     }
 
     pub(crate) fn writes(&self) -> Vec<(FourCc, SmcValue)> {
@@ -101,8 +112,15 @@ pub(crate) struct FakeSmc(Shared);
 
 impl KeySource for FakeSmc {
     fn read(&mut self, key: FourCc) -> Result<SmcValue, SmcError> {
-        self.0
-            .state()
+        let mut state = self.0.state();
+        if let Some(left) = state.reads_left.get_mut(&key) {
+            if *left == 0 {
+                // kIOReturnTimeout
+                return Err(SmcError::Kernel(0xe000_02d6_u32 as i32));
+            }
+            *left -= 1;
+        }
+        state
             .values
             .get(&key)
             .cloned()

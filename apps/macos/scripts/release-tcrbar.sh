@@ -78,13 +78,17 @@ readonly required_cert_class="Developer ID Application"
 # The code-signing identifier of the bundled proxy, Contents/MacOS/tcr. The root
 # fan helper accepts calls only from code signed under this exact name, so it
 # must match what build-tcrbar.sh gives a Developer ID build
-# (`tcr_identifier_for_tier`). Changing it here strands every installed helper.
+# (`fan_identity_suffix`). Changing it here strands every installed helper.
 readonly tcr_release_identifier="io.github.dhkts1.tcr"
 
 # The root fan helper's label, which is also its signing identifier
 # (`FanIdentity::helper_label` in crates/tcr-fan/src/identity.rs). The proxy talks
 # only to a helper signed under this exact name.
 readonly fan_helper_release_identifier="io.github.dhkts1.tcrbar.fanhelper"
+
+# The shipping app's bundle id, which the helper's LaunchDaemon plist names as
+# its associated bundle.
+readonly app_release_identifier="io.github.dhkts1.tcrbar"
 
 die() { printf 'ERROR: %s\n' "$@" >&2; exit 1; }
 stage() { printf '\n==> %s\n' "$1"; }
@@ -257,6 +261,28 @@ assert_tcr_identifier() {
            "The proxy would refuse to talk to this helper." ;;
   esac
   note "bundled tcr-fan-helper: signed as $fan_helper_release_identifier"
+}
+
+# The helper runs as root, so its own signature carries the hardened runtime
+# too (the bundle-level assert above reads only the app's main executable), and
+# its LaunchDaemon plist must start it on demand only, under its label.
+# `check-fan-helper-plist.sh` is the same check build-tcrbar.sh runs on the copy
+# it writes. Captured, then matched, for the pipefail reason above.
+assert_fan_helper() {
+  local bundle="$1" helper desc plist
+  helper="$bundle/Contents/MacOS/tcr-fan-helper"
+  desc="$(codesign -dvv "$helper" 2>&1)" \
+    || die "codesign could not read a signature from $helper."
+  case "$desc" in
+    *"flags="*"runtime"*) ;;
+    *) die "$helper is not signed with the hardened runtime (--options runtime)." ;;
+  esac
+  note "bundled tcr-fan-helper: hardened runtime present"
+
+  plist="$bundle/Contents/Library/LaunchDaemons/$fan_helper_release_identifier.plist"
+  "$here/check-fan-helper-plist.sh" "$plist" "$fan_helper_release_identifier" \
+    "$app_release_identifier" \
+    || die "the fan helper's LaunchDaemon plist in $bundle is not the shipping one (lines above)."
 }
 
 # ---------------------------------------------------------------------------
@@ -554,6 +580,7 @@ main() {
     assert_developer_id "$verify_only"
     assert_hardened_runtime "$verify_only"
     assert_tcr_identifier "$verify_only"
+    assert_fan_helper "$verify_only"
     assert_sparkle_public_key "$verify_only"
     exit 0
   fi
@@ -619,6 +646,7 @@ main() {
   resign_hardened "$app_dir"
   assert_hardened_runtime "$app_dir"
   assert_tcr_identifier "$app_dir"
+  assert_fan_helper "$app_dir"
 
   # ---- stage 3.5: Sparkle public key assert -------------------------------
   stage "stage 3.5/9  assert the bundle carries a Sparkle public key"

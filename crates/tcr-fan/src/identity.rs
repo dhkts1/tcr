@@ -8,9 +8,11 @@
 //! handoff's peer check in the main crate (`handoff::PEER_REQUIREMENT`), and a
 //! test there holds the two equal.
 //!
-//! A dev build (`TCRBAR_DEV_BUILD=1`) signs both binaries with `.dev`
-//! identifiers and registers the helper under a `.dev` label, so a release
-//! proxy can never reach a dev helper or the reverse.
+//! Any build but a shipping Developer ID one (`TCRBAR_DEV_BUILD=1`, or another
+//! certificate) signs both binaries with `.dev` identifiers and names the
+//! helper's plist with a `.dev` label, one rule in `build-tcrbar.sh`
+//! (`fan_identity_suffix`), so a release proxy can never reach a dev helper or
+//! the reverse.
 //!
 //! Each binary decides which identity it is from its own signature, never from
 //! an environment variable or an argument: [`FanIdentity::of_this_process`]. A
@@ -43,7 +45,8 @@ pub const TEAM: &str = team_clause!();
 pub enum FanIdentity {
     /// A shipping build, signed with Developer ID.
     Release,
-    /// A `TCRBAR_DEV_BUILD=1` build: `.dev` identifiers and label.
+    /// Any other build (`TCRBAR_DEV_BUILD=1`, or a signature that is not
+    /// Developer ID): `.dev` identifiers and label.
     Dev,
 }
 

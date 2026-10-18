@@ -1,8 +1,8 @@
 # Explicit workspace, added alongside `crates/tcr-status-wire` (the shared
 # `tcr status --json` wire type). Keep `apps/macos/**` OUT of `members` forever
 # — `.github/workflows/ci.yml` runs `cargo test --all` / `cargo clippy
-# --all-targets --locked` on ubuntu, and `--all` means `--workspace`: anything
-# listed here compiles on Linux.
+# --workspace --all-targets --locked` on ubuntu, and `--all` means
+# `--workspace`: anything listed here compiles on Linux.
 [workspace]
 members = [".", "crates/tcr-status-wire", "crates/tcr-fdpass", "crates/tcr-peer-wire", "crates/tcr-smc", "crates/tcr-fan", "crates/tcr-fan-helper"]
 resolver = "2"

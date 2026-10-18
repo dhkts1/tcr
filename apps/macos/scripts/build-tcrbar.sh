@@ -243,20 +243,13 @@ fi
 # (`FanHelperRegistration.swift`). Nothing here registers it: that is
 # `TcrBar --fan-helper register`, an explicit step.
 #
-# The label is the launchd label, the Mach service name, the plist's file stem
-# and the helper's signing identifier at once (`FanIdentity::helper_label` in
-# `crates/tcr-fan/src/identity.rs`). A dev build gets `.dev` on all of them and
-# on the plist's associated bundle id, so a dev TcrBar registers a dev helper,
-# and a dev helper answers only a dev `tcr`.
+# Its label, and the plist named after it, are written after the signing tier is
+# known (`fan_identity_suffix` below), because the tier decides them.
 #
 # TCR_BUILD_SHA is the helper's version-op `build`, the same short sha the
 # bundled `tcr` was just checked against; the helper has no build script of its
 # own to stamp one.
 fan_helper_name="tcr-fan-helper"
-fan_helper_label="io.github.dhkts1.tcrbar.fanhelper"
-if [ "${TCRBAR_DEV_BUILD:-0}" = "1" ]; then
-  fan_helper_label="$fan_helper_label.dev"
-fi
 echo "==> cargo build --release -p $fan_helper_name"
 TCR_BUILD_SHA="$expected_sha" cargo build --manifest-path "$repo_root/Cargo.toml" --release -p "$fan_helper_name"
 fan_helper_binary="$cargo_target_dir/release/$fan_helper_name"
@@ -266,17 +259,7 @@ if [ ! -x "$fan_helper_binary" ]; then
 fi
 cp "$fan_helper_binary" "$macos_dir/$fan_helper_name"
 chmod +x "$macos_dir/$fan_helper_name"
-launch_daemons_dir="$app_dir/Contents/Library/LaunchDaemons"
-fan_helper_plist="$launch_daemons_dir/$fan_helper_label.plist"
-mkdir -p "$launch_daemons_dir"
-cp "$pkg_dir/LaunchDaemons/io.github.dhkts1.tcrbar.fanhelper.plist" "$fan_helper_plist"
-if [ "${TCRBAR_DEV_BUILD:-0}" = "1" ]; then
-  plutil -replace Label -string "$fan_helper_label" "$fan_helper_plist"
-  plutil -replace MachServices -json "{\"$fan_helper_label\": true}" "$fan_helper_plist"
-  plutil -replace AssociatedBundleIdentifiers -json "[\"$bundle_id\"]" "$fan_helper_plist"
-fi
-plutil -lint "$fan_helper_plist" >/dev/null
-echo "    $fan_helper_name: bundled, plist $fan_helper_label.plist"
+echo "    $fan_helper_name: bundled"
 
 # Sparkle's EdDSA public key — OMITTED when unset, never a placeholder.
 #
@@ -460,21 +443,46 @@ fi
 # signed as `tcr`, a name any other binary called `tcr` can carry. The root fan
 # helper accepts calls only from code whose signature names this identifier (with
 # the team clause beside it), so the string here and the helper's requirement must
-# agree. Only a Developer ID signature on a shipping build gets the shipping
-# identifier. Every other tier gets `.dev`, and so does a TCRBAR_DEV_BUILD=1 build
-# whatever certificate signed it, so a dev build can never satisfy the shipping
-# pin. `release-tcrbar.sh` re-signs the same file and sets the shipping identifier
-# there too: a pin set in one script and not the other is the bug.
-tcr_identifier_for_tier() {
+# agree. `release-tcrbar.sh` re-signs the same file and sets the shipping
+# identifier there too: a pin set in one script and not the other is the bug.
+#
+# One rule names both ends of the fan helper's connection: the proxy's
+# identifier, and the helper's label, which is also the launchd label, the Mach
+# service name, the plist's file stem and the helper's signing identifier
+# (`FanIdentity` in `crates/tcr-fan/src/identity.rs`). Only a Developer ID
+# signature on a shipping build gets the shipping names. Every other tier gets
+# `.dev` on all of them, and so does a TCRBAR_DEV_BUILD=1 build whatever
+# certificate signed it, so a dev build can never satisfy a shipping pin, and no
+# build can pair a `.dev` proxy with the shipping helper or the reverse.
+fan_identity_suffix() {
   # $1 is the signing tier: "Developer ID Application", "Apple Development" or "ad-hoc".
   # TCRBAR_DEV_BUILD is read the same way as for the bundle id at the top.
   if [ "$1" = "Developer ID Application" ] && [ "${TCRBAR_DEV_BUILD:-0}" != "1" ]; then
-    echo "io.github.dhkts1.tcr"
+    echo ""
   else
-    echo "io.github.dhkts1.tcr.dev"
+    echo ".dev"
   fi
 }
-tcr_identifier="$(tcr_identifier_for_tier "$sign_tier")"
+fan_suffix="$(fan_identity_suffix "$sign_tier")"
+tcr_identifier="io.github.dhkts1.tcr$fan_suffix"
+fan_helper_label="io.github.dhkts1.tcrbar.fanhelper$fan_suffix"
+
+# The helper's LaunchDaemon plist, written before any signature because the
+# bundle's seal covers it. The checked-in file carries the shipping names; a
+# `.dev` build renames the copy and rewrites its label and service to match,
+# and every build names this app's own bundle id as its associated bundle.
+# `check-fan-helper-plist.sh` is the same check `release-tcrbar.sh` runs on a
+# bundle it ships: the label, the service, and on demand only.
+launch_daemons_dir="$app_dir/Contents/Library/LaunchDaemons"
+fan_helper_plist="$launch_daemons_dir/$fan_helper_label.plist"
+mkdir -p "$launch_daemons_dir"
+cp "$pkg_dir/LaunchDaemons/io.github.dhkts1.tcrbar.fanhelper.plist" "$fan_helper_plist"
+plutil -replace Label -string "$fan_helper_label" "$fan_helper_plist"
+plutil -replace MachServices -json "{\"$fan_helper_label\": true}" "$fan_helper_plist"
+plutil -replace AssociatedBundleIdentifiers -json "[\"$bundle_id\"]" "$fan_helper_plist"
+plutil -lint "$fan_helper_plist" >/dev/null
+"$here/check-fan-helper-plist.sh" "$fan_helper_plist" "$fan_helper_label" "$bundle_id"
+echo "    $fan_helper_name: plist $fan_helper_label.plist"
 
 echo "==> codesign ($sign_tier)"
 sparkle_version_dir="$frameworks_dir/Sparkle.framework/Versions/B"

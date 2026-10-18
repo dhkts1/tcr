@@ -107,7 +107,10 @@ Flags:
 - `--skip-notarize` — build and sign the DMG but skip notarization and stapling. The result opens
   only on machines that already trust it; useful for testing an update feed, never for a release.
 - `--tag vX.Y.Z` — must equal `v<Cargo.toml version>`. Mismatch aborts.
-- `--verify-only <path/to/TcrBar.app>` — run the signature asserts against an existing bundle.
+- `--verify-only <path/to/TcrBar.app>` — run the signature asserts against an existing bundle,
+  including the fan helper's: its identifier, its hardened runtime, and its LaunchDaemon plist's
+  `Label`, `MachServices`, `BundleProgram` and `AssociatedBundleIdentifiers`, with no `RunAtLoad`
+  and no `KeepAlive` (`apps/macos/scripts/check-fan-helper-plist.sh`).
 
 ## The update feed
 

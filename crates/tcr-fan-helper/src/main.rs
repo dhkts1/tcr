@@ -23,7 +23,10 @@
 //!
 //! # When it stops
 //!
-//! When it is idle: no connection, no holder and no disconnect window. When the
+//! When it is idle: no connection, no holder and no disconnect window. A
+//! connection counts only once one of its messages reaches root, so a caller
+//! that fails the requirement, whose messages libxpc drops, cannot keep it
+//! running. When the
 //! proxy holding the fans disconnects (it quit, crashed or was killed), root
 //! hands the fans back at once if they are still the ones it set, and retries
 //! over about a minute if that fails; it then exits. launchd's SIGTERM hands
@@ -52,7 +55,8 @@ mod helper {
 
     /// How long a freshly started helper waits for its first connection. launchd
     /// starts it because a message is waiting, so one arrives at once; a request
-    /// the listener's requirement dropped may leave nothing to wait for.
+    /// the listener's requirement dropped leaves nothing to wait for, and its
+    /// connection does not count (`Root::connected`), so this check exits.
     const STARTUP_IDLE_GRACE: Duration = Duration::from_secs(10);
 
     /// The commit this helper was built from, as `build-tcrbar.sh` passes it in.

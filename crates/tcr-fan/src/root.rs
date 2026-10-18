@@ -25,7 +25,12 @@
 //!   changed them, log it and leave them. **A disconnect of any other
 //!   connection changes nothing**: a stale connection's drop must never undo a
 //!   newer holder's fans.
-//! - **exit** only when idle: no connection, no holder, no window.
+//! - **exit** only when idle: no connection, no holder, no window. A
+//!   connection counts once one of its messages reaches root, so a peer whose
+//!   every message libxpc drops (it failed the signature check) cannot keep
+//!   root alive.
+//! - **a failed set-manual** that wrote nothing (no such fan, or `FNum` did
+//!   not read) changes no hands: the previous holder and its window stand.
 //!
 //! # The recovery limit
 //!
@@ -148,7 +153,7 @@ impl<K: KeyAccess> Root<K> {
         }
     }
 
-    /// No connection, no holder, no window.
+    /// No counted connection, no holder, no window.
     pub fn is_idle(&self) -> bool {
         self.peers.is_empty() && self.holder.is_none() && self.window.is_none()
     }
@@ -163,12 +168,16 @@ impl<K: KeyAccess> Root<K> {
         self.window.is_some()
     }
 
-    pub fn connected(&mut self, peer: PeerId) {
-        self.peers.insert(peer);
-    }
+    /// A connection arrived. It is not counted yet: libxpc drops every message
+    /// from a peer that fails the listener's code-signing requirement, so a
+    /// connection counted here could keep root from ever going idle without
+    /// once reaching it. A peer counts from its first message that reaches
+    /// [`Self::request`].
+    pub const fn connected(&mut self, _peer: PeerId) {}
 
     /// One request, already decoded by [`wire::decode_request`]. A refused
-    /// decode is answered without opening the SMC.
+    /// decode is answered without opening the SMC. The peer counts as
+    /// connected from here until it disconnects.
     pub fn request(&mut self, peer: PeerId, request: Result<Request, Refusal>) -> Reply {
         self.peers.insert(peer);
         let result = match request {
@@ -293,23 +302,74 @@ impl<K: KeyAccess> Root<K> {
             });
         }
 
-        // The caller becomes the holder. What root put in manual for an
-        // earlier holder, or for a connection whose window is running, is
-        // still root's doing, so the record carries over.
-        let mut fans = Vec::new();
-        if let Some(old) = self.holder.take() {
-            if old.peer != peer {
-                self.say(
-                    Level::Notice,
-                    &format!(
-                        "connection {} takes the fans from connection {}",
-                        peer.0, old.peer.0
-                    ),
-                );
-            }
-            fans = old.fans;
+        // What root put in manual for an earlier holder, or for a connection
+        // whose window is running, is still root's doing, so the record
+        // carries over to whoever holds next.
+        let mut fans = self
+            .holder
+            .as_ref()
+            .map(|h| h.fans.clone())
+            .unwrap_or_default();
+        if let Some(window) = &self.window {
+            merge(&mut fans, &window.fans);
         }
-        if let Some(window) = self.window.take() {
+
+        match self.writer()?.set_manual(fan) {
+            Ok(entered) => {
+                if !fans.iter().any(|h| h.fan == fan) {
+                    fans.push(HeldFan {
+                        fan,
+                        written_rpm: None,
+                    });
+                }
+                self.take_over(peer, fans);
+                Ok(Reply::Manual {
+                    unlocked: entered.unlocked,
+                })
+            }
+            Err(SetManualFailed { cause, hand_back }) => {
+                match hand_back {
+                    // Nothing was written, so no hands change: the previous
+                    // holder, and any window still running, stand as they were.
+                    None => {}
+                    // Every fan is automatic again: nobody holds anything.
+                    Some(Ok(())) => {
+                        self.holder = None;
+                        self.window = None;
+                    }
+                    // Fans may be manual and nobody else is holding them now,
+                    // so this connection holds them and its disconnect window
+                    // tries again.
+                    Some(Err(error)) => {
+                        self.take_over(peer, fans);
+                        self.say(
+                            Level::Critical,
+                            &format!(
+                                "set-manual failed ({cause}) and the hand-back after it failed too: {error}"
+                            ),
+                        );
+                    }
+                }
+                Err(HelperError::from_fan(cause))
+            }
+        }
+    }
+
+    /// `peer` becomes the holder of `fans`, ending any earlier hold and any
+    /// pending disconnect window.
+    fn take_over(&mut self, peer: PeerId, fans: Vec<HeldFan>) {
+        if let Some(old) = self.holder.take()
+            && old.peer != peer
+        {
+            self.say(
+                Level::Notice,
+                &format!(
+                    "connection {} takes the fans from connection {}",
+                    peer.0, old.peer.0
+                ),
+            );
+        }
+        if self.window.take().is_some() {
             self.say(
                 Level::Notice,
                 &format!(
@@ -317,42 +377,8 @@ impl<K: KeyAccess> Root<K> {
                     peer.0
                 ),
             );
-            merge(&mut fans, &window.fans);
         }
         self.holder = Some(Hold { peer, fans });
-
-        match self.writer()?.set_manual(fan) {
-            Ok(entered) => {
-                if let Some(hold) = self.holder.as_mut()
-                    && !hold.fans.iter().any(|h| h.fan == fan)
-                {
-                    hold.fans.push(HeldFan {
-                        fan,
-                        written_rpm: None,
-                    });
-                }
-                Ok(Reply::Manual {
-                    unlocked: entered.unlocked,
-                })
-            }
-            Err(SetManualFailed { cause, hand_back }) => {
-                match hand_back {
-                    // Nothing was written, so nothing changed.
-                    None => {}
-                    // Every fan is automatic again: nobody holds anything.
-                    Some(Ok(())) => self.holder = None,
-                    // The hold stays, so this connection's disconnect window
-                    // tries again.
-                    Some(Err(error)) => self.say(
-                        Level::Critical,
-                        &format!(
-                            "set-manual failed ({cause}) and the hand-back after it failed too: {error}"
-                        ),
-                    ),
-                }
-                Err(HelperError::from_fan(cause))
-            }
-        }
     }
 
     fn set_target(&mut self, peer: PeerId, fan: FanIndex, rpm: f64) -> Result<Reply, HelperError> {
@@ -717,8 +743,13 @@ mod tests {
         assert!(rig.root.is_idle());
 
         // Two connections: the first to leave does not end the helper.
-        rig.root.connected(PeerId(1));
-        rig.root.connected(PeerId(2));
+        for peer in [1, 2] {
+            rig.root.connected(PeerId(peer));
+            assert!(matches!(
+                rig.send(peer, Request::Version),
+                Reply::Version { .. }
+            ));
+        }
         assert!(!rig.root.is_idle());
         assert_eq!(rig.root.disconnected(PeerId(1)), Next::Stay);
         assert_eq!(rig.root.disconnected(PeerId(2)), Next::Exit);
@@ -736,6 +767,10 @@ mod tests {
         // A connection arriving during the window keeps the helper alive past
         // the window's end; its own departure is what ends it.
         rig.root.connected(PeerId(4));
+        assert!(matches!(
+            rig.send(4, Request::Version),
+            Reply::Version { .. }
+        ));
         rig.smc.accept("F0Md");
         assert_eq!(rig.root.window_due(window), Next::Stay);
         assert!(!rig.root.window_pending());
@@ -746,6 +781,87 @@ mod tests {
         assert_eq!(rig.send(5, Request::HandBack), Reply::HandedBack);
         assert_eq!(rig.root.holder(), None);
         assert_eq!(rig.root.disconnected(PeerId(5)), Next::Exit);
+    }
+
+    #[test]
+    fn a_connection_that_never_reaches_root_leaves_it_idle() {
+        // A peer that failed the signature check: libxpc accepted the
+        // connection and dropped every message, so root heard only "connected".
+        let mut rig = Rig::new();
+        rig.root.connected(PeerId(1));
+        assert!(rig.root.is_idle(), "a silent connection kept root alive");
+        assert_eq!(rig.root.disconnected(PeerId(1)), Next::Exit);
+
+        // Beside a counted peer, a silent one's arrival changes nothing either:
+        // the counted peer's departure is what ends the helper.
+        rig.root.connected(PeerId(2));
+        assert!(matches!(
+            rig.send(2, Request::Version),
+            Reply::Version { .. }
+        ));
+        rig.root.connected(PeerId(3));
+        assert_eq!(rig.root.disconnected(PeerId(2)), Next::Exit);
+    }
+
+    #[test]
+    fn a_set_manual_that_wrote_nothing_keeps_the_previous_holder() {
+        // A holder, and a second connection whose set-manual fails before any
+        // write: `FNum` reads for root's own check, then not for the writer's.
+        let mut rig = Rig::new();
+        rig.hold(1, 3000.0);
+        rig.smc.fail_reads_after("FNum", 1);
+        rig.smc.clear_writes();
+        assert!(matches!(
+            rig.send(2, Request::SetManual { fan: fan(0) }),
+            Reply::Refused(_)
+        ));
+        rig.smc.accept("FNum");
+        assert!(rig.smc.writes().is_empty());
+        assert_eq!(rig.root.holder(), Some(PeerId(1)));
+        assert_eq!(
+            rig.send(
+                1,
+                Request::SetTarget {
+                    fan: fan(1),
+                    rpm: 2500.0
+                }
+            ),
+            Reply::Target { rpm: 2500.0 }
+        );
+        assert_eq!(
+            rig.send(
+                2,
+                Request::SetTarget {
+                    fan: fan(0),
+                    rpm: 2000.0
+                }
+            ),
+            Reply::Refused(HelperError::NotHolder)
+        );
+
+        // The same failure during a disconnect window leaves the window
+        // running: its next attempt still hands the fans back.
+        let mut rig = Rig::new();
+        rig.hold(1, 3000.0);
+        rig.smc.refuse("F0Md");
+        let Next::RetryAfter { window, .. } = rig.root.disconnected(PeerId(1)) else {
+            panic!("expected a window");
+        };
+        rig.smc.accept("F0Md");
+        rig.smc.fail_reads_after("FNum", 1);
+        assert!(matches!(
+            rig.send(2, Request::SetManual { fan: fan(0) }),
+            Reply::Refused(_)
+        ));
+        rig.smc.accept("FNum");
+        assert_eq!(rig.root.holder(), None);
+        assert!(rig.root.window_pending());
+        assert_eq!(rig.root.window_due(window), Next::Stay);
+        assert_eq!(rig.smc.ui8("F0Md"), 0);
+        assert_eq!(rig.smc.ui8("F1Md"), 0);
+        assert!(!rig.root.window_pending());
+        // Peer 2 sent a message, so it still counts; its departure ends it.
+        assert_eq!(rig.root.disconnected(PeerId(2)), Next::Exit);
     }
 
     #[test]

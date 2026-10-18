@@ -2510,7 +2510,8 @@ sends the helper its version op straight from this CLI process and prints the re
 but a protocol-1 reply. It writes no fan.
 
 Which helper it dials comes from this binary's own signature: the `tcr` bundled in TcrBar.app
-(signed `io.github.dhkts1.tcr`, or `.dev` in a dev build) dials the matching helper, and any
+(signed `io.github.dhkts1.tcr`, or `.dev` in any build but a shipping Developer ID one, the same
+rule that names the helper) dials the matching helper, and any
 other `tcr` refuses to dial and says so. `--label` names the helper to dial instead
 (`io.github.dhkts1.tcrbar.fanhelper` or its `.dev` twin), so an unsigned build can be pointed
 at a real helper to watch the helper refuse it: the helper's own signing requirement still

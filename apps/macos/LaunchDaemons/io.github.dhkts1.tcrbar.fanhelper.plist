@@ -4,9 +4,10 @@
   The root fan helper (crates/tcr-fan-helper), registered by TcrBar with
   SMAppService.daemon (FanHelperRegistration.swift) from
   Contents/Library/LaunchDaemons/ inside TcrBar.app, where
-  scripts/build-tcrbar.sh copies it. A dev build writes a copy named
-  io.github.dhkts1.tcrbar.fanhelper.dev.plist with the .dev label, service
-  and bundle id.
+  scripts/build-tcrbar.sh copies it. Any build but a shipping Developer ID one
+  writes a copy named io.github.dhkts1.tcrbar.fanhelper.dev.plist with the
+  .dev label and service (fan_identity_suffix there), and every build names its
+  own app's bundle id. scripts/check-fan-helper-plist.sh holds these keys.
 
   On demand only: launchd starts the helper when the tcr proxy sends to the
   Mach service, and the helper exits when it is idle, so there is no
