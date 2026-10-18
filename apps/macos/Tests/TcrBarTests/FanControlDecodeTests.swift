@@ -147,6 +147,104 @@ final class FanControlDecodeTests: XCTestCase {
         XCTAssertNil(fans?.last?.targetRPM)
     }
 
+    // MARK: The committed cross-language fixture
+
+    /// `<repo>/tests/fixtures/fan-control-contract.json`: the SAME file the
+    /// Rust side renders and compares against (`src/fan.rs`), located from
+    /// `#filePath` as ``RealWorldDecodeTests/contractFixtureURL`` locates
+    /// `status-contract.json`.
+    static var fanContractURL: URL {
+        var url = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { url = url.deletingLastPathComponent() }
+        return url.appendingPathComponent("tests/fixtures/fan-control-contract.json")
+    }
+
+    private func fanContract() throws -> [String: Any] {
+        let data = try Data(contentsOf: Self.fanContractURL)
+        guard let samples = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw XCTSkip("unreachable: the fixture's top level is not an object")
+        }
+        return samples
+    }
+
+    /// Every sample decodes, and nothing in the fixture is left unread: a
+    /// sample the Rust side adds and this list does not name fails here.
+    func testEverySampleInTheSharedFixtureDecodes() throws {
+        let samples = try fanContract()
+        let expected: [String: FanControl] = [
+            "off": FanControl(desired: .auto, state: .off),
+            "holdingFixed5000": FanControl(
+                desired: .fixed(rpm: 5_000), state: .holding,
+                targets: [FanTarget(fan: 0, rpm: 5_000), FanTarget(fan: 1, rpm: 5_000)]),
+            "holdingFollow": FanControl(
+                desired: .followCPU(FanCurve(quietBelowC: 60, fullAtC: 90)), state: .holding,
+                targets: [FanTarget(fan: 0, rpm: 5_777), FanTarget(fan: 1, rpm: 5_777)]),
+            "foreignMacsFanControl": FanControl(
+                desired: .fixed(rpm: 5_000), state: .foreign, reason: .macsFanControl),
+            "foreignMacsFanControlWaiting": FanControl(
+                desired: .auto, state: .foreign, reason: .macsFanControl,
+                targets: [FanTarget(fan: 0, rpm: 5_000), FanTarget(fan: 1, rpm: 5_000)],
+                detail: "fans go back to automatic when Macs Fan Control quits"),
+            "unavailableModeLocked": FanControl(
+                desired: .fixed(rpm: 5_000), state: .unavailable, reason: .modeLocked,
+                detail: "fan 1 would not leave automatic"),
+            "unavailableHelperVersion": FanControl(
+                desired: .fixed(rpm: 5_000), state: .unavailable, reason: .helperVersion,
+                detail: "the installed helper speaks protocol 2; this tcr speaks 1"),
+            "unavailableHelperUnreachable": FanControl(
+                desired: .fixed(rpm: 5_000), state: .unavailable, reason: .helperUnreachable),
+        ]
+        XCTAssertEqual(Set(samples.keys), Set(expected.keys), "the fixture's samples changed")
+        for (name, sample) in samples.sorted(by: { $0.key < $1.key }) {
+            var lines: [String] = []
+            let control = Fleet.decodeFanControl(sample, log: { lines.append($0) })
+            XCTAssertEqual(lines, [], "\(name) logged a decode failure")
+            XCTAssertEqual(control, expected[name], name)
+        }
+        // Inside a whole sessions document too, as the poll reads it.
+        let document: [String: Any] = [
+            "supported": true, "sessions": [], "fanControl": samples["holdingFixed5000"] as Any,
+        ]
+        let read = try Fleet.decodeSessions(JSONSerialization.data(withJSONObject: document))
+        XCTAssertEqual(read.fanControl, expected["holdingFixed5000"])
+    }
+
+    /// The controller's reason when the helper's reply was not the contract's
+    /// shape at all: `{"helperVersion": {}}`, no `installed`.
+    func testAHelperVersionWithNoInstalledDecodes() throws {
+        let control = try decode(
+            #"{"desired": {"mode": "fixed", "rpm": 5000}, "state": "unavailable", "reason": {"helperVersion": {}}, "hotGuard": false, "targets": [], "detail": null, "sinceMs": 0}"#
+        )
+        XCTAssertEqual(control?.state, .unavailable)
+        XCTAssertEqual(control?.reason, .helperVersion)
+    }
+
+    /// The heat object as a fan-control proxy writes it: `ftst` beside the
+    /// fans, and each fan with `manual` and `targetRpm`. The rows read, and a
+    /// key this build does not use (`ftst`, on the heat object or a fan) fails
+    /// nothing.
+    func testAHeatRowWithFtstAndTargetRpmDecodes() throws {
+        let json = """
+            {"supported": true, "sessions": [],
+             "heat": {"cpuCelsius": 71.5, "ftst": true, "fans": [
+                {"index": 0, "actualRpm": 5013.0, "minRpm": 1350.0, "maxRpm": 5777.0, "manual": true, "targetRpm": 5000.0, "ftst": true},
+                {"index": 1, "actualRpm": 1400.0, "minRpm": 1350.0, "maxRpm": 5777.0, "manual": false, "targetRpm": 0.0}]}}
+            """
+        let heat = try Fleet.decodeSessions(Data(json.utf8)).heat
+        XCTAssertEqual(
+            heat,
+            HeatReading(
+                cpuCelsius: 71.5,
+                fans: [
+                    FanReading(
+                        index: 0, actualRPM: 5_013, minRPM: 1_350, maxRPM: 5_777, isManual: true,
+                        targetRPM: 5_000),
+                    FanReading(
+                        index: 1, actualRPM: 1_400, minRPM: 1_350, maxRPM: 5_777, isManual: false,
+                        targetRPM: 0),
+                ]))
+    }
+
     func testCommandsAreTheCliVerbs() {
         XCTAssertEqual(FanCommand.auto.arguments, ["fan", "auto"])
         XCTAssertEqual(FanCommand.fixed(rpm: 5_000).arguments, ["fan", "fixed", "5000"])

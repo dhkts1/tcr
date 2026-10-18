@@ -63,6 +63,9 @@ public enum FanNote: Equatable, Sendable {
     case unrecognisedState(String)
     /// macOS reports a registration status this build does not know.
     case unrecognisedRegistration(String)
+    /// This TcrBar's `Info.plist` names no fan helper, so it has none to
+    /// install (``FanHelperRegistration/Status/noLabel``).
+    case noHelperLabel
 
     public var text: String {
         switch self {
@@ -82,6 +85,8 @@ public enum FanNote: Equatable, Sendable {
             return "tcr reports the fans as “\(raw)”, which this TcrBar does not know."
         case .unrecognisedRegistration(let raw):
             return "macOS reports the fan helper as “\(raw)”, which this TcrBar does not know."
+        case .noHelperLabel:
+            return "This TcrBar build names no fan helper, so it cannot install one."
         }
     }
 
@@ -271,6 +276,7 @@ public final class FanControlModel: ObservableObject {
             case .notRegistered, .notFound: return .install(selected: selected)
             case .requiresApproval: return .approval(selected: selected)
             case .enabled: return .startingHelper(selected: selected)
+            case .noLabel: return .controls(selected: selected, note: .noHelperLabel)
             case .unrecognised:
                 return .controls(
                     selected: selected, note: .unrecognisedRegistration(registration.word))

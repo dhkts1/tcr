@@ -62,7 +62,7 @@ final class FanControlModelTests: XCTestCase {
     private let fixed = FanDesired.fixed(rpm: 5_000)
     private let follow = FanDesired.followCPU(FanCurve(quietBelowC: 60, fullAtC: 90))
     private let allRegistrations: [FanHelperRegistration.Status] = [
-        .enabled, .notRegistered, .requiresApproval, .notFound, .unrecognised(rawValue: 9),
+        .enabled, .notRegistered, .requiresApproval, .notFound, .unrecognised(rawValue: 9), .noLabel,
     ]
 
     private func panel(
@@ -120,6 +120,17 @@ final class FanControlModelTests: XCTestCase {
         XCTAssertEqual(
             panel(fixed, .unavailable, .helperUnreachable, .unrecognised(rawValue: 9)),
             .controls(selected: .fixed, note: .unrecognisedRegistration("unrecognised(9)")))
+    }
+
+    /// A build whose Info.plist names no helper offers no install: it has
+    /// no helper to register.
+    func testNoHelperLabelOffersNoInstall() {
+        XCTAssertEqual(
+            panel(fixed, .unavailable, .helperUnreachable, .noLabel),
+            .controls(selected: .fixed, note: .noHelperLabel))
+        XCTAssertEqual(
+            panel(follow, .unavailable, .helperUnreachable, .noLabel),
+            .controls(selected: .followCPU, note: .noHelperLabel))
     }
 
     /// fixed | enabled | holding: panel 9. followCpu | enabled | holding: panel 10.
