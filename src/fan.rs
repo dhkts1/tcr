@@ -13,10 +13,15 @@
 //!
 //! # What the status shows
 //!
-//! [`FanHandle`] keeps the last [`Snapshot`] the controller published, plus the
-//! wish. The wish is updated by the handle as it sends, under the same lock,
-//! so a status read right after `POST /_tcr/fan` already names the new mode
-//! even while the controller is still busy with the old one.
+//! [`FanHandle`] keeps the last [`Snapshot`] the controller published, wish
+//! included. The handle does not write the wish as it sends: a wish written
+//! ahead of the controller would pair the new mode with a state the
+//! controller reached for the old one (fans going back to automatic, Macs
+//! Fan Control starting) and `tcr fan` would judge that state as its
+//! answer. So a status read right after `POST /_tcr/fan` can still name the
+//! old mode, until the controller acts on the new one; the POST's own answer
+//! is that old object, which `tcr fan` keeps to tell "not taken yet" from
+//! "replaced".
 //!
 //! # Persistence
 //!
@@ -323,8 +328,8 @@ impl FanRequest {
 
 // The status object.
 
-/// The `fanControl` object for a wish and a snapshot.
-pub fn row(desired: FanMode, snapshot: &Snapshot) -> FanControlRow {
+/// The `fanControl` object for a snapshot.
+pub fn row(snapshot: &Snapshot) -> FanControlRow {
     let (state, reason) = match snapshot.state {
         State::Off => (FanStateRow::Off, None),
         State::Entering => (FanStateRow::Entering, None),
@@ -341,7 +346,7 @@ pub fn row(desired: FanMode, snapshot: &Snapshot) -> FanControlRow {
         State::Stuck => (FanStateRow::Stuck, None),
     };
     FanControlRow {
-        desired: desired_row(desired),
+        desired: desired_row(snapshot.desired),
         state,
         reason,
         hot_guard: snapshot.hot_guard,
@@ -402,12 +407,6 @@ fn detail_text(snapshot: &Snapshot) -> Option<String> {
 
 // The handle.
 
-/// What the status shows: the wish and the controller's last snapshot.
-struct Shown {
-    desired: FanMode,
-    snapshot: Snapshot,
-}
-
 /// The controller's thread stopped: nothing receives a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotRunning;
@@ -415,31 +414,28 @@ pub struct NotRunning;
 /// The route's and the status payload's way to the controller.
 pub struct FanHandle {
     tx: Sender<Input>,
-    shown: Arc<Mutex<Shown>>,
+    /// The controller's last snapshot, wish included.
+    shown: Arc<Mutex<Snapshot>>,
     /// Hears once when the thread's loop returns.
     done: Mutex<mpsc::Receiver<()>>,
 }
 
 impl FanHandle {
-    /// Send `command`; the answer is the `fanControl` object as of now, the
-    /// wish already updated.
+    /// Send `command`; the answer is the `fanControl` object as it stood when
+    /// the command went in, before the controller acted on it. The lock is
+    /// held across the send, so nothing the controller publishes after taking
+    /// this command can be in the answer.
     pub fn send(&self, command: Command) -> Result<FanControlRow, NotRunning> {
-        let mut shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
+        let shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
         self.tx
             .send(Input::Command(command))
             .map_err(|_gone| NotRunning)?;
-        match command {
-            Command::Set(mode) => shown.desired = mode,
-            Command::ForceHandBack => shown.desired = FanMode::Auto,
-            Command::Shutdown { .. } => {}
-        }
-        Ok(row(shown.desired, &shown.snapshot))
+        Ok(row(&shown))
     }
 
     /// The `fanControl` object as of now.
     pub fn row(&self) -> FanControlRow {
-        let shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
-        row(shown.desired, &shown.snapshot)
+        row(&self.shown.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Ask the controller to hand back what it holds and stop, and wait at
@@ -473,15 +469,13 @@ pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
     let desired = saved.as_ref().map_or(FanMode::Auto, |s| s.desired);
     let (tx, rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
-    let shown = Arc::new(Mutex::new(Shown {
+    let shown = Arc::new(Mutex::new(Snapshot {
         desired,
-        snapshot: Snapshot {
-            state: State::Off,
-            hot_guard: false,
-            targets: Vec::new(),
-            detail: None,
-            since_ms: wall_ms(),
-        },
+        state: State::Off,
+        hot_guard: false,
+        targets: Vec::new(),
+        detail: None,
+        since_ms: wall_ms(),
     }));
     let published = Arc::clone(&shown);
     let after_panic = Arc::clone(&shown);
@@ -500,10 +494,8 @@ pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
                         inbox: rx,
                         log: Box::new(log_line),
                         publish: Box::new(move |snapshot: &Snapshot| {
-                            published
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .snapshot = snapshot.clone();
+                            *published.lock().unwrap_or_else(PoisonError::into_inner) =
+                                snapshot.clone();
                         }),
                         pid: std::process::id(),
                     };
@@ -527,7 +519,7 @@ pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
 /// (say, "holding") standing for a controller that is gone. The panic drops
 /// the helper connection on its way out, so root judges the fans and hands
 /// back what is still its doing.
-fn run_guarded(run: impl FnOnce(), shown: &Mutex<Shown>) {
+fn run_guarded(run: impl FnOnce(), shown: &Mutex<Snapshot>) {
     let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) else {
         return;
     };
@@ -538,7 +530,8 @@ fn run_guarded(run: impl FnOnce(), shown: &Mutex<Shown>) {
         .unwrap_or_else(|| "a panic with no message".to_string());
     tracing::error!(%why, "fan control: the controller stopped; restart tcr to control the fans again");
     let mut shown = shown.lock().unwrap_or_else(PoisonError::into_inner);
-    shown.snapshot = Snapshot {
+    *shown = Snapshot {
+        desired: shown.desired,
         state: State::Unavailable(Unavailable::ControllerStopped),
         hot_guard: false,
         targets: Vec::new(),
@@ -552,75 +545,90 @@ fn run_guarded(run: impl FnOnce(), shown: &Mutex<Shown>) {
 /// must never touch the machine's fans.
 #[cfg(test)]
 pub(crate) fn start_inert() -> Arc<FanHandle> {
-    struct NoSmc;
-    impl tcr_fan::controller::Heat for NoSmc {
+    let (handle, controller) = inert(None);
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        controller.run();
+        done_tx.send(()).ok();
+    });
+    *handle.done.lock().unwrap() = done_rx;
+    handle
+}
+
+#[cfg(test)]
+type Inert = Controller<inert::NoHelper, inert::NoSmc, inert::NoMacs, SystemClock, inert::Nowhere>;
+
+/// A handle and the controller behind it, not running: a test steps it by
+/// hand, so it can land a step for the old wish between a send and the
+/// controller taking it.
+#[cfg(test)]
+fn inert(saved: Option<Saved>) -> (Arc<FanHandle>, Inert) {
+    let (tx, rx) = mpsc::channel();
+    let (_never, done_rx) = mpsc::channel();
+    let shown = Arc::new(Mutex::new(Snapshot {
+        desired: saved.as_ref().map_or(FanMode::Auto, |s| s.desired),
+        state: State::Off,
+        hot_guard: false,
+        targets: Vec::new(),
+        detail: None,
+        since_ms: 0,
+    }));
+    let published = Arc::clone(&shown);
+    let parts = Parts {
+        helper: inert::NoHelper,
+        heat: inert::NoSmc,
+        probe: inert::NoMacs,
+        clock: SystemClock,
+        store: inert::Nowhere,
+        inbox: rx,
+        log: Box::new(|_, _| {}),
+        publish: Box::new(move |snapshot: &Snapshot| {
+            *published.lock().unwrap() = snapshot.clone();
+        }),
+        pid: std::process::id(),
+    };
+    let controller = Controller::new(parts, saved);
+    let handle = Arc::new(FanHandle {
+        tx,
+        shown,
+        done: Mutex::new(done_rx),
+    });
+    (handle, controller)
+}
+
+#[cfg(test)]
+mod inert {
+    use std::time::Duration;
+
+    use tcr_fan::controller::{Fault, Generation, Heat, Helper, Probe, Saved, Store};
+    use tcr_fan::wire::{Reply, Request};
+
+    pub(super) struct NoSmc;
+    impl Heat for NoSmc {
         fn read(&mut self) -> Option<tcr_smc::HeatReading> {
             None
         }
     }
-    struct NoHelper;
-    impl tcr_fan::controller::Helper for NoHelper {
-        fn open(
-            &mut self,
-            _: tcr_fan::controller::Generation,
-        ) -> Result<(), tcr_fan::controller::Fault> {
-            Err(tcr_fan::controller::Fault::NotSignedForFans)
+    pub(super) struct NoHelper;
+    impl Helper for NoHelper {
+        fn open(&mut self, _: Generation) -> Result<(), Fault> {
+            Err(Fault::NotSignedForFans)
         }
-        fn send(
-            &mut self,
-            _: &tcr_fan::wire::Request,
-            _: Duration,
-        ) -> Result<tcr_fan::wire::Reply, tcr_fan::controller::Fault> {
-            Err(tcr_fan::controller::Fault::NotSignedForFans)
+        fn send(&mut self, _: &Request, _: Duration) -> Result<Reply, Fault> {
+            Err(Fault::NotSignedForFans)
         }
         fn close(&mut self) {}
     }
-    struct NoMacs;
-    impl tcr_fan::controller::Probe for NoMacs {
+    pub(super) struct NoMacs;
+    impl Probe for NoMacs {
         fn macs_running(&mut self) -> Result<bool, String> {
             Ok(false)
         }
     }
-    struct Nowhere;
+    pub(super) struct Nowhere;
     impl Store for Nowhere {
         fn save(&mut self, _: &Saved) {}
     }
-
-    let (tx, rx) = mpsc::channel();
-    let (done_tx, done_rx) = mpsc::channel();
-    let shown = Arc::new(Mutex::new(Shown {
-        desired: FanMode::Auto,
-        snapshot: Snapshot {
-            state: State::Off,
-            hot_guard: false,
-            targets: Vec::new(),
-            detail: None,
-            since_ms: 0,
-        },
-    }));
-    let published = Arc::clone(&shown);
-    std::thread::spawn(move || {
-        let parts = Parts {
-            helper: NoHelper,
-            heat: NoSmc,
-            probe: NoMacs,
-            clock: SystemClock,
-            store: Nowhere,
-            inbox: rx,
-            log: Box::new(|_, _| {}),
-            publish: Box::new(move |snapshot: &Snapshot| {
-                published.lock().unwrap().snapshot = snapshot.clone();
-            }),
-            pid: std::process::id(),
-        };
-        Controller::new(parts, None).run();
-        done_tx.send(()).ok();
-    });
-    Arc::new(FanHandle {
-        tx,
-        shown,
-        done: Mutex::new(done_rx),
-    })
 }
 
 fn log_line(level: Level, line: &str) {
@@ -827,12 +835,21 @@ mod tests {
 
     fn snapshot(state: State, targets: &[(u8, f64)], detail: Option<Detail>) -> Snapshot {
         Snapshot {
+            desired: FanMode::Auto,
             state,
             hot_guard: false,
             targets: targets.iter().map(|&(i, rpm)| (fan(i), rpm)).collect(),
             detail,
             since_ms: 1_760_000_000_000,
         }
+    }
+
+    /// The row for `snapshot` with `desired` as its wish.
+    fn row_with(desired: FanMode, snapshot: Snapshot) -> FanControlRow {
+        row(&Snapshot {
+            desired,
+            ..snapshot
+        })
     }
 
     /// What this code emits for each state TcrBar draws is, value for value,
@@ -903,7 +920,7 @@ mod tests {
         assert_eq!(cases.len(), samples.len(), "every sample is checked");
         for (name, desired, snapshot) in cases {
             assert_eq!(
-                serde_json::to_value(row(desired, &snapshot)).unwrap(),
+                serde_json::to_value(row_with(desired, snapshot)).unwrap(),
                 samples[name],
                 "{name}"
             );
@@ -912,9 +929,9 @@ mod tests {
 
     #[test]
     fn fan_status_reasons_with_fields_get_a_detail() {
-        let locked = row(
+        let locked = row_with(
             FanMode::Auto,
-            &snapshot(
+            snapshot(
                 State::Unavailable(Unavailable::ModeLocked { fan: 1 }),
                 &[],
                 None,
@@ -927,9 +944,9 @@ mod tests {
         );
         let wire = serde_json::to_value(&locked).unwrap();
         assert_eq!(wire["reason"], serde_json::json!({"modeLocked": 1}));
-        let version = row(
+        let version = row_with(
             FanMode::Auto,
-            &snapshot(
+            snapshot(
                 State::Unavailable(Unavailable::HelperVersion { installed: Some(2) }),
                 &[],
                 None,
@@ -976,7 +993,7 @@ mod tests {
         ];
         for (desired, snapshot, expected) in cases {
             assert_eq!(
-                serde_json::to_string(&row(desired, &snapshot)).unwrap(),
+                serde_json::to_string(&row_with(desired, snapshot)).unwrap(),
                 expected
             );
         }
@@ -1165,17 +1182,19 @@ mod tests {
             rpm: Rpm::new(5000).unwrap(),
         };
         let holding = || {
-            Mutex::new(Shown {
+            Mutex::new(Snapshot {
                 desired: fixed,
-                snapshot: snapshot(State::Holding, &[(0, 5000.0), (1, 5000.0)], None),
+                ..snapshot(State::Holding, &[(0, 5000.0), (1, 5000.0)], None)
             })
         };
         let shown = holding();
         run_guarded(|| panic!("a controller bug"), &shown);
-        let after = {
-            let shown = shown.lock().unwrap();
-            row(shown.desired, &shown.snapshot)
-        };
+        let after = row(&shown.lock().unwrap());
+        assert_eq!(
+            after.desired,
+            FanDesiredRow::Fixed { rpm: 5000 },
+            "the wish stays"
+        );
         assert_eq!(after.state, FanStateRow::Unavailable);
         assert_eq!(after.reason, Some(FanReasonRow::ControllerStopped));
         assert_eq!(after.targets, vec![]);
@@ -1184,6 +1203,48 @@ mod tests {
         // A run that returns leaves what it published.
         let shown = holding();
         run_guarded(|| {}, &shown);
-        assert_eq!(shown.lock().unwrap().snapshot.state, State::Holding);
+        assert_eq!(shown.lock().unwrap().state, State::Holding);
+    }
+    /// The race the first cut of `tcr fan` could lose: a state change made
+    /// for the old wish lands after `POST /_tcr/fan` sent the new one and
+    /// before the controller took it. No status read may pair the new wish
+    /// with that state; the wish shows once the controller acted on it.
+    #[test]
+    fn fan_status_never_pairs_a_new_wish_with_the_old_wishs_state() {
+        let fixed = FanMode::Fixed {
+            rpm: Rpm::new(5000).unwrap(),
+        };
+        let (handle, mut controller) = inert(Some(Saved {
+            desired: fixed,
+            hold: None,
+        }));
+        let before = handle.row();
+        assert_eq!(before.desired, FanDesiredRow::Fixed { rpm: 5000 });
+        assert_eq!(before.state, FanStateRow::Unavailable, "no SMC here");
+
+        let answer = handle.send(Command::Set(FanMode::Auto)).unwrap();
+        assert_eq!(
+            answer, before,
+            "the POST answers with the object before the command"
+        );
+
+        // The old wish's tick, before the controller drains the channel: the
+        // SMC still does not read, so the state turns unknown.
+        controller.tick(false);
+        let between = handle.row();
+        assert_eq!(between.state, FanStateRow::Unknown);
+        assert_eq!(
+            between.desired,
+            FanDesiredRow::Fixed { rpm: 5000 },
+            "the new wish paired with a state reached for the old one: {between:?}"
+        );
+
+        controller.pump();
+        let after = handle.row();
+        assert_eq!(
+            (after.desired, after.state),
+            (FanDesiredRow::Auto, FanStateRow::Off)
+        );
+        assert!(after.since_ms >= between.since_ms);
     }
 }

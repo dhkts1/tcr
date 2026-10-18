@@ -3670,31 +3670,44 @@ pub const FAN_SETTLE: Duration = Duration::from_secs(
 );
 const FAN_POLL: Duration = Duration::from_millis(250);
 
-/// Where `tcr fan <mode>` stands after one status read.
+/// Where `tcr fan` stands after one status read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FanWait {
-    /// The controller has not taken the command yet, or is still entering or releasing.
+    /// The controller has not acted on the command yet, or is still entering or releasing.
     Waiting,
-    /// The command was taken and the state no longer moves.
+    /// The controller acted on the command and the state no longer moves.
     Settled,
-    /// The wish is no longer the one sent: another command replaced it.
+    /// The controller acted on a wish that is neither this command's nor the one it replaced:
+    /// another command replaced it.
     Replaced,
 }
 
-/// One status read against the command sent at `sent_at` (wall ms).
-fn fan_wait(
+/// One command as `tcr fan` sent it: what it asked for, when (wall ms), and the wish the
+/// status showed as it went in (the POST's answer, read under the lock the send holds).
+#[derive(Debug, Clone, Copy)]
+struct FanSent {
     request: crate::fan::FanRequest,
-    row: &tcr_status_wire::FanControlRow,
     sent_at: i64,
-) -> FanWait {
-    if row.desired != request.desired_row() {
-        return FanWait::Replaced;
+    before: tcr_status_wire::FanDesiredRow,
+}
+
+/// One status read against `sent`. The status pairs each state with the wish it was reached
+/// for, and shows a wish only once the controller acted on it (`crate::fan`, "What the status
+/// shows"), so a read that still shows `sent.before` is a controller that has not taken this
+/// command yet, whatever its state or `sinceMs`.
+fn fan_wait(sent: &FanSent, row: &tcr_status_wire::FanControlRow) -> FanWait {
+    if row.desired != sent.request.desired_row() {
+        return if row.desired == sent.before {
+            FanWait::Waiting
+        } else {
+            FanWait::Replaced
+        };
     }
     let moving = matches!(
         row.state,
         tcr_status_wire::FanStateRow::Entering | tcr_status_wire::FanStateRow::Releasing
     );
-    if row.since_ms < sent_at || moving {
+    if row.since_ms < sent.sent_at || moving {
         FanWait::Waiting
     } else {
         FanWait::Settled
@@ -3702,12 +3715,8 @@ fn fan_wait(
 }
 
 /// Exit 0 only for the mode this command sent, settled in the state it means.
-fn fan_succeeded(
-    request: crate::fan::FanRequest,
-    row: &tcr_status_wire::FanControlRow,
-    sent_at: i64,
-) -> bool {
-    fan_wait(request, row, sent_at) == FanWait::Settled && row.state == request.settled_state()
+fn fan_succeeded(sent: &FanSent, row: &tcr_status_wire::FanControlRow) -> bool {
+    fan_wait(sent, row) == FanWait::Settled && row.state == sent.request.settled_state()
 }
 
 fn live_status_why(error: &LiveStatusError, port: u16) -> String {
@@ -3782,8 +3791,12 @@ pub async fn fan(
         })
         .await
         .result;
-    match answer {
-        Ok(_accepted) => {}
+    let sent = match answer {
+        Ok(accepted) => FanSent {
+            request,
+            sent_at,
+            before: accepted.desired,
+        },
         Err(LiveControlError::Rejected(message)) => bail!("{message}"),
         Err(LiveControlError::NoRoute) => bail!(
             "the tcr on 127.0.0.1:{} is too old to control fans (no {} route)",
@@ -3791,12 +3804,12 @@ pub async fn fan(
             crate::proxy::FAN_PATH
         ),
         Err(other) => bail!("could not reach the fan controller: {}", other.why()),
-    }
+    };
 
     let started = std::time::Instant::now();
     let (row, heat) = loop {
         let (row, heat) = live_fan(&config).await?;
-        if fan_wait(request, &row, sent_at) != FanWait::Waiting || started.elapsed() >= FAN_SETTLE {
+        if fan_wait(&sent, &row) != FanWait::Waiting || started.elapsed() >= FAN_SETTLE {
             break (row, heat);
         }
         tokio::time::sleep(FAN_POLL).await;
@@ -3806,12 +3819,22 @@ pub async fn fan(
     } else {
         print!("{}", render_fan_text(&row, heat.as_ref()));
     }
-    if fan_succeeded(request, &row, sent_at) {
+    if fan_succeeded(&sent, &row) {
         return Ok(0);
     }
-    if fan_wait(request, &row, sent_at) == FanWait::Replaced {
-        eprintln!("tcr: another command changed the fan mode before this one settled");
-        return Ok(1);
+    match fan_wait(&sent, &row) {
+        FanWait::Replaced => {
+            eprintln!("tcr: another command changed the fan mode before this one settled");
+            return Ok(1);
+        }
+        FanWait::Waiting if row.desired != request.desired_row() => {
+            eprintln!(
+                "tcr: the fan controller had not acted on this command after {} s",
+                FAN_SETTLE.as_secs()
+            );
+            return Ok(1);
+        }
+        FanWait::Waiting | FanWait::Settled => {}
     }
     let reason = row
         .reason
@@ -8343,91 +8366,104 @@ mod tests {
         );
     }
 
+    /// A status row for the `tcr fan` tests.
+    fn fan_row(
+        desired: tcr_status_wire::FanDesiredRow,
+        state: tcr_status_wire::FanStateRow,
+        since_ms: i64,
+    ) -> tcr_status_wire::FanControlRow {
+        tcr_status_wire::FanControlRow {
+            desired,
+            state,
+            reason: None,
+            hot_guard: false,
+            targets: vec![],
+            detail: None,
+            since_ms,
+        }
+    }
+
     /// `tcr fan fixed 5000` succeeds only for fixed 5000 itself: holding another mode, even
     /// one newer than the command, is not its success.
     #[test]
     fn fan_cli_succeeds_only_for_the_mode_it_sent() {
         use crate::fan::FanRequest;
-        use tcr_status_wire::{FanControlRow, FanDesiredRow, FanStateRow};
-        let sent_at = 1_000;
-        let at = |desired, state, since_ms| FanControlRow {
-            desired,
-            state,
-            reason: None,
-            hot_guard: false,
-            targets: vec![],
-            detail: None,
-            since_ms,
+        use tcr_status_wire::{FanDesiredRow, FanStateRow};
+        let sent = FanSent {
+            request: FanRequest::Fixed { rpm: 5000 },
+            sent_at: 1_000,
+            before: FanDesiredRow::Auto,
         };
-        let request = FanRequest::Fixed { rpm: 5000 };
         let ours = FanDesiredRow::Fixed { rpm: 5000 };
         let other = FanDesiredRow::Fixed { rpm: 3000 };
 
-        let settled = at(ours, FanStateRow::Holding, 1_200);
-        assert_eq!(fan_wait(request, &settled, sent_at), FanWait::Settled);
-        assert!(fan_succeeded(request, &settled, sent_at));
+        let settled = fan_row(ours, FanStateRow::Holding, 1_200);
+        assert_eq!(fan_wait(&sent, &settled), FanWait::Settled);
+        assert!(fan_succeeded(&sent, &settled));
 
-        let replaced = at(other, FanStateRow::Holding, 1_200);
-        assert_eq!(fan_wait(request, &replaced, sent_at), FanWait::Replaced);
-        assert!(!fan_succeeded(request, &replaced, sent_at));
-        let auto_replaced = at(FanDesiredRow::Auto, FanStateRow::Off, 1_200);
-        assert!(!fan_succeeded(request, &auto_replaced, sent_at));
+        let replaced = fan_row(other, FanStateRow::Holding, 1_200);
+        assert_eq!(fan_wait(&sent, &replaced), FanWait::Replaced);
+        assert!(!fan_succeeded(&sent, &replaced));
+        // A replacement that asks for the wish from before this command reads as this one not
+        // taken yet: never a success, and the wait ends on its timeout.
+        let auto_again = fan_row(FanDesiredRow::Auto, FanStateRow::Off, 1_200);
+        assert_eq!(fan_wait(&sent, &auto_again), FanWait::Waiting);
+        assert!(!fan_succeeded(&sent, &auto_again));
 
-        // Not taken yet, or still entering: wait.
-        let before = at(ours, FanStateRow::Holding, 900);
-        assert_eq!(fan_wait(request, &before, sent_at), FanWait::Waiting);
-        assert!(!fan_succeeded(request, &before, sent_at));
-        let entering = at(ours, FanStateRow::Entering, 1_200);
-        assert_eq!(fan_wait(request, &entering, sent_at), FanWait::Waiting);
+        // Not acted on yet, or still entering: wait.
+        let before = fan_row(ours, FanStateRow::Holding, 900);
+        assert_eq!(fan_wait(&sent, &before), FanWait::Waiting);
+        assert!(!fan_succeeded(&sent, &before));
+        let entering = fan_row(ours, FanStateRow::Entering, 1_200);
+        assert_eq!(fan_wait(&sent, &entering), FanWait::Waiting);
 
         // Settled, but not holding.
-        let foreign = at(ours, FanStateRow::Foreign, 1_200);
-        assert_eq!(fan_wait(request, &foreign, sent_at), FanWait::Settled);
-        assert!(!fan_succeeded(request, &foreign, sent_at));
+        let foreign = fan_row(ours, FanStateRow::Foreign, 1_200);
+        assert_eq!(fan_wait(&sent, &foreign), FanWait::Settled);
+        assert!(!fan_succeeded(&sent, &foreign));
 
         // `auto --force` is Auto.
-        let off = at(FanDesiredRow::Auto, FanStateRow::Off, 1_200);
-        assert!(fan_succeeded(
-            FanRequest::Auto { force: true },
-            &off,
-            sent_at
-        ));
+        let forced = FanSent {
+            request: FanRequest::Auto { force: true },
+            sent_at: 1_000,
+            before: ours,
+        };
+        let off = fan_row(FanDesiredRow::Auto, FanStateRow::Off, 1_200);
+        assert!(fan_succeeded(&forced, &off));
     }
 
-    /// `tcr fan auto` with the fans held at 5000, as the controller now publishes it: the
-    /// snapshot from taking the command keeps the old `sinceMs`, so it waits; releasing waits;
-    /// `off` succeeds. A command that replaces it mid-wait reports Replaced.
+    /// `tcr fan auto` with the fans held at 5000. The status keeps the old wish until the
+    /// controller acts, so the snapshot from taking the command, and a state the old wish
+    /// reached after the send (the SMC not reading: unknown, with a fresh `sinceMs`), both wait;
+    /// releasing waits; `off` succeeds. A third wish is Replaced.
     #[test]
     fn fan_cli_auto_from_holding_waits_through_the_release() {
         use crate::fan::FanRequest;
-        use tcr_status_wire::{FanControlRow, FanDesiredRow, FanStateRow};
-        let sent_at = 1_000;
-        let at = |desired, state, since_ms| FanControlRow {
-            desired,
-            state,
-            reason: None,
-            hot_guard: false,
-            targets: vec![],
-            detail: None,
-            since_ms,
+        use tcr_status_wire::{FanDesiredRow, FanStateRow};
+        let held = FanDesiredRow::Fixed { rpm: 5000 };
+        let sent = FanSent {
+            request: FanRequest::Auto { force: false },
+            sent_at: 1_000,
+            before: held,
         };
-        let request = FanRequest::Auto { force: false };
-        let taken = at(FanDesiredRow::Auto, FanStateRow::Holding, 400);
-        assert_eq!(fan_wait(request, &taken, sent_at), FanWait::Waiting);
-        assert!(!fan_succeeded(request, &taken, sent_at));
-        let releasing = at(FanDesiredRow::Auto, FanStateRow::Releasing, 1_180);
-        assert_eq!(fan_wait(request, &releasing, sent_at), FanWait::Waiting);
-        let off = at(FanDesiredRow::Auto, FanStateRow::Off, 1_388);
-        assert_eq!(fan_wait(request, &off, sent_at), FanWait::Settled);
-        assert!(fan_succeeded(request, &off, sent_at));
+        let taken = fan_row(held, FanStateRow::Holding, 400);
+        assert_eq!(fan_wait(&sent, &taken), FanWait::Waiting);
+        assert!(!fan_succeeded(&sent, &taken));
+        let old_wish_moved = fan_row(held, FanStateRow::Unknown, 1_100);
+        assert_eq!(fan_wait(&sent, &old_wish_moved), FanWait::Waiting);
+        let releasing = fan_row(FanDesiredRow::Auto, FanStateRow::Releasing, 1_180);
+        assert_eq!(fan_wait(&sent, &releasing), FanWait::Waiting);
+        let off = fan_row(FanDesiredRow::Auto, FanStateRow::Off, 1_388);
+        assert_eq!(fan_wait(&sent, &off), FanWait::Settled);
+        assert!(fan_succeeded(&sent, &off));
 
-        let replaced = at(
+        let replaced = fan_row(
             FanDesiredRow::Fixed { rpm: 3000 },
             FanStateRow::Holding,
-            400,
+            1_200,
         );
-        assert_eq!(fan_wait(request, &replaced, sent_at), FanWait::Replaced);
-        assert!(!fan_succeeded(request, &replaced, sent_at));
+        assert_eq!(fan_wait(&sent, &replaced), FanWait::Replaced);
+        assert!(!fan_succeeded(&sent, &replaced));
     }
 
     /// The wait covers the version call (which waits out launchd starting the helper late),

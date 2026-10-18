@@ -2544,7 +2544,9 @@ set-targets), and exits 0 only when the wish is still the mode it sent and
 the state is `holding` for `fixed` and `follow`, or `off` for `auto`. Otherwise it prints the
 state and exits 1 with the reason, for example
 `tcr: the fans are foreign (macsFanControl), not holding`; a mode another command set in the
-meantime is `tcr: another command changed the fan mode before this one settled`.
+meantime is `tcr: another command changed the fan mode before this one settled`, and a
+controller that never acted on the mode in that time is
+`tcr: the fan controller had not acted on this command after 49 s`.
 
 With no action it prints the wish, the state and the reason, then each fan as the server reads it
 (`actual`, `min`, `max`, the mode key, `F{n}Tg` as `target`, and what this server last `written`),
@@ -2594,9 +2596,12 @@ file means Auto.
   an internal error; a restart starts it again). A reason that carries data is a one-key object.
 - `targets`: what this server last wrote to each fan it holds.
 - `detail`: a sentence for a person, or `null`.
-- `sinceMs`: when the state last changed, or the controller last acted on a command. Taking a
-  command does not move it, so `desired` can show a new wish beside an older `sinceMs` until the
-  controller has acted; `tcr fan` waits for a `sinceMs` at or after the moment it sent.
+- `sinceMs`: when the state last changed, or the controller last acted on a command.
+
+`desired` and `sinceMs` move together, when the controller acts: a mode just sent does not show
+until the controller has acted on it, so every object pairs a state with the wish it was reached
+for. `tcr fan` waits while the object still shows the wish from before its command, and for a
+`sinceMs` at or after the moment it sent.
 
 The committed samples are `tests/fixtures/fan-control-contract.json`; TcrBar's popover decodes
 the same file.
@@ -2607,7 +2612,8 @@ Gated like `/_tcr/config` (loopback, the proxy key when one is set, a loopback h
 cross-site, `application/json`). The body is exactly one of `{"mode": "auto"}`,
 `{"mode": "auto", "force": true}`, `{"mode": "fixed", "rpm": 5000}`,
 `{"mode": "followCpu", "quietBelowC": 60, "fullAtC": 90}`; any other key or value is a 400 in one
-sentence. Accepted is 202 with the `fanControl` object; a server running no fan controller
+sentence. Accepted is 202 with the `fanControl` object as it stood when the command went in, before the
+controller acted on it (`tcr fan` keeps its `desired` to tell "not taken yet" from "replaced"); a server running no fan controller
 answers 503. `GET` is 405. Any local caller that passes that gate can ask for a fan mode, which
 is the same class of caller that can already save a setting or add an account; what it gets is a
 validated mode, clamped by the helper, with the hot guard on in Follow CPU.

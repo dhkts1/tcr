@@ -2456,8 +2456,9 @@ async fn config_set_handler(State(manager): State<Arc<Manager>>, req: Request) -
 ///
 /// Never waits on the fans: the controller may be inside a 15 s unlock, and
 /// the mode is queued behind it (latest wins). The 202 body is the
-/// `fanControl` object with the new wish; `tcr fan` then polls the status
-/// route until the state settles.
+/// `fanControl` object as it stood when the command went in, before the
+/// controller acted on it ([`crate::fan::FanHandle::send`]); `tcr fan` keeps
+/// its wish, then polls the status route until the state settles.
 async fn fan_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let request: crate::fan::FanRequest = match read_command(
         &FAN_ROUTE,
@@ -15444,8 +15445,9 @@ mod tests {
     }
 
     /// `/_tcr/fan`: POST only, the exact bodies of the contract, a stamped 400
-    /// in one sentence for a refused value, a stamped 202 carrying the new
-    /// wish, and the same object on the status route. The controller behind it
+    /// in one sentence for a refused value, a stamped 202 carrying the object
+    /// from before the command, and the new wish on the status route once the
+    /// controller acted on it. The controller behind it
     /// reaches no SMC and no helper, so nothing here can touch a fan.
     #[tokio::test]
     async fn fan_route_takes_the_contract_bodies_and_answers_locally() {
@@ -15482,7 +15484,8 @@ mod tests {
         let accepted = body_json(response).await;
         assert_eq!(
             accepted["desired"],
-            serde_json::json!({"mode": "fixed", "rpm": 5000})
+            serde_json::json!({"mode": "auto"}),
+            "the object from before the command: the controller starts on Auto"
         );
 
         let response = drive_full(
@@ -15548,22 +15551,28 @@ mod tests {
         )
         .await;
         let status = body_json(response).await;
-        assert_eq!(
-            status["fanControl"]["desired"],
-            serde_json::json!({"mode": "fixed", "rpm": 5000})
-        );
-        let mut seen = status["fanControl"]["reason"].clone();
+        assert!(status["fanControl"].is_object(), "{status}");
+        // The wish shows once the controller has acted on it.
+        let want =
+            serde_json::json!({"desired": {"mode": "fixed", "rpm": 5000}, "reason": "noSmc"});
+        let mut seen = serde_json::json!({
+            "desired": status["fanControl"]["desired"],
+            "reason": status["fanControl"]["reason"],
+        });
         for _ in 0..50 {
-            if seen == "noSmc" {
+            if seen == want {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
             seen = manager
                 .fan()
-                .map(|f| serde_json::json!(f.row().reason))
+                .map(|f| {
+                    let row = f.row();
+                    serde_json::json!({"desired": row.desired, "reason": row.reason})
+                })
                 .unwrap_or_default();
         }
-        assert_eq!(seen, "noSmc");
+        assert_eq!(seen, want);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         if let Some(fan) = manager.fan() {
             let fan = Arc::clone(fan);

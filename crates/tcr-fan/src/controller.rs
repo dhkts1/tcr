@@ -499,10 +499,17 @@ pub enum Level {
 
 pub type Log = Box<dyn FnMut(Level, &str) + Send>;
 
-/// What the status route shows, minus the wish (which the route's side
-/// publishes as it sends, so a status read never shows an older one).
+/// What the status route shows.
+///
+/// `desired` and `since_ms` are set together and only together, when the
+/// controller stamps ([`Controller::advance`] after acting on a command, or a
+/// state change with no command waiting): every snapshot pairs a state with
+/// the wish it was reached for. A command taken but not yet acted on does not
+/// show; the wish stays the one the controller last acted on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
+    /// The wish the controller last acted on.
+    pub desired: FanMode,
     pub state: State,
     pub hot_guard: bool,
     /// What was last written to each fan held.
@@ -601,6 +608,9 @@ pub struct Controller<H, R, P, C, S> {
     connected: bool,
     hot: bool,
     detail: Option<Detail>,
+    /// The wish [`Snapshot::desired`] shows: `desired` as of the last
+    /// [`Self::stamp`], never ahead of it.
+    shown_desired: FanMode,
     since_ms: i64,
     failed_entries: u32,
     backoff_step: usize,
@@ -634,6 +644,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             connected: false,
             hot: false,
             detail: None,
+            shown_desired: desired,
             since_ms,
             failed_entries: 0,
             backoff_step: 0,
@@ -723,9 +734,11 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
 
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
+            desired: self.shown_desired,
             state: self.state,
-            // Off the moment the wish leaves Follow CPU, not at the next tick.
-            hot_guard: self.hot && self.desired.has_hot_guard(),
+            // Off as soon as the shown wish leaves Follow CPU, not at the next
+            // tick.
+            hot_guard: self.hot && self.shown_desired.has_hot_guard(),
             targets: self
                 .hold
                 .iter()
@@ -822,8 +835,9 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 self.backoff_step = 0;
                 self.retry_at = None;
                 self.reentries.clear();
-                // No `since_ms` here: taking a command is not acting on it
-                // ([`Self::advance`] stamps it once the step for it is done).
+                // No stamp here: taking a command is not acting on it, and
+                // the snapshot keeps the wish last acted on until
+                // [`Self::advance`] stamps after the step for this one.
                 self.save();
                 self.publish();
             }
@@ -887,16 +901,17 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// the middle of one (between two writes of an entry), so the loop never
     /// goes back to waiting on a channel whose stop it already took.
     ///
-    /// A step for a command ends by stamping `since_ms`, whether it changed
-    /// the state, wrote a round, or found nothing to do (the same Fixed
-    /// again): that stamp is what `tcr fan` waits for. Not when a newer
-    /// command was taken during the step, which the next step acts on.
+    /// A step for a command ends with a [`Self::stamp`] (the wish shown and
+    /// `since_ms`), whether it changed the state, wrote a round, or found
+    /// nothing to do (the same Fixed again): that stamp is what `tcr fan`
+    /// waits for. Not when a newer command was taken during the step, which
+    /// the next step acts on.
     pub fn advance(&mut self) -> Flow {
         let fresh = std::mem::take(&mut self.fresh);
         if self.stopping.is_none() {
             self.step(fresh);
             if fresh && !self.fresh && self.stopping.is_none() {
-                self.since_ms = self.parts.clock.wall_ms();
+                self.stamp();
                 self.publish();
             }
         }
@@ -1728,10 +1743,16 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             // With a command taken and not yet acted on, a state reached for
             // the wish before it is not that command's answer.
             if !self.fresh {
-                self.since_ms = self.parts.clock.wall_ms();
+                self.stamp();
             }
         }
         self.publish();
+    }
+
+    /// The wish shown and `since_ms`, moved together ([`Snapshot`]).
+    fn stamp(&mut self) {
+        self.shown_desired = self.desired;
+        self.since_ms = self.parts.clock.wall_ms();
     }
 
     fn publish(&mut self) {
