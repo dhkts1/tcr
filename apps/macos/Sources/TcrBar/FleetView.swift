@@ -244,6 +244,7 @@ struct FleetView: View {
     /// else. Read on appear and on every poll — never per render, since
     /// ``MachineStats/read()`` walks the process table.
     @State private var machine: MachineStats?
+    @State private var machineReading = false
 
     /// What each RUNNING Bash call's process tree is costing, keyed by
     /// ``SessionToolEntry/id`` — the row's `640% · 2.1G`, and the pid
@@ -474,7 +475,7 @@ struct FleetView: View {
             if !snapshotMode {
                 codexBannerSnapshot.peerSharing = peers.snapshot.sharing
                 refreshSessionFiles()
-                machine = MachineStats.read()
+                refreshMachine()
                 refreshClaudeCount()
                 claudeRoute = ClaudeRouteRead.current()
             }
@@ -486,7 +487,7 @@ struct FleetView: View {
         .onChange(of: poller.lastPollAt) { _ in
             if !snapshotMode {
                 refreshSessionFiles()
-                machine = MachineStats.read()
+                refreshMachine()
                 refreshClaudeCount()
                 refreshZeroRequestsSince()
                 claudeRoute = ClaudeRouteRead.current()
@@ -2633,6 +2634,20 @@ struct FleetView: View {
     /// the proxy lists (``CodexRolloutJoin``, which looks each one up once).
     /// A Claude file wins an id clash. Read on appear and on each poll, never
     /// in `snapshotMode`, like the Claude files alone were.
+    /// ``MachineStats/read()`` on a background task, assigned back here on
+    /// the main actor: the process walk and the SMC reads are kernel calls,
+    /// and a poll that waits on them freezes the panel for that long. A poll
+    /// that lands while the last read is still out skips rather than queues.
+    private func refreshMachine() {
+        guard !machineReading else { return }
+        machineReading = true
+        Task {
+            let reading = await Task.detached(priority: .utility) { MachineStats.read() }.value
+            machineReading = false
+            machine = reading
+        }
+    }
+
     private func refreshSessionFiles() {
         guard !sessionFilesReading else { return }
         sessionFilesReading = true
@@ -3008,12 +3023,22 @@ struct FleetView: View {
         if let machine {
             numbers.append(
                 summaryPhrase(machine.loadClause).foregroundColor(machineLoadTint(machine.loadTint)))
+            // Heat right after load, because both describe the box, and never
+            // tinted: load stays the line's only coloured clause. The CPU and
+            // the fans are two phrases, so a wrap can fall between them.
+            for phrase in machine.heatPhrases {
+                numbers.append(summaryPhrase(phrase))
+            }
             numbers.append(summaryPhrase(machine.restClause))
         }
         if fleet.toolsTotalErrors > 0 {
             numbers.append(summaryPhrase("\(fleet.toolsTotalErrors) err today"))
         }
         numbers.append(summaryPhrase("\(fleet.toolsTotalTimeouts) timed out"))
+        let numbersLine = joinedBySeparator(numbers)
+            .font(V4.font(V4.muteSize))
+            .foregroundColor(Tok.mute)
+            .lineSpacing(Tok.secondaryLineSpacing)
         return VStack(alignment: .leading, spacing: Tok.tightSpacing) {
             HStack(alignment: .firstTextBaseline) {
                 Text("\(running) running, \(nearTimeout) near timeout")
@@ -3025,13 +3050,42 @@ struct FleetView: View {
                     .font(V4.font(V4.muteSize))
                     .foregroundColor(fleet.accountsNearLimitCount > 0 ? Tok.near : Tok.mute)
             }
-            joinedBySeparator(numbers)
-                .font(V4.font(V4.muteSize))
-                .foregroundColor(Tok.mute)
-                .fixedSize(horizontal: false, vertical: true)
-                .lineSpacing(Tok.secondaryLineSpacing)
+            // ``toolsNumbersReservedLines`` lines RESERVED, whatever the line
+            // holds, so the heat clause appearing, vanishing or changing width
+            // never moves the cards below (Gil 2026-10-14: no layout shifts).
+            // The reserve is a hidden Text of that many lines in the same font
+            // and spacing rather than a height in points:
+            // `SettingsPanes.waitingLine` measured wrapped lines half a point
+            // off a computed reserve.
+            //
+            // The reserve is `fixedSize` vertically like the line itself. Without
+            // it a hidden Text is compressible: the ZStack's height became a range
+            // from the visible line's height up to the reserve, and when the line
+            // filled fewer lines than the reserve the stack below laid out
+            // differently, cutting the first slowest command to one line and
+            // packing the running rows tighter (scene 17 against 17d, 2026-10-18).
+            ZStack(alignment: .topLeading) {
+                Text(Array(repeating: "0", count: Self.toolsNumbersReservedLines).joined(separator: "\n"))
+                    .font(V4.font(V4.muteSize))
+                    .lineSpacing(Tok.secondaryLineSpacing)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .hidden()
+                    .accessibilityHidden(true)
+                numbersLine
+                    .lineLimit(Self.toolsNumbersReservedLines)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .help(machine?.heatDetail ?? "")
         }
     }
+
+    /// How many lines the Tools numbers line keeps, filled or not. THREE, not
+    /// the mockup's two: `docs/design/fan-readout-mockup.html` panel 6 (every
+    /// clause at its widest) was rendered with `--render-states` on
+    /// 2026-10-18 and ran past two lines in the 372 pt panel, cutting
+    /// "128 timed out" to "1…". The mockup's own rule for that outcome is
+    /// that the reserve grows to three for every state.
+    static let toolsNumbersReservedLines = 3
 
     /// `[Text]` joined by a dimmed " · ", the one place both summary numbers
     /// lines build their trailing clause list — so a future third summary line

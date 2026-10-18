@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import TcrBarCore
+import TcrSMC
 
 /// Rasterise every panel state to PNG, in-process, then exit.
 ///
@@ -189,6 +190,15 @@ enum RenderStates {
             // the commands behind it) and a harness that can only draw it
             // closed reviews half the section.
             ("17b-tools-tab-timeout-class-open", .loaded(sessionsTabFleet), false, nil),
+            // Heat and fans on the machine line, `docs/design/fan-readout-mockup.html`
+            // panels 2, 4, 5 and 6. Each is scene 17 with only the machine
+            // reading changed (``heatScenes``), so the first card's top must
+            // sit at the same pixel row as in 17: the numbers line reserves its
+            // lines whatever it holds (`FleetView.toolsNumbersReservedLines`).
+            ("17d-tools-tab-heat-manual", .loaded(sessionsTabFleet), false, nil),
+            ("17e-tools-tab-heat-fans-off", .loaded(sessionsTabFleet), false, nil),
+            ("17f-tools-tab-heat-no-fans", .loaded(sessionsTabFleet), false, nil),
+            ("17g-tools-tab-heat-worst-case", .loaded(heatWorstCaseFleet), false, nil),
             // The same two tabs at the LIVE fleet's measured dimensions
             // instead of the mockup's — see `realShapeFleet`. These are the
             // only scenes where TIMED OUT TODAY is absent (the real fleet
@@ -687,7 +697,8 @@ enum RenderStates {
             return .sessions
         case "17-tools-tab", "17b-tools-tab-timeout-class-open", "18b-tools-tab-old-server",
             "18d-tools-tab-old-tcr", "22-tools-tab-real-fleet", "17c-tools-tab-codex",
-            "27-one-height-tools":
+            "27-one-height-tools", "17d-tools-tab-heat-manual", "17e-tools-tab-heat-fans-off",
+            "17f-tools-tab-heat-no-fans", "17g-tools-tab-heat-worst-case":
             return .tools
         case "27-one-height-peers":
             return .peers
@@ -1171,10 +1182,14 @@ enum RenderStates {
                 codexBannerSnapshot: bannerSnapshot,
                 snapshotMode: true,
                 initialTab: initialTab(for: scene.name),
-                initialSessionFiles: sessionFilesFixture(for: scene.name),
-                initialMachineStats: machineFixture,
+                // A heat scene is scene 17 in every fixture but the machine
+                // reading, so the two differ by the numbers line alone.
+                initialSessionFiles: sessionFilesFixture(
+                    for: heatScenes[scene.name] == nil ? scene.name : "17-tools-tab"),
+                initialMachineStats: heatScenes[scene.name] ?? machineFixture,
                 initialRunningProcesses: runningProcessesFixture(
-                    for: scene.name, state: scene.state),
+                    for: heatScenes[scene.name] == nil ? scene.name : "17-tools-tab",
+                    state: scene.state),
                 initialExpandedTimeoutClasses: expandedTimeoutClassesFixture(for: scene.name),
                 initialZeroRequestsSince: claudeBannerScenes.contains(scene.name)
                     ? noRequestsBannerZeroSince : nil,
@@ -3253,6 +3268,69 @@ enum RenderStates {
         compiles: 5,
         diskFreeBytes: 210_000_000_000)
 
+    /// The machine reading of each heat scene, `docs/design/fan-readout-mockup.html`.
+    /// Panels 2, 4 and 5 are ``machineFixture`` with a heat reading added, so
+    /// the numbers line is the only thing that differs from scene 17. The
+    /// heat figures of panel 2 are the ones measured on a Mac16,7 on
+    /// 2026-10-18; panels 4 and 5 are the mockup's illustrative ones. Panel
+    /// 6 is every clause at its widest, design figures, none of them measured:
+    /// it is the line that must still fit the reserved lines.
+    private static let heatScenes: [String: MachineStats] = {
+        func machine(_ heat: HeatReading) -> MachineStats {
+            MachineStats(
+                loadAverage: machineFixture.loadAverage, cores: machineFixture.cores,
+                memoryUsedBytes: machineFixture.memoryUsedBytes,
+                memoryTotalBytes: machineFixture.memoryTotalBytes,
+                compiles: machineFixture.compiles, diskFreeBytes: machineFixture.diskFreeBytes,
+                heat: heat)
+        }
+        func fan(_ index: Int, _ actual: Double, manual: Bool) -> FanReading {
+            FanReading(index: index, actualRPM: actual, minRPM: 1_350, maxRPM: 5_777, isManual: manual)
+        }
+        return [
+            // "CPU 93°C · fans 87% manual"
+            "17d-tools-tab-heat-manual": machine(
+                HeatReading(
+                    cpuCelsius: 93.3, fans: [fan(0, 5_013, manual: true), fan(1, 4_976, manual: true)])),
+            // "CPU 46°C · fans off"
+            "17e-tools-tab-heat-fans-off": machine(
+                HeatReading(cpuCelsius: 46, fans: [fan(0, 0, manual: false), fan(1, 0, manual: false)])),
+            // "CPU 61°C", a Mac with no fans
+            "17f-tools-tab-heat-no-fans": machine(HeatReading(cpuCelsius: 61, fans: [])),
+            // "load 168.4/14 · CPU 105°C · fans 100% manual · 128/128 GB ·
+            // 999 compiles · 1024 GB free", then the fleet's "99 err today ·
+            // 9999 timed out" from ``heatWorstCaseFleet``. Three-digit
+            // compiles and four-digit timeouts are design figures, not
+            // measured: wider than any seen, so the reserve is tested past them.
+            "17g-tools-tab-heat-worst-case": MachineStats(
+                loadAverage: 168.4, cores: 14, memoryUsedBytes: 128 * 1_073_741_824,
+                memoryTotalBytes: 128 * 1_073_741_824, compiles: 999,
+                diskFreeBytes: 1_024_000_000_000,
+                heat: HeatReading(
+                    cpuCelsius: 105, fans: [fan(0, 5_777, manual: true), fan(1, 5_777, manual: true)])),
+        ]
+    }()
+
+    /// Scene 17's fleet plus one session that carries no running call, sized
+    /// so the fleet's totals read `99 err today · 9999 timed out`: the
+    /// mockup's widest errors and a four-digit timeout count, a design figure
+    /// wider than the mockup's 128. Derived from the base totals rather than
+    /// written down, so a change to `sessionsFixture` cannot quietly shorten
+    /// the worst case.
+    private static var heatWorstCaseFleet: Fleet {
+        let base = sessionsTabFleet
+        let now = Int64(referenceDate.timeIntervalSince1970 * 1000)
+        let padding = Session(
+            sessionId: "cccccccc-1111-2222-3333-444444444444", account: base.accounts.first?.name,
+            model: "claude-sonnet-5", firstSeenMs: now - 3_600_000, lastSeenMs: now, requests: 10,
+            tools: SessionTools(
+                calls: 300, errors: max(0, 99 - base.toolsTotalErrors),
+                timeouts: max(0, 9_999 - base.toolsTotalTimeouts)))
+        return Fleet(
+            accounts: base.accounts, unreadable: base.unreadable, sessions: base.sessions + [padding],
+            sessionsSupported: true)
+    }
+
     /// Tall enough that thirteen rows are all visible rather than scrolled. This
     /// is a review artifact, so seeing everything beats fidelity to the clip.
     private static let renderHeight: CGFloat = 900
@@ -3267,10 +3345,11 @@ enum RenderStates {
     ]
 
     /// Every scene drawn with a running, supervised proxy: the parity scenes,
-    /// and the README's top image, which should look like a reader's own
-    /// panel rather than a stopped one.
+    /// the README's top image, which should look like a reader's own panel
+    /// rather than a stopped one, and the heat scenes, which must differ from
+    /// scene 17 by the numbers line alone.
     private static let supervisedScenes: Set<String> =
-        parityScenes.union(["01b-healthy-running"])
+        parityScenes.union(["01b-healthy-running"]).union(heatScenes.keys)
 
     /// The poll time every scene's header shows. "updated … ago" is measured
     /// against the real clock, so a poll pinned to `referenceDate` read
