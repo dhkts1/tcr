@@ -674,9 +674,10 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             return;
         };
         if self.hold.is_some() {
-            // The state is still `Off` here, so a fan with no target yet is
-            // not ours: `whose` passes `Unwritten::NotOurs`.
-            match self.whose(&reading) {
+            // No entry is in flight at boot, so a fan with no target yet is
+            // not ours. Named here, not read off the state, so a state set
+            // before boot cannot change the verdict.
+            match self.whose_as(&reading, Unwritten::NotOurs) {
                 // A held fan back on automatic is re-taken by the first
                 // entry, or handed back with the rest when Auto is wanted.
                 Holder::Ours | Holder::PartlyAutomatic => {
@@ -1192,8 +1193,13 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
 
     /// Who holds the fans, by the keys against this process's record.
     fn whose(&self, reading: &HeatReading) -> Holder {
+        self.whose_as(reading, self.unwritten())
+    }
+
+    /// [`Self::whose`], with the rule for a fan with no target yet given.
+    fn whose_as(&self, reading: &HeatReading, unwritten: Unwritten) -> Holder {
         let record = self.hold.as_ref().map(|h| h.fans.as_slice());
-        holder::classify(&states(reading), record, self.unwritten(), false)
+        holder::classify(&states(reading), record, unwritten, false)
     }
 
     /// How a held fan with no target yet counts: ours only in the middle of

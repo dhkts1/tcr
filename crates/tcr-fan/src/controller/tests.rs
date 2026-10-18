@@ -1325,6 +1325,31 @@ fn a_record_without_a_target_is_not_ours_after_entry() {
     assert_eq!(rig.written(), vec![]);
 }
 
+/// Boot names its own rule for a fan with no target yet: a state set before
+/// boot (here mid-entry, where such a fan counts as ours) does not change it.
+#[test]
+fn boot_judges_an_unwritten_fan_not_ours_whatever_the_state() {
+    let mut reading = machine();
+    for f in &mut reading.fans {
+        f.mode = FanMode::Manual;
+        f.target_rpm = Some(2000.0);
+    }
+    let hold = Hold {
+        writer_pid: 1,
+        fans: (0..2)
+            .map(|i| HeldFan {
+                fan: fan(i),
+                written_rpm: None,
+            })
+            .collect(),
+    };
+    let mut rig = rig_from(None, Some(reading));
+    rig.c.hold = Some(hold);
+    rig.c.state = State::Entering;
+    rig.c.boot();
+    assert_eq!(rig.c.hold(), None);
+}
+
 /// One held fan back on automatic while the other keeps our target: taken
 /// again (counted), never left reading "holding".
 #[test]
