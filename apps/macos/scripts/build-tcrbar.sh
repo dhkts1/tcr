@@ -410,6 +410,28 @@ if [ "$sign_tier" = "Developer ID Application" ]; then
   codesign_flags="--force --options runtime --timestamp"
 fi
 
+# The bundled `tcr` is signed under a reverse-DNS identifier, never the default.
+#
+# Left alone, codesign names a bare Mach-O after its file, so the proxy used to be
+# signed as `tcr`, a name any other binary called `tcr` can carry. The root fan
+# helper accepts calls only from code whose signature names this identifier (with
+# the team clause beside it), so the string here and the helper's requirement must
+# agree. Only a Developer ID signature on a shipping build gets the shipping
+# identifier. Every other tier gets `.dev`, and so does a TCRBAR_DEV_BUILD=1 build
+# whatever certificate signed it, so a dev build can never satisfy the shipping
+# pin. `release-tcrbar.sh` re-signs the same file and sets the shipping identifier
+# there too: a pin set in one script and not the other is the bug.
+tcr_identifier_for_tier() {
+  # $1 is the signing tier: "Developer ID Application", "Apple Development" or "ad-hoc".
+  # TCRBAR_DEV_BUILD is read the same way as for the bundle id at the top.
+  if [ "$1" = "Developer ID Application" ] && [ "${TCRBAR_DEV_BUILD:-0}" != "1" ]; then
+    echo "io.github.dhkts1.tcr"
+  else
+    echo "io.github.dhkts1.tcr.dev"
+  fi
+}
+tcr_identifier="$(tcr_identifier_for_tier "$sign_tier")"
+
 echo "==> codesign ($sign_tier)"
 sparkle_version_dir="$frameworks_dir/Sparkle.framework/Versions/B"
 for nested in "$sparkle_version_dir/XPCServices/"*.xpc \
@@ -422,7 +444,8 @@ done
 # shellcheck disable=SC2086
 codesign -s "$sign_key" $codesign_flags "$sparkle_version_dir"
 # shellcheck disable=SC2086
-codesign -s "$sign_key" $codesign_flags "$macos_dir/tcr"
+codesign -s "$sign_key" $codesign_flags --identifier "$tcr_identifier" "$macos_dir/tcr"
+echo "    tcr: signed as $tcr_identifier"
 # The app's own executable is signed HERE, as a plain Mach-O, because the icon
 # step below runs it. The bundle signature further down re-signs it in place with
 # the same key and flags, which is what gives it the bundle identity; this earlier
