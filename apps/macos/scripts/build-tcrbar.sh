@@ -483,6 +483,17 @@ plutil -replace AssociatedBundleIdentifiers -json "[\"$bundle_id\"]" "$fan_helpe
 plutil -lint "$fan_helper_plist" >/dev/null
 "$here/check-fan-helper-plist.sh" "$fan_helper_plist" "$fan_helper_label" "$bundle_id"
 echo "    $fan_helper_name: plist $fan_helper_label.plist"
+# The app reads the helper's label from here and from nowhere else
+# (`FanHelperRegistration.infoPlistKey`): the suffix above follows the signing
+# tier, which the app cannot see, so it must be told the label this build
+# shipped rather than guess it from its bundle id. Written before the bundle is
+# sealed, which covers Info.plist.
+plutil -insert TcrFanHelperLabel -string "$fan_helper_label" "$app_dir/Contents/Info.plist"
+[ "$(plutil -extract TcrFanHelperLabel raw -o - "$app_dir/Contents/Info.plist")" = "$fan_helper_label" ] || {
+  echo "ERROR: Info.plist TcrFanHelperLabel does not read back as $fan_helper_label." >&2
+  exit 1
+}
+echo "    Info.plist: TcrFanHelperLabel $fan_helper_label"
 
 echo "==> codesign ($sign_tier)"
 sparkle_version_dir="$frameworks_dir/Sparkle.framework/Versions/B"

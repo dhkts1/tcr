@@ -283,6 +283,14 @@ assert_fan_helper() {
   "$here/check-fan-helper-plist.sh" "$plist" "$fan_helper_release_identifier" \
     "$app_release_identifier" \
     || die "the fan helper's LaunchDaemon plist in $bundle is not the shipping one (lines above)."
+
+  # The app registers the label its Info.plist names (build-tcrbar.sh writes
+  # it), so it must be the shipping label the plist above carries.
+  local named
+  named="$(plutil -extract TcrFanHelperLabel raw -o - "$bundle/Contents/Info.plist" 2>/dev/null || true)"
+  [ "$named" = "$fan_helper_release_identifier" ] \
+    || die "$bundle/Contents/Info.plist names fan helper '$named', not $fan_helper_release_identifier."
+  note "Info.plist: TcrFanHelperLabel $fan_helper_release_identifier"
 }
 
 # ---------------------------------------------------------------------------

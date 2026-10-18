@@ -12,19 +12,27 @@ public struct FanReading: Equatable, Sendable, Decodable {
     /// The fan's mode key says a program fixed its speed, so it no longer
     /// follows heat.
     public let isManual: Bool
+    /// The speed the fan is told to hold (`F{n}Tg`), whoever told it. Nil from
+    /// a proxy that predates the key or a read that failed. What Fixed starts
+    /// at when a program already holds the fans (``FanControlModel/heldSpeed(heat:)``).
+    public let targetRPM: Double?
 
-    public init(index: Int, actualRPM: Double, minRPM: Double, maxRPM: Double, isManual: Bool) {
+    public init(
+        index: Int, actualRPM: Double, minRPM: Double, maxRPM: Double, isManual: Bool,
+        targetRPM: Double? = nil
+    ) {
         self.index = index
         self.actualRPM = actualRPM
         self.minRPM = minRPM
         self.maxRPM = maxRPM
         self.isManual = isManual
+        self.targetRPM = targetRPM
     }
 
     /// The wire's camelCase names, `actualRpm` rather than this type's
     /// `actualRPM`.
     private enum CodingKeys: String, CodingKey {
-        case index, actualRpm, minRpm, maxRpm, manual
+        case index, actualRpm, minRpm, maxRpm, manual, targetRpm
     }
 
     /// Every key optional, as the Rust side declares them: a later field
@@ -36,6 +44,7 @@ public struct FanReading: Equatable, Sendable, Decodable {
         minRPM = try c.decodeIfPresent(Double.self, forKey: .minRpm) ?? 0
         maxRPM = try c.decodeIfPresent(Double.self, forKey: .maxRpm) ?? 0
         isManual = try c.decodeIfPresent(Bool.self, forKey: .manual) ?? false
+        targetRPM = try c.decodeIfPresent(Double.self, forKey: .targetRpm)
     }
 }
 
