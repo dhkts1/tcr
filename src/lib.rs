@@ -29,6 +29,7 @@ pub mod control_identity;
 pub mod demo;
 pub mod doctor;
 pub mod fallback;
+pub mod fan_probe;
 pub mod file_log;
 #[cfg(unix)]
 pub mod handoff;

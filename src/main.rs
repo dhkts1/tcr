@@ -140,6 +140,31 @@ enum Command {
     /// overwrite a `claude` alias, function or base URL already in place, and
     /// each takes `--remove`.
     Setup(SetupArgs),
+    /// The root fan helper. Hidden: only `probe` exists so far.
+    #[command(hide = true)]
+    Fan(FanArgs),
+}
+
+/// `tcr fan …`.
+#[derive(clap::Args)]
+struct FanArgs {
+    #[command(subcommand)]
+    action: FanAction,
+}
+
+#[derive(Subcommand)]
+enum FanAction {
+    /// Send the root fan helper its version op and print the reply. Writes no
+    /// fan. Dials the helper this binary's signature belongs to, or `--label`'s.
+    Probe(FanProbeArgs),
+}
+
+#[derive(clap::Args)]
+struct FanProbeArgs {
+    /// Dial this helper label instead of the one this binary's signature
+    /// names, to watch the helper refuse a caller it should refuse.
+    #[arg(long)]
+    label: Option<String>,
 }
 
 /// `tcr setup …`: install, remove or report the two routes that make typing
@@ -1725,6 +1750,9 @@ async fn run_main() -> anyhow::Result<()> {
         Some(Command::Ui) => run_ui(),
         Some(Command::Doctor(args)) => run_doctor(args).await,
         Some(Command::Setup(args)) => run_setup(args),
+        Some(Command::Fan(args)) => match args.action {
+            FanAction::Probe(probe) => tcr::fan_probe::run(probe.label).await,
+        },
         None => run_server(cli.server).await,
     }
 }

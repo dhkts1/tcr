@@ -77,6 +77,12 @@ enum TcrBarEntry {
         if let probe = KeepAwakeProbe.request() {
             KeepAwakeProbe.run(probe)  // exits
         }
+        // The fan helper's registration: prints and exits, draws nothing and
+        // starts no server. `register` is the operator's (or the hardware
+        // test's) explicit install of the root helper.
+        if let request = FanHelperRegistration.request() {
+            FanHelperRegistration.run(request)  // exits
+        }
         if let directory = RenderStates.requestedDirectory() {
             // AppKit needs to exist before anything can be rasterised, but the
             // app is never activated and no window or status item is created.

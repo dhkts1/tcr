@@ -234,6 +234,50 @@ else
   exit 1
 fi
 
+# The root fan helper, `crates/tcr-fan-helper`, and its LaunchDaemon plist.
+#
+# Its own binary, never a `tcr` subcommand: it runs as root, so it links the SMC
+# writer and the fan contract and none of the proxy. It ships at
+# `Contents/MacOS/tcr-fan-helper` with its plist in
+# `Contents/Library/LaunchDaemons/`, which is where `SMAppService.daemon` looks
+# (`FanHelperRegistration.swift`). Nothing here registers it: that is
+# `TcrBar --fan-helper register`, an explicit step.
+#
+# The label is the launchd label, the Mach service name, the plist's file stem
+# and the helper's signing identifier at once (`FanIdentity::helper_label` in
+# `crates/tcr-fan/src/identity.rs`). A dev build gets `.dev` on all of them and
+# on the plist's associated bundle id, so a dev TcrBar registers a dev helper,
+# and a dev helper answers only a dev `tcr`.
+#
+# TCR_BUILD_SHA is the helper's version-op `build`, the same short sha the
+# bundled `tcr` was just checked against; the helper has no build script of its
+# own to stamp one.
+fan_helper_name="tcr-fan-helper"
+fan_helper_label="io.github.dhkts1.tcrbar.fanhelper"
+if [ "${TCRBAR_DEV_BUILD:-0}" = "1" ]; then
+  fan_helper_label="$fan_helper_label.dev"
+fi
+echo "==> cargo build --release -p $fan_helper_name"
+TCR_BUILD_SHA="$expected_sha" cargo build --manifest-path "$repo_root/Cargo.toml" --release -p "$fan_helper_name"
+fan_helper_binary="$cargo_target_dir/release/$fan_helper_name"
+if [ ! -x "$fan_helper_binary" ]; then
+  echo "ERROR: $fan_helper_binary is not executable after the build." >&2
+  exit 1
+fi
+cp "$fan_helper_binary" "$macos_dir/$fan_helper_name"
+chmod +x "$macos_dir/$fan_helper_name"
+launch_daemons_dir="$app_dir/Contents/Library/LaunchDaemons"
+fan_helper_plist="$launch_daemons_dir/$fan_helper_label.plist"
+mkdir -p "$launch_daemons_dir"
+cp "$pkg_dir/LaunchDaemons/io.github.dhkts1.tcrbar.fanhelper.plist" "$fan_helper_plist"
+if [ "${TCRBAR_DEV_BUILD:-0}" = "1" ]; then
+  plutil -replace Label -string "$fan_helper_label" "$fan_helper_plist"
+  plutil -replace MachServices -json "{\"$fan_helper_label\": true}" "$fan_helper_plist"
+  plutil -replace AssociatedBundleIdentifiers -json "[\"$bundle_id\"]" "$fan_helper_plist"
+fi
+plutil -lint "$fan_helper_plist" >/dev/null
+echo "    $fan_helper_name: bundled, plist $fan_helper_label.plist"
+
 # Sparkle's EdDSA public key — OMITTED when unset, never a placeholder.
 #
 # Sparkle refuses any update whose signature does not verify against this key.
@@ -372,7 +416,7 @@ done
 # one Mach-O: it contains an Updater.app, an Autoupdate helper and two XPC
 # services, each of which is code in its own right. Code signs INSIDE-OUT, so the
 # order is xpc → Updater.app → Autoupdate → the framework version → the app's own
-# `tcr` → its own executable → the bundle. Signing the framework after the bundle
+# `tcr` → the fan helper → its own executable → the bundle. Signing the framework after the bundle
 # would invalidate the bundle's seal, and signing the framework without its nested
 # payload leaves the framework's own seal invalid — `--deep --strict` catches both.
 #
@@ -446,6 +490,13 @@ codesign -s "$sign_key" $codesign_flags "$sparkle_version_dir"
 # shellcheck disable=SC2086
 codesign -s "$sign_key" $codesign_flags --identifier "$tcr_identifier" "$macos_dir/tcr"
 echo "    tcr: signed as $tcr_identifier"
+# The fan helper is nested code like `tcr`: signed before the bundle, with the
+# same key and flags, and under its label as an explicit identifier, because a
+# bare Mach-O otherwise takes its file name and the proxy talks only to a helper
+# whose signature names the label (`FanIdentity::helper_requirement`).
+# shellcheck disable=SC2086
+codesign -s "$sign_key" $codesign_flags --identifier "$fan_helper_label" "$macos_dir/$fan_helper_name"
+echo "    $fan_helper_name: signed as $fan_helper_label"
 # The app's own executable is signed HERE, as a plain Mach-O, because the icon
 # step below runs it. The bundle signature further down re-signs it in place with
 # the same key and flags, which is what gives it the bundle identity; this earlier

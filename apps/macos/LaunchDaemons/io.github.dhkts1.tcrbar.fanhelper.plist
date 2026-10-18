@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The root fan helper (crates/tcr-fan-helper), registered by TcrBar with
+  SMAppService.daemon (FanHelperRegistration.swift) from
+  Contents/Library/LaunchDaemons/ inside TcrBar.app, where
+  scripts/build-tcrbar.sh copies it. A dev build writes a copy named
+  io.github.dhkts1.tcrbar.fanhelper.dev.plist with the .dev label, service
+  and bundle id.
+
+  On demand only: launchd starts the helper when the tcr proxy sends to the
+  Mach service, and the helper exits when it is idle, so there is no
+  RunAtLoad and no KeepAlive. The label, the service name and the helper's
+  signing identifier are one string, FanIdentity::helper_label in
+  crates/tcr-fan/src/identity.rs.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.github.dhkts1.tcrbar.fanhelper</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/tcr-fan-helper</string>
+	<key>MachServices</key>
+	<dict>
+		<key>io.github.dhkts1.tcrbar.fanhelper</key>
+		<true/>
+	</dict>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>io.github.dhkts1.tcrbar</string>
+	</array>
+</dict>
+</plist>

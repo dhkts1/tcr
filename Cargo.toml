@@ -4,7 +4,7 @@
 # --all-targets --locked` on ubuntu, and `--all` means `--workspace`: anything
 # listed here compiles on Linux.
 [workspace]
-members = [".", "crates/tcr-status-wire", "crates/tcr-fdpass", "crates/tcr-peer-wire", "crates/tcr-smc"]
+members = [".", "crates/tcr-status-wire", "crates/tcr-fdpass", "crates/tcr-peer-wire", "crates/tcr-smc", "crates/tcr-fan", "crates/tcr-fan-helper"]
 resolver = "2"
 
 # One lint table for every crate (each opts in with `[lints] workspace = true`).
@@ -406,6 +406,10 @@ tcr-peer-wire = { path = "crates/tcr-peer-wire" }
 # of its own for the reason `tcr-fdpass` is one: IOKit calls are unsafe and this crate is
 # #![forbid(unsafe_code)]. No package of its own: it declares its IOKit calls by hand.
 tcr-smc = { path = "crates/tcr-smc" }
+# The root fan helper's wire contract, both ends' signing identities and the macOS XPC
+# client (`tcr fan probe`, src/fan_probe.rs). A crate of its own for the same reason: libxpc
+# calls are unsafe. The helper binary itself is `crates/tcr-fan-helper`, never part of tcr.
+tcr-fan = { path = "crates/tcr-fan" }
 # The 128 opaque bits of a lease id (`Ledger::grant`, src/peer/lease.rs). Granted
 # as a DIRECT dependency rather than reached for through `snow`: 0.3.4 is already
 # in `Cargo.lock` (snow's `use-getrandom` resolves it), so this adds one

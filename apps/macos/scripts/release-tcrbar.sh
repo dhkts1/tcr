@@ -81,6 +81,11 @@ readonly required_cert_class="Developer ID Application"
 # (`tcr_identifier_for_tier`). Changing it here strands every installed helper.
 readonly tcr_release_identifier="io.github.dhkts1.tcr"
 
+# The root fan helper's label, which is also its signing identifier
+# (`FanIdentity::helper_label` in crates/tcr-fan/src/identity.rs). The proxy talks
+# only to a helper signed under this exact name.
+readonly fan_helper_release_identifier="io.github.dhkts1.tcrbar.fanhelper"
+
 die() { printf 'ERROR: %s\n' "$@" >&2; exit 1; }
 stage() { printf '\n==> %s\n' "$1"; }
 note() { printf '    %s\n' "$1"; }
@@ -202,6 +207,12 @@ resign_hardened() {
     --identifier "$tcr_release_identifier" \
     --sign "$identity" "$bundle/Contents/MacOS/tcr" >/dev/null 2>&1 \
     || die "codesign failed on the nested tcr binary."
+  # The fan helper is nested code too: before the bundle, same flags, its label
+  # as the identifier, for the same reason as `tcr` above.
+  codesign --force --options runtime --timestamp \
+    --identifier "$fan_helper_release_identifier" \
+    --sign "$identity" "$bundle/Contents/MacOS/tcr-fan-helper" >/dev/null 2>&1 \
+    || die "codesign failed on the nested tcr-fan-helper binary."
   codesign --force --options runtime --timestamp \
     --sign "$identity" "$bundle" >/dev/null 2>&1 \
     || die "codesign failed on $bundle."
@@ -237,6 +248,15 @@ assert_tcr_identifier() {
            "The root fan helper would refuse every call from this proxy." ;;
   esac
   note "bundled tcr: signed as $tcr_release_identifier"
+
+  desc="$(codesign -dv "$bundle/Contents/MacOS/tcr-fan-helper" 2>&1)" \
+    || die "codesign could not read a signature from $bundle/Contents/MacOS/tcr-fan-helper."
+  case "$desc" in
+    *"Identifier=$fan_helper_release_identifier"$'\n'*) ;;
+    *) die "$bundle/Contents/MacOS/tcr-fan-helper is not signed as $fan_helper_release_identifier." \
+           "The proxy would refuse to talk to this helper." ;;
+  esac
+  note "bundled tcr-fan-helper: signed as $fan_helper_release_identifier"
 }
 
 # ---------------------------------------------------------------------------
