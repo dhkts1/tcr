@@ -234,6 +234,33 @@ else
   exit 1
 fi
 
+# The root fan helper, `crates/tcr-fan-helper`, and its LaunchDaemon plist.
+#
+# Its own binary, never a `tcr` subcommand: it runs as root, so it links the SMC
+# writer and the fan contract and none of the proxy. It ships at
+# `Contents/MacOS/tcr-fan-helper` with its plist in
+# `Contents/Library/LaunchDaemons/`, which is where `SMAppService.daemon` looks
+# (`FanHelperRegistration.swift`). Nothing here registers it: that is
+# `TcrBar --fan-helper register`, an explicit step.
+#
+# Its label, and the plist named after it, are written after the signing tier is
+# known (`fan_identity_suffix` below), because the tier decides them.
+#
+# TCR_BUILD_SHA is the helper's version-op `build`, the same short sha the
+# bundled `tcr` was just checked against; the helper has no build script of its
+# own to stamp one.
+fan_helper_name="tcr-fan-helper"
+echo "==> cargo build --release -p $fan_helper_name"
+TCR_BUILD_SHA="$expected_sha" cargo build --manifest-path "$repo_root/Cargo.toml" --release -p "$fan_helper_name"
+fan_helper_binary="$cargo_target_dir/release/$fan_helper_name"
+if [ ! -x "$fan_helper_binary" ]; then
+  echo "ERROR: $fan_helper_binary is not executable after the build." >&2
+  exit 1
+fi
+cp "$fan_helper_binary" "$macos_dir/$fan_helper_name"
+chmod +x "$macos_dir/$fan_helper_name"
+echo "    $fan_helper_name: bundled"
+
 # Sparkle's EdDSA public key — OMITTED when unset, never a placeholder.
 #
 # Sparkle refuses any update whose signature does not verify against this key.
@@ -372,7 +399,7 @@ done
 # one Mach-O: it contains an Updater.app, an Autoupdate helper and two XPC
 # services, each of which is code in its own right. Code signs INSIDE-OUT, so the
 # order is xpc → Updater.app → Autoupdate → the framework version → the app's own
-# `tcr` → its own executable → the bundle. Signing the framework after the bundle
+# `tcr` → the fan helper → its own executable → the bundle. Signing the framework after the bundle
 # would invalidate the bundle's seal, and signing the framework without its nested
 # payload leaves the framework's own seal invalid — `--deep --strict` catches both.
 #
@@ -416,21 +443,46 @@ fi
 # signed as `tcr`, a name any other binary called `tcr` can carry. The root fan
 # helper accepts calls only from code whose signature names this identifier (with
 # the team clause beside it), so the string here and the helper's requirement must
-# agree. Only a Developer ID signature on a shipping build gets the shipping
-# identifier. Every other tier gets `.dev`, and so does a TCRBAR_DEV_BUILD=1 build
-# whatever certificate signed it, so a dev build can never satisfy the shipping
-# pin. `release-tcrbar.sh` re-signs the same file and sets the shipping identifier
-# there too: a pin set in one script and not the other is the bug.
-tcr_identifier_for_tier() {
+# agree. `release-tcrbar.sh` re-signs the same file and sets the shipping
+# identifier there too: a pin set in one script and not the other is the bug.
+#
+# One rule names both ends of the fan helper's connection: the proxy's
+# identifier, and the helper's label, which is also the launchd label, the Mach
+# service name, the plist's file stem and the helper's signing identifier
+# (`FanIdentity` in `crates/tcr-fan/src/identity.rs`). Only a Developer ID
+# signature on a shipping build gets the shipping names. Every other tier gets
+# `.dev` on all of them, and so does a TCRBAR_DEV_BUILD=1 build whatever
+# certificate signed it, so a dev build can never satisfy a shipping pin, and no
+# build can pair a `.dev` proxy with the shipping helper or the reverse.
+fan_identity_suffix() {
   # $1 is the signing tier: "Developer ID Application", "Apple Development" or "ad-hoc".
   # TCRBAR_DEV_BUILD is read the same way as for the bundle id at the top.
   if [ "$1" = "Developer ID Application" ] && [ "${TCRBAR_DEV_BUILD:-0}" != "1" ]; then
-    echo "io.github.dhkts1.tcr"
+    echo ""
   else
-    echo "io.github.dhkts1.tcr.dev"
+    echo ".dev"
   fi
 }
-tcr_identifier="$(tcr_identifier_for_tier "$sign_tier")"
+fan_suffix="$(fan_identity_suffix "$sign_tier")"
+tcr_identifier="io.github.dhkts1.tcr$fan_suffix"
+fan_helper_label="io.github.dhkts1.tcrbar.fanhelper$fan_suffix"
+
+# The helper's LaunchDaemon plist, written before any signature because the
+# bundle's seal covers it. The checked-in file carries the shipping names; a
+# `.dev` build renames the copy and rewrites its label and service to match,
+# and every build names this app's own bundle id as its associated bundle.
+# `check-fan-helper-plist.sh` is the same check `release-tcrbar.sh` runs on a
+# bundle it ships: the label, the service, and on demand only.
+launch_daemons_dir="$app_dir/Contents/Library/LaunchDaemons"
+fan_helper_plist="$launch_daemons_dir/$fan_helper_label.plist"
+mkdir -p "$launch_daemons_dir"
+cp "$pkg_dir/LaunchDaemons/io.github.dhkts1.tcrbar.fanhelper.plist" "$fan_helper_plist"
+plutil -replace Label -string "$fan_helper_label" "$fan_helper_plist"
+plutil -replace MachServices -json "{\"$fan_helper_label\": true}" "$fan_helper_plist"
+plutil -replace AssociatedBundleIdentifiers -json "[\"$bundle_id\"]" "$fan_helper_plist"
+plutil -lint "$fan_helper_plist" >/dev/null
+"$here/check-fan-helper-plist.sh" "$fan_helper_plist" "$fan_helper_label" "$bundle_id"
+echo "    $fan_helper_name: plist $fan_helper_label.plist"
 
 echo "==> codesign ($sign_tier)"
 sparkle_version_dir="$frameworks_dir/Sparkle.framework/Versions/B"
@@ -446,6 +498,13 @@ codesign -s "$sign_key" $codesign_flags "$sparkle_version_dir"
 # shellcheck disable=SC2086
 codesign -s "$sign_key" $codesign_flags --identifier "$tcr_identifier" "$macos_dir/tcr"
 echo "    tcr: signed as $tcr_identifier"
+# The fan helper is nested code like `tcr`: signed before the bundle, with the
+# same key and flags, and under its label as an explicit identifier, because a
+# bare Mach-O otherwise takes its file name and the proxy talks only to a helper
+# whose signature names the label (`FanIdentity::helper_requirement`).
+# shellcheck disable=SC2086
+codesign -s "$sign_key" $codesign_flags --identifier "$fan_helper_label" "$macos_dir/$fan_helper_name"
+echo "    $fan_helper_name: signed as $fan_helper_label"
 # The app's own executable is signed HERE, as a plain Mach-O, because the icon
 # step below runs it. The bundle signature further down re-signs it in place with
 # the same key and flags, which is what gives it the bundle identity; this earlier

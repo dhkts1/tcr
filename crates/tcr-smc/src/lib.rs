@@ -1167,6 +1167,15 @@ pub const MODE_RETRY_GAP: Duration = Duration::from_millis(100);
 /// Unmeasured.
 pub const HAND_BACK_TRIES: usize = 10;
 pub const HAND_BACK_GAP: Duration = Duration::from_millis(50);
+/// After the hand-back's writes, the keys are re-read up to this many times,
+/// [`HAND_BACK_SETTLE_GAP`] apart, until every one reads 0: the SMC takes a
+/// moment to apply a mode write. Measured 2026-10-18 on an M4 Pro: a single
+/// re-read at once found both mode keys still 1, and a read about one second
+/// later found `F0Md`, `F1Md` and `Ftst` all 0. Twenty polls 100 ms apart wait
+/// up to about 2 s, twice that, and keep the whole hand-back inside the
+/// controller's 5 s deadline even with every write retried.
+pub const HAND_BACK_SETTLE_POLLS: usize = 20;
+pub const HAND_BACK_SETTLE_GAP: Duration = Duration::from_millis(100);
 
 const UNLOCK_KEY: FourCc = FourCc::new(*b"Ftst");
 
@@ -1476,7 +1485,9 @@ impl<K: KeyAccess> FanWriter<K> {
     /// THEN `Ftst` to 0 where present and raised (requirement M3; Stats does
     /// modes first). Each write is tried [`HAND_BACK_TRIES`] times; a failure
     /// moves on to the next key rather than stopping. Then every key is read
-    /// again, and anything not 0 is [`FanError::HandBackIncomplete`].
+    /// again, up to [`HAND_BACK_SETTLE_POLLS`] times [`HAND_BACK_SETTLE_GAP`]
+    /// apart until all read 0, and anything still not 0 is
+    /// [`FanError::HandBackIncomplete`].
     ///
     /// A mode key that did not read is written 0 anyway: the write checks the
     /// key's own type, and the re-read is the judge.
@@ -1506,11 +1517,29 @@ impl<K: KeyAccess> FanWriter<K> {
             Ok(_) | Err(_) => self.write_retried(UNLOCK_KEY, 0),
         }
 
+        // The SMC applies the writes a moment later: poll until every key
+        // reads 0, and judge only what is still raised when the time is up.
+        let mut poll = 1;
+        loop {
+            let incomplete = self.still_raised(&mode_keys);
+            if incomplete.fans == 0 && !incomplete.ftst {
+                return Ok(());
+            }
+            if poll >= HAND_BACK_SETTLE_POLLS {
+                return Err(FanError::HandBackIncomplete(incomplete));
+            }
+            (self.sleep)(HAND_BACK_SETTLE_GAP);
+            poll += 1;
+        }
+    }
+
+    /// One re-read of every mode key and `Ftst`: what does not read 0.
+    fn still_raised(&mut self, mode_keys: &[(FanIndex, FourCc)]) -> HandBackIncomplete {
         let mut incomplete = HandBackIncomplete {
             fans: 0,
             ftst: false,
         };
-        for &(fan, key) in &mode_keys {
+        for &(fan, key) in mode_keys {
             match self.smc.read(key).and_then(|v| v.uint8_value()) {
                 Ok(0) | Err(SmcError::KeyNotFound(_)) => {}
                 Ok(_) | Err(_) => incomplete.fans |= 1 << fan.get(),
@@ -1520,10 +1549,7 @@ impl<K: KeyAccess> FanWriter<K> {
             self.smc.read(UNLOCK_KEY).and_then(|v| v.uint8_value()),
             Ok(0) | Err(SmcError::KeyNotFound(_))
         );
-        if incomplete.fans != 0 || incomplete.ftst {
-            return Err(FanError::HandBackIncomplete(incomplete));
-        }
-        Ok(())
+        incomplete
     }
 
     /// One `ui8` write, tried up to [`HAND_BACK_TRIES`] times while the SMC
@@ -1833,6 +1859,12 @@ mod tests {
         /// Take writes to the key and keep its old value: an SMC that says
         /// yes and does not change.
         sticky: HashSet<FourCc>,
+        /// Take writes to the key but keep answering reads with the old
+        /// value for this many reads after each write, as a real SMC does
+        /// while it applies a mode change.
+        lag: HashMap<FourCc, usize>,
+        /// A landed write not applied yet: the value, and reads left before it is.
+        pending: HashMap<FourCc, (SmcValue, usize)>,
     }
 
     impl FakeSmc {
@@ -1862,6 +1894,15 @@ mod tests {
     impl KeySource for FakeSmc {
         fn read(&mut self, key: FourCc) -> Result<SmcValue, SmcError> {
             self.reads.push(key);
+            if let Some((value, left)) = self.pending.get_mut(&key) {
+                if *left == 0 {
+                    let value = value.clone();
+                    self.pending.remove(&key);
+                    self.values.insert(key, Ok(value));
+                } else {
+                    *left -= 1;
+                }
+            }
             self.values
                 .get(&key)
                 .cloned()
@@ -1901,7 +1942,9 @@ mod tests {
                 },
             )?;
             self.writes.push((key, value.clone()));
-            if !self.sticky.contains(&key) {
+            if let Some(&reads) = self.lag.get(&key) {
+                self.pending.insert(key, (value.clone(), reads));
+            } else if !self.sticky.contains(&key) {
                 self.values.insert(key, Ok(value.clone()));
             }
             Ok(())
@@ -2701,18 +2744,21 @@ mod tests {
                 .count(),
             HAND_BACK_TRIES
         );
-        assert_eq!(*waits.lock().unwrap(), [HAND_BACK_GAP; HAND_BACK_TRIES - 1]);
+        let mut expected = vec![HAND_BACK_GAP; HAND_BACK_TRIES - 1];
+        expected.extend([HAND_BACK_SETTLE_GAP; HAND_BACK_SETTLE_POLLS - 1]);
+        assert_eq!(*waits.lock().unwrap(), expected);
         assert_eq!(written(&fans), ["F1Md", "Ftst"]);
     }
 
-    /// An SMC that says yes and does not change is caught by the re-read.
+    /// An SMC that says yes and does not change is caught by the re-read,
+    /// after every poll of the settle wait.
     #[test]
     fn hand_back_rereads_what_it_wrote() {
         let mut smc = apple_silicon(Some(1));
         smc.set("F1Md", Ok(SmcValue::ui8(1)));
         smc.sticky.insert(code("Ftst"));
         smc.sticky.insert(code("F1Md"));
-        let (mut fans, _) = writer(smc);
+        let (mut fans, waits) = writer(smc);
         assert_eq!(
             fans.hand_back(),
             Err(FanError::HandBackIncomplete(HandBackIncomplete {
@@ -2721,6 +2767,49 @@ mod tests {
             }))
         );
         assert_eq!(written(&fans), ["F1Md", "Ftst"]);
+        assert_eq!(
+            *waits.lock().unwrap(),
+            [HAND_BACK_SETTLE_GAP; HAND_BACK_SETTLE_POLLS - 1]
+        );
+    }
+
+    /// The hardware's shape (M4 Pro, 2026-10-18): the writes land, but the
+    /// mode keys and `Ftst` read 1 for a while after. The hand-back waits for
+    /// them and succeeds, one settle gap per read that still saw 1.
+    #[test]
+    fn hand_back_waits_for_the_smc_to_apply_it() {
+        for lag in [1, 5, HAND_BACK_SETTLE_POLLS - 1] {
+            let mut smc = apple_silicon(Some(1));
+            smc.set("F0Md", Ok(SmcValue::ui8(1)));
+            smc.set("F1Md", Ok(SmcValue::ui8(1)));
+            for key in ["F0Md", "F1Md", "Ftst"] {
+                smc.lag.insert(code(key), lag);
+            }
+            let (mut fans, waits) = writer(smc);
+            assert_eq!(fans.hand_back(), Ok(()), "lag {lag}");
+            assert_eq!(written(&fans), ["F0Md", "F1Md", "Ftst"]);
+            assert_eq!(*waits.lock().unwrap(), vec![HAND_BACK_SETTLE_GAP; lag]);
+        }
+    }
+
+    /// Slower than the settle wait allows: reported, naming what still read 1.
+    #[test]
+    fn hand_back_slower_than_the_settle_wait_is_reported() {
+        let mut smc = apple_silicon(Some(1));
+        smc.set("F0Md", Ok(SmcValue::ui8(1)));
+        smc.lag.insert(code("F0Md"), HAND_BACK_SETTLE_POLLS);
+        let (mut fans, waits) = writer(smc);
+        assert_eq!(
+            fans.hand_back(),
+            Err(FanError::HandBackIncomplete(HandBackIncomplete {
+                fans: 0b01,
+                ftst: false
+            }))
+        );
+        assert_eq!(
+            *waits.lock().unwrap(),
+            [HAND_BACK_SETTLE_GAP; HAND_BACK_SETTLE_POLLS - 1]
+        );
     }
 
     /// If the hand-back after a failed entry fails too, both are returned.

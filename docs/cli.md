@@ -2502,6 +2502,33 @@ reason.
 
 ---
 
+## `tcr fan probe [--label <label>]` (hidden)
+
+A diagnostic for the root fan helper, not yet a feature: no fan mode can be set from tcr. It
+sends the helper its version op straight from this CLI process and prints the reply
+(`helper answered: protocol 1, build <sha>`) or the XPC error, and exits non-zero on anything
+but a protocol-1 reply. It writes no fan.
+
+Which helper it dials comes from this binary's own signature: the `tcr` bundled in TcrBar.app
+(signed `io.github.dhkts1.tcr`, or `.dev` in any build but a shipping Developer ID one, the same
+rule that names the helper) dials the matching helper, and any
+other `tcr` refuses to dial and says so. `--label` names the helper to dial instead
+(`io.github.dhkts1.tcrbar.fanhelper` or its `.dev` twin), so an unsigned build can be pointed
+at a real helper to watch the helper refuse it: the helper's own signing requirement still
+decides.
+
+The helper is registered with `TcrBar --fan-helper register` and approved in System Settings ▸
+General ▸ Login Items; `TcrBar --fan-helper status` reads the registration back.
+
+**The recovery limit.** When the connection holding the fans goes away, the helper hands them
+back to macOS if they still carry the targets it wrote, retrying for about a minute (the first
+attempt at once, then six more after waits of 1, 2, 4, 8, 16 and 32 s) and logging each failure
+at `LOG_CRIT`. If every attempt fails the fans stay manual at the last target until the next
+proxy start, `tcr fan auto --force` (not built yet), or a reboot. Whether a reboot resets fan
+modes on Apple Silicon has not been measured yet.
+
+---
+
 ## `tcr peer`
 
 Finds other Macs on the network, trusts them, and lets trusted Macs share Claude accounts

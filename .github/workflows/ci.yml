@@ -229,9 +229,13 @@ jobs:
 
       # --locked: fail if CI would silently rewrite Cargo.lock. Pins the exact
       # dependency set that was reviewed — important for an auth-handling proxy.
+      # --workspace: the root is a package as well as the workspace, so without
+      # it clippy lints `tcr` alone and none of `crates/*`. The macOS half of
+      # every `#[cfg(target_os = "macos")]` block is compiled out here; the
+      # `macos` job runs the same command to lint it.
       - name: Clippy
         if: needs.changes.outputs.inert != 'true'
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
         if: needs.changes.outputs.inert != 'true'
@@ -272,9 +276,12 @@ jobs:
   # Before this existed the app's Swift tests had never run in CI at all, so a
   # Rust-side change could silently break TcrBar with every check green.
   #
-  # Deliberately does NOT re-run fmt/clippy: those are platform-independent and
-  # already gated by `ci`. macOS runner minutes are billed at a multiple of
-  # Linux, so this job runs only what Linux cannot answer.
+  # Re-runs clippy but not fmt. Formatting is platform-independent and already
+  # gated by `ci`; clippy is not, because it lints only the code that compiles
+  # for the runner's OS, and the XPC client and listener, the helper's `mod
+  # helper` and the macOS half of the fan identity exist only on macOS. macOS
+  # runner minutes are billed at a multiple of Linux, so this job runs only
+  # what Linux cannot answer.
   macos:
     name: macos
     needs: changes
@@ -288,9 +295,11 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy
 
       - name: Toolchain version
-        run: rustc -V && cargo -V
+        run: rustc -V && cargo -V && cargo clippy -V
 
       # Auto-keys on runner OS as well as Cargo.lock, so this shares nothing
       # with the ubuntu jobs' caches.
@@ -304,6 +313,11 @@ jobs:
       # rather than /tmp. macOS is also the only platform this app ships on.
       - name: Test (rust)
         run: cargo test --all --locked
+
+      # The same command as `ci`'s Clippy step, here for the code that step
+      # never compiles: everything under `#[cfg(target_os = "macos")]`.
+      - name: Clippy (macOS-only code)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # Recorded so a runner-image bump that changes the Swift language mode is
       # attributable from the log rather than looking like a source regression.

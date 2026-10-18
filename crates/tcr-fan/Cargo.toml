@@ -1,0 +1,36 @@
+[package]
+name = "tcr-fan"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "PolyForm-Noncommercial-1.0.0"
+publish = false
+description = "The root fan helper's XPC contract, both ends' code-signing identities, and the rule that says whose the fans are"
+
+[lints]
+workspace = true
+
+# Everything but `xpc` and `macs` is plain Rust and is tested on Linux by CI's
+# `cargo test --all`: the wire codec runs over an in-memory dictionary, the
+# holder rule and root's own logic over a fake SMC. The two macOS modules carry
+# the unsafe (libxpc, libdispatch and libproc calls), which is why this is a
+# crate of its own: the main crate is #![forbid(unsafe_code)].
+[dependencies]
+tcr-smc = { path = "../tcr-smc" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The two block-taking libxpc calls (a connection's event handler and a reply
+# handler) take an Objective-C block, and `block2` is how Rust builds one. It
+# brings `objc2` and `objc2-encode`; all three were approved by name. Every other
+# libxpc and libdispatch call here is a plain C function declared by hand in
+# `src/xpc.rs`, and the timer and signal handlers use the `_f` variants that take
+# a function pointer, so no other call needs a block.
+block2 = "0.6"
+# Both ends' own-signature check (`identity::FanIdentity::of_this_process`) and
+# the requirement-string parse test. Already in the tree through `tcr-fdpass`.
+security-framework = { version = "3.7", default-features = false }
+# The Macs Fan Control probe reads each candidate app's bundle identifier with
+# CFBundle (`src/macs.rs`). Already in the tree.
+core-foundation = "0.10"
+# `syslog`, `proc_listallpids`, `proc_pidpath`, the signal numbers. Already in the tree.
+libc = "0.2"
