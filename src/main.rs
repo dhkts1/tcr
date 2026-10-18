@@ -140,22 +140,51 @@ enum Command {
     /// overwrite a `claude` alias, function or base URL already in place, and
     /// each takes `--remove`.
     Setup(SetupArgs),
-    /// The root fan helper. Hidden: only `probe` exists so far.
-    #[command(hide = true)]
+    /// Fan control through the running server: with no action, print the mode
+    /// asked for, what the controller is doing, and each fan. `auto`, `fixed`
+    /// and `follow` set the mode, wait until it holds, and exit 1 with the reason
+    /// when it does not. Needs the tcr bundled in TcrBar.app and its helper.
     Fan(FanArgs),
 }
 
 /// `tcr fan …`.
 #[derive(clap::Args)]
 struct FanArgs {
+    #[command(flatten)]
+    config: ConfigFile,
+    /// Print the server's `fanControl` object as JSON instead of text.
+    #[arg(long)]
+    json: bool,
     #[command(subcommand)]
-    action: FanAction,
+    action: Option<FanAction>,
 }
 
 #[derive(Subcommand)]
 enum FanAction {
+    /// Give the fans back to macOS.
+    Auto {
+        /// Hand back without checking that the fans are the ones this tcr
+        /// set: the recovery for fans left manual by a run no process
+        /// remembers. Still waits while Macs Fan Control runs.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Hold every fan at one speed, clamped to each fan's range.
+    Fixed {
+        /// Revolutions per minute, 1 to 20000.
+        rpm: u32,
+    },
+    /// Follow the CPU: each fan's minimum at or below the quiet temperature, full
+    /// speed at the full one (at most 100 °C), a straight line between.
+    Follow {
+        /// °C, at least 20.
+        quiet_c: u8,
+        /// °C, at least 5 above the quiet temperature and at most 100.
+        full_c: u8,
+    },
     /// Send the root fan helper its version op and print the reply. Writes no
     /// fan. Dials the helper this binary's signature belongs to, or `--label`'s.
+    #[command(hide = true)]
     Probe(FanProbeArgs),
 }
 
@@ -1750,9 +1779,7 @@ async fn run_main() -> anyhow::Result<()> {
         Some(Command::Ui) => run_ui(),
         Some(Command::Doctor(args)) => run_doctor(args).await,
         Some(Command::Setup(args)) => run_setup(args),
-        Some(Command::Fan(args)) => match args.action {
-            FanAction::Probe(probe) => tcr::fan_probe::run(probe.label).await,
-        },
+        Some(Command::Fan(args)) => run_fan(args).await,
         None => run_server(cli.server).await,
     }
 }
@@ -6223,6 +6250,26 @@ async fn run_doctor(args: DoctorArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `tcr fan [auto [--force] | fixed <RPM> | follow <QUIET_C> <FULL_C>]`.
+async fn run_fan(args: FanArgs) -> anyhow::Result<()> {
+    use tcr::fan::FanRequest;
+    let request = match args.action {
+        Some(FanAction::Probe(probe)) => return tcr::fan_probe::run(probe.label).await,
+        None => None,
+        Some(FanAction::Auto { force }) => Some(FanRequest::Auto { force }),
+        Some(FanAction::Fixed { rpm }) => Some(FanRequest::Fixed { rpm }),
+        Some(FanAction::Follow { quiet_c, full_c }) => Some(FanRequest::FollowCpu {
+            quiet_below_c: quiet_c,
+            full_at_c: full_c,
+        }),
+    };
+    let code = cli::fan(&args.config.path(), request, args.json).await?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
 /// `tcr sessions [--json]` — the running proxy's live sessions.
 async fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
     let config_path = args.config.path();
@@ -7816,6 +7863,16 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         server::ServeOutcome::StoodDown(stand_down) => stand_down_exit(&stand_down, file_log),
     };
     let bound = handle.addr();
+
+    // Fan control: a binary-only side effect like the caches above, because
+    // `fan.json` is one shared file and the helper takes one holder. Started
+    // after the bind, so a process that stood down never dials the helper.
+    match tcr::fan::start(tcr::paths::cache_dir().fan_file()) {
+        Ok(fan) => handle.manager().install_fan(fan),
+        Err(error) => {
+            tracing::warn!(%error, "fan control: could not start its thread; fans stay automatic");
+        }
+    }
 
     let mut handle = handle;
     if args.headless {

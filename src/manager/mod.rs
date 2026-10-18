@@ -1264,6 +1264,11 @@ pub struct Manager {
     /// means this process loaded no TLS material, which [`Self::mitm_status`]
     /// reports as MITM off.
     mitm: std::sync::OnceLock<crate::status::MitmStatus>,
+    /// The fan controller's handle ([`crate::fan`]), installed once by the
+    /// binary after the bind ([`Self::install_fan`]). Unset in a library
+    /// caller or a test that did not ask for one: such a process runs no fan
+    /// control, its status carries no `fanControl`, and `/_tcr/fan` says so.
+    fan: std::sync::OnceLock<Arc<crate::fan::FanHandle>>,
     /// The Codex 429s this process sent itself in the last ten minutes, and the latest one
     /// ([`Self::note_codex_refusal`], [`Self::codex_traffic`]). A leaf lock, never held with
     /// another. In memory only: a restart empties it.
@@ -1744,6 +1749,7 @@ impl Manager {
             fable_weekly_threshold,
             groups: RwLock::new(groups),
             mitm: std::sync::OnceLock::new(),
+            fan: std::sync::OnceLock::new(),
             codex_refused: Mutex::new(CodexRefusals::default()),
             codex_unpooled: Mutex::new(MinuteRing::default()),
             groups_reload_mtime: Mutex::new(None),

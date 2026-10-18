@@ -12,6 +12,7 @@
 //! Linux by CI. Those two are `#[cfg(target_os = "macos")]` and hold every
 //! `unsafe` block in the crate.
 
+pub mod controller;
 pub mod holder;
 pub mod identity;
 pub mod root;

@@ -519,6 +519,19 @@ impl ServerHandle {
         );
         let deadline = tokio::time::Instant::now() + grace;
 
+        // Fans first, while the process is still whole: the controller hands
+        // back what it holds within `fan::SHUTDOWN_HAND_BACK` (3 s, inside
+        // this grace). It blocks, so it waits on the blocking pool; if it runs
+        // over, the helper connection closes with the process and root hands
+        // back on its own.
+        if let Some(fan) = self.manager.fan() {
+            let fan = Arc::clone(fan);
+            let stop = tokio::task::spawn_blocking(move || fan.shutdown(grace));
+            if tokio::time::timeout_at(deadline, stop).await.is_err() {
+                tracing::warn!("fan control did not stop inside the shutdown grace");
+            }
+        }
+
         if let Some(server) = self.server.as_mut() {
             // `&mut JoinHandle` polls the join without consuming it: losing the
             // race to the caller's own timeout leaves the task owned here.

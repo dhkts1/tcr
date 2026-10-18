@@ -1100,6 +1100,22 @@ pub const CONFIG_PATH: &str = "/_tcr/config";
 /// The [`ENDPOINT_HEADER`] value both halves of [`CONFIG_PATH`] stamp.
 pub const CONFIG_ENDPOINT: &str = "config";
 
+/// The fan mode, for `tcr fan` and TcrBar (which shells out to it): `POST`
+/// only, gated by [`read_command`] like [`CONFIG_PATH`]. The body is one
+/// [`crate::fan::FanRequest`]; a refused value is a stamped 400 with one
+/// sentence, an accepted one a stamped 202 carrying the `fanControl` object as
+/// of that moment (the controller works on it after the answer). A process
+/// that runs no fan controller answers a stamped 503.
+///
+/// Who can call it: anyone who passes [`local_endpoint_gate`], the same class
+/// of caller that can already save a setting or add an account. What that
+/// caller gets is a validated mode; root clamps every rpm to the fan's own
+/// range, and the hot guard runs in Follow CPU (Fixed holds exactly the rpm asked).
+pub const FAN_PATH: &str = "/_tcr/fan";
+
+/// The [`ENDPOINT_HEADER`] value [`FAN_PATH`] stamps.
+pub const FAN_ENDPOINT: &str = "fan";
+
 /// Body cap for the local control route: a JSON object with three short fields.
 /// Deliberately not [`MAX_BODY_BYTES`] (256 MiB, sized for model requests) — this
 /// route buffers into memory in a credential-holding process, and nothing
@@ -1663,6 +1679,10 @@ pub fn app(manager: Arc<Manager>) -> Router {
                 .post(config_set_handler)
                 .fallback(|| async { method_not_allowed(&CONFIG_ROUTE) }),
         )
+        .route(
+            FAN_PATH,
+            axum::routing::post(fan_handler).fallback(|| async { method_not_allowed(&FAN_ROUTE) }),
+        )
         .fallback(handle)
         .with_state(manager)
 }
@@ -1872,6 +1892,11 @@ async fn status_handler(
     payload.heat = crate::heat::current()
         .await
         .map(crate::status::HeatField::Reading);
+    // A copy of the controller's last published state: no SMC read, no lock
+    // held past the copy.
+    payload.fan_control = manager
+        .fan()
+        .map(|fan| crate::status::FanControlField::Reading(fan.row()));
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a
         // proxy never panics on a client request — surface it as a 500 instead.
@@ -1983,6 +2008,13 @@ const CONFIG_ROUTE: LocalRoute = LocalRoute {
     name: "settings",
     stamp: CONFIG_ENDPOINT,
     verbs: "GET or POST",
+    advertises_providers: false,
+};
+
+const FAN_ROUTE: LocalRoute = LocalRoute {
+    name: "fan",
+    stamp: FAN_ENDPOINT,
+    verbs: "POST",
     advertises_providers: false,
 };
 
@@ -2416,6 +2448,63 @@ async fn config_set_handler(State(manager): State<Arc<Manager>>, req: Request) -
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorKind::Api,
             &format!("The proxy could not write its config file: {why}"),
+        ),
+    }
+}
+
+/// `POST /_tcr/fan`: hand one fan mode to the controller ([`FAN_PATH`]).
+///
+/// Never waits on the fans: the controller may be inside a 15 s unlock, and
+/// the mode is queued behind it (latest wins). The 202 body is the
+/// `fanControl` object as it stood when the command went in, before the
+/// controller acted on it ([`crate::fan::FanHandle::send`]); `tcr fan` keeps
+/// its wish, then polls the status route until the state settles.
+async fn fan_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
+    let request: crate::fan::FanRequest = match read_command(
+        &FAN_ROUTE,
+        &manager,
+        req,
+        "Expected a JSON object: {\"mode\": \"auto\"} (optionally with \"force\": true), \
+         {\"mode\": \"fixed\", \"rpm\": 5000} or \
+         {\"mode\": \"followCpu\", \"quietBelowC\": 60, \"fullAtC\": 90}.",
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(refusal) => return *refusal,
+    };
+    let command = match request.command() {
+        Ok(command) => command,
+        Err(refusal) => {
+            return route_error(
+                &FAN_ROUTE,
+                StatusCode::BAD_REQUEST,
+                ErrorKind::InvalidRequest,
+                &format!("The fan mode was refused: {refusal}"),
+            );
+        }
+    };
+    let Some(fan) = manager.fan() else {
+        return route_error(
+            &FAN_ROUTE,
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorKind::Api,
+            "This tcr server runs no fan controller.",
+        );
+    };
+    match fan.send(command) {
+        Ok(row) => {
+            let mut response = json_ok(&FAN_ROUTE, &row);
+            if response.status() == StatusCode::OK {
+                *response.status_mut() = StatusCode::ACCEPTED;
+            }
+            response
+        }
+        Err(crate::fan::NotRunning) => route_error(
+            &FAN_ROUTE,
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorKind::Api,
+            "The fan controller has stopped; restart tcr to control fans.",
         ),
     }
 }
@@ -15345,6 +15434,152 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    fn stamp_of(response: &Response) -> Option<String> {
+        response
+            .headers()
+            .get(ENDPOINT_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    /// `/_tcr/fan`: POST only, the exact bodies of the contract, a stamped 400
+    /// in one sentence for a refused value, a stamped 202 carrying the object
+    /// from before the command, and the new wish on the status route once the
+    /// controller acted on it. The controller behind it
+    /// reaches no SMC and no helper, so nothing here can touch a fan.
+    #[tokio::test]
+    async fn fan_route_takes_the_contract_bodies_and_answers_locally() {
+        let (upstream, hits) = spawn_echo_upstream().await;
+        let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
+        let json = [("content-type", "application/json")];
+
+        // No controller in this process: a stamped 503, never a forward.
+        let response = drive_full(
+            Arc::clone(&manager),
+            Method::POST,
+            FAN_PATH,
+            Some(loopback_peer()),
+            &json,
+            r#"{"mode":"auto"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stamp_of(&response).as_deref(), Some(FAN_ENDPOINT));
+
+        manager.install_fan(crate::fan::start_inert());
+
+        let response = drive_full(
+            Arc::clone(&manager),
+            Method::POST,
+            FAN_PATH,
+            Some(loopback_peer()),
+            &json,
+            r#"{"mode":"fixed","rpm":5000}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(stamp_of(&response).as_deref(), Some(FAN_ENDPOINT));
+        let accepted = body_json(response).await;
+        assert_eq!(
+            accepted["desired"],
+            serde_json::json!({"mode": "auto"}),
+            "the object from before the command: the controller starts on Auto"
+        );
+
+        let response = drive_full(
+            Arc::clone(&manager),
+            Method::POST,
+            FAN_PATH,
+            Some(loopback_peer()),
+            &json,
+            r#"{"mode":"followCpu","quietBelowC":60,"fullAtC":101}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(stamp_of(&response).as_deref(), Some(FAN_ENDPOINT));
+        let refused = body_json(response).await.to_string();
+        assert!(refused.contains("above the hot guard"), "{refused}");
+
+        for body in [r#"{"mode":"fixed","rpm":5000,"x":1}"#, r#"["fixed",5000]"#] {
+            let response = drive_full(
+                Arc::clone(&manager),
+                Method::POST,
+                FAN_PATH,
+                Some(loopback_peer()),
+                &json,
+                body,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        let (status, _) = drive(
+            Arc::clone(&manager),
+            Method::GET,
+            FAN_PATH,
+            Some(loopback_peer()),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+
+        // Not loopback: refused by the shared gate, unstamped.
+        let response = drive_full(
+            Arc::clone(&manager),
+            Method::POST,
+            FAN_PATH,
+            Some(remote_peer()),
+            &json,
+            r#"{"mode":"auto"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(stamp_of(&response), None);
+
+        // The status route carries the same object. With no SMC the
+        // controller reports `unavailable / noSmc`.
+        let response = drive_full(
+            Arc::clone(&manager),
+            Method::GET,
+            STATUS_PATH,
+            Some(loopback_peer()),
+            &[],
+            "",
+        )
+        .await;
+        let status = body_json(response).await;
+        assert!(status["fanControl"].is_object(), "{status}");
+        // The wish shows once the controller has acted on it.
+        let want =
+            serde_json::json!({"desired": {"mode": "fixed", "rpm": 5000}, "reason": "noSmc"});
+        let mut seen = serde_json::json!({
+            "desired": status["fanControl"]["desired"],
+            "reason": status["fanControl"]["reason"],
+        });
+        for _ in 0..50 {
+            if seen == want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            seen = manager
+                .fan()
+                .map(|f| {
+                    let row = f.row();
+                    serde_json::json!({"desired": row.desired, "reason": row.reason})
+                })
+                .unwrap_or_default();
+        }
+        assert_eq!(seen, want);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        if let Some(fan) = manager.fan() {
+            let fan = Arc::clone(fan);
+            tokio::task::spawn_blocking(move || fan.shutdown(Duration::from_secs(1)))
+                .await
+                .expect("the controller stops");
+        }
     }
 
     /// The traversal table, end to end, against the fake upstream that reports what
