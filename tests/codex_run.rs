@@ -211,6 +211,10 @@ fn a_pooled_codex_launch_gives_shell_tools_direct_defaults() {
             "shell_environment_policy.set.ALL_PROXY=\"\"".to_string(),
             "-c".to_string(),
             "shell_environment_policy.set.all_proxy=\"\"".to_string(),
+            "-c".to_string(),
+            "shell_environment_policy.set.NODE_EXTRA_CA_CERTS=\"\"".to_string(),
+            "-c".to_string(),
+            "shell_environment_policy.set.CODEX_CA_CERTIFICATE=\"\"".to_string(),
             "exec".to_string(),
             "--json".to_string(),
             "-c".to_string(),
@@ -271,4 +275,37 @@ fn an_older_proxy_keeps_the_configured_codex_doctor_verdict() {
         "{}",
         details(&output)
     );
+}
+
+#[test]
+fn shell_defaults_preserve_corporate_proxies_and_explicit_config_set_entries() {
+    let fixture = Fixture::new(true);
+    let codex = fixture.home.path().join("fake-codex");
+    std::fs::write(&codex, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let policy = fixture.home.path().join(".codex/config.toml");
+    let policy_text = "[shell_environment_policy]\ninherit = 'none'\n[shell_environment_policy.set]\nHTTPS_PROXY = 'http://configured.example:8080'\nSENTINEL = 'keep'\n";
+    std::fs::write(&policy, policy_text).unwrap();
+    let output = fixture
+        .command()
+        .args(["run", "--codex", "--config"])
+        .arg(&fixture.config)
+        .env("ALL_PROXY", "http://corporate.example:8080")
+        .env("NODE_EXTRA_CA_CERTS", "/caller/ca.pem")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", details(&output));
+    let args = String::from_utf8_lossy(&output.stdout);
+    for setting in [
+        "shell_environment_policy.set.HTTPS_PROXY=\"http://configured.example:8080\"",
+        "shell_environment_policy.set.ALL_PROXY=\"http://corporate.example:8080\"",
+        "shell_environment_policy.set.NODE_EXTRA_CA_CERTS=\"/caller/ca.pem\"",
+    ] {
+        assert!(args.contains(setting), "{args}");
+    }
+    assert!(
+        !args.contains("SENTINEL"),
+        "unrelated config entries remain in the file"
+    );
+    assert_eq!(std::fs::read_to_string(policy).unwrap(), policy_text);
 }

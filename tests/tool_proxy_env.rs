@@ -1,15 +1,17 @@
 //! The Claude launch contract, using executable fixtures and real shells.
 //! Actual installed-client routing is exercised by test-agent-proxy-isolation.py.
+#![expect(clippy::unwrap_used, reason = "test helpers fail with context")]
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
+use tcr::log_err::LogErr as _;
 
 struct StatusStub {
     listener: TcpListener,
@@ -23,10 +25,11 @@ impl StatusStub {
         listener.set_nonblocking(true).unwrap();
         let serving = listener.try_clone().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
-        let stopping = stop.clone();
+        let stopping = Arc::clone(&stop);
         let task = std::thread::spawn(move || {
             let body = serde_json::json!({
                 "kind": "tcr.status.v1", "mitm": {"interceptedHosts": ["api.anthropic.com", "chatgpt.com"], "leaf": "minted"},
+                "requestKeyMode": "log",
                 "accounts": [{"name": "bob@example.com", "provider": "codex", "priority": 0,
                     "status": "active", "disabled": false, "requests": 0, "inputTokens": 0,
                     "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0,
@@ -61,7 +64,11 @@ impl StatusStub {
                     continue;
                 }
                 assert!(head.starts_with(b"GET /_tcr/status "));
-                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).log_debug("fixture client disconnected");
             }
         });
         Self {
@@ -75,7 +82,7 @@ impl StatusStub {
 impl Drop for StatusStub {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        let _ = self.task.take().unwrap().join();
+        self.task.take().unwrap().join().unwrap();
     }
 }
 
@@ -144,7 +151,7 @@ test "$ANTHROPIC_BASE_URL" = https://api.anthropic.com
 test "$HTTPS_PROXY" = "$EXPECTED_AGENT_PROXY"
 test "$https_proxy" = "$EXPECTED_AGENT_PROXY"
 test -f "$NODE_EXTRA_CA_CERTS"
-command='. "$CLAUDE_ENV_FILE"; test "$CALLER_SENTINEL" = kept; test -z "${HTTPS_PROXY:-}"; test -z "${https_proxy:-}"; test -z "${HTTP_PROXY:-}"; test -z "${http_proxy:-}"; test -z "${ALL_PROXY:-}"; test -z "${all_proxy:-}"; codex; printf "shell-direct\n"'
+command='. "$CLAUDE_ENV_FILE"; test "$CALLER_SENTINEL" = kept; test -z "${HTTPS_PROXY:-}"; test -z "${https_proxy:-}"; test -z "${HTTP_PROXY:-}"; test -z "${http_proxy:-}"; test "$ALL_PROXY" = http://proxy.example:3999; test "$all_proxy" = http://proxy.example:3999; test -z "${NODE_EXTRA_CA_CERTS:-}"; test -z "${CODEX_CA_CERTIFICATE:-}"; codex; printf "shell-direct\n"'
 exec "$CLAUDE_CODE_SHELL_PREFIX" "set -eu; $command"
 "#,
     );
@@ -165,8 +172,8 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" "set -eu; $command"
             format!("http://tcr-codex@127.0.0.1:{port}"),
         )
         .env("EXPECTED_AGENT_PROXY", format!("http://127.0.0.1:{port}"))
-        .env("ALL_PROXY", "http://127.0.0.1:1")
-        .env("all_proxy", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://proxy.example:3999")
+        .env("all_proxy", "http://proxy.example:3999")
         .current_dir(home)
         .output()
         .unwrap();
@@ -183,4 +190,211 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" "set -eu; $command"
     ] {
         assert!(out.contains(expected), "missing {expected}: {out}");
     }
+}
+
+struct AgentFixture {
+    home: tempfile::TempDir,
+    _status: StatusStub,
+}
+impl AgentFixture {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let status = StatusStub::new();
+        let port = status.listener.local_addr().unwrap().port();
+        std::fs::write(home.path().join("config.json"), format!(r#"{{"proxy":{{"port":{port},"requestKey":"fixture-key-one"}},"claudeCodeImport":false,"accounts":[{{"name":"alice@example.com","accessToken":"fixture"}}]}}"#)).unwrap();
+        std::fs::create_dir_all(home.path().join(".config")).unwrap();
+        tcr::mitm::load_tls_in(&home.path().join(".config")).unwrap();
+        Self {
+            home,
+            _status: status,
+        }
+    }
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        cmd.args(["run", "--config"])
+            .arg(self.home.path().join("config.json"))
+            .env_clear()
+            .env("HOME", self.home.path())
+            .env(
+                "PATH",
+                self.home.path().join("bin").to_string_lossy().to_string() + ":/usr/bin:/bin",
+            )
+            .env("TCR_TEST_BIN", env!("CARGO_BIN_EXE_tcr"))
+            .env("SHELL", "/bin/bash")
+            .env("TCR_CLAUDE_BIN", self.home.path().join("real-claude"))
+            .env("TCR_CODEX_BIN", self.home.path().join("real-codex"));
+        cmd
+    }
+    fn run(&self, body: &str) -> std::process::Output {
+        script(&self.home.path().join("real-claude"), body);
+        let output = self.command().output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+}
+
+#[test]
+fn nested_claude_preserves_explicit_overrides() {
+    let fixture = AgentFixture::new();
+    fixture.run(r#"
+if [ "${NESTED:-}" = yes ]; then
+    test "$ANTHROPIC_BASE_URL" = http://127.0.0.1:4000
+    test "$HTTPS_PROXY" = http://proxy.example:3999
+    test "$NODE_EXTRA_CA_CERTS" = /caller/ca.pem
+    printf 'overrides-kept\n'
+    exit
+fi
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'NESTED=yes ANTHROPIC_BASE_URL=http://127.0.0.1:4000 HTTPS_PROXY=http://proxy.example:3999 NODE_EXTRA_CA_CERTS=/caller/ca.pem claude'
+"#);
+    // Cleanup is observable after the foreground client exits.
+    let parent = fixture.home.path().join(".cache/tcr/tool-env");
+    assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
+}
+
+#[test]
+fn nested_claude_from_codex_has_a_plain_marker_and_claudes_ca() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"
+case "$HTTPS_PROXY" in *tcr-codex*) exit 72;; esac
+test "$NODE_EXTRA_CA_CERTS" = "$HOME/.config/tcr-ca.pem"
+printf 'plain-claude\n'
+"#,
+    );
+    script(
+        &fixture.home.path().join("real-codex"),
+        r#"
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'claude'
+"#,
+    );
+    let output = fixture.command().arg("--codex").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("plain-claude"));
+}
+
+#[test]
+fn a_prefix_with_flags_is_refused_before_starting_the_client() {
+    let fixture = AgentFixture::new();
+    script(&fixture.home.path().join("real-claude"), "exit 79");
+    let output = fixture
+        .command()
+        .env(
+            "CLAUDE_CODE_SHELL_PREFIX",
+            "/usr/local/bin/audit-wrap --log",
+        )
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("executable wrapper script"));
+}
+
+#[test]
+fn a_callers_codex_bin_overrides_the_nested_launcher_default() {
+    let fixture = AgentFixture::new();
+    script(&fixture.home.path().join("real-codex"), "exit 78");
+    script(
+        &fixture.home.path().join("override-codex"),
+        "printf 'override-codex\\n'",
+    );
+    fixture.run(
+        r#"
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'CODEX_BIN="$HOME/override-codex" codex'
+"#,
+    );
+}
+
+#[test]
+fn nested_tcr_commands_skip_the_path_launchers() {
+    let fixture = AgentFixture::new();
+    std::fs::create_dir(fixture.home.path().join("bin")).unwrap();
+    script(
+        &fixture.home.path().join("bin/claude"),
+        "printf 'real-client\\n'",
+    );
+    let output = fixture.run(r#"
+if [ "${INNER:-}" = yes ]; then exit 73; fi
+# Remove explicit binary overrides, forcing the inner tcr to search PATH.
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'unset TCR_CLAUDE_BIN; INNER=yes "$TCR_TEST_BIN" run --config "$HOME/config.json"'
+"#);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("real-client"));
+}
+
+#[test]
+fn relative_cache_roots_produce_absolute_helpers_and_insecure_roots_are_refused() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"
+case "$CLAUDE_CODE_SHELL_PREFIX" in /*) ;; *) exit 74;; esac
+"#,
+    );
+    let output = fixture
+        .command()
+        .env("XDG_CACHE_HOME", "relative-cache")
+        .current_dir(fixture.home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let root = fixture.home.path().join("relative-cache/tcr/tool-env");
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let output = fixture
+        .command()
+        .env("XDG_CACHE_HOME", "relative-cache")
+        .current_dir(fixture.home.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mode 0700"));
+}
+
+#[test]
+fn nested_tcr_codex_run_uses_its_own_config_and_real_binary() {
+    let fixture = AgentFixture::new();
+    let inner = StatusStub::new();
+    let inner_port = inner.listener.local_addr().unwrap().port();
+    std::fs::write(
+        fixture.home.path().join("other.json"),
+        format!(r#"{{"proxy":{{"port":{inner_port}}},"accounts":[],"claudeCodeImport":false}}"#),
+    )
+    .unwrap();
+    std::fs::create_dir(fixture.home.path().join("bin")).unwrap();
+    script(
+        &fixture.home.path().join("bin/codex"),
+        &format!(
+            "test \"$HTTPS_PROXY\" = 'http://tcr-codex@127.0.0.1:{inner_port}'\nprintf 'inner-config-kept\\n'"
+        ),
+    );
+    script(&fixture.home.path().join("real-codex"), "exit 75");
+    let output = fixture.run(r#"
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'unset TCR_CODEX_BIN; "$TCR_TEST_BIN" run --codex --config "$HOME/other.json"'
+"#);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("inner-config-kept"));
+}
+
+#[test]
+fn helper_files_never_contain_the_runtime_request_key() {
+    let fixture = AgentFixture::new();
+    fixture.run(
+        r#"
+root=$(dirname "$CLAUDE_CODE_SHELL_PREFIX")
+for helper in "$root"/*; do
+    if /usr/bin/grep -q fixture-key-one "$helper"; then exit 71; fi
+done
+"#,
+    );
 }

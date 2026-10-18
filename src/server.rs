@@ -478,9 +478,10 @@ impl ServerHandle {
     /// transfer the still-bound listener. The receiver starts only after the
     /// existing handoff ownership gate has been released.
     pub async fn handoff(&mut self, peer: &std::os::unix::net::UnixStream) -> anyhow::Result<()> {
-        let _ = self.shutdown.send(true);
+        crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
         self.stop_tasks(tokio::time::Instant::now() + DEFAULT_SHUTDOWN_GRACE)
             .await;
+        self.flush_cache_finally(SavedCache::BoundTokens);
         self.flush_cache_finally(SavedCache::WireSessions);
         let listener = self.listener.as_ref().context("no listener to hand over")?;
         crate::handoff::complete_handoff(
@@ -495,12 +496,11 @@ impl ServerHandle {
         Ok(())
     }
 
-    /// Keep the runtime alive while accepted tunnels finish. This is separate
-    /// from ordinary bounded shutdown: replacement has a successor serving new
-    /// traffic, and a long-lived CONNECT must not be cut at an arbitrary deadline.
+    /// Wait for accepted connections after HTTP graceful shutdown. The binary
+    /// bounds this wait and continues polling termination signals.
     pub async fn drain_connections(&mut self) {
         if let Some(connections) = self.connections.as_mut() {
-            let _ = connections.recv().await;
+            connections.recv().await;
         }
         self.connections.take();
     }
@@ -510,15 +510,15 @@ impl ServerHandle {
             // `&mut JoinHandle` polls the join without consuming it: losing the
             // race to the caller's own timeout leaves the task owned here.
             let stopped = self.server_finished
-                || match tokio::time::timeout_at(deadline, &mut *server).await {
-                    Ok(_) => true,
-                    Err(_) => {
-                        // NOT awaited after the abort: a task wedged in a
-                        // synchronous write never reaches a cancellation point,
-                        // so awaiting it back would reintroduce the hang.
-                        server.abort();
-                        false
-                    }
+                || if tokio::time::timeout_at(deadline, &mut *server)
+                    .await
+                    .is_ok()
+                {
+                    true
+                } else {
+                    // A wedged synchronous write cannot be awaited after abort.
+                    server.abort();
+                    false
                 };
             self.server = None;
             if stopped {
@@ -529,12 +529,11 @@ impl ServerHandle {
             }
         }
         while let Some(task) = self.background.last_mut() {
-            match tokio::time::timeout_at(deadline, &mut *task).await {
-                Ok(_) => self.tasks_joined += 1,
-                Err(_) => {
-                    task.abort();
-                    self.tasks_aborted += 1;
-                }
+            if tokio::time::timeout_at(deadline, &mut *task).await.is_ok() {
+                self.tasks_joined += 1;
+            } else {
+                task.abort();
+                self.tasks_aborted += 1;
             }
             self.background.pop();
         }
@@ -584,7 +583,7 @@ impl ServerHandle {
     /// carry over and the flushes are idempotent.
     pub async fn shutdown_within(&mut self, grace: Duration) -> ShutdownReport {
         self.listener.take();
-        let _ = self.shutdown.send(true);
+        crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
         let deadline = tokio::time::Instant::now() + grace;
 
         self.stop_tasks(deadline).await;
@@ -2631,7 +2630,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     };
 
     let (connections, drain) = tokio::sync::mpsc::channel(1);
-    let serve_manager = manager.clone();
+    let serve_manager = Arc::clone(&manager);
     let mut stop = shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
         mitm::serve_tracked_with_shutdown(
@@ -2639,7 +2638,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
             serve_manager,
             tls,
             async move {
-                let _ = stop.changed().await;
+                crate::log_err::LogErr::log_debug(stop.changed().await, "waiting for shutdown");
             },
             connections,
         )

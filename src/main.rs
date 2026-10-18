@@ -6410,7 +6410,10 @@ fn claude_bin() -> String {
 /// spawns or would spawn the user's harness, so every call site resolves the
 /// same way.
 fn claude_command() -> std::process::Command {
-    std::process::Command::new(claude_bin())
+    let name = claude_bin();
+    std::process::Command::new(
+        tool_env::executable(Path::new(&name)).unwrap_or_else(|| PathBuf::from(name)),
+    )
 }
 
 /// A fresh [`std::process::Command`] for the `codex` binary `tcr run --codex` launches:
@@ -6466,14 +6469,22 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         for line in apply_codex_launch(&mut cmd, port, &launch, &launch_key) {
             eprintln!("{line}");
         }
-        if matches!(launch, CodexLaunch::SeeThrough { .. }) {
-            tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path)?;
-        }
+        let helpers = if matches!(launch, CodexLaunch::SeeThrough { .. }) {
+            let (helpers, lines) =
+                tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path)?;
+            for line in lines {
+                eprintln!("{line}");
+            }
+            Some(helpers)
+        } else {
+            None
+        };
         // Generated shell-tool defaults precede explicit caller overrides.
         cmd.args(&args.args);
         let status = cmd
             .status()
             .with_context(|| format!("failed to launch `{}`", codex.display()))?;
+        drop(helpers);
         std::process::exit(status.code().unwrap_or(1));
     }
 
@@ -6508,6 +6519,7 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let mut cmd = claude_command();
+    let mut helpers = None;
     cmd.args(&args.args);
     mark_run_active(&mut cmd);
 
@@ -6547,8 +6559,11 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // always works; there is no half-applied third state.
         let mut lines = match see_through_ca() {
             Some(ca) => {
-                let lines = apply_see_through_env(&mut cmd, port, &ca, &launch_key);
-                tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path)?;
+                let mut lines = apply_see_through_env(&mut cmd, port, &ca, &launch_key);
+                let (owner, notices) =
+                    tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path)?;
+                helpers = Some(owner);
+                lines.extend(notices);
                 lines
             }
             None => apply_base_url_env(&mut cmd, port, &launch_key),
@@ -6564,6 +6579,7 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
     let status = cmd
         .status()
         .context("failed to launch `claude` — is it on PATH?")?;
+    drop(helpers);
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -6805,7 +6821,7 @@ fn apply_codex_launch(
                 key,
             ));
             apply_nested_claude_ca(cmd, ca, std::env::var_os("NODE_EXTRA_CA_CERTS").is_some());
-            tool_env::apply_codex_shell_policy(cmd);
+            lines.extend(tool_env::apply_codex_shell_policy(cmd));
             lines.extend(key.notice(port));
             for rewrite in no_proxy {
                 cmd.env(rewrite.var, &rewrite.kept);
@@ -6819,23 +6835,6 @@ fn apply_codex_launch(
     }
     lines.extend(launch.notices(port));
     lines
-}
-
-/// What a pooled codex launch says about its shell tools' proxy. Keyed, a
-/// helper the user points at tcr by hand needs the key too, so the line says
-/// where to get it, and never prints it.
-fn shell_tools_notice(port: u16, keyed: bool) -> String {
-    if keyed {
-        format!(
-            "[tcr] shell tools use an unmarked, keyed proxy and keep their own ChatGPT login. \
-             Other helpers can inherit Codex's marker; for those commands set HTTPS_PROXY and \
-             https_proxy to http://tcr:<key>@127.0.0.1:{port}, the key from `tcr request-key`."
-        )
-    } else {
-        "[tcr] shell tools use an unmarked proxy and keep their own ChatGPT login. Other helpers \
-         can inherit Codex's marker; use unmarked HTTPS_PROXY and https_proxy for those commands."
-            .to_string()
-    }
 }
 
 /// Every spelling of a proxy variable `codex`'s HTTP stack reads for an
@@ -7378,8 +7377,9 @@ fn apply_codex_see_through_env(
     }
     vec![
         format!(
-            "[tcr] see-through mode: codex keeps its own backend URL, tunnelling via {}; a \
-             FedRAMP or residency-routed login runs on its own credential, unpooled",
+            "[tcr] see-through mode: codex keeps its own backend URL, proxy via {}; only marked \
+             chatgpt.com traffic is eligible for pooling; custom backends, FedRAMP and \
+             residency-routed logins run unpooled",
             proxy.shown
         ),
         if caller_ca_exported {
@@ -7670,8 +7670,13 @@ const fn stand_down_exit_code(
 async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     let config_path = args.config.path();
     let (config, persist_path) = load_config(&config_path)?;
-    let restart_endpoint =
-        tcr::restart::Endpoint::bind().context("could not open the CLI restart endpoint")?;
+    let restart_endpoint = match tcr::restart::Endpoint::bind() {
+        Ok(endpoint) => Some(endpoint),
+        Err(error) => {
+            eprintln!("[tcr] warning: listener handoff disabled: {error}");
+            None
+        }
+    };
     let inherited_listener = if args.replace {
         tcr::restart::request_listener(args.port.unwrap_or(config.proxy.port)).await?
     } else {
@@ -7801,6 +7806,11 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
 
     let mut handle = handle;
     let mut successor = None;
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).ok();
+    if sigterm.is_none() {
+        tracing::warn!("could not install SIGTERM handler");
+    }
     if args.headless {
         // Installed BEFORE the "listening" line below, not after: that line is
         // what a caller (or `tests/headless_sigterm.rs`) waits on before it
@@ -7825,13 +7835,6 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         // `server::DEFAULT_SHUTDOWN_GRACE`), documented as bounded — tasks
         // that miss the grace are aborted and counted in
         // `report.tasks_aborted`, warned about just below.
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = signal(SignalKind::terminate()).ok();
-        if sigterm.is_none() {
-            tracing::warn!(
-                "could not install SIGTERM handler; a supervised stop will kill this process without draining"
-            );
-        }
         tracing::info!("tcr listening on http://{bound} (headless)");
         // Block until Ctrl-C, SIGTERM, or the server task exits.
         let trigger = tokio::select! {
@@ -7845,8 +7848,8 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
                 }
             } => ShutdownTrigger::Sigterm,
             () = handle.serving_stopped() => ShutdownTrigger::ServingStopped,
-            peer = restart_endpoint.accept() => {
-                successor = Some(peer?);
+            peer = tcr::restart::accept(restart_endpoint.as_ref()) => {
+                successor = Some(peer);
                 ShutdownTrigger::Replaced
             },
         };
@@ -7860,16 +7863,11 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         // drops the TUI future, and dropping it runs `TerminalGuard`'s destructor,
         // which restores the terminal (the same restore path as a clean quit or a
         // panic) BEFORE the shutdown/flush below and any SIGKILL fallback.
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = signal(SignalKind::terminate()).ok();
-        if sigterm.is_none() {
-            tracing::warn!("could not install SIGTERM handler; terminal may not restore if killed");
-        }
         let tui_fut = tui::run(Arc::clone(handle.manager()));
         tokio::pin!(tui_fut);
         tokio::select! {
-            peer = restart_endpoint.accept() => {
-                successor = Some(peer?);
+            peer = tcr::restart::accept(restart_endpoint.as_ref()) => {
+                successor = Some(peer);
             }
 
             res = &mut tui_fut => {
@@ -7891,13 +7889,33 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     }
 
     if let Some(peer) = successor {
-        handle.handoff(&peer).await?;
+        // One budget includes the handshake and draining. A failed or interrupted
+        // handshake still falls through to shutdown and the usage-ledger flush.
+        let replacement = async {
+            if let Err(error) = handle.handoff(&peer).await {
+                tracing::warn!(%error, "listener handoff failed; draining before shutdown");
+            } else {
+                tracing::info!("listener handed over; draining accepted connections");
+            }
+            handle.drain_connections().await;
+            tracing::info!("accepted connections drained");
+        };
+        tokio::select! {
+            () = replacement => {},
+            _ = tokio::signal::ctrl_c() => tracing::info!("shutdown signal received during drain"),
+            () = async {
+                match sigterm.as_mut() {
+                    Some(sig) => { sig.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => tracing::info!("SIGTERM received during drain; shutting down"),
+            () = tokio::time::sleep(tcr::restart::DRAIN_CEILING) => {
+                tracing::warn!("replacement drain deadline reached; shutting down");
+            }
+        }
         drop(peer);
-        drop(restart_endpoint);
-        tracing::info!("listener handed over; draining accepted connections");
-        handle.drain_connections().await;
-        tracing::info!("accepted connections drained");
     }
+    drop(restart_endpoint);
 
     // Stop serving, then flush the config and the affinity pins. The whole
     // sequence — including the final pin write a clean shutdown owes the next
@@ -7980,9 +7998,8 @@ const fn wedged_incumbent_recovery(kind: singleton::ProxyKind) -> &'static str {
              start it again to recover a wedged embedded proxy."
         }
         singleton::ProxyKind::Tcr => {
-            "Run `tcr --replace` to take the port over; that is the recovery for a wedged proxy, \
-             and it is not being done automatically because it also wipes the pin map of a proxy \
-             that was merely slow to answer."
+            "Stop the proxy explicitly, or use `tcr --replace` if it runs this version or newer \
+             and its listener handoff endpoint still answers."
         }
     }
 }
@@ -8674,13 +8691,9 @@ mod tests {
         )
     }
 
-    /// (b) and (c): keyed, codex keeps the `tcr-codex` marker with the key as its
-    /// password, and its shell tools get the unmarked `tcr` user with the key. The
-    /// server's own parse reads the first as marked and keyed, the second as keyed
-    /// only. Unkeyed, both are today's URLs. A direct launch never reaches tcr and
-    /// gets neither.
+    /// Keyed model traffic retains the marker; shell defaults contain no key.
     #[test]
-    fn a_keyed_codex_launch_keeps_the_marker_and_keys_its_shell_tools() {
+    fn a_keyed_codex_launch_keeps_the_marker_and_restores_shell_settings() {
         let pooled = CodexLaunch::SeeThrough {
             ca: PathBuf::from("/tmp/ca.pem"),
             no_proxy: Vec::new(),
@@ -8695,24 +8708,30 @@ mod tests {
         let mut cmd = std::process::Command::new("true");
         let lines = apply_codex_launch(&mut cmd, 3999, &pooled, &sent(KEY));
         let codex_url = format!("http://tcr-codex:{KEY}@127.0.0.1:3999");
-        let shell_url = format!("http://tcr:{KEY}@127.0.0.1:3999");
+
         let env = env_changes(&cmd);
         assert_eq!(env.get("HTTPS_PROXY"), Some(&Some(codex_url.clone())));
         assert_eq!(env.get("https_proxy"), Some(&Some(codex_url.clone())));
-        assert_eq!(
-            shell_args(&cmd),
-            [
-                format!("shell_environment_policy.set.HTTPS_PROXY=\"{shell_url}\""),
-                format!("shell_environment_policy.set.https_proxy=\"{shell_url}\""),
-            ]
-        );
+        let expected: Vec<_> = [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NODE_EXTRA_CA_CERTS",
+            "CODEX_CA_CERTIFICATE",
+        ]
+        .iter()
+        .map(|var| format!("shell_environment_policy.set.{var}=\"\""))
+        .collect();
+        assert_eq!(shell_args(&cmd), expected);
         let codex = server_reads(&codex_url);
         assert!(codex.codex_marked && codex.key_ok, "{codex:?}");
-        let shell = server_reads(&shell_url);
-        assert!(!shell.codex_marked && shell.key_ok, "{shell:?}");
         assert!(
-            lines.iter().any(|line| line.contains("tcr request-key")),
-            "the shell-tool line says where a hand-set helper gets the key: {lines:?}"
+            lines
+                .iter()
+                .any(|line| line.contains("caller's proxy and CA"))
         );
 
         for decision in unkeyed_decisions() {
@@ -8724,14 +8743,7 @@ mod tests {
                 Some(&Some("http://tcr-codex@127.0.0.1:3999".to_string())),
                 "{decision:?}"
             );
-            assert_eq!(
-                shell_args(&cmd),
-                [
-                    "shell_environment_policy.set.HTTPS_PROXY=\"http://127.0.0.1:3999\"",
-                    "shell_environment_policy.set.https_proxy=\"http://127.0.0.1:3999\"",
-                ],
-                "{decision:?}"
-            );
+            assert_eq!(shell_args(&cmd), expected, "{decision:?}");
             assert_eq!(
                 lines
                     .iter()
@@ -8887,8 +8899,9 @@ mod tests {
         // advice having been dropped for everyone.
         let advice = wedged_incumbent_recovery(singleton::ProxyKind::Tcr);
         assert!(
-            advice.contains("Run `tcr --replace`"),
-            "Tcr is recoverable by --replace: {advice}"
+            advice.contains("Stop the proxy explicitly")
+                && advice.contains("this version or newer"),
+            "standalone recovery must explain when handoff is available: {advice}"
         );
     }
 

@@ -652,4 +652,14 @@ final class ChildStderrTests: XCTestCase {
             XCTAssertEqual(collected.value.count, payload.count, "stderr was lost or truncated")
         }
     }
+    func testUnavailableHandoffExplainsTheFirstUpgrade() async {
+        let state = ServerController.classifyExit(
+            intent: .takeover, exitCode: 1,
+            stderr: "tcr-handoff-unavailable: incumbent endpoint unavailable"
+        )
+        guard case .takeoverRefused = state else { return XCTFail("wrong state: \(state)") }
+        XCTAssertTrue(state.summary.contains("Stop the existing proxy"))
+        XCTAssertTrue(state.summary.contains("this version or newer"))
+    }
+
 }

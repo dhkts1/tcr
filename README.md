@@ -145,7 +145,7 @@ Codex account. `tcr run --codex` sets that marker and the CA. A nested `codex` o
 uses the same launch checks through a private helper, so it can use the pool too.
 Both launchers keep shell tools such as `git`, `gh` and `curl` off tcr, without a host
 whitelist. Nested `claude`/`codex` commands on PATH regain the session's proxy; the agents'
-own auxiliary traffic still uses it. See [the shell routing contract](docs/cli.md#tcr-run).
+own auxiliary traffic still uses it. See [the shell routing contract](docs/cli.md#tcr-run----args).
 An unmarked `HTTPS_PROXY` tunnels `chatgpt.com` untouched and leaves the client on its own
 login. Marked connections relay paths outside `/backend-api/`
 with the client's credential. `codex` takes no CA from `NODE_EXTRA_CA_CERTS`:
@@ -153,8 +153,8 @@ with the client's credential. `codex` takes no CA from `NODE_EXTRA_CA_CERTS`:
 and a CA already in the system trust store works too. Claude launches set only
 `NODE_EXTRA_CA_CERTS`, preserving a nested Codex client's own CA choice. A pooled Codex launch
 sets `CODEX_CA_CERTIFICATE` only when you have not supplied it, and preserves an explicit
-`NODE_EXTRA_CA_CERTS` too. Shell tools connect directly; explicitly configured child
-environments can override that default. Keep the marker scoped to `tcr run --codex` rather
+`NODE_EXTRA_CA_CERTS` too. Shell tools retain the caller's proxy and CA settings, connecting
+directly when the caller configured no proxy. Keep the marker scoped to `tcr run --codex` rather
 than exporting it to a shell.
 The config lives at `~/.config/tcr.json`. `name` and
 `accessToken` are the only required keys. Every other key, its default and the file's permissions

@@ -1,24 +1,13 @@
-//! Keep the agents' CONNECT route out of their shell tools. Claude's shell prefix
-//! covers shell hooks/MCP too; its env file runs after the Bash snapshot. Codex's
-//! shell policy applies after its snapshot. Neither changes a model base URL.
-//!
-//! PATH launchers put ordinary nested `claude`/`codex` invocations back through
-//! the pool. Absolute executable paths and explicit environment/config overrides
-//! can bypass this convenience; this is routing, not a security boundary.
-//!
-//! Helpers are content-addressed, private cache files. Keeping them after the
-//! foreground agent exits lets background shells finish and avoids per-launch
-//! cache growth. They contain executable/CA paths and a loopback proxy URL, never
-//! account credentials. No user shell or client configuration is edited.
-
+//! Separate shell-tool routing from the model client's proxy. Private launchers
+//! restore nested agents; their scripts contain no proxy values or request keys.
+//! A launch owns its temporary directory and removes it when the client exits.
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
-use sha2::{Digest, Sha256};
 
 const PROXIES: [&str; 6] = [
     "HTTPS_PROXY",
@@ -28,6 +17,7 @@ const PROXIES: [&str; 6] = [
     "ALL_PROXY",
     "all_proxy",
 ];
+const CAS: [&str; 2] = ["NODE_EXTRA_CA_CERTS", "CODEX_CA_CERTIFICATE"];
 
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -45,15 +35,17 @@ fn inherited(cmd: &Command, name: &str) -> Option<String> {
     }
 }
 
-/// Resolve before putting the helpers on PATH, and retain symlinks (npm relies
-/// on their parent directory). Absolute paths also survive a tool changing cwd.
-fn executable(name: &Path) -> Option<PathBuf> {
+/// Resolve PATH without re-entering an outer session's tcr launchers. Retain
+/// npm symlinks: their parent directory is meaningful to the executable.
+pub(crate) fn executable(name: &Path) -> Option<PathBuf> {
     let path = if name.components().count() > 1 || name.is_absolute() {
         name.to_path_buf()
     } else {
         std::env::split_paths(&std::env::var_os("PATH")?)
             .map(|dir| dir.join(name))
-            .find(|p| tcr::codex_local::is_executable_file(p))?
+            .find(|p| {
+                tcr::codex_local::is_executable_file(p) && !tcr::codex_local::is_tool_launcher(p)
+            })?
     };
     tcr::codex_local::is_executable_file(&path)
         .then(|| std::path::absolute(path).ok())
@@ -61,11 +53,8 @@ fn executable(name: &Path) -> Option<PathBuf> {
 }
 
 fn publish(path: &Path, contents: &str) -> anyhow::Result<()> {
-    if std::fs::read_to_string(path).ok().as_deref() == Some(contents) {
-        return Ok(());
-    }
-    // Atomic replacement: another session may already be executing this helper.
-    let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    let parent = path.parent().context("helper must have a parent")?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o700))?;
     file.write_all(contents.as_bytes())?;
@@ -73,34 +62,119 @@ fn publish(path: &Path, contents: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn codex_policy() -> Vec<String> {
-    // `set` composes with both legacy exclude/include_only and current filters.
-    // Setting empty strings also wins over inherited ALL_PROXY fallbacks.
+fn model_port(cmd: &Command) -> Option<u16> {
+    reqwest::Url::parse(&inherited(cmd, "HTTPS_PROXY")?)
+        .ok()?
+        .port_or_known_default()
+}
+
+fn caller_env(port: Option<u16>) -> BTreeMap<String, String> {
+    let ca = tcr::mitm::minted_ca_path();
     PROXIES
         .iter()
-        .map(|key| format!("shell_environment_policy.set.{key}=\"\""))
+        .chain(CAS.iter())
+        .filter_map(|key| {
+            let value = std::env::var(key).ok()?;
+            // Strip only our own CA; caller bundles remain part of the shell env.
+            if (CAS.contains(key) && Path::new(&value) == ca)
+                || (PROXIES.contains(key)
+                    && port.is_some_and(|port| tcr::doctor::points_at_tcr(&value, port)))
+            {
+                return None;
+            }
+            Some(((*key).to_string(), value))
+        })
         .collect()
 }
 
-pub fn apply_codex_shell_policy(cmd: &mut Command) {
-    for setting in codex_policy() {
-        cmd.args(["-c", &setting]);
+/// Preserve explicit config-file set entries. CLI arguments appended by the
+/// caller can override these defaults again. This reads, never edits, Codex's file.
+fn codex_policy(cmd: &Command) -> BTreeMap<String, String> {
+    let mut values = caller_env(model_port(cmd));
+    let file = std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map_or_else(
+            || {
+                PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                    .join(".codex/config.toml")
+            },
+            |home| PathBuf::from(home).join("config.toml"),
+        );
+    if let Ok(text) = std::fs::read_to_string(file)
+        && let Ok(document) = text.parse::<toml_edit::DocumentMut>()
+        && let Some(set) = document
+            .get("shell_environment_policy")
+            .and_then(|p| p.get("set"))
+            .and_then(toml_edit::Item::as_table_like)
+    {
+        for (key, item) in set.iter() {
+            if let Some(value) = item.as_str() {
+                values.insert(key.to_string(), value.to_string());
+            }
+        }
     }
-    eprintln!(
-        "[tcr] shell tools connect directly; nested codex on PATH uses the current pool checks"
-    );
+    for key in PROXIES.iter().chain(CAS.iter()) {
+        values.entry((*key).to_string()).or_default();
+    }
+    values
 }
 
-/// Apply only after see-through routing is selected, before user CLI arguments.
-pub fn apply(cmd: &mut Command, claude: &Path, config: &Path) -> anyhow::Result<()> {
+pub(crate) fn apply_codex_shell_policy(cmd: &mut Command) -> Vec<String> {
+    let values = codex_policy(cmd);
+    for key in PROXIES.iter().chain(CAS.iter()) {
+        let value = values.get(*key).cloned().unwrap_or_default();
+        cmd.args([
+            "-c",
+            &format!(
+                "shell_environment_policy.set.{key}={}",
+                serde_json::Value::String(value)
+            ),
+        ]);
+    }
+    vec!["[tcr] shell tools use the caller's proxy and CA settings; nested codex on PATH uses the current pool checks".into()]
+}
+
+/// Apply after model routing, before explicit CLI arguments. The returned owner
+/// must live until the foreground agent exits, including error paths.
+pub(crate) fn apply(
+    cmd: &mut Command,
+    claude: &Path,
+    config: &Path,
+) -> anyhow::Result<(tempfile::TempDir, Vec<String>)> {
     let claude = executable(claude);
     let tcr = std::env::current_exe()?;
     let config = std::path::absolute(config)?;
     let codex_bin = tcr::codex_local::find_codex()
         .ok()
         .and_then(|found| executable(&found.path));
-    let prefix = inherited(cmd, "CLAUDE_CODE_SHELL_PREFIX").filter(|v| !v.is_empty());
-    let env_file = inherited(cmd, "CLAUDE_ENV_FILE").filter(|v| !v.is_empty());
+    let original = |key: &str, saved: &str| {
+        inherited(cmd, key)
+            .filter(|v| !v.is_empty())
+            .and_then(|value| {
+                if tcr::codex_local::is_tool_launcher(Path::new(&value)) {
+                    std::env::var(saved).ok().filter(|v| !v.is_empty())
+                } else {
+                    Some(value)
+                }
+            })
+    };
+    let prefix = original("CLAUDE_CODE_SHELL_PREFIX", "TCR_TOOL_ORIGINAL_PREFIX");
+    // Claude splits a prefix at the last " -". Treating the whole string as an
+    // executable breaks every shell command. Refuse unsupported flag syntax
+    // before starting the agent rather than silently changing its meaning.
+    anyhow::ensure!(
+        !prefix.as_ref().is_some_and(|p| p.contains(" -")),
+        "CLAUDE_CODE_SHELL_PREFIX with flags is not supported by tcr's shell routing; use an executable wrapper script instead"
+    );
+    let env_file = original("CLAUDE_ENV_FILE", "TCR_TOOL_ORIGINAL_ENV_FILE");
+    cmd.env(
+        "TCR_TOOL_ORIGINAL_PREFIX",
+        prefix.as_deref().unwrap_or_default(),
+    );
+    cmd.env(
+        "TCR_TOOL_ORIGINAL_ENV_FILE",
+        env_file.as_deref().unwrap_or_default(),
+    );
     let shell = inherited(cmd, "CLAUDE_CODE_SHELL")
         .or_else(|| inherited(cmd, "SHELL"))
         .filter(|s| {
@@ -110,42 +184,50 @@ pub fn apply(cmd: &mut Command, claude: &Path, config: &Path) -> anyhow::Result<
             )
         })
         .unwrap_or_else(|| "/bin/bash".into());
-    let mut agent_env = BTreeMap::new();
-    for key in [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "NODE_EXTRA_CA_CERTS",
-        "CODEX_CA_CERTIFICATE",
-    ] {
-        if let Some(value) = inherited(cmd, key) {
-            agent_env.insert(key, value);
-        }
-    }
-    let seed = serde_json::to_vec(&(
-        "tool-env-v2",
-        &tcr,
-        &config,
-        &claude,
-        &codex_bin,
-        &prefix,
-        &env_file,
-        &shell,
-        &agent_env,
-    ))?;
-    let root = tcr::paths::cache_dir().root().join("tool-env").join(
-        Sha256::digest(seed)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>(),
-    );
+    let parent = std::path::absolute(tcr::paths::cache_dir().root().join("tool-env"))?;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(&root)?;
-    let root_text = path_text(&root)?;
-    let cleanup = format!("unset {}\n", PROXIES.join(" "));
-    let prepend = format!("export PATH={}:\"$PATH\"\n", quote(root_text));
-    let mut env_script = String::new();
+        .create(&parent)?;
+    let meta = std::fs::symlink_metadata(&parent)?;
+    let uid = tcr_fdpass::effective_uid();
+    anyhow::ensure!(
+        meta.is_dir() && meta.uid() == uid && meta.mode() & 0o777 == 0o700,
+        "tool helper directory must be owned by this user with mode 0700 and must not be a symlink"
+    );
+    let directory = tempfile::Builder::new()
+        .prefix("launch-")
+        .tempdir_in(&parent)?;
+    let root = directory.path();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    let caller = caller_env(model_port(cmd));
+    let mut cleanup = String::new();
+    for key in PROXIES.iter().chain(CAS.iter()) {
+        let saved = format!("TCR_TOOL_CALLER_{key}");
+        if let Some(value) = caller.get(*key) {
+            cmd.env(&saved, value);
+            cleanup.push_str(&format!("export {key}=\"${{{saved}}}\"\n"));
+        } else {
+            cmd.env_remove(&saved);
+            cleanup.push_str(&format!("unset {key}\n"));
+        }
+    }
+    // Runtime environment only: no request key or proxy credential is written
+    // into a helper file or used to choose its directory.
+    if let Some(value) = inherited(cmd, "HTTPS_PROXY") {
+        let mut proxy = reqwest::Url::parse(&value)?;
+        proxy
+            .set_username(if proxy.password().is_some() {
+                "tcr"
+            } else {
+                ""
+            })
+            .map_err(|()| anyhow::anyhow!("invalid nested Claude proxy URL"))?;
+        cmd.env("TCR_TOOL_CLAUDE_PROXY", proxy.as_str());
+    }
+    cmd.env("TCR_TOOL_CLAUDE_CA", tcr::mitm::minted_ca_path());
+    let prepend = format!("export PATH={}:\"$PATH\"\n", quote(path_text(root)?));
+    let mut env_script = String::from("#!/bin/sh\n# tcr tool launcher\n");
     if let Some(file) = &env_file {
         env_script.push_str(&format!(". {}\n", quote(file)));
     }
@@ -158,42 +240,41 @@ pub fn apply(cmd: &mut Command, claude: &Path, config: &Path) -> anyhow::Result<
     };
     publish(
         &root.join("shell-prefix"),
-        &format!("#!/bin/sh\n{cleanup}{prepend}{exec}"),
+        &format!("#!/bin/sh\n# tcr tool launcher\n{cleanup}{prepend}{exec}"),
     )?;
-
-    let mut restore = String::new();
-    for (key, value) in &agent_env {
-        restore.push_str(&format!("export {key}={}\n", quote(value)));
-    }
-    restore.push_str(&format!(
+    let restore = format!(
         "export CLAUDE_CODE_SHELL_PREFIX={}\nexport CLAUDE_ENV_FILE={}\n",
         quote(path_text(&root.join("shell-prefix"))?),
         quote(path_text(&root.join("shell-env"))?),
-    ));
+    );
     if let Some(bin) = claude {
-        publish(&root.join("claude"), &format!(
-            "#!/bin/sh\n{restore}export ANTHROPIC_BASE_URL=https://api.anthropic.com\nexec {} \"$@\"\n",
-            quote(path_text(&bin)?),
-        ))?;
+        publish(
+            &root.join("claude"),
+            &format!(
+                "#!/bin/sh\n# tcr tool launcher\n{restore}: \"${{HTTPS_PROXY:=${{TCR_TOOL_CLAUDE_PROXY}}}}\"\n: \"${{https_proxy:=$HTTPS_PROXY}}\"\n: \"${{NODE_EXTRA_CA_CERTS:=${{TCR_TOOL_CLAUDE_CA}}}}\"\n: \"${{ANTHROPIC_BASE_URL:=https://api.anthropic.com}}\"\nexport HTTPS_PROXY https_proxy NODE_EXTRA_CA_CERTS ANTHROPIC_BASE_URL\nexec {} \"$@\"\n",
+                quote(path_text(&bin)?),
+            ),
+        )?;
     }
     if let Some(bin) = codex_bin {
-        // Reuse the current launch decision, including live interception and
-        // caller CA checks. Pin the real executable before adding our PATH shim.
+        let pinned = quote(path_text(&bin)?);
         publish(
             &root.join("codex"),
             &format!(
-                "#!/bin/sh\nexport TCR_CODEX_BIN={}\nexec {} run --codex --config {} -- \"$@\"\n",
-                quote(path_text(&bin)?),
+                "#!/bin/sh\n# tcr tool launcher\nif [ -n \"${{CODEX_BIN:-}}\" ] && [ \"${{TCR_CODEX_BIN:-}}\" = {pinned} ]; then unset TCR_CODEX_BIN; fi\nif [ -z \"${{TCR_CODEX_BIN:-}}${{CODEX_BIN:-}}\" ]; then export TCR_CODEX_BIN={pinned}; fi\nexec {} run --codex --config {} -- \"$@\"\n",
                 quote(path_text(&tcr)?),
                 quote(path_text(&config)?),
             ),
         )?;
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let paths = std::iter::once(root.clone()).chain(std::env::split_paths(&path));
-    cmd.env("PATH", std::env::join_paths(paths)?);
+    cmd.env(
+        "PATH",
+        std::env::join_paths(
+            std::iter::once(root.to_path_buf()).chain(std::env::split_paths(&path)),
+        )?,
+    );
     cmd.env("CLAUDE_CODE_SHELL_PREFIX", root.join("shell-prefix"));
     cmd.env("CLAUDE_ENV_FILE", root.join("shell-env"));
-    eprintln!("[tcr] shell tools connect directly; nested claude/codex on PATH use the pool");
-    Ok(())
+    Ok((directory, vec!["[tcr] shell tools use the caller's proxy and CA settings; nested claude/codex on PATH use the pool unless explicitly overridden".into()]))
 }

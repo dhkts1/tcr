@@ -5,10 +5,12 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{
+    Arc,
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc,
+    mpsc,
 };
 use std::time::{Duration, Instant};
+use tcr::log_err::LogErr as _;
 
 struct Proxy {
     child: Child,
@@ -40,7 +42,7 @@ impl Proxy {
         let (tx, lines) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let _ = tx.send(line);
+                tx.send(line).log_debug("test log receiver closed");
             }
         });
         Self { child, lines }
@@ -73,8 +75,8 @@ impl Proxy {
 
 impl Drop for Proxy {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.kill().log_debug("test proxy already stopped");
+        self.child.wait().log_debug("reaping test proxy");
     }
 }
 
@@ -97,7 +99,7 @@ fn connections_arriving_during_replace_are_never_refused() {
     let mut old = Proxy::spawn(home.path(), 0, false);
     let addr = old.ready();
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_client = stop.clone();
+    let stop_client = Arc::clone(&stop);
     let (started_tx, started_rx) = mpsc::channel();
     let clients = std::thread::spawn(move || {
         let mut attempts = 0;
@@ -107,11 +109,27 @@ fn connections_arriving_during_replace_are_never_refused() {
             // process boots. A loaded host can take longer than 250 ms; the
             // regression is an unbound socket (ConnectionRefused), not a
             // subsecond startup latency guarantee.
-            if let Err(error) = TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
-                errors.push(error.kind());
+            let response = (|| -> std::io::Result<()> {
+                let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(30))?;
+                stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+                stream.write_all(
+                    b"GET /_tcr/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )?;
+                let mut status = String::new();
+                BufReader::new(stream).read_line(&mut status)?;
+                if !status.starts_with("HTTP/1.1 200") {
+                    return Err(std::io::Error::other(format!(
+                        "unexpected status: {status}"
+                    )));
+                }
+                Ok(())
+            })();
+            if let Err(error) = response {
+                errors.push(error.to_string());
             }
             attempts += 1;
-            let _ = started_tx.send(());
+            started_tx.send(()).log_debug("test ready receiver closed");
             std::thread::sleep(Duration::from_millis(2));
         }
         (attempts, errors)
@@ -236,11 +254,7 @@ fn predecessor_retains_its_listener_until_the_receiver_acknowledges_it() {
     let home = scratch_home();
     let mut old = Proxy::spawn(home.path(), 0, false);
     let addr = old.ready();
-    let endpoint = home
-        .path()
-        .join(".cache")
-        .join(tcr::paths::CACHE_DIR)
-        .join(format!("restart-{}.sock", old.child.id()));
+    let endpoint = tcr::restart::socket_path(old.child.id());
     let mut peer = UnixStream::connect(endpoint).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     peer.write_all(b"tcr-replace/2\n").unwrap();
@@ -269,4 +283,171 @@ fn predecessor_retains_its_listener_until_the_receiver_acknowledges_it() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn replacement_closes_an_idle_http_keep_alive_connection() {
+    let home = scratch_home();
+    let mut old = Proxy::spawn(home.path(), 0, false);
+    let addr = old.ready();
+    let mut http = TcpStream::connect(addr).unwrap();
+    http.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    http.write_all(b"GET /_tcr/status HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut reader = BufReader::new(http);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.starts_with("HTTP/1.1 200"));
+    let mut length = 0;
+    loop {
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length: ") {
+            length = value.trim().parse().unwrap();
+        }
+    }
+    reader.read_exact(&mut vec![0; length]).unwrap();
+    let mut successor = Proxy::spawn(home.path(), addr.port(), true);
+    successor.ready();
+    assert_eq!(
+        reader
+            .read(&mut [0; 1])
+            .expect("idle h1 must close after handoff"),
+        0
+    );
+}
+
+fn held_tunnel(addr: SocketAddr) -> (TcpStream, TcpStream) {
+    let echo = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut tunnel = TcpStream::connect(addr).unwrap();
+    tunnel
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        tunnel,
+        "CONNECT {} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        echo.local_addr().unwrap()
+    )
+    .unwrap();
+    let (upstream, _) = echo.accept().unwrap();
+    let mut response = [0; 39];
+    tunnel.read_exact(&mut response).unwrap();
+    assert_eq!(&response, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+    (tunnel, upstream)
+}
+
+fn wait_exit(proxy: &mut Proxy, seconds: u64) {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        if let Some(status) = proxy.child.try_wait().unwrap() {
+            assert!(status.success(), "shutdown failed: {status}");
+            return;
+        }
+        assert!(Instant::now() < deadline, "predecessor failed to shut down");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_never_ending_tunnel_has_a_drain_ceiling() {
+    let home = scratch_home();
+    let mut old = Proxy::spawn(home.path(), 0, false);
+    let addr = old.ready();
+    let _held = held_tunnel(addr);
+    let mut successor = Proxy::spawn(home.path(), addr.port(), true);
+    successor.ready();
+    wait_exit(&mut old, tcr::restart::DRAIN_CEILING.as_secs() + 10);
+}
+
+#[test]
+fn termination_signals_interrupt_drain_and_shutdown_cleanly() {
+    for signal in ["-TERM", "-INT"] {
+        let home = scratch_home();
+        let mut old = Proxy::spawn(home.path(), 0, false);
+        let addr = old.ready();
+        let _held = held_tunnel(addr);
+        let mut successor = Proxy::spawn(home.path(), addr.port(), true);
+        successor.ready();
+        assert!(old.child.try_wait().unwrap().is_none());
+        assert!(
+            Command::new("/bin/kill")
+                .args([signal, &old.child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        wait_exit(&mut old, 8);
+        let lines: Vec<_> = old.lines.try_iter().collect();
+        assert!(
+            lines.iter().any(|line| line.contains("during drain")),
+            "{lines:?}"
+        );
+    }
+}
+
+#[test]
+fn a_receiver_that_dies_after_receipt_still_drains_the_predecessor() {
+    use std::os::unix::net::UnixStream;
+    let home = scratch_home();
+    let mut old = Proxy::spawn(home.path(), 0, false);
+    let addr = old.ready();
+    let (_client, mut upstream) = held_tunnel(addr);
+    let mut peer = UnixStream::connect(tcr::restart::socket_path(old.child.id())).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    peer.write_all(b"tcr-replace/2\n").unwrap();
+    let listener = tcr_fdpass::recv_listener(&peer).unwrap();
+    drop(peer);
+    drop(listener);
+    // With an EOF instead of a receipt, the old process must drain its live
+    // tunnel, then reach the ordinary shutdown path instead of a `?` exit.
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(old.child.try_wait().unwrap().is_none());
+    upstream.write_all(b"alive").unwrap();
+    drop(upstream);
+    drop(_client);
+    wait_exit(&mut old, 8);
+    let lines: Vec<_> = old.lines.try_iter().collect();
+    assert!(
+        lines.iter().any(|line| line.contains("handoff failed")),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn replacement_sends_goaway_to_an_idle_http2_client() {
+    let home = scratch_home();
+    let mut old = Proxy::spawn(home.path(), 0, false);
+    let addr = old.ready();
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(stream),
+    )
+    .await
+    .unwrap();
+    let connection = tokio::spawn(connection);
+    let response = sender
+        .send_request(
+            hyper::Request::builder()
+                .uri(format!("http://{addr}/_tcr/status"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), hyper::StatusCode::OK);
+    axum::body::to_bytes(axum::body::Body::new(response.into_body()), 1_000_000)
+        .await
+        .unwrap();
+    let mut successor = Proxy::spawn(home.path(), addr.port(), true);
+    successor.ready();
+    tokio::time::timeout(Duration::from_secs(5), connection)
+        .await
+        .expect("h2 client must receive GOAWAY and finish")
+        .unwrap()
+        .unwrap();
+    assert!(sender.is_closed());
 }

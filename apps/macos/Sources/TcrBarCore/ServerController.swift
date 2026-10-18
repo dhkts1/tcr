@@ -70,6 +70,13 @@ public final class ServerController: ObservableObject {
             case .incumbentHoldsPort(let message):
                 return "Already running — not ours, left alone. \(message)"
             case .takeoverRefused(let message):
+                if message.contains("tcr-handoff-unavailable") {
+                    return """
+                        Listener handoff is unavailable. Stop the existing proxy from its own \
+                        terminal or supervisor, then start the server here. Use --replace only \
+                        when the existing proxy runs this version or newer and handoff is enabled. \(message)
+                        """
+                }
                 return """
                     Takeover did not happen — the existing proxy is still serving. \
                     tcr refuses to replace a proxy hosted inside a `tcr run` \
@@ -83,7 +90,7 @@ public final class ServerController: ObservableObject {
                     so requests through it are failing. It was left alone rather \
                     than replaced: a proxy that was merely slow to answer would \
                     lose its session→account pin map, so this app will not make \
-                    that call for you. "Take over port…" is the recovery. If a \
+                    that call for you. Stop it, or use "Take over port…" if its handoff endpoint responds. If a \
                     takeover is what produced this, tcr declined to replace this \
                     particular holder — a proxy hosted inside a `tcr run` process \
                     is deliberately never replaced — and it has to be stopped from \
@@ -93,8 +100,8 @@ public final class ServerController: ObservableObject {
                 return """
                     Already running — not ours, left alone. It is serving an older \
                     build than the `tcr` on disk, so a fix you just built is not \
-                    live on the port. "Take over port…" replaces it, at the cost of \
-                    every live session's prompt cache. \(message)
+                    live on the port. Stop it, or use "Take over port…" if it runs this version or newer \
+                    and listener handoff is enabled. \(message)
                     """
             case .exited(let code, let message):
                 // A tcr too old for a config holding a Codex account exits on its
@@ -559,6 +566,9 @@ public final class ServerController: ObservableObject {
             unknownArgumentMarkers.contains(where: { trimmed.contains($0) })
         {
             return .toolTooOld(message: trimmed)
+        }
+        if trimmed.contains("tcr-handoff-unavailable") {
+            return .takeoverRefused(message: trimmed)
         }
         // Both intents, deliberately. On the takeover path these are still the
         // more useful facts than "refused": exit 4 says the thing that kept the
