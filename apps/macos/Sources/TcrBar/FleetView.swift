@@ -2634,15 +2634,19 @@ struct FleetView: View {
     /// the proxy lists (``CodexRolloutJoin``, which looks each one up once).
     /// A Claude file wins an id clash. Read on appear and on each poll, never
     /// in `snapshotMode`, like the Claude files alone were.
-    /// ``MachineStats/read()`` on a background task, assigned back here on
-    /// the main actor: the process walk and the SMC reads are kernel calls,
-    /// and a poll that waits on them freezes the panel for that long. A poll
-    /// that lands while the last read is still out skips rather than queues.
+    /// ``MachineStats/read(heat:)`` on a background task, assigned back here
+    /// on the main actor: the process walk is kernel calls, and a poll that
+    /// waits on them freezes the panel for that long. A poll that lands while
+    /// the last read is still out skips rather than queues. The heat is the
+    /// proxy's, from the latest poll (``Fleet/heat``): the app reads no SMC.
     private func refreshMachine() {
         guard !machineReading else { return }
         machineReading = true
+        let heat = poller.state.loadedFleet?.heat
         Task {
-            let reading = await Task.detached(priority: .utility) { MachineStats.read() }.value
+            let reading = await Task.detached(priority: .utility) {
+                MachineStats.read(heat: heat)
+            }.value
             machineReading = false
             machine = reading
         }

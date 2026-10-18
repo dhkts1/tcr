@@ -1,7 +1,6 @@
 import AppKit
 import SwiftUI
 import TcrBarCore
-import TcrSMC
 
 /// Rasterise every panel state to PNG, in-process, then exit.
 ///

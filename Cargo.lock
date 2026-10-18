@@ -3045,6 +3045,7 @@ dependencies = [
  "tcr",
  "tcr-fdpass",
  "tcr-peer-wire",
+ "tcr-smc",
  "tcr-status-wire",
  "tempfile",
  "thiserror 2.0.21",
@@ -3077,6 +3078,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "tcr-smc"
+version = "0.1.0"
 
 [[package]]
 name = "tcr-status-wire"

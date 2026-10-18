@@ -1861,6 +1861,10 @@ async fn status_handler(
         payload.unkeyed_connects = Some(connects);
         payload.unkeyed_requests = Some(requests);
     }
+    // Read on the blocking pool and kept for two seconds (`crate::heat`), so a
+    // burst of status requests costs one SMC read and none of it runs on this
+    // worker. Absent where there is no AppleSMC.
+    payload.heat = crate::heat::current().await;
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a
         // proxy never panics on a client request — surface it as a 500 instead.
@@ -11339,6 +11343,30 @@ mod tests {
         let payload: crate::status::StatusPayload =
             serde_json::from_slice(&body).expect("a tcr status payload");
         assert_eq!(payload.mitm, Some(recorded));
+    }
+
+    /// The endpoint carries the machine's heat exactly where there is an
+    /// AppleSMC to read: a reading with a CPU figure on a Mac that has one, no
+    /// key at all in a VM or on Linux.
+    #[tokio::test]
+    async fn status_endpoint_carries_heat_where_there_is_an_smc() {
+        let manager = Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
+        let (status, _, body) =
+            status_request(manager, Method::GET, Some(loopback_peer()), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let wire: Value = serde_json::from_slice(&body).expect("json");
+        let mut smc = tcr_smc::HeatSource::open(Box::new(|_| {}));
+        match smc.read() {
+            None => assert!(wire.get("heat").is_none(), "no SMC, no key: {wire}"),
+            Some(reading) => {
+                assert!(reading.cpu_celsius.is_some(), "this Mac reads a CPU figure");
+                let cpu = wire["heat"]["cpuCelsius"].as_f64();
+                assert!(
+                    cpu.is_some_and(|c| tcr_smc::PLAUSIBLE_CELSIUS.contains(&c)),
+                    "{wire}"
+                );
+            }
+        }
     }
 
     /// THE BITING TEST for the whole change: the endpoint reports the counters of

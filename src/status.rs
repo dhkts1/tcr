@@ -290,6 +290,18 @@ pub struct StatusPayload {
         skip_serializing_if = "Option::is_none"
     )]
     pub unkeyed_requests: Option<Vec<UnkeyedCount>>,
+    /// How hot the serving Mac runs and how hard its fans work ([`crate::heat`]).
+    /// `None` where there is no AppleSMC to read (a VM, Linux), and from an OLD
+    /// server that predates the key. `from_snapshot` leaves it `None` and the
+    /// serving process fills it, as with [`Self::mitm`].
+    ///
+    /// Not a secret: a temperature and some fan speeds, so the module's
+    /// no-secret invariant holds. `#[serde(default, skip_serializing_if)]` and,
+    /// per this struct's `build` doc-comment, NOT a [`STATUS_KIND`] bump: an OLD
+    /// client skips the unknown key, and a NEW client reading an OLD server
+    /// reads `None`, which draws the line without heat, the truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heat: Option<tcr_status_wire::HeatRow>,
 }
 
 /// One row of [`StatusPayload::unkeyed_connects`] or
@@ -690,6 +702,8 @@ impl StatusPayload {
             request_key_mode: None,
             unkeyed_connects: None,
             unkeyed_requests: None,
+            // The machine's heat is read by the serving process, off its runtime.
+            heat: None,
         }
     }
 
@@ -2719,6 +2733,58 @@ mod tests {
             let back: StatusPayload = serde_json::from_value(wire).expect("deserialize");
             assert_eq!(back.mitm, Some(reported));
         }
+    }
+
+    /// `heat` carries no key until the serving process reads one, an older
+    /// server's payload reads as `None`, and a reading crosses in camelCase
+    /// and comes back whole.
+    #[test]
+    fn heat_is_absent_until_the_serving_process_reads_it() {
+        let mut payload = StatusPayload::from_snapshot(
+            &snapshot_with_counters(),
+            &[0.85],
+            false,
+            None,
+            Default::default(),
+        );
+        let wire = serde_json::to_string(&payload).expect("serialize");
+        assert!(
+            !wire.contains("\"heat\""),
+            "no key until it is read: {wire}"
+        );
+        let old: StatusPayload =
+            serde_json::from_str(r#"{"kind":"tcr.status.v1","accounts":[]}"#).expect("parse");
+        assert_eq!(old.heat, None, "an older server reports no heat");
+
+        let reading = tcr_status_wire::HeatRow {
+            cpu_celsius: Some(93.25),
+            fans: vec![tcr_status_wire::FanRow {
+                index: 0,
+                actual_rpm: 4976.0,
+                min_rpm: 1350.0,
+                max_rpm: 5777.0,
+                manual: true,
+            }],
+        };
+        payload.heat = Some(reading.clone());
+        let wire = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(
+            wire["heat"],
+            serde_json::json!({
+                "cpuCelsius": 93.25,
+                "fans": [{"index": 0, "actualRpm": 4976.0, "minRpm": 1350.0,
+                          "maxRpm": 5777.0, "manual": true}],
+            }),
+            "{wire}"
+        );
+        let back: StatusPayload = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(back.heat, Some(reading));
+
+        // A reading with no CPU figure and no fans is still a reading: the SMC
+        // opened and nothing read. It crosses as an empty object, not as absent.
+        payload.heat = Some(tcr_status_wire::HeatRow::default());
+        let wire = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(wire["heat"], serde_json::json!({"fans": []}));
     }
 
     /// Every Codex fact a server knows, the facts its snapshot groups under `codex`,

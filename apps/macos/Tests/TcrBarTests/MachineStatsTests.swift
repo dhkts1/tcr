@@ -1,4 +1,3 @@
-import TcrSMC
 import XCTest
 
 @testable import TcrBarCore
@@ -201,5 +200,55 @@ final class MachineStatsTests: XCTestCase {
         // Without manual there is nothing to say about the fans.
         XCTAssertEqual(
             heated(HeatReading(cpuCelsius: 50, fans: [fan(0, 2_000, max: 0)])).heatClause, "CPU 50°C")
+    }
+
+    // MARK: - heat from the proxy (`tcr sessions --json`'s `heat` object)
+
+    /// The proxy's reading, as `render_sessions_json` writes it, decodes into
+    /// the fleet and draws the same clause a hand-built reading does.
+    func testHeatDecodesFromTheSessionsDocument() throws {
+        let json = """
+            {"supported": true, "sessions": [],
+             "heat": {"cpuCelsius": 93.3, "fans": [
+                {"index": 0, "actualRpm": 4976.0, "minRpm": 1350.0, "maxRpm": 5777.0, "manual": false},
+                {"index": 1, "actualRpm": 5013.0, "minRpm": 1350.0, "maxRpm": 5777.0, "manual": true}]}}
+            """
+        let read = try Fleet.decodeSessions(Data(json.utf8))
+        XCTAssertEqual(
+            read.heat,
+            HeatReading(
+                cpuCelsius: 93.3,
+                fans: [fan(0, 4_976), fan(1, 5_013, manual: true)]))
+        let fleet = Fleet(accounts: []).withSessions(read)
+        XCTAssertEqual(fleet.heat, read.heat)
+        XCTAssertEqual(
+            MachineStats.read(heat: fleet.heat).heatClause, "CPU 93°C · fans 87% manual")
+    }
+
+    /// No `heat` key (a proxy with no SMC, or one that predates the key) is no
+    /// reading, and the line is the line without heat.
+    func testNoHeatKeyIsNoReading() throws {
+        let read = try Fleet.decodeSessions(Data(#"{"supported": true, "sessions": []}"#.utf8))
+        XCTAssertNil(read.heat)
+        XCTAssertNil(heated(read.heat).heatClause)
+    }
+
+    /// A `heat` that is not the shape this build reads costs the heat clause
+    /// and nothing else: the session rows beside it still decode.
+    func testUnreadableHeatCostsOnlyTheHeat() throws {
+        let json = """
+            {"supported": true, "sessions": [{"sessionId": "11111111-1111-1111-1111-111111111111"}],
+             "heat": {"cpuCelsius": "hot"}}
+            """
+        let read = try Fleet.decodeSessions(Data(json.utf8))
+        XCTAssertNil(read.heat)
+        XCTAssertEqual(read.channel, .live)
+        XCTAssertEqual(read.sessions.count + read.unreadable.count, 1)
+        // A reading with nothing in it (the SMC opened, nothing read) is a
+        // reading, and draws no clause.
+        let empty = try Fleet.decodeSessions(
+            Data(#"{"supported": true, "sessions": [], "heat": {"fans": []}}"#.utf8))
+        XCTAssertEqual(empty.heat, HeatReading(cpuCelsius: nil, fans: []))
+        XCTAssertNil(heated(empty.heat).heatClause)
     }
 }
