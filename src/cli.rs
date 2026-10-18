@@ -8361,6 +8361,7 @@ mod tests {
             targets: vec![],
             detail: None,
             command: 0,
+            since_ms: None,
         };
         let heat = tcr_status_wire::HeatRow {
             cpu_celsius: Some(61.0),
@@ -8426,6 +8427,7 @@ mod tests {
             targets: vec![],
             detail: None,
             command,
+            since_ms: None,
         }
     }
 
@@ -8560,6 +8562,11 @@ mod tests {
 
         let ours: crate::fan::FanAccepted = serde_json::from_str(r#"{"command":7}"#).unwrap();
         assert_eq!(accepted_command(ours, 3456).unwrap(), 7);
+        // This build's 202: the whole object from before the command, with its number.
+        let full = r#"{"desired":{"mode":"auto"},"state":"off","reason":null,
+            "hotGuard":false,"targets":[],"detail":null,"command":8,"sinceMs":1760000000000}"#;
+        let ours: crate::fan::FanAccepted = serde_json::from_str(full).unwrap();
+        assert_eq!(accepted_command(ours, 3456).unwrap(), 8);
 
         // Its status object does not read as one, so nothing is judged from it.
         assert!(serde_json::from_str::<tcr_status_wire::FanControlRow>(old_answer).is_err());

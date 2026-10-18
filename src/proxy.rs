@@ -2455,10 +2455,11 @@ async fn config_set_handler(State(manager): State<Arc<Manager>>, req: Request) -
 /// `POST /_tcr/fan`: hand one fan mode to the controller ([`FAN_PATH`]).
 ///
 /// Never waits on the fans: the controller may be inside a 15 s unlock, and
-/// the mode is queued behind it (latest wins). The 202 body is
-/// `{"command": n}`, the number the command was sent under
-/// ([`crate::fan::FanHandle::send`]); `tcr fan` polls the status route until
-/// `fanControl.command` reaches it and the state settles.
+/// the mode is queued behind it (latest wins). The 202 body is the
+/// `fanControl` object as it stood when the command went in, with `command`
+/// the number the command was sent under ([`crate::fan::FanHandle::send`]);
+/// `tcr fan` polls the status route until `fanControl.command` reaches it and
+/// the state settles. A 1.2.12 `tcr fan` reads the rest, as it always did.
 async fn fan_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let request: crate::fan::FanRequest = match read_command(
         &FAN_ROUTE,
@@ -2493,10 +2494,7 @@ async fn fan_handler(State(manager): State<Arc<Manager>>, req: Request) -> Respo
         );
     };
     match fan.send(command) {
-        Ok(command) => {
-            let accepted = crate::fan::FanAccepted {
-                command: Some(command),
-            };
+        Ok(accepted) => {
             let mut response = json_ok(&FAN_ROUTE, &accepted);
             if response.status() == StatusCode::OK {
                 *response.status_mut() = StatusCode::ACCEPTED;
@@ -15448,8 +15446,9 @@ mod tests {
     }
 
     /// `/_tcr/fan`: POST only, the exact bodies of the contract, a stamped 400
-    /// in one sentence for a refused value, a stamped 202 carrying the
-    /// command's number, and the new wish on the status route, under that
+    /// in one sentence for a refused value, a stamped 202 carrying the object
+    /// from before the command under the command's number, and the new wish on
+    /// the status route, under that
     /// number, once the controller acted on it. The controller behind it
     /// reaches no SMC and no helper, so nothing here can touch a fan.
     #[tokio::test]
@@ -15488,11 +15487,14 @@ mod tests {
         let mine = accepted["command"]
             .as_u64()
             .unwrap_or_else(|| panic!("the 202 names the command's number: {accepted}"));
+        // The rest is the object from before the command, as 1.2.12 answered:
+        // the controller starts on Auto.
         assert_eq!(
-            accepted.as_object().map(serde_json::Map::len),
-            Some(1),
+            accepted["desired"],
+            serde_json::json!({"mode": "auto"}),
             "{accepted}"
         );
+        assert!(accepted["sinceMs"].is_i64(), "{accepted}");
 
         let response = drive_full(
             Arc::clone(&manager),

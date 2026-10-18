@@ -2582,7 +2582,8 @@ file means Auto.
   "hotGuard": false,
   "targets": [{"fan": 0, "rpm": 5000.0}, {"fan": 1, "rpm": 5000.0}],
   "detail": null,
-  "command": 1760000000000
+  "command": 1760000000000,
+  "sinceMs": 1760000000000
 }
 ```
 
@@ -2600,6 +2601,9 @@ file means Auto.
 - `detail`: a sentence for a person, or `null`.
 - `command`: the number of the newest command the controller has acted on. Numbers start from
   the server's start time in milliseconds and go up by one per command.
+- `sinceMs`: milliseconds since the Unix epoch when the state last changed or the controller last
+  acted on a command. Written only for `tcr fan` 1.2.12, which waits on it; nothing newer reads
+  it, and it goes after the release after next.
 
 `desired` and `command` move together, when the controller acts: a mode just sent does not show
 until the controller has acted on it, so every object pairs a state with the wish it was reached
@@ -2616,9 +2620,12 @@ Gated like `/_tcr/config` (loopback, the proxy key when one is set, a loopback h
 cross-site, `application/json`). The body is exactly one of `{"mode": "auto"}`,
 `{"mode": "auto", "force": true}`, `{"mode": "fixed", "rpm": 5000}`,
 `{"mode": "followCpu", "quietBelowC": 60, "fullAtC": 90}`; any other key or value is a 400 in one
-sentence. Accepted is 202 with `{"command": n}`, the number the command was given, which
-`fanControl.command` reaches once the controller has acted on it; a server running no fan
-controller answers 503. `GET` is 405. Any local caller that passes that gate can ask for a fan mode, which
+sentence. Accepted is 202 with the `fanControl` object as it stood when the command went in,
+before the controller acted on it, except that its `command` is the number this command was
+given, which `fanControl.command` reaches once the controller has acted on it. `tcr fan` reads
+only that number; `tcr fan` 1.2.12 reads the rest, keeping `desired` to tell "not taken yet"
+from "replaced", so it works against this server. A server running no fan controller
+answers 503. `GET` is 405. Any local caller that passes that gate can ask for a fan mode, which
 is the same class of caller that can already save a setting or add an account; what it gets is a
 validated mode, clamped by the helper, with the hot guard on in Follow CPU.
 

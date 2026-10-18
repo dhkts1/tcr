@@ -523,6 +523,10 @@ pub struct Snapshot {
     /// from before the controller acted on a command reads below that
     /// command's number. Starts at [`Parts::commands_before`].
     pub command: u64,
+    /// Wall ms of the last stamp: when the state last changed, or the
+    /// controller last acted on a command. Moves with `command`. Only for
+    /// 1.2.12's `tcr fan`, which waits on it; goes with the status's `sinceMs`.
+    pub since_ms: i64,
 }
 
 pub type Publish = Box<dyn FnMut(&Snapshot) + Send>;
@@ -619,6 +623,8 @@ pub struct Controller<H, R, P, C, S> {
     /// [`Snapshot::command`] shows, moved with `shown_desired`).
     taken: u64,
     acted: u64,
+    /// [`Snapshot::since_ms`], moved with `acted`.
+    since_ms: i64,
     failed_entries: u32,
     backoff_step: usize,
     retry_at: Option<Instant>,
@@ -640,6 +646,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// dropped.
     pub fn new(parts: Parts<H, R, P, C, S>, saved: Option<Saved>) -> Self {
         let first = parts.commands_before;
+        let since_ms = parts.clock.wall_ms();
         let (desired, hold) = saved.map_or((FanDesired::Auto, None), |s| (s.desired, s.hold));
         let mut controller = Self {
             parts,
@@ -653,6 +660,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             shown_desired: desired,
             taken: first,
             acted: first,
+            since_ms,
             failed_entries: 0,
             backoff_step: 0,
             retry_at: None,
@@ -751,6 +759,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 .collect(),
             detail: self.detail,
             command: self.acted,
+            since_ms: self.since_ms,
         }
     }
 
@@ -1743,9 +1752,10 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
 
     /// The wish shown and the command number acted on, moved together
     /// ([`Snapshot`]).
-    const fn stamp(&mut self) {
+    fn stamp(&mut self) {
         self.shown_desired = self.desired;
         self.acted = self.taken;
+        self.since_ms = self.parts.clock.wall_ms();
     }
 
     fn publish(&mut self) {

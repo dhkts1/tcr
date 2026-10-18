@@ -460,6 +460,12 @@ pub struct FanControlRow {
     /// this to reach it. Numbers start from the wall clock in ms when the server starts, so a
     /// server restarted since reads as having acted on every command sent before.
     pub command: u64,
+    /// Milliseconds since the Unix epoch when the state last changed, or the controller last
+    /// acted on a command; it moves with `command`. Written only for 1.2.12's `tcr fan`, which
+    /// requires it and waits on it; nothing in this build reads it. Optional so a reader does
+    /// not break when the server stops writing it, after the release after next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
 }
 
 /// [`FanControlRow::desired`]: one mode, tagged by `mode`. Whole rpm and whole °C.
