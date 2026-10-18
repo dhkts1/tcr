@@ -312,6 +312,39 @@ impl Rig {
     fn set_target(&self, index: u8, rpm: f64) {
         self.world.lock().fan_mut(fan(index)).unwrap().target_rpm = Some(rpm);
     }
+
+    fn cpu(&self, celsius: f64) {
+        self.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(celsius);
+    }
+
+    fn macs(&self, running: Result<bool, String>) {
+        self.world.lock().macs = running;
+    }
+
+    /// Every fan back on automatic, as macOS taking them would leave it.
+    fn all_auto(&self) {
+        for f in &mut self.world.lock().reading.as_mut().unwrap().fans {
+            f.mode = FanMode::Auto;
+        }
+    }
+
+    /// The helper answers `result` to every request `when` picks, and acts
+    /// as root would on the rest.
+    fn answer(
+        &self,
+        when: impl Fn(&Request) -> bool + Send + 'static,
+        result: Result<Reply, Fault>,
+    ) {
+        self.hook(Box::new(move |request, _machine, _inject, _clock| {
+            when(request).then(|| result.clone())
+        }));
+    }
+
+    /// A connection event from connection `generation`, then a pump.
+    fn fault(&mut self, generation: Generation, fault: Fault) {
+        self.tx.send(Input::Xpc { generation, fault }).unwrap();
+        self.c.pump();
+    }
 }
 
 fn holding(mode: FanDesired) -> Rig {
@@ -332,21 +365,27 @@ fn set_manual(index: u8) -> Request {
     Request::SetManual { fan: fan(index) }
 }
 
+/// Both fans' set-targets at `rpm`.
+fn targets(rpm: f64) -> Vec<Request> {
+    vec![set_target(0, rpm), set_target(1, rpm)]
+}
+
+/// An entry's writes: both set-manuals, then both set-targets at `rpm`.
+fn entry(rpm: f64) -> Vec<Request> {
+    [vec![set_manual(0), set_manual(1)], targets(rpm)].concat()
+}
+
+/// An entry's requests, the version call first.
+fn entry_requests(rpm: f64) -> Vec<Request> {
+    [vec![Request::Version], entry(rpm)].concat()
+}
+
 // The happy paths.
 
 #[test]
 fn fixed_enters_every_fan_then_targets_them() {
     let rig = holding(fixed(5000));
-    assert_eq!(
-        rig.world.lock().requests,
-        vec![
-            Request::Version,
-            set_manual(0),
-            set_manual(1),
-            set_target(0, 5000.0),
-            set_target(1, 5000.0),
-        ]
-    );
+    assert_eq!(rig.world.lock().requests, entry_requests(5000.0));
     let hold = rig.c.hold().unwrap();
     assert_eq!(hold.writer_pid, 4242);
     assert!(hold.fans.iter().all(|f| f.written_rpm == Some(5000.0)));
@@ -385,16 +424,13 @@ fn follow_writes_only_past_the_step() {
     assert_eq!(rig.c.hold().unwrap().fans[0].written_rpm, Some(1350.0));
     rig.clear_requests();
     // 61 °C moves the target 1/30 of the range: under 5 %.
-    rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(61.0);
+    rig.cpu(61.0);
     assert_eq!(rig.next_tick(), Some(TickOutcome::NoChange));
     // 75 °C is half way.
-    rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(75.0);
+    rig.cpu(75.0);
     assert_eq!(rig.next_tick(), Some(TickOutcome::Wrote(2)));
     let half = 1350.0 + (5777.0 - 1350.0) / 2.0;
-    assert_eq!(
-        rig.written(),
-        vec![set_target(0, half), set_target(1, half)]
-    );
+    assert_eq!(rig.written(), targets(half));
 }
 
 #[test]
@@ -403,25 +439,17 @@ fn the_hot_guard_runs_full_until_it_cools() {
     // guard, not the curve, is what holds full speed.
     let mut rig = holding(follow(40, 100));
     rig.clear_requests();
-    rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(100.0);
+    rig.cpu(100.0);
     assert_eq!(rig.next_tick(), Some(TickOutcome::Wrote(2)));
     assert!(rig.c.snapshot().hot_guard);
-    rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(95.0);
+    rig.cpu(95.0);
     assert_eq!(rig.next_tick(), Some(TickOutcome::NoChange));
     assert!(rig.c.snapshot().hot_guard);
-    rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(89.0);
+    rig.cpu(89.0);
     assert_eq!(rig.next_tick(), Some(TickOutcome::Wrote(2)));
     assert!(!rig.c.snapshot().hot_guard);
     let cooled = (49.0_f64 / 60.0).mul_add(5777.0 - 1350.0, 1350.0);
-    assert_eq!(
-        rig.written(),
-        vec![
-            set_target(0, 5777.0),
-            set_target(1, 5777.0),
-            set_target(0, cooled),
-            set_target(1, cooled),
-        ]
-    );
+    assert_eq!(rig.written(), [targets(5777.0), targets(cooled)].concat());
 }
 
 /// A round's plan, worked out before any write: the cases the two tests above
@@ -511,33 +539,22 @@ fn the_hot_guard_never_raises_a_fixed_target() {
     let mut rig = rig_from(None, Some(hot_reading));
     rig.send(Command::Set(fixed(5000)));
     assert_eq!(rig.c.state(), State::Holding);
-    assert_eq!(
-        rig.written(),
-        vec![
-            set_manual(0),
-            set_manual(1),
-            set_target(0, 5000.0),
-            set_target(1, 5000.0),
-        ]
-    );
+    assert_eq!(rig.written(), entry(5000.0));
     assert!(!rig.c.snapshot().hot_guard);
     rig.clear_requests();
-    rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(104.0);
+    rig.cpu(104.0);
     assert_eq!(rig.next_tick(), Some(TickOutcome::NoChange));
     assert_eq!(rig.written(), vec![]);
     assert!(!rig.c.snapshot().hot_guard);
 
     let mut rig = holding(follow(40, 100));
-    rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(105.0);
+    rig.cpu(105.0);
     assert_eq!(rig.next_tick(), Some(TickOutcome::Wrote(2)));
     assert!(rig.c.snapshot().hot_guard);
     rig.clear_requests();
     rig.send(Command::Set(fixed(3000)));
     assert!(!rig.c.snapshot().hot_guard);
-    assert_eq!(
-        rig.written(),
-        vec![set_target(0, 3000.0), set_target(1, 3000.0)]
-    );
+    assert_eq!(rig.written(), targets(3000.0));
     assert_eq!(rig.next_tick(), Some(TickOutcome::NoChange));
     assert_eq!(rig.c.hold().unwrap().fans[0].written_rpm, Some(3000.0));
 }
@@ -547,10 +564,7 @@ fn a_new_fixed_speed_is_written_at_once() {
     let mut rig = holding(fixed(5000));
     rig.clear_requests();
     rig.send(Command::Set(fixed(5100)));
-    assert_eq!(
-        rig.written(),
-        vec![set_target(0, 5100.0), set_target(1, 5100.0)]
-    );
+    assert_eq!(rig.written(), targets(5100.0));
 }
 
 // H1: whose fans.
@@ -589,7 +603,7 @@ fn tick_never_writes_when_target_changed() {
 fn no_write_while_macs_runs() {
     // Entering: not even a version call.
     let mut rig = rig();
-    rig.world.lock().macs = Ok(true);
+    rig.macs(Ok(true));
     rig.send(Command::Set(fixed(3000)));
     assert_eq!(rig.c.state(), State::Foreign(ForeignHolder::MacsFanControl));
     assert_eq!(rig.world.lock().requests, vec![]);
@@ -602,8 +616,8 @@ fn no_write_while_macs_runs() {
     // Holding.
     let mut rig = holding(fixed(3000));
     rig.clear_requests();
-    rig.world.lock().macs = Ok(true);
-    rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(100.0);
+    rig.macs(Ok(true));
+    rig.cpu(100.0);
     assert_eq!(
         rig.next_tick(),
         Some(TickOutcome::HeldBack(Why::MacsFanControl))
@@ -615,14 +629,14 @@ fn no_write_while_macs_runs() {
     // Releasing: Auto waits, then hands back once it quits.
     let mut rig = holding(fixed(3000));
     rig.clear_requests();
-    rig.world.lock().macs = Ok(true);
+    rig.macs(Ok(true));
     rig.send(Command::Set(FanDesired::Auto));
     assert_eq!(rig.written(), vec![]);
     assert_eq!(rig.c.state(), State::Foreign(ForeignHolder::MacsFanControl));
     assert_eq!(rig.c.detail(), Some(Detail::WaitingForMacs));
     rig.next_tick();
     assert_eq!(rig.written(), vec![]);
-    rig.world.lock().macs = Ok(false);
+    rig.macs(Ok(false));
     rig.next_tick();
     assert_eq!(rig.written(), vec![Request::HandBack]);
     assert_eq!(rig.c.state(), State::Off);
@@ -630,7 +644,7 @@ fn no_write_while_macs_runs() {
     // A force waits too.
     let mut rig = holding(fixed(3000));
     rig.clear_requests();
-    rig.world.lock().macs = Ok(true);
+    rig.macs(Ok(true));
     rig.send(Command::ForceHandBack);
     assert_eq!(rig.written(), vec![]);
 }
@@ -642,7 +656,7 @@ fn read_error_writes_nothing() {
     let mut rig = holding(follow(60, 90));
     rig.clear_requests();
     rig.world.lock().fan_mut(fan(1)).unwrap().mode = FanMode::Unreadable;
-    rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(100.0);
+    rig.cpu(100.0);
     assert_eq!(
         rig.next_tick(),
         Some(TickOutcome::HeldBack(Why::Unreadable))
@@ -655,13 +669,13 @@ fn read_error_writes_nothing() {
         Some(TickOutcome::HeldBack(Why::Unreadable))
     );
     let probe_failed = {
-        rig.world.lock().macs = Err("proc_listallpids failed".into());
+        rig.macs(Err("proc_listallpids failed".into()));
         rig.next_tick()
     };
     assert_eq!(probe_failed, Some(TickOutcome::HeldBack(Why::ProbeFailed)));
     assert_eq!(rig.written(), vec![]);
     // Readable again and still ours: back to holding, and full speed is written.
-    rig.world.lock().macs = Ok(false);
+    rig.macs(Ok(false));
     rig.world.lock().fan_mut(fan(1)).unwrap().target_rpm = Some(1350.0);
     assert_eq!(rig.next_tick(), Some(TickOutcome::Wrote(2)));
     assert_eq!(rig.c.state(), State::Holding);
@@ -680,12 +694,7 @@ fn holder_rechecked_each_tick() {
     );
     assert_eq!(rig.written(), vec![]);
     // When it hands the fans back, we take them again (not counted).
-    {
-        let mut machine = rig.world.lock();
-        for f in &mut machine.reading.as_mut().unwrap().fans {
-            f.mode = FanMode::Auto;
-        }
-    }
+    rig.all_auto();
     rig.next_tick();
     assert_eq!(rig.c.state(), State::Holding);
 }
@@ -745,15 +754,7 @@ fn the_latest_wish_during_the_unlock_wins() {
     }));
     rig.send(Command::Set(fixed(3000)));
     assert_eq!(rig.c.state(), State::Holding);
-    assert_eq!(
-        rig.written(),
-        vec![
-            set_manual(0),
-            set_manual(1),
-            set_target(0, 4500.0),
-            set_target(1, 4500.0)
-        ]
-    );
+    assert_eq!(rig.written(), entry(4500.0));
 }
 
 // H3: partial failure.
@@ -761,10 +762,10 @@ fn the_latest_wish_during_the_unlock_wins() {
 #[test]
 fn second_fan_failure_hands_back_before_error() {
     let mut rig = rig();
-    rig.hook(Box::new(|request, _machine, _inject, _clock| {
-        (*request == set_manual(1))
-            .then_some(Ok(Reply::Refused(HelperError::ModeLocked { fan: 1 })))
-    }));
+    rig.answer(
+        |request| *request == set_manual(1),
+        Ok(Reply::Refused(HelperError::ModeLocked { fan: 1 })),
+    );
     rig.send(Command::Set(fixed(3000)));
     assert_eq!(
         rig.written(),
@@ -785,9 +786,10 @@ fn second_fan_failure_hands_back_before_error() {
 #[test]
 fn a_target_failure_hands_back_too() {
     let mut rig = rig();
-    rig.hook(Box::new(|request, _machine, _inject, _clock| {
-        (*request == set_target(1, 3000.0)).then_some(Err(Fault::NoReply))
-    }));
+    rig.answer(
+        |request| *request == set_target(1, 3000.0),
+        Err(Fault::NoReply),
+    );
     rig.send(Command::Set(fixed(3000)));
     assert_eq!(rig.written().last(), Some(&Request::HandBack));
     assert_eq!(
@@ -805,16 +807,7 @@ fn a_helper_launchd_starts_late_still_answers_the_version_call() {
     late.world.lock().first_reply_after = Duration::from_secs(11);
     late.send(Command::Set(fixed(5000)));
     assert_eq!(late.c.state(), State::Holding);
-    assert_eq!(
-        late.world.lock().requests,
-        vec![
-            Request::Version,
-            set_manual(0),
-            set_manual(1),
-            set_target(0, 5000.0),
-            set_target(1, 5000.0),
-        ]
-    );
+    assert_eq!(late.world.lock().requests, entry_requests(5000.0));
 
     // Past the deadline is still no reply: the wait is bounded.
     let mut too_late = rig();
@@ -830,9 +823,7 @@ fn a_helper_launchd_starts_late_still_answers_the_version_call() {
 #[test]
 fn three_failed_entries_stop_the_retry() {
     let mut rig = rig();
-    rig.hook(Box::new(|request, _machine, _inject, _clock| {
-        matches!(request, Request::Version).then_some(Err(Fault::Invalid))
-    }));
+    rig.answer(|request| *request == Request::Version, Err(Fault::Invalid));
     rig.send(Command::Set(fixed(3000)));
     for wait in [5, 10] {
         assert_eq!(
@@ -861,9 +852,10 @@ fn three_failed_entries_stop_the_retry() {
 #[test]
 fn a_signature_refusal_is_never_retried_on_its_own() {
     let mut rig = rig();
-    rig.hook(Box::new(|request, _machine, _inject, _clock| {
-        matches!(request, Request::Version).then_some(Err(Fault::Requirement))
-    }));
+    rig.answer(
+        |request| *request == Request::Version,
+        Err(Fault::Requirement),
+    );
     rig.send(Command::Set(fixed(3000)));
     assert_eq!(
         rig.c.state(),
@@ -884,38 +876,17 @@ fn interrupted_reapplies() {
     let mut rig = holding(fixed(3000));
     rig.clear_requests();
     let first = rig.c.generation();
-    rig.tx
-        .send(Input::Xpc {
-            generation: first,
-            fault: Fault::Interrupted,
-        })
-        .unwrap();
-    rig.c.pump();
+    rig.fault(first, Fault::Interrupted);
     assert_eq!(rig.c.state(), State::Holding);
     assert!(rig.c.generation() > first);
-    assert_eq!(
-        rig.world.lock().requests,
-        vec![
-            Request::Version,
-            set_manual(0),
-            set_manual(1),
-            set_target(0, 3000.0),
-            set_target(1, 3000.0),
-        ]
-    );
+    assert_eq!(rig.world.lock().requests, entry_requests(3000.0));
 }
 
 #[test]
 fn stale_generation_event_ignored() {
     let mut rig = holding(fixed(3000));
     let old = rig.c.generation();
-    rig.tx
-        .send(Input::Xpc {
-            generation: old,
-            fault: Fault::Interrupted,
-        })
-        .unwrap();
-    rig.c.pump();
+    rig.fault(old, Fault::Interrupted);
     let current = rig.c.generation();
     assert!(current > old);
     rig.clear_requests();
@@ -925,26 +896,14 @@ fn stale_generation_event_ignored() {
         Fault::Interrupted,
         Fault::PeerCodeSigningRequirement,
     ] {
-        rig.tx
-            .send(Input::Xpc {
-                generation: old,
-                fault,
-            })
-            .unwrap();
-        rig.c.pump();
+        rig.fault(old, fault);
     }
     assert_eq!(rig.c.state(), State::Holding);
     assert!(rig.c.connected());
     assert_eq!(rig.c.generation(), current);
     assert_eq!(rig.world.lock().requests, vec![]);
     // The current one's does count.
-    rig.tx
-        .send(Input::Xpc {
-            generation: current,
-            fault: Fault::Invalid,
-        })
-        .unwrap();
-    rig.c.pump();
+    rig.fault(current, Fault::Invalid);
     assert_eq!(
         rig.c.state(),
         State::Unavailable(Unavailable::HelperUnreachable)
@@ -957,12 +916,7 @@ fn wake_with_every_fan_automatic_reenters_and_says_why() {
     // The wall clock jumps an hour while the monotonic one does not.
     rig.next_tick();
     rig.clock.0.lock().unwrap().1 += 3_600_000;
-    {
-        let mut machine = rig.world.lock();
-        for f in &mut machine.reading.as_mut().unwrap().fans {
-            f.mode = FanMode::Auto;
-        }
-    }
+    rig.all_auto();
     rig.clear_requests();
     rig.next_tick();
     assert_eq!(rig.c.state(), State::Holding);
@@ -974,12 +928,7 @@ fn wake_with_every_fan_automatic_reenters_and_says_why() {
 fn fans_that_keep_going_automatic_are_contended() {
     let mut rig = holding(fixed(3000));
     for _ in 0..=REENTRY_LIMIT {
-        {
-            let mut machine = rig.world.lock();
-            for f in &mut machine.reading.as_mut().unwrap().fans {
-                f.mode = FanMode::Auto;
-            }
-        }
+        rig.all_auto();
         rig.next_tick();
     }
     assert_eq!(rig.c.state(), State::Unavailable(Unavailable::Contended));
@@ -989,11 +938,11 @@ fn fans_that_keep_going_automatic_are_contended() {
 fn another_tcr_taking_over_stops_without_a_hand_back() {
     let mut rig = holding(follow(60, 90));
     rig.clear_requests();
-    rig.hook(Box::new(|request, _machine, _inject, _clock| {
-        matches!(request, Request::SetTarget { .. })
-            .then_some(Ok(Reply::Refused(HelperError::NotHolder)))
-    }));
-    rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(80.0);
+    rig.answer(
+        |request| matches!(request, Request::SetTarget { .. }),
+        Ok(Reply::Refused(HelperError::NotHolder)),
+    );
+    rig.cpu(80.0);
     rig.next_tick();
     assert!(!rig.written().contains(&Request::HandBack));
     assert_eq!(rig.c.detail(), Some(Detail::TakenOver));
@@ -1089,14 +1038,13 @@ fn shutdown_hands_back_and_keeps_the_wish() {
 fn a_failing_hand_back_is_stuck_after_three_tries() {
     let mut rig = holding(fixed(3000));
     rig.clear_requests();
-    rig.hook(Box::new(|request, _machine, _inject, _clock| {
-        matches!(request, Request::HandBack).then_some(Ok(Reply::Refused(
-            HelperError::HandBackIncomplete {
-                fans: 1,
-                ftst: false,
-            },
-        )))
-    }));
+    rig.answer(
+        |request| *request == Request::HandBack,
+        Ok(Reply::Refused(HelperError::HandBackIncomplete {
+            fans: 1,
+            ftst: false,
+        })),
+    );
     rig.send(Command::Set(FanDesired::Auto));
     assert_eq!(rig.c.state(), State::Stuck);
     assert_eq!(rig.written(), vec![Request::HandBack; RELEASE_TRIES]);
@@ -1149,13 +1097,13 @@ fn every_tick_path_has_an_outcome() {
 
     let mut rig = holding(follow(60, 90));
     seen.push(rig.next_tick());
-    rig.world.lock().reading.as_mut().unwrap().cpu_celsius = Some(90.0);
+    rig.cpu(90.0);
     seen.push(rig.next_tick());
-    rig.world.lock().macs = Err("probe".into());
+    rig.macs(Err("probe".into()));
     seen.push(rig.next_tick());
-    rig.world.lock().macs = Ok(true);
+    rig.macs(Ok(true));
     seen.push(rig.next_tick());
-    rig.world.lock().macs = Ok(false);
+    rig.macs(Ok(false));
     rig.world.lock().fan_mut(fan(0)).unwrap().mode = FanMode::Unreadable;
     seen.push(rig.next_tick());
     rig.world.lock().fan_mut(fan(0)).unwrap().mode = FanMode::Manual;
@@ -1169,16 +1117,12 @@ fn every_tick_path_has_an_outcome() {
     rig.world.lock().reading = reading;
 
     let mut rig = holding(fixed(3000));
-    {
-        let mut machine = rig.world.lock();
-        for f in &mut machine.reading.as_mut().unwrap().fans {
-            f.mode = FanMode::Auto;
-        }
-    }
+    rig.all_auto();
     seen.push(rig.next_tick());
-    rig.hook(Box::new(|request, _machine, _inject, _clock| {
-        matches!(request, Request::SetTarget { .. }).then_some(Err(Fault::NoReply))
-    }));
+    rig.answer(
+        |request| matches!(request, Request::SetTarget { .. }),
+        Err(Fault::NoReply),
+    );
     rig.send(Command::Set(fixed(3500)));
     seen.push(rig.c.last_outcome());
 
@@ -1223,7 +1167,7 @@ impl Rig {
 fn a_waiting_release_logs_once_not_every_tick() {
     // Something held: Auto waits, quietly.
     let mut rig = holding(fixed(3000));
-    rig.world.lock().macs = Ok(true);
+    rig.macs(Ok(true));
     rig.send(Command::Set(FanDesired::Auto));
     assert_eq!(rig.c.state(), State::Foreign(ForeignHolder::MacsFanControl));
     assert!(!rig.take_logs().is_empty(), "the change itself is said");
@@ -1236,7 +1180,7 @@ fn a_waiting_release_logs_once_not_every_tick() {
 
     // A forced hand-back waits the same way.
     let mut rig = holding(fixed(3000));
-    rig.world.lock().macs = Ok(true);
+    rig.macs(Ok(true));
     rig.send(Command::ForceHandBack);
     rig.take_logs();
     for _ in 0..5 {
@@ -1246,7 +1190,7 @@ fn a_waiting_release_logs_once_not_every_tick() {
 
     // A probe that keeps failing: one warning, not one per tick.
     let mut rig = holding(fixed(3000));
-    rig.world.lock().macs = Err("proc_listallpids failed".into());
+    rig.macs(Err("proc_listallpids failed".into()));
     rig.send(Command::Set(FanDesired::Auto));
     assert_eq!(rig.c.state(), State::Unknown);
     let warnings = |logs: &[(Level, String)]| logs.iter().filter(|l| l.0 == Level::Warn).count();
@@ -1258,7 +1202,7 @@ fn a_waiting_release_logs_once_not_every_tick() {
 
     // Nothing held and no connection: Auto is simply off, no tick.
     let mut rig = rig_from(None, Some(machine()));
-    rig.world.lock().macs = Ok(true);
+    rig.macs(Ok(true));
     rig.send(Command::Set(fixed(3000)));
     assert_eq!(rig.c.state(), State::Foreign(ForeignHolder::MacsFanControl));
     assert_eq!(rig.c.hold(), None);
@@ -1360,15 +1304,7 @@ fn a_held_fan_back_on_automatic_alone_is_retaken() {
         rig.next_tick(),
         Some(TickOutcome::HeldBack(Why::Reentering))
     );
-    assert_eq!(
-        rig.written(),
-        vec![
-            set_manual(0),
-            set_manual(1),
-            set_target(0, 3000.0),
-            set_target(1, 3000.0)
-        ]
-    );
+    assert_eq!(rig.written(), entry(3000.0));
     assert_eq!(rig.c.state(), State::Holding);
     assert_eq!(
         rig.world.lock().fan_mut(fan(1)).unwrap().mode,
@@ -1454,7 +1390,7 @@ fn a_shutdown_checks_as_a_release_does() {
 
     let mut rig = holding(fixed(3000));
     rig.clear_requests();
-    rig.world.lock().macs = Err("probe".into());
+    rig.macs(Err("probe".into()));
     let at = deadline(&rig);
     assert_eq!(rig.send(Command::Shutdown { deadline: at }), Flow::Exit);
     assert_eq!(rig.written(), vec![]);
@@ -1475,11 +1411,11 @@ fn a_shutdown_checks_as_a_release_does() {
 #[test]
 fn a_new_mode_drops_a_waiting_hand_back() {
     let mut rig = holding(fixed(3000));
-    rig.world.lock().macs = Ok(true);
+    rig.macs(Ok(true));
     rig.send(Command::ForceHandBack);
     rig.send(Command::Set(fixed(3000)));
     rig.clear_requests();
-    rig.world.lock().macs = Ok(false);
+    rig.macs(Ok(false));
     rig.next_tick();
     rig.next_tick();
     assert!(
@@ -1548,10 +1484,7 @@ fn a_changed_fixed_settles_after_the_write() {
     rig.clear_requests();
     let sent_at = rig.command_time();
     rig.send(Command::Set(fixed(4000)));
-    assert_eq!(
-        rig.written(),
-        vec![set_target(0, 4000.0), set_target(1, 4000.0)]
-    );
+    assert_eq!(rig.written(), targets(4000.0));
     let settled = rig.first_settled(sent_at).unwrap();
     assert_eq!(settled.state, State::Holding);
     assert_eq!(
