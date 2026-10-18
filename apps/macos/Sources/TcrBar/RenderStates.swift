@@ -3298,11 +3298,13 @@ enum RenderStates {
             // "CPU 61°C", a Mac with no fans
             "17f-tools-tab-heat-no-fans": machine(HeatReading(cpuCelsius: 61, fans: [])),
             // "load 168.4/14 · CPU 105°C · fans 100% manual · 128/128 GB ·
-            // 14 compiles · 1024 GB free", then the fleet's "99 err today ·
-            // 128 timed out" from ``heatWorstCaseFleet``.
+            // 999 compiles · 1024 GB free", then the fleet's "99 err today ·
+            // 9999 timed out" from ``heatWorstCaseFleet``. Three-digit
+            // compiles and four-digit timeouts are design figures, not
+            // measured: wider than any seen, so the reserve is tested past them.
             "17g-tools-tab-heat-worst-case": MachineStats(
                 loadAverage: 168.4, cores: 14, memoryUsedBytes: 128 * 1_073_741_824,
-                memoryTotalBytes: 128 * 1_073_741_824, compiles: 14,
+                memoryTotalBytes: 128 * 1_073_741_824, compiles: 999,
                 diskFreeBytes: 1_024_000_000_000,
                 heat: HeatReading(
                     cpuCelsius: 105, fans: [fan(0, 5_777, manual: true), fan(1, 5_777, manual: true)])),
@@ -3310,9 +3312,11 @@ enum RenderStates {
     }()
 
     /// Scene 17's fleet plus one session that carries no running call, sized
-    /// so the fleet's totals read the mockup's widest `99 err today · 128
-    /// timed out`. Derived from the base totals rather than written down, so
-    /// a change to `sessionsFixture` cannot quietly shorten the worst case.
+    /// so the fleet's totals read `99 err today · 9999 timed out`: the
+    /// mockup's widest errors and a four-digit timeout count, a design figure
+    /// wider than the mockup's 128. Derived from the base totals rather than
+    /// written down, so a change to `sessionsFixture` cannot quietly shorten
+    /// the worst case.
     private static var heatWorstCaseFleet: Fleet {
         let base = sessionsTabFleet
         let now = Int64(referenceDate.timeIntervalSince1970 * 1000)
@@ -3321,7 +3325,7 @@ enum RenderStates {
             model: "claude-sonnet-5", firstSeenMs: now - 3_600_000, lastSeenMs: now, requests: 10,
             tools: SessionTools(
                 calls: 300, errors: max(0, 99 - base.toolsTotalErrors),
-                timeouts: max(0, 128 - base.toolsTotalTimeouts)))
+                timeouts: max(0, 9_999 - base.toolsTotalTimeouts)))
         return Fleet(
             accounts: base.accounts, unreadable: base.unreadable, sessions: base.sessions + [padding],
             sessionsSupported: true)

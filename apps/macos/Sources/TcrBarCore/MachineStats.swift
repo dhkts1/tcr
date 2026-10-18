@@ -120,37 +120,60 @@ public struct MachineStats: Equatable, Sendable {
     ///   longer follow heat is the case worth seeing.
     /// - `fans off` when every fan reads 0 rpm; no fan part on a Mac with no
     ///   fans (`CPU 61°C`); no CPU part when no CPU sensor reads.
+    /// - ` manual` survives a reading with no share to show (every maximum
+    ///   reads 0): `fans manual`, because who holds the fans is the news.
     /// - Nil with no reading, so the line is exactly the line without heat.
+    ///
+    /// ``heatPhrases`` joined; the panel draws the two phrases apart so a wrap
+    /// can fall between them.
     public var heatClause: String? {
-        guard let heat else { return nil }
-        var parts: [String] = []
-        if let celsius = heat.cpuCelsius {
-            parts.append("CPU \(Int(celsius.rounded()))°C")
+        let phrases = heatPhrases
+        return phrases.isEmpty ? nil : phrases.joined(separator: " · ")
+    }
+
+    /// The CPU phrase and the fan phrase, each present or not on its own.
+    ///
+    /// Never traps: TcrSMC drops non-finite and out-of-band readings at the
+    /// source, but a `HeatReading` is a public value anyone can build, and
+    /// `Int(_:)` of NaN stops the process. A figure that is not a number is
+    /// left out, never drawn as one.
+    public var heatPhrases: [String] {
+        guard let heat else { return [] }
+        var phrases: [String] = []
+        if let celsius = heat.cpuCelsius, let degrees = Self.whole(celsius) {
+            phrases.append("CPU \(degrees)°C")
         }
-        if !heat.fans.isEmpty {
-            let manual = heat.fans.contains { $0.isManual } ? " manual" : ""
-            if heat.fans.allSatisfy({ $0.actualRPM <= 0 }) {
-                parts.append("fans off\(manual)")
-            } else if let busiest = heat.fans.compactMap(Self.shareOfMax).max() {
-                parts.append("fans \(Int((busiest * 100).rounded()))%\(manual)")
+        let fans = heat.fans.filter { $0.actualRPM.isFinite }
+        if !fans.isEmpty {
+            let manual = fans.contains { $0.isManual } ? " manual" : ""
+            if fans.allSatisfy({ $0.actualRPM <= 0 }) {
+                phrases.append("fans off\(manual)")
+            } else if let busiest = fans.compactMap(Self.shareOfMax).max(),
+                let percent = Self.whole(busiest * 100)
+            {
+                phrases.append("fans \(percent)%\(manual)")
+            } else if !manual.isEmpty {
+                phrases.append("fans\(manual)")
             }
         }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        return phrases
     }
 
     /// The per-fan detail behind ``heatClause``, for the numbers line's
     /// tooltip (mockup panel 3): one decimal on the CPU, each fan's own rpm
     /// against its own maximum, and what `manual` means. Nil when
-    /// ``heatClause`` is.
+    /// ``heatClause`` is. Figures that are not numbers are left out here too.
     public var heatDetail: String? {
         guard let heat, heatClause != nil else { return nil }
         var lines: [String] = []
-        if let celsius = heat.cpuCelsius {
+        if let celsius = heat.cpuCelsius, celsius.isFinite {
             lines.append("Hottest CPU sensor \(String(format: "%.1f", celsius)) °C")
         }
         for fan in heat.fans {
-            lines.append(
-                "Fan \(fan.index + 1): \(Self.grouped(fan.actualRPM)) of \(Self.grouped(fan.maxRPM)) rpm")
+            guard let actual = Self.grouped(fan.actualRPM) else { continue }
+            // A maximum of 0 is one that did not read, not a ceiling of 0.
+            let of = fan.maxRPM > 0 ? Self.grouped(fan.maxRPM).map { " of \($0)" } ?? "" : ""
+            lines.append("Fan \(fan.index + 1): \(actual)\(of) rpm")
         }
         if heat.fans.contains(where: { $0.isManual }) {
             lines.append("Manual: another app set these speeds, so they do not follow the heat.")
@@ -161,16 +184,26 @@ public struct MachineStats: Equatable, Sendable {
     /// Actual over maximum, or nil for a fan whose maximum did not read: a
     /// share of nothing is not 0 %, it is no figure.
     static func shareOfMax(_ fan: FanReading) -> Double? {
-        fan.maxRPM > 0 ? fan.actualRPM / fan.maxRPM : nil
+        guard fan.maxRPM.isFinite, fan.maxRPM > 0, fan.actualRPM.isFinite else { return nil }
+        return fan.actualRPM / fan.maxRPM
+    }
+
+    /// `value` rounded to a whole number, or nil when it is not a number
+    /// `Int` can hold: NaN, an infinity, or past ±10^15.
+    static func whole(_ value: Double) -> Int? {
+        guard value.isFinite, abs(value) < 1e15 else { return nil }
+        return Int(value.rounded())
     }
 
     /// Whole rpm with a comma every three digits, "5,013": fixed rather than
-    /// the user's locale, like every other figure on the panel.
-    static func grouped(_ rpm: Double) -> String {
-        let digits = String(Int(rpm.rounded()))
+    /// the user's locale, like every other figure on the panel. Nil for a
+    /// figure that is not a number. No minus sign: TcrSMC drops negative rpm.
+    static func grouped(_ rpm: Double) -> String? {
+        guard let rounded = whole(rpm) else { return nil }
+        let digits = String(rounded)
         var out = ""
         for (offset, digit) in digits.enumerated() {
-            if offset > 0 && (digits.count - offset) % 3 == 0 && digit != "-" { out.append(",") }
+            if offset > 0 && (digits.count - offset) % 3 == 0 { out.append(",") }
             out.append(digit)
         }
         return out
@@ -205,6 +238,9 @@ extension MachineStats {
     ///
     /// A reading that fails is a zero in that one field, never a `nil` whole:
     /// `getloadavg` returning -1 does not make the memory figure unknown.
+    ///
+    /// Blocking: the process walk and the SMC reads are kernel calls, so the
+    /// panel calls this off the main thread and assigns the result on it.
     public static func read() -> MachineStats {
         MachineStats(
             loadAverage: readLoadAverage(),

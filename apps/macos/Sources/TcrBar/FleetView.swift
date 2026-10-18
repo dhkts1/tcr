@@ -244,6 +244,7 @@ struct FleetView: View {
     /// else. Read on appear and on every poll — never per render, since
     /// ``MachineStats/read()`` walks the process table.
     @State private var machine: MachineStats?
+    @State private var machineReading = false
 
     /// What each RUNNING Bash call's process tree is costing, keyed by
     /// ``SessionToolEntry/id`` — the row's `640% · 2.1G`, and the pid
@@ -474,7 +475,7 @@ struct FleetView: View {
             if !snapshotMode {
                 codexBannerSnapshot.peerSharing = peers.snapshot.sharing
                 refreshSessionFiles()
-                machine = MachineStats.read()
+                refreshMachine()
                 refreshClaudeCount()
                 claudeRoute = ClaudeRouteRead.current()
             }
@@ -486,7 +487,7 @@ struct FleetView: View {
         .onChange(of: poller.lastPollAt) { _ in
             if !snapshotMode {
                 refreshSessionFiles()
-                machine = MachineStats.read()
+                refreshMachine()
                 refreshClaudeCount()
                 refreshZeroRequestsSince()
                 claudeRoute = ClaudeRouteRead.current()
@@ -2633,6 +2634,20 @@ struct FleetView: View {
     /// the proxy lists (``CodexRolloutJoin``, which looks each one up once).
     /// A Claude file wins an id clash. Read on appear and on each poll, never
     /// in `snapshotMode`, like the Claude files alone were.
+    /// ``MachineStats/read()`` on a background task, assigned back here on
+    /// the main actor: the process walk and the SMC reads are kernel calls,
+    /// and a poll that waits on them freezes the panel for that long. A poll
+    /// that lands while the last read is still out skips rather than queues.
+    private func refreshMachine() {
+        guard !machineReading else { return }
+        machineReading = true
+        Task {
+            let reading = await Task.detached(priority: .utility) { MachineStats.read() }.value
+            machineReading = false
+            machine = reading
+        }
+    }
+
     private func refreshSessionFiles() {
         guard !sessionFilesReading else { return }
         sessionFilesReading = true
@@ -3009,9 +3024,10 @@ struct FleetView: View {
             numbers.append(
                 summaryPhrase(machine.loadClause).foregroundColor(machineLoadTint(machine.loadTint)))
             // Heat right after load, because both describe the box, and never
-            // tinted: load stays the line's only coloured clause.
-            if let heat = machine.heatClause {
-                numbers.append(summaryPhrase(heat))
+            // tinted: load stays the line's only coloured clause. The CPU and
+            // the fans are two phrases, so a wrap can fall between them.
+            for phrase in machine.heatPhrases {
+                numbers.append(summaryPhrase(phrase))
             }
             numbers.append(summaryPhrase(machine.restClause))
         }

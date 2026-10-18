@@ -160,5 +160,46 @@ final class MachineStatsTests: XCTestCase {
         XCTAssertEqual(MachineStats.grouped(999), "999")
         XCTAssertEqual(MachineStats.grouped(5_013.4), "5,013")
         XCTAssertEqual(MachineStats.grouped(1_234_567), "1,234,567")
+        XCTAssertNil(MachineStats.grouped(.nan))
+    }
+
+    /// A `HeatReading` anyone builds can carry NaN or an infinity; the clause,
+    /// the phrases and the tooltip leave that figure out and never trap.
+    func testNonFiniteFiguresAreLeftOutNeverTrap() {
+        let machine = heated(
+            HeatReading(
+                cpuCelsius: .nan,
+                fans: [fan(0, .infinity), fan(1, 2_000, max: .nan), fan(2, .nan, manual: true)]))
+        XCTAssertNil(machine.heatClause)
+        XCTAssertEqual(machine.heatPhrases, [])
+        XCTAssertNil(machine.heatDetail)
+
+        let cpuOnly = heated(HeatReading(cpuCelsius: .infinity, fans: [fan(0, 2_888)]))
+        XCTAssertEqual(cpuOnly.heatClause, "fans 50%")
+        XCTAssertEqual(cpuOnly.heatDetail, "Fan 1: 2,888 of 5,777 rpm")
+    }
+
+    /// The CPU and the fans are two phrases, so the panel can wrap between them.
+    func testHeatPhrasesAreSeparate() {
+        let machine = heated(HeatReading(cpuCelsius: 93.3, fans: [fan(0, 5_013, manual: true)]))
+        XCTAssertEqual(machine.heatPhrases, ["CPU 93°C", "fans 87% manual"])
+        XCTAssertEqual(heated(HeatReading(cpuCelsius: 61, fans: [])).heatPhrases, ["CPU 61°C"])
+    }
+
+    /// Manual is the news even when no fan has a maximum to share against.
+    func testManualSurvivesWithNoShare() {
+        let machine = heated(
+            HeatReading(cpuCelsius: 50, fans: [fan(0, 2_000, max: 0, manual: true)]))
+        XCTAssertEqual(machine.heatClause, "CPU 50°C · fans manual")
+        XCTAssertEqual(
+            machine.heatDetail,
+            """
+            Hottest CPU sensor 50.0 °C
+            Fan 1: 2,000 rpm
+            Manual: another app set these speeds, so they do not follow the heat.
+            """)
+        // Without manual there is nothing to say about the fans.
+        XCTAssertEqual(
+            heated(HeatReading(cpuCelsius: 50, fans: [fan(0, 2_000, max: 0)])).heatClause, "CPU 50°C")
     }
 }
