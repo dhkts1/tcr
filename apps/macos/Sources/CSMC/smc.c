@@ -66,9 +66,8 @@ int32_t csmc_open(uint32_t *connection) {
 
 int32_t csmc_close(uint32_t connection) { return IOServiceClose(connection); }
 
-int32_t csmc_read_key(
-    uint32_t connection, uint32_t key, uint32_t *type, uint32_t *size, uint8_t *bytes,
-    uint8_t *smc_result) {
+int32_t csmc_key_info(
+    uint32_t connection, uint32_t key, uint32_t *type, uint32_t *size, uint8_t *smc_result) {
     SMCParam in, out;
     memset(&in, 0, sizeof in);
     memset(&out, 0, sizeof out);
@@ -77,11 +76,22 @@ int32_t csmc_read_key(
     kern_return_t kr = call(connection, &in, &out);
     *smc_result = out.result;
     if (kr != KERN_SUCCESS || out.result != 0) return kr;
-
-    uint32_t dataSize = out.keyInfo.dataSize;
     *type = out.keyInfo.dataType;
+    *size = out.keyInfo.dataSize;
+    return kr;
+}
+
+int32_t csmc_read_key(
+    uint32_t connection, uint32_t key, uint32_t *type, uint32_t *size, uint8_t *bytes,
+    uint8_t *smc_result) {
+    uint32_t dataSize = 0;
+    kern_return_t kr = csmc_key_info(connection, key, type, &dataSize, smc_result);
+    if (kr != KERN_SUCCESS || *smc_result != 0) return kr;
     *size = dataSize;
 
+    SMCParam in, out;
+    memset(&in, 0, sizeof in);
+    in.key = key;
     in.keyInfo.dataSize = dataSize;
     in.data8 = kSMCReadBytes;
     memset(&out, 0, sizeof out);

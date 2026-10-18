@@ -22,9 +22,53 @@ final class SMCDecodeTests: XCTestCase {
     }
 
     func testFloatEncodeIsTheInverse() throws {
-        XCTAssertEqual(SMCValue.flt(5000).bytes, hex("00409c45"))
-        XCTAssertEqual(SMCValue.flt(5777).bytes, hex("0088b445"))
+        XCTAssertEqual(try SMCValue.flt(5000).bytes, hex("00409c45"))
+        XCTAssertEqual(try SMCValue.flt(5777).bytes, hex("0088b445"))
         XCTAssertEqual(try SMCValue.flt(5030.2).floatValue(), 5030.2)
+        XCTAssertEqual(try SMCValue.flt(0).bytes, [0, 0, 0, 0])
+    }
+
+    /// The root helper sends what `flt` returns straight to the SMC, so NaN,
+    /// the infinities and negatives stop here: none of them is a fan speed.
+    func testFloatEncodeRefusesNonFiniteAndNegative() {
+        for value in [Float.nan, .infinity, -.infinity, -1, -0.5] {
+            XCTAssertThrowsError(try SMCValue.flt(value), "\(value)") { error in
+                guard case .outOfRange(type: .flt, value: let got) = error as? SMCError else {
+                    return XCTFail("\(value): \(error)")
+                }
+                XCTAssertTrue(got.isNaN ? value.isNaN : got == Double(value), "\(got)")
+            }
+        }
+    }
+
+    /// `write` sends nothing unless the value is the key's own type and size:
+    /// a `ui8` to a `flt ` key would be a fan target of whatever byte it is.
+    func testWriteCheckRefusesWrongTypeAndSize() throws {
+        let fanTarget = SMCKeyInfo(type: .flt, size: 4)
+        XCTAssertNoThrow(try SMCConnection.checkWrite(try SMCValue.flt(3000), fits: fanTarget))
+        XCTAssertThrowsError(try SMCConnection.checkWrite(.ui8(1), fits: fanTarget)) { error in
+            XCTAssertEqual(error as? SMCError, .wrongType(expected: .flt, actual: .ui8))
+        }
+        XCTAssertThrowsError(
+            try SMCConnection.checkWrite(SMCValue(type: .flt, bytes: [0, 0]), fits: fanTarget)
+        ) { error in
+            XCTAssertEqual(error as? SMCError, .wrongSize(type: .flt, expected: 4, actual: 2))
+        }
+        // Empty is a size mismatch even against a key that declares 0 bytes.
+        XCTAssertThrowsError(
+            try SMCConnection.checkWrite(
+                SMCValue(type: .ui8, bytes: []), fits: SMCKeyInfo(type: .ui8, size: 0))
+        ) { error in
+            XCTAssertEqual(error as? SMCError, .wrongSize(type: .ui8, expected: 0, actual: 0))
+        }
+    }
+
+    /// A refused key-table index call names an index, not a missing `#KEY`.
+    func testKeyIndexRefusalIsItsOwnError() {
+        XCTAssertEqual(
+            SMCError.checkIndex(0, smcResult: 0x84, index: 7), .keyIndexRefused(index: 7, result: 0x84))
+        XCTAssertEqual(SMCError.checkIndex(5, smcResult: 0, index: 7), .kernel(code: 5))
+        XCTAssertNil(SMCError.checkIndex(0, smcResult: 0, index: 7))
     }
 
     func testIntegerTypesAreBigEndian() throws {
@@ -94,17 +138,31 @@ final class SMCDecodeTests: XCTestCase {
         XCTAssertNil(SMCError.check(0, smcResult: 0, key: "F0Tg"))
     }
 
-    /// The one hardware read. Skips, by name, where there is no AppleSMC.
+    /// The one hardware read. Skips, by name, only where there is no AppleSMC;
+    /// any other error, opening or reading, fails it.
     func testHardwareReadIsPlausibleWhereThereIsAnSMC() throws {
-        guard let heat = HeatReading.read() else {
-            throw XCTSkip("HeatReading.read() is nil: no readable AppleSMC here (a VM)")
+        let smc: SMCConnection
+        do {
+            smc = try SMCConnection()
+        } catch SMCError.unavailable {
+            throw XCTSkip("no AppleSMC here (a VM)")
         }
-        if let cpu = heat.cpuCelsius {
-            XCTAssertTrue(HeatReader.plausibleCelsius.contains(cpu), "\(cpu)")
-        }
+        var errors: [String] = []
+        let heat = HeatReader(smc: smc, report: { errors.append($0) }).read()
+        XCTAssertEqual(errors, [])
+        let cpu = try XCTUnwrap(heat.cpuCelsius, "a Mac with an SMC has a CPU temperature")
+        XCTAssertTrue(HeatReader.plausibleCelsius.contains(cpu), "\(cpu)")
         for fan in heat.fans {
             XCTAssertGreaterThan(fan.maxRPM, 0, "fan \(fan.index)")
             XCTAssertGreaterThanOrEqual(fan.actualRPM, 0, "fan \(fan.index)")
+        }
+        // `write` refuses before it sends: a `ui8` to `#KEY` (a `ui32`, on every
+        // SMC) is `wrongType`, where a write that reached the kernel would come
+        // back `notPrivileged`. Only as non-root, so nothing could land.
+        if getuid() != 0 {
+            XCTAssertThrowsError(try smc.write("#KEY", .ui8(1))) { error in
+                XCTAssertEqual(error as? SMCError, .wrongType(expected: .ui32, actual: .ui8))
+            }
         }
     }
 }

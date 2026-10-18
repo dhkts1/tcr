@@ -5,7 +5,7 @@
 // by construction. A Swift struct does not: a nested struct's tail padding is
 // laid out differently, and the kernel reads the bytes, not the declaration.
 //
-// Five calls and nothing else. Every decision (which key, what a value means,
+// Six calls and nothing else. Every decision (which key, what a value means,
 // which error is which) lives in the Swift library TcrSMC on top of this.
 //
 // Each call returns the IOKit kern_return_t. Calls that reach the SMC also
@@ -21,8 +21,14 @@ int32_t csmc_open(uint32_t *connection);
 
 int32_t csmc_close(uint32_t connection);
 
-/// Reads one key: its type (a four-character code), its size, and up to 32
-/// bytes of value into `bytes`, which must hold 32.
+/// One key's type (a four-character code) and size in bytes, without its value.
+int32_t csmc_key_info(
+    uint32_t connection, uint32_t key, uint32_t *type, uint32_t *size, uint8_t *smc_result);
+
+/// Reads one key: its type (a four-character code), its size as the SMC
+/// reports it, and up to 32 bytes of value into `bytes`, which must hold 32.
+/// A size past 32 copies 32 and reports the real size, so the caller can
+/// refuse it.
 int32_t csmc_read_key(
     uint32_t connection, uint32_t key, uint32_t *type, uint32_t *size, uint8_t *bytes,
     uint8_t *smc_result);

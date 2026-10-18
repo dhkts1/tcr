@@ -47,7 +47,7 @@ public struct FourCC: Hashable, Sendable, CustomStringConvertible, ExpressibleBy
     public static let fpe2: FourCC = "fpe2"
 }
 
-public enum SMCError: Error, Equatable, Sendable {
+public enum SMCError: Error, Hashable, Sendable {
     /// No AppleSMC service: normal in a virtual machine, including CI's macOS runner.
     case unavailable
     /// `kIOReturnNotPrivileged` (0xe00002c1): the kernel wants root. Its own
@@ -57,13 +57,19 @@ public enum SMCError: Error, Equatable, Sendable {
     case keyNotFound(FourCC)
     /// IOKit succeeded but the SMC refused, with its own result byte.
     case smcRefused(key: FourCC, result: UInt8)
+    /// The SMC refused to name the key at this index of its key table.
+    case keyIndexRefused(index: UInt32, result: UInt8)
     /// Any other IOKit error, by its `kern_return_t`.
     case kernel(code: Int32)
-    /// A typed decode asked of a value of another type.
+    /// A typed decode asked of a value of another type, or a write of a value
+    /// whose type is not the key's own.
     case wrongType(expected: FourCC, actual: FourCC)
-    /// A value whose byte count does not fit its type.
+    /// A value whose byte count does not fit its type, a write whose byte
+    /// count is not the key's own, or a key the SMC says is wider than the 32
+    /// bytes its protocol carries.
     case wrongSize(type: FourCC, expected: Int, actual: Int)
-    /// An encode asked for a number its type cannot hold.
+    /// An encode asked for a number its type cannot hold, or one no fan or
+    /// sensor can mean: NaN, an infinity, a negative `flt `.
     case outOfRange(type: FourCC, value: Double)
     /// A numeric decode of a type this library does not read.
     case unsupportedType(FourCC)
@@ -79,6 +85,15 @@ public enum SMCError: Error, Equatable, Sendable {
         if kr != 0 { return .kernel(code: kr) }
         if smcResult == smcKeyNotFound { return .keyNotFound(key) }
         if smcResult != 0 { return .smcRefused(key: key, result: smcResult) }
+        return nil
+    }
+
+    /// The same for a key-table index call, which names no key: its refusal
+    /// is ``keyIndexRefused(index:result:)``, never a "no such key".
+    static func checkIndex(_ kr: Int32, smcResult: UInt8, index: UInt32) -> SMCError? {
+        if kr == notPrivilegedCode { return .notPrivileged }
+        if kr != 0 { return .kernel(code: kr) }
+        if smcResult != 0 { return .keyIndexRefused(index: index, result: smcResult) }
         return nil
     }
 }
@@ -146,7 +161,13 @@ public struct SMCValue: Equatable, Sendable {
         }
     }
 
-    public static func flt(_ value: Float) -> SMCValue {
+    /// Throws for NaN, either infinity and any negative number: every `flt `
+    /// this library writes is a fan speed, and none of those is one. The root
+    /// helper sends what this returns straight to the SMC.
+    public static func flt(_ value: Float) throws -> SMCValue {
+        guard value.isFinite, value >= 0 else {
+            throw SMCError.outOfRange(type: .flt, value: Double(value))
+        }
         let raw = value.bitPattern
         return SMCValue(type: .flt, bytes: [0, 8, 16, 24].map { UInt8(truncatingIfNeeded: raw >> $0) })
     }
@@ -194,23 +215,47 @@ public final class SMCConnection {
         csmc_close(handle)
     }
 
+    /// The most bytes one SMC call carries: the protocol struct's
+    /// `uint8_t bytes[32]`.
+    public static let maxValueSize = 32
+
+    /// Throws ``SMCError/wrongSize(type:expected:actual:)`` when the SMC says
+    /// the key is wider than ``maxValueSize``, rather than returning the first
+    /// 32 bytes of a longer value as if they were all of it.
     public func read(_ key: FourCC) throws -> SMCValue {
         var type: UInt32 = 0
         var size: UInt32 = 0
         var smcResult: UInt8 = 0
-        var buffer = [UInt8](repeating: 0, count: 32)
+        var buffer = [UInt8](repeating: 0, count: Self.maxValueSize)
         let kr = buffer.withUnsafeMutableBufferPointer { raw in
             csmc_read_key(handle, key.rawValue, &type, &size, raw.baseAddress, &smcResult)
         }
         if let error = SMCError.check(kr, smcResult: smcResult, key: key) { throw error }
-        return SMCValue(type: FourCC(rawValue: type), bytes: Array(buffer.prefix(min(Int(size), 32))))
+        guard Int(size) <= Self.maxValueSize else {
+            throw SMCError.wrongSize(
+                type: FourCC(rawValue: type), expected: Self.maxValueSize, actual: Int(size))
+        }
+        return SMCValue(type: FourCC(rawValue: type), bytes: Array(buffer.prefix(Int(size))))
+    }
+
+    /// The key's own type and size, as the SMC declares them, without its value.
+    public func keyInfo(_ key: FourCC) throws -> SMCKeyInfo {
+        var type: UInt32 = 0
+        var size: UInt32 = 0
+        var smcResult: UInt8 = 0
+        let kr = csmc_key_info(handle, key.rawValue, &type, &size, &smcResult)
+        if let error = SMCError.check(kr, smcResult: smcResult, key: key) { throw error }
+        return SMCKeyInfo(type: FourCC(rawValue: type), size: Int(size))
     }
 
     /// Needs root: a non-root caller gets ``SMCError/notPrivileged``.
+    ///
+    /// Reads the key's own type and size first and sends nothing unless
+    /// `value` matches both (``checkWrite(_:fits:)``): the SMC takes whatever
+    /// bytes it is handed, and a `ui8` written to a `flt ` key is a fan target
+    /// of whatever those bytes happen to mean.
     public func write(_ key: FourCC, _ value: SMCValue) throws {
-        guard value.bytes.count <= 32 else {
-            throw SMCError.wrongSize(type: value.type, expected: 32, actual: value.bytes.count)
-        }
+        try Self.checkWrite(value, fits: try keyInfo(key))
         var smcResult: UInt8 = 0
         let kr = value.bytes.withUnsafeBufferPointer { raw in
             csmc_write_key(
@@ -218,6 +263,20 @@ public final class SMCConnection {
                 &smcResult)
         }
         if let error = SMCError.check(kr, smcResult: smcResult, key: key) { throw error }
+    }
+
+    /// The check ``write(_:_:)`` makes before it sends anything: the type is
+    /// the key's own and the byte count is the key's own. An empty value is a
+    /// size mismatch whatever the key says.
+    static func checkWrite(_ value: SMCValue, fits info: SMCKeyInfo) throws {
+        guard value.type == info.type else {
+            throw SMCError.wrongType(expected: info.type, actual: value.type)
+        }
+        guard !value.bytes.isEmpty, value.bytes.count == info.size,
+            value.bytes.count <= maxValueSize
+        else {
+            throw SMCError.wrongSize(type: info.type, expected: info.size, actual: value.bytes.count)
+        }
     }
 
     /// Every key name the SMC reports, in its own order. 3,462 on a Mac16,7:
@@ -230,12 +289,32 @@ public final class SMCConnection {
             var raw: UInt32 = 0
             var smcResult: UInt8 = 0
             let kr = csmc_key_at_index(handle, index, &raw, &smcResult)
-            if let error = SMCError.check(kr, smcResult: smcResult, key: "#KEY") { throw error }
+            if let error = SMCError.checkIndex(kr, smcResult: smcResult, index: index) { throw error }
             keys.append(FourCC(rawValue: raw))
         }
         return keys
     }
 }
+
+/// A key's declared type and size.
+public struct SMCKeyInfo: Equatable, Sendable {
+    public let type: FourCC
+    public let size: Int
+
+    public init(type: FourCC, size: Int) {
+        self.type = type
+        self.size = size
+    }
+}
+
+/// What ``HeatReader`` needs from an SMC: one key's value, and the key table.
+/// ``SMCConnection`` is the real one; tests hand in a fake.
+protocol SMCKeySource: AnyObject {
+    func read(_ key: FourCC) throws -> SMCValue
+    func keys() throws -> [FourCC]
+}
+
+extension SMCConnection: SMCKeySource {}
 
 /// One fan, as read.
 public struct FanReading: Equatable, Sendable {
@@ -259,10 +338,12 @@ public struct FanReading: Equatable, Sendable {
 
 /// How hot the CPU is and how hard the fans work.
 public struct HeatReading: Equatable, Sendable {
-    /// The hottest CPU sensor, °C. Nil when this Mac has neither `TCMz` nor
-    /// any readable `Tp*` sensor.
+    /// The hottest CPU sensor, °C, always within ``HeatReader/plausibleCelsius``.
+    /// Nil when this Mac has neither `TCMz` nor any readable `Tp*` sensor, or
+    /// when none of them read this time.
     public let cpuCelsius: Double?
-    /// Empty on a Mac with no fans (`FNum` 0, a MacBook Air).
+    /// Empty on a Mac with no fans (`FNum` 0, a MacBook Air), and missing any
+    /// fan whose speed did not read.
     public let fans: [FanReading]
 
     public init(cpuCelsius: Double?, fans: [FanReading]) {
@@ -270,115 +351,183 @@ public struct HeatReading: Equatable, Sendable {
         self.fans = fans
     }
 
-    /// Read now. Nil when AppleSMC is absent or unreadable, which is normal in
-    /// a VM, or when it yields neither a temperature nor a fan.
+    /// Read now. Nil means one thing: this Mac has no AppleSMC
+    /// (``SMCError/unavailable``, normal in a VM).
+    ///
+    /// Every other error is logged, once per distinct error, and the reading
+    /// carries whatever did read: a bad fan key never removes the CPU, and the
+    /// reverse. An SMC that opened and read nothing is an empty reading, not nil.
     public static func read() -> HeatReading? {
-        guard let reader = HeatReader.shared else { return nil }
-        return try? reader.read()
+        switch HeatReader.shared {
+        case .unavailable: return nil
+        case .failed: return HeatReading(cpuCelsius: nil, fans: [])
+        case .ready(let reader): return reader.read()
+        }
     }
 }
 
 /// The process-wide reader behind ``HeatReading/read()``: one connection, and
-/// the two per-Mac facts (where the CPU temperature lives, which spelling the
-/// fan mode key uses) found once and kept.
+/// the per-Mac facts (where the CPU temperature lives, which spelling the fan
+/// mode key uses, each fan's limits) found once and kept.
 final class HeatReader: @unchecked Sendable {
-    /// Where the CPU temperature comes from on this Mac.
-    enum CPUSource: Equatable {
-        /// One key that already holds the CPU maximum (`TCMz`).
-        case key(FourCC)
-        /// The hottest of these `Tp*` sensors, enumerated once.
-        case hottest([FourCC])
+    enum Shared {
+        case ready(HeatReader)
+        /// No AppleSMC: a VM. Nothing about that changes between polls.
+        case unavailable
+        /// AppleSMC is there and would not open. Logged once, here.
+        case failed(Error)
     }
+
+    static let shared: Shared = {
+        do {
+            return .ready(HeatReader(smc: try SMCConnection()))
+        } catch SMCError.unavailable {
+            return .unavailable
+        } catch {
+            HeatReader.log("SMC: AppleSMC would not open: \(error)")
+            return .failed(error)
+        }
+    }()
 
     static let cpuMaxKey: FourCC = "TCMz"
 
-    /// Nil when AppleSMC cannot be opened; then it stays nil for the life of
-    /// the process, because nothing about a VM changes between polls.
-    static let shared: HeatReader? = {
-        guard let connection = try? SMCConnection() else { return nil }
-        return HeatReader(connection: connection)
-    }()
-
-    private let connection: SMCConnection
-    private let lock = NSLock()
-    private var cpuSource: CPUSource?
-    private var modeKeyIsLower: Bool?
-
-    init(connection: SMCConnection, cpuSource: CPUSource? = nil) {
-        self.connection = connection
-        self.cpuSource = cpuSource
-    }
-
-    func read() throws -> HeatReading? {
-        lock.lock()
-        defer { lock.unlock() }
-        let cpu = try readCPU(source: try resolvedCPUSource())
-        let fans = try readFans()
-        if cpu == nil && fans.isEmpty { return nil }
-        return HeatReading(cpuCelsius: cpu, fans: fans)
-    }
-
-    /// `TCMz` when this Mac has it; otherwise the `Tp*` sensors, enumerated
-    /// once per process. 3,462 keys on every poll is not a price to pay for
-    /// one number. An enumeration that fails is kept as an empty list rather
-    /// than retried each poll, for the same reason.
-    private func resolvedCPUSource() throws -> CPUSource {
-        if let cpuSource { return cpuSource }
-        let source: CPUSource
-        do {
-            _ = try connection.read(Self.cpuMaxKey).floatValue()
-            source = .key(Self.cpuMaxKey)
-        } catch SMCError.keyNotFound {
-            source = .hottest((try? Self.processorSensorKeys(connection)) ?? [])
-        }
-        cpuSource = source
-        return source
-    }
-
-    /// Every `Tp*` key holding a 4-byte `flt `: the processor sensors (102 on
-    /// a Mac16,7).
-    static func processorSensorKeys(_ connection: SMCConnection) throws -> [FourCC] {
-        try connection.keys().filter { key in
-            guard key.rawValue >> 16 == UInt32(UInt8(ascii: "T")) << 8 | UInt32(UInt8(ascii: "p"))
-            else { return false }
-            guard let value = try? connection.read(key) else { return false }
-            return value.type == .flt && value.bytes.count == 4
-        }
-    }
+    /// How long a failed `Tp*` enumeration waits before the next try. A
+    /// starting value, not a measured one: long enough that a key table that
+    /// keeps failing does not cost 3,462 kernel calls every poll.
+    static let enumerationRetryDelay: TimeInterval = 60
 
     /// A sensor that reads 0 or below, or past 150 °C, is one not fitted or
-    /// not powered, not a hot CPU; the maximum skips it.
+    /// not powered, not a hot CPU; the reading drops it, whichever key it came
+    /// from. NaN is outside every range.
     static let plausibleCelsius: ClosedRange<Double> = 0.5...150
 
-    func readCPU(source: CPUSource) throws -> Double? {
-        switch source {
-        case .key(let key):
-            return Double(try connection.read(key).floatValue())
-        case .hottest(let keys):
-            var hottest: Double?
-            for key in keys {
-                guard let value = try? connection.read(key).floatValue() else { continue }
-                let celsius = Double(value)
-                guard Self.plausibleCelsius.contains(celsius) else { continue }
-                hottest = max(hottest ?? celsius, celsius)
+    private let smc: any SMCKeySource
+    private let now: () -> TimeInterval
+    private let report: (String) -> Void
+    private let lock = NSLock()
+
+    /// `TCMz` is a 4-byte `flt ` on this Mac (true), is not or is absent
+    /// (false), or has not answered yet (nil).
+    private var useMaxKey: Bool?
+    /// The `Tp*` sensors, once an enumeration has succeeded.
+    private var processorKeys: [FourCC]?
+    private var enumerationFailedAt: TimeInterval?
+    private var modeKeyIsLower: Bool?
+    /// Each fan's `Mn` and `Mx`, kept once both read: they do not change.
+    private var fanLimits: [Int: (min: Double, max: Double)] = [:]
+    /// Every line already reported, so a key that fails on every poll is
+    /// one log line, not one a poll.
+    private var reported: Set<String> = []
+
+    init(
+        smc: any SMCKeySource,
+        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        report: @escaping (String) -> Void = HeatReader.log
+    ) {
+        self.smc = smc
+        self.now = now
+        self.report = report
+    }
+
+    /// The app logs through `NSLog` throughout (`PanelSizeDelta.marker`'s
+    /// doc-comment says why), and a menu-bar app's stderr goes nowhere.
+    static func log(_ line: String) {
+        NSLog("TcrBar: %@", line)
+    }
+
+    func read() -> HeatReading {
+        lock.lock()
+        defer { lock.unlock() }
+        return HeatReading(cpuCelsius: readCPU(), fans: readFans())
+    }
+
+    private func note(_ what: String, _ error: Error) {
+        let line = "SMC: \(what): \(error)"
+        if reported.insert(line).inserted { report(line) }
+    }
+
+    // MARK: CPU
+
+    /// `TCMz` when this Mac has it as a 4-byte `flt `; otherwise the hottest
+    /// `Tp*` sensor.
+    private func readCPU() -> Double? {
+        if useMaxKey != false {
+            do {
+                let value = try smc.read(Self.cpuMaxKey)
+                if value.type == .flt && value.bytes.count == 4 {
+                    useMaxKey = true
+                    return Self.plausible(Double(try value.floatValue()))
+                }
+                // Some other type or size: not the key this reader knows.
+                useMaxKey = false
+            } catch SMCError.keyNotFound {
+                useMaxKey = false
+            } catch {
+                note("\(Self.cpuMaxKey) read", error)
+                // A key that has read before failed this once: no figure this
+                // poll. One never yet read: try the sensors, ask again next poll.
+                if useMaxKey == true { return nil }
             }
-            return hottest
+        }
+        guard let keys = resolvedProcessorKeys() else { return nil }
+        var hottest: Double?
+        for key in keys {
+            let celsius: Double
+            do {
+                celsius = Double(try smc.read(key).floatValue())
+            } catch {
+                note("\(key) read", error)
+                continue
+            }
+            guard let plausible = Self.plausible(celsius) else { continue }
+            hottest = max(hottest ?? plausible, plausible)
+        }
+        return hottest
+    }
+
+    static func plausible(_ celsius: Double) -> Double? {
+        plausibleCelsius.contains(celsius) ? celsius : nil
+    }
+
+    /// The `Tp*` sensors, enumerated once: 3,462 keys on every poll is not a
+    /// price to pay for one number. A failed enumeration is NOT kept: it is
+    /// logged and tried again no sooner than ``enumerationRetryDelay`` later.
+    private func resolvedProcessorKeys() -> [FourCC]? {
+        if let processorKeys { return processorKeys }
+        if let failedAt = enumerationFailedAt, now() - failedAt < Self.enumerationRetryDelay {
+            return nil
+        }
+        do {
+            let keys = try processorSensorKeys()
+            processorKeys = keys
+            enumerationFailedAt = nil
+            return keys
+        } catch {
+            note("key table enumeration (retrying in \(Int(Self.enumerationRetryDelay)) s)", error)
+            enumerationFailedAt = now()
+            return nil
         }
     }
 
-    /// `F{n}md` where it exists, else `F{n}Md`: some Apple Silicon models
-    /// spell the mode key in lower case. Stats probes `F0md` the same way.
-    private func modeKey(_ fan: Int) throws -> FourCC {
-        if modeKeyIsLower == nil {
+    /// Every `Tp*` key holding a 4-byte `flt ` (102 on a Mac16,7). A key that
+    /// will not read now is kept, logged, and read again on the next poll:
+    /// one failure is not a reason to drop a sensor for the life of the process.
+    private func processorSensorKeys() throws -> [FourCC] {
+        let tp = UInt32(UInt8(ascii: "T")) << 8 | UInt32(UInt8(ascii: "p"))
+        var kept: [FourCC] = []
+        for key in try smc.keys() where key.rawValue >> 16 == tp {
             do {
-                _ = try connection.read("F0md")
-                modeKeyIsLower = true
-            } catch SMCError.keyNotFound {
-                modeKeyIsLower = false
+                let value = try smc.read(key)
+                if value.type == .flt && value.bytes.count == 4 { kept.append(key) }
+            } catch {
+                note("\(key) read", error)
+                kept.append(key)
             }
         }
-        return Self.fanKey(fan, modeKeyIsLower == true ? "md" : "Md")
+        return kept
     }
+
+    // MARK: Fans
 
     /// `F{n}{suffix}`. Four bytes for every `fan` in 0...9, which is the only
     /// range ``readFans()`` asks for; anything else is a bug and stops here.
@@ -386,29 +535,84 @@ final class HeatReader: @unchecked Sendable {
         FourCC(stringLiteral: "F\(fan)\(suffix)")
     }
 
-    private func readFans() throws -> [FanReading] {
+    private func readFans() -> [FanReading] {
         let count: Int
         do {
-            count = Int(try connection.read("FNum").uint8Value())
+            count = Int(try smc.read("FNum").uint8Value())
         } catch SMCError.keyNotFound {
+            return []
+        } catch {
+            note("FNum read", error)
             return []
         }
         // Ten fans is the most a fan key's single digit can name.
-        return try (0..<min(count, 10)).map { fan in
-            func number(_ suffix: String) throws -> Double {
-                try connection.read(Self.fanKey(fan, suffix)).numericValue()
-            }
-            let isManual: Bool
-            do {
-                isManual = try connection.read(try modeKey(fan)).uint8Value() == 1
-            } catch SMCError.keyNotFound {
-                // No mode key at all (older Intel Macs keep the bit in `FS! `):
-                // nothing says another app holds this fan.
-                isManual = false
-            }
-            return FanReading(
-                index: fan, actualRPM: try number("Ac"), minRPM: try number("Mn"),
-                maxRPM: try number("Mx"), isManual: isManual)
+        return (0..<min(count, 10)).compactMap(readFan)
+    }
+
+    /// Nil when the fan's speed does not read, or reads as no speed at all
+    /// (not finite, or negative).
+    private func readFan(_ fan: Int) -> FanReading? {
+        guard let actual = rpm(fan, "Ac") else { return nil }
+        let limits = self.limits(fan)
+        return FanReading(
+            index: fan, actualRPM: actual, minRPM: limits.min, maxRPM: limits.max,
+            isManual: isManual(fan))
+    }
+
+    /// `Mn` and `Mx`, read once both read and then kept. One that does not
+    /// read is 0 this poll (``FanReading/maxRPM`` 0 is "no maximum") and is
+    /// asked again next poll.
+    private func limits(_ fan: Int) -> (min: Double, max: Double) {
+        if let known = fanLimits[fan] { return known }
+        let low = rpm(fan, "Mn")
+        let high = rpm(fan, "Mx")
+        guard let low, let high else { return (low ?? 0, high ?? 0) }
+        fanLimits[fan] = (low, high)
+        return (low, high)
+    }
+
+    private func rpm(_ fan: Int, _ suffix: String) -> Double? {
+        let key = Self.fanKey(fan, suffix)
+        let value: Double
+        do {
+            value = try smc.read(key).numericValue()
+        } catch {
+            note("\(key) read", error)
+            return nil
         }
+        return value.isFinite && value >= 0 ? value : nil
+    }
+
+    /// The fan's mode key reads 1. No mode key at all (older Intel Macs keep
+    /// the bit in `FS! `) means nothing says another app holds this fan.
+    private func isManual(_ fan: Int) -> Bool {
+        guard let suffix = modeKeySuffix() else { return false }
+        let key = Self.fanKey(fan, suffix)
+        do {
+            return try smc.read(key).uint8Value() == 1
+        } catch SMCError.keyNotFound {
+            return false
+        } catch {
+            note("\(key) read", error)
+            return false
+        }
+    }
+
+    /// `md` where `F0md` exists, else `Md`: some Apple Silicon models spell
+    /// the mode key in lower case. Stats probes `F0md` the same way. Nil, and
+    /// asked again next poll, when the probe itself fails.
+    private func modeKeySuffix() -> String? {
+        if modeKeyIsLower == nil {
+            do {
+                _ = try smc.read("F0md")
+                modeKeyIsLower = true
+            } catch SMCError.keyNotFound {
+                modeKeyIsLower = false
+            } catch {
+                note("F0md read", error)
+                return nil
+            }
+        }
+        return modeKeyIsLower == true ? "md" : "Md"
     }
 }
