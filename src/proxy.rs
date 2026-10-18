@@ -2455,10 +2455,10 @@ async fn config_set_handler(State(manager): State<Arc<Manager>>, req: Request) -
 /// `POST /_tcr/fan`: hand one fan mode to the controller ([`FAN_PATH`]).
 ///
 /// Never waits on the fans: the controller may be inside a 15 s unlock, and
-/// the mode is queued behind it (latest wins). The 202 body is the
-/// `fanControl` object as it stood when the command went in, before the
-/// controller acted on it ([`crate::fan::FanHandle::send`]); `tcr fan` keeps
-/// its wish, then polls the status route until the state settles.
+/// the mode is queued behind it (latest wins). The 202 body is
+/// `{"command": n}`, the number the command was sent under
+/// ([`crate::fan::FanHandle::send`]); `tcr fan` polls the status route until
+/// `fanControl.command` reaches it and the state settles.
 async fn fan_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let request: crate::fan::FanRequest = match read_command(
         &FAN_ROUTE,
@@ -2493,8 +2493,11 @@ async fn fan_handler(State(manager): State<Arc<Manager>>, req: Request) -> Respo
         );
     };
     match fan.send(command) {
-        Ok(row) => {
-            let mut response = json_ok(&FAN_ROUTE, &row);
+        Ok(command) => {
+            let accepted = crate::fan::FanAccepted {
+                command: Some(command),
+            };
+            let mut response = json_ok(&FAN_ROUTE, &accepted);
             if response.status() == StatusCode::OK {
                 *response.status_mut() = StatusCode::ACCEPTED;
             }
@@ -15445,9 +15448,9 @@ mod tests {
     }
 
     /// `/_tcr/fan`: POST only, the exact bodies of the contract, a stamped 400
-    /// in one sentence for a refused value, a stamped 202 carrying the object
-    /// from before the command, and the new wish on the status route once the
-    /// controller acted on it. The controller behind it
+    /// in one sentence for a refused value, a stamped 202 carrying the
+    /// command's number, and the new wish on the status route, under that
+    /// number, once the controller acted on it. The controller behind it
     /// reaches no SMC and no helper, so nothing here can touch a fan.
     #[tokio::test]
     async fn fan_route_takes_the_contract_bodies_and_answers_locally() {
@@ -15482,10 +15485,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(stamp_of(&response).as_deref(), Some(FAN_ENDPOINT));
         let accepted = body_json(response).await;
+        let mine = accepted["command"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("the 202 names the command's number: {accepted}"));
         assert_eq!(
-            accepted["desired"],
-            serde_json::json!({"mode": "auto"}),
-            "the object from before the command: the controller starts on Auto"
+            accepted.as_object().map(serde_json::Map::len),
+            Some(1),
+            "{accepted}"
         );
 
         let response = drive_full(
@@ -15552,12 +15558,15 @@ mod tests {
         .await;
         let status = body_json(response).await;
         assert!(status["fanControl"].is_object(), "{status}");
-        // The wish shows once the controller has acted on it.
-        let want =
-            serde_json::json!({"desired": {"mode": "fixed", "rpm": 5000}, "reason": "noSmc"});
+        // The wish shows once the controller has acted on it, under the
+        // number the 202 gave.
+        let want = serde_json::json!({
+            "desired": {"mode": "fixed", "rpm": 5000}, "reason": "noSmc", "command": mine
+        });
         let mut seen = serde_json::json!({
             "desired": status["fanControl"]["desired"],
             "reason": status["fanControl"]["reason"],
+            "command": status["fanControl"]["command"],
         });
         for _ in 0..50 {
             if seen == want {
@@ -15568,7 +15577,9 @@ mod tests {
                 .fan()
                 .map(|f| {
                     let row = f.row();
-                    serde_json::json!({"desired": row.desired, "reason": row.reason})
+                    serde_json::json!({
+                        "desired": row.desired, "reason": row.reason, "command": row.command
+                    })
                 })
                 .unwrap_or_default();
         }

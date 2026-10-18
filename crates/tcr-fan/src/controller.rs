@@ -432,7 +432,10 @@ pub struct Generation(pub u64);
 /// One thing on the controller's channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input {
-    Command(Command),
+    /// A command, numbered by its sender in channel order: [`Snapshot::command`]
+    /// reaches `seq` once the controller has acted on it. A shutdown's number
+    /// is not counted.
+    Command { seq: u64, command: Command },
     /// A connection error delivered by XPC, tagged with its connection.
     Xpc {
         generation: Generation,
@@ -501,7 +504,7 @@ pub type Log = Box<dyn FnMut(Level, &str) + Send>;
 
 /// What the status route shows.
 ///
-/// `desired` and `since_ms` are set together and only together, when the
+/// `desired` and `command` are set together and only together, when the
 /// controller stamps ([`Controller::advance`] after acting on a command, or a
 /// state change with no command waiting): every snapshot pairs a state with
 /// the wish it was reached for. A command taken but not yet acted on does not
@@ -515,10 +518,11 @@ pub struct Snapshot {
     /// What was last written to each fan held.
     pub targets: Vec<(FanIndex, f64)>,
     pub detail: Option<Detail>,
-    /// When the state last changed, or the controller last acted on a
-    /// command. Taking a command does not move it, so a snapshot from before
-    /// the controller acted on a command is older than that command.
-    pub since_ms: i64,
+    /// The number of the newest command the controller has acted on
+    /// ([`Input::Command`]). Taking a command does not move it, so a snapshot
+    /// from before the controller acted on a command reads below that
+    /// command's number. Starts at [`Parts::commands_before`].
+    pub command: u64,
 }
 
 pub type Publish = Box<dyn FnMut(&Snapshot) + Send>;
@@ -542,6 +546,10 @@ pub struct Parts<H, R, P, C, S> {
     pub publish: Publish,
     /// This process, for the hold record.
     pub pid: u32,
+    /// Where command numbers start: every command this process is sent is
+    /// numbered above it. The proxy seeds it from the wall clock, so a
+    /// command sent to a process that has since restarted reads as acted on.
+    pub commands_before: u64,
 }
 
 /// How an attempt to enter ended, when it did not end holding.
@@ -607,7 +615,10 @@ pub struct Controller<H, R, P, C, S> {
     /// The wish [`Snapshot::desired`] shows: `desired` as of the last
     /// [`Self::stamp`], never ahead of it.
     shown_desired: FanDesired,
-    since_ms: i64,
+    /// The newest command number taken, and the newest acted on (what
+    /// [`Snapshot::command`] shows, moved with `shown_desired`).
+    taken: u64,
+    acted: u64,
     failed_entries: u32,
     backoff_step: usize,
     retry_at: Option<Instant>,
@@ -628,7 +639,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// matches becomes this process's; one the fans no longer match is
     /// dropped.
     pub fn new(parts: Parts<H, R, P, C, S>, saved: Option<Saved>) -> Self {
-        let since_ms = parts.clock.wall_ms();
+        let first = parts.commands_before;
         let (desired, hold) = saved.map_or((FanDesired::Auto, None), |s| (s.desired, s.hold));
         let mut controller = Self {
             parts,
@@ -640,7 +651,8 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             hot: false,
             detail: None,
             shown_desired: desired,
-            since_ms,
+            taken: first,
+            acted: first,
             failed_entries: 0,
             backoff_step: 0,
             retry_at: None,
@@ -737,7 +749,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 .filter_map(|f| f.written_rpm.map(|rpm| (f.fan, rpm)))
                 .collect(),
             detail: self.detail,
-            since_ms: self.since_ms,
+            command: self.acted,
         }
     }
 
@@ -774,9 +786,12 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
 
     /// Nobody can send another command: stop as a shutdown would.
     fn closed_channel(&self) -> Input {
-        Input::Command(Command::Shutdown {
-            deadline: self.parts.clock.now() + Duration::from_secs(3),
-        })
+        Input::Command {
+            seq: self.taken,
+            command: Command::Shutdown {
+                deadline: self.parts.clock.now() + Duration::from_secs(3),
+            },
+        }
     }
 
     /// How long the loop may wait for input before it has work of its own.
@@ -814,8 +829,12 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// Take one input.
     pub fn accept(&mut self, input: Input) {
         match input {
-            Input::Command(Command::Set(mode)) => {
+            Input::Command {
+                seq,
+                command: Command::Set(mode),
+            } => {
                 self.desired = mode;
+                self.taken = seq;
                 self.fresh = true;
                 // A hand-back that waited (on Macs Fan Control, or a read) was
                 // for the wish this one replaces: a manual mode must never be
@@ -831,14 +850,21 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 self.save();
                 self.publish();
             }
-            Input::Command(Command::ForceHandBack) => {
+            Input::Command {
+                seq,
+                command: Command::ForceHandBack,
+            } => {
                 self.desired = FanDesired::Auto;
+                self.taken = seq;
                 self.pending = Some(Pending::ForcedRelease);
                 self.fresh = true;
                 self.save();
                 self.publish();
             }
-            Input::Command(Command::Shutdown { deadline }) => self.stopping = Some(deadline),
+            Input::Command {
+                command: Command::Shutdown { deadline },
+                ..
+            } => self.stopping = Some(deadline),
             Input::Xpc { generation, fault } => self.on_xpc(generation, fault),
         }
     }
@@ -892,9 +918,9 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// goes back to waiting on a channel whose stop it already took.
     ///
     /// A step for a command ends with a [`Self::stamp`] (the wish shown and
-    /// `since_ms`), whether it changed the state, wrote a round, or found
-    /// nothing to do (the same Fixed again): that stamp is what `tcr fan`
-    /// waits for. Not when a newer command was taken during the step, which
+    /// the command number acted on), whether it changed the state, wrote a
+    /// round, or found nothing to do (the same Fixed again): that stamp is
+    /// what `tcr fan` waits for. Not when a newer command was taken during the step, which
     /// the next step acts on.
     pub fn advance(&mut self) -> Flow {
         let fresh = std::mem::take(&mut self.fresh);
@@ -1709,10 +1735,11 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         self.publish();
     }
 
-    /// The wish shown and `since_ms`, moved together ([`Snapshot`]).
-    fn stamp(&mut self) {
+    /// The wish shown and the command number acted on, moved together
+    /// ([`Snapshot`]).
+    const fn stamp(&mut self) {
         self.shown_desired = self.desired;
-        self.since_ms = self.parts.clock.wall_ms();
+        self.acted = self.taken;
     }
 
     fn publish(&mut self) {

@@ -149,7 +149,11 @@ fn held_at(rpm: f64) -> HeatReading {
 fn holding(mode: FanDesired, rpm: f64) -> Controller<Root, Fans, NoMacs, Now, Nowhere> {
     let fans = Fans(std::sync::Arc::new(std::sync::Mutex::new(held_at(rpm))));
     let (tx, rx) = mpsc::channel();
-    tx.send(Input::Command(Command::Set(mode))).unwrap();
+    tx.send(Input::Command {
+        seq: 1,
+        command: Command::Set(mode),
+    })
+    .unwrap();
     let mut controller = Controller::new(
         Parts {
             helper: Root(fans.clone()),
@@ -161,6 +165,7 @@ fn holding(mode: FanDesired, rpm: f64) -> Controller<Root, Fans, NoMacs, Now, No
             log: Box::new(|_, _| {}),
             publish: Box::new(|_| {}),
             pid: 1,
+            commands_before: 0,
         },
         None,
     );

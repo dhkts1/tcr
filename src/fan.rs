@@ -19,9 +19,13 @@
 //! controller reached for the old one (fans going back to automatic, Macs
 //! Fan Control starting) and `tcr fan` would judge that state as its
 //! answer. So a status read right after `POST /_tcr/fan` can still name the
-//! old mode, until the controller acts on the new one; the POST's own answer
-//! is that old object, which `tcr fan` keeps to tell "not taken yet" from
-//! "replaced".
+//! old mode, until the controller acts on the new one.
+//!
+//! The handle numbers each command it sends, in channel order, and the POST
+//! answers with that number ([`FanAccepted`]). The status carries the number
+//! of the newest command the controller acted on, beside the wish it acted on,
+//! so `tcr fan` waits until the number reaches its own, then reads the wish: its
+//! own is its answer, any other means a later command replaced it.
 //!
 //! # Persistence
 //!
@@ -318,6 +322,18 @@ impl FanRequest {
     }
 }
 
+/// The 202 body of `POST /_tcr/fan`: the number the command was sent under,
+/// which [`FanControlRow::command`] reaches once the controller has acted on
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FanAccepted {
+    /// Always written by this build. `None` only when reading the answer of a
+    /// server older than the command counter, which answered with its whole
+    /// `fanControl` object instead.
+    #[serde(default)]
+    pub command: Option<u64>,
+}
+
 // The status object.
 
 /// The `fanControl` object for a snapshot.
@@ -351,7 +367,7 @@ pub fn row(snapshot: &Snapshot) -> FanControlRow {
             })
             .collect(),
         detail: detail_text(snapshot),
-        since_ms: snapshot.since_ms,
+        command: snapshot.command,
     }
 }
 
@@ -408,21 +424,25 @@ pub struct FanHandle {
     tx: Sender<Input>,
     /// The controller's last snapshot, wish included.
     shown: Arc<Mutex<Snapshot>>,
+    /// The number of the last command sent. Held across the send, so numbers
+    /// follow channel order, which the controller acts in.
+    sent: Mutex<u64>,
     /// Hears once when the thread's loop returns.
     done: Mutex<mpsc::Receiver<()>>,
 }
 
 impl FanHandle {
-    /// Send `command`; the answer is the `fanControl` object as it stood when
-    /// the command went in, before the controller acted on it. The lock is
-    /// held across the send, so nothing the controller publishes after taking
-    /// this command can be in the answer.
-    pub fn send(&self, command: Command) -> Result<FanControlRow, NotRunning> {
-        let shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
+    /// Send `command` under the next number, and answer that number: the
+    /// status's [`FanControlRow::command`] reaches it once the controller has
+    /// acted on this command.
+    pub fn send(&self, command: Command) -> Result<u64, NotRunning> {
+        let mut sent = self.sent.lock().unwrap_or_else(PoisonError::into_inner);
+        let seq = *sent + 1;
         self.tx
-            .send(Input::Command(command))
+            .send(Input::Command { seq, command })
             .map_err(|_gone| NotRunning)?;
-        Ok(row(&shown))
+        *sent = seq;
+        Ok(seq)
     }
 
     /// The `fanControl` object as of now.
@@ -435,11 +455,10 @@ impl FanHandle {
     pub fn shutdown(&self, grace: Duration) {
         let wait = grace.min(SHUTDOWN_HAND_BACK);
         let deadline = Instant::now() + wait;
-        if self
-            .tx
-            .send(Input::Command(Command::Shutdown { deadline }))
-            .is_err()
-        {
+        // Not a numbered command: the controller does not count a shutdown.
+        let seq = *self.sent.lock().unwrap_or_else(PoisonError::into_inner);
+        let command = Command::Shutdown { deadline };
+        if self.tx.send(Input::Command { seq, command }).is_err() {
             return;
         }
         let done = self.done.lock().unwrap_or_else(PoisonError::into_inner);
@@ -459,6 +478,9 @@ impl FanHandle {
 pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
     let (store, saved) = FileStore::open(file, std::process::id());
     let desired = saved.as_ref().map_or(FanDesired::Auto, |s| s.desired);
+    // Above any number an earlier process gave out, unless one gave out more
+    // commands than milliseconds passed between the two starts.
+    let commands_before = u64::try_from(wall_ms()).unwrap_or(0);
     let (tx, rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let shown = Arc::new(Mutex::new(Snapshot {
@@ -467,7 +489,7 @@ pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
         hot_guard: false,
         targets: Vec::new(),
         detail: None,
-        since_ms: wall_ms(),
+        command: commands_before,
     }));
     let published = Arc::clone(&shown);
     let after_panic = Arc::clone(&shown);
@@ -490,6 +512,7 @@ pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
                                 snapshot.clone();
                         }),
                         pid: std::process::id(),
+                        commands_before,
                     };
                     Controller::new(parts, saved).run();
                 },
@@ -502,6 +525,7 @@ pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
     Ok(Arc::new(FanHandle {
         tx,
         shown,
+        sent: Mutex::new(commands_before),
         done: Mutex::new(done_rx),
     }))
 }
@@ -528,7 +552,7 @@ fn run_guarded(run: impl FnOnce(), shown: &Mutex<Snapshot>) {
         hot_guard: false,
         targets: Vec::new(),
         detail: None,
-        since_ms: wall_ms(),
+        command: shown.command,
     };
 }
 
@@ -563,7 +587,7 @@ fn inert(saved: Option<Saved>) -> (Arc<FanHandle>, Inert) {
         hot_guard: false,
         targets: Vec::new(),
         detail: None,
-        since_ms: 0,
+        command: 0,
     }));
     let published = Arc::clone(&shown);
     let parts = Parts {
@@ -578,11 +602,13 @@ fn inert(saved: Option<Saved>) -> (Arc<FanHandle>, Inert) {
             *published.lock().unwrap() = snapshot.clone();
         }),
         pid: std::process::id(),
+        commands_before: 0,
     };
     let controller = Controller::new(parts, saved);
     let handle = Arc::new(FanHandle {
         tx,
         shown,
+        sent: Mutex::new(0),
         done: Mutex::new(done_rx),
     });
     (handle, controller)
@@ -832,7 +858,7 @@ mod tests {
             hot_guard: false,
             targets: targets.iter().map(|&(i, rpm)| (fan(i), rpm)).collect(),
             detail,
-            since_ms: 1_760_000_000_000,
+            command: 1_760_000_000_000,
         }
     }
 
@@ -956,7 +982,7 @@ mod tests {
     #[test]
     fn fan_status_serializes_exactly_what_the_popover_decodes() {
         let at = |state, targets: &[(u8, f64)], detail| Snapshot {
-            since_ms: 0,
+            command: 0,
             ..snapshot(state, targets, detail)
         };
         let fixed = FanDesired::Fixed {
@@ -966,12 +992,12 @@ mod tests {
             (
                 FanDesired::Auto,
                 at(State::Off, &[], None),
-                r#"{"desired":{"mode":"auto"},"state":"off","reason":null,"hotGuard":false,"targets":[],"detail":null,"sinceMs":0}"#,
+                r#"{"desired":{"mode":"auto"},"state":"off","reason":null,"hotGuard":false,"targets":[],"detail":null,"command":0}"#,
             ),
             (
                 fixed,
                 at(State::Holding, &[(0, 5000.0), (1, 5000.0)], None),
-                r#"{"desired":{"mode":"fixed","rpm":5000},"state":"holding","reason":null,"hotGuard":false,"targets":[{"fan":0,"rpm":5000.0},{"fan":1,"rpm":5000.0}],"detail":null,"sinceMs":0}"#,
+                r#"{"desired":{"mode":"fixed","rpm":5000},"state":"holding","reason":null,"hotGuard":false,"targets":[{"fan":0,"rpm":5000.0},{"fan":1,"rpm":5000.0}],"detail":null,"command":0}"#,
             ),
             (
                 FanDesired::Auto,
@@ -980,7 +1006,7 @@ mod tests {
                     &[],
                     Some(Detail::WaitingForMacs),
                 ),
-                r#"{"desired":{"mode":"auto"},"state":"foreign","reason":"macsFanControl","hotGuard":false,"targets":[],"detail":"fans go back to automatic when Macs Fan Control quits","sinceMs":0}"#,
+                r#"{"desired":{"mode":"auto"},"state":"foreign","reason":"macsFanControl","hotGuard":false,"targets":[],"detail":"fans go back to automatic when Macs Fan Control quits","command":0}"#,
             ),
         ];
         for (desired, snapshot, expected) in cases {
@@ -1214,10 +1240,10 @@ mod tests {
         assert_eq!(before.desired, FanDesiredRow::Fixed { rpm: 5000 });
         assert_eq!(before.state, FanStateRow::Unavailable, "no SMC here");
 
-        let answer = handle.send(Command::Set(FanDesired::Auto)).unwrap();
-        assert_eq!(
-            answer, before,
-            "the POST answers with the object before the command"
+        let mine = handle.send(Command::Set(FanDesired::Auto)).unwrap();
+        assert!(
+            mine > before.command,
+            "the POST answers with a number the status has not reached"
         );
 
         // The old wish's tick, before the controller drains the channel: the
@@ -1230,6 +1256,7 @@ mod tests {
             FanDesiredRow::Fixed { rpm: 5000 },
             "the new wish paired with a state reached for the old one: {between:?}"
         );
+        assert!(between.command < mine, "{between:?}");
 
         controller.pump();
         let after = handle.row();
@@ -1237,6 +1264,24 @@ mod tests {
             (after.desired, after.state),
             (FanDesiredRow::Auto, FanStateRow::Off)
         );
-        assert!(after.since_ms >= between.since_ms);
+        assert_eq!(after.command, mine);
+    }
+
+    /// The handle numbers commands one after another, from where the process
+    /// started; a shutdown takes no number.
+    #[test]
+    fn fan_route_numbers_each_command_in_order() {
+        let (handle, _controller) = inert(None);
+        let first = handle.send(Command::Set(FanDesired::Auto)).unwrap();
+        let second = handle.send(Command::ForceHandBack).unwrap();
+        assert_eq!((first, second), (1, 2));
+        let (handle, controller) = inert(None);
+        drop(controller);
+        assert_eq!(
+            handle.send(Command::Set(FanDesired::Auto)),
+            Err(NotRunning),
+            "a controller that is gone answers no number"
+        );
+        assert_eq!(*handle.sent.lock().unwrap(), 0, "and takes none");
     }
 }

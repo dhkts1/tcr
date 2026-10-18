@@ -2876,13 +2876,27 @@ mod tests {
         assert_eq!(payload.heat, None);
     }
 
+    /// A `fanControl` from a server older than the command counter (`sinceMs`, no `command`)
+    /// is unreadable and says which field it lacks: no other field stands in for the count.
+    #[test]
+    fn fan_status_without_the_command_counter_is_unreadable() {
+        let body = r#"{"kind":"tcr.status.v1","accounts":[],
+            "fanControl":{"desired":{"mode":"auto"},"state":"off","reason":null,
+            "hotGuard":false,"targets":[],"detail":null,"sinceMs":1760000000000}}"#;
+        let payload: StatusPayload = serde_json::from_str(body).expect("still a payload");
+        match payload.fan_control {
+            Some(FanControlField::Unreadable(why)) => assert!(why.contains("`command`"), "{why}"),
+            other => panic!("expected an unreadable fanControl, got {other:?}"),
+        }
+    }
+
     /// A `fanControl` with a state this build has no name for (a newer server) costs fan
     /// control and nothing else, and an absent key is no controller, never a default.
     #[test]
     fn fan_status_unreadable_or_absent_does_not_fail_the_payload() {
         let body = r#"{"kind":"tcr.status.v1","accounts":[],"http1_only":true,
             "fanControl":{"desired":{"mode":"auto"},"state":"hibernating","reason":null,
-            "hotGuard":false,"targets":[],"detail":null,"sinceMs":0}}"#;
+            "hotGuard":false,"targets":[],"detail":null,"command":0}}"#;
         let payload: StatusPayload = serde_json::from_str(body).expect("still a payload");
         assert!(payload.http1_only);
         assert!(

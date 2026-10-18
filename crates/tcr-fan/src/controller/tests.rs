@@ -14,9 +14,35 @@ fn fan(index: u8) -> FanIndex {
     FanIndex::new(index).unwrap()
 }
 
+/// Where the rig's command numbers start, as the proxy seeds them from the
+/// wall clock.
+const COMMANDS_BEFORE: u64 = 1_760_000_000_000;
+
+/// The controller's channel, numbering commands in channel order as the
+/// proxy's handle does.
+#[derive(Clone)]
+struct Inbox {
+    tx: Sender<Input>,
+    sent: Arc<Mutex<u64>>,
+}
+
+impl Inbox {
+    /// Send `command` under the next number, and return that number.
+    fn command(&self, command: Command) -> u64 {
+        let mut sent = self.sent.lock().unwrap();
+        *sent += 1;
+        self.tx
+            .send(Input::Command {
+                seq: *sent,
+                command,
+            })
+            .unwrap();
+        *sent
+    }
+}
+
 type Hook = Box<
-    dyn FnMut(&Request, &mut Machine, &Sender<Input>, &FakeClock) -> Option<Result<Reply, Fault>>
-        + Send,
+    dyn FnMut(&Request, &mut Machine, &Inbox, &FakeClock) -> Option<Result<Reply, Fault>> + Send,
 >;
 
 struct Machine {
@@ -94,7 +120,7 @@ impl World {
 struct FakeHelper {
     world: World,
     hook: Option<Hook>,
-    inject: Sender<Input>,
+    inject: Inbox,
     clock: FakeClock,
     hooks: Arc<Mutex<Option<Hook>>>,
 }
@@ -190,7 +216,7 @@ type Under = Controller<FakeHelper, FakeHeat, FakeProbe, FakeClock, FakeStore>;
 struct Rig {
     c: Under,
     world: World,
-    tx: Sender<Input>,
+    inbox: Inbox,
     clock: FakeClock,
     store: FakeStore,
     hooks: Arc<Mutex<Option<Hook>>>,
@@ -228,6 +254,10 @@ fn rig_from(saved: Option<Saved>, reading: Option<HeatReading>) -> Rig {
         fresh: false,
     })));
     let (tx, rx) = mpsc::channel();
+    let inbox = Inbox {
+        tx,
+        sent: Arc::new(Mutex::new(COMMANDS_BEFORE)),
+    };
     let clock = FakeClock(Arc::new(Mutex::new((Instant::now(), 1_000_000))));
     let store = FakeStore::default();
     let hooks: Arc<Mutex<Option<Hook>>> = Arc::new(Mutex::new(None));
@@ -239,7 +269,7 @@ fn rig_from(saved: Option<Saved>, reading: Option<HeatReading>) -> Rig {
         helper: FakeHelper {
             world: world.clone(),
             hook: None,
-            inject: tx.clone(),
+            inject: inbox.clone(),
             clock: clock.clone(),
             hooks: Arc::clone(&hooks),
         },
@@ -255,11 +285,12 @@ fn rig_from(saved: Option<Saved>, reading: Option<HeatReading>) -> Rig {
             shown.lock().unwrap().push(snapshot.clone());
         }),
         pid: 4242,
+        commands_before: COMMANDS_BEFORE,
     };
     Rig {
         c: Controller::new(parts, saved),
         world,
-        tx,
+        inbox,
         clock,
         store,
         hooks,
@@ -286,7 +317,7 @@ fn follow(quiet: u8, full: u8) -> FanDesired {
 
 impl Rig {
     fn send(&mut self, command: Command) -> Flow {
-        self.tx.send(Input::Command(command)).unwrap();
+        self.inbox.command(command);
         self.c.pump()
     }
 
@@ -342,7 +373,10 @@ impl Rig {
 
     /// A connection event from connection `generation`, then a pump.
     fn fault(&mut self, generation: Generation, fault: Fault) {
-        self.tx.send(Input::Xpc { generation, fault }).unwrap();
+        self.inbox
+            .tx
+            .send(Input::Xpc { generation, fault })
+            .unwrap();
         self.c.pump();
     }
 }
@@ -711,9 +745,7 @@ fn fixed_then_auto_within_unlock_ends_off() {
     rig.hook(Box::new(move |request, _machine, inject, clock| {
         if matches!(request, Request::SetManual { .. }) && !sent {
             clock.advance(Duration::from_secs(3));
-            inject
-                .send(Input::Command(Command::Set(FanDesired::Auto)))
-                .unwrap();
+            inject.command(Command::Set(FanDesired::Auto));
             sent = true;
         }
         None
@@ -746,7 +778,7 @@ fn the_latest_wish_during_the_unlock_wins() {
                 let mode = FanDesired::Fixed {
                     rpm: Rpm::new(rpm).unwrap(),
                 };
-                inject.send(Input::Command(Command::Set(mode))).unwrap();
+                inject.command(Command::Set(mode));
             }
             sent = true;
         }
@@ -1360,11 +1392,9 @@ fn a_shutdown_during_entry_is_acted_on() {
     let mut sent = false;
     rig.hook(Box::new(move |request, _machine, inject, clock| {
         if *request == set_manual(0) && !sent {
-            inject
-                .send(Input::Command(Command::Shutdown {
-                    deadline: clock.now() + Duration::from_secs(3),
-                }))
-                .unwrap();
+            inject.command(Command::Shutdown {
+                deadline: clock.now() + Duration::from_secs(3),
+            });
             sent = true;
         }
         None
@@ -1426,32 +1456,34 @@ fn a_new_mode_drops_a_waiting_hand_back() {
     assert_eq!(rig.c.state(), State::Holding);
 }
 
-// When a command is acted on: `sinceMs` against the moment it was sent.
+// When a command is acted on: the number it was sent under against the one
+// the snapshot shows.
 
 /// What `tcr fan` (`fan_wait` in the binary's `src/cli.rs`) reads off a
-/// snapshot for a command sent at `sent_at`: settled once `since_ms` is at
-/// or after it and the state is not on its way somewhere.
-fn reads_settled(snapshot: &Snapshot, sent_at: i64) -> bool {
-    snapshot.since_ms >= sent_at && !matches!(snapshot.state, State::Entering | State::Releasing)
+/// snapshot for command number `mine`: settled once the controller acted on
+/// it or a later one, and the state is not on its way somewhere.
+fn reads_settled(snapshot: &Snapshot, mine: u64) -> bool {
+    snapshot.command >= mine && !matches!(snapshot.state, State::Entering | State::Releasing)
 }
 
 impl Rig {
-    /// A second later than anything so far: the wall time a command is sent
-    /// at. What was published before it is forgotten.
-    fn command_time(&self) -> i64 {
-        self.clock.advance(Duration::from_secs(1));
+    /// Forget what was published, send `command`, pump, and return the
+    /// command's number.
+    fn numbered(&mut self, command: Command) -> u64 {
         self.published.lock().unwrap().clear();
-        self.clock.wall_ms()
+        let mine = self.inbox.command(command);
+        self.c.pump();
+        mine
     }
 
-    /// The first snapshot since [`Self::command_time`] that `tcr fan` would
-    /// stop on.
-    fn first_settled(&self, sent_at: i64) -> Option<Snapshot> {
+    /// The first snapshot since [`Self::numbered`] that `tcr fan` would stop
+    /// on.
+    fn first_settled(&self, mine: u64) -> Option<Snapshot> {
         self.published
             .lock()
             .unwrap()
             .iter()
-            .find(|s| reads_settled(s, sent_at))
+            .find(|s| reads_settled(s, mine))
             .cloned()
     }
 }
@@ -1462,18 +1494,14 @@ impl Rig {
 #[test]
 fn auto_from_holding_settles_only_on_off() {
     let mut rig = holding(fixed(5000));
-    let sent_at = rig.command_time();
-    rig.tx
-        .send(Input::Command(Command::Set(FanDesired::Auto)))
-        .unwrap();
-    rig.c.pump();
+    let mine = rig.numbered(Command::Set(FanDesired::Auto));
     let first = rig.published.lock().unwrap().first().cloned().unwrap();
     assert_eq!(first.state, State::Holding, "the taking publishes first");
     assert!(
-        !reads_settled(&first, sent_at),
+        !reads_settled(&first, mine),
         "a snapshot from before the release is not the command's answer: {first:?}"
     );
-    let settled = rig.first_settled(sent_at).unwrap();
+    let settled = rig.first_settled(mine).unwrap();
     assert_eq!(settled.state, State::Off, "{settled:?}");
 }
 
@@ -1482,10 +1510,9 @@ fn auto_from_holding_settles_only_on_off() {
 fn a_changed_fixed_settles_after_the_write() {
     let mut rig = holding(fixed(5000));
     rig.clear_requests();
-    let sent_at = rig.command_time();
-    rig.send(Command::Set(fixed(4000)));
+    let mine = rig.numbered(Command::Set(fixed(4000)));
     assert_eq!(rig.written(), targets(4000.0));
-    let settled = rig.first_settled(sent_at).unwrap();
+    let settled = rig.first_settled(mine).unwrap();
     assert_eq!(settled.state, State::Holding);
     assert_eq!(
         settled.targets,
@@ -1500,10 +1527,9 @@ fn a_changed_fixed_settles_after_the_write() {
 fn a_repeated_fixed_settles_with_nothing_to_write() {
     let mut rig = holding(fixed(5000));
     rig.clear_requests();
-    let sent_at = rig.command_time();
-    rig.send(Command::Set(fixed(5000)));
+    let mine = rig.numbered(Command::Set(fixed(5000)));
     assert_eq!(rig.written(), vec![], "nothing to write");
-    let settled = rig.first_settled(sent_at).unwrap();
+    let settled = rig.first_settled(mine).unwrap();
     assert_eq!(settled.state, State::Holding);
     assert_eq!(settled.targets, vec![(fan(0), 5000.0), (fan(1), 5000.0)]);
 }
@@ -1515,31 +1541,54 @@ fn a_repeated_fixed_settles_with_nothing_to_write() {
 #[test]
 fn a_command_taken_mid_entry_settles_after_its_own_round() {
     let mut rig = rig();
-    let sent_at = Arc::new(Mutex::new(None));
-    let seen = Arc::clone(&sent_at);
-    rig.hook(Box::new(move |request, _machine, inject, clock| {
+    let sent = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&sent);
+    rig.hook(Box::new(move |request, _machine, inject, _clock| {
         if *request == set_target(0, 5000.0) && seen.lock().unwrap().is_none() {
-            clock.advance(Duration::from_secs(1));
-            *seen.lock().unwrap() = Some(clock.wall_ms());
-            inject
-                .send(Input::Command(Command::Set(fixed(4000))))
-                .unwrap();
+            *seen.lock().unwrap() = Some(inject.command(Command::Set(fixed(4000))));
         }
         None
     }));
     rig.send(Command::Set(fixed(5000)));
-    let sent_at = sent_at.lock().unwrap().unwrap();
+    let mine = sent.lock().unwrap().unwrap();
     assert_eq!(rig.c.state(), State::Holding);
+    assert!(
+        rig.c.snapshot().command < mine,
+        "the entry for the command before is not this one's answer"
+    );
     assert_eq!(
         rig.c.wait(),
         Some(Duration::ZERO),
         "a command taken mid-entry is acted on at once"
     );
     rig.c.pump();
-    let settled = rig.first_settled(sent_at).unwrap();
+    let settled = rig.first_settled(mine).unwrap();
     assert_eq!(
         settled.targets,
         vec![(fan(0), 4000.0), (fan(1), 4000.0)],
         "settled while fan 0 still held the old target: {settled:?}"
     );
+}
+
+/// Two commands drained in one pump are acted on in one step, under the later
+/// number: the earlier one reads as acted on, and the wish shown is the later
+/// one's, which is what tells the earlier command it was replaced.
+#[test]
+fn a_drained_pair_is_acted_on_under_the_later_number() {
+    let mut rig = holding(fixed(5000));
+    let first = rig.inbox.command(Command::Set(fixed(4000)));
+    let second = rig.inbox.command(Command::Set(FanDesired::Auto));
+    rig.c.pump();
+    let shown = rig.c.snapshot();
+    assert_eq!(shown.command, second);
+    assert!(shown.command > first);
+    assert_eq!((shown.desired, shown.state), (FanDesired::Auto, State::Off));
+}
+
+/// A new process starts its numbers at `commands_before`, and shows them as
+/// acted on: a command sent to the process before it reads as acted on.
+#[test]
+fn a_new_controller_shows_its_first_number_as_acted_on() {
+    let rig = rig();
+    assert_eq!(rig.c.snapshot().command, COMMANDS_BEFORE);
 }
