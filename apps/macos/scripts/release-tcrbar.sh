@@ -75,6 +75,12 @@ appcast_path="$pkg_dir/appcast.xml"
 # installers, which we do not ship). See docs/RELEASING.md.
 readonly required_cert_class="Developer ID Application"
 
+# The code-signing identifier of the bundled proxy, Contents/MacOS/tcr. The root
+# fan helper accepts calls only from code signed under this exact name, so it
+# must match what build-tcrbar.sh gives a Developer ID build
+# (`tcr_identifier_for_tier`). Changing it here strands every installed helper.
+readonly tcr_release_identifier="io.github.dhkts1.tcr"
+
 die() { printf 'ERROR: %s\n' "$@" >&2; exit 1; }
 stage() { printf '\n==> %s\n' "$1"; }
 note() { printf '    %s\n' "$1"; }
@@ -189,7 +195,11 @@ resign_hardened() {
     "('+' -> Software -> '$required_cert_class'; NOT Developer ID Installer," \
     "NOT Apple Distribution, NOT Apple Development)."
 
+  # The shipping identifier, the same string build-tcrbar.sh gives a Developer ID
+  # build. Without --identifier this re-sign would put back the default, `tcr`,
+  # and the root fan helper's requirement pins this exact name.
   codesign --force --options runtime --timestamp \
+    --identifier "$tcr_release_identifier" \
     --sign "$identity" "$bundle/Contents/MacOS/tcr" >/dev/null 2>&1 \
     || die "codesign failed on the nested tcr binary."
   codesign --force --options runtime --timestamp \
@@ -213,6 +223,20 @@ assert_hardened_runtime() {
            "notarytool would reject it without naming this as the cause." ;;
   esac
   note "hardened runtime: present, signature verifies --deep --strict"
+}
+
+# The bundled proxy must carry the shipping identifier. Captured, then matched,
+# for the same pipefail reason as above.
+assert_tcr_identifier() {
+  local bundle="$1" desc
+  desc="$(codesign -dv "$bundle/Contents/MacOS/tcr" 2>&1)" \
+    || die "codesign could not read a signature from $bundle/Contents/MacOS/tcr."
+  case "$desc" in
+    *"Identifier=$tcr_release_identifier"$'\n'*) ;;
+    *) die "$bundle/Contents/MacOS/tcr is not signed as $tcr_release_identifier." \
+           "The root fan helper would refuse every call from this proxy." ;;
+  esac
+  note "bundled tcr: signed as $tcr_release_identifier"
 }
 
 # ---------------------------------------------------------------------------
@@ -509,6 +533,7 @@ main() {
     stage "verify-only: $verify_only"
     assert_developer_id "$verify_only"
     assert_hardened_runtime "$verify_only"
+    assert_tcr_identifier "$verify_only"
     assert_sparkle_public_key "$verify_only"
     exit 0
   fi
@@ -573,6 +598,7 @@ main() {
   stage "stage 3/9  re-sign with the hardened runtime and a secure timestamp"
   resign_hardened "$app_dir"
   assert_hardened_runtime "$app_dir"
+  assert_tcr_identifier "$app_dir"
 
   # ---- stage 3.5: Sparkle public key assert -------------------------------
   stage "stage 3.5/9  assert the bundle carries a Sparkle public key"
