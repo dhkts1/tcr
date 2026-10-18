@@ -77,6 +77,12 @@ final class FanControlDecodeTests: XCTestCase {
             try decode(
                 #"{"desired": {"mode": "auto"}, "state": "unavailable", "reason": "notSignedForFans"}"#)?
                 .reason, .notSignedForFans)
+
+        XCTAssertEqual(
+            try decode(
+                #"{"desired": {"mode": "fixed", "rpm": 5000}, "state": "unavailable", "reason": "controllerStopped"}"#
+            )?
+            .reason, .controllerStopped)
     }
 
     /// A value this build does not know is kept by its own word, never mapped

@@ -101,6 +101,8 @@ public enum FanNote: Equatable, Sendable {
         case .modeLocked: return "macOS would not let go of a fan."
         case .contended: return "Something else keeps taking the fans back."
         case .helperRefused: return "The fan helper refused."
+        case .controllerStopped:
+            return "tcr's fan control stopped on an error. Restarting the tcr server starts it again."
         case .notSignedForFans: return "This tcr is not the one TcrBar ships; fan control needs it."
         case .macsFanControl, .anotherApp: return "Another app holds the fans."
         case .unrecognised(let raw): return "Fan control is off: “\(raw)”."

@@ -218,6 +218,7 @@ public enum FanControlReason: Equatable, Sendable, Decodable {
     case modeLocked
     case contended
     case helperRefused
+    case controllerStopped
     case unrecognised(String)
 
     /// The reason's wire name: what `tcr fan` prints, and what the popover
@@ -236,6 +237,7 @@ public enum FanControlReason: Equatable, Sendable, Decodable {
         case .modeLocked: return "modeLocked"
         case .contended: return "contended"
         case .helperRefused: return "helperRefused"
+        case .controllerStopped: return "controllerStopped"
         case .unrecognised(let raw): return raw
         }
     }
@@ -254,6 +256,7 @@ public enum FanControlReason: Equatable, Sendable, Decodable {
         case "modeLocked": self = .modeLocked
         case "contended": self = .contended
         case "helperRefused": self = .helperRefused
+        case "controllerStopped": self = .controllerStopped
         default: self = .unrecognised(word)
         }
     }
