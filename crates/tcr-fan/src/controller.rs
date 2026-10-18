@@ -1324,7 +1324,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         self.arm_tick();
     }
 
-    fn unschedule(&mut self) {
+    const fn unschedule(&mut self) {
         self.next_tick = None;
         self.retry_at = None;
     }

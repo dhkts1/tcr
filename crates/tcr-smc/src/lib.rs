@@ -1066,19 +1066,14 @@ fn mode_key_suffix<S: KeySource>(
     smc: &mut S,
     kept: &mut Option<bool>,
 ) -> Result<[u8; 2], SmcError> {
-    let lower = match *kept {
-        Some(lower) => lower,
-        None => {
-            let lower = match smc.read(LOWER_MODE_PROBE_KEY) {
-                Ok(_) => true,
-                Err(SmcError::KeyNotFound(_)) => false,
-                Err(error) => return Err(error),
-            };
-            *kept = Some(lower);
-            lower
-        }
-    };
-    Ok(if lower { *b"md" } else { *b"Md" })
+    if kept.is_none() {
+        *kept = Some(match smc.read(LOWER_MODE_PROBE_KEY) {
+            Ok(_) => true,
+            Err(SmcError::KeyNotFound(_)) => false,
+            Err(error) => return Err(error),
+        });
+    }
+    Ok(if *kept == Some(true) { *b"md" } else { *b"Md" })
 }
 
 /// What [`HeatSource::open`] opens: AppleSMC on a Mac.
