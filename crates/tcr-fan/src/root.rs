@@ -25,7 +25,9 @@
 //!   changed them, log it and leave them. **A disconnect of any other
 //!   connection changes nothing**: a stale connection's drop must never undo a
 //!   newer holder's fans.
-//! - **exit** only when idle: no connection, no holder, no window. A
+//! - **exit** only when idle: no connection, no holder, no window, and still
+//!   so [`IDLE_EXIT_GRACE`] later (launchd will not start the helper again
+//!   sooner than 10 s after its last start). A
 //!   connection counts once one of its messages reaches root, so a peer whose
 //!   every message libxpc drops (it failed the signature check) cannot keep
 //!   root alive.
@@ -61,6 +63,32 @@ pub const DISCONNECT_RETRY_GAPS: [Duration; 6] = [
 
 /// Every attempt the window makes, the first included.
 pub const DISCONNECT_ATTEMPTS: usize = DISCONNECT_RETRY_GAPS.len() + 1;
+
+/// How long the helper stays up once idle before it exits, if still idle then.
+/// launchd starts a job no sooner than 10 s after its previous start (measured
+/// 2026-10-18 on an M4 Pro: starts at 22:40:34.13, 22:40:44.29 and
+/// 22:40:54.71), so a helper that exited at once left a caller arriving inside
+/// those 10 s waiting on launchd, and its first call timed out. Staying 15 s
+/// means the helper has been up longer than the spacing before it exits, so
+/// the next start is never held back.
+pub const IDLE_EXIT_GRACE: Duration = Duration::from_secs(15);
+
+/// One scheduled idle check. Anything that reaches root after it was issued,
+/// or a later check, makes it stale: a stale check never exits the helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleCheck(u64);
+
+impl IdleCheck {
+    /// The id as a number, for the helper to carry through a timer's context
+    /// pointer.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
 
 /// One XPC connection, numbered by the helper in the order they arrived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -107,8 +135,10 @@ pub type WriterOpener<K> = Box<dyn FnMut() -> Result<FanWriter<K>, SmcError> + S
 pub enum Next {
     /// Keep running.
     Stay,
-    /// Idle: no connection, no holder, no window. Exit now.
-    Exit,
+    /// Idle: no connection, no holder, no window. Call [`Root::idle_due`]
+    /// with this check after this long ([`IDLE_EXIT_GRACE`]), and exit only
+    /// if it says so.
+    ExitIfStillIdle { check: IdleCheck, after: Duration },
     /// Call [`Root::window_due`] with this id after this long.
     RetryAfter { window: WindowId, after: Duration },
 }
@@ -135,6 +165,9 @@ pub struct Root<K> {
     holder: Option<Hold>,
     window: Option<Window>,
     windows_opened: u64,
+    /// Bumped by every request and every idle check issued; an
+    /// [`IdleCheck`] is current only while this still equals it.
+    activity: u64,
 }
 
 impl<K: KeyAccess> Root<K> {
@@ -150,12 +183,25 @@ impl<K: KeyAccess> Root<K> {
             holder: None,
             window: None,
             windows_opened: 0,
+            activity: 0,
         }
     }
 
     /// No counted connection, no holder, no window.
     pub fn is_idle(&self) -> bool {
         self.peers.is_empty() && self.holder.is_none() && self.window.is_none()
+    }
+
+    /// A check that stays current until anything reaches root: the helper's
+    /// startup check, scheduled before the first connection.
+    pub const fn idle_check_now(&self) -> IdleCheck {
+        IdleCheck(self.activity)
+    }
+
+    /// The timer for `check` fired: `true` when root is idle and nothing has
+    /// reached it since the check was issued, so the helper may exit.
+    pub fn idle_due(&self, check: IdleCheck) -> bool {
+        self.is_idle() && check.0 == self.activity
     }
 
     /// The connection holding the fans, if any.
@@ -180,6 +226,7 @@ impl<K: KeyAccess> Root<K> {
     /// connected from here until it disconnects.
     pub fn request(&mut self, peer: PeerId, request: Result<Request, Refusal>) -> Reply {
         self.peers.insert(peer);
+        self.activity += 1;
         let result = match request {
             Err(Refusal::BadRequest) => Err(HelperError::BadRequest),
             Err(Refusal::FanPastMax { fan }) => self.no_such_fan(fan),
@@ -263,11 +310,16 @@ impl<K: KeyAccess> Root<K> {
         }
     }
 
-    fn exit_if_idle(&self) -> Next {
-        if self.is_idle() {
-            Next::Exit
-        } else {
-            Next::Stay
+    /// Idle: a fresh check, which makes every earlier one stale, so the
+    /// helper exits [`IDLE_EXIT_GRACE`] after the LAST time it went idle.
+    fn exit_if_idle(&mut self) -> Next {
+        if !self.is_idle() {
+            return Next::Stay;
+        }
+        self.activity += 1;
+        Next::ExitIfStillIdle {
+            check: IdleCheck(self.activity),
+            after: IDLE_EXIT_GRACE,
         }
     }
 
@@ -596,6 +648,79 @@ mod tests {
         FanIndex::new(index).unwrap()
     }
 
+    /// Root went idle: the check it issued, after asserting the grace.
+    fn exit_check(next: Next) -> IdleCheck {
+        let Next::ExitIfStillIdle { check, after } = next else {
+            panic!("expected an idle check, got {next:?}");
+        };
+        assert_eq!(after, IDLE_EXIT_GRACE);
+        check
+    }
+
+    fn assert_exits(next: Next) {
+        exit_check(next);
+    }
+
+    fn version(rig: &mut Rig, peer: u64) {
+        rig.root.connected(PeerId(peer));
+        assert!(matches!(
+            rig.send(peer, Request::Version),
+            Reply::Version { .. }
+        ));
+    }
+
+    /// launchd starts the helper no sooner than 10 s after its last start
+    /// (measured 2026-10-18), so the helper outlasts that once idle.
+    #[test]
+    fn the_idle_grace_outlasts_launchds_restart_spacing() {
+        assert!(IDLE_EXIT_GRACE > Duration::from_secs(10));
+        let mut rig = Rig::new();
+        version(&mut rig, 1);
+        let check = exit_check(rig.root.disconnected(PeerId(1)));
+        assert!(rig.root.idle_due(check), "nothing happened, so it may exit");
+    }
+
+    /// A connection inside the grace keeps the helper; once it leaves, only
+    /// the newest check may exit it, a full grace after that departure.
+    #[test]
+    fn a_connection_inside_the_idle_grace_keeps_the_helper() {
+        let mut rig = Rig::new();
+        version(&mut rig, 1);
+        let first = exit_check(rig.root.disconnected(PeerId(1)));
+
+        version(&mut rig, 2);
+        assert!(!rig.root.idle_due(first), "exited under a live connection");
+        let second = exit_check(rig.root.disconnected(PeerId(2)));
+        assert!(!rig.root.idle_due(first), "a stale check exited early");
+        assert!(rig.root.idle_due(second));
+
+        // A silent connection (dropped by the signature check) that comes and
+        // goes restarts the grace too, and still cannot keep root up.
+        rig.root.connected(PeerId(3));
+        let third = exit_check(rig.root.disconnected(PeerId(3)));
+        assert!(!rig.root.idle_due(second));
+        assert!(rig.root.idle_due(third));
+    }
+
+    /// The startup check exits only if nothing ever reached root.
+    #[test]
+    fn the_startup_check_exits_only_when_nothing_arrived() {
+        let mut rig = Rig::new();
+        let startup = rig.root.idle_check_now();
+        rig.root.connected(PeerId(1));
+        assert!(
+            rig.root.idle_due(startup),
+            "a silent connection kept root up"
+        );
+
+        let mut rig = Rig::new();
+        let startup = rig.root.idle_check_now();
+        version(&mut rig, 1);
+        let after = exit_check(rig.root.disconnected(PeerId(1)));
+        assert!(!rig.root.idle_due(startup), "startup check cut the grace");
+        assert!(rig.root.idle_due(after));
+    }
+
     #[test]
     fn version_answers_without_opening_the_smc() {
         let mut rig = Rig::new();
@@ -720,7 +845,7 @@ mod tests {
         rig.smc.set_ui8("Ftst", 1);
         rig.hold(1, 3000.0);
         rig.smc.clear_writes();
-        assert_eq!(rig.root.disconnected(PeerId(1)), Next::Exit);
+        assert_exits(rig.root.disconnected(PeerId(1)));
         assert_eq!(rig.smc.written_keys(), ["F0Md", "F1Md", "Ftst"]);
         assert_eq!(rig.smc.ui8("F0Md"), 0);
         assert_eq!(rig.smc.ui8("Ftst"), 0);
@@ -732,7 +857,7 @@ mod tests {
         rig.hold(1, 3000.0);
         rig.smc.set_flt("F1Tg", 4200.0);
         rig.smc.clear_writes();
-        assert_eq!(rig.root.disconnected(PeerId(1)), Next::Exit);
+        assert_exits(rig.root.disconnected(PeerId(1)));
         assert!(rig.smc.writes().is_empty());
         assert_eq!(rig.smc.ui8("F1Md"), 1);
     }
@@ -752,7 +877,7 @@ mod tests {
         }
         assert!(!rig.root.is_idle());
         assert_eq!(rig.root.disconnected(PeerId(1)), Next::Stay);
-        assert_eq!(rig.root.disconnected(PeerId(2)), Next::Exit);
+        assert_exits(rig.root.disconnected(PeerId(2)));
 
         // A holder whose hand-back keeps failing: no connection is left, but
         // the window is, so the helper stays.
@@ -774,13 +899,13 @@ mod tests {
         rig.smc.accept("F0Md");
         assert_eq!(rig.root.window_due(window), Next::Stay);
         assert!(!rig.root.window_pending());
-        assert_eq!(rig.root.disconnected(PeerId(4)), Next::Exit);
+        assert_exits(rig.root.disconnected(PeerId(4)));
 
         // A holder that hands back by itself and leaves: idle, exit.
         rig.hold(5, 3000.0);
         assert_eq!(rig.send(5, Request::HandBack), Reply::HandedBack);
         assert_eq!(rig.root.holder(), None);
-        assert_eq!(rig.root.disconnected(PeerId(5)), Next::Exit);
+        assert_exits(rig.root.disconnected(PeerId(5)));
     }
 
     #[test]
@@ -790,7 +915,7 @@ mod tests {
         let mut rig = Rig::new();
         rig.root.connected(PeerId(1));
         assert!(rig.root.is_idle(), "a silent connection kept root alive");
-        assert_eq!(rig.root.disconnected(PeerId(1)), Next::Exit);
+        assert_exits(rig.root.disconnected(PeerId(1)));
 
         // Beside a counted peer, a silent one's arrival changes nothing either:
         // the counted peer's departure is what ends the helper.
@@ -800,7 +925,7 @@ mod tests {
             Reply::Version { .. }
         ));
         rig.root.connected(PeerId(3));
-        assert_eq!(rig.root.disconnected(PeerId(2)), Next::Exit);
+        assert_exits(rig.root.disconnected(PeerId(2)));
     }
 
     #[test]
@@ -861,7 +986,7 @@ mod tests {
         assert_eq!(rig.smc.ui8("F1Md"), 0);
         assert!(!rig.root.window_pending());
         // Peer 2 sent a message, so it still counts; its departure ends it.
-        assert_eq!(rig.root.disconnected(PeerId(2)), Next::Exit);
+        assert_exits(rig.root.disconnected(PeerId(2)));
     }
 
     #[test]
@@ -878,7 +1003,7 @@ mod tests {
             assert!(gaps.len() < 100, "the window does not end");
             next = rig.root.window_due(window);
         }
-        assert_eq!(next, Next::Exit);
+        assert_exits(next);
         assert_eq!(gaps, DISCONNECT_RETRY_GAPS);
         assert_eq!(gaps.iter().sum::<Duration>(), Duration::from_secs(63));
         // Seven failed attempts and the closing "gave up" line, all critical.

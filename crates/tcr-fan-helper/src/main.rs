@@ -23,7 +23,11 @@
 //!
 //! # When it stops
 //!
-//! When it is idle: no connection, no holder and no disconnect window. A
+//! When it has been idle for `tcr_fan::root::IDLE_EXIT_GRACE` (15 s): no
+//! connection, no holder and no disconnect window, and nothing arrived
+//! meanwhile. Not at once, because launchd starts the job no sooner than 10 s
+//! after its previous start, and a caller inside that gap would wait on
+//! launchd rather than on the helper. A
 //! connection counts only once one of its messages reaches root, so a caller
 //! that fails the requirement, whose messages libxpc drops, cannot keep it
 //! running. When the
@@ -48,7 +52,7 @@ mod helper {
     use std::time::Duration;
 
     use tcr_fan::identity::{FanIdentity, Role};
-    use tcr_fan::root::{Level, Next, PeerId, Root, WindowId};
+    use tcr_fan::root::{IdleCheck, Level, Next, PeerId, Root, WindowId};
     use tcr_fan::wire::{self, MemDict};
     use tcr_fan::xpc::{self, Listener, Queue, Service, XpcDict, XpcError};
     use tcr_smc::{FanWriter, SmcConnection};
@@ -102,18 +106,30 @@ mod helper {
     fn act(next: Next) {
         match next {
             Next::Stay => {}
-            Next::Exit => {
-                log(
-                    Level::Notice,
-                    "idle: no connection, no holder, no window; exiting",
-                );
-                quit(0);
+            // Not at once: launchd will not start the helper again within
+            // 10 s of this start, so quitting now would leave the next caller
+            // waiting on launchd (`IDLE_EXIT_GRACE`).
+            Next::ExitIfStillIdle { check, after } => {
+                if let Some(state) = STATE.get() {
+                    state.queue.after(after, check.get(), idle_due);
+                }
             }
             Next::RetryAfter { window, after } => {
                 if let Some(state) = STATE.get() {
                     state.queue.after(after, window.get(), window_due);
                 }
             }
+        }
+    }
+
+    extern "C" fn idle_due(context: *mut c_void) {
+        let check = IdleCheck::from_raw(context as usize as u64);
+        if with_root(|root| root.idle_due(check)) == Some(true) {
+            log(
+                Level::Notice,
+                "idle: no connection, no holder, no window; exiting",
+            );
+            quit(0);
         }
     }
 
@@ -124,8 +140,9 @@ mod helper {
         }
     }
 
-    extern "C" fn idle_check(_context: *mut c_void) {
-        if with_root(|root| root.is_idle()) == Some(true) {
+    extern "C" fn startup_idle_check(context: *mut c_void) {
+        let check = IdleCheck::from_raw(context as usize as u64);
+        if with_root(|root| root.idle_due(check)) == Some(true) {
             log(Level::Notice, "no connection arrived; exiting");
             quit(0);
         }
@@ -189,6 +206,7 @@ mod helper {
             BUILD,
             Box::new(log),
         );
+        let startup = root.idle_check_now();
         if STATE
             .set(State {
                 root: Mutex::new(root),
@@ -213,7 +231,7 @@ mod helper {
             Arc::new(Helper),
         )
         .map_err(|e| fail("listener", e))?;
-        queue.after(STARTUP_IDLE_GRACE, 0, idle_check);
+        queue.after(STARTUP_IDLE_GRACE, startup.get(), startup_idle_check);
         log(
             Level::Notice,
             &format!("listening on {label} ({identity} build {BUILD})"),
