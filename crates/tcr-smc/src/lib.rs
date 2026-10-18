@@ -971,7 +971,7 @@ impl<S: KeySource> HeatReader<S> {
             }
         };
         // Ten fans is the most a fan key's single digit can name.
-        (0..count.min(10))
+        (0..count.min(MAX_FANS))
             .filter_map(|fan| FanIndex::new(fan).and_then(|fan| self.read_fan(fan)))
             .collect()
     }
@@ -1039,41 +1039,46 @@ impl<S: KeySource> HeatReader<S> {
     /// [`FanMode::Unreadable`]: nothing says who holds the fan, so a
     /// controller writes nothing to it.
     fn mode(&mut self, fan: FanIndex) -> FanMode {
-        let Some(suffix) = self.mode_key_suffix() else {
-            return FanMode::Unreadable;
+        let suffix = match mode_key_suffix(&mut self.smc, &mut self.mode_key_is_lower) {
+            Ok(suffix) => suffix,
+            Err(error) => {
+                self.note(&format!("{LOWER_MODE_PROBE_KEY} read"), &error);
+                return FanMode::Unreadable;
+            }
         };
         let key = fan_key(fan, suffix);
         match self.smc.read(key).and_then(|v| v.uint8_value()) {
-            Ok(0 | 3) => FanMode::Auto,
-            Ok(1) => FanMode::Manual,
-            Ok(_) | Err(SmcError::KeyNotFound(_)) => FanMode::Unreadable,
+            Ok(value) => FanMode::from_ui8(value),
+            Err(SmcError::KeyNotFound(_)) => FanMode::Unreadable,
             Err(error) => {
                 self.note(&format!("{key} read"), &error);
                 FanMode::Unreadable
             }
         }
     }
+}
 
-    /// `md` where `F0md` exists, else `Md`: some Apple Silicon models spell
-    /// the mode key in lower case. Stats probes `F0md` the same way. `None`,
-    /// and asked again next poll, when the probe itself fails.
-    fn mode_key_suffix(&mut self) -> Option<[u8; 2]> {
-        if self.mode_key_is_lower.is_none() {
-            match self.smc.read(LOWER_MODE_PROBE_KEY) {
-                Ok(_) => self.mode_key_is_lower = Some(true),
-                Err(SmcError::KeyNotFound(_)) => self.mode_key_is_lower = Some(false),
-                Err(error) => {
-                    self.note(&format!("{LOWER_MODE_PROBE_KEY} read"), &error);
-                    return None;
-                }
-            }
+/// `md` where `F0md` exists, else `Md`: some Apple Silicon models spell the
+/// mode key in lower case. Stats probes `F0md` the same way. Probed once and
+/// kept in `kept`; a probe that fails is not kept, and is asked again next
+/// time. [`HeatReader`] and [`FanWriter`] both spell the key through this.
+fn mode_key_suffix<S: KeySource>(
+    smc: &mut S,
+    kept: &mut Option<bool>,
+) -> Result<[u8; 2], SmcError> {
+    let lower = match *kept {
+        Some(lower) => lower,
+        None => {
+            let lower = match smc.read(LOWER_MODE_PROBE_KEY) {
+                Ok(_) => true,
+                Err(SmcError::KeyNotFound(_)) => false,
+                Err(error) => return Err(error),
+            };
+            *kept = Some(lower);
+            lower
         }
-        Some(if self.mode_key_is_lower == Some(true) {
-            *b"md"
-        } else {
-            *b"Md"
-        })
-    }
+    };
+    Ok(if lower { *b"md" } else { *b"Md" })
 }
 
 /// What [`HeatSource::open`] opens: AppleSMC on a Mac.
@@ -1265,6 +1270,17 @@ pub enum FanMode {
     Unreadable,
 }
 
+impl FanMode {
+    /// A mode key's `ui8`: 0 or 3 automatic, 1 manual, anything else unknown.
+    const fn from_ui8(value: u8) -> Self {
+        match value {
+            0 | 3 => Self::Auto,
+            1 => Self::Manual,
+            _ => Self::Unreadable,
+        }
+    }
+}
+
 /// After a hand-back, what still did not read 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandBackIncomplete {
@@ -1433,11 +1449,10 @@ impl<K: KeyAccess> FanWriter<K> {
         let Ok(key) = self.mode_key(fan) else {
             return FanMode::Unreadable;
         };
-        match self.smc.read(key).and_then(|v| v.uint8_value()) {
-            Ok(0 | 3) => FanMode::Auto,
-            Ok(1) => FanMode::Manual,
-            Ok(_) | Err(_) => FanMode::Unreadable,
-        }
+        self.smc
+            .read(key)
+            .and_then(|v| v.uint8_value())
+            .map_or(FanMode::Unreadable, FanMode::from_ui8)
     }
 
     /// `Ftst`: `None` on a Mac that has no such key, otherwise whether it
@@ -1543,27 +1558,26 @@ impl<K: KeyAccess> FanWriter<K> {
     pub fn hand_back(&mut self) -> Result<(), FanError> {
         let count = self.fan_count()?;
         let fans: Vec<FanIndex> = (0..count).filter_map(FanIndex::new).collect();
-        let mode_keys: Vec<(FanIndex, FourCc)> = match self.mode_key_suffix() {
-            Ok(suffix) => fans
-                .iter()
-                .map(|&fan| (fan, fan_key(fan, suffix)))
-                .collect(),
-            // The probe failed: try both spellings, the missing one answers
-            // "no such key" and is skipped.
-            Err(_) => fans
-                .iter()
-                .flat_map(|&fan| [(fan, fan_key(fan, *b"md")), (fan, fan_key(fan, *b"Md"))])
-                .collect(),
-        };
+        let mode_keys: Vec<(FanIndex, FourCc)> =
+            match mode_key_suffix(&mut self.smc, &mut self.mode_key_is_lower) {
+                Ok(suffix) => fans
+                    .iter()
+                    .map(|&fan| (fan, fan_key(fan, suffix)))
+                    .collect(),
+                // The probe failed: try both spellings, the missing one answers
+                // "no such key" and is skipped.
+                Err(_) => fans
+                    .iter()
+                    .flat_map(|&fan| [(fan, fan_key(fan, *b"md")), (fan, fan_key(fan, *b"Md"))])
+                    .collect(),
+            };
         for &(_, key) in &mode_keys {
-            match self.smc.read(key).and_then(|v| v.uint8_value()) {
-                Ok(0) | Err(SmcError::KeyNotFound(_)) => {}
-                Ok(_) | Err(_) => self.write_retried(key, 0),
+            if self.raised(key) {
+                self.write_retried(key, 0);
             }
         }
-        match self.smc.read(UNLOCK_KEY).and_then(|v| v.uint8_value()) {
-            Ok(0) | Err(SmcError::KeyNotFound(_)) => {}
-            Ok(_) | Err(_) => self.write_retried(UNLOCK_KEY, 0),
+        if self.raised(UNLOCK_KEY) {
+            self.write_retried(UNLOCK_KEY, 0);
         }
 
         // The SMC applies the writes a moment later: poll until every key
@@ -1589,16 +1603,21 @@ impl<K: KeyAccess> FanWriter<K> {
             ftst: false,
         };
         for &(fan, key) in mode_keys {
-            match self.smc.read(key).and_then(|v| v.uint8_value()) {
-                Ok(0) | Err(SmcError::KeyNotFound(_)) => {}
-                Ok(_) | Err(_) => incomplete.fans |= 1 << fan.get(),
+            if self.raised(key) {
+                incomplete.fans |= 1 << fan.get();
             }
         }
-        incomplete.ftst = !matches!(
-            self.smc.read(UNLOCK_KEY).and_then(|v| v.uint8_value()),
-            Ok(0) | Err(SmcError::KeyNotFound(_))
-        );
+        incomplete.ftst = self.raised(UNLOCK_KEY);
         incomplete
+    }
+
+    /// `key` reads other than 0, or does not read. An absent key is not
+    /// raised: there is nothing to hand back.
+    fn raised(&mut self, key: FourCc) -> bool {
+        !matches!(
+            self.smc.read(key).and_then(|v| v.uint8_value()),
+            Ok(0) | Err(SmcError::KeyNotFound(_))
+        )
     }
 
     /// One `ui8` write, tried up to [`HAND_BACK_TRIES`] times while the SMC
@@ -1619,22 +1638,10 @@ impl<K: KeyAccess> FanWriter<K> {
     /// `F{n}md` where `F0md` exists, else `F{n}Md`, probed once and kept, as
     /// [`HeatReader`] does. A probe that fails is not kept.
     fn mode_key(&mut self, fan: FanIndex) -> Result<FourCc, SmcError> {
-        Ok(fan_key(fan, self.mode_key_suffix()?))
-    }
-
-    fn mode_key_suffix(&mut self) -> Result<[u8; 2], SmcError> {
-        if self.mode_key_is_lower.is_none() {
-            match self.smc.read(LOWER_MODE_PROBE_KEY) {
-                Ok(_) => self.mode_key_is_lower = Some(true),
-                Err(SmcError::KeyNotFound(_)) => self.mode_key_is_lower = Some(false),
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(if self.mode_key_is_lower == Some(true) {
-            *b"md"
-        } else {
-            *b"Md"
-        })
+        Ok(fan_key(
+            fan,
+            mode_key_suffix(&mut self.smc, &mut self.mode_key_is_lower)?,
+        ))
     }
 }
 
