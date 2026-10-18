@@ -424,6 +424,83 @@ fn the_hot_guard_runs_full_until_it_cools() {
     );
 }
 
+/// A round's plan, worked out before any write: the cases the two tests above
+/// drive through the rig, plus a forced round, a fan not held and a range
+/// that did not read.
+#[test]
+fn a_round_plans_the_hot_guard_and_the_gate() {
+    let range = 5777.0 - 1350.0;
+    let held = |rpm: f64| Hold {
+        writer_pid: 4242,
+        fans: (0..2)
+            .map(|i| HeldFan {
+                fan: fan(i),
+                written_rpm: Some(rpm),
+            })
+            .collect(),
+    };
+    let both = |rpm: f64| vec![(fan(0), rpm), (fan(1), rpm)];
+    let at = |celsius: f64| HeatReading {
+        cpu_celsius: Some(celsius),
+        ..machine()
+    };
+    let step = (1.0_f64 / 30.0).mul_add(range, 1350.0);
+    let half = 1350.0 + range / 2.0;
+    let cooled = (49.0_f64 / 60.0).mul_add(range, 1350.0);
+    // (desired, cpu, previous, was hot, forced) -> (hot, writes)
+    let cases = [
+        (follow(60, 90), 61.0, 1350.0, false, false, false, vec![]),
+        (follow(60, 90), 61.0, 1350.0, false, true, false, both(step)),
+        (
+            follow(60, 90),
+            75.0,
+            1350.0,
+            false,
+            false,
+            false,
+            both(half),
+        ),
+        (
+            follow(40, 100),
+            100.0,
+            1350.0,
+            false,
+            false,
+            true,
+            both(5777.0),
+        ),
+        (follow(40, 100), 95.0, 5777.0, true, false, true, vec![]),
+        (
+            follow(40, 100),
+            89.0,
+            5777.0,
+            true,
+            false,
+            false,
+            both(cooled),
+        ),
+        (fixed(5000), 104.0, 5000.0, false, false, false, vec![]),
+        (fixed(5100), 50.0, 5000.0, false, false, false, both(5100.0)),
+    ];
+    for (desired, cpu, previous, was_hot, forced, hot, writes) in cases {
+        let round = plan_round(desired, &at(cpu), Some(&held(previous)), was_hot, forced);
+        let case = format!("{desired:?} at {cpu} from {previous}, hot {was_hot}, forced {forced}");
+        assert_eq!(round.hot, hot, "{case}");
+        assert_eq!(round.writes, writes, "{case}");
+        assert!(!round.limits_unknown, "{case}");
+    }
+
+    // No record: nothing is ours to write.
+    let round = plan_round(fixed(5000), &machine(), None, false, true);
+    assert_eq!(round.writes, vec![]);
+    // A held fan whose range did not read, in a mode that needs it.
+    let mut no_range = machine();
+    no_range.fans[1].max_rpm = 0.0;
+    let round = plan_round(follow(60, 90), &no_range, Some(&held(5000.0)), false, true);
+    assert_eq!(round.writes, vec![(fan(0), 1350.0)]);
+    assert!(round.limits_unknown);
+}
+
 /// Fixed holds exactly the rpm asked for, however hot (Gil, 2026-10-18: the
 /// guard turned `fixed 5000` into 5777 at 104-106 °C). Entering hot, holding
 /// hot, and switching to Fixed while the guard is on in Follow CPU.
