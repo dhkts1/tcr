@@ -286,18 +286,10 @@ pub enum FanRequest {
 impl FanRequest {
     /// The command it asks for, or why it is refused.
     pub fn command(self) -> Result<Command, ModeError> {
-        Ok(match self {
-            Self::Auto { force: true } => Command::ForceHandBack,
-            Self::Auto { force: false } => Command::Set(FanMode::Auto),
-            Self::Fixed { rpm } => Command::Set(mode_of(FanDesiredRow::Fixed { rpm })?),
-            Self::FollowCpu {
-                quiet_below_c,
-                full_at_c,
-            } => Command::Set(mode_of(FanDesiredRow::FollowCpu {
-                quiet_below_c,
-                full_at_c,
-            })?),
-        })
+        match self {
+            Self::Auto { force: true } => Ok(Command::ForceHandBack),
+            other => mode_of(other.desired_row()).map(Command::Set),
+        }
     }
 
     /// The wish this request sets, as the status spells it. `auto --force`

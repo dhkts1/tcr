@@ -519,27 +519,6 @@ pub enum FanReasonRow {
     ControllerStopped,
 }
 
-impl FanReasonRow {
-    /// The reason's name, without its data: what a person or a script reads.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::MacsFanControl => "macsFanControl",
-            Self::AnotherApp => "anotherApp",
-            Self::NotSignedForFans => "notSignedForFans",
-            Self::NoSmc => "noSmc",
-            Self::NoFans => "noFans",
-            Self::HelperUnreachable => "helperUnreachable",
-            Self::HelperNoReply => "helperNoReply",
-            Self::HelperSignature => "helperSignature",
-            Self::HelperVersion { .. } => "helperVersion",
-            Self::ModeLocked(_) => "modeLocked",
-            Self::Contended => "contended",
-            Self::HelperRefused => "helperRefused",
-            Self::ControllerStopped => "controllerStopped",
-        }
-    }
-}
-
 /// One entry of [`FanControlRow::targets`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FanTargetRow {

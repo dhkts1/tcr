@@ -3838,7 +3838,7 @@ pub async fn fan(
     }
     let reason = row
         .reason
-        .map(|r| format!(" ({})", r.name()))
+        .map(|r| format!(" ({})", fan_word(&r)))
         .unwrap_or_default();
     let detail = row.detail.map(|d| format!(": {d}")).unwrap_or_default();
     eprintln!(
@@ -3849,12 +3849,20 @@ pub async fn fan(
     Ok(1)
 }
 
-/// A wire enum's own JSON spelling, for a line a person reads and a script greps.
+/// A wire enum's own JSON spelling, for a line a person reads and a script greps: a bare
+/// string, or the one key of serde's tagged form (`{"modeLocked": 1}` is `modeLocked`).
 fn fan_word<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| "?".to_string())
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(word)) => word,
+        Ok(serde_json::Value::Object(map)) if map.len() == 1 => {
+            let Some((word, _)) = map.into_iter().next() else {
+                return "?".to_string();
+            };
+            word
+        }
+        // A shape with no word; none of the enums this spells has one.
+        _ => "?".to_string(),
+    }
 }
 
 /// `tcr fan`'s text: the wish, the state and why, then each fan as heat reads it.
@@ -3874,8 +3882,7 @@ fn render_fan_text(
     let mut out = format!(
         "desired={desired}\nstate={}\nreason={}\n",
         fan_word(&row.state),
-        row.reason
-            .map_or_else(|| "-".to_string(), |r| r.name().to_string()),
+        row.reason.map_or_else(|| "-".to_string(), |r| fan_word(&r)),
     );
     if let Some(detail) = &row.detail {
         out.push_str(&format!("detail={detail}\n"));
@@ -8364,6 +8371,37 @@ mod tests {
             "desired=fixed 5000 rpm\nstate=foreign\nreason=macsFanControl\nhotGuard=off\n\
              cpu=61.0°C\nfan=0 actual=5013 min=1350 max=5777 mode=manual target=5000\nftst=0\n"
         );
+    }
+
+    /// A reason's word is its wire name without its data, for the ones that carry data too:
+    /// what `reason=` and the failure line print.
+    #[test]
+    fn fan_reason_word_is_the_wire_name_without_its_data() {
+        use tcr_status_wire::FanReasonRow;
+        for (reason, word) in [
+            (FanReasonRow::MacsFanControl, "macsFanControl"),
+            (FanReasonRow::AnotherApp, "anotherApp"),
+            (FanReasonRow::NotSignedForFans, "notSignedForFans"),
+            (FanReasonRow::NoSmc, "noSmc"),
+            (FanReasonRow::NoFans, "noFans"),
+            (FanReasonRow::HelperUnreachable, "helperUnreachable"),
+            (FanReasonRow::HelperNoReply, "helperNoReply"),
+            (FanReasonRow::HelperSignature, "helperSignature"),
+            (
+                FanReasonRow::HelperVersion { installed: None },
+                "helperVersion",
+            ),
+            (
+                FanReasonRow::HelperVersion { installed: Some(2) },
+                "helperVersion",
+            ),
+            (FanReasonRow::ModeLocked(1), "modeLocked"),
+            (FanReasonRow::Contended, "contended"),
+            (FanReasonRow::HelperRefused, "helperRefused"),
+            (FanReasonRow::ControllerStopped, "controllerStopped"),
+        ] {
+            assert_eq!(fan_word(&reason), word, "{reason:?}");
+        }
     }
 
     /// A status row for the `tcr fan` tests.
