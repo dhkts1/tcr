@@ -293,9 +293,8 @@ struct FanPopover: View {
         switch panel {
         case .anotherApp:
             return "TcrBar did not set these speeds and will not change them."
-        case .controls(.fixed, _) where fans.fanControl?.state == .holding:
-            return back + " At 100°C the fans go to full speed, whatever is set."
-        case .controls(.followCPU, _) where fans.fanControl?.state == .holding:
+        case .controls(.fixed, _) where fans.fanControl?.state == .holding,
+            .controls(.followCPU, _) where fans.fanControl?.state == .holding:
             return back
         default:
             let figures = (heat?.fans ?? []).map { "Fan \($0.index + 1) \(rpmText($0, ofMax: false))" }

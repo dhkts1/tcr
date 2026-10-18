@@ -123,6 +123,32 @@ public enum FanHelperRegistration {
         try service(label).register()
     }
 
+    /// What a `register()` call came to.
+    public enum RegisterOutcome: Equatable, Sendable {
+        /// Registered: the call returned, or it threw and macOS reports the
+        /// service registered all the same. The status says which: usually
+        /// ``Status/requiresApproval``.
+        case registered(Status)
+        /// Not registered; the thrown error is the reason.
+        case failed
+    }
+
+    /// Judge a `register()` by the status read right after it, never by the
+    /// error code. On the 2026-10-18 hardware run `register()` threw
+    /// `SMAppServiceErrorDomain` code 1, "Operation not permitted", while the
+    /// service was registered and waiting for approval; the operator approved
+    /// it and the status read `enabled`. So a throw followed by
+    /// ``Status/requiresApproval`` or ``Status/enabled`` is a success, and a
+    /// throw followed by any other status is still the failure the error says.
+    public static func registerOutcome(thrown: Error?, statusAfter: Status) -> RegisterOutcome {
+        guard thrown != nil else { return .registered(statusAfter) }
+        switch statusAfter {
+        case .requiresApproval, .enabled: return .registered(statusAfter)
+        case .notRegistered, .notFound, .unrecognised, .noLabel:
+            return .failed
+        }
+    }
+
     /// Remove the registration. For testing only; the panel offers no such
     /// control.
     public static func unregister(label: String? = label) throws {
@@ -188,6 +214,7 @@ public enum FanHelperRegistration {
             print("\(label): \(status(label: label).word)")
             exit(0)
         case .register, .unregister:
+            var thrown: Error?
             do {
                 if request == .register {
                     try register(label: label)
@@ -195,13 +222,24 @@ public enum FanHelperRegistration {
                     try unregister(label: label)
                 }
             } catch {
-                write(
-                    "\(label): \(request == .register ? "register" : "unregister") failed: \(error)",
-                    to: FileHandle.standardError)
-                print("\(label): \(status(label: label).word)")
+                thrown = error
+            }
+            let after = status(label: label)
+            if request == .register {
+                // A throw that left the service waiting for approval is a
+                // registration, not a failure (see ``registerOutcome``).
+                if registerOutcome(thrown: thrown, statusAfter: after) == .failed {
+                    let why = thrown.map { String(describing: $0) } ?? "no error"
+                    write("\(label): register failed: \(why)", to: FileHandle.standardError)
+                    print("\(label): \(after.word)")
+                    exit(1)
+                }
+            } else if let thrown {
+                write("\(label): unregister failed: \(thrown)", to: FileHandle.standardError)
+                print("\(label): \(after.word)")
                 exit(1)
             }
-            print("\(label): \(status(label: label).word)")
+            print("\(label): \(after.word)")
             exit(0)
         }
     }

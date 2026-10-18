@@ -117,4 +117,26 @@ final class FanHelperRegistrationTests: XCTestCase {
             return XCTFail("an unknown verb must be a usage error, not a start")
         }
     }
+
+    // MARK: register() that throws
+
+    private struct Refused: Error {}
+
+    /// 2026-10-18, Gil's Mac: `register()` threw "Operation not permitted"
+    /// and the status right after read `requiresApproval`. That is a
+    /// registration; only another status keeps the failure.
+    func testAThrowIsJudgedByTheStatusAfterIt() {
+        typealias R = FanHelperRegistration
+        for after in [R.Status.requiresApproval, .enabled] {
+            XCTAssertEqual(R.registerOutcome(thrown: Refused(), statusAfter: after), .registered(after))
+        }
+        for after in [R.Status.notRegistered, .notFound, .unrecognised(rawValue: 9), .noLabel] {
+            XCTAssertEqual(R.registerOutcome(thrown: Refused(), statusAfter: after), .failed)
+        }
+        // No throw: whatever the status says, the call did register.
+        XCTAssertEqual(
+            R.registerOutcome(thrown: nil, statusAfter: .requiresApproval), .registered(.requiresApproval))
+        XCTAssertEqual(
+            R.registerOutcome(thrown: nil, statusAfter: .notRegistered), .registered(.notRegistered))
+    }
 }

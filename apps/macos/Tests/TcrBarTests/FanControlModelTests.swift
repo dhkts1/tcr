@@ -353,4 +353,36 @@ final class FanControlModelTests: XCTestCase {
             "CPU 93°C · fans 87% manual")
         XCTAssertEqual(line(nil), "CPU 93°C · fans 87% manual")
     }
+
+    // MARK: - Install
+
+    /// `register()` throwing while macOS holds the helper for approval is
+    /// not an error panel: no failure is set and the panel is the approval one.
+    func testInstallThatThrowsButRequiresApprovalShowsApproval() {
+        struct Refused: Error {}
+        registration = .requiresApproval
+        let fans = FanControlModel(
+            runner: { _ in .done },
+            readRegistration: { [unowned self] in self.registration },
+            registerHelper: { throw Refused() },
+            openApprovalPage: {})
+        fans.update(fanControl: FanControl(desired: .auto, state: .off), heat: nil)
+        fans.installHelper()
+        XCTAssertNil(fans.failure)
+        XCTAssertEqual(fans.registration, .requiresApproval)
+    }
+
+    /// A throw with the helper still not registered stays a failure.
+    func testInstallThatThrowsAndStaysUnregisteredFails() {
+        struct Refused: Error {}
+        registration = .notRegistered
+        let fans = FanControlModel(
+            runner: { _ in .done },
+            readRegistration: { [unowned self] in self.registration },
+            registerHelper: { throw Refused() },
+            openApprovalPage: {})
+        fans.update(fanControl: FanControl(desired: .auto, state: .off), heat: nil)
+        fans.installHelper()
+        XCTAssertNotNil(fans.failure)
+    }
 }

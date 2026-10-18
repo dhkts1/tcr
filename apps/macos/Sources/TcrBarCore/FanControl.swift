@@ -16,8 +16,8 @@ public struct FanControl: Equatable, Sendable, Decodable {
     public let state: FanControlState
     /// Why the state is what it is. Nil while nothing is wrong.
     public let reason: FanControlReason?
-    /// The CPU passed the hot guard, so every fan is at full speed whatever
-    /// the mode says.
+    /// The CPU passed the hot guard, so every fan is at full speed. Follow CPU
+    /// only: Fixed holds exactly the speed picked (Gil, 2026-10-18).
     public let hotGuard: Bool
     /// The speed the controller last wrote to each fan. Empty while it holds
     /// none.

@@ -383,10 +383,19 @@ public final class FanControlModel: ObservableObject {
     /// next read shows as panel 8.
     public func installHelper() {
         failure = nil
+        var thrown: Error?
         do {
             try registerHelper()
         } catch {
-            failure = "The helper did not install: \(error.localizedDescription)"
+            thrown = error
+        }
+        // The status right after the call decides, not the error: macOS
+        // throws "Operation not permitted" for a helper it registered and is
+        // holding for approval.
+        let outcome = FanHelperRegistration.registerOutcome(
+            thrown: thrown, statusAfter: readRegistration())
+        if outcome == .failed, let thrown {
+            failure = "The helper did not install: \(thrown.localizedDescription)"
         }
         popoverOpened()
     }
