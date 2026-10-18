@@ -3057,10 +3057,18 @@ struct FleetView: View {
             // and spacing rather than a height in points:
             // `SettingsPanes.waitingLine` measured wrapped lines half a point
             // off a computed reserve.
+            //
+            // The reserve is `fixedSize` vertically like the line itself. Without
+            // it a hidden Text is compressible: the ZStack's height became a range
+            // from the visible line's height up to the reserve, and when the line
+            // filled fewer lines than the reserve the stack below laid out
+            // differently, cutting the first slowest command to one line and
+            // packing the running rows tighter (scene 17 against 17d, 2026-10-18).
             ZStack(alignment: .topLeading) {
                 Text(Array(repeating: "0", count: Self.toolsNumbersReservedLines).joined(separator: "\n"))
                     .font(V4.font(V4.muteSize))
                     .lineSpacing(Tok.secondaryLineSpacing)
+                    .fixedSize(horizontal: false, vertical: true)
                     .hidden()
                     .accessibilityHidden(true)
                 numbersLine
