@@ -3265,6 +3265,11 @@ public struct Fleet: Equatable, Sendable {
     /// read, predates the key, or the sessions half of the poll failed.
     public let heat: HeatReading?
 
+    /// What the proxy's fan controller is doing (``FanControl``), from the same
+    /// object as ``heat``. Nil from a proxy that predates fan control, and when
+    /// the object would not decode (logged once).
+    public let fanControl: FanControl?
+
     /// Whether the CURRENT read populated ``sessions`` at all — distinct from
     /// an empty ``sessions``, which is also true of a server with nothing live
     /// right now. Derived from ``sessionsChannel`` rather than stored beside
@@ -3296,7 +3301,8 @@ public struct Fleet: Equatable, Sendable {
         sessions: [Session] = [],
         sessionsChannel: SessionsChannel,
         unreadableSessions: [UnreadableRow] = [],
-        heat: HeatReading? = nil
+        heat: HeatReading? = nil,
+        fanControl: FanControl? = nil
     ) {
         self.accounts = accounts
         self.unreadable = unreadable
@@ -3304,6 +3310,7 @@ public struct Fleet: Equatable, Sendable {
         self.sessionsChannel = sessionsChannel
         self.unreadableSessions = unreadableSessions
         self.heat = heat
+        self.fanControl = fanControl
     }
 
     /// What the `tcr sessions --json` half of a poll produced.
@@ -3345,17 +3352,21 @@ public struct Fleet: Equatable, Sendable {
         public let unreadable: [UnreadableRow]
         /// The document's `heat` object, see ``Fleet/heat``.
         public let heat: HeatReading?
+        /// The document's `fanControl` object, see ``Fleet/fanControl``.
+        public let fanControl: FanControl?
 
         public init(
             sessions: [Session] = [],
             channel: SessionsChannel,
             unreadable: [UnreadableRow] = [],
-            heat: HeatReading? = nil
+            heat: HeatReading? = nil,
+            fanControl: FanControl? = nil
         ) {
             self.sessions = sessions
             self.channel = channel
             self.unreadable = unreadable
             self.heat = heat
+            self.fanControl = fanControl
         }
     }
 
@@ -3368,7 +3379,8 @@ public struct Fleet: Equatable, Sendable {
             sessions: read.sessions,
             sessionsChannel: read.channel,
             unreadableSessions: read.unreadable,
-            heat: read.heat)
+            heat: read.heat,
+            fanControl: read.fanControl)
     }
 
     /// The document's `heat` object, or nil when there is none. Every key of
@@ -3381,16 +3393,32 @@ public struct Fleet: Equatable, Sendable {
     static func decodeHeat(_ value: Any?, log: (String) -> Void = HeatDecodeLog.shared.once)
         -> HeatReading?
     {
+        decodeMachineObject(value, named: "heat reading", log: log)
+    }
+
+    /// The document's `fanControl` object (``FanControl``), or nil when there
+    /// is none. Same containment as ``decodeHeat(_:log:)``: one that will not
+    /// decode is logged once and left out, and the popover then says the tcr
+    /// cannot control fans rather than guessing at a state.
+    static func decodeFanControl(
+        _ value: Any?, log: (String) -> Void = HeatDecodeLog.shared.once
+    ) -> FanControl? {
+        decodeMachineObject(value, named: "fan control", log: log)
+    }
+
+    private static func decodeMachineObject<T: Decodable>(
+        _ value: Any?, named name: String, log: (String) -> Void
+    ) -> T? {
         guard let value else { return nil }
         guard JSONSerialization.isValidJSONObject(value) else {
-            log("TcrBar: the poll's heat reading is not a JSON object; left out")
+            log("TcrBar: the poll's \(name) is not a JSON object; left out")
             return nil
         }
         do {
             let data = try JSONSerialization.data(withJSONObject: value, options: [])
-            return try JSONDecoder().decode(HeatReading.self, from: data)
+            return try JSONDecoder().decode(T.self, from: data)
         } catch {
-            log("TcrBar: the poll's heat reading did not decode, so it is left out: \(error)")
+            log("TcrBar: the poll's \(name) did not decode, so it is left out: \(error)")
             return nil
         }
     }
@@ -3425,8 +3453,10 @@ public struct Fleet: Equatable, Sendable {
             )
         }
         let heat = decodeHeat(object["heat"])
+        let fanControl = decodeFanControl(object["fanControl"])
         guard supported else {
-            return SessionsRead(channel: .serverPredatesSessions, heat: heat)
+            return SessionsRead(
+                channel: .serverPredatesSessions, heat: heat, fanControl: fanControl)
         }
 
         let rows = object["sessions"] as? [Any] ?? []
@@ -3450,7 +3480,8 @@ public struct Fleet: Equatable, Sendable {
             }
         }
         return SessionsRead(
-            sessions: sessions, channel: .live, unreadable: unreadable, heat: heat)
+            sessions: sessions, channel: .live, unreadable: unreadable, heat: heat,
+            fanControl: fanControl)
     }
 
     private enum CodingKeys: String, CodingKey {

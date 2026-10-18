@@ -45,6 +45,11 @@ public struct MachineStats: Equatable, Sendable {
     /// SMC (a VM), from a proxy too old to say, and with no proxy at all; the
     /// line is then exactly the line without it.
     public let heat: HeatReading?
+    /// What the proxy's fan controller is doing, from the same poll
+    /// (``Fleet/fanControl``). It decides the word after the fan share
+    /// (``heatPhrases``): nil leaves stage 1's rule, where any manual fan reads
+    /// ` manual`.
+    public let fanControl: FanControl?
 
     public init(
         loadAverage: Double,
@@ -53,7 +58,8 @@ public struct MachineStats: Equatable, Sendable {
         memoryTotalBytes: UInt64,
         compiles: Int,
         diskFreeBytes: UInt64,
-        heat: HeatReading? = nil
+        heat: HeatReading? = nil,
+        fanControl: FanControl? = nil
     ) {
         self.loadAverage = loadAverage
         self.cores = cores
@@ -62,6 +68,55 @@ public struct MachineStats: Equatable, Sendable {
         self.compiles = compiles
         self.diskFreeBytes = diskFreeBytes
         self.heat = heat
+        self.fanControl = fanControl
+    }
+
+    /// The word after the fan share on the numbers line.
+    public enum FanSuffix: Equatable, Sendable {
+        /// tcr holds the fans in Fixed: ` fixed`, because they no longer
+        /// follow heat (mockup panel 9).
+        case fixed
+        /// tcr holds the fans in Follow CPU: no word, because they follow heat
+        /// (panel 10).
+        case none
+        /// Another program holds the fans: ` manual` (panel 11).
+        case manual
+        /// Anything else: ` manual` when any fan's mode key reads manual, the
+        /// stage 1 rule.
+        case fromModeKeys
+
+        public static func of(_ control: FanControl?) -> FanSuffix {
+            guard let control else { return .fromModeKeys }
+            switch (control.state, control.desired) {
+            case (.holding, .fixed): return .fixed
+            case (.holding, .followCPU): return .none
+            case (.foreign, _): return .manual
+            default: return .fromModeKeys
+            }
+        }
+    }
+
+    /// The ` fixed` or ` manual` the fan phrase ends with, or "".
+    var fanSuffixWord: String {
+        let fans = (heat?.fans ?? []).filter { $0.actualRPM.isFinite }
+        switch FanSuffix.of(fanControl) {
+        case .fixed: return " fixed"
+        case .none: return ""
+        case .manual: return " manual"
+        case .fromModeKeys: return fans.contains { $0.isManual } ? " manual" : ""
+        }
+    }
+
+    /// The tooltip's last line, matching ``fanSuffixWord``; nil when the line
+    /// carries no word.
+    var fanSuffixDetail: String? {
+        switch FanSuffix.of(fanControl) {
+        case .fixed: return "Fixed: tcr holds these speeds, so they do not follow the heat."
+        case .none: return nil
+        case .manual, .fromModeKeys:
+            guard fanSuffixWord == " manual" else { return nil }
+            return "Manual: another app set these speeds, so they do not follow the heat."
+        }
     }
 
     /// How hard the box is being pushed, by Gil's own dispatch rule
@@ -116,9 +171,11 @@ public struct MachineStats: Equatable, Sendable {
     ///
     /// - Whole degrees. Fans are the BUSIER fan's speed as a share of its own
     ///   maximum, whole percent: raw rpm means nothing without the maximum.
-    /// - ` manual` when any fan's mode key says a program fixed its speed.
-    ///   TcrBar sets no fan, so manual means another app, and fans that no
-    ///   longer follow heat is the case worth seeing.
+    /// - The word after the share is ``FanSuffix``: ` fixed` while tcr holds
+    ///   the fans in Fixed, none in Follow CPU, ` manual` while another app
+    ///   holds them, and otherwise ` manual` when any fan's mode key says a
+    ///   program fixed its speed: fans that no longer follow heat is the case
+    ///   worth seeing.
     /// - `fans off` when every fan reads 0 rpm; no fan part on a Mac with no
     ///   fans (`CPU 61°C`); no CPU part when no CPU sensor reads.
     /// - ` manual` survives a reading with no share to show (every maximum
@@ -146,7 +203,7 @@ public struct MachineStats: Equatable, Sendable {
         }
         let fans = heat.fans.filter { $0.actualRPM.isFinite }
         if !fans.isEmpty {
-            let manual = fans.contains { $0.isManual } ? " manual" : ""
+            let manual = fanSuffixWord
             if fans.allSatisfy({ $0.actualRPM <= 0 }) {
                 phrases.append("fans off\(manual)")
             } else if let busiest = fans.compactMap(Self.shareOfMax).max(),
@@ -176,8 +233,8 @@ public struct MachineStats: Equatable, Sendable {
             let of = fan.maxRPM > 0 ? Self.grouped(fan.maxRPM).map { " of \($0)" } ?? "" : ""
             lines.append("Fan \(fan.index + 1): \(actual)\(of) rpm")
         }
-        if heat.fans.contains(where: { $0.isManual }) {
-            lines.append("Manual: another app set these speeds, so they do not follow the heat.")
+        if !heat.fans.isEmpty, let suffix = fanSuffixDetail {
+            lines.append(suffix)
         }
         return lines.joined(separator: "\n")
     }
@@ -191,7 +248,7 @@ public struct MachineStats: Equatable, Sendable {
 
     /// `value` rounded to a whole number, or nil when it is not a number
     /// `Int` can hold: NaN, an infinity, or past ±10^15.
-    static func whole(_ value: Double) -> Int? {
+    public static func whole(_ value: Double) -> Int? {
         guard value.isFinite, abs(value) < 1e15 else { return nil }
         return Int(value.rounded())
     }
@@ -199,7 +256,7 @@ public struct MachineStats: Equatable, Sendable {
     /// Whole rpm with a comma every three digits, "5,013": fixed rather than
     /// the user's locale, like every other figure on the panel. Nil for a
     /// figure that is not a number. No minus sign: the proxy drops negative rpm.
-    static func grouped(_ rpm: Double) -> String? {
+    public static func grouped(_ rpm: Double) -> String? {
         guard let rounded = whole(rpm) else { return nil }
         let digits = String(rounded)
         var out = ""
@@ -241,11 +298,12 @@ extension MachineStats {
     /// `getloadavg` returning -1 does not make the memory figure unknown.
     ///
     /// `heat` is not read here. The proxy reads the SMC and the poll carries
-    /// it (``Fleet/heat``); the caller passes the latest one in.
+    /// it (``Fleet/heat``); the caller passes the latest one in, and the
+    /// controller's state from the same poll (``Fleet/fanControl``).
     ///
     /// Blocking: the process walk is kernel calls, so the panel calls this
     /// off the main thread and assigns the result on it.
-    public static func read(heat: HeatReading? = nil) -> MachineStats {
+    public static func read(heat: HeatReading? = nil, fanControl: FanControl? = nil) -> MachineStats {
         MachineStats(
             loadAverage: readLoadAverage(),
             cores: ProcessInfo.processInfo.processorCount,
@@ -253,7 +311,8 @@ extension MachineStats {
             memoryTotalBytes: ProcessInfo.processInfo.physicalMemory,
             compiles: readCompileCount(),
             diskFreeBytes: readDiskFree(),
-            heat: heat
+            heat: heat,
+            fanControl: fanControl
         )
     }
 
