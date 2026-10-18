@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import TcrSMC
 
 /// What the box itself is doing — the Tools tab's machine line, "load 7.1/14
 /// · 48/64 GB · 5 compiles · 210 GB free".
@@ -40,6 +41,9 @@ public struct MachineStats: Equatable, Sendable {
     /// own.
     public let compiles: Int
     public let diskFreeBytes: UInt64
+    /// CPU temperature and fans, from AppleSMC without root. Nil where the SMC
+    /// cannot be read (a VM), and the line is then exactly the line without it.
+    public let heat: HeatReading?
 
     public init(
         loadAverage: Double,
@@ -47,7 +51,8 @@ public struct MachineStats: Equatable, Sendable {
         memoryUsedBytes: UInt64,
         memoryTotalBytes: UInt64,
         compiles: Int,
-        diskFreeBytes: UInt64
+        diskFreeBytes: UInt64,
+        heat: HeatReading? = nil
     ) {
         self.loadAverage = loadAverage
         self.cores = cores
@@ -55,6 +60,7 @@ public struct MachineStats: Equatable, Sendable {
         self.memoryTotalBytes = memoryTotalBytes
         self.compiles = compiles
         self.diskFreeBytes = diskFreeBytes
+        self.heat = heat
     }
 
     /// How hard the box is being pushed, by Gil's own dispatch rule
@@ -82,8 +88,11 @@ public struct MachineStats: Equatable, Sendable {
         return .overloaded
     }
 
-    /// "load 7.1/14 · 48/64 GB · 5 compiles · 210 GB free".
-    public var line: String { "\(loadClause) · \(restClause)" }
+    /// "load 7.1/14 · 48/64 GB · 5 compiles · 210 GB free", with
+    /// ``heatClause`` after the load when there is one.
+    public var line: String {
+        [loadClause, heatClause, restClause].compactMap { $0 }.joined(separator: " · ")
+    }
 
     /// The load clause alone — the one part a view TINTS, split out here so
     /// the tint and the words it colours can never drift apart.
@@ -96,6 +105,75 @@ public struct MachineStats: Equatable, Sendable {
         return
             "\(Self.gibibytes(memoryUsedBytes))/\(Self.gibibytes(memoryTotalBytes)) GB"
             + " · \(compiles) \(compileNoun) · \(Self.gigabytes(diskFreeBytes)) GB free"
+    }
+
+    /// "CPU 93°C · fans 87%": the other half of "is the box overloaded?",
+    /// how hot it runs and how hard the fans work. Right after the load,
+    /// because both describe the box. Never tinted, for the reason
+    /// ``restClause`` gives (`docs/design/fan-readout-mockup.html`, panels 2
+    /// to 6).
+    ///
+    /// - Whole degrees. Fans are the BUSIER fan's speed as a share of its own
+    ///   maximum, whole percent: raw rpm means nothing without the maximum.
+    /// - ` manual` when any fan's mode key says a program fixed its speed.
+    ///   TcrBar sets no fan, so manual means another app, and fans that no
+    ///   longer follow heat is the case worth seeing.
+    /// - `fans off` when every fan reads 0 rpm; no fan part on a Mac with no
+    ///   fans (`CPU 61°C`); no CPU part when no CPU sensor reads.
+    /// - Nil with no reading, so the line is exactly the line without heat.
+    public var heatClause: String? {
+        guard let heat else { return nil }
+        var parts: [String] = []
+        if let celsius = heat.cpuCelsius {
+            parts.append("CPU \(Int(celsius.rounded()))°C")
+        }
+        if !heat.fans.isEmpty {
+            let manual = heat.fans.contains { $0.isManual } ? " manual" : ""
+            if heat.fans.allSatisfy({ $0.actualRPM <= 0 }) {
+                parts.append("fans off\(manual)")
+            } else if let busiest = heat.fans.compactMap(Self.shareOfMax).max() {
+                parts.append("fans \(Int((busiest * 100).rounded()))%\(manual)")
+            }
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// The per-fan detail behind ``heatClause``, for the numbers line's
+    /// tooltip (mockup panel 3): one decimal on the CPU, each fan's own rpm
+    /// against its own maximum, and what `manual` means. Nil when
+    /// ``heatClause`` is.
+    public var heatDetail: String? {
+        guard let heat, heatClause != nil else { return nil }
+        var lines: [String] = []
+        if let celsius = heat.cpuCelsius {
+            lines.append("Hottest CPU sensor \(String(format: "%.1f", celsius)) °C")
+        }
+        for fan in heat.fans {
+            lines.append(
+                "Fan \(fan.index + 1): \(Self.grouped(fan.actualRPM)) of \(Self.grouped(fan.maxRPM)) rpm")
+        }
+        if heat.fans.contains(where: { $0.isManual }) {
+            lines.append("Manual: another app set these speeds, so they do not follow the heat.")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Actual over maximum, or nil for a fan whose maximum did not read: a
+    /// share of nothing is not 0 %, it is no figure.
+    static func shareOfMax(_ fan: FanReading) -> Double? {
+        fan.maxRPM > 0 ? fan.actualRPM / fan.maxRPM : nil
+    }
+
+    /// Whole rpm with a comma every three digits, "5,013": fixed rather than
+    /// the user's locale, like every other figure on the panel.
+    static func grouped(_ rpm: Double) -> String {
+        let digits = String(Int(rpm.rounded()))
+        var out = ""
+        for (offset, digit) in digits.enumerated() {
+            if offset > 0 && (digits.count - offset) % 3 == 0 && digit != "-" { out.append(",") }
+            out.append(digit)
+        }
+        return out
     }
 
     /// Memory in binary GB, which is the unit a Mac's own "64 GB" memory
@@ -134,7 +212,8 @@ extension MachineStats {
             memoryUsedBytes: readMemoryUsed(),
             memoryTotalBytes: ProcessInfo.processInfo.physicalMemory,
             compiles: readCompileCount(),
-            diskFreeBytes: readDiskFree()
+            diskFreeBytes: readDiskFree(),
+            heat: HeatReading.read()
         )
     }
 

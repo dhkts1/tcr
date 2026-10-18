@@ -1,3 +1,4 @@
+import TcrSMC
 import XCTest
 
 @testable import TcrBarCore
@@ -66,5 +67,98 @@ final class MachineStatsTests: XCTestCase {
     /// box: dividing by it must not colour the line red.
     func testZeroCoresIsCalmNotRed() {
         XCTAssertEqual(stats(load: 7.1, cores: 0).loadTint, .calm)
+    }
+
+    // MARK: - heat (`docs/design/fan-readout-mockup.html`, panels 2 to 6)
+
+    private func fan(_ index: Int, _ actual: Double, max: Double = 5_777, manual: Bool = false)
+        -> FanReading
+    {
+        FanReading(index: index, actualRPM: actual, minRPM: 1_350, maxRPM: max, isManual: manual)
+    }
+
+    private func heated(_ heat: HeatReading?) -> MachineStats {
+        MachineStats(
+            loadAverage: 7.1, cores: 14, memoryUsedBytes: 48 * 1_073_741_824,
+            memoryTotalBytes: 64 * 1_073_741_824, compiles: 5, diskFreeBytes: 210_000_000_000,
+            heat: heat)
+    }
+
+    /// Whole degrees, and the BUSIER fan's share of its own maximum: 5,013 of
+    /// 5,777 is 86.8 %, which reads 87. The quieter fan (4,976, 86.1 %) would
+    /// read 86, so this also pins which fan the figure comes from.
+    func testHeatClauseUsesTheBusierFan() {
+        let machine = heated(HeatReading(cpuCelsius: 93.3, fans: [fan(0, 4_976), fan(1, 5_013)]))
+        XCTAssertEqual(machine.heatClause, "CPU 93°C · fans 87%")
+    }
+
+    /// Two fans with different maximums: the share is each fan against its
+    /// own, so a slower fan with a lower ceiling can be the busier one.
+    func testBusierIsByShareNotByRPM() {
+        let machine = heated(
+            HeatReading(cpuCelsius: 50, fans: [fan(0, 3_000, max: 6_000), fan(1, 2_700, max: 3_000)]))
+        XCTAssertEqual(machine.heatClause, "CPU 50°C · fans 90%")
+    }
+
+    /// Any fan whose mode key says manual: another app holds the fans.
+    func testManualSuffix() {
+        let machine = heated(
+            HeatReading(
+                cpuCelsius: 93.3, fans: [fan(0, 5_013, manual: true), fan(1, 4_976, manual: false)]))
+        XCTAssertEqual(machine.heatClause, "CPU 93°C · fans 87% manual")
+    }
+
+    func testFansOffWhenEveryFanReadsZero() {
+        let machine = heated(HeatReading(cpuCelsius: 46.2, fans: [fan(0, 0), fan(1, 0)]))
+        XCTAssertEqual(machine.heatClause, "CPU 46°C · fans off")
+    }
+
+    /// One fan spinning is not "off".
+    func testOneFanSpinningIsNotOff() {
+        let machine = heated(HeatReading(cpuCelsius: 46, fans: [fan(0, 0), fan(1, 1_444)]))
+        XCTAssertEqual(machine.heatClause, "CPU 46°C · fans 25%")
+    }
+
+    /// A MacBook Air reports zero fans: the fan part goes, heat stays.
+    func testNoFansDropsTheFanPart() {
+        XCTAssertEqual(heated(HeatReading(cpuCelsius: 61, fans: [])).heatClause, "CPU 61°C")
+    }
+
+    /// No reading at all: no clause, and the line is exactly today's line.
+    func testNoReadingIsTodaysLine() {
+        let machine = heated(nil)
+        XCTAssertNil(machine.heatClause)
+        XCTAssertNil(machine.heatDetail)
+        XCTAssertEqual(machine.line, "load 7.1/14 · 48/64 GB · 5 compiles · 210 GB free")
+    }
+
+    /// The clause sits right after the load in the whole line.
+    func testHeatSitsAfterTheLoad() {
+        let machine = heated(HeatReading(cpuCelsius: 93.3, fans: [fan(0, 5_013)]))
+        XCTAssertEqual(
+            machine.line, "load 7.1/14 · CPU 93°C · fans 87% · 48/64 GB · 5 compiles · 210 GB free")
+    }
+
+    /// The tooltip of mockup panel 3: one decimal on the CPU, each fan's own
+    /// figures, and what manual means.
+    func testHeatDetailIsPanelThreesTooltip() {
+        let machine = heated(
+            HeatReading(
+                cpuCelsius: 93.3, fans: [fan(0, 5_013, manual: true), fan(1, 4_976, manual: true)]))
+        XCTAssertEqual(
+            machine.heatDetail,
+            """
+            Hottest CPU sensor 93.3 °C
+            Fan 1: 5,013 of 5,777 rpm
+            Fan 2: 4,976 of 5,777 rpm
+            Manual: another app set these speeds, so they do not follow the heat.
+            """)
+    }
+
+    func testGroupedRPM() {
+        XCTAssertEqual(MachineStats.grouped(0), "0")
+        XCTAssertEqual(MachineStats.grouped(999), "999")
+        XCTAssertEqual(MachineStats.grouped(5_013.4), "5,013")
+        XCTAssertEqual(MachineStats.grouped(1_234_567), "1,234,567")
     }
 }

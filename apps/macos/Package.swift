@@ -33,6 +33,8 @@ let package = Package(
             name: "TcrBar",
             dependencies: [
                 "TcrBarCore",
+                // The render harness builds heat readings for its fixtures.
+                "TcrSMC",
                 .product(name: "Sparkle", package: "Sparkle"),
             ],
             path: "Sources/TcrBar",
