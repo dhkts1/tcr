@@ -2546,7 +2546,9 @@ state and exits 1 with the reason, for example
 `tcr: the fans are foreign (macsFanControl), not holding`; a mode another command set in the
 meantime is `tcr: another command changed the fan mode before this one settled`, and a
 controller that never acted on the mode in that time is
-`tcr: the fan controller had not acted on this command after 49 s`. A server older than the
+`tcr: the fan controller had not acted on this command after 49 s`. A status reading
+`unavailable / controllerStopped` ends the wait at once, since that controller acts on nothing
+again, and the failure line names it. A server older than the
 command counter takes the mode but cannot say when it acted on it: `tcr fan` says so and exits
 1 without guessing.
 

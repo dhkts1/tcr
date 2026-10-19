@@ -3680,6 +3680,10 @@ enum FanWait {
     /// The controller acted on this command or a later one, and the wish it shows is not this
     /// command's: a later command replaced it.
     Replaced,
+    /// The controller's thread stopped (`unavailable / controllerStopped`). It acts on nothing
+    /// again and its command number stays where the panic left it, so waiting for this
+    /// command to be acted on would only run out the whole [`FAN_SETTLE`].
+    Stopped,
 }
 
 /// One command as `tcr fan` sent it: what it asked for, and the number the route gave it.
@@ -3694,6 +3698,13 @@ struct FanSent {
 /// shows"): below this command's number, the controller has not acted on it yet; at or past
 /// it, the wish shown is this command's, or a later command's that replaced it.
 fn fan_wait(sent: &FanSent, row: &tcr_status_wire::FanControlRow) -> FanWait {
+    // First: a stopped controller never acts on this command, so neither its number nor its
+    // wish can move again.
+    if row.state == tcr_status_wire::FanStateRow::Unavailable
+        && row.reason == Some(tcr_status_wire::FanReasonRow::ControllerStopped)
+    {
+        return FanWait::Stopped;
+    }
     if row.command < sent.command {
         return FanWait::Waiting;
     }
@@ -3842,7 +3853,8 @@ pub async fn fan(
             );
             return Ok(1);
         }
-        FanWait::Waiting | FanWait::Settled => {}
+        // A stopped controller says so in the line below: its reason and detail.
+        FanWait::Waiting | FanWait::Settled | FanWait::Stopped => {}
     }
     let reason = row
         .reason
@@ -8603,6 +8615,46 @@ mod tests {
         );
         assert_eq!(fan_wait(&sent, &replaced), FanWait::Replaced);
         assert!(!fan_succeeded(&sent, &replaced));
+    }
+
+    /// A controller that stopped on a panic keeps the command number it had, below this
+    /// command's, and never acts again: `tcr fan` ends its wait at the first status that says
+    /// so, whatever the wish and number shown, and fails with that reason.
+    #[test]
+    fn fan_cli_a_stopped_controller_ends_the_wait_at_once() {
+        use crate::fan::FanRequest;
+        use tcr_status_wire::{FanDesiredRow, FanReasonRow, FanStateRow};
+        for request in [
+            FanRequest::Fixed { rpm: 5000 },
+            FanRequest::Auto { force: false },
+        ] {
+            let sent = FanSent {
+                request,
+                command: 1_000,
+            };
+            for (desired, command) in [
+                (FanDesiredRow::Auto, 999),
+                (FanDesiredRow::Fixed { rpm: 3000 }, 999),
+                (request.desired_row(), 1_000),
+            ] {
+                let mut stopped = fan_row(desired, FanStateRow::Unavailable, command);
+                stopped.reason = Some(FanReasonRow::ControllerStopped);
+                assert_eq!(
+                    fan_wait(&sent, &stopped),
+                    FanWait::Stopped,
+                    "{request:?} {desired:?} {command}"
+                );
+                assert!(!fan_succeeded(&sent, &stopped));
+            }
+        }
+        // Another reason under an old number is still a wait: the controller may yet act.
+        let sent = FanSent {
+            request: FanRequest::Fixed { rpm: 5000 },
+            command: 1_000,
+        };
+        let mut silent = fan_row(FanDesiredRow::Auto, FanStateRow::Unavailable, 999);
+        silent.reason = Some(FanReasonRow::HelperNoReply);
+        assert_eq!(fan_wait(&sent, &silent), FanWait::Waiting);
     }
 
     /// The wait covers the version call (which waits out launchd starting the helper late),
