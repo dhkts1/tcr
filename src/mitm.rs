@@ -1260,6 +1260,35 @@ mod tests {
     use super::*;
     use crate::log_err::LogErr as _;
 
+    #[tokio::test]
+    async fn review_restart_serves_already_queued_http_before_draining() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"GET /_tcr/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let (_signal, drain) = tokio::sync::watch::channel(true);
+        let serving = tokio::spawn(serve_http(
+            server,
+            "127.0.0.1:12345".parse().unwrap(),
+            dummy_manager(),
+            None,
+            drain,
+        ));
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        serving.await.unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "an already queued request must get HTTP 200 during drain, got {} bytes",
+            response.len()
+        );
+    }
+
     /// `write_file`'s `mode` must be enforced when the destination ALREADY exists,
     /// not only when it is created. `OpenOptionsExt::mode()` applies solely to the
     /// creating open, so without a post-write `set_permissions` a pre-existing
