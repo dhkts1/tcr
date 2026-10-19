@@ -4790,6 +4790,11 @@ pub fn wrap(config_path: &Path, days: u32, json: bool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review_guidance_requires_a_compatible_incumbent() {
+        assert!(RESTART_HINT.contains("stop it"));
+        assert!(RESTART_HINT.contains("if it runs this version or newer"));
+    }
     use super::*;
     use crate::oauth::{OAuthError, RefreshFuture};
     use crate::probe::{ProbeFuture, Usage, UsageBucket};

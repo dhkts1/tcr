@@ -968,6 +968,10 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review_guidance_requires_a_compatible_incumbent() {
+        assert!(stand_down_message(12345, 42).contains("if it runs this version or newer"));
+    }
     use super::*;
 
     /// How long [`port_listeners_finds_this_process_on_an_ephemeral_port`]
