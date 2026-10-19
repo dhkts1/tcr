@@ -59,6 +59,23 @@ fn the_fan_control_samples_say_what_their_names_say() {
     );
 }
 
+/// Every sample carries `sinceMs` beside `command`, as the server writes it for 1.2.12's
+/// `tcr fan` (which requires it); a reader does not need it, so an object without it still
+/// decodes and is written back without it.
+#[test]
+fn since_ms_is_written_beside_command_and_optional_to_read() {
+    let samples = samples();
+    for (name, sample) in &samples {
+        assert!(sample["sinceMs"].is_i64(), "sample {name} lacks sinceMs");
+        assert!(sample["command"].is_u64(), "sample {name} lacks command");
+    }
+    let mut without = samples["off"].clone();
+    without.as_object_mut().unwrap().remove("sinceMs");
+    let row: FanControlRow = serde_json::from_value(without.clone()).unwrap();
+    assert_eq!(row.since_ms, None);
+    assert_eq!(serde_json::to_value(&row).unwrap(), without);
+}
+
 /// An unknown state from a newer server is a decode error for the whole object, never a
 /// guess: the main crate's status field keeps that error beside the rest of the payload.
 #[test]

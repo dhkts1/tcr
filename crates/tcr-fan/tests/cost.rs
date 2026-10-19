@@ -16,11 +16,11 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use tcr_fan::controller::{
-    Clock, Command, Controller, FanMode, Fault, FollowCurve, Generation, Heat, Helper, Input,
+    Clock, Command, Controller, FanDesired, Fault, FollowCurve, Generation, Heat, Helper, Input,
     Parts, Probe, Rpm, Saved, Store,
 };
 use tcr_fan::wire::{PROTOCOL_VERSION, Reply, Request};
-use tcr_smc::{FanIndex, FanMode as KeyMode, FanReading, HeatReading};
+use tcr_smc::{FanIndex, FanMode, FanReading, HeatReading};
 
 fn thread_cpu() -> Duration {
     let mut ts = libc::timespec {
@@ -70,7 +70,7 @@ impl Helper for Root {
             Request::SetManual { fan } => {
                 for f in &mut self.0.0.lock().unwrap().fans {
                     if f.index == fan {
-                        f.mode = KeyMode::Manual;
+                        f.mode = FanMode::Manual;
                     }
                 }
                 Reply::Manual { unlocked: false }
@@ -137,7 +137,7 @@ fn held_at(rpm: f64) -> HeatReading {
                 actual_rpm: rpm,
                 min_rpm: 1350.0,
                 max_rpm: 5777.0,
-                mode: KeyMode::Auto,
+                mode: FanMode::Auto,
                 target_rpm: Some(rpm),
             })
             .collect(),
@@ -146,10 +146,14 @@ fn held_at(rpm: f64) -> HeatReading {
 }
 
 /// A controller holding `mode`, whose fake fans read back exactly what it wrote.
-fn holding(mode: FanMode, rpm: f64) -> Controller<Root, Fans, NoMacs, Now, Nowhere> {
+fn holding(mode: FanDesired, rpm: f64) -> Controller<Root, Fans, NoMacs, Now, Nowhere> {
     let fans = Fans(std::sync::Arc::new(std::sync::Mutex::new(held_at(rpm))));
     let (tx, rx) = mpsc::channel();
-    tx.send(Input::Command(Command::Set(mode))).unwrap();
+    tx.send(Input::Command {
+        seq: 1,
+        command: Command::Set(mode),
+    })
+    .unwrap();
     let mut controller = Controller::new(
         Parts {
             helper: Root(fans.clone()),
@@ -161,6 +165,7 @@ fn holding(mode: FanMode, rpm: f64) -> Controller<Root, Fans, NoMacs, Now, Nowhe
             log: Box::new(|_, _| {}),
             publish: Box::new(|_| {}),
             pid: 1,
+            commands_before: 0,
         },
         None,
     );
@@ -178,7 +183,7 @@ fn holding(mode: FanMode, rpm: f64) -> Controller<Root, Fans, NoMacs, Now, Nowhe
 fn cost_pairs() {
     let n = 2000;
     let mut fixed = holding(
-        FanMode::Fixed {
+        FanDesired::Fixed {
             rpm: Rpm::new(5000).unwrap(),
         },
         5000.0,
@@ -192,7 +197,7 @@ fn cost_pairs() {
     // At 70 °C on a 60-90 curve the target is a third of the range.
     let third = 1350.0 + (5777.0 - 1350.0) / 3.0;
     let mut follow = holding(
-        FanMode::FollowCpu {
+        FanDesired::FollowCpu {
             curve: FollowCurve::new(60, 90).unwrap(),
         },
         third,

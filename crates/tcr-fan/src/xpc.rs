@@ -371,31 +371,26 @@ impl Dict for OwnedDict {
 }
 
 impl DictMut for OwnedDict {
-    fn set_u64(&mut self, key: &'static str, value: u64) {
-        if let Ok(key) = c_string(key) {
+    fn set(&mut self, key: &'static str, value: &Value) {
+        let Ok(key) = c_string(key) else {
+            return;
+        };
+        let (dict, key) = (self.0.raw(), key.as_ptr());
+        match value {
             // SAFETY: a live dictionary this value owns; `key` outlives the call.
-            unsafe { xpc_dictionary_set_uint64(self.0.raw(), key.as_ptr(), value) }
-        }
-    }
-
-    fn set_f64(&mut self, key: &'static str, value: f64) {
-        if let Ok(key) = c_string(key) {
-            // SAFETY: as in `set_u64`.
-            unsafe { xpc_dictionary_set_double(self.0.raw(), key.as_ptr(), value) }
-        }
-    }
-
-    fn set_bool(&mut self, key: &'static str, value: bool) {
-        if let Ok(key) = c_string(key) {
-            // SAFETY: as in `set_u64`.
-            unsafe { xpc_dictionary_set_bool(self.0.raw(), key.as_ptr(), value) }
-        }
-    }
-
-    fn set_str(&mut self, key: &'static str, value: &str) {
-        if let (Ok(key), Ok(value)) = (c_string(key), c_string(value)) {
-            // SAFETY: as in `set_u64`; libxpc copies the string.
-            unsafe { xpc_dictionary_set_string(self.0.raw(), key.as_ptr(), value.as_ptr()) }
+            Value::U64(v) => unsafe { xpc_dictionary_set_uint64(dict, key, *v) },
+            // SAFETY: as for `U64`.
+            Value::F64(v) => unsafe { xpc_dictionary_set_double(dict, key, *v) },
+            // SAFETY: as for `U64`.
+            Value::Bool(v) => unsafe { xpc_dictionary_set_bool(dict, key, *v) },
+            Value::Str(v) => {
+                if let Ok(text) = c_string(v) {
+                    // SAFETY: as for `U64`; libxpc copies the string.
+                    unsafe { xpc_dictionary_set_string(dict, key, text.as_ptr()) }
+                }
+            }
+            // Nothing encodes one, and it has no XPC type to write.
+            Value::Other => {}
         }
     }
 }
@@ -514,12 +509,50 @@ pub trait Service: Send + Sync + 'static {
 /// leaked, once per refused call. The helper exits on it, so for the listener
 /// that is once per process. For a [`Client`] it is once per
 /// [`Client::connect`] that fails this way, so a caller must not retry a
-/// [`XpcError::Requirement`]: the proxy's controller turns it into
-/// `Unavailable(HelperSignature)` and never retries that on its own
-/// (`crate::controller`), which bounds the leak to one per command an operator
-/// sends.
+/// [`XpcError::Requirement`] in a loop: the proxy's controller turns it into
+/// `Unavailable(HelperSignature)` and retries that on its own only once,
+/// `SIGNATURE_RETRY_AFTER` later (`crate::controller`), which bounds the leak
+/// to one per refused connect and at most two per command an operator sends
+/// (or per start, which applies the saved mode).
 const fn abandon(connection: Owned) {
     std::mem::forget(connection);
+}
+
+/// A Mach-service connection for `label` on `queue`, with `requirement` set on
+/// it, not yet activated. A requirement libxpc refuses abandons the connection.
+fn service_connection(
+    label: &str,
+    requirement: &str,
+    queue: &Queue,
+    flags: u64,
+) -> Result<Owned, XpcError> {
+    let name = c_string(label)?;
+    let requirement = c_string(requirement)?;
+    // SAFETY: `name` outlives the call; a live queue.
+    let connection = Owned::from_create(unsafe {
+        xpc_connection_create_mach_service(name.as_ptr(), queue.raw(), flags)
+    })
+    .ok_or(XpcError::NoObject("xpc_connection_create_mach_service"))?;
+    // SAFETY: an inactive connection, a C string that outlives the call
+    // (libxpc copies it), called once per connection as required.
+    let rc = unsafe {
+        xpc_connection_set_peer_code_signing_requirement(connection.raw(), requirement.as_ptr())
+    };
+    if rc != 0 {
+        abandon(connection);
+        return Err(XpcError::Requirement(rc));
+    }
+    Ok(connection)
+}
+
+/// Give an inactive connection its handler, then activate it.
+fn activate(connection: Object, handler: &Block<dyn Fn(Object)>) {
+    // SAFETY: a live, inactive connection the caller holds; libxpc copies the
+    // block.
+    unsafe {
+        xpc_connection_set_event_handler(connection, handler);
+        xpc_connection_activate(connection);
+    }
 }
 
 /// The helper's Mach-service listener.
@@ -537,24 +570,7 @@ impl Listener {
         queue: &Arc<Queue>,
         service: Arc<dyn Service>,
     ) -> Result<Self, XpcError> {
-        let name = c_string(label)?;
-        let requirement = c_string(requirement)?;
-        // SAFETY: `name` outlives the call; a live queue.
-        let connection = Owned::from_create(unsafe {
-            xpc_connection_create_mach_service(name.as_ptr(), queue.raw(), MACH_SERVICE_LISTENER)
-        })
-        .ok_or(XpcError::NoObject("xpc_connection_create_mach_service"))?;
-
-        // SAFETY: an inactive connection, a C string that outlives the call
-        // (libxpc copies it), called once per connection as required.
-        let rc = unsafe {
-            xpc_connection_set_peer_code_signing_requirement(connection.raw(), requirement.as_ptr())
-        };
-        if rc != 0 {
-            abandon(connection);
-            return Err(XpcError::Requirement(rc));
-        }
-
+        let connection = service_connection(label, requirement, queue, MACH_SERVICE_LISTENER)?;
         let next_peer = Arc::new(AtomicU64::new(1));
         let peer_queue = Arc::clone(queue);
         let handler = RcBlock::new(move |event: Object| {
@@ -565,11 +581,7 @@ impl Listener {
                 service.listener_error(error_kind(event));
             }
         });
-        // SAFETY: an inactive connection; libxpc copies the block.
-        unsafe {
-            xpc_connection_set_event_handler(connection.raw(), &handler);
-            xpc_connection_activate(connection.raw());
-        }
+        activate(connection.raw(), &handler);
         Ok(Self { connection })
     }
 }
@@ -609,12 +621,9 @@ fn accept(peer: Object, id: PeerId, queue: &Queue, service: Arc<dyn Service>) {
             }
         }
     });
-    // SAFETY: a retained, inactive peer connection; libxpc copies the block.
-    unsafe {
-        xpc_connection_set_target_queue(raw, queue.raw());
-        xpc_connection_set_event_handler(raw, &handler);
-        xpc_connection_activate(raw);
-    }
+    // SAFETY: a retained, inactive peer connection and a live queue.
+    unsafe { xpc_connection_set_target_queue(raw, queue.raw()) }
+    activate(raw, &handler);
 }
 
 /// The proxy's end: one connection to the helper, in the system domain, that
@@ -634,32 +643,14 @@ impl Client {
         requirement: &str,
         on_error: impl Fn(XpcError) + Send + 'static,
     ) -> Result<Self, XpcError> {
-        let name = c_string(label)?;
-        let requirement = c_string(requirement)?;
         let queue = Queue::serial(&format!("{label}.client"))?;
-        // SAFETY: `name` outlives the call; a live queue.
-        let connection = Owned::from_create(unsafe {
-            xpc_connection_create_mach_service(name.as_ptr(), queue.raw(), MACH_SERVICE_PRIVILEGED)
-        })
-        .ok_or(XpcError::NoObject("xpc_connection_create_mach_service"))?;
-        // SAFETY: as in `Listener::start`.
-        let rc = unsafe {
-            xpc_connection_set_peer_code_signing_requirement(connection.raw(), requirement.as_ptr())
-        };
-        if rc != 0 {
-            abandon(connection);
-            return Err(XpcError::Requirement(rc));
-        }
+        let connection = service_connection(label, requirement, &queue, MACH_SERVICE_PRIVILEGED)?;
         let handler = RcBlock::new(move |event: Object| {
             if is(event, &raw const _xpc_type_error) {
                 on_error(error_kind(event));
             }
         });
-        // SAFETY: an inactive connection; libxpc copies the block.
-        unsafe {
-            xpc_connection_set_event_handler(connection.raw(), &handler);
-            xpc_connection_activate(connection.raw());
-        }
+        activate(connection.raw(), &handler);
         Ok(Self { connection, queue })
     }
 

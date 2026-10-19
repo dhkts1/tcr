@@ -455,10 +455,18 @@ pub struct FanControlRow {
     pub targets: Vec<FanTargetRow>,
     /// A sentence for a person, or `null`.
     pub detail: Option<String>,
+    /// The number of the newest command the controller has acted on (taking one does not move
+    /// it). `POST /_tcr/fan` answers with the number it gave the command; `tcr fan` waits for
+    /// this to reach it. Numbers start from the wall clock in ms when the server starts, or one
+    /// past the last number it saved when that is higher, so a server restarted since reads as
+    /// having acted on every command sent before.
+    pub command: u64,
     /// Milliseconds since the Unix epoch when the state last changed, or the controller last
-    /// acted on a command (taking one does not move it). `tcr fan` waits for a value at or after
-    /// the moment it sent its command.
-    pub since_ms: i64,
+    /// acted on a command; it moves with `command`. Written only for 1.2.12's `tcr fan`, which
+    /// requires it and waits on it; nothing in this build reads it. Optional so a reader does
+    /// not break when the server stops writing it, after the release after next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
 }
 
 /// [`FanControlRow::desired`]: one mode, tagged by `mode`. Whole rpm and whole °C.
@@ -517,27 +525,6 @@ pub enum FanReasonRow {
     HelperRefused,
     /// The proxy's fan controller stopped on an internal error; a restart starts it again.
     ControllerStopped,
-}
-
-impl FanReasonRow {
-    /// The reason's name, without its data: what a person or a script reads.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::MacsFanControl => "macsFanControl",
-            Self::AnotherApp => "anotherApp",
-            Self::NotSignedForFans => "notSignedForFans",
-            Self::NoSmc => "noSmc",
-            Self::NoFans => "noFans",
-            Self::HelperUnreachable => "helperUnreachable",
-            Self::HelperNoReply => "helperNoReply",
-            Self::HelperSignature => "helperSignature",
-            Self::HelperVersion { .. } => "helperVersion",
-            Self::ModeLocked(_) => "modeLocked",
-            Self::Contended => "contended",
-            Self::HelperRefused => "helperRefused",
-            Self::ControllerStopped => "controllerStopped",
-        }
-    }
 }
 
 /// One entry of [`FanControlRow::targets`].

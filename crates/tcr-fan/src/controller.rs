@@ -65,7 +65,9 @@ pub const RELEASE_TRIES: usize = 3;
 pub const RELEASE_GAP: Duration = Duration::from_secs(1);
 /// Entries that fail in a row before the automatic retry stops until the
 /// next command or restart, so a fan that will not unlock is not put through
-/// the `Ftst` dance every minute.
+/// the `Ftst` dance every minute. A helper that is unreachable or silent is
+/// the exception: it goes on every [`RETRY_EVERY`] instead
+/// ([`Unavailable::never_stops`]).
 pub const ENTRY_FAILURES_BEFORE_STOP: u32 = 3;
 /// More than this many re-entries inside [`REENTRY_WINDOW`] is contention:
 /// something keeps taking the fans back.
@@ -77,14 +79,36 @@ pub const BACKOFF: [Duration; 5] = [
     Duration::from_secs(10),
     Duration::from_secs(20),
     Duration::from_secs(40),
-    Duration::from_secs(60),
+    RETRY_EVERY,
 ];
+/// After [`ENTRY_FAILURES_BEFORE_STOP`] failures in a row, how often a helper
+/// that is unreachable or silent is tried again while a manual mode is
+/// wished ([`Unavailable::never_stops`]), with no log line unless the state
+/// changes.
+pub const RETRY_EVERY: Duration = Duration::from_secs(60);
+/// How long after a signature refusal it is tried once more on its own
+/// ([`Unavailable::HelperSignature`]); a second refusal waits for the next
+/// command. Why (2026-10-19, a TcrBar update from 1.2.12 to 1.2.13): the old
+/// proxy stopped, its helper went idle and stayed up for its idle grace
+/// ([`crate::root::IDLE_EXIT_GRACE`], 15 s), and the new proxy dialled that
+/// old helper, whose files the update had just replaced, so the signature
+/// check failed. Nothing tried again, and the fans stayed automatic until the
+/// mode was sent again. That helper exited 25 s after the refusal, and launchd
+/// starts the next one no sooner than 10 s after the previous start
+/// ([`VERSION_DEADLINE`]); 45 s is past both, with room.
+pub const SIGNATURE_RETRY_AFTER: Duration = Duration::from_secs(45);
 /// In Follow CPU a new target is written only when it moved at least this
 /// share of the fan's range (or reached an end, or the hot guard flipped). A
 /// starting value, not a measured one.
 pub const WRITE_STEP: f64 = 0.05;
-/// A tick whose wall clock moved this much further than its monotonic clock
-/// slept in between: the log line names the cause "after sleep".
+/// A look whose wall clock moved this much further than its monotonic clock
+/// slept in between, since on macOS `Instant` (`mach_absolute_time`) stands
+/// still in sleep and the wall clock does not. A tick that sees it names the
+/// cause "after sleep"; a scheduled retry that sees it starts the backoff
+/// over and tries at once. Why the retry needs it (2026-10-19): a Mac slept
+/// with the fans held, the three tries were spent in dark wakes, where the
+/// SMC takes no mode write, and nothing took the fans back after the real
+/// wake, which left them automatic at 0 rpm with the CPU at 101 °C.
 pub const SLEEP_GAP: Duration = Duration::from_secs(10);
 /// The highest rpm a Fixed mode may ask for. Root clamps to each fan's own
 /// range; this only refuses nonsense at the edge.
@@ -210,7 +234,7 @@ impl std::error::Error for ModeError {}
 
 /// What the fans should do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FanMode {
+pub enum FanDesired {
     /// macOS has them.
     Auto,
     /// Exactly this rpm, clamped only by root to each fan's range: no hot
@@ -223,7 +247,7 @@ pub enum FanMode {
     },
 }
 
-impl FanMode {
+impl FanDesired {
     pub const fn is_manual(self) -> bool {
         !matches!(self, Self::Auto)
     }
@@ -237,7 +261,7 @@ impl FanMode {
 /// A command from the route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
-    Set(FanMode),
+    Set(FanDesired),
     /// `tcr fan auto --force`: hand back without checking the record (never
     /// without checking for Macs Fan Control). The operator's recovery for a
     /// hold no process remembers.
@@ -270,7 +294,9 @@ pub enum Unavailable {
     /// A call ran past its deadline.
     HelperNoReply,
     /// What answered is not the helper this build trusts, or the requirement
-    /// itself was refused. Never retried automatically.
+    /// itself was refused. Retried once on its own, [`SIGNATURE_RETRY_AFTER`]
+    /// later (an update's old helper still answering); then not until the
+    /// next command.
     HelperSignature,
     /// The helper speaks another protocol; `None` when its reply was not the
     /// contract's shape at all.
@@ -304,6 +330,14 @@ impl Unavailable {
                         | HelperError::LimitsUnreadable { .. }
                 )
         )
+    }
+
+    /// Whether the retry goes on past [`ENTRY_FAILURES_BEFORE_STOP`], every
+    /// [`RETRY_EVERY`]: a helper that is unreachable or silent writes nothing,
+    /// so trying it costs no unlock, and a sleep's dark wakes fail exactly
+    /// this way.
+    const fn never_stops(self) -> bool {
+        matches!(self, Self::HelperUnreachable | Self::HelperNoReply)
     }
 }
 
@@ -348,9 +382,13 @@ pub enum Detail {
     /// The fans went back to automatic across a sleep and are being taken
     /// again.
     AfterSleep,
-    /// Three entries in a row failed; no automatic retry until the next
-    /// command or restart.
+    /// Three entries in a row failed for a reason that stops the retry; no
+    /// automatic retry until the next command or restart.
     RetryStopped,
+    /// Three entries in a row failed on a helper that is unreachable or
+    /// silent; it is tried again every [`RETRY_EVERY`], and at once after a
+    /// sleep.
+    RetryingEveryMinute,
     /// Another tcr's set-manual made it the holder.
     TakenOver,
 }
@@ -363,6 +401,10 @@ impl fmt::Display for Detail {
             }
             Self::AfterSleep => write!(f, "re-applying after sleep"),
             Self::RetryStopped => write!(f, "three tries failed; send the mode again to retry"),
+            Self::RetryingEveryMinute => write!(
+                f,
+                "three tries failed; trying again every minute and on waking from sleep"
+            ),
             Self::TakenOver => write!(f, "another tcr took the fans"),
         }
     }
@@ -432,7 +474,10 @@ pub struct Generation(pub u64);
 /// One thing on the controller's channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input {
-    Command(Command),
+    /// A command, numbered by its sender in channel order: [`Snapshot::command`]
+    /// reaches `seq` once the controller has acted on it. A shutdown's number
+    /// is not counted.
+    Command { seq: u64, command: Command },
     /// A connection error delivered by XPC, tagged with its connection.
     Xpc {
         generation: Generation,
@@ -480,7 +525,7 @@ pub struct Hold {
 /// What persists across a restart: the wish and the hold.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Saved {
-    pub desired: FanMode,
+    pub desired: FanDesired,
     pub hold: Option<Hold>,
 }
 
@@ -501,7 +546,7 @@ pub type Log = Box<dyn FnMut(Level, &str) + Send>;
 
 /// What the status route shows.
 ///
-/// `desired` and `since_ms` are set together and only together, when the
+/// `desired` and `command` are set together and only together, when the
 /// controller stamps ([`Controller::advance`] after acting on a command, or a
 /// state change with no command waiting): every snapshot pairs a state with
 /// the wish it was reached for. A command taken but not yet acted on does not
@@ -509,15 +554,20 @@ pub type Log = Box<dyn FnMut(Level, &str) + Send>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     /// The wish the controller last acted on.
-    pub desired: FanMode,
+    pub desired: FanDesired,
     pub state: State,
     pub hot_guard: bool,
     /// What was last written to each fan held.
     pub targets: Vec<(FanIndex, f64)>,
     pub detail: Option<Detail>,
-    /// When the state last changed, or the controller last acted on a
-    /// command. Taking a command does not move it, so a snapshot from before
-    /// the controller acted on a command is older than that command.
+    /// The number of the newest command the controller has acted on
+    /// ([`Input::Command`]). Taking a command does not move it, so a snapshot
+    /// from before the controller acted on a command reads below that
+    /// command's number. Starts at [`Parts::commands_before`].
+    pub command: u64,
+    /// Wall ms of the last stamp: when the state last changed, or the
+    /// controller last acted on a command. Moves with `command`. Only for
+    /// 1.2.12's `tcr fan`, which waits on it; goes with the status's `sinceMs`.
     pub since_ms: i64,
 }
 
@@ -542,6 +592,11 @@ pub struct Parts<H, R, P, C, S> {
     pub publish: Publish,
     /// This process, for the hold record.
     pub pid: u32,
+    /// Where command numbers start: every command this process is sent is
+    /// numbered above it. The proxy seeds it from the wall clock, or one past
+    /// the last number it saved when that is higher, so a command sent to a
+    /// process that has since restarted reads as acted on.
+    pub commands_before: u64,
 }
 
 /// How an attempt to enter ended, when it did not end holding.
@@ -570,17 +625,13 @@ impl Blocked {
     }
 }
 
-/// How the steps after the first set-manual stopped: a [`Stop`] the step
-/// already dealt with, or a block that still owes a hand-back.
-enum Halt {
-    Stop(Stop),
-    Blocked(Blocked),
-}
-
-impl From<Stop> for Halt {
-    fn from(stop: Stop) -> Self {
-        Self::Stop(stop)
-    }
+/// A release that is wanted and waits (on Macs Fan Control, or a read).
+/// Forced wins wherever it is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    Release,
+    /// `auto --force`: hand back without the record check.
+    ForcedRelease,
 }
 
 /// What a release (or a shutdown) found it may do.
@@ -601,7 +652,7 @@ enum Waiting {
 
 pub struct Controller<H, R, P, C, S> {
     parts: Parts<H, R, P, C, S>,
-    desired: FanMode,
+    desired: FanDesired,
     hold: Option<Hold>,
     state: State,
     generation: u64,
@@ -610,21 +661,32 @@ pub struct Controller<H, R, P, C, S> {
     detail: Option<Detail>,
     /// The wish [`Snapshot::desired`] shows: `desired` as of the last
     /// [`Self::stamp`], never ahead of it.
-    shown_desired: FanMode,
+    shown_desired: FanDesired,
+    /// The newest command number taken, and the newest acted on (what
+    /// [`Snapshot::command`] shows, moved with `shown_desired`).
+    taken: u64,
+    acted: u64,
+    /// [`Snapshot::since_ms`], moved with `acted`.
     since_ms: i64,
     failed_entries: u32,
+    /// The one automatic retry of a signature refusal since the last command
+    /// is spent ([`SIGNATURE_RETRY_AFTER`]).
+    signature_retried: bool,
     backoff_step: usize,
     retry_at: Option<Instant>,
     next_tick: Option<Instant>,
     reentries: VecDeque<Instant>,
     /// A hand-back is wanted and waits on Macs Fan Control or a read.
-    release_pending: bool,
-    force_pending: bool,
+    pending: Option<Pending>,
     /// A command arrived since the last [`Self::advance`].
     fresh: bool,
     stopping: Option<Instant>,
-    last_tick: Option<(Instant, i64)>,
+    /// Both clocks at the last look ([`Self::slept`]).
+    last_look: Option<(Instant, i64)>,
     last_outcome: Option<TickOutcome>,
+    /// A retry past [`ENTRY_FAILURES_BEFORE_STOP`] is under way from this
+    /// state: a change to `Entering`, or back to this state, logs at Debug.
+    quiet: Option<State>,
 }
 
 impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S> {
@@ -633,8 +695,9 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// matches becomes this process's; one the fans no longer match is
     /// dropped.
     pub fn new(parts: Parts<H, R, P, C, S>, saved: Option<Saved>) -> Self {
+        let first = parts.commands_before;
         let since_ms = parts.clock.wall_ms();
-        let (desired, hold) = saved.map_or((FanMode::Auto, None), |s| (s.desired, s.hold));
+        let (desired, hold) = saved.map_or((FanDesired::Auto, None), |s| (s.desired, s.hold));
         let mut controller = Self {
             parts,
             desired,
@@ -645,18 +708,21 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             hot: false,
             detail: None,
             shown_desired: desired,
+            taken: first,
+            acted: first,
             since_ms,
             failed_entries: 0,
+            signature_retried: false,
             backoff_step: 0,
             retry_at: None,
             next_tick: None,
             reentries: VecDeque::new(),
-            release_pending: false,
-            force_pending: false,
+            pending: None,
             fresh: false,
             stopping: None,
-            last_tick: None,
+            last_look: None,
             last_outcome: None,
+            quiet: None,
         };
         controller.boot();
         controller
@@ -667,13 +733,11 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             self.set_state(State::Unavailable(Unavailable::NoSmc));
             return;
         };
-        if let Some(hold) = &self.hold {
-            match holder::classify(
-                &states(&reading),
-                Some(&hold.fans),
-                Unwritten::NotOurs,
-                false,
-            ) {
+        if self.hold.is_some() {
+            // No entry is in flight at boot, so a fan with no target yet is
+            // not ours. Named here, not read off the state, so a state set
+            // before boot cannot change the verdict.
+            match self.whose_as(&reading, Unwritten::NotOurs) {
                 // A held fan back on automatic is re-taken by the first
                 // entry, or handed back with the rest when Auto is wanted.
                 Holder::Ours | Holder::PartlyAutomatic => {
@@ -696,7 +760,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         }
         if !self.desired.is_manual() && self.hold.is_some() {
             // Due at once: the first [`Self::pump`] hands back.
-            self.release_pending = true;
+            self.pending = Some(Pending::Release);
             self.next_tick = Some(self.parts.clock.now());
         }
         self.publish();
@@ -708,7 +772,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         self.state
     }
 
-    pub const fn desired(&self) -> FanMode {
+    pub const fn desired(&self) -> FanDesired {
         self.desired
     }
 
@@ -746,6 +810,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 .filter_map(|f| f.written_rpm.map(|rpm| (f.fan, rpm)))
                 .collect(),
             detail: self.detail,
+            command: self.acted,
             since_ms: self.since_ms,
         }
     }
@@ -783,20 +848,29 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
 
     /// Nobody can send another command: stop as a shutdown would.
     fn closed_channel(&self) -> Input {
-        Input::Command(Command::Shutdown {
-            deadline: self.parts.clock.now() + Duration::from_secs(3),
-        })
+        Input::Command {
+            seq: self.taken,
+            command: Command::Shutdown {
+                deadline: self.parts.clock.now() + Duration::from_secs(3),
+            },
+        }
     }
 
     /// How long the loop may wait for input before it has work of its own.
     /// Zero while a command taken in the middle of a step waits: it is acted
     /// on at once, not at the next tick.
+    ///
+    /// While a retry is scheduled the loop looks at least every [`TICK`],
+    /// though the retry may be a minute off: the wait is measured on the
+    /// monotonic clock, which stands still in sleep, so only a look soon
+    /// after a wake sees the sleep ([`SLEEP_GAP`]) in time to try at once.
     fn wait(&self) -> Option<Duration> {
         if self.fresh {
             return Some(Duration::ZERO);
         }
         let now = self.parts.clock.now();
-        [self.next_tick, self.retry_at]
+        let look = self.retry_at.map(|_| now + TICK);
+        [self.next_tick, self.retry_at, look]
             .into_iter()
             .flatten()
             .min()
@@ -823,15 +897,19 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// Take one input.
     pub fn accept(&mut self, input: Input) {
         match input {
-            Input::Command(Command::Set(mode)) => {
+            Input::Command {
+                seq,
+                command: Command::Set(mode),
+            } => {
                 self.desired = mode;
+                self.taken = seq;
                 self.fresh = true;
                 // A hand-back that waited (on Macs Fan Control, or a read) was
                 // for the wish this one replaces: a manual mode must never be
                 // handed back by it, and Auto starts its own.
-                self.force_pending = false;
-                self.release_pending = false;
+                self.pending = None;
                 self.failed_entries = 0;
+                self.signature_retried = false;
                 self.backoff_step = 0;
                 self.retry_at = None;
                 self.reentries.clear();
@@ -841,14 +919,21 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 self.save();
                 self.publish();
             }
-            Input::Command(Command::ForceHandBack) => {
-                self.desired = FanMode::Auto;
-                self.force_pending = true;
+            Input::Command {
+                seq,
+                command: Command::ForceHandBack,
+            } => {
+                self.desired = FanDesired::Auto;
+                self.taken = seq;
+                self.pending = Some(Pending::ForcedRelease);
                 self.fresh = true;
                 self.save();
                 self.publish();
             }
-            Input::Command(Command::Shutdown { deadline }) => self.stopping = Some(deadline),
+            Input::Command {
+                command: Command::Shutdown { deadline },
+                ..
+            } => self.stopping = Some(deadline),
             Input::Xpc { generation, fault } => self.on_xpc(generation, fault),
         }
     }
@@ -902,9 +987,9 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// goes back to waiting on a channel whose stop it already took.
     ///
     /// A step for a command ends with a [`Self::stamp`] (the wish shown and
-    /// `since_ms`), whether it changed the state, wrote a round, or found
-    /// nothing to do (the same Fixed again): that stamp is what `tcr fan`
-    /// waits for. Not when a newer command was taken during the step, which
+    /// the command number acted on), whether it changed the state, wrote a
+    /// round, or found nothing to do (the same Fixed again): that stamp is
+    /// what `tcr fan` waits for. Not when a newer command was taken during the step, which
     /// the next step acts on.
     pub fn advance(&mut self) -> Flow {
         let fresh = std::mem::take(&mut self.fresh);
@@ -923,10 +1008,11 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     }
 
     fn step(&mut self, fresh: bool) {
+        let slept = self.slept();
         let now = self.parts.clock.now();
         let tick_due = self.next_tick.is_some_and(|at| at <= now);
         let retry_due = self.retry_at.is_some_and(|at| at <= now);
-        if self.force_pending {
+        if self.pending == Some(Pending::ForcedRelease) {
             // A forced hand-back waiting on Macs Fan Control looks again on
             // the tick, like any other waiting release.
             if fresh || tick_due {
@@ -935,7 +1021,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             return;
         }
         if !self.desired.is_manual() {
-            if self.release_pending {
+            if self.pending == Some(Pending::Release) {
                 if fresh || tick_due {
                     self.release(false);
                 }
@@ -955,8 +1041,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                         if self.hold.is_some() || self.connected {
                             self.release(false);
                         } else if !matches!(self.state, State::Unavailable(Unavailable::NoSmc)) {
-                            self.retry_at = None;
-                            self.next_tick = None;
+                            self.unschedule();
                             self.set_state(State::Off);
                         }
                     }
@@ -968,18 +1053,34 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             State::Off | State::Stuck | State::Entering | State::Releasing => self.enter(),
             // Only a command or a scheduled retry tries again, and a retry is
             // scheduled only for a reason that retries
-            // ([`Unavailable::retries`]): a signature refusal waits for the
-            // next command, so a refused requirement is never retried in a
-            // loop.
-            State::Unavailable(_) => {
-                if fresh || retry_due {
+            // ([`Unavailable::retries`]), or once for a signature refusal
+            // ([`SIGNATURE_RETRY_AFTER`]), so a refused requirement is never
+            // retried in a loop. A sleep makes a scheduled retry due at once,
+            // with the backoff started over; not the signature retry, which
+            // waits on the old helper's idle grace, and that does not run
+            // ahead in sleep either.
+            State::Unavailable(why) => {
+                let woke = slept && self.retry_at.is_some() && why.retries();
+                if woke {
+                    self.backoff_step = 0;
+                    self.log(
+                        Level::Debug,
+                        "fan control: the machine slept; trying the fans again now",
+                    );
+                }
+                if fresh || retry_due || woke {
                     self.retry_at = None;
+                    // Past the third failure in a row a try that changes
+                    // nothing says nothing.
+                    let quiet = !fresh && self.failed_entries >= ENTRY_FAILURES_BEFORE_STOP;
+                    self.quiet = quiet.then_some(self.state);
                     self.enter();
+                    self.quiet = None;
                 }
             }
             State::Holding | State::Unknown | State::Foreign(_) => {
-                if fresh || tick_due {
-                    self.tick(fresh);
+                if fresh || tick_due || slept {
+                    self.tick_after(fresh, slept);
                 }
             }
         }
@@ -995,8 +1096,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 // counts the fans set manual without a target yet as ours,
                 // and hands them back. A stop is the shutdown's to do.
                 if self.stopping.is_none() {
-                    let force = std::mem::take(&mut self.force_pending);
-                    self.release(force);
+                    self.release(self.pending == Some(Pending::ForcedRelease));
                 }
             }
         }
@@ -1014,22 +1114,18 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             if self.hold.is_some() {
                 // `FNum` did not read while a record names fans: unknown,
                 // never "no fans", and the record stays.
-                self.set_state(State::Unknown);
-                self.arm_tick();
+                self.wait_in(State::Unknown);
             } else {
                 self.unavailable(Unavailable::NoFans);
             }
             return Err(Stop::Settled);
         }
-        if let Err(blocked) = self.check_foreign(&reading) {
-            if let Some(blocked) = blocked {
-                self.settle_blocked(blocked);
-            }
-            return Err(Stop::Settled);
-        }
+        self.check_foreign(&reading)?;
 
-        let generation = self.open()?;
-        match self.parts.helper.send(&Request::Version, VERSION_DEADLINE) {
+        let generation = self
+            .dial()
+            .map_err(|fault| self.entry_failed(Failure::Fault(fault), false))?;
+        match self.call(&Request::Version, VERSION_DEADLINE) {
             Ok(Reply::Version { protocol, .. }) if protocol == PROTOCOL_VERSION => {}
             Ok(Reply::Version { protocol, .. }) => {
                 self.close();
@@ -1038,11 +1134,8 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 });
                 return Err(Stop::Settled);
             }
-            Ok(Reply::Refused(error)) => {
-                return Err(self.entry_failed(Failure::Refused(error), false));
-            }
             Ok(_other) => return Err(self.entry_failed(Failure::Fault(Fault::Malformed), false)),
-            Err(fault) => return Err(self.entry_failed(Failure::Fault(fault), false)),
+            Err(failure) => return Err(self.entry_failed(failure, false)),
         }
 
         // The record goes to disk before the first write: a crash between the
@@ -1060,21 +1153,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         });
         self.save();
 
-        let mut manual_sent = false;
-        match self.take_fans(generation, &fans, &reading, &mut manual_sent) {
-            Ok(()) => {}
-            Err(Halt::Stop(stop)) => return Err(stop),
-            Err(Halt::Blocked(blocked)) => {
-                // Requirement H3: whatever stopped the entry, a fan already
-                // set manual goes back before the state says why.
-                if manual_sent && self.connected {
-                    self.hand_back_once(HAND_BACK_DEADLINE);
-                }
-                self.close();
-                self.settle_blocked(blocked);
-                return Err(Stop::Settled);
-            }
-        }
+        self.take_fans(generation, &fans, &reading)?;
 
         self.failed_entries = 0;
         self.backoff_step = 0;
@@ -1083,36 +1162,26 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         Ok(())
     }
 
-    /// Every set-manual, then every set-target. `manual_sent` turns true at
-    /// the first set-manual sent, so the caller knows a block owes a
-    /// hand-back. Failures the steps report themselves ([`Self::entry_failed`]
-    /// hands back already).
+    /// Every set-manual, then every set-target. Every way it stops is settled
+    /// here: a block by [`Self::blocked_mid_entry`], a failure by
+    /// [`Self::entry_failed`], both handing back first when a set-manual went
+    /// out (requirement H3).
     fn take_fans(
         &mut self,
         generation: Generation,
         fans: &[FanIndex],
         reading: &HeatReading,
-        manual_sent: &mut bool,
-    ) -> Result<(), Halt> {
-        for &fan in fans {
+    ) -> Result<(), Stop> {
+        for (sent, &fan) in fans.iter().enumerate() {
             self.between_steps(generation)?;
-            self.probe().map_err(Halt::Blocked)?;
-            *manual_sent = true;
-            match self
-                .parts
-                .helper
-                .send(&Request::SetManual { fan }, SET_MANUAL_DEADLINE)
-            {
+            if let Err(blocked) = self.probe() {
+                // `sent > 0`: an earlier fan's set-manual went out.
+                return Err(self.blocked_mid_entry(blocked, sent > 0));
+            }
+            match self.call(&Request::SetManual { fan }, SET_MANUAL_DEADLINE) {
                 Ok(Reply::Manual { .. }) => {}
-                Ok(Reply::Refused(error)) => {
-                    return Err(self.entry_failed(Failure::Refused(error), true).into());
-                }
-                Ok(_other) => {
-                    return Err(self
-                        .entry_failed(Failure::Fault(Fault::Malformed), true)
-                        .into());
-                }
-                Err(fault) => return Err(self.entry_failed(Failure::Fault(fault), true).into()),
+                Ok(_other) => return Err(self.entry_failed(Failure::Fault(Fault::Malformed), true)),
+                Err(failure) => return Err(self.entry_failed(failure, true)),
             }
         }
 
@@ -1121,27 +1190,36 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             self.between_steps(generation)?;
             let Some(target) = target_for(self.desired, fan_reading, reading.cpu_celsius, self.hot)
             else {
-                return Err(self
-                    .entry_failed(
-                        Failure::Refused(HelperError::LimitsUnreadable {
-                            fan: u64::from(fan_reading.index.get()),
-                        }),
-                        true,
-                    )
-                    .into());
+                let fan = u64::from(fan_reading.index.get());
+                return Err(self.entry_failed(
+                    Failure::Refused(HelperError::LimitsUnreadable { fan }),
+                    true,
+                ));
             };
-            self.probe().map_err(Halt::Blocked)?;
+            if let Err(blocked) = self.probe() {
+                return Err(self.blocked_mid_entry(blocked, true));
+            }
             self.write_target(fan_reading.index, target)
-                .map_err(|failure| Halt::Stop(self.entry_failed(failure, true)))?;
+                .map_err(|failure| self.entry_failed(failure, true))?;
         }
         Ok(())
+    }
+
+    /// A block stopped an entry partway. Requirement H3: whatever stopped the
+    /// entry, a fan already set manual (`owed`) goes back before the state
+    /// says why.
+    fn blocked_mid_entry(&mut self, blocked: Blocked, owed: bool) -> Stop {
+        self.hand_back_then_close(owed);
+        self.settle_blocked(blocked);
+        Stop::Settled
     }
 
     /// Between two writes: take what arrived, and stop when the wish is no
     /// longer manual or this connection is gone (requirement H2).
     fn between_steps(&mut self, generation: Generation) -> Result<(), Stop> {
         self.drain();
-        if self.stopping.is_some() || self.force_pending || !self.desired.is_manual() {
+        let forced = self.pending == Some(Pending::ForcedRelease);
+        if self.stopping.is_some() || forced || !self.desired.is_manual() {
             return Err(Stop::Changed);
         }
         if !self.connected || Generation(self.generation) != generation {
@@ -1181,24 +1259,32 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         self.arm_tick();
     }
 
-    /// Before entering: whoever else has the fans keeps them. `Err(Some)` is
-    /// a block for the caller to settle; `Err(None)` set the state already.
-    fn check_foreign(&mut self, reading: &HeatReading) -> Result<(), Option<Blocked>> {
-        self.probe().map_err(Some)?;
-        let record = self.hold.as_ref().map(|h| h.fans.as_slice());
-        match holder::classify(&states(reading), record, self.unwritten(), false) {
-            Holder::MacOs | Holder::Ours | Holder::PartlyAutomatic => Ok(()),
-            Holder::AnotherApp | Holder::MacsFanControl => {
-                self.set_state(State::Foreign(ForeignHolder::AnotherApp));
-                self.arm_tick();
-                Err(None)
-            }
-            Holder::Unknown => {
-                self.set_state(State::Unknown);
-                self.arm_tick();
-                Err(None)
-            }
+    /// Before entering: whoever else has the fans keeps them. Every way it
+    /// stops has set the state already.
+    fn check_foreign(&mut self, reading: &HeatReading) -> Result<(), Stop> {
+        if let Err(blocked) = self.probe() {
+            self.settle_blocked(blocked);
+            return Err(Stop::Settled);
         }
+        match self.whose(reading) {
+            Holder::MacOs | Holder::Ours | Holder::PartlyAutomatic => return Ok(()),
+            Holder::AnotherApp | Holder::MacsFanControl => {
+                self.wait_in(State::Foreign(ForeignHolder::AnotherApp));
+            }
+            Holder::Unknown => self.wait_in(State::Unknown),
+        }
+        Err(Stop::Settled)
+    }
+
+    /// Who holds the fans, by the keys against this process's record.
+    fn whose(&self, reading: &HeatReading) -> Holder {
+        self.whose_as(reading, self.unwritten())
+    }
+
+    /// [`Self::whose`], with the rule for a fan with no target yet given.
+    fn whose_as(&self, reading: &HeatReading, unwritten: Unwritten) -> Holder {
+        let record = self.hold.as_ref().map(|h| h.fans.as_slice());
+        holder::classify(&states(reading), record, unwritten, false)
     }
 
     /// How a held fan with no target yet counts: ours only in the middle of
@@ -1211,16 +1297,24 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         }
     }
 
-    fn open(&mut self) -> Result<Generation, Stop> {
+    /// Close, take the next generation, open (M2: one generation per
+    /// connection).
+    fn dial(&mut self) -> Result<Generation, Fault> {
         self.close();
         self.generation += 1;
         let generation = Generation(self.generation);
-        match self.parts.helper.open(generation) {
-            Ok(()) => {
-                self.connected = true;
-                Ok(generation)
-            }
-            Err(fault) => Err(self.entry_failed(Failure::Fault(fault), false)),
+        self.parts.helper.open(generation)?;
+        self.connected = true;
+        Ok(generation)
+    }
+
+    /// One request; a refusal and a fault both come back as a [`Failure`].
+    /// Each caller matches only the reply it expects.
+    fn call(&mut self, request: &Request, deadline: Duration) -> Result<Reply, Failure> {
+        match self.parts.helper.send(request, deadline) {
+            Ok(Reply::Refused(error)) => Err(Failure::Refused(error)),
+            Ok(reply) => Ok(reply),
+            Err(fault) => Err(Failure::Fault(fault)),
         }
     }
 
@@ -1233,11 +1327,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
 
     /// One set-target, recorded and saved.
     fn write_target(&mut self, fan: FanIndex, rpm: f64) -> Result<(), Failure> {
-        match self
-            .parts
-            .helper
-            .send(&Request::SetTarget { fan, rpm }, SET_TARGET_DEADLINE)
-        {
+        match self.call(&Request::SetTarget { fan, rpm }, SET_TARGET_DEADLINE) {
             Ok(Reply::Target { rpm: written }) => {
                 if let Some(hold) = &mut self.hold
                     && let Some(held) = hold.fans.iter_mut().find(|h| h.fan == fan)
@@ -1251,9 +1341,8 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 );
                 Ok(())
             }
-            Ok(Reply::Refused(error)) => Err(Failure::Refused(error)),
             Ok(_other) => Err(Failure::Fault(Fault::Malformed)),
-            Err(fault) => Err(Failure::Fault(fault)),
+            Err(failure) => Err(failure),
         }
     }
 
@@ -1264,18 +1353,20 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             self.taken_over();
             return Stop::Settled;
         }
-        if wrote && self.connected {
-            self.hand_back_once(HAND_BACK_DEADLINE);
-        }
-        self.close();
+        self.hand_back_then_close(wrote);
         if failure == Failure::Fault(Fault::Interrupted) {
             self.reenter_counted();
             return Stop::Settled;
         }
         self.failed_entries += 1;
         let why = failure.unavailable();
+        let level = if self.quiet == Some(State::Unavailable(why)) {
+            Level::Debug
+        } else {
+            Level::Warn
+        };
         self.log(
-            Level::Warn,
+            level,
             &format!("fan control: could not take the fans: {why:?}"),
         );
         self.unavailable(why);
@@ -1291,19 +1382,45 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         self.set_state(State::Unavailable(Unavailable::HelperRefused(
             HelperError::NotHolder,
         )));
-        self.next_tick = None;
-        self.retry_at = None;
+        self.unschedule();
+    }
+
+    /// Requirement H3: a fan this run set manual (`owed`) goes back before
+    /// anything reports, then the connection closes.
+    fn hand_back_then_close(&mut self, owed: bool) {
+        if owed && self.connected {
+            self.hand_back_once(HAND_BACK_DEADLINE);
+        }
+        self.close();
     }
 
     /// Set `Unavailable(why)` and schedule the retry, if this one retries
-    /// and the run of failures is short enough.
+    /// and the run of failures is short enough, or it never stops
+    /// ([`Unavailable::never_stops`]): from the third failure in a row that
+    /// one is tried every [`RETRY_EVERY`], or sooner after a sleep. A
+    /// signature refusal is tried once more, [`SIGNATURE_RETRY_AFTER`] on,
+    /// and then not until the next command.
     fn unavailable(&mut self, why: Unavailable) {
-        self.next_tick = None;
-        self.retry_at = None;
-        if why.retries() && self.desired.is_manual() {
-            if self.failed_entries >= ENTRY_FAILURES_BEFORE_STOP {
+        self.unschedule();
+        if why == Unavailable::HelperSignature
+            && self.desired.is_manual()
+            && !self.signature_retried
+        {
+            self.signature_retried = true;
+            self.retry_at = Some(self.parts.clock.now() + SIGNATURE_RETRY_AFTER);
+        } else if why.retries() && self.desired.is_manual() {
+            let past = self.failed_entries >= ENTRY_FAILURES_BEFORE_STOP;
+            if past && !why.never_stops() {
                 self.detail = Some(Detail::RetryStopped);
             } else {
+                if past {
+                    self.detail = Some(Detail::RetryingEveryMinute);
+                }
+                if self.failed_entries == ENTRY_FAILURES_BEFORE_STOP {
+                    // The third failure: every minute from here, until a
+                    // sleep starts the backoff over.
+                    self.backoff_step = BACKOFF.len() - 1;
+                }
                 let wait = BACKOFF[self.backoff_step.min(BACKOFF.len() - 1)];
                 self.backoff_step += 1;
                 self.retry_at = Some(self.parts.clock.now() + wait);
@@ -1329,10 +1446,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 Level::Warn,
                 "fan control: the fans keep going back to automatic; stopping",
             );
-            if self.connected {
-                self.hand_back_once(HAND_BACK_DEADLINE);
-            }
-            self.close();
+            self.hand_back_then_close(true);
             self.unavailable(Unavailable::Contended);
             return;
         }
@@ -1345,18 +1459,34 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         self.next_tick = Some(self.parts.clock.now() + TICK);
     }
 
+    /// Set the state, then arm the tick that looks again.
+    fn wait_in(&mut self, state: State) {
+        self.set_state(state);
+        self.arm_tick();
+    }
+
+    const fn unschedule(&mut self) {
+        self.next_tick = None;
+        self.retry_at = None;
+    }
+
     /// One tick: read, probe, classify, guard, target, gate, write.
     /// `forced`: a new command, so the gate does not hold a changed target
     /// back.
     pub fn tick(&mut self, forced: bool) -> TickOutcome {
+        let after_sleep = self.slept();
+        self.tick_after(forced, after_sleep)
+    }
+
+    /// [`Self::tick`], with the look at the clocks already taken.
+    fn tick_after(&mut self, forced: bool, after_sleep: bool) -> TickOutcome {
         self.arm_tick();
-        let outcome = self.tick_inner(forced);
+        let outcome = self.tick_inner(forced, after_sleep);
         self.last_outcome = Some(outcome);
         outcome
     }
 
-    fn tick_inner(&mut self, forced: bool) -> TickOutcome {
-        let after_sleep = self.slept();
+    fn tick_inner(&mut self, forced: bool, after_sleep: bool) -> TickOutcome {
         let Some(reading) = self.parts.heat.read() else {
             self.set_state(State::Unknown);
             return TickOutcome::HeldBack(Why::Unreadable);
@@ -1366,8 +1496,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             self.settle_blocked(blocked);
             return TickOutcome::HeldBack(why);
         }
-        let record = self.hold.as_ref().map(|h| h.fans.as_slice());
-        match holder::classify(&states(&reading), record, self.unwritten(), false) {
+        match self.whose(&reading) {
             Holder::Unknown => {
                 self.set_state(State::Unknown);
                 TickOutcome::HeldBack(Why::Unreadable)
@@ -1399,7 +1528,14 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                             "fan control: every fan is automatic again; re-applying"
                         },
                     );
-                    self.reenter_counted();
+                    if after_sleep {
+                        // The sleep explains it, and the contention window
+                        // runs on the monotonic clock, which stood still
+                        // through it: a night of dark wakes is not contention.
+                        self.enter();
+                    } else {
+                        self.reenter_counted();
+                    }
                 } else {
                     self.enter();
                 }
@@ -1430,35 +1566,19 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         }
     }
 
-    /// Work out each held fan's target and write the ones past the gate.
+    /// Write each target [`plan_round`] lets through.
     fn write_round(&mut self, reading: &HeatReading, forced: bool) -> TickOutcome {
-        let was_hot = self.hot;
-        self.hot = self.desired.has_hot_guard() && guard(self.hot, reading.cpu_celsius);
-        let flipped = was_hot != self.hot;
+        let round = plan_round(self.desired, reading, self.hold.as_ref(), self.hot, forced);
+        let flipped = round.hot != self.hot;
+        self.hot = round.hot;
         let mut wrote = 0_u8;
-        let mut limits_unknown = false;
-        for fan in &reading.fans {
-            let Some(previous) = self
-                .hold
-                .as_ref()
-                .and_then(|h| h.fans.iter().find(|held| held.fan == fan.index))
-                .map(|held| held.written_rpm)
-            else {
-                continue;
-            };
-            let Some(target) = target_for(self.desired, fan, reading.cpu_celsius, self.hot) else {
-                limits_unknown = true;
-                continue;
-            };
-            if !should_write(previous, target, fan, self.desired, flipped || forced) {
-                continue;
-            }
+        for (fan, target) in round.writes {
             if let Err(blocked) = self.probe() {
                 let why = blocked.why();
                 self.settle_blocked(blocked);
                 return TickOutcome::HeldBack(why);
             }
-            match self.write_target(fan.index, target) {
+            match self.write_target(fan, target) {
                 Ok(()) => wrote = wrote.saturating_add(1),
                 Err(Failure::Refused(HelperError::NotHolder)) => {
                     self.taken_over();
@@ -1470,8 +1590,8 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                     return TickOutcome::HeldBack(Why::Helper);
                 }
                 Err(failure) => {
-                    self.hand_back_once(HAND_BACK_DEADLINE);
-                    self.close();
+                    // Connected: a round runs only on an open connection.
+                    self.hand_back_then_close(true);
                     self.failed_entries += 1;
                     self.unavailable(failure.unavailable());
                     return TickOutcome::HeldBack(Why::Helper);
@@ -1484,23 +1604,24 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         if wrote > 0 {
             self.publish();
             TickOutcome::Wrote(wrote)
-        } else if limits_unknown {
+        } else if round.limits_unknown {
             TickOutcome::HeldBack(Why::LimitsUnknown)
         } else {
             TickOutcome::NoChange
         }
     }
 
-    /// Did the machine sleep since the last tick? The monotonic clock stops
-    /// in sleep on macOS; the wall clock does not.
+    /// Did the machine sleep since the last look (a step, or a tick called
+    /// on its own)? The monotonic clock stops in sleep on macOS; the wall
+    /// clock does not ([`SLEEP_GAP`]).
     fn slept(&mut self) -> bool {
         let now = (self.parts.clock.now(), self.parts.clock.wall_ms());
-        let slept = self.last_tick.is_some_and(|(at, wall)| {
+        let slept = self.last_look.is_some_and(|(at, wall)| {
             let monotonic = now.0.saturating_duration_since(at).as_millis();
             let wall = u128::try_from(now.1.saturating_sub(wall)).unwrap_or(0);
             wall.saturating_sub(monotonic) > SLEEP_GAP.as_millis()
         });
-        self.last_tick = Some(now);
+        self.last_look = Some(now);
         slept
     }
 
@@ -1513,8 +1634,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// waiting (on Macs Fan Control, or a read) changes nothing and says
     /// nothing new on each tick it waits.
     fn release(&mut self, force: bool) {
-        self.release_pending = false;
-        self.force_pending = false;
+        self.pending = None;
         self.retry_at = None;
         match self.judge_release(force) {
             Verdict::NothingOurs => {
@@ -1522,8 +1642,11 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 self.finish_off();
             }
             Verdict::Wait(waiting) => {
-                self.release_pending = true;
-                self.force_pending = force;
+                self.pending = Some(if force {
+                    Pending::ForcedRelease
+                } else {
+                    Pending::Release
+                });
                 match waiting {
                     Waiting::Blocked(Blocked::Macs) => {
                         self.detail = Some(Detail::WaitingForMacs);
@@ -1535,8 +1658,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                     }
                     Waiting::Unreadable => {
                         self.detail = None;
-                        self.set_state(State::Unknown);
-                        self.arm_tick();
+                        self.wait_in(State::Unknown);
                     }
                 }
             }
@@ -1593,30 +1715,23 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             if budget.is_zero() {
                 break;
             }
-            if !self.connected {
-                self.close();
-                self.generation += 1;
-                match self.parts.helper.open(Generation(self.generation)) {
-                    Ok(()) => self.connected = true,
-                    Err(fault) => {
-                        self.log(
-                            Level::Warn,
-                            &format!(
-                                "fan control: could not reach the helper to hand back: {fault:?}"
-                            ),
-                        );
-                        if matches!(
-                            fault,
-                            Fault::NotSignedForFans
-                                | Fault::Requirement
-                                | Fault::PeerCodeSigningRequirement
-                        ) {
-                            break;
-                        }
-                        self.pause_between_tries(attempt, deadline);
-                        continue;
-                    }
+            if !self.connected
+                && let Err(fault) = self.dial()
+            {
+                self.log(
+                    Level::Warn,
+                    &format!("fan control: could not reach the helper to hand back: {fault:?}"),
+                );
+                if matches!(
+                    fault,
+                    Fault::NotSignedForFans
+                        | Fault::Requirement
+                        | Fault::PeerCodeSigningRequirement
+                ) {
+                    break;
                 }
+                self.pause_between_tries(attempt, deadline);
+                continue;
             }
             match self.hand_back_once(budget) {
                 HandBack::Done => {
@@ -1656,6 +1771,8 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// One hand-back on the open connection. Success clears the record when
     /// this process wrote it.
     fn hand_back_once(&mut self, deadline: Duration) -> HandBack {
+        // Not through `call`: the line below names any other reply whole, a
+        // refusal included.
         match self.parts.helper.send(&Request::HandBack, deadline) {
             Ok(Reply::HandedBack) => {
                 if self
@@ -1688,8 +1805,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
 
     fn finish_off(&mut self) {
         self.next_tick = None;
-        self.release_pending = false;
-        self.force_pending = false;
+        self.pending = None;
         self.detail = None;
         self.set_state(State::Off);
     }
@@ -1702,10 +1818,8 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// failed is not "Macs Fan Control is not running", and fans another
     /// program changed are not handed back.
     fn shut_down(&mut self, deadline: Instant) {
-        self.next_tick = None;
-        self.retry_at = None;
-        self.release_pending = false;
-        self.force_pending = false;
+        self.unschedule();
+        self.pending = None;
         match self.judge_release(false) {
             Verdict::HandBack => {
                 self.set_state(State::Releasing);
@@ -1735,10 +1849,11 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
 
     fn set_state(&mut self, state: State) {
         if state != self.state {
-            self.log(
-                Level::Info,
-                &format!("fan control: {} -> {}", self.state, state),
-            );
+            let level = match self.quiet {
+                Some(from) if state == State::Entering || state == from => Level::Debug,
+                _ => Level::Info,
+            };
+            self.log(level, &format!("fan control: {} -> {}", self.state, state));
             self.state = state;
             // With a command taken and not yet acted on, a state reached for
             // the wish before it is not that command's answer.
@@ -1749,9 +1864,11 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         self.publish();
     }
 
-    /// The wish shown and `since_ms`, moved together ([`Snapshot`]).
+    /// The wish shown and the command number acted on, moved together
+    /// ([`Snapshot`]).
     fn stamp(&mut self) {
         self.shown_desired = self.desired;
+        self.acted = self.taken;
         self.since_ms = self.parts.clock.wall_ms();
     }
 
@@ -1827,22 +1944,69 @@ fn limits(fan: &FanReading) -> Option<(f64, f64)> {
 
 /// What this fan should turn at. `None` when the mode needs the fan's range
 /// and it did not read.
-fn target_for(mode: FanMode, fan: &FanReading, celsius: Option<f64>, hot: bool) -> Option<f64> {
+fn target_for(mode: FanDesired, fan: &FanReading, celsius: Option<f64>, hot: bool) -> Option<f64> {
     let range = limits(fan);
     if hot && mode.has_hot_guard() {
         return range.map(|(_, max)| max);
     }
     match mode {
-        FanMode::Auto => None,
-        FanMode::Fixed { rpm } => {
+        FanDesired::Auto => None,
+        FanDesired::Fixed { rpm } => {
             let rpm = f64::from(rpm.get());
             Some(range.map_or(rpm, |(min, max)| rpm.clamp(min, max)))
         }
-        FanMode::FollowCpu { curve } => {
+        FanDesired::FollowCpu { curve } => {
             let (min, max) = range?;
             Some(celsius.map_or(max, |c| curve.share(c).mul_add(max - min, min)))
         }
     }
+}
+
+/// One tick's writes, worked out before any is sent.
+#[derive(Debug, Clone, PartialEq)]
+struct Round {
+    /// The hot guard after this reading.
+    hot: bool,
+    /// Each held fan past the write gate, and its target, in reading order.
+    writes: Vec<(FanIndex, f64)>,
+    /// A held fan's target needs its range, and the range did not read.
+    limits_unknown: bool,
+}
+
+/// Each held fan's target, and which pass the gate. Pure: a fan's previous
+/// target never depends on another fan's write, so planning them all before
+/// the first write is what writing them one by one did. `forced`: a new
+/// command, so the gate does not hold a changed target back.
+fn plan_round(
+    desired: FanDesired,
+    reading: &HeatReading,
+    hold: Option<&Hold>,
+    was_hot: bool,
+    forced: bool,
+) -> Round {
+    let hot = desired.has_hot_guard() && guard(was_hot, reading.cpu_celsius);
+    let flipped = was_hot != hot;
+    let mut round = Round {
+        hot,
+        writes: Vec::new(),
+        limits_unknown: false,
+    };
+    for fan in &reading.fans {
+        let Some(previous) = hold
+            .and_then(|h| h.fans.iter().find(|held| held.fan == fan.index))
+            .map(|held| held.written_rpm)
+        else {
+            continue;
+        };
+        let Some(target) = target_for(desired, fan, reading.cpu_celsius, hot) else {
+            round.limits_unknown = true;
+            continue;
+        };
+        if should_write(previous, target, fan, desired, flipped || forced) {
+            round.writes.push((fan.index, target));
+        }
+    }
+    round
 }
 
 /// The write gate. `forced`: a new command or a hot-guard flip.
@@ -1850,7 +2014,7 @@ fn should_write(
     previous: Option<f64>,
     target: f64,
     fan: &FanReading,
-    mode: FanMode,
+    mode: FanDesired,
     forced: bool,
 ) -> bool {
     let Some(previous) = previous else {
@@ -1859,7 +2023,7 @@ fn should_write(
     if (target - previous).abs() <= holder::TARGET_TOLERANCE_RPM {
         return false;
     }
-    if forced || matches!(mode, FanMode::Fixed { .. }) {
+    if forced || matches!(mode, FanDesired::Fixed { .. }) {
         return true;
     }
     let Some((min, max)) = limits(fan) else {
