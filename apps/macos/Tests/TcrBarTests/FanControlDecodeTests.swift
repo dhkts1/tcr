@@ -18,7 +18,7 @@ final class FanControlDecodeTests: XCTestCase {
            "hotGuard": false,
            "targets": [ { "fan": 0, "rpm": 5777.0 } ],
            "detail": null,
-           "sinceMs": 0
+           "command": 0
          }}
         """
 
@@ -44,12 +44,12 @@ final class FanControlDecodeTests: XCTestCase {
     func testEveryDesiredModeDecodes() throws {
         XCTAssertEqual(
             try decode(
-                #"{"desired": {"mode": "auto"}, "state": "off", "reason": null, "hotGuard": false, "targets": [], "detail": null, "sinceMs": 0}"#
+                #"{"desired": {"mode": "auto"}, "state": "off", "reason": null, "hotGuard": false, "targets": [], "detail": null, "command": 0}"#
             )?
             .desired, .auto)
         XCTAssertEqual(
             try decode(
-                #"{"desired": {"mode": "fixed", "rpm": 5000}, "state": "holding", "reason": null, "hotGuard": false, "targets": [{"fan": 0, "rpm": 5000.0}, {"fan": 1, "rpm": 5000.0}], "detail": null, "sinceMs": 0}"#
+                #"{"desired": {"mode": "fixed", "rpm": 5000}, "state": "holding", "reason": null, "hotGuard": false, "targets": [{"fan": 0, "rpm": 5000.0}, {"fan": 1, "rpm": 5000.0}], "detail": null, "command": 0}"#
             )?
             .desired, .fixed(rpm: 5_000))
         XCTAssertEqual(
@@ -61,13 +61,13 @@ final class FanControlDecodeTests: XCTestCase {
 
     func testReasonsDecodeToTheirCases() throws {
         let unreachable = try decode(
-            #"{"desired": {"mode": "fixed", "rpm": 5000}, "state": "unavailable", "reason": "helperUnreachable", "hotGuard": false, "targets": [], "detail": null, "sinceMs": 0}"#
+            #"{"desired": {"mode": "fixed", "rpm": 5000}, "state": "unavailable", "reason": "helperUnreachable", "hotGuard": false, "targets": [], "detail": null, "command": 0}"#
         )
         XCTAssertEqual(unreachable?.state, .unavailable)
         XCTAssertEqual(unreachable?.reason, .helperUnreachable)
 
         let macs = try decode(
-            #"{"desired": {"mode": "auto"}, "state": "foreign", "reason": "macsFanControl", "hotGuard": false, "targets": [], "detail": "fans go back to automatic when Macs Fan Control quits", "sinceMs": 0}"#
+            #"{"desired": {"mode": "auto"}, "state": "foreign", "reason": "macsFanControl", "hotGuard": false, "targets": [], "detail": "fans go back to automatic when Macs Fan Control quits", "command": 0}"#
         )
         XCTAssertEqual(macs?.state, .foreign)
         XCTAssertEqual(macs?.reason, .macsFanControl)
@@ -219,7 +219,7 @@ final class FanControlDecodeTests: XCTestCase {
     /// shape at all: `{"helperVersion": {}}`, no `installed`.
     func testAHelperVersionWithNoInstalledDecodes() throws {
         let control = try decode(
-            #"{"desired": {"mode": "fixed", "rpm": 5000}, "state": "unavailable", "reason": {"helperVersion": {}}, "hotGuard": false, "targets": [], "detail": null, "sinceMs": 0}"#
+            #"{"desired": {"mode": "fixed", "rpm": 5000}, "state": "unavailable", "reason": {"helperVersion": {}}, "hotGuard": false, "targets": [], "detail": null, "command": 0}"#
         )
         XCTAssertEqual(control?.state, .unavailable)
         XCTAssertEqual(control?.reason, .helperVersion)

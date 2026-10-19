@@ -281,29 +281,24 @@ impl<K: KeyAccess> Root<K> {
             (None, Some(window)) => window.fans,
             (None, None) => return,
         };
-        match self.judge(&fans) {
-            Ok(StillOurs::Ours) => match self
-                .writer()
-                .and_then(|w| w.hand_back().map_err(HelperError::from_fan))
-            {
-                Ok(()) => self.say(Level::Notice, "SIGTERM: fans handed back to macOS"),
-                Err(error) => self.say(
-                    Level::Critical,
-                    &format!("SIGTERM: hand-back failed ({error}); fans may stay manual"),
-                ),
-            },
-            Ok(StillOurs::Changed { fan }) => self.say(
+        match self.release_if_ours(&fans) {
+            Released::HandedBack => self.say(Level::Notice, "SIGTERM: fans handed back to macOS"),
+            Released::HandBackFailed(error) => self.say(
+                Level::Critical,
+                &format!("SIGTERM: hand-back failed ({error}); fans may stay manual"),
+            ),
+            Released::Changed(fan) => self.say(
                 Level::Notice,
                 &format!(
                     "SIGTERM: fan {} changed since root wrote it; left as it is",
                     fan.get()
                 ),
             ),
-            Ok(StillOurs::Unknown { fan }) => self.say(
+            Released::Unknown(fan) => self.say(
                 Level::Critical,
                 &format!("SIGTERM: fan {} did not read; wrote nothing", fan.get()),
             ),
-            Err(error) => self.say(
+            Released::Unreadable(error) => self.say(
                 Level::Critical,
                 &format!("SIGTERM: fans did not read ({error}); wrote nothing"),
             ),
@@ -335,8 +330,12 @@ impl<K: KeyAccess> Root<K> {
         self.writer.as_mut().ok_or(HelperError::SmcUnavailable)
     }
 
+    fn fan_count(&mut self) -> Result<u8, HelperError> {
+        self.writer()?.fan_count().map_err(HelperError::from_fan)
+    }
+
     fn no_such_fan(&mut self, fan: u64) -> Result<Reply, HelperError> {
-        let count = self.writer()?.fan_count().map_err(HelperError::from_fan)?;
+        let count = self.fan_count()?;
         Err(HelperError::NoSuchFan {
             fan,
             count: u64::from(count),
@@ -346,7 +345,7 @@ impl<K: KeyAccess> Root<K> {
     fn set_manual(&mut self, peer: PeerId, fan: FanIndex) -> Result<Reply, HelperError> {
         // The fan is checked before anything changes hands: a refused index
         // leaves the holder and any window exactly as they were.
-        let count = self.writer()?.fan_count().map_err(HelperError::from_fan)?;
+        let count = self.fan_count()?;
         if fan.get() >= count {
             return Err(HelperError::NoSuchFan {
                 fan: u64::from(fan.get()),
@@ -479,8 +478,8 @@ impl<K: KeyAccess> Root<K> {
 
     /// Every fan's mode and target, read now.
     fn reading(&mut self) -> Result<Vec<FanState>, HelperError> {
+        let count = self.fan_count()?;
         let writer = self.writer()?;
-        let count = writer.fan_count().map_err(HelperError::from_fan)?;
         Ok((0..count)
             .filter_map(FanIndex::new)
             .map(|fan| FanState {
@@ -491,14 +490,27 @@ impl<K: KeyAccess> Root<K> {
             .collect())
     }
 
-    fn judge(&mut self, fans: &[HeldFan]) -> Result<StillOurs, HelperError> {
+    /// Judge `fans` against the keys, and hand every fan back only when they
+    /// are still root's doing. `terminate` and a disconnect window word the
+    /// outcome each in their own lines.
+    fn release_if_ours(&mut self, fans: &[HeldFan]) -> Released {
+        let reading = match self.reading() {
+            Ok(reading) => reading,
+            Err(error) => return Released::Unreadable(error),
+        };
         // Root put every fan in its record in manual itself, so a fan with
         // no target yet is still its doing to hand back.
-        Ok(holder::still_ours(
-            &self.reading()?,
-            fans,
-            holder::Unwritten::Ours,
-        ))
+        match holder::still_ours(&reading, fans, holder::Unwritten::Ours) {
+            StillOurs::Ours => match self
+                .writer()
+                .and_then(|w| w.hand_back().map_err(HelperError::from_fan))
+            {
+                Ok(()) => Released::HandedBack,
+                Err(error) => Released::HandBackFailed(error),
+            },
+            StillOurs::Changed { fan } => Released::Changed(fan),
+            StillOurs::Unknown { fan } => Released::Unknown(fan),
+        }
     }
 
     /// One attempt of window `id`, which is current.
@@ -510,8 +522,8 @@ impl<K: KeyAccess> Root<K> {
         let attempts = window.attempts;
         let fans = window.fans.clone();
 
-        let failure = match self.judge(&fans) {
-            Ok(StillOurs::Changed { fan }) => {
+        let failure = match self.release_if_ours(&fans) {
+            Released::Changed(fan) => {
                 self.say(
                     Level::Notice,
                     &format!(
@@ -522,23 +534,18 @@ impl<K: KeyAccess> Root<K> {
                 self.window = None;
                 return self.exit_if_idle();
             }
-            Ok(StillOurs::Ours) => {
-                match self
-                    .writer()
-                    .and_then(|w| w.hand_back().map_err(HelperError::from_fan))
-                {
-                    Ok(()) => {
-                        self.say(Level::Notice, "holder gone; fans handed back to macOS");
-                        self.window = None;
-                        return self.exit_if_idle();
-                    }
-                    Err(error) => format!("hand-back failed: {error}"),
-                }
+            Released::HandedBack => {
+                self.say(Level::Notice, "holder gone; fans handed back to macOS");
+                self.window = None;
+                return self.exit_if_idle();
             }
-            Ok(StillOurs::Unknown { fan }) => {
+            Released::HandBackFailed(error) => format!("hand-back failed: {error}"),
+            Released::Unknown(fan) => {
                 format!("fan {} did not read, so nothing was written", fan.get())
             }
-            Err(error) => format!("the fans did not read ({error}), so nothing was written"),
+            Released::Unreadable(error) => {
+                format!("the fans did not read ({error}), so nothing was written")
+            }
         };
         self.say(
             Level::Critical,
@@ -554,6 +561,18 @@ impl<K: KeyAccess> Root<K> {
         self.window = None;
         self.exit_if_idle()
     }
+}
+
+/// What [`Root::release_if_ours`] did with a record of held fans.
+enum Released {
+    HandedBack,
+    HandBackFailed(HelperError),
+    /// This fan changed since root wrote it: left as it is.
+    Changed(FanIndex),
+    /// This fan did not read: nothing written.
+    Unknown(FanIndex),
+    /// The fans did not read at all: nothing written.
+    Unreadable(HelperError),
 }
 
 /// Add every fan of `more` that `into` does not already hold.
@@ -619,6 +638,16 @@ mod tests {
             self.root.request(PeerId(peer), Ok(request))
         }
 
+        fn target(&mut self, peer: u64, index: u8, rpm: f64) -> Reply {
+            self.send(
+                peer,
+                Request::SetTarget {
+                    fan: fan(index),
+                    rpm,
+                },
+            )
+        }
+
         /// Peer takes fan 0 and 1 to manual at `rpm`.
         fn hold(&mut self, peer: u64, rpm: f64) {
             self.root.connected(PeerId(peer));
@@ -627,16 +656,7 @@ mod tests {
                     self.send(peer, Request::SetManual { fan: fan(index) }),
                     Reply::Manual { .. }
                 ));
-                assert_eq!(
-                    self.send(
-                        peer,
-                        Request::SetTarget {
-                            fan: fan(index),
-                            rpm
-                        }
-                    ),
-                    Reply::Target { rpm }
-                );
+                assert_eq!(self.target(peer, index, rpm), Reply::Target { rpm });
             }
         }
 
@@ -787,13 +807,7 @@ mod tests {
         rig.hold(1, 3000.0);
         let before = rig.smc.writes().len();
         assert_eq!(
-            rig.send(
-                1,
-                Request::SetTarget {
-                    fan: fan(0),
-                    rpm: f64::NAN
-                }
-            ),
+            rig.target(1, 0, f64::NAN),
             Reply::Refused(HelperError::NotANumber)
         );
         assert_eq!(rig.smc.writes().len(), before);
@@ -810,13 +824,7 @@ mod tests {
         ));
         assert_eq!(rig.root.holder(), Some(PeerId(2)));
         assert_eq!(
-            rig.send(
-                1,
-                Request::SetTarget {
-                    fan: fan(0),
-                    rpm: 2000.0
-                }
-            ),
+            rig.target(1, 0, 2000.0),
             Reply::Refused(HelperError::NotHolder)
         );
         // The old holder's departure no longer hands anything back.
@@ -829,11 +837,7 @@ mod tests {
     fn non_holder_disconnect_does_not_hand_back() {
         let mut rig = Rig::new();
         rig.hold(1, 3000.0);
-        rig.root.connected(PeerId(2));
-        assert!(matches!(
-            rig.send(2, Request::Version),
-            Reply::Version { .. }
-        ));
+        version(&mut rig, 2);
         let before = rig.smc.writes().len();
 
         assert_eq!(rig.root.disconnected(PeerId(2)), Next::Stay);
@@ -875,11 +879,7 @@ mod tests {
 
         // Two connections: the first to leave does not end the helper.
         for peer in [1, 2] {
-            rig.root.connected(PeerId(peer));
-            assert!(matches!(
-                rig.send(peer, Request::Version),
-                Reply::Version { .. }
-            ));
+            version(&mut rig, peer);
         }
         assert!(!rig.root.is_idle());
         assert_eq!(rig.root.disconnected(PeerId(1)), Next::Stay);
@@ -897,11 +897,7 @@ mod tests {
 
         // A connection arriving during the window keeps the helper alive past
         // the window's end; its own departure is what ends it.
-        rig.root.connected(PeerId(4));
-        assert!(matches!(
-            rig.send(4, Request::Version),
-            Reply::Version { .. }
-        ));
+        version(&mut rig, 4);
         rig.smc.accept("F0Md");
         assert_eq!(rig.root.window_due(window), Next::Stay);
         assert!(!rig.root.window_pending());
@@ -925,11 +921,7 @@ mod tests {
 
         // Beside a counted peer, a silent one's arrival changes nothing either:
         // the counted peer's departure is what ends the helper.
-        rig.root.connected(PeerId(2));
-        assert!(matches!(
-            rig.send(2, Request::Version),
-            Reply::Version { .. }
-        ));
+        version(&mut rig, 2);
         rig.root.connected(PeerId(3));
         assert_exits(rig.root.disconnected(PeerId(2)));
     }
@@ -949,24 +941,9 @@ mod tests {
         rig.smc.accept("FNum");
         assert!(rig.smc.writes().is_empty());
         assert_eq!(rig.root.holder(), Some(PeerId(1)));
+        assert_eq!(rig.target(1, 1, 2500.0), Reply::Target { rpm: 2500.0 });
         assert_eq!(
-            rig.send(
-                1,
-                Request::SetTarget {
-                    fan: fan(1),
-                    rpm: 2500.0
-                }
-            ),
-            Reply::Target { rpm: 2500.0 }
-        );
-        assert_eq!(
-            rig.send(
-                2,
-                Request::SetTarget {
-                    fan: fan(0),
-                    rpm: 2000.0
-                }
-            ),
+            rig.target(2, 0, 2000.0),
             Reply::Refused(HelperError::NotHolder)
         );
 
@@ -1045,16 +1022,7 @@ mod tests {
         assert!(rig.smc.writes().is_empty(), "a cancelled window wrote");
         assert_eq!(rig.root.holder(), Some(PeerId(2)));
         // The new holder inherited fan 1, which root still has manual.
-        assert_eq!(
-            rig.send(
-                2,
-                Request::SetTarget {
-                    fan: fan(1),
-                    rpm: 2500.0
-                }
-            ),
-            Reply::Target { rpm: 2500.0 }
-        );
+        assert_eq!(rig.target(2, 1, 2500.0), Reply::Target { rpm: 2500.0 });
     }
 
     #[test]

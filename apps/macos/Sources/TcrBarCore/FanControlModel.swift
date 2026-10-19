@@ -462,7 +462,7 @@ public final class FanControlModel: ObservableObject {
     }
 
     /// `tcr fan ...` through ``TcrTool``, on a detached task: the command polls
-    /// the proxy for up to 20 s, and the main thread never waits on it.
+    /// the proxy for up to 49 s (`FAN_SETTLE`), and the main thread never waits on it.
     public nonisolated static let runTcr: Runner = { arguments in
         await Task.detached(priority: .userInitiated) {
             switch TcrTool.resolve() {

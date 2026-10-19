@@ -221,27 +221,6 @@ public enum FanControlReason: Equatable, Sendable, Decodable {
     case controllerStopped
     case unrecognised(String)
 
-    /// The reason's wire name: what `tcr fan` prints, and what the popover
-    /// shows for a reason it has no sentence for.
-    public var word: String {
-        switch self {
-        case .macsFanControl: return "macsFanControl"
-        case .anotherApp: return "anotherApp"
-        case .notSignedForFans: return "notSignedForFans"
-        case .noSmc: return "noSmc"
-        case .noFans: return "noFans"
-        case .helperUnreachable: return "helperUnreachable"
-        case .helperNoReply: return "helperNoReply"
-        case .helperSignature: return "helperSignature"
-        case .helperVersion: return "helperVersion"
-        case .modeLocked: return "modeLocked"
-        case .contended: return "contended"
-        case .helperRefused: return "helperRefused"
-        case .controllerStopped: return "controllerStopped"
-        case .unrecognised(let raw): return raw
-        }
-    }
-
     init(word: String) {
         switch word {
         case "macsFanControl": self = .macsFanControl

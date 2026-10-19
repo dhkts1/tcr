@@ -36,6 +36,7 @@
 //! timing (F1, `docs/design/panel-tabs.md`) — IS on the wire, as [`StatusPayload::sessions`]:
 //! it carries no credential material either, and it is the whole point of the feature.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -321,16 +322,19 @@ pub struct StatusPayload {
     pub fan_control: Option<FanControlField>,
 }
 
-/// [`StatusPayload::fan_control`] as a client read it: the object, or why it
-/// did not parse (a state this build has no name for, from a newer server).
+/// A status field as a client read it: the value, or why it did not parse (a
+/// state this build has no name for, from a newer server). The serving process
+/// only ever writes [`Self::Reading`]; only a client holds [`Self::Unreadable`].
 #[derive(Debug, Clone, PartialEq)]
-pub enum FanControlField {
-    Reading(tcr_status_wire::FanControlRow),
+pub enum Lenient<T> {
+    Reading(T),
+    /// The object did not parse as a `T`; the parser's own words. The caller
+    /// says so where its diagnostics go.
     Unreadable(String),
 }
 
-impl FanControlField {
-    pub const fn reading(&self) -> Option<&tcr_status_wire::FanControlRow> {
+impl<T> Lenient<T> {
+    pub const fn reading(&self) -> Option<&T> {
         match self {
             Self::Reading(row) => Some(row),
             Self::Unreadable(_) => None,
@@ -338,7 +342,9 @@ impl FanControlField {
     }
 }
 
-impl Serialize for FanControlField {
+impl<T: Serialize> Serialize for Lenient<T> {
+    /// The value as itself. An unreadable one writes `null`: there is nothing
+    /// to pass on.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Reading(row) => row.serialize(serializer),
@@ -347,49 +353,9 @@ impl Serialize for FanControlField {
     }
 }
 
-impl<'de> Deserialize<'de> for FanControlField {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        Ok(match serde_json::from_value(value) {
-            Ok(row) => Self::Reading(row),
-            Err(error) => Self::Unreadable(error.to_string()),
-        })
-    }
-}
-
-/// [`StatusPayload::heat`] as a client read it: the reading, or why it did not
-/// parse. The serving process only ever writes [`Self::Reading`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum HeatField {
-    Reading(tcr_status_wire::HeatRow),
-    /// The `heat` object did not parse as a [`tcr_status_wire::HeatRow`]; the
-    /// parser's own words. The caller says so where its diagnostics go.
-    Unreadable(String),
-}
-
-impl HeatField {
-    pub const fn reading(&self) -> Option<&tcr_status_wire::HeatRow> {
-        match self {
-            Self::Reading(row) => Some(row),
-            Self::Unreadable(_) => None,
-        }
-    }
-}
-
-impl Serialize for HeatField {
-    /// The reading as a [`tcr_status_wire::HeatRow`]. An unreadable one, which
-    /// only a client holds, writes `null`: there is no reading to pass on.
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Reading(row) => row.serialize(serializer),
-            Self::Unreadable(_) => serializer.serialize_none(),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for HeatField {
+impl<'de, T: DeserializeOwned> Deserialize<'de> for Lenient<T> {
     /// Never fails on content: any JSON value reads, and one that is not a
-    /// heat object becomes [`Self::Unreadable`].
+    /// `T` becomes [`Self::Unreadable`].
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
         Ok(match serde_json::from_value(value) {
@@ -398,6 +364,11 @@ impl<'de> Deserialize<'de> for HeatField {
         })
     }
 }
+
+/// [`StatusPayload::fan_control`] as a client read it.
+pub type FanControlField = Lenient<tcr_status_wire::FanControlRow>;
+/// [`StatusPayload::heat`] as a client read it.
+pub type HeatField = Lenient<tcr_status_wire::HeatRow>;
 
 /// One row of [`StatusPayload::unkeyed_connects`] or
 /// [`StatusPayload::unkeyed_requests`]. `class` and `user_agent` come from closed
@@ -2905,13 +2876,27 @@ mod tests {
         assert_eq!(payload.heat, None);
     }
 
+    /// A `fanControl` from a server older than the command counter (`sinceMs`, no `command`)
+    /// is unreadable and says which field it lacks: no other field stands in for the count.
+    #[test]
+    fn fan_status_without_the_command_counter_is_unreadable() {
+        let body = r#"{"kind":"tcr.status.v1","accounts":[],
+            "fanControl":{"desired":{"mode":"auto"},"state":"off","reason":null,
+            "hotGuard":false,"targets":[],"detail":null,"sinceMs":1760000000000}}"#;
+        let payload: StatusPayload = serde_json::from_str(body).expect("still a payload");
+        match payload.fan_control {
+            Some(FanControlField::Unreadable(why)) => assert!(why.contains("`command`"), "{why}"),
+            other => panic!("expected an unreadable fanControl, got {other:?}"),
+        }
+    }
+
     /// A `fanControl` with a state this build has no name for (a newer server) costs fan
     /// control and nothing else, and an absent key is no controller, never a default.
     #[test]
     fn fan_status_unreadable_or_absent_does_not_fail_the_payload() {
         let body = r#"{"kind":"tcr.status.v1","accounts":[],"http1_only":true,
             "fanControl":{"desired":{"mode":"auto"},"state":"hibernating","reason":null,
-            "hotGuard":false,"targets":[],"detail":null,"sinceMs":0}}"#;
+            "hotGuard":false,"targets":[],"detail":null,"command":0}}"#;
         let payload: StatusPayload = serde_json::from_str(body).expect("still a payload");
         assert!(payload.http1_only);
         assert!(

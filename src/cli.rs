@@ -3677,41 +3677,62 @@ enum FanWait {
     Waiting,
     /// The controller acted on the command and the state no longer moves.
     Settled,
-    /// The controller acted on a wish that is neither this command's nor the one it replaced:
-    /// another command replaced it.
+    /// The controller acted on this command or a later one, and the wish it shows is not this
+    /// command's: a later command replaced it.
     Replaced,
+    /// The controller's thread stopped (`unavailable / controllerStopped`). It acts on nothing
+    /// again and its command number stays where the panic left it, so waiting for this
+    /// command to be acted on would only run out the whole [`FAN_SETTLE`].
+    Stopped,
 }
 
-/// One command as `tcr fan` sent it: what it asked for, when (wall ms), and the wish the
-/// status showed as it went in (the POST's answer, read under the lock the send holds).
+/// One command as `tcr fan` sent it: what it asked for, and the number the route gave it.
 #[derive(Debug, Clone, Copy)]
 struct FanSent {
     request: crate::fan::FanRequest,
-    sent_at: i64,
-    before: tcr_status_wire::FanDesiredRow,
+    command: u64,
 }
 
 /// One status read against `sent`. The status pairs each state with the wish it was reached
-/// for, and shows a wish only once the controller acted on it (`crate::fan`, "What the status
-/// shows"), so a read that still shows `sent.before` is a controller that has not taken this
-/// command yet, whatever its state or `sinceMs`.
+/// for, under the number of the newest command acted on (`crate::fan`, "What the status
+/// shows"): below this command's number, the controller has not acted on it yet; at or past
+/// it, the wish shown is this command's, or a later command's that replaced it.
 fn fan_wait(sent: &FanSent, row: &tcr_status_wire::FanControlRow) -> FanWait {
+    // First: a stopped controller never acts on this command, so neither its number nor its
+    // wish can move again.
+    if row.state == tcr_status_wire::FanStateRow::Unavailable
+        && row.reason == Some(tcr_status_wire::FanReasonRow::ControllerStopped)
+    {
+        return FanWait::Stopped;
+    }
+    if row.command < sent.command {
+        return FanWait::Waiting;
+    }
     if row.desired != sent.request.desired_row() {
-        return if row.desired == sent.before {
-            FanWait::Waiting
-        } else {
-            FanWait::Replaced
-        };
+        return FanWait::Replaced;
     }
     let moving = matches!(
         row.state,
         tcr_status_wire::FanStateRow::Entering | tcr_status_wire::FanStateRow::Releasing
     );
-    if row.since_ms < sent.sent_at || moving {
+    if moving {
         FanWait::Waiting
     } else {
         FanWait::Settled
     }
+}
+
+/// This command's number from the route's 202, or why there is none: a server older than the
+/// command counter answered with its whole `fanControl` object, and nothing else it says tells
+/// whether it has acted on this command.
+fn accepted_command(accepted: crate::fan::FanAccepted, port: u16) -> anyhow::Result<u64> {
+    accepted.command.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the tcr on 127.0.0.1:{port} took the fan mode but is older than this tcr's fan \
+             command counter, so whether the fans reached it cannot be told; restart that tcr on \
+             this build, then run `tcr fan` to read the state"
+        )
+    })
 }
 
 /// Exit 0 only for the mode this command sent, settled in the state it means.
@@ -3748,9 +3769,11 @@ async fn live_fan(
         .cloned();
     match payload.fan_control {
         Some(crate::status::FanControlField::Reading(row)) => Ok((row, heat)),
-        Some(crate::status::FanControlField::Unreadable(why)) => {
-            bail!("the server's fanControl object did not parse: {why}")
-        }
+        Some(crate::status::FanControlField::Unreadable(why)) => bail!(
+            "the tcr on 127.0.0.1:{} answered with a fanControl object this tcr cannot read \
+             ({why}); a server of another build answers this way, so restart it on this build",
+            config.proxy.port
+        ),
         None => bail!(
             "the tcr on 127.0.0.1:{} runs no fan controller (an older tcr, or one not started as the server)",
             config.proxy.port
@@ -3782,10 +3805,7 @@ pub async fn fan(
         .command()
         .map_err(|e| anyhow::anyhow!("the fan mode was refused: {e}"))?;
 
-    let sent_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-    let answer: Result<tcr_status_wire::FanControlRow, LiveControlError> =
+    let answer: Result<crate::fan::FanAccepted, LiveControlError> =
         call_route(&config, &FAN_ROUTE, |client, url| {
             client.post(url).json(&request)
         })
@@ -3794,8 +3814,7 @@ pub async fn fan(
     let sent = match answer {
         Ok(accepted) => FanSent {
             request,
-            sent_at,
-            before: accepted.desired,
+            command: accepted_command(accepted, config.proxy.port)?,
         },
         Err(LiveControlError::Rejected(message)) => bail!("{message}"),
         Err(LiveControlError::NoRoute) => bail!(
@@ -3827,18 +3846,19 @@ pub async fn fan(
             eprintln!("tcr: another command changed the fan mode before this one settled");
             return Ok(1);
         }
-        FanWait::Waiting if row.desired != request.desired_row() => {
+        FanWait::Waiting if row.command < sent.command => {
             eprintln!(
                 "tcr: the fan controller had not acted on this command after {} s",
                 FAN_SETTLE.as_secs()
             );
             return Ok(1);
         }
-        FanWait::Waiting | FanWait::Settled => {}
+        // A stopped controller says so in the line below: its reason and detail.
+        FanWait::Waiting | FanWait::Settled | FanWait::Stopped => {}
     }
     let reason = row
         .reason
-        .map(|r| format!(" ({})", r.name()))
+        .map(|r| format!(" ({})", fan_word(&r)))
         .unwrap_or_default();
     let detail = row.detail.map(|d| format!(": {d}")).unwrap_or_default();
     eprintln!(
@@ -3849,12 +3869,20 @@ pub async fn fan(
     Ok(1)
 }
 
-/// A wire enum's own JSON spelling, for a line a person reads and a script greps.
+/// A wire enum's own JSON spelling, for a line a person reads and a script greps: a bare
+/// string, or the one key of serde's tagged form (`{"modeLocked": 1}` is `modeLocked`).
 fn fan_word<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| "?".to_string())
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(word)) => word,
+        Ok(serde_json::Value::Object(map)) if map.len() == 1 => {
+            let Some((word, _)) = map.into_iter().next() else {
+                return "?".to_string();
+            };
+            word
+        }
+        // A shape with no word; none of the enums this spells has one.
+        _ => "?".to_string(),
+    }
 }
 
 /// `tcr fan`'s text: the wish, the state and why, then each fan as heat reads it.
@@ -3874,8 +3902,7 @@ fn render_fan_text(
     let mut out = format!(
         "desired={desired}\nstate={}\nreason={}\n",
         fan_word(&row.state),
-        row.reason
-            .map_or_else(|| "-".to_string(), |r| r.name().to_string()),
+        row.reason.map_or_else(|| "-".to_string(), |r| fan_word(&r)),
     );
     if let Some(detail) = &row.detail {
         out.push_str(&format!("detail={detail}\n"));
@@ -8345,7 +8372,8 @@ mod tests {
             hot_guard: false,
             targets: vec![],
             detail: None,
-            since_ms: 0,
+            command: 0,
+            since_ms: None,
         };
         let heat = tcr_status_wire::HeatRow {
             cpu_celsius: Some(61.0),
@@ -8366,11 +8394,42 @@ mod tests {
         );
     }
 
-    /// A status row for the `tcr fan` tests.
+    /// A reason's word is its wire name without its data, for the ones that carry data too:
+    /// what `reason=` and the failure line print.
+    #[test]
+    fn fan_reason_word_is_the_wire_name_without_its_data() {
+        use tcr_status_wire::FanReasonRow;
+        for (reason, word) in [
+            (FanReasonRow::MacsFanControl, "macsFanControl"),
+            (FanReasonRow::AnotherApp, "anotherApp"),
+            (FanReasonRow::NotSignedForFans, "notSignedForFans"),
+            (FanReasonRow::NoSmc, "noSmc"),
+            (FanReasonRow::NoFans, "noFans"),
+            (FanReasonRow::HelperUnreachable, "helperUnreachable"),
+            (FanReasonRow::HelperNoReply, "helperNoReply"),
+            (FanReasonRow::HelperSignature, "helperSignature"),
+            (
+                FanReasonRow::HelperVersion { installed: None },
+                "helperVersion",
+            ),
+            (
+                FanReasonRow::HelperVersion { installed: Some(2) },
+                "helperVersion",
+            ),
+            (FanReasonRow::ModeLocked(1), "modeLocked"),
+            (FanReasonRow::Contended, "contended"),
+            (FanReasonRow::HelperRefused, "helperRefused"),
+            (FanReasonRow::ControllerStopped, "controllerStopped"),
+        ] {
+            assert_eq!(fan_word(&reason), word, "{reason:?}");
+        }
+    }
+
+    /// A status row for the `tcr fan` tests, under `command`, the newest command acted on.
     fn fan_row(
         desired: tcr_status_wire::FanDesiredRow,
         state: tcr_status_wire::FanStateRow,
-        since_ms: i64,
+        command: u64,
     ) -> tcr_status_wire::FanControlRow {
         tcr_status_wire::FanControlRow {
             desired,
@@ -8379,7 +8438,8 @@ mod tests {
             hot_guard: false,
             targets: vec![],
             detail: None,
-            since_ms,
+            command,
+            since_ms: None,
         }
     }
 
@@ -8391,8 +8451,7 @@ mod tests {
         use tcr_status_wire::{FanDesiredRow, FanStateRow};
         let sent = FanSent {
             request: FanRequest::Fixed { rpm: 5000 },
-            sent_at: 1_000,
-            before: FanDesiredRow::Auto,
+            command: 1_000,
         };
         let ours = FanDesiredRow::Fixed { rpm: 5000 };
         let other = FanDesiredRow::Fixed { rpm: 3000 };
@@ -8404,11 +8463,6 @@ mod tests {
         let replaced = fan_row(other, FanStateRow::Holding, 1_200);
         assert_eq!(fan_wait(&sent, &replaced), FanWait::Replaced);
         assert!(!fan_succeeded(&sent, &replaced));
-        // A replacement that asks for the wish from before this command reads as this one not
-        // taken yet: never a success, and the wait ends on its timeout.
-        let auto_again = fan_row(FanDesiredRow::Auto, FanStateRow::Off, 1_200);
-        assert_eq!(fan_wait(&sent, &auto_again), FanWait::Waiting);
-        assert!(!fan_succeeded(&sent, &auto_again));
 
         // Not acted on yet, or still entering: wait.
         let before = fan_row(ours, FanStateRow::Holding, 900);
@@ -8425,17 +8479,115 @@ mod tests {
         // `auto --force` is Auto.
         let forced = FanSent {
             request: FanRequest::Auto { force: true },
-            sent_at: 1_000,
-            before: ours,
+            command: 1_000,
         };
         let off = fan_row(FanDesiredRow::Auto, FanStateRow::Off, 1_200);
         assert!(fan_succeeded(&forced, &off));
     }
 
-    /// `tcr fan auto` with the fans held at 5000. The status keeps the old wish until the
-    /// controller acts, so the snapshot from taking the command, and a state the old wish
-    /// reached after the send (the SMC not reading: unknown, with a fresh `sinceMs`), both wait;
-    /// releasing waits; `off` succeeds. A third wish is Replaced.
+    /// The case the command counter exists for (Gil, 2026-10-19): a later command that asks
+    /// for the very wish from before this one is a replacement, said at once, never a wait for
+    /// this command that runs out at 49 s.
+    #[test]
+    fn fan_cli_a_return_to_the_wish_from_before_is_replaced_at_once() {
+        use crate::fan::FanRequest;
+        use tcr_status_wire::{FanDesiredRow, FanStateRow};
+        let sent = FanSent {
+            request: FanRequest::Fixed { rpm: 5000 },
+            command: 1_000,
+        };
+        // Before: Auto, as acted on under 999. Then `auto` again, number 1_001, acted on.
+        let before = fan_row(FanDesiredRow::Auto, FanStateRow::Off, 999);
+        assert_eq!(fan_wait(&sent, &before), FanWait::Waiting);
+        let auto_again = fan_row(FanDesiredRow::Auto, FanStateRow::Off, 1_001);
+        assert_eq!(fan_wait(&sent, &auto_again), FanWait::Replaced);
+        assert!(!fan_succeeded(&sent, &auto_again));
+    }
+
+    /// Two commands drained in one step are acted on under the later number: the earlier one
+    /// is judged by the wish shown, its own (settled by the state) or the later one's
+    /// (replaced).
+    #[test]
+    fn fan_cli_a_drained_pair_settles_the_earlier_command_by_its_wish() {
+        use crate::fan::FanRequest;
+        use tcr_status_wire::{FanDesiredRow, FanStateRow};
+        let earlier = FanSent {
+            request: FanRequest::Fixed { rpm: 5000 },
+            command: 1_000,
+        };
+        let same = fan_row(
+            FanDesiredRow::Fixed { rpm: 5000 },
+            FanStateRow::Holding,
+            1_001,
+        );
+        assert_eq!(fan_wait(&earlier, &same), FanWait::Settled);
+        assert!(fan_succeeded(&earlier, &same));
+        let other = fan_row(
+            FanDesiredRow::Fixed { rpm: 3000 },
+            FanStateRow::Holding,
+            1_001,
+        );
+        assert_eq!(fan_wait(&earlier, &other), FanWait::Replaced);
+    }
+
+    /// A server restarted after the command went in numbers from its own start, above the
+    /// command's number, so the command reads as acted on; the wish the restart reapplied (the
+    /// one the command saved before the restart) decides.
+    #[test]
+    fn fan_cli_a_restarted_server_settles() {
+        use crate::fan::FanRequest;
+        use tcr_status_wire::{FanDesiredRow, FanStateRow};
+        let sent = FanSent {
+            request: FanRequest::Fixed { rpm: 5000 },
+            command: 1_760_000_000_001,
+        };
+        let restarted = 1_760_000_090_000;
+        let held = fan_row(
+            FanDesiredRow::Fixed { rpm: 5000 },
+            FanStateRow::Holding,
+            restarted,
+        );
+        assert_eq!(fan_wait(&sent, &held), FanWait::Settled);
+        assert!(fan_succeeded(&sent, &held));
+        let reentering = fan_row(
+            FanDesiredRow::Fixed { rpm: 5000 },
+            FanStateRow::Entering,
+            restarted,
+        );
+        assert_eq!(fan_wait(&sent, &reentering), FanWait::Waiting);
+    }
+
+    /// A server older than the counter answers the POST with its whole `fanControl` object and
+    /// writes no `command` in its status. `tcr fan` says so and fails, and reads no other
+    /// field in its place.
+    #[test]
+    fn fan_cli_a_server_without_the_counter_says_so() {
+        let old_answer = r#"{"desired":{"mode":"auto"},"state":"off","reason":null,
+            "hotGuard":false,"targets":[],"detail":null,"sinceMs":1760000000000}"#;
+        let accepted: crate::fan::FanAccepted = serde_json::from_str(old_answer).unwrap();
+        let refused = accepted_command(accepted, 3456).unwrap_err().to_string();
+        assert!(
+            refused.contains("older than this tcr's fan command counter"),
+            "{refused}"
+        );
+        assert!(refused.contains("127.0.0.1:3456"), "{refused}");
+
+        let ours: crate::fan::FanAccepted = serde_json::from_str(r#"{"command":7}"#).unwrap();
+        assert_eq!(accepted_command(ours, 3456).unwrap(), 7);
+        // This build's 202: the whole object from before the command, with its number.
+        let full = r#"{"desired":{"mode":"auto"},"state":"off","reason":null,
+            "hotGuard":false,"targets":[],"detail":null,"command":8,"sinceMs":1760000000000}"#;
+        let ours: crate::fan::FanAccepted = serde_json::from_str(full).unwrap();
+        assert_eq!(accepted_command(ours, 3456).unwrap(), 8);
+
+        // Its status object does not read as one, so nothing is judged from it.
+        assert!(serde_json::from_str::<tcr_status_wire::FanControlRow>(old_answer).is_err());
+    }
+
+    /// `tcr fan auto` with the fans held at 5000. The status keeps the old wish and the old
+    /// number until the controller acts, so the snapshot from taking the command, and a state
+    /// the old wish reached after the send (the SMC not reading: unknown, still under the old
+    /// number), both wait; releasing waits; `off` succeeds. A third wish is Replaced.
     #[test]
     fn fan_cli_auto_from_holding_waits_through_the_release() {
         use crate::fan::FanRequest;
@@ -8443,17 +8595,16 @@ mod tests {
         let held = FanDesiredRow::Fixed { rpm: 5000 };
         let sent = FanSent {
             request: FanRequest::Auto { force: false },
-            sent_at: 1_000,
-            before: held,
+            command: 1_000,
         };
-        let taken = fan_row(held, FanStateRow::Holding, 400);
+        let taken = fan_row(held, FanStateRow::Holding, 999);
         assert_eq!(fan_wait(&sent, &taken), FanWait::Waiting);
         assert!(!fan_succeeded(&sent, &taken));
-        let old_wish_moved = fan_row(held, FanStateRow::Unknown, 1_100);
+        let old_wish_moved = fan_row(held, FanStateRow::Unknown, 999);
         assert_eq!(fan_wait(&sent, &old_wish_moved), FanWait::Waiting);
-        let releasing = fan_row(FanDesiredRow::Auto, FanStateRow::Releasing, 1_180);
+        let releasing = fan_row(FanDesiredRow::Auto, FanStateRow::Releasing, 1_000);
         assert_eq!(fan_wait(&sent, &releasing), FanWait::Waiting);
-        let off = fan_row(FanDesiredRow::Auto, FanStateRow::Off, 1_388);
+        let off = fan_row(FanDesiredRow::Auto, FanStateRow::Off, 1_000);
         assert_eq!(fan_wait(&sent, &off), FanWait::Settled);
         assert!(fan_succeeded(&sent, &off));
 
@@ -8464,6 +8615,46 @@ mod tests {
         );
         assert_eq!(fan_wait(&sent, &replaced), FanWait::Replaced);
         assert!(!fan_succeeded(&sent, &replaced));
+    }
+
+    /// A controller that stopped on a panic keeps the command number it had, below this
+    /// command's, and never acts again: `tcr fan` ends its wait at the first status that says
+    /// so, whatever the wish and number shown, and fails with that reason.
+    #[test]
+    fn fan_cli_a_stopped_controller_ends_the_wait_at_once() {
+        use crate::fan::FanRequest;
+        use tcr_status_wire::{FanDesiredRow, FanReasonRow, FanStateRow};
+        for request in [
+            FanRequest::Fixed { rpm: 5000 },
+            FanRequest::Auto { force: false },
+        ] {
+            let sent = FanSent {
+                request,
+                command: 1_000,
+            };
+            for (desired, command) in [
+                (FanDesiredRow::Auto, 999),
+                (FanDesiredRow::Fixed { rpm: 3000 }, 999),
+                (request.desired_row(), 1_000),
+            ] {
+                let mut stopped = fan_row(desired, FanStateRow::Unavailable, command);
+                stopped.reason = Some(FanReasonRow::ControllerStopped);
+                assert_eq!(
+                    fan_wait(&sent, &stopped),
+                    FanWait::Stopped,
+                    "{request:?} {desired:?} {command}"
+                );
+                assert!(!fan_succeeded(&sent, &stopped));
+            }
+        }
+        // Another reason under an old number is still a wait: the controller may yet act.
+        let sent = FanSent {
+            request: FanRequest::Fixed { rpm: 5000 },
+            command: 1_000,
+        };
+        let mut silent = fan_row(FanDesiredRow::Auto, FanStateRow::Unavailable, 999);
+        silent.reason = Some(FanReasonRow::HelperNoReply);
+        assert_eq!(fan_wait(&sent, &silent), FanWait::Waiting);
     }
 
     /// The wait covers the version call (which waits out launchd starting the helper late),

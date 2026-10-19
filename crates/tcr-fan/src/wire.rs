@@ -359,10 +359,21 @@ pub trait Dict {
 
 /// A dictionary to encode into.
 pub trait DictMut {
-    fn set_u64(&mut self, key: &'static str, value: u64);
-    fn set_f64(&mut self, key: &'static str, value: f64);
-    fn set_bool(&mut self, key: &'static str, value: bool);
-    fn set_str(&mut self, key: &'static str, value: &str);
+    /// Write one entry. [`Value::Other`] has no type to write and is skipped.
+    fn set(&mut self, key: &'static str, value: &Value);
+
+    fn set_u64(&mut self, key: &'static str, value: u64) {
+        self.set(key, &Value::U64(value));
+    }
+    fn set_f64(&mut self, key: &'static str, value: f64) {
+        self.set(key, &Value::F64(value));
+    }
+    fn set_bool(&mut self, key: &'static str, value: bool) {
+        self.set(key, &Value::Bool(value));
+    }
+    fn set_str(&mut self, key: &'static str, value: &str) {
+        self.set(key, &Value::Str(value.to_owned()));
+    }
 }
 
 /// An in-memory dictionary: what the tests decode and what root's logic
@@ -388,15 +399,8 @@ impl MemDict {
     /// and is skipped; nothing in this crate encodes one.
     pub fn copy_into(&self, out: &mut impl DictMut) {
         for (name, value) in &self.0 {
-            let Some(name) = static_key(name) else {
-                continue;
-            };
-            match value {
-                Value::U64(v) => out.set_u64(name, *v),
-                Value::F64(v) => out.set_f64(name, *v),
-                Value::Bool(v) => out.set_bool(name, *v),
-                Value::Str(v) => out.set_str(name, v),
-                Value::Other => {}
+            if let Some(name) = static_key(name) {
+                out.set(name, value);
             }
         }
     }
@@ -433,17 +437,10 @@ impl Dict for MemDict {
 }
 
 impl DictMut for MemDict {
-    fn set_u64(&mut self, key: &'static str, value: u64) {
-        self.insert(key, Value::U64(value));
-    }
-    fn set_f64(&mut self, key: &'static str, value: f64) {
-        self.insert(key, Value::F64(value));
-    }
-    fn set_bool(&mut self, key: &'static str, value: bool) {
-        self.insert(key, Value::Bool(value));
-    }
-    fn set_str(&mut self, key: &'static str, value: &str) {
-        self.insert(key, Value::Str(value.to_owned()));
+    fn set(&mut self, key: &'static str, value: &Value) {
+        if !matches!(value, Value::Other) {
+            self.insert(key, value.clone());
+        }
     }
 }
 
