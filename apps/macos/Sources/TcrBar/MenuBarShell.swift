@@ -95,6 +95,9 @@ final class MenuBarShell {
     /// same reason as `countsPreference`: the mark it steers is composed on
     /// every poll tick, not just while the Settings window is open.
     let cupPoolPreference: MenuBarCupPoolPreference
+    /// The fan popover's model. Owned here so a `tcr fan` command in flight
+    /// outlives a closed panel. It runs nothing until someone clicks.
+    let fans = FanControlModel()
     /// "Panel density" (Settings window, Menu Bar pane). Owned here, same
     /// shape as `defaultTabPreference`, even though `V4.compact` never reads
     /// this instance — the picker binding in `SettingsPanes` needs a live
@@ -226,7 +229,7 @@ final class MenuBarShell {
                 groupController: self.groupController, removeController: self.removeController,
                 codexPresence: self.codexPresence, codexNotes: self.codexNotes,
                 codexBannerSnapshot: self.codexBannerSnapshot,
-                routeController: self.claudeRoute,
+                routeController: self.claudeRoute, fans: self.fans,
                 onWhatsNew: { [weak self] in self?.openWhatsNew() },
                 onSettings: { [weak self] in self?.openSettings() },
                 runOpenPanel: { [weak self] panel in self?.runOpenPanel(panel) },
@@ -826,7 +829,7 @@ final class MenuBarShell {
                 groupController: groupController, removeController: removeController,
                 codexPresence: codexPresence, codexNotes: codexNotes,
                 codexBannerSnapshot: codexBannerSnapshot,
-                routeController: claudeRoute,
+                routeController: claudeRoute, fans: fans,
                 onWhatsNew: { [weak self] in self?.openWhatsNew() },
                 onSettings: { [weak self] in self?.openSettings() },
                 runOpenPanel: { [weak self] panel in self?.runOpenPanel(panel) },
@@ -986,6 +989,7 @@ struct FleetPanel: View {
     @ObservedObject var codexNotes: CodexNoteStore
     @ObservedObject var codexBannerSnapshot: CodexBannerSnapshot
     @ObservedObject var routeController: ClaudeRouteController
+    @ObservedObject var fans: FanControlModel
     var onWhatsNew: () -> Void = {}
     var onSettings: () -> Void = {}
     /// The shell's picker runner, which keeps the panel up while a picker runs.
@@ -1025,7 +1029,8 @@ struct FleetPanel: View {
             onSettings: onSettings,
             runOpenPanel: runOpenPanel,
             onFindingTurnedOn: onFindingTurnedOn,
-            initialTab: initialTab
+            initialTab: initialTab,
+            fans: fans
         )
     }
 }

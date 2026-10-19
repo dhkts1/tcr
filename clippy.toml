@@ -24,6 +24,9 @@ doc-valid-idents = [
     "WireGuard",
     "SipHash",
     "DoS",
+    "AppleSMC",
+    "IOKit",
+    "MacBook",
 ]
 
 # reqwest 0.13 is built with `rustls-no-provider`, and a client built before a rustls crypto

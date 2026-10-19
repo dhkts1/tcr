@@ -290,6 +290,113 @@ pub struct StatusPayload {
         skip_serializing_if = "Option::is_none"
     )]
     pub unkeyed_requests: Option<Vec<UnkeyedCount>>,
+    /// How hot the serving Mac runs and how hard its fans work ([`crate::heat`]).
+    /// `None` where there is no AppleSMC to read (a VM, Linux), and from an OLD
+    /// server that predates the key. `from_snapshot` leaves it `None` and the
+    /// serving process fills it, as with [`Self::mitm`].
+    ///
+    /// Not a secret: a temperature and some fan speeds, so the module's
+    /// no-secret invariant holds. `#[serde(default, skip_serializing_if)]` and,
+    /// per this struct's `build` doc-comment, NOT a [`STATUS_KIND`] bump: an OLD
+    /// client skips the unknown key, and a NEW client reading an OLD server
+    /// reads `None`, which draws the line without heat, the truth.
+    ///
+    /// A [`HeatField`], not a bare row, so a `heat` object this build cannot
+    /// read costs the heat and nothing else: a typed field that failed would
+    /// fail the whole payload, and `tcr status` would fall back to the offline
+    /// snapshot over a temperature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heat: Option<HeatField>,
+    /// What the serving proxy's fan controller is doing ([`crate::fan`]),
+    /// a sibling of [`Self::heat`]. `None` from a process that runs no fan
+    /// control (a library caller, a test) and from a server older than the
+    /// key; not a [`STATUS_KIND`] bump, for the reasons [`Self::heat`] gives.
+    /// A [`FanControlField`], so an object this build cannot read costs fan
+    /// control and nothing else.
+    #[serde(
+        rename = "fanControl",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fan_control: Option<FanControlField>,
+}
+
+/// [`StatusPayload::fan_control`] as a client read it: the object, or why it
+/// did not parse (a state this build has no name for, from a newer server).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FanControlField {
+    Reading(tcr_status_wire::FanControlRow),
+    Unreadable(String),
+}
+
+impl FanControlField {
+    pub const fn reading(&self) -> Option<&tcr_status_wire::FanControlRow> {
+        match self {
+            Self::Reading(row) => Some(row),
+            Self::Unreadable(_) => None,
+        }
+    }
+}
+
+impl Serialize for FanControlField {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Reading(row) => row.serialize(serializer),
+            Self::Unreadable(_) => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FanControlField {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(match serde_json::from_value(value) {
+            Ok(row) => Self::Reading(row),
+            Err(error) => Self::Unreadable(error.to_string()),
+        })
+    }
+}
+
+/// [`StatusPayload::heat`] as a client read it: the reading, or why it did not
+/// parse. The serving process only ever writes [`Self::Reading`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeatField {
+    Reading(tcr_status_wire::HeatRow),
+    /// The `heat` object did not parse as a [`tcr_status_wire::HeatRow`]; the
+    /// parser's own words. The caller says so where its diagnostics go.
+    Unreadable(String),
+}
+
+impl HeatField {
+    pub const fn reading(&self) -> Option<&tcr_status_wire::HeatRow> {
+        match self {
+            Self::Reading(row) => Some(row),
+            Self::Unreadable(_) => None,
+        }
+    }
+}
+
+impl Serialize for HeatField {
+    /// The reading as a [`tcr_status_wire::HeatRow`]. An unreadable one, which
+    /// only a client holds, writes `null`: there is no reading to pass on.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Reading(row) => row.serialize(serializer),
+            Self::Unreadable(_) => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HeatField {
+    /// Never fails on content: any JSON value reads, and one that is not a
+    /// heat object becomes [`Self::Unreadable`].
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(match serde_json::from_value(value) {
+            Ok(row) => Self::Reading(row),
+            Err(error) => Self::Unreadable(error.to_string()),
+        })
+    }
 }
 
 /// One row of [`StatusPayload::unkeyed_connects`] or
@@ -690,6 +797,10 @@ impl StatusPayload {
             request_key_mode: None,
             unkeyed_connects: None,
             unkeyed_requests: None,
+            // The machine's heat is read by the serving process, off its runtime.
+            heat: None,
+            // So is the fan controller, which only the serving process runs.
+            fan_control: None,
         }
     }
 
@@ -2719,6 +2830,103 @@ mod tests {
             let back: StatusPayload = serde_json::from_value(wire).expect("deserialize");
             assert_eq!(back.mitm, Some(reported));
         }
+    }
+
+    /// `heat` carries no key until the serving process reads one, an older
+    /// server's payload reads as `None`, and a reading crosses in camelCase
+    /// and comes back whole.
+    #[test]
+    fn heat_is_absent_until_the_serving_process_reads_it() {
+        let mut payload = StatusPayload::from_snapshot(
+            &snapshot_with_counters(),
+            &[0.85],
+            false,
+            None,
+            Default::default(),
+        );
+        let wire = serde_json::to_string(&payload).expect("serialize");
+        assert!(
+            !wire.contains("\"heat\""),
+            "no key until it is read: {wire}"
+        );
+        let old: StatusPayload =
+            serde_json::from_str(r#"{"kind":"tcr.status.v1","accounts":[]}"#).expect("parse");
+        assert_eq!(old.heat, None, "an older server reports no heat");
+
+        let reading = tcr_status_wire::HeatRow {
+            cpu_celsius: Some(93.25),
+            fans: vec![tcr_status_wire::FanRow {
+                index: 0,
+                actual_rpm: 4976.0,
+                min_rpm: 1350.0,
+                max_rpm: 5777.0,
+                manual: true,
+                target_rpm: None,
+            }],
+            ftst: None,
+        };
+        payload.heat = Some(HeatField::Reading(reading.clone()));
+        let wire = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(
+            wire["heat"],
+            serde_json::json!({
+                "cpuCelsius": 93.25,
+                "fans": [{"index": 0, "actualRpm": 4976.0, "minRpm": 1350.0,
+                          "maxRpm": 5777.0, "manual": true}],
+            }),
+            "{wire}"
+        );
+        let back: StatusPayload = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(back.heat, Some(HeatField::Reading(reading)));
+
+        // A reading with no CPU figure and no fans is still a reading: the SMC
+        // opened and nothing read. It crosses as an empty object, not as absent.
+        payload.heat = Some(HeatField::Reading(tcr_status_wire::HeatRow::default()));
+        let wire = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(wire["heat"], serde_json::json!({"fans": []}));
+    }
+
+    /// A `heat` this build cannot read costs the heat and nothing else: the
+    /// payload still parses, every other field intact, and the parser's words
+    /// are kept for the caller to report. `null` is no reading, as absent is.
+    #[test]
+    fn an_unreadable_heat_does_not_fail_the_payload() {
+        let body = r#"{"kind":"tcr.status.v1","accounts":[],"http1_only":true,
+            "heat":{"cpuCelsius":"hot","fans":[]}}"#;
+        let payload: StatusPayload = serde_json::from_str(body).expect("still a payload");
+        assert!(payload.http1_only);
+        match payload.heat {
+            Some(HeatField::Unreadable(why)) => assert!(why.contains("invalid type"), "{why}"),
+            other => panic!("expected an unreadable heat, got {other:?}"),
+        }
+        let payload: StatusPayload =
+            serde_json::from_str(r#"{"kind":"tcr.status.v1","accounts":[],"heat":null}"#)
+                .expect("parse");
+        assert_eq!(payload.heat, None);
+    }
+
+    /// A `fanControl` with a state this build has no name for (a newer server) costs fan
+    /// control and nothing else, and an absent key is no controller, never a default.
+    #[test]
+    fn fan_status_unreadable_or_absent_does_not_fail_the_payload() {
+        let body = r#"{"kind":"tcr.status.v1","accounts":[],"http1_only":true,
+            "fanControl":{"desired":{"mode":"auto"},"state":"hibernating","reason":null,
+            "hotGuard":false,"targets":[],"detail":null,"sinceMs":0}}"#;
+        let payload: StatusPayload = serde_json::from_str(body).expect("still a payload");
+        assert!(payload.http1_only);
+        assert!(
+            matches!(payload.fan_control, Some(FanControlField::Unreadable(_))),
+            "{:?}",
+            payload.fan_control
+        );
+        let payload: StatusPayload =
+            serde_json::from_str(r#"{"kind":"tcr.status.v1","accounts":[]}"#).expect("parse");
+        assert_eq!(payload.fan_control, None);
+        assert!(
+            !serde_json::to_string(&payload)
+                .unwrap()
+                .contains("fanControl")
+        );
     }
 
     /// Every Codex fact a server knows, the facts its snapshot groups under `codex`,

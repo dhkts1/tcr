@@ -29,7 +29,7 @@ docker run --rm \
   -v "tcr-linux-rustup-$toolchain":/usr/local/rustup \
   -e CARGO_TARGET_DIR=/target \
   -w /src "rust:$toolchain" \
-  cargo clippy --all-targets --locked --keep-going --message-format=short -- -D warnings \
+  cargo clippy --workspace --all-targets --locked --keep-going --message-format=short -- -D warnings \
   > "$log" 2>&1 || status=$?
 
 hits=$(grep -E '^(src|tests|crates|examples|build)[^:]*:[0-9]+:[0-9]+: (error|warning)' "$log" | sort -u || true)

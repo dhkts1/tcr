@@ -388,6 +388,167 @@ pub struct SessionsSummary {
     pub cost_usd: f64,
 }
 
+/// How hot the serving Mac's CPU runs and how hard its fans work, read by the proxy through
+/// AppleSMC (the `tcr-smc` crate). Machine-wide, not per account, so it rides the status
+/// payload's top level and `tcr sessions --json`'s object, never an account row.
+///
+/// Every field defaults, for the same skew reason as [`SessionsSummary`]: a later field must
+/// not fail an older client's parse.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeatRow {
+    /// The hottest CPU sensor in °C, always between 0.5 and 150. Absent when no CPU sensor
+    /// read this time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_celsius: Option<f64>,
+    /// One per fan whose speed read. Empty on a Mac with no fans.
+    #[serde(default)]
+    pub fans: Vec<FanRow>,
+    /// The SMC's `Ftst` unlock flag: `true` while a fan writer holds it raised. Absent on a
+    /// Mac without it, when it did not read, and from a server older than fan control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ftst: Option<bool>,
+}
+
+/// One fan of [`HeatRow::fans`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanRow {
+    /// 0-based, the `n` in the SMC's `F{n}Ac`.
+    #[serde(default)]
+    pub index: u8,
+    #[serde(default)]
+    pub actual_rpm: f64,
+    /// 0 when it did not read.
+    #[serde(default)]
+    pub min_rpm: f64,
+    /// 0 when it did not read: "no maximum", not a ceiling of 0.
+    #[serde(default)]
+    pub max_rpm: f64,
+    /// The fan's mode key says a program fixed its speed, so it no longer follows the heat.
+    #[serde(default)]
+    pub manual: bool,
+    /// `F{n}Tg`, the speed the fan is told to hold. Absent when it did not read, and from a
+    /// server older than fan control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_rpm: Option<f64>,
+}
+
+/// What the serving proxy's fan controller is doing: the `fanControl` object, a sibling of
+/// [`HeatRow`] on the status payload's top level and on `tcr sessions --json`'s object.
+///
+/// The contract with TcrBar's popover. `state` and `reason` are closed enums here; the
+/// committed fixture `tests/fixtures/fan-control-contract.json` carries one sample per state
+/// TcrBar draws, and both sides read it. `reason` and `detail` are always present, `null`
+/// when there is none.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanControlRow {
+    /// The mode asked for, as the route and `tcr fan` took it.
+    pub desired: FanDesiredRow,
+    pub state: FanStateRow,
+    /// Why, for `foreign` and `unavailable`; `null` otherwise.
+    pub reason: Option<FanReasonRow>,
+    /// The hot guard holds every fan at full speed.
+    pub hot_guard: bool,
+    /// The target last written to each fan this process holds; empty when it holds none.
+    pub targets: Vec<FanTargetRow>,
+    /// A sentence for a person, or `null`.
+    pub detail: Option<String>,
+    /// Milliseconds since the Unix epoch when the state last changed, or the controller last
+    /// acted on a command (taking one does not move it). `tcr fan` waits for a value at or after
+    /// the moment it sent its command.
+    pub since_ms: i64,
+}
+
+/// [`FanControlRow::desired`]: one mode, tagged by `mode`. Whole rpm and whole °C.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "mode",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum FanDesiredRow {
+    Auto,
+    Fixed { rpm: u32 },
+    FollowCpu { quiet_below_c: u8, full_at_c: u8 },
+}
+
+/// [`FanControlRow::state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FanStateRow {
+    /// Automatic is wanted and nothing is held.
+    Off,
+    Entering,
+    Holding,
+    Releasing,
+    /// Another program has the fans; `reason` says which.
+    Foreign,
+    /// A read failed; nothing is written until one succeeds.
+    Unknown,
+    /// No manual mode can be held; `reason` says why.
+    Unavailable,
+    /// A hand-back failed; the helper hands back on its own after the connection closed.
+    Stuck,
+}
+
+/// [`FanControlRow::reason`]. A plain reason is a string (`"macsFanControl"`); one that carries
+/// data is a one-key object: `{"modeLocked": 1}` (the fan), `{"helperVersion": {"installed":
+/// 2}}` (the helper's protocol; `{}` when its reply was not the contract's shape at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FanReasonRow {
+    MacsFanControl,
+    AnotherApp,
+    NotSignedForFans,
+    NoSmc,
+    NoFans,
+    HelperUnreachable,
+    HelperNoReply,
+    HelperSignature,
+    HelperVersion {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        installed: Option<u64>,
+    },
+    /// The fan that would not leave automatic.
+    ModeLocked(u64),
+    Contended,
+    HelperRefused,
+    /// The proxy's fan controller stopped on an internal error; a restart starts it again.
+    ControllerStopped,
+}
+
+impl FanReasonRow {
+    /// The reason's name, without its data: what a person or a script reads.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MacsFanControl => "macsFanControl",
+            Self::AnotherApp => "anotherApp",
+            Self::NotSignedForFans => "notSignedForFans",
+            Self::NoSmc => "noSmc",
+            Self::NoFans => "noFans",
+            Self::HelperUnreachable => "helperUnreachable",
+            Self::HelperNoReply => "helperNoReply",
+            Self::HelperSignature => "helperSignature",
+            Self::HelperVersion { .. } => "helperVersion",
+            Self::ModeLocked(_) => "modeLocked",
+            Self::Contended => "contended",
+            Self::HelperRefused => "helperRefused",
+            Self::ControllerStopped => "controllerStopped",
+        }
+    }
+}
+
+/// One entry of [`FanControlRow::targets`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FanTargetRow {
+    /// 0-based, as [`FanRow::index`].
+    pub fan: u8,
+    /// What the helper wrote, after its clamp.
+    pub rpm: f64,
+}
+
 /// One live session on the `tcr status --json` wire's `sessions` array (F1,
 /// `docs/design/panel-tabs.md`). One entry per session the proxy has seen in the last hour —
 /// see `src/session_wire.rs` in the main crate for how it is built and bounded.

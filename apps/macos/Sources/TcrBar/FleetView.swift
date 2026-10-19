@@ -34,6 +34,9 @@ struct FleetView: View {
     /// decided by the shell before the panel opens, never by this view. See
     /// ``ClaudeRouteController``.
     @ObservedObject var routeController: ClaudeRouteController
+    /// The fan popover behind the heat clause. Owned by the shell so a command
+    /// in flight outlives a closed panel; fed each poll's `fanControl` here.
+    @ObservedObject var fans: FanControlModel
     /// Owned by the app so it survives the panel closing; bound here so the
     /// checkbox and the launch path can never disagree about its value.
     @Binding var startServerAtLaunch: Bool
@@ -245,6 +248,8 @@ struct FleetView: View {
     /// ``MachineStats/read()`` walks the process table.
     @State private var machine: MachineStats?
     @State private var machineReading = false
+    /// Whether the fan popover shows. The model is ``fans``.
+    @State private var showFanPopover = false
 
     /// What each RUNNING Bash call's process tree is costing, keyed by
     /// ``SessionToolEntry/id`` — the row's `640% · 2.1G`, and the pid
@@ -400,7 +405,10 @@ struct FleetView: View {
         // reads ``keptOpenCardsKey``; the render harness passes its own set
         // for every scene, so an operator's real choice never leaks into a
         // render.
-        initialKeptOpen: KeptOpenCards? = nil
+        initialKeptOpen: KeptOpenCards? = nil,
+        // The fans, owned by the shell. `nil` (the render harness) is a pinned
+        // model that runs nothing and reads no registration.
+        fans: FanControlModel? = nil
     ) {
         self.poller = poller
         self.server = server
@@ -412,6 +420,7 @@ struct FleetView: View {
         self.groupController = groupController
         self.removeController = removeController
         self.routeController = routeController
+        self.fans = fans ?? .pinned(fanControl: nil, heat: nil, registration: .notRegistered)
         self._startServerAtLaunch = startServerAtLaunch
         self.codexBannerSnapshot = codexBannerSnapshot ?? CodexBannerSnapshot()
         self.codexPresence = codexPresence
@@ -2634,15 +2643,23 @@ struct FleetView: View {
     /// the proxy lists (``CodexRolloutJoin``, which looks each one up once).
     /// A Claude file wins an id clash. Read on appear and on each poll, never
     /// in `snapshotMode`, like the Claude files alone were.
-    /// ``MachineStats/read()`` on a background task, assigned back here on
-    /// the main actor: the process walk and the SMC reads are kernel calls,
-    /// and a poll that waits on them freezes the panel for that long. A poll
-    /// that lands while the last read is still out skips rather than queues.
+    /// ``MachineStats/read(heat:)`` on a background task, assigned back here
+    /// on the main actor: the process walk is kernel calls, and a poll that
+    /// waits on them freezes the panel for that long. A poll that lands while
+    /// the last read is still out skips rather than queues. The heat is the
+    /// proxy's, from the latest poll (``Fleet/heat``): the app reads no SMC.
+    /// The fan popover's model takes the same poll's facts first, every poll,
+    /// skipped or not.
     private func refreshMachine() {
+        let heat = poller.state.loadedFleet?.heat
+        let fanControl = poller.state.loadedFleet?.fanControl
+        fans.update(fanControl: fanControl, heat: heat)
         guard !machineReading else { return }
         machineReading = true
         Task {
-            let reading = await Task.detached(priority: .utility) { MachineStats.read() }.value
+            let reading = await Task.detached(priority: .utility) {
+                MachineStats.read(heat: heat, fanControl: fanControl)
+            }.value
             machineReading = false
             machine = reading
         }
@@ -3025,9 +3042,11 @@ struct FleetView: View {
                 summaryPhrase(machine.loadClause).foregroundColor(machineLoadTint(machine.loadTint)))
             // Heat right after load, because both describe the box, and never
             // tinted: load stays the line's only coloured clause. The CPU and
-            // the fans are two phrases, so a wrap can fall between them.
+            // the fans are two phrases, so a wrap can fall between them. Each
+            // is a LINK inside the one wrapping Text, so it opens the fan
+            // popover without splitting the line into views that wrap apart.
             for phrase in machine.heatPhrases {
-                numbers.append(summaryPhrase(phrase))
+                numbers.append(heatLink(phrase))
             }
             numbers.append(summaryPhrase(machine.restClause))
         }
@@ -3074,9 +3093,37 @@ struct FleetView: View {
                 numbersLine
                     .lineLimit(Self.toolsNumbersReservedLines)
                     .fixedSize(horizontal: false, vertical: true)
+                    // A link's colour is the tint, not the run's own: the
+                    // clause stays the line's grey, never an accent blue.
+                    .tint(Tok.mute)
             }
             .help(machine?.heatDetail ?? "")
+            .environment(
+                \.openURL,
+                OpenURLAction { url in
+                    guard url == FanPopover.linkURL else { return .systemAction }
+                    fans.popoverOpened()
+                    showFanPopover = true
+                    return .handled
+                }
+            )
+            // Anchored to the line; a popover is a window of its own, so it
+            // covers the panel and moves nothing in it.
+            .popover(isPresented: $showFanPopover, arrowEdge: .bottom) {
+                FanPopover(fans: fans)
+            }
         }
+    }
+
+    /// One heat phrase as a link to the fan popover: unbreakable like every
+    /// other phrase (``summaryPhrase(_:)``), the line's own grey with a dotted
+    /// underline, the mockup's `.open` style, so it reads as something to
+    /// click without becoming a second coloured clause.
+    private func heatLink(_ phrase: String) -> Text {
+        var link = AttributedString(QuotaFormat.unbreakable(phrase))
+        link.link = FanPopover.linkURL
+        link.underlineStyle = Text.LineStyle(pattern: .dot)
+        return Text(link)
     }
 
     /// How many lines the Tools numbers line keeps, filled or not. THREE, not

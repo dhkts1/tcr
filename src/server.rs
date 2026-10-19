@@ -586,6 +586,19 @@ impl ServerHandle {
         crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
         let deadline = tokio::time::Instant::now() + grace;
 
+        // Fans first, while the process is still whole: the controller hands
+        // back what it holds within `fan::SHUTDOWN_HAND_BACK` (3 s, inside
+        // this grace). It blocks, so it waits on the blocking pool; if it runs
+        // over, the helper connection closes with the process and root hands
+        // back on its own.
+        if let Some(fan) = self.manager.fan() {
+            let fan = Arc::clone(fan);
+            let stop = tokio::task::spawn_blocking(move || fan.shutdown(grace));
+            if tokio::time::timeout_at(deadline, stop).await.is_err() {
+                tracing::warn!("fan control did not stop inside the shutdown grace");
+            }
+        }
+
         self.stop_tasks(deadline).await;
 
         // Withdraw the port claim once the accept loop is done, so the next `tcr`

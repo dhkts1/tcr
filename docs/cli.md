@@ -1866,6 +1866,45 @@ A server that has the key always sends it, MITM off included, and a server built
 it out. That difference is how `tcr run --codex` tells an older proxy from one running without
 MITM.
 
+### The `heat` object on `GET /_tcr/status`
+
+How hot the serving Mac's CPU runs and how hard its fans work, read by the proxy through AppleSMC
+without root (`crates/tcr-smc`). It is on the raw `/_tcr/status` document and on `tcr sessions
+--json`'s object (see [`tcr sessions`](#tcr-sessions)), never in `tcr status --json`'s array: it
+describes the machine, not an account.
+
+```
+"heat": {
+  "cpuCelsius": 61.3,
+  "fans": [
+    {"index": 0, "actualRpm": 2401.5, "minRpm": 1350.0, "maxRpm": 5777.0, "manual": false, "targetRpm": 0.0},
+    {"index": 1, "actualRpm": 2398.0, "minRpm": 1350.0, "maxRpm": 5777.0, "manual": false, "targetRpm": 0.0}
+  ],
+  "ftst": false
+}
+```
+
+- `cpuCelsius` is the hottest CPU sensor: `TCMz` where the Mac has it, otherwise the hottest `Tp*`
+  sensor. Readings outside 0.5 to 150 °C are dropped as sensors that are not fitted or not powered.
+  The key is absent when no CPU sensor read.
+- `fans` has one entry per fan whose speed read, and is empty on a Mac with no fans. `index` is
+  0-based, the `n` in the SMC's `F{n}Ac`. `minRpm` or `maxRpm` is 0 when it did not read. `manual`
+  says the fan's mode key reads "forced": a program fixed the speed, so it no longer follows the
+  heat. A mode key that did not read is `false` here; fan control itself treats it as unknown
+  and writes nothing. `targetRpm` is `F{n}Tg`, the speed the fan is told to hold, absent when it
+  did not read.
+- `ftst` is the SMC's `Ftst` unlock flag, `true` while a fan writer holds it raised. Absent on a
+  Mac without it.
+- An SMC that opened and read nothing gives `{"fans": []}`. One that refused to open gives the
+  same, and the proxy tries to open it again a minute later.
+
+The whole key is absent where there is no AppleSMC (a virtual machine, Linux), and from a server
+built before it. One reading answers for 2 seconds, so a burst of status requests costs one SMC
+read. A request never queues behind a read that is still running: it waits at most 500 ms, and
+otherwise answers with the last reading, or with no key when there has never been one. A client
+that cannot parse the object (one built for a later shape, say) leaves the heat out and keeps the
+rest of the payload. `tcr sessions` says so on stderr.
+
 ### The request key on `GET /_tcr/status`
 
 Also on the raw `/_tcr/status` document only, like `mitm`: whether the serving process holds a
@@ -2247,6 +2286,12 @@ rows, and the panel has a different sentence for each, so the two must stay dist
 rows themselves are the same `SessionRow` shape `tcr status --json`'s payload documents above,
 verbatim.
 
+The object also carries the server's [`heat`](#the-heat-object-on-get-_tcrstatus) reading when
+there is one, under a `heat` key. The key is absent when the server read none. TcrBar's machine
+line on the Tools tab reads its CPU and fan figures from here, because the app reads no SMC
+itself. Beside it, a `fanControl` key carries the server's fan controller
+([`tcr fan`](#tcr-fan)), absent from a server that runs none.
+
 ```
 $ tcr sessions
 supported=true sessions=2
@@ -2504,6 +2549,142 @@ your checkout is; when the bundle id is not registered it says TcrBar is not ins
 names the install script, rather than surfacing LaunchServices' exit code. On non-macOS
 builds the subcommand still exists so `--help` is identical everywhere, and fails with that
 reason.
+
+---
+
+## `tcr fan`
+
+```
+tcr fan [--json]
+tcr fan auto [--force]
+tcr fan fixed <RPM>
+tcr fan follow <QUIET_C> <FULL_C>
+```
+
+Fan control through the running server. The server holds the one connection to the root fan
+helper and runs the controller on its own thread; this command asks it through
+`POST /_tcr/fan` and reads the result from `GET /_tcr/status`. It needs the `tcr` bundled in
+TcrBar.app (signed for fans) running as the server, and the helper registered and approved
+([below](#tcr-fan-probe---label-label-hidden)). Fans go back to automatic when the server stops,
+crashes or updates.
+
+- `auto` hands the fans back to macOS. `--force` hands back even when this server holds no record
+  of having set them: the recovery for fans left manual by a run nobody remembers. Neither writes
+  while Macs Fan Control runs; Auto then waits ("fans go back to automatic when Macs Fan Control
+  quits").
+- `fixed <RPM>` holds every fan at exactly that speed, 1 to 20000, clamped by the helper to each
+  fan's own range, however hot the CPU runs, as Macs Fan Control does.
+- `follow <QUIET_C> <FULL_C>` runs each fan at its minimum at or below `QUIET_C` and at full speed
+  from `FULL_C`, a straight line between. Whole degrees; `QUIET_C` at least 20, `FULL_C` at least
+  `QUIET_C + 5` and at most 100.
+- In `follow` a hot guard runs the fans at full speed from 100 °C until the CPU is below 90 °C
+  (starting values, not yet measured). `fixed` has no hot guard, and `hotGuard` is always `false`
+  in it.
+
+A mode command is never optimistic: it sends the mode, then reads the status until the state
+leaves `entering` and `releasing` (at most 49 s: the version call at its 15 s worst, which waits
+out launchd starting the helper up to 10 s late, two set-manuals at their 15 s worst, and two
+set-targets), and exits 0 only when the wish is still the mode it sent and
+the state is `holding` for `fixed` and `follow`, or `off` for `auto`. Otherwise it prints the
+state and exits 1 with the reason, for example
+`tcr: the fans are foreign (macsFanControl), not holding`; a mode another command set in the
+meantime is `tcr: another command changed the fan mode before this one settled`, and a
+controller that never acted on the mode in that time is
+`tcr: the fan controller had not acted on this command after 49 s`.
+
+With no action it prints the wish, the state and the reason, then each fan as the server reads it
+(`actual`, `min`, `max`, the mode key, `F{n}Tg` as `target`, and what this server last `written`),
+and `ftst`. `--json` prints the `fanControl` object below.
+
+### What the controller does
+
+Whose the fans are is judged on every 3 s tick, never remembered: a fan is this server's only
+while its `F{n}Tg` still reads the target it wrote (within 1 rpm). If Macs Fan Control runs, or
+another program moved a target, the state is `foreign` and nothing is written; a read that fails
+is `unknown` and nothing is written, and so is a reading that lost a fan the server holds (when
+the fan count does not read, no fan does). When every fan reads automatic again (a wake from
+sleep, or someone handed back), or one held fan does while the rest keep their targets, the
+controller takes them again; more than 3 such re-entries in 10 minutes is
+`unavailable / contended`. An entry that stops partway (Macs Fan Control starts, its probe fails,
+a call fails, or Auto or a stop arrives) hands back any fan it already set manual before it
+reports why. Follow CPU writes a new target only when it moved at least 5 % of
+the fan's range, reached an end, or the hot guard flipped.
+
+The wish and the hold record live in `~/.cache/tcr/fan.json`, never in the config file. A
+graceful stop hands back within 3 s; the next start re-applies the wish. A missing or unreadable
+file means Auto.
+
+### The `fanControl` object
+
+```
+"fanControl": {
+  "desired": {"mode": "fixed", "rpm": 5000},
+  "state": "holding",
+  "reason": null,
+  "hotGuard": false,
+  "targets": [{"fan": 0, "rpm": 5000.0}, {"fan": 1, "rpm": 5000.0}],
+  "detail": null,
+  "sinceMs": 1760000000000
+}
+```
+
+- `desired`: `{"mode": "auto"}`, `{"mode": "fixed", "rpm": 5000}` or
+  `{"mode": "followCpu", "quietBelowC": 60, "fullAtC": 90}`.
+- `state`: `off`, `entering`, `holding`, `releasing`, `foreign`, `unknown`, `unavailable`, `stuck`.
+- `reason`, for `foreign` and `unavailable`, `null` otherwise: `macsFanControl`, `anotherApp`,
+  `notSignedForFans`, `noSmc`, `noFans`, `helperUnreachable` (not registered, not approved, or not
+  answering; retried after 5, 10, 20, 40, then every 60 s, stopping after three failed tries in a
+  row until the next command), `helperNoReply`, `helperSignature` (never retried on its own),
+  `{"helperVersion": {"installed": 2}}`, `{"modeLocked": 1}` (that fan would not leave
+  automatic), `contended`, `helperRefused`, `controllerStopped` (the controller's thread stopped on
+  an internal error; a restart starts it again). A reason that carries data is a one-key object.
+- `targets`: what this server last wrote to each fan it holds.
+- `detail`: a sentence for a person, or `null`.
+- `sinceMs`: when the state last changed, or the controller last acted on a command.
+
+`desired` and `sinceMs` move together, when the controller acts: a mode just sent does not show
+until the controller has acted on it, so every object pairs a state with the wish it was reached
+for. `tcr fan` waits while the object still shows the wish from before its command, and for a
+`sinceMs` at or after the moment it sent.
+
+The committed samples are `tests/fixtures/fan-control-contract.json`; TcrBar's popover decodes
+the same file.
+
+### `POST /_tcr/fan`
+
+Gated like `/_tcr/config` (loopback, the proxy key when one is set, a loopback host, not
+cross-site, `application/json`). The body is exactly one of `{"mode": "auto"}`,
+`{"mode": "auto", "force": true}`, `{"mode": "fixed", "rpm": 5000}`,
+`{"mode": "followCpu", "quietBelowC": 60, "fullAtC": 90}`; any other key or value is a 400 in one
+sentence. Accepted is 202 with the `fanControl` object as it stood when the command went in, before the
+controller acted on it (`tcr fan` keeps its `desired` to tell "not taken yet" from "replaced"); a server running no fan controller
+answers 503. `GET` is 405. Any local caller that passes that gate can ask for a fan mode, which
+is the same class of caller that can already save a setting or add an account; what it gets is a
+validated mode, clamped by the helper, with the hot guard on in Follow CPU.
+
+## `tcr fan probe [--label <label>]` (hidden)
+
+A diagnostic for the root fan helper. It sends the helper its version op straight from this CLI process and prints the reply
+(`helper answered: protocol 1, build <sha>`) or the XPC error, and exits non-zero on anything
+but a protocol-1 reply. It writes no fan.
+
+Which helper it dials comes from this binary's own signature: the `tcr` bundled in TcrBar.app
+(signed `io.github.dhkts1.tcr`, or `.dev` in any build but a shipping Developer ID one, the same
+rule that names the helper) dials the matching helper, and any
+other `tcr` refuses to dial and says so. `--label` names the helper to dial instead
+(`io.github.dhkts1.tcrbar.fanhelper` or its `.dev` twin), so an unsigned build can be pointed
+at a real helper to watch the helper refuse it: the helper's own signing requirement still
+decides.
+
+The helper is registered with `TcrBar --fan-helper register` and approved in System Settings ▸
+General ▸ Login Items; `TcrBar --fan-helper status` reads the registration back.
+
+**The recovery limit.** When the connection holding the fans goes away, the helper hands them
+back to macOS if they still carry the targets it wrote, retrying for about a minute (the first
+attempt at once, then six more after waits of 1, 2, 4, 8, 16 and 32 s) and logging each failure
+at `LOG_CRIT`. If every attempt fails the fans stay manual at the last target until the next
+proxy start, `tcr fan auto --force`, or a reboot. Whether a reboot resets fan
+modes on Apple Silicon has not been measured yet.
 
 ---
 
