@@ -1067,30 +1067,122 @@ fn auto_never_retries_anything() {
     assert_eq!(rig.opens(), opens);
 }
 
-/// A refused requirement is remembered: no automatic retry, so the
-/// connection the XPC layer leaks on that path is leaked once per command.
-#[test]
-fn a_signature_refusal_is_never_retried_on_its_own() {
-    let mut rig = rig();
+/// A rig whose helper refuses the signature check while `old` is set: the
+/// replaced app's helper, still up for its idle grace after an update.
+fn refused_signature(old: &Arc<std::sync::atomic::AtomicBool>, fault: Fault) -> Rig {
+    let rig = rig();
+    let old = Arc::clone(old);
     rig.answer(
-        |request| *request == Request::Version,
-        Err(Fault::Requirement),
+        move |request| {
+            *request == Request::Version && old.load(std::sync::atomic::Ordering::SeqCst)
+        },
+        Err(fault),
     );
+    rig
+}
+
+/// The update race (2026-10-19, 1.2.12 to 1.2.13): the new proxy reached the
+/// old helper, which failed the signature check, and nothing tried again.
+/// Now one try goes out on its own, after the old helper's idle grace and
+/// launchd's restart spacing, and takes the fans with no command sent.
+#[test]
+fn a_signature_refusal_is_retried_once_after_the_old_helper_is_gone() {
+    assert!(
+        SIGNATURE_RETRY_AFTER > crate::root::IDLE_EXIT_GRACE + Duration::from_secs(10),
+        "past the idle grace plus launchd's 10 s spacing"
+    );
+    for fault in [Fault::PeerCodeSigningRequirement, Fault::Requirement] {
+        let old = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut rig = refused_signature(&old, fault);
+        rig.send(Command::Set(fixed(3000)));
+        assert_eq!(
+            rig.c.state(),
+            State::Unavailable(Unavailable::HelperSignature)
+        );
+        assert_eq!(rig.opens(), 1);
+        // A sleep does not bring it forward: the old helper's grace stood
+        // still through it too.
+        rig.slept_for(Duration::from_secs(3_600));
+        rig.c.pump();
+        rig.clock.advance(
+            SIGNATURE_RETRY_AFTER
+                .checked_sub(TICK + Duration::from_secs(1))
+                .unwrap(),
+        );
+        rig.c.pump();
+        assert_eq!(rig.opens(), 1, "not before {SIGNATURE_RETRY_AFTER:?}");
+        // The old helper exited; launchd starts the new one.
+        old.store(false, std::sync::atomic::Ordering::SeqCst);
+        rig.clock.advance(Duration::from_secs(1));
+        rig.c.pump();
+        assert_eq!(rig.opens(), 2, "{fault:?}: tried once on its own");
+        assert_eq!(rig.c.state(), State::Holding, "{fault:?}");
+    }
+}
+
+/// A second refusal is a helper this build really does not trust: no more
+/// tries until the next command, asleep or awake, so the connection the XPC
+/// layer leaks on a refused requirement is leaked at most twice per command.
+#[test]
+fn a_second_signature_refusal_stops_for_good() {
+    let old = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut rig = refused_signature(&old, Fault::Requirement);
     rig.send(Command::Set(fixed(3000)));
+    rig.clock.advance(SIGNATURE_RETRY_AFTER);
+    rig.c.pump();
+    assert_eq!(rig.opens(), 2);
     assert_eq!(
         rig.c.state(),
         State::Unavailable(Unavailable::HelperSignature)
     );
-    let opens = rig.world.lock().opened.len();
     assert_eq!(rig.c.wait(), None, "nothing scheduled");
     for _ in 0..20 {
-        rig.clock.advance(Duration::from_secs(60));
+        rig.clock.advance(RETRY_EVERY);
         rig.c.pump();
-        // Nor after a sleep.
         rig.slept_for(Duration::from_secs(3_600));
         rig.c.pump();
     }
-    assert_eq!(rig.world.lock().opened.len(), opens);
+    assert_eq!(rig.opens(), 2);
+}
+
+/// A command starts it over: one try now, one more on its own, then stop.
+#[test]
+fn a_command_after_the_signature_stop_retries_again() {
+    let old = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut rig = refused_signature(&old, Fault::Requirement);
+    rig.send(Command::Set(fixed(3000)));
+    rig.clock.advance(SIGNATURE_RETRY_AFTER);
+    rig.c.pump();
+    assert_eq!(rig.opens(), 2);
+    rig.send(Command::Set(fixed(3000)));
+    assert_eq!(rig.opens(), 3, "the command tries at once");
+    rig.clock.advance(SIGNATURE_RETRY_AFTER);
+    rig.c.pump();
+    assert_eq!(rig.opens(), 4, "and once more on its own");
+    rig.clock.advance(SIGNATURE_RETRY_AFTER * 10);
+    rig.c.pump();
+    assert_eq!(rig.opens(), 4);
+    // The helper is the right one now: the next command takes the fans.
+    old.store(false, std::sync::atomic::Ordering::SeqCst);
+    rig.send(Command::Set(fixed(3000)));
+    assert_eq!(rig.c.state(), State::Holding);
+}
+
+/// Auto after a signature refusal retries nothing: the scheduled try goes.
+#[test]
+fn auto_never_retries_a_signature_refusal() {
+    let old = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut rig = refused_signature(&old, Fault::PeerCodeSigningRequirement);
+    rig.send(Command::Set(fixed(3000)));
+    assert_eq!(rig.opens(), 1);
+    rig.send(Command::Set(FanDesired::Auto));
+    assert_eq!(rig.c.state(), State::Off);
+    assert_eq!(rig.c.wait(), None);
+    for _ in 0..10 {
+        rig.clock.advance(SIGNATURE_RETRY_AFTER);
+        rig.c.pump();
+    }
+    assert_eq!(rig.opens(), 1);
 }
 
 // M1 and M2: connection events.
