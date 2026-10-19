@@ -822,7 +822,7 @@ mod tests {
     use super::*;
     use tcr_fan::controller::Detail;
 
-    /// Real controller and FileStore; only the hardware/helper are fake.
+    /// Real controller and `FileStore`; only the hardware/helper are fake.
     #[derive(Clone)]
     struct HandoffMachine(Arc<Mutex<tcr_smc::HeatReading>>);
 
