@@ -65,7 +65,9 @@ pub const RELEASE_TRIES: usize = 3;
 pub const RELEASE_GAP: Duration = Duration::from_secs(1);
 /// Entries that fail in a row before the automatic retry stops until the
 /// next command or restart, so a fan that will not unlock is not put through
-/// the `Ftst` dance every minute.
+/// the `Ftst` dance every minute. A helper that is unreachable or silent is
+/// the exception: it goes on every [`RETRY_EVERY`] instead
+/// ([`Unavailable::never_stops`]).
 pub const ENTRY_FAILURES_BEFORE_STOP: u32 = 3;
 /// More than this many re-entries inside [`REENTRY_WINDOW`] is contention:
 /// something keeps taking the fans back.
@@ -77,14 +79,25 @@ pub const BACKOFF: [Duration; 5] = [
     Duration::from_secs(10),
     Duration::from_secs(20),
     Duration::from_secs(40),
-    Duration::from_secs(60),
+    RETRY_EVERY,
 ];
+/// After [`ENTRY_FAILURES_BEFORE_STOP`] failures in a row, how often a helper
+/// that is unreachable or silent is tried again while a manual mode is
+/// wished ([`Unavailable::never_stops`]), with no log line unless the state
+/// changes.
+pub const RETRY_EVERY: Duration = Duration::from_secs(60);
 /// In Follow CPU a new target is written only when it moved at least this
 /// share of the fan's range (or reached an end, or the hot guard flipped). A
 /// starting value, not a measured one.
 pub const WRITE_STEP: f64 = 0.05;
-/// A tick whose wall clock moved this much further than its monotonic clock
-/// slept in between: the log line names the cause "after sleep".
+/// A look whose wall clock moved this much further than its monotonic clock
+/// slept in between, since on macOS `Instant` (`mach_absolute_time`) stands
+/// still in sleep and the wall clock does not. A tick that sees it names the
+/// cause "after sleep"; a scheduled retry that sees it starts the backoff
+/// over and tries at once. Why the retry needs it (2026-10-19): a Mac slept
+/// with the fans held, the three tries were spent in dark wakes, where the
+/// SMC takes no mode write, and nothing took the fans back after the real
+/// wake, which left them automatic at 0 rpm with the CPU at 101 °C.
 pub const SLEEP_GAP: Duration = Duration::from_secs(10);
 /// The highest rpm a Fixed mode may ask for. Root clamps to each fan's own
 /// range; this only refuses nonsense at the edge.
@@ -305,6 +318,14 @@ impl Unavailable {
                 )
         )
     }
+
+    /// Whether the retry goes on past [`ENTRY_FAILURES_BEFORE_STOP`], every
+    /// [`RETRY_EVERY`]: a helper that is unreachable or silent writes nothing,
+    /// so trying it costs no unlock, and a sleep's dark wakes fail exactly
+    /// this way.
+    const fn never_stops(self) -> bool {
+        matches!(self, Self::HelperUnreachable | Self::HelperNoReply)
+    }
 }
 
 /// The controller's state.
@@ -348,9 +369,13 @@ pub enum Detail {
     /// The fans went back to automatic across a sleep and are being taken
     /// again.
     AfterSleep,
-    /// Three entries in a row failed; no automatic retry until the next
-    /// command or restart.
+    /// Three entries in a row failed for a reason that stops the retry; no
+    /// automatic retry until the next command or restart.
     RetryStopped,
+    /// Three entries in a row failed on a helper that is unreachable or
+    /// silent; it is tried again every [`RETRY_EVERY`], and at once after a
+    /// sleep.
+    RetryingEveryMinute,
     /// Another tcr's set-manual made it the holder.
     TakenOver,
 }
@@ -363,6 +388,10 @@ impl fmt::Display for Detail {
             }
             Self::AfterSleep => write!(f, "re-applying after sleep"),
             Self::RetryStopped => write!(f, "three tries failed; send the mode again to retry"),
+            Self::RetryingEveryMinute => write!(
+                f,
+                "three tries failed; trying again every minute and on waking from sleep"
+            ),
             Self::TakenOver => write!(f, "another tcr took the fans"),
         }
     }
@@ -636,8 +665,12 @@ pub struct Controller<H, R, P, C, S> {
     /// A command arrived since the last [`Self::advance`].
     fresh: bool,
     stopping: Option<Instant>,
-    last_tick: Option<(Instant, i64)>,
+    /// Both clocks at the last look ([`Self::slept`]).
+    last_look: Option<(Instant, i64)>,
     last_outcome: Option<TickOutcome>,
+    /// A retry past [`ENTRY_FAILURES_BEFORE_STOP`] is under way from this
+    /// state: a change to `Entering`, or back to this state, logs at Debug.
+    quiet: Option<State>,
 }
 
 impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S> {
@@ -670,8 +703,9 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             pending: None,
             fresh: false,
             stopping: None,
-            last_tick: None,
+            last_look: None,
             last_outcome: None,
+            quiet: None,
         };
         controller.boot();
         controller
@@ -808,12 +842,18 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// How long the loop may wait for input before it has work of its own.
     /// Zero while a command taken in the middle of a step waits: it is acted
     /// on at once, not at the next tick.
+    ///
+    /// While a retry is scheduled the loop looks at least every [`TICK`],
+    /// though the retry may be a minute off: the wait is measured on the
+    /// monotonic clock, which stands still in sleep, so only a look soon
+    /// after a wake sees the sleep ([`SLEEP_GAP`]) in time to try at once.
     fn wait(&self) -> Option<Duration> {
         if self.fresh {
             return Some(Duration::ZERO);
         }
         let now = self.parts.clock.now();
-        [self.next_tick, self.retry_at]
+        let look = self.retry_at.map(|_| now + TICK);
+        [self.next_tick, self.retry_at, look]
             .into_iter()
             .flatten()
             .min()
@@ -950,6 +990,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     }
 
     fn step(&mut self, fresh: bool) {
+        let slept = self.slept();
         let now = self.parts.clock.now();
         let tick_due = self.next_tick.is_some_and(|at| at <= now);
         let retry_due = self.retry_at.is_some_and(|at| at <= now);
@@ -996,16 +1037,30 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             // scheduled only for a reason that retries
             // ([`Unavailable::retries`]): a signature refusal waits for the
             // next command, so a refused requirement is never retried in a
-            // loop.
+            // loop. A sleep makes a scheduled retry due at once, with the
+            // backoff started over.
             State::Unavailable(_) => {
-                if fresh || retry_due {
+                let woke = slept && self.retry_at.is_some();
+                if woke {
+                    self.backoff_step = 0;
+                    self.log(
+                        Level::Debug,
+                        "fan control: the machine slept; trying the fans again now",
+                    );
+                }
+                if fresh || retry_due || woke {
                     self.retry_at = None;
+                    // Past the third failure in a row a try that changes
+                    // nothing says nothing.
+                    let quiet = !fresh && self.failed_entries >= ENTRY_FAILURES_BEFORE_STOP;
+                    self.quiet = quiet.then_some(self.state);
                     self.enter();
+                    self.quiet = None;
                 }
             }
             State::Holding | State::Unknown | State::Foreign(_) => {
-                if fresh || tick_due {
-                    self.tick(fresh);
+                if fresh || tick_due || slept {
+                    self.tick_after(fresh, slept);
                 }
             }
         }
@@ -1285,8 +1340,13 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         }
         self.failed_entries += 1;
         let why = failure.unavailable();
+        let level = if self.quiet == Some(State::Unavailable(why)) {
+            Level::Debug
+        } else {
+            Level::Warn
+        };
         self.log(
-            Level::Warn,
+            level,
             &format!("fan control: could not take the fans: {why:?}"),
         );
         self.unavailable(why);
@@ -1315,13 +1375,24 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     }
 
     /// Set `Unavailable(why)` and schedule the retry, if this one retries
-    /// and the run of failures is short enough.
+    /// and the run of failures is short enough, or it never stops
+    /// ([`Unavailable::never_stops`]): from the third failure in a row that
+    /// one is tried every [`RETRY_EVERY`], or sooner after a sleep.
     fn unavailable(&mut self, why: Unavailable) {
         self.unschedule();
         if why.retries() && self.desired.is_manual() {
-            if self.failed_entries >= ENTRY_FAILURES_BEFORE_STOP {
+            let past = self.failed_entries >= ENTRY_FAILURES_BEFORE_STOP;
+            if past && !why.never_stops() {
                 self.detail = Some(Detail::RetryStopped);
             } else {
+                if past {
+                    self.detail = Some(Detail::RetryingEveryMinute);
+                }
+                if self.failed_entries == ENTRY_FAILURES_BEFORE_STOP {
+                    // The third failure: every minute from here, until a
+                    // sleep starts the backoff over.
+                    self.backoff_step = BACKOFF.len() - 1;
+                }
                 let wait = BACKOFF[self.backoff_step.min(BACKOFF.len() - 1)];
                 self.backoff_step += 1;
                 self.retry_at = Some(self.parts.clock.now() + wait);
@@ -1375,14 +1446,19 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// `forced`: a new command, so the gate does not hold a changed target
     /// back.
     pub fn tick(&mut self, forced: bool) -> TickOutcome {
+        let after_sleep = self.slept();
+        self.tick_after(forced, after_sleep)
+    }
+
+    /// [`Self::tick`], with the look at the clocks already taken.
+    fn tick_after(&mut self, forced: bool, after_sleep: bool) -> TickOutcome {
         self.arm_tick();
-        let outcome = self.tick_inner(forced);
+        let outcome = self.tick_inner(forced, after_sleep);
         self.last_outcome = Some(outcome);
         outcome
     }
 
-    fn tick_inner(&mut self, forced: bool) -> TickOutcome {
-        let after_sleep = self.slept();
+    fn tick_inner(&mut self, forced: bool, after_sleep: bool) -> TickOutcome {
         let Some(reading) = self.parts.heat.read() else {
             self.set_state(State::Unknown);
             return TickOutcome::HeldBack(Why::Unreadable);
@@ -1424,7 +1500,14 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                             "fan control: every fan is automatic again; re-applying"
                         },
                     );
-                    self.reenter_counted();
+                    if after_sleep {
+                        // The sleep explains it, and the contention window
+                        // runs on the monotonic clock, which stood still
+                        // through it: a night of dark wakes is not contention.
+                        self.enter();
+                    } else {
+                        self.reenter_counted();
+                    }
                 } else {
                     self.enter();
                 }
@@ -1500,16 +1583,17 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
         }
     }
 
-    /// Did the machine sleep since the last tick? The monotonic clock stops
-    /// in sleep on macOS; the wall clock does not.
+    /// Did the machine sleep since the last look (a step, or a tick called
+    /// on its own)? The monotonic clock stops in sleep on macOS; the wall
+    /// clock does not ([`SLEEP_GAP`]).
     fn slept(&mut self) -> bool {
         let now = (self.parts.clock.now(), self.parts.clock.wall_ms());
-        let slept = self.last_tick.is_some_and(|(at, wall)| {
+        let slept = self.last_look.is_some_and(|(at, wall)| {
             let monotonic = now.0.saturating_duration_since(at).as_millis();
             let wall = u128::try_from(now.1.saturating_sub(wall)).unwrap_or(0);
             wall.saturating_sub(monotonic) > SLEEP_GAP.as_millis()
         });
-        self.last_tick = Some(now);
+        self.last_look = Some(now);
         slept
     }
 
@@ -1737,10 +1821,11 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
 
     fn set_state(&mut self, state: State) {
         if state != self.state {
-            self.log(
-                Level::Info,
-                &format!("fan control: {} -> {}", self.state, state),
-            );
+            let level = match self.quiet {
+                Some(from) if state == State::Entering || state == from => Level::Debug,
+                _ => Level::Info,
+            };
+            self.log(level, &format!("fan control: {} -> {}", self.state, state));
             self.state = state;
             // With a command taken and not yet acted on, a state reached for
             // the wish before it is not that command's answer.
