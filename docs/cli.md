@@ -2598,7 +2598,9 @@ file means Auto.
   `notSignedForFans`, `noSmc`, `noFans`, `helperUnreachable` (not registered, not approved, or not
   answering) and `helperNoReply` (retried after 5 and 10 s, then every 60 s for as long as a manual
   mode is wished, with no log line unless the state changes, and at once after a sleep, with the
-  waits started over), `helperSignature` (never retried on its own),
+  waits started over), `helperSignature` (retried once on its own 45 s later, since right after a
+  TcrBar update the old helper can still be answering; a second refusal is not retried until the
+  next command),
   `{"helperVersion": {"installed": 2}}`, `{"modeLocked": 1}` (that fan would not leave
   automatic; retried after 5 and 10 s, then not until the next command, so a fan that will not
   unlock is not put through the unlock every minute), `contended`, `helperRefused`,

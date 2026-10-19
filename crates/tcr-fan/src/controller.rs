@@ -86,6 +86,17 @@ pub const BACKOFF: [Duration; 5] = [
 /// wished ([`Unavailable::never_stops`]), with no log line unless the state
 /// changes.
 pub const RETRY_EVERY: Duration = Duration::from_secs(60);
+/// How long after a signature refusal it is tried once more on its own
+/// ([`Unavailable::HelperSignature`]); a second refusal waits for the next
+/// command. Why (2026-10-19, a TcrBar update from 1.2.12 to 1.2.13): the old
+/// proxy stopped, its helper went idle and stayed up for its idle grace
+/// ([`crate::root::IDLE_EXIT_GRACE`], 15 s), and the new proxy dialled that
+/// old helper, whose files the update had just replaced, so the signature
+/// check failed. Nothing tried again, and the fans stayed automatic until the
+/// mode was sent again. That helper exited 25 s after the refusal, and launchd
+/// starts the next one no sooner than 10 s after the previous start
+/// ([`VERSION_DEADLINE`]); 45 s is past both, with room.
+pub const SIGNATURE_RETRY_AFTER: Duration = Duration::from_secs(45);
 /// In Follow CPU a new target is written only when it moved at least this
 /// share of the fan's range (or reached an end, or the hot guard flipped). A
 /// starting value, not a measured one.
@@ -283,7 +294,9 @@ pub enum Unavailable {
     /// A call ran past its deadline.
     HelperNoReply,
     /// What answered is not the helper this build trusts, or the requirement
-    /// itself was refused. Never retried automatically.
+    /// itself was refused. Retried once on its own, [`SIGNATURE_RETRY_AFTER`]
+    /// later (an update's old helper still answering); then not until the
+    /// next command.
     HelperSignature,
     /// The helper speaks another protocol; `None` when its reply was not the
     /// contract's shape at all.
@@ -656,6 +669,9 @@ pub struct Controller<H, R, P, C, S> {
     /// [`Snapshot::since_ms`], moved with `acted`.
     since_ms: i64,
     failed_entries: u32,
+    /// The one automatic retry of a signature refusal since the last command
+    /// is spent ([`SIGNATURE_RETRY_AFTER`]).
+    signature_retried: bool,
     backoff_step: usize,
     retry_at: Option<Instant>,
     next_tick: Option<Instant>,
@@ -696,6 +712,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             acted: first,
             since_ms,
             failed_entries: 0,
+            signature_retried: false,
             backoff_step: 0,
             retry_at: None,
             next_tick: None,
@@ -892,6 +909,7 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
                 // handed back by it, and Auto starts its own.
                 self.pending = None;
                 self.failed_entries = 0;
+                self.signature_retried = false;
                 self.backoff_step = 0;
                 self.retry_at = None;
                 self.reentries.clear();
@@ -1035,12 +1053,14 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
             State::Off | State::Stuck | State::Entering | State::Releasing => self.enter(),
             // Only a command or a scheduled retry tries again, and a retry is
             // scheduled only for a reason that retries
-            // ([`Unavailable::retries`]): a signature refusal waits for the
-            // next command, so a refused requirement is never retried in a
-            // loop. A sleep makes a scheduled retry due at once, with the
-            // backoff started over.
-            State::Unavailable(_) => {
-                let woke = slept && self.retry_at.is_some();
+            // ([`Unavailable::retries`]), or once for a signature refusal
+            // ([`SIGNATURE_RETRY_AFTER`]), so a refused requirement is never
+            // retried in a loop. A sleep makes a scheduled retry due at once,
+            // with the backoff started over; not the signature retry, which
+            // waits on the old helper's idle grace, and that does not run
+            // ahead in sleep either.
+            State::Unavailable(why) => {
+                let woke = slept && self.retry_at.is_some() && why.retries();
                 if woke {
                     self.backoff_step = 0;
                     self.log(
@@ -1377,10 +1397,18 @@ impl<H: Helper, R: Heat, P: Probe, C: Clock, S: Store> Controller<H, R, P, C, S>
     /// Set `Unavailable(why)` and schedule the retry, if this one retries
     /// and the run of failures is short enough, or it never stops
     /// ([`Unavailable::never_stops`]): from the third failure in a row that
-    /// one is tried every [`RETRY_EVERY`], or sooner after a sleep.
+    /// one is tried every [`RETRY_EVERY`], or sooner after a sleep. A
+    /// signature refusal is tried once more, [`SIGNATURE_RETRY_AFTER`] on,
+    /// and then not until the next command.
     fn unavailable(&mut self, why: Unavailable) {
         self.unschedule();
-        if why.retries() && self.desired.is_manual() {
+        if why == Unavailable::HelperSignature
+            && self.desired.is_manual()
+            && !self.signature_retried
+        {
+            self.signature_retried = true;
+            self.retry_at = Some(self.parts.clock.now() + SIGNATURE_RETRY_AFTER);
+        } else if why.retries() && self.desired.is_manual() {
             let past = self.failed_entries >= ENTRY_FAILURES_BEFORE_STOP;
             if past && !why.never_stops() {
                 self.detail = Some(Detail::RetryStopped);
