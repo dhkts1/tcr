@@ -227,12 +227,110 @@ pub async fn accept(endpoint: Option<&Endpoint>) -> std::os::unix::net::UnixStre
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_restart_faults_are_recoverable() {
+        const CHILD: &str = "TCR_REVIEW_RESTART_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", "ulimit -n 128; exec \"$@\"", "restart-fixture"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "restart::tests::review_restart_faults_are_recoverable",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("XDG_CACHE_HOME", "different-fixture-cache")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "restart accept must survive EMFILE and remain usable: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert_eq!(
+            socket_path(42),
+            PathBuf::from(format!(
+                "/tmp/tcr-restart-{}/restart-42.sock",
+                current_uid()
+            )),
+            "handoff discovery must not depend on successor cache variables"
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use std::io::Write;
+                let root = tempfile::tempdir().unwrap();
+                std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let path = root.path().join("restart.sock");
+                let endpoint = Endpoint::bind_at(path.clone()).unwrap();
+                let mut peer = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                peer.write_all(REQUEST).unwrap();
+                let mut files = Vec::new();
+                loop {
+                    match std::fs::File::open("/dev/null") {
+                        Ok(file) => files.push(file),
+                        Err(error) => {
+                            assert_eq!(
+                                error.raw_os_error(),
+                                Some(24),
+                                "must actually reach EMFILE"
+                            );
+                            break;
+                        }
+                    }
+                }
+                assert!(!files.is_empty(), "positive descriptor-pressure control");
+                let accepting = endpoint.accept();
+                tokio::pin!(accepting);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(150), &mut accepting)
+                        .await
+                        .is_err(),
+                    "a transient accept error must stay pending while descriptors are exhausted"
+                );
+                drop(files);
+                // The exhausted accept can close its peer; retry a fresh request.
+                let mut retry = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                retry.write_all(REQUEST).unwrap();
+                let accepted = tokio::time::timeout(Duration::from_secs(3), &mut accepting).await;
+                assert!(
+                    accepted.is_ok(),
+                    "accept must resume after descriptor recovery"
+                );
+            });
+    }
+
     #[tokio::test]
     async fn a_refused_stale_socket_can_be_rebound() {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = root.path().join("restart.sock");
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        // Establish the named refusal precondition instead of assuming
+        // listener release is already observable.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match tokio::time::timeout(Duration::from_millis(100), UnixStream::connect(&path)).await
+            {
+                Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => break,
+                Ok(Ok(peer)) => drop(peer),
+                Ok(Err(error)) => panic!("unexpected stale-socket probe: {error}"),
+                Err(_) => {}
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "socket never became refused"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let endpoint = Endpoint::bind_at(path.clone()).unwrap();
         assert!(UnixStream::connect(&path).await.is_ok());
         assert!(
