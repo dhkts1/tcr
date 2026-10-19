@@ -852,22 +852,31 @@ fn a_helper_launchd_starts_late_still_answers_the_version_call() {
     assert_eq!(too_late.written(), vec![]);
 }
 
+/// A fan that will not leave automatic is not put through the unlock every
+/// minute: three refusals in a row stop the retry until the next command, a
+/// sleep included.
 #[test]
 fn three_failed_entries_stop_the_retry() {
     let mut rig = rig();
-    rig.answer(|request| *request == Request::Version, Err(Fault::Invalid));
+    rig.answer(
+        |request| *request == set_manual(0),
+        Ok(Reply::Refused(HelperError::ModeLocked { fan: 0 })),
+    );
     rig.send(Command::Set(fixed(3000)));
     for wait in [5, 10] {
         assert_eq!(
             rig.c.state(),
-            State::Unavailable(Unavailable::HelperUnreachable)
+            State::Unavailable(Unavailable::ModeLocked { fan: 0 })
         );
         rig.clock.advance(Duration::from_secs(wait));
         rig.c.pump();
     }
     assert_eq!(rig.c.detail(), Some(Detail::RetryStopped));
+    assert_eq!(rig.c.wait(), None, "nothing scheduled");
     let calls = rig.world.lock().requests.len();
     rig.clock.advance(Duration::from_secs(600));
+    rig.c.pump();
+    rig.slept_for(Duration::from_secs(3_600));
     rig.c.pump();
     assert_eq!(
         rig.world.lock().requests.len(),
@@ -876,7 +885,186 @@ fn three_failed_entries_stop_the_retry() {
     );
     // A new command tries again.
     rig.send(Command::Set(fixed(3000)));
-    assert_eq!(rig.world.lock().requests.len(), calls + 1);
+    assert!(rig.world.lock().requests.len() > calls);
+}
+
+impl Rig {
+    /// The machine slept for `asleep`: the wall clock moves and the monotonic
+    /// one does not, as `mach_absolute_time` stands still in sleep. Then one
+    /// tick's worth of both, the loop's next look.
+    fn slept_for(&self, asleep: Duration) {
+        self.clock.0.lock().unwrap().1 += i64::try_from(asleep.as_millis()).unwrap();
+        self.clock.advance(TICK);
+    }
+
+    fn opens(&self) -> usize {
+        self.world.lock().opened.len()
+    }
+
+    /// Lines logged at Info or louder since the last [`Rig::take_logs`].
+    fn loud_logs(&self) -> Vec<String> {
+        self.take_logs()
+            .into_iter()
+            .filter(|(level, _)| *level != Level::Debug)
+            .map(|(_, line)| line)
+            .collect()
+    }
+}
+
+/// A helper whose reply never comes (the SMC taking no mode write in a dark
+/// wake, 2026-10-19). Three failures in a row, then `answers` decides.
+fn silent_three_times(answers: &Arc<std::sync::atomic::AtomicBool>) -> Rig {
+    let mut rig = rig();
+    let answers = Arc::clone(answers);
+    rig.answer(
+        move |request| {
+            *request == Request::Version && !answers.load(std::sync::atomic::Ordering::SeqCst)
+        },
+        Err(Fault::NoReply),
+    );
+    rig.send(Command::Set(fixed(3000)));
+    for wait in [5, 10] {
+        rig.clock.advance(Duration::from_secs(wait));
+        rig.c.pump();
+    }
+    assert_eq!(rig.opens(), 3);
+    assert_eq!(
+        rig.c.state(),
+        State::Unavailable(Unavailable::HelperNoReply)
+    );
+    rig
+}
+
+/// The overnight case (2026-10-19): the three tries were spent in dark wakes
+/// and nothing took the fans back after the real wake. While a manual mode is
+/// wished a silent or unreachable helper is tried every minute past the
+/// third failure, with no line logged per try, until it answers.
+#[test]
+fn a_silent_helper_is_retried_every_minute_past_three_quietly() {
+    let answers = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut rig = silent_three_times(&answers);
+    assert_eq!(rig.c.detail(), Some(Detail::RetryingEveryMinute));
+    rig.take_logs();
+    for n in 4..=8 {
+        rig.clock
+            .advance(RETRY_EVERY.checked_sub(Duration::from_secs(1)).unwrap());
+        rig.c.pump();
+        assert_eq!(rig.opens(), n - 1, "not before a minute");
+        rig.clock.advance(Duration::from_secs(1));
+        rig.c.pump();
+        assert_eq!(rig.opens(), n, "try {n} at a minute");
+        assert_eq!(
+            rig.c.state(),
+            State::Unavailable(Unavailable::HelperNoReply)
+        );
+        assert_eq!(rig.c.detail(), Some(Detail::RetryingEveryMinute));
+    }
+    assert_eq!(rig.loud_logs(), Vec::<String>::new(), "no line per try");
+
+    // An unreachable helper is the same.
+    let mut unreachable = rig_for_unreachable();
+    for _ in 0..6 {
+        let opens = unreachable.opens();
+        unreachable.clock.advance(RETRY_EVERY);
+        unreachable.c.pump();
+        assert_eq!(unreachable.opens(), opens + 1);
+    }
+
+    // The helper answers: holding, said once.
+    answers.store(true, std::sync::atomic::Ordering::SeqCst);
+    rig.clock.advance(RETRY_EVERY);
+    rig.c.pump();
+    assert_eq!(rig.c.state(), State::Holding);
+    assert_eq!(rig.c.detail(), None);
+    let loud = rig.loud_logs();
+    assert_eq!(loud.len(), 1, "{loud:?}");
+    assert!(loud[0].ends_with("-> holding"), "{loud:?}");
+}
+
+fn rig_for_unreachable() -> Rig {
+    let mut rig = rig();
+    rig.answer(|request| *request == Request::Version, Err(Fault::Invalid));
+    rig.send(Command::Set(fixed(3000)));
+    for wait in [5, 10] {
+        rig.clock.advance(Duration::from_secs(wait));
+        rig.c.pump();
+    }
+    assert_eq!(rig.opens(), 3);
+    assert_eq!(
+        rig.c.state(),
+        State::Unavailable(Unavailable::HelperUnreachable)
+    );
+    rig
+}
+
+/// A sleep shows as the wall clock running ahead of the monotonic one. The
+/// loop looks at least every tick while a retry is scheduled, so a wake is
+/// seen at once; the backoff starts over and the helper is tried then, not
+/// at the minute.
+#[test]
+fn a_sleep_resets_the_backoff_and_retries_at_once() {
+    // Early: after the first failure the try is due in 5 s, and a wake 3 s
+    // on tries at once.
+    let mut rig = rig();
+    rig.answer(|request| *request == Request::Version, Err(Fault::Invalid));
+    rig.send(Command::Set(fixed(3000)));
+    assert_eq!(rig.opens(), 1);
+    rig.slept_for(Duration::from_secs(3_600));
+    rig.c.pump();
+    assert_eq!(rig.opens(), 2, "tried on waking");
+    // The backoff starts over at 5 s rather than going on to 10 s.
+    rig.clock
+        .advance(BACKOFF[0].checked_sub(Duration::from_secs(1)).unwrap());
+    rig.c.pump();
+    assert_eq!(rig.opens(), 2);
+    rig.clock.advance(Duration::from_secs(1));
+    rig.c.pump();
+    assert_eq!(rig.opens(), 3);
+
+    // Past three, quietly every minute: a sleep tries at once too, and only
+    // a real gap counts.
+    let answers = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut quiet = silent_three_times(&answers);
+    assert!(
+        matches!(quiet.c.wait(), Some(wait) if wait <= TICK),
+        "the loop looks at the clocks every tick while a try is scheduled"
+    );
+    quiet.clock.advance(TICK);
+    quiet.c.pump();
+    assert_eq!(quiet.opens(), 3, "three seconds awake is not a sleep");
+    quiet.slept_for(SLEEP_GAP + Duration::from_secs(1));
+    quiet.c.pump();
+    assert_eq!(
+        quiet.opens(),
+        4,
+        "a sleep longer than the gap tries at once"
+    );
+    // The backoff starts over: the next try is 5 s on.
+    quiet.clock.advance(BACKOFF[0]);
+    quiet.c.pump();
+    assert_eq!(quiet.opens(), 5);
+    // The real wake: the helper answers, and the fans are taken back.
+    answers.store(true, std::sync::atomic::Ordering::SeqCst);
+    quiet.slept_for(Duration::from_secs(3_600));
+    quiet.c.pump();
+    assert_eq!(quiet.c.state(), State::Holding);
+}
+
+/// Auto never retries anything, asleep or awake, and schedules nothing.
+#[test]
+fn auto_never_retries_anything() {
+    let mut rig = rig_for_unreachable();
+    rig.send(Command::Set(FanDesired::Auto));
+    assert_eq!(rig.c.state(), State::Off);
+    assert_eq!(rig.c.wait(), None);
+    let opens = rig.opens();
+    for _ in 0..10 {
+        rig.clock.advance(RETRY_EVERY);
+        rig.c.pump();
+        rig.slept_for(Duration::from_secs(3_600));
+        rig.c.pump();
+    }
+    assert_eq!(rig.opens(), opens);
 }
 
 /// A refused requirement is remembered: no automatic retry, so the
@@ -894,8 +1082,12 @@ fn a_signature_refusal_is_never_retried_on_its_own() {
         State::Unavailable(Unavailable::HelperSignature)
     );
     let opens = rig.world.lock().opened.len();
+    assert_eq!(rig.c.wait(), None, "nothing scheduled");
     for _ in 0..20 {
         rig.clock.advance(Duration::from_secs(60));
+        rig.c.pump();
+        // Nor after a sleep.
+        rig.slept_for(Duration::from_secs(3_600));
         rig.c.pump();
     }
     assert_eq!(rig.world.lock().opened.len(), opens);
@@ -954,6 +1146,21 @@ fn wake_with_every_fan_automatic_reenters_and_says_why() {
     assert_eq!(rig.c.state(), State::Holding);
     assert_eq!(rig.c.detail(), None, "the detail clears once holding again");
     assert_eq!(rig.written().len(), 4);
+}
+
+/// Each sleep hands the fans back to macOS, and the contention window runs on
+/// the monotonic clock, which stands still in sleep: a night of dark wakes
+/// would read as "something keeps taking the fans" and stop for good. A
+/// re-entry after a sleep is not counted.
+#[test]
+fn reentries_after_sleep_are_not_contention() {
+    let mut rig = holding(fixed(3000));
+    for _ in 0..=REENTRY_LIMIT * 3 {
+        rig.all_auto();
+        rig.slept_for(Duration::from_mins(30));
+        rig.c.pump();
+        assert_eq!(rig.c.state(), State::Holding);
+    }
 }
 
 #[test]

@@ -2565,7 +2565,9 @@ is `unknown` and nothing is written, and so is a reading that lost a fan the ser
 the fan count does not read, no fan does). When every fan reads automatic again (a wake from
 sleep, or someone handed back), or one held fan does while the rest keep their targets, the
 controller takes them again; more than 3 such re-entries in 10 minutes is
-`unavailable / contended`. An entry that stops partway (Macs Fan Control starts, its probe fails,
+`unavailable / contended`. A re-entry after a sleep is not counted: a sleep hands the fans back
+on its own, and the 10 minutes do not run while the Mac sleeps. The controller tells a sleep by
+the wall clock running more than 10 s ahead of the monotonic clock, which stands still in sleep. An entry that stops partway (Macs Fan Control starts, its probe fails,
 a call fails, or Auto or a stop arrives) hands back any fan it already set manual before it
 reports why. Follow CPU writes a new target only when it moved at least 5 % of
 the fan's range, reached an end, or the hot guard flipped.
@@ -2594,10 +2596,13 @@ file means Auto.
 - `state`: `off`, `entering`, `holding`, `releasing`, `foreign`, `unknown`, `unavailable`, `stuck`.
 - `reason`, for `foreign` and `unavailable`, `null` otherwise: `macsFanControl`, `anotherApp`,
   `notSignedForFans`, `noSmc`, `noFans`, `helperUnreachable` (not registered, not approved, or not
-  answering; retried after 5, 10, 20, 40, then every 60 s, stopping after three failed tries in a
-  row until the next command), `helperNoReply`, `helperSignature` (never retried on its own),
+  answering) and `helperNoReply` (retried after 5 and 10 s, then every 60 s for as long as a manual
+  mode is wished, with no log line unless the state changes, and at once after a sleep, with the
+  waits started over), `helperSignature` (never retried on its own),
   `{"helperVersion": {"installed": 2}}`, `{"modeLocked": 1}` (that fan would not leave
-  automatic), `contended`, `helperRefused`, `controllerStopped` (the controller's thread stopped on
+  automatic; retried after 5 and 10 s, then not until the next command, so a fan that will not
+  unlock is not put through the unlock every minute), `contended`, `helperRefused`,
+  `controllerStopped` (the controller's thread stopped on
   an internal error; a restart starts it again). A reason that carries data is a one-key object.
 - `targets`: what this server last wrote to each fan it holds.
 - `detail`: a sentence for a person, or `null`.
