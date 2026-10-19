@@ -439,8 +439,9 @@ impl FanHandle {
     }
 
     /// Ask the controller to hand back what it holds and stop, and wait at
-    /// most `grace` for it. Blocking: call it off the runtime.
-    pub fn shutdown(&self, grace: Duration) {
+    /// most `grace` for it. Returns whether it stopped; a timeout is false.
+    /// Blocking: call it off the runtime.
+    pub fn shutdown(&self, grace: Duration) -> bool {
         let wait = grace.min(SHUTDOWN_HAND_BACK);
         let deadline = Instant::now() + wait;
         if self
@@ -448,16 +449,17 @@ impl FanHandle {
             .send(Input::Command(Command::Shutdown { deadline }))
             .is_err()
         {
-            return;
+            return true;
         }
         let done = self.done.lock().unwrap_or_else(PoisonError::into_inner);
-        if done
-            .recv_timeout(wait + Duration::from_millis(500))
-            .is_err()
-        {
-            tracing::warn!(
-                "fan control: the controller did not stop in time; the helper hands back when this process exits"
-            );
+        match done.recv_timeout(wait + Duration::from_millis(500)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    "fan control: the controller did not stop in time; the helper hands back when this process exits"
+                );
+                false
+            }
         }
     }
 }

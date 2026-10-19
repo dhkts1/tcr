@@ -479,8 +479,20 @@ impl ServerHandle {
     /// existing handoff ownership gate has been released.
     pub async fn handoff(&mut self, peer: &std::os::unix::net::UnixStream) -> anyhow::Result<()> {
         crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
-        self.stop_tasks(tokio::time::Instant::now() + DEFAULT_SHUTDOWN_GRACE)
-            .await;
+        let deadline = tokio::time::Instant::now() + DEFAULT_SHUTDOWN_GRACE;
+        // The controller also mutates hardware and saves its wish. Finish its
+        // last save before the successor can take ownership and save Auto;
+        // accepted connections may keep draining after that release.
+        if let Some(fan) = self.manager.fan() {
+            let fan = Arc::clone(fan);
+            let stop = tokio::task::spawn_blocking(move || fan.shutdown(DEFAULT_SHUTDOWN_GRACE));
+            let stopped = tokio::time::timeout_at(deadline, stop)
+                .await
+                .context("fan control exceeded the handoff shutdown grace")?
+                .context("fan control shutdown task failed")?;
+            anyhow::ensure!(stopped, "fan control did not stop before handoff");
+        }
+        self.stop_tasks(deadline).await;
         self.flush_cache_finally(SavedCache::BoundTokens);
         self.flush_cache_finally(SavedCache::WireSessions);
         let listener = self.listener.as_ref().context("no listener to hand over")?;
