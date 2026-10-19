@@ -451,3 +451,192 @@ async fn replacement_sends_goaway_to_an_idle_http2_client() {
         .unwrap();
     assert!(sender.is_closed());
 }
+
+fn assert_stand_down_flushes_the_actual_log_owner() {
+    let incumbent_home = scratch_home();
+    let mut old = Proxy::spawn(incumbent_home.path(), 0, false);
+    let addr = old.ready();
+    let home = scratch_home();
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.path().join("config.json")).unwrap())
+            .unwrap();
+    for index in 0..30000 {
+        config[format!("fixture_{}_{index:04}", "x".repeat(40))] = serde_json::json!(true);
+    }
+    config["zz_fixture_final_log_sentinel"] = serde_json::json!(true);
+    std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+    let logs = home.path().join(".cache/tcr/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let date = time::OffsetDateTime::now_utc()
+        .format(time::macros::format_description!("[year]-[month]-[day]"))
+        .unwrap();
+    let fifo = logs.join(format!("tcr.log.{date}"));
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (release_tx, release_rx) = mpsc::channel();
+    let (log_tx, log_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut file = std::fs::File::open(fifo).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(120)).unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        log_tx.send(text).unwrap();
+    });
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    cmd.args([
+        "server",
+        "--headless",
+        "--port",
+        &addr.port().to_string(),
+        "--config",
+    ])
+    .arg(home.path().join("config.json"))
+    .env_clear()
+    .env("HOME", home.path())
+    .env("PATH", "/usr/bin:/bin")
+    .env("TCR_CLAUDE_CODE_CREDENTIALS", home.path().join("no-login"))
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped());
+    let mut child = tcr::test_support::child::KillOnDrop::spawn(&mut cmd).unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (notice_tx, notice_rx) = mpsc::channel();
+    let stderr_reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if line.contains("exiting without binding") {
+                notice_tx.send(()).unwrap();
+            }
+        }
+    });
+    let notice = notice_rx.recv_timeout(Duration::from_secs(90));
+    std::thread::sleep(Duration::from_millis(100));
+    release_tx.send(()).unwrap();
+    assert!(
+        notice.is_ok(),
+        "the real server must reach its stand-down exit"
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "{status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stand-down did not finish after log reader resumed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let text = log_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    reader.join().unwrap();
+    stderr_reader.join().unwrap();
+    assert!(
+        text.contains("zz_fixture_final_log_sentinel"),
+        "stand-down lost the queued tail; only {} bytes were drained",
+        text.len()
+    );
+    assert!(
+        old.child.try_wait().unwrap().is_none(),
+        "stand-down must preserve its own fixture incumbent"
+    );
+}
+
+#[test]
+fn review_exit_paths_keep_logging_and_serving() {
+    use std::os::unix::process::CommandExt;
+    if std::env::var_os("TCR_REVIEW_BIND_COLLISION").is_some() {
+        let path = tcr::restart::socket_path(std::process::id());
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let listener: std::os::fd::OwnedFd = listener.into();
+        // The holder keeps this process's endpoint live across exec. Its input
+        // closes when tcr exits, then it removes only this fixture's path.
+        let mut holder = Command::new("/bin/sh")
+            .args(["-c", "read -r _; /bin/rm -- \"$1\"", "endpoint-holder"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(listener))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let error = Command::new(env!("CARGO_BIN_EXE_tcr"))
+            .args(["server", "--headless", "--port", "0", "--config"])
+            .arg(Path::new(&std::env::var_os("HOME").unwrap()).join("config.json"))
+            .stdin(Stdio::from(holder.stdin.take().unwrap()))
+            .exec();
+        holder.wait().unwrap();
+        panic!("fixture exec failed: {error}");
+    }
+    assert_stand_down_flushes_the_actual_log_owner();
+    let home = scratch_home();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "server_replace::review_exit_paths_keep_logging_and_serving",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("TCR_REVIEW_BIND_COLLISION", "1")
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("TCR_CLAUDE_CODE_CREDENTIALS", home.path().join("no-login"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, lines) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            tx.send(line).log_debug("fixture receiver closed");
+        }
+    });
+    let mut proxy = Proxy { child, lines };
+    let addr = proxy.ready();
+    let mut connection = TcpStream::connect(addr).unwrap();
+    connection
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    connection
+        .write_all(b"GET /_tcr/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    BufReader::new(connection).read_line(&mut response).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "bind failure must preserve serving: {response}"
+    );
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-TERM", &proxy.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_exit(&mut proxy, 15);
+    let mut stderr = String::new();
+    proxy
+        .child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.contains("listener handoff disabled"),
+        "bind failure must warn: {stderr}"
+    );
+    let path = tcr::restart::socket_path(proxy.child.id());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "fixture endpoint holder did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reader.join().unwrap();
+}
