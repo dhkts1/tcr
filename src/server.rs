@@ -2708,7 +2708,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reviewer_handoff_stops_the_predecessor_fan_before_release() {
         use std::io::{Read, Write};
-        use tcr_fan::controller::{Command, FanMode};
+        use tcr_fan::controller::{Command, FanDesired};
         let dir = tempfile::tempdir().unwrap();
         let fan = crate::fan::start(dir.path().join("fan.json")).unwrap();
         let manager = inert_manager();
@@ -2737,7 +2737,7 @@ mod tests {
         handle.handoff(&ours).await.unwrap();
         receiver.join().unwrap();
         assert!(manager.mutation_is_released(), "handoff must finish first");
-        let still_accepts = fan.send(Command::Set(FanMode::Auto)).is_ok();
+        let still_accepts = fan.send(Command::Set(FanDesired::Auto)).is_ok();
         // Close our own thread even when the assertion below fails.
         tokio::task::spawn_blocking(move || fan.shutdown(Duration::from_secs(1)))
             .await
@@ -2752,7 +2752,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reviewer_control_handoff_with_fan_already_stopped() {
         use std::io::{Read, Write};
-        use tcr_fan::controller::{Command, FanMode};
+        use tcr_fan::controller::{Command, FanDesired};
         let dir = tempfile::tempdir().unwrap();
         let fan = crate::fan::start(dir.path().join("fan.json")).unwrap();
         let manager = inert_manager();
@@ -2785,7 +2785,7 @@ mod tests {
         handle.handoff(&ours).await.unwrap();
         receiver.join().unwrap();
         assert!(manager.mutation_is_released(), "handoff must finish first");
-        let still_accepts = fan.send(Command::Set(FanMode::Auto)).is_ok();
+        let still_accepts = fan.send(Command::Set(FanDesired::Auto)).is_ok();
         // Close our own thread even when the assertion below fails.
         tokio::task::spawn_blocking(move || fan.shutdown(Duration::from_secs(1)))
             .await
