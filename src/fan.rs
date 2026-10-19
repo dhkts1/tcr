@@ -1275,7 +1275,7 @@ mod tests {
         let (old, _) = FileStore::open(path.clone(), 300);
         assert!((before..ahead).contains(&*old.sent.lock().unwrap()));
         std::fs::write(&path, "{").unwrap();
-        let (unreadable, saved) = FileStore::open(path.clone(), 300);
+        let (unreadable, saved) = FileStore::open(path, 300);
         assert_eq!(saved, None);
         assert!((before..ahead).contains(&*unreadable.sent.lock().unwrap()));
     }
