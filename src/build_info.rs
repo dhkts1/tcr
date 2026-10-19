@@ -518,6 +518,46 @@ fn git_in(root: &Path, args: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn review_guidance_requires_a_compatible_incumbent() {
+        let ours = build("9f3a1b2", Some(false));
+        for running in [
+            None,
+            Some(build("unknown", None)),
+            Some(build("cd146ce", Some(false))),
+        ] {
+            let report = stand_down_build_report(12345, &ours, running.as_ref(), None);
+            assert!(
+                report.line.contains("if it runs this version or newer"),
+                "first-upgrade guidance: {}",
+                report.line
+            );
+            assert!(report.line.contains("stop it"), "{}", report.line);
+        }
+        let cli = include_str!("../docs/cli.md");
+        for clause in [
+            "30-second ceiling",
+            "HTTP/2 receives GOAWAY",
+            "cannot refresh tokens after releasing ownership",
+            "failed handshake shuts it down",
+            "Shell tools use the caller's network settings.",
+            "private helper directory",
+        ] {
+            assert!(
+                cli.contains(clause),
+                "missing shipped CLI contract: {clause}"
+            );
+        }
+        assert!(
+            include_str!("../README.md").contains("docs/cli.md#tcr-run----args"),
+            "README run link must resolve"
+        );
+        assert!(
+            include_str!("../docs/troubleshooting.md").contains("if it runs this version or newer"),
+            "troubleshooting must explain first upgrade"
+        );
+    }
+
     fn build(sha: &str, dirty: Option<bool>) -> BuildInfo {
         BuildInfo {
             sha: sha.to_string(),
