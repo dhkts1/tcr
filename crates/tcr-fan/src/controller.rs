@@ -551,8 +551,9 @@ pub struct Parts<H, R, P, C, S> {
     /// This process, for the hold record.
     pub pid: u32,
     /// Where command numbers start: every command this process is sent is
-    /// numbered above it. The proxy seeds it from the wall clock, so a
-    /// command sent to a process that has since restarted reads as acted on.
+    /// numbered above it. The proxy seeds it from the wall clock, or one past
+    /// the last number it saved when that is higher, so a command sent to a
+    /// process that has since restarted reads as acted on.
     pub commands_before: u64,
 }
 

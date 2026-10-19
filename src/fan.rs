@@ -78,6 +78,11 @@ struct FanFile {
     desired: FanDesiredRow,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hold: Option<HoldFile>,
+    /// The newest command number the writer had given out when it saved, so
+    /// the next process numbers above it ([`commands_before`]). Absent from a
+    /// file an older tcr wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -96,10 +101,11 @@ struct HeldFanFile {
 }
 
 impl FanFile {
-    fn of(saved: &Saved, saved_at_ms: i64) -> Self {
+    fn of(saved: &Saved, saved_at_ms: i64, command: u64) -> Self {
         Self {
             version: FAN_FILE_VERSION,
             saved_at_ms,
+            command: Some(command),
             desired: desired_row(saved.desired),
             hold: saved.hold.as_ref().map(|hold| HoldFile {
                 writer_pid: hold.writer_pid,
@@ -153,7 +159,7 @@ fn load_file(path: &Path) -> (Option<Saved>, Option<FanFile>) {
     match read_cache::<FanFile>(path, FAN_FILE_VERSION) {
         CacheRead::Missing => (None, None),
         CacheRead::Degraded(why) => {
-            tracing::warn!(path = %path.display(), "fan control: ignored the saved fan mode ({why}); starting on automatic");
+            tracing::warn!(path = %path.display(), "fan control: ignored the saved fan mode ({why}); starting on automatic, numbering fan commands from the clock");
             (None, None)
         }
         CacheRead::Read(file) => match file.clone().parse() {
@@ -164,6 +170,16 @@ fn load_file(path: &Path) -> (Option<Saved>, Option<FanFile>) {
             }
         },
     }
+}
+
+/// Where a process's command numbers start: the wall clock in ms, or one past
+/// the last number an earlier process saved when that is higher (the clock
+/// went back, or that process gave out more numbers than milliseconds passed
+/// before this start). So the counter never goes backwards across a restart,
+/// and a command sent to an earlier process reads as acted on.
+fn commands_before(saved: Option<u64>, clock_ms: i64) -> u64 {
+    let clock = u64::try_from(clock_ms).unwrap_or(0);
+    saved.map_or(clock, |last| clock.max(last.saturating_add(1)))
 }
 
 /// `fan.json`, written by one process at a time.
@@ -182,18 +198,26 @@ struct FileStore {
     known: Option<FanFile>,
     /// Said once that the file is another process's now.
     yielded: bool,
+    /// The newest command number given out, shared with [`FanHandle::sent`]:
+    /// every save writes it, so the next process numbers above it.
+    sent: Arc<Mutex<u64>>,
 }
 
 impl FileStore {
-    /// The store for `path`, and the wish saved there.
+    /// The store for `path`, and the wish saved there. Its
+    /// [`Self::sent`] starts at [`commands_before`] for the number saved
+    /// there and the clock now.
     fn open(path: PathBuf, pid: u32) -> (Self, Option<Saved>) {
         let (saved, known) = load_file(&path);
+        let last = known.as_ref().and_then(|file| file.command);
+        let first = commands_before(last, wall_ms());
         (
             Self {
                 path,
                 pid,
                 known,
                 yielded: false,
+                sent: Arc::new(Mutex::new(first)),
             },
             saved,
         )
@@ -227,7 +251,8 @@ impl Store for FileStore {
             }
             return;
         }
-        let file = FanFile::of(saved, wall_ms());
+        let command = *self.sent.lock().unwrap_or_else(PoisonError::into_inner);
+        let file = FanFile::of(saved, wall_ms(), command);
         match write_cache(&self.path, &file, Layout::Pretty) {
             Ok(()) => self.known = Some(file),
             Err(error) => {
@@ -432,9 +457,10 @@ pub struct FanHandle {
     tx: Sender<Input>,
     /// The controller's last snapshot, wish included.
     shown: Arc<Mutex<Snapshot>>,
-    /// The number of the last command sent. Held across the send, so numbers
-    /// follow channel order, which the controller acts in.
-    sent: Mutex<u64>,
+    /// The number of the last command sent, shared with the store so every
+    /// save persists it. Held across the send, so numbers follow channel
+    /// order, which the controller acts in.
+    sent: Arc<Mutex<u64>>,
     /// Hears once when the thread's loop returns.
     done: Mutex<mpsc::Receiver<()>>,
 }
@@ -496,9 +522,8 @@ impl FanHandle {
 pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
     let (store, saved) = FileStore::open(file, std::process::id());
     let desired = saved.as_ref().map_or(FanDesired::Auto, |s| s.desired);
-    // Above any number an earlier process gave out, unless one gave out more
-    // commands than milliseconds passed between the two starts.
-    let commands_before = u64::try_from(wall_ms()).unwrap_or(0);
+    let sent = Arc::clone(&store.sent);
+    let commands_before = *sent.lock().unwrap_or_else(PoisonError::into_inner);
     let (tx, rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let shown = Arc::new(Mutex::new(Snapshot {
@@ -544,7 +569,7 @@ pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
     Ok(Arc::new(FanHandle {
         tx,
         shown,
-        sent: Mutex::new(commands_before),
+        sent,
         done: Mutex::new(done_rx),
     }))
 }
@@ -629,7 +654,7 @@ fn inert(saved: Option<Saved>) -> (Arc<FanHandle>, Inert) {
     let handle = Arc::new(FanHandle {
         tx,
         shown,
-        sent: Mutex::new(0),
+        sent: Arc::new(Mutex::new(0)),
         done: Mutex::new(done_rx),
     });
     (handle, controller)
@@ -1213,6 +1238,46 @@ mod tests {
         let (mut next, _) = FileStore::open(path.clone(), 300);
         next.save(&held_by(300, false));
         assert_eq!(load(&path), Some(held_by(300, false)));
+    }
+
+    /// The command counter never goes backwards across a restart: a number
+    /// saved above the clock (the clock went back, or many commands in a
+    /// short run) wins, and the next process numbers past it.
+    #[test]
+    fn fan_file_a_saved_command_number_above_the_clock_wins() {
+        assert_eq!(commands_before(None, 1_000), 1_000);
+        assert_eq!(commands_before(Some(5), 1_000), 1_000);
+        assert_eq!(commands_before(Some(5_000), 1_000), 5_001);
+        assert_eq!(commands_before(None, -1), 0, "a clock before 1970");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fan.json");
+        let ahead = u64::try_from(wall_ms()).unwrap() + 3_600_000;
+        let (mut first, _) = FileStore::open(path.clone(), 100);
+        *first.sent.lock().unwrap() = ahead;
+        first.save(&held_by(100, false));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["command"], ahead, "{text}");
+
+        let (next, saved) = FileStore::open(path.clone(), 200);
+        assert_eq!(saved, Some(held_by(100, false)));
+        assert_eq!(*next.sent.lock().unwrap(), ahead + 1);
+
+        // A file an older tcr wrote, with no number, and an unreadable one:
+        // the clock.
+        std::fs::write(
+            &path,
+            r#"{"version":1,"savedAtMs":0,"desired":{"mode":"auto"}}"#,
+        )
+        .unwrap();
+        let before = u64::try_from(wall_ms()).unwrap();
+        let (old, _) = FileStore::open(path.clone(), 300);
+        assert!((before..ahead).contains(&*old.sent.lock().unwrap()));
+        std::fs::write(&path, "{").unwrap();
+        let (unreadable, saved) = FileStore::open(path.clone(), 300);
+        assert_eq!(saved, None);
+        assert!((before..ahead).contains(&*unreadable.sent.lock().unwrap()));
     }
 
     /// A panic on the controller's thread leaves `unavailable /

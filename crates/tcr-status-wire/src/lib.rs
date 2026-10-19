@@ -457,8 +457,9 @@ pub struct FanControlRow {
     pub detail: Option<String>,
     /// The number of the newest command the controller has acted on (taking one does not move
     /// it). `POST /_tcr/fan` answers with the number it gave the command; `tcr fan` waits for
-    /// this to reach it. Numbers start from the wall clock in ms when the server starts, so a
-    /// server restarted since reads as having acted on every command sent before.
+    /// this to reach it. Numbers start from the wall clock in ms when the server starts, or one
+    /// past the last number it saved when that is higher, so a server restarted since reads as
+    /// having acted on every command sent before.
     pub command: u64,
     /// Milliseconds since the Unix epoch when the state last changed, or the controller last
     /// acted on a command; it moves with `command`. Written only for 1.2.12's `tcr fan`, which

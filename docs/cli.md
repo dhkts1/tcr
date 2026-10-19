@@ -2600,7 +2600,8 @@ file means Auto.
 - `targets`: what this server last wrote to each fan it holds.
 - `detail`: a sentence for a person, or `null`.
 - `command`: the number of the newest command the controller has acted on. Numbers start from
-  the server's start time in milliseconds and go up by one per command.
+  the server's start time in milliseconds, or one past the last number saved in `fan.json` when
+  that is higher, so they never go backwards across a restart; they go up by one per command.
 - `sinceMs`: milliseconds since the Unix epoch when the state last changed or the controller last
   acted on a command. Written only for `tcr fan` 1.2.12, which waits on it; nothing newer reads
   it, and it goes after the release after next.
