@@ -1,0 +1,22 @@
+[package]
+name = "tcr-fan-helper"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "PolyForm-Noncommercial-1.0.0"
+publish = false
+description = "TcrBar's root fan helper: four XPC operations that set fan speeds, accepted only from the signed tcr proxy"
+
+[lints]
+workspace = true
+
+# Runs as root, so it links the SMC writer and the fan contract and nothing
+# else: no TLS, no HTTP, no OAuth, nothing of the proxy. It is its own binary,
+# never a `tcr` subcommand, for exactly that reason.
+[dependencies]
+tcr-smc = { path = "../tcr-smc" }
+tcr-fan = { path = "../tcr-fan" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `syslog`, `signal` and `exit`. Already in the tree.
+libc = "0.2"

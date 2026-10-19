@@ -479,8 +479,20 @@ impl ServerHandle {
     /// existing handoff ownership gate has been released.
     pub async fn handoff(&mut self, peer: &std::os::unix::net::UnixStream) -> anyhow::Result<()> {
         crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
-        self.stop_tasks(tokio::time::Instant::now() + DEFAULT_SHUTDOWN_GRACE)
-            .await;
+        let deadline = tokio::time::Instant::now() + DEFAULT_SHUTDOWN_GRACE;
+        // The controller also mutates hardware and saves its wish. Finish its
+        // last save before the successor can take ownership and save Auto;
+        // accepted connections may keep draining after that release.
+        if let Some(fan) = self.manager.fan() {
+            let fan = Arc::clone(fan);
+            let stop = tokio::task::spawn_blocking(move || fan.shutdown(DEFAULT_SHUTDOWN_GRACE));
+            let stopped = tokio::time::timeout_at(deadline, stop)
+                .await
+                .context("fan control exceeded the handoff shutdown grace")?
+                .context("fan control shutdown task failed")?;
+            anyhow::ensure!(stopped, "fan control did not stop before handoff");
+        }
+        self.stop_tasks(deadline).await;
         self.flush_cache_finally(SavedCache::BoundTokens);
         self.flush_cache_finally(SavedCache::WireSessions);
         let listener = self.listener.as_ref().context("no listener to hand over")?;
@@ -585,6 +597,19 @@ impl ServerHandle {
         self.listener.take();
         crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
         let deadline = tokio::time::Instant::now() + grace;
+
+        // Fans first, while the process is still whole: the controller hands
+        // back what it holds within `fan::SHUTDOWN_HAND_BACK` (3 s, inside
+        // this grace). It blocks, so it waits on the blocking pool; if it runs
+        // over, the helper connection closes with the process and root hands
+        // back on its own.
+        if let Some(fan) = self.manager.fan() {
+            let fan = Arc::clone(fan);
+            let stop = tokio::task::spawn_blocking(move || fan.shutdown(grace));
+            if tokio::time::timeout_at(deadline, stop).await.is_err() {
+                tracing::warn!("fan control did not stop inside the shutdown grace");
+            }
+        }
 
         self.stop_tasks(deadline).await;
 
@@ -2679,6 +2704,98 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_handoff_stops_the_predecessor_fan_before_release() {
+        use std::io::{Read, Write};
+        use tcr_fan::controller::{Command, FanDesired};
+        let dir = tempfile::tempdir().unwrap();
+        let fan = crate::fan::start(dir.path().join("fan.json")).unwrap();
+        let manager = inert_manager();
+        manager.install_fan(Arc::clone(&fan));
+        let (shutdown, _rx) = watch::channel(false);
+        let mut handle = handle_full(
+            shutdown,
+            tokio::spawn(async {}),
+            Vec::new(),
+            Arc::clone(&manager),
+            None,
+        );
+        handle.listener = Some(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let (ours, mut successor) = std::os::unix::net::UnixStream::pair().unwrap();
+        let receiver = std::thread::spawn(move || {
+            successor
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let listener = tcr_fdpass::recv_listener(&successor).unwrap();
+            successor.write_all(b"listener-received\n").unwrap();
+            let mut released = [0u8; 18];
+            successor.read_exact(&mut released).unwrap();
+            assert_eq!(&released, b"listener-released\n");
+            drop(listener);
+        });
+        handle.handoff(&ours).await.unwrap();
+        receiver.join().unwrap();
+        assert!(manager.mutation_is_released(), "handoff must finish first");
+        let still_accepts = fan.send(Command::Set(FanDesired::Auto)).is_ok();
+        // Close our own thread even when the assertion below fails.
+        tokio::task::spawn_blocking(move || fan.shutdown(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        handle.shutdown().await;
+        assert!(
+            !still_accepts,
+            "predecessor fan controller still accepts mutations after the listener and ownership were released"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_control_handoff_with_fan_already_stopped() {
+        use std::io::{Read, Write};
+        use tcr_fan::controller::{Command, FanDesired};
+        let dir = tempfile::tempdir().unwrap();
+        let fan = crate::fan::start(dir.path().join("fan.json")).unwrap();
+        let manager = inert_manager();
+        manager.install_fan(Arc::clone(&fan));
+        let (shutdown, _rx) = watch::channel(false);
+        let mut handle = handle_full(
+            shutdown,
+            tokio::spawn(async {}),
+            Vec::new(),
+            Arc::clone(&manager),
+            None,
+        );
+        handle.listener = Some(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let (ours, mut successor) = std::os::unix::net::UnixStream::pair().unwrap();
+        let receiver = std::thread::spawn(move || {
+            successor
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let listener = tcr_fdpass::recv_listener(&successor).unwrap();
+            successor.write_all(b"listener-received\n").unwrap();
+            let mut released = [0u8; 18];
+            successor.read_exact(&mut released).unwrap();
+            assert_eq!(&released, b"listener-released\n");
+            drop(listener);
+        });
+        let stopped_fan = Arc::clone(&fan);
+        tokio::task::spawn_blocking(move || stopped_fan.shutdown(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        handle.handoff(&ours).await.unwrap();
+        receiver.join().unwrap();
+        assert!(manager.mutation_is_released(), "handoff must finish first");
+        let still_accepts = fan.send(Command::Set(FanDesired::Auto)).is_ok();
+        // Close our own thread even when the assertion below fails.
+        tokio::task::spawn_blocking(move || fan.shutdown(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        handle.shutdown().await;
+        assert!(
+            !still_accepts,
+            "predecessor fan controller still accepts mutations after the listener and ownership were released"
+        );
+    }
 
     #[test]
     fn worker_threads_default_to_four_or_the_cores_and_honour_the_override() {

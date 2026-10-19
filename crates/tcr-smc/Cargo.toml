@@ -1,0 +1,18 @@
+[package]
+name = "tcr-smc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "PolyForm-Noncommercial-1.0.0"
+publish = false
+description = "Fan speeds and CPU temperature from the Mac's System Management Controller, read through AppleSMC without root"
+
+[lints]
+workspace = true
+
+# No dependencies, on purpose. The AppleSMC calls are six IOKit functions and
+# one Mach static, declared by hand in `src/lib.rs`; the crate that would wrap
+# them (`IOKit-sys` and friends) is a new package for twenty lines of `extern`.
+# Built on Linux by CI's `cargo test --all`, where every AppleSMC item is
+# `#[cfg(target_os = "macos")]` and the reader reports "unavailable".
+[dependencies]

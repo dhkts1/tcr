@@ -201,17 +201,18 @@ tags alone and can never be reached from a pull request.
 
 | Job | Runner | What it runs |
 | --- | --- | --- |
-| `ci` **(required)** | ubuntu | `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --all --locked`, `cargo build --release --locked` |
+| `ci` **(required)** | ubuntu | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --all --locked`, `cargo build --release --locked` |
 | `audit` **(required)** | ubuntu | `cargo audit` against `Cargo.lock`: fails on real RustSec advisories, warns on unmaintained deps |
-| `macos` **(required)** | macOS | `cargo test --all --locked` again (different code paths: `src/singleton.rs` shells out to BSD `ps`/`lsof`, install placement relies on `rename(2)`, `$TMPDIR` is a sandbox path), plus `swift-format lint --strict`, `swift build` and `swift test` for the TcrBar app |
+| `macos` **(required)** | macOS | `cargo test --all --locked` again (different code paths: `src/singleton.rs` shells out to BSD `ps`/`lsof`, install placement relies on `rename(2)`, `$TMPDIR` is a sandbox path), the same clippy command as `ci` (only here does it compile the `#[cfg(target_os = "macos")]` code), plus `swift-format lint --strict`, `swift build` and `swift test` for the TcrBar app |
 | `tsan` | ubuntu | ThreadSanitizer on nightly over the `concurrent_pacing_stress` harness and every `concurrent_lock_stress` test (the bound-token map and the usage buckets) |
 | `miri` | ubuntu | UB detection over the pure leaf modules (`model::`, `account_uuid::`, `quota::`). `continue-on-error`, so it is informational rather than a gate |
 
 `--locked` everywhere is deliberate: CI must fail rather than silently rewrite `Cargo.lock`, because
 this is an auth-handling proxy and the reviewed dependency set is the one that should ship.
 
-The `ci` job's clippy runs on Linux, and clippy on a Mac never sees the Linux side of a
-`#[cfg(target_os = "macos")]` block: an import only macOS code uses passes locally and fails there.
+Clippy runs in both `ci` (Linux) and `macos`, because each OS compiles only its own side of a
+`#[cfg(target_os = "macos")]` block. Clippy on a Mac never sees the Linux side: an import only macOS
+code uses passes locally and fails in `ci`.
 Before pushing a change that touches such code or its imports, run `scripts/linux-clippy.sh`, which
 runs the same clippy command in a Docker container on the pinned toolchain and prints every hit.
 

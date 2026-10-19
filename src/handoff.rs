@@ -252,6 +252,17 @@ mod tests {
         );
     }
 
+    /// The root fan helper's requirements carry their own copy of the team
+    /// clause (`tcr_fan::identity::TEAM`). One value, checked here rather than
+    /// copied unwatched: a change to either breaks this test.
+    #[test]
+    fn handoff_and_fan_team_clause_match() {
+        assert_eq!(
+            PEER_REQUIREMENT,
+            format!("anchor apple generic{}", tcr_fan::identity::TEAM)
+        );
+    }
+
     /// After a handoff this process is draining, not owning. A request that
     /// still lands on it must not rotate a token the successor is holding.
     #[tokio::test]

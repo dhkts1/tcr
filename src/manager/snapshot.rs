@@ -135,6 +135,19 @@ impl Manager {
         }
     }
 
+    /// Attach the fan controller. Once: a second call is refused and logged,
+    /// because two controllers would both dial the helper.
+    pub fn install_fan(&self, handle: Arc<crate::fan::FanHandle>) {
+        if self.fan.set(handle).is_err() {
+            tracing::warn!("a fan controller is already attached; the second one was not");
+        }
+    }
+
+    /// The fan controller, when this process runs one.
+    pub fn fan(&self) -> Option<&Arc<crate::fan::FanHandle>> {
+        self.fan.get()
+    }
+
     /// Every group on the fleet mapped to its resolved color — hot-reloaded
     /// from `groupSettings` on the same cadence [`Self::snapshot`] and
     /// selection reload (see [`Self::reload_groups_if_changed`]'s doc); a

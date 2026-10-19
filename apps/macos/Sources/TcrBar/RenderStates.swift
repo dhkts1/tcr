@@ -1,7 +1,6 @@
 import AppKit
 import SwiftUI
 import TcrBarCore
-import TcrSMC
 
 /// Rasterise every panel state to PNG, in-process, then exit.
 ///
@@ -199,6 +198,17 @@ enum RenderStates {
             ("17e-tools-tab-heat-fans-off", .loaded(sessionsTabFleet), false, nil),
             ("17f-tools-tab-heat-no-fans", .loaded(sessionsTabFleet), false, nil),
             ("17g-tools-tab-heat-worst-case", .loaded(heatWorstCaseFleet), false, nil),
+            // Fan control, mockup panels 7 to 11: the numbers line under each
+            // popover, `fans off` (7, 8), ` fixed` (9), no word in Follow CPU
+            // (10), ` manual` while Macs Fan Control holds the fans (11). Scene
+            // 17 but the machine reading, like 17d to 17g. The popover itself
+            // is ``fanPopoverScenes``: `ImageRenderer` draws a view, never a
+            // presentation.
+            ("17h-tools-tab-fan-install", .loaded(sessionsTabFleet), false, nil),
+            ("17i-tools-tab-fan-approval", .loaded(sessionsTabFleet), false, nil),
+            ("17j-tools-tab-fan-fixed", .loaded(sessionsTabFleet), false, nil),
+            ("17k-tools-tab-fan-follow-cpu", .loaded(sessionsTabFleet), false, nil),
+            ("17l-tools-tab-fan-another-app", .loaded(sessionsTabFleet), false, nil),
             // The same two tabs at the LIVE fleet's measured dimensions
             // instead of the mockup's — see `realShapeFleet`. These are the
             // only scenes where TIMED OUT TODAY is absent (the real fleet
@@ -698,7 +708,9 @@ enum RenderStates {
         case "17-tools-tab", "17b-tools-tab-timeout-class-open", "18b-tools-tab-old-server",
             "18d-tools-tab-old-tcr", "22-tools-tab-real-fleet", "17c-tools-tab-codex",
             "27-one-height-tools", "17d-tools-tab-heat-manual", "17e-tools-tab-heat-fans-off",
-            "17f-tools-tab-heat-no-fans", "17g-tools-tab-heat-worst-case":
+            "17f-tools-tab-heat-no-fans", "17g-tools-tab-heat-worst-case",
+            "17h-tools-tab-fan-install", "17i-tools-tab-fan-approval", "17j-tools-tab-fan-fixed",
+            "17k-tools-tab-fan-follow-cpu", "17l-tools-tab-fan-another-app":
             return .tools
         case "27-one-height-peers":
             return .peers
@@ -1007,6 +1019,13 @@ enum RenderStates {
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderControl(scene, appearance: appearance, into: directory) { written += 1 }
+            }
+        }
+        for scene in fanPopoverScenes where filter.admits(scene.name) {
+            matched += 1
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderFanPopover(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
         for scene in tabStripScenes where filter.admits(scene.name) {
@@ -3276,13 +3295,16 @@ enum RenderStates {
     /// 6 is every clause at its widest, design figures, none of them measured:
     /// it is the line that must still fit the reserved lines.
     private static let heatScenes: [String: MachineStats] = {
-        func machine(_ heat: HeatReading) -> MachineStats {
+        func machine(_ heat: HeatReading, _ fanControl: FanControl? = nil) -> MachineStats {
             MachineStats(
                 loadAverage: machineFixture.loadAverage, cores: machineFixture.cores,
                 memoryUsedBytes: machineFixture.memoryUsedBytes,
                 memoryTotalBytes: machineFixture.memoryTotalBytes,
                 compiles: machineFixture.compiles, diskFreeBytes: machineFixture.diskFreeBytes,
-                heat: heat)
+                heat: heat, fanControl: fanControl)
+        }
+        func fanScene(_ panel: FanScene) -> MachineStats {
+            machine(panel.heat, panel.fanControl)
         }
         func fan(_ index: Int, _ actual: Double, manual: Bool) -> FanReading {
             FanReading(index: index, actualRPM: actual, minRPM: 1_350, maxRPM: 5_777, isManual: manual)
@@ -3308,8 +3330,111 @@ enum RenderStates {
                 diskFreeBytes: 1_024_000_000_000,
                 heat: HeatReading(
                     cpuCelsius: 105, fans: [fan(0, 5_777, manual: true), fan(1, 5_777, manual: true)])),
+            // "CPU 46°C · fans off", panels 7 and 8.
+            "17h-tools-tab-fan-install": fanScene(.install),
+            "17i-tools-tab-fan-approval": fanScene(.approval),
+            // "CPU 93°C · fans 87% fixed", panel 9.
+            "17j-tools-tab-fan-fixed": fanScene(.fixed),
+            // "CPU 93°C · fans 100%", panel 10.
+            "17k-tools-tab-fan-follow-cpu": fanScene(.followCPU),
+            // "CPU 93°C · fans 87% manual", panel 11.
+            "17l-tools-tab-fan-another-app": fanScene(.anotherApp),
         ]
     }()
+
+    // MARK: - Fan control, mockup panels 7 to 11
+
+    /// The facts behind each fan panel: the poll's `heat` and `fanControl`,
+    /// and macOS's answer for the helper. Panel 11's heat is the Mac16,7
+    /// reading of 2026-10-18 with Macs Fan Control holding both fans at 5,000
+    /// rpm; the rest are the mockup's illustrative figures.
+    enum FanScene: CaseIterable {
+        case install, approval, fixed, followCPU, anotherApp
+
+        private static func fan(_ index: Int, _ actual: Double, target: Double?) -> FanReading {
+            FanReading(
+                index: index, actualRPM: actual, minRPM: 1_350, maxRPM: 5_777,
+                isManual: target != nil, targetRPM: target)
+        }
+
+        /// A quiet box, fans automatic and stopped (7, 8); both held at 5,000
+        /// (9, 11); Follow CPU past full speed (10).
+        var heat: HeatReading {
+            switch self {
+            case .install, .approval:
+                return HeatReading(
+                    cpuCelsius: 46, fans: [Self.fan(0, 0, target: nil), Self.fan(1, 0, target: nil)])
+            case .fixed, .anotherApp:
+                return HeatReading(
+                    cpuCelsius: 93.3,
+                    fans: [Self.fan(0, 5_013, target: 5_000), Self.fan(1, 4_976, target: 5_000)])
+            case .followCPU:
+                return HeatReading(
+                    cpuCelsius: 93,
+                    fans: [Self.fan(0, 5_777, target: 5_777), Self.fan(1, 5_777, target: 5_777)])
+            }
+        }
+
+        /// 7 and 8: Fixed asked for at the slowest speed, since the fans were at
+        /// rest, and the proxy cannot reach a helper yet.
+        var fanControl: FanControl {
+            switch self {
+            case .install, .approval:
+                return FanControl(
+                    desired: .fixed(rpm: 1_350), state: .unavailable, reason: .helperUnreachable)
+            case .fixed:
+                return FanControl(
+                    desired: .fixed(rpm: 5_000), state: .holding,
+                    targets: [FanTarget(fan: 0, rpm: 5_000), FanTarget(fan: 1, rpm: 5_000)])
+            case .followCPU:
+                return FanControl(
+                    desired: .followCPU(.starting), state: .holding,
+                    targets: [FanTarget(fan: 0, rpm: 5_777), FanTarget(fan: 1, rpm: 5_777)])
+            case .anotherApp:
+                return FanControl(desired: .auto, state: .foreign, reason: .macsFanControl)
+            }
+        }
+
+        var registration: FanHelperRegistration.Status {
+            switch self {
+            case .install: return .notRegistered
+            case .approval: return .requiresApproval
+            case .fixed, .followCPU, .anotherApp: return .enabled
+            }
+        }
+
+        var popoverSceneName: String {
+            switch self {
+            case .install: return "17h-fan-popover-install"
+            case .approval: return "17i-fan-popover-approval"
+            case .fixed: return "17j-fan-popover-fixed"
+            case .followCPU: return "17k-fan-popover-follow-cpu"
+            case .anotherApp: return "17l-fan-popover-another-app"
+            }
+        }
+    }
+
+    /// The popover's content, one PNG per mockup panel, from a pinned model:
+    /// no `tcr fan`, no registration read or write.
+    private static var fanPopoverScenes: [(name: String, scene: FanScene)] {
+        FanScene.allCases.map { ($0.popoverSceneName, $0) }
+    }
+
+    @MainActor
+    private static func renderFanPopover(
+        _ entry: (name: String, scene: FanScene), appearance: Appearance, into directory: URL
+    ) -> Bool {
+        withDrawingAppearance(appearance.nsAppearance) {
+            let model = FanControlModel.pinned(
+                fanControl: entry.scene.fanControl, heat: entry.scene.heat,
+                registration: entry.scene.registration)
+            let view = FanPopover(fans: model)
+                .background(Tok.panel)
+                .environment(\.colorScheme, appearance == .dark ? .dark : .light)
+                .fixedSize()
+            return rasterise(view, named: "\(entry.name)-\(appearance.rawValue).png", into: directory)
+        }
+    }
 
     /// Scene 17's fleet plus one session that carries no running call, sized
     /// so the fleet's totals read `99 err today · 9999 timed out`: the
