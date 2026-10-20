@@ -945,6 +945,21 @@ fn stable_session_key(
 /// ever answers locally belongs under this prefix.
 pub const STATUS_PATH: &str = "/_tcr/status";
 
+/// Path of the peer dial route [`peer_dial_handler`] serves: the CLI asks the
+/// running tcr to dial a tailnet address through tcr's own tailnet node, which
+/// lives in this process, and gets the connection back as a byte stream.
+/// `POST` with `Upgrade: tcr-peer-dial`, behind [`local_endpoint_gate`].
+pub const PEER_DIAL_PATH: &str = "/_tcr/peer/dial";
+
+/// The `Upgrade` protocol token [`PEER_DIAL_PATH`] answers `101` to.
+pub const PEER_DIAL_UPGRADE: &str = "tcr-peer-dial";
+
+/// The request header naming the socket [`PEER_DIAL_PATH`] dials.
+pub const PEER_DIAL_TARGET_HEADER: &str = "x-tcr-dial";
+
+/// The [`ENDPOINT_HEADER`] value the peer dial route stamps.
+pub const PEER_DIAL_ENDPOINT: &str = "peer-dial";
+
 /// Path of the light quota read [`quota_handler`] serves, for a status line that
 /// ticks every turn: per account its gate and its 5-hour and weekly utilization,
 /// read from memory. `GET` only, behind the same gate as [`STATUS_PATH`].
@@ -1683,6 +1698,11 @@ pub fn app(manager: Arc<Manager>) -> Router {
             FAN_PATH,
             axum::routing::post(fan_handler).fallback(|| async { method_not_allowed(&FAN_ROUTE) }),
         )
+        .route(
+            PEER_DIAL_PATH,
+            axum::routing::post(peer_dial_handler)
+                .fallback(|| async { method_not_allowed(&PEER_DIAL_ROUTE) }),
+        )
         .fallback(handle)
         .with_state(manager)
 }
@@ -2017,6 +2037,146 @@ const FAN_ROUTE: LocalRoute = LocalRoute {
     verbs: "POST",
     advertises_providers: false,
 };
+
+const PEER_DIAL_ROUTE: LocalRoute = LocalRoute {
+    name: "peer dial",
+    stamp: PEER_DIAL_ENDPOINT,
+    verbs: "POST",
+    advertises_providers: false,
+};
+
+/// `POST /_tcr/peer/dial`: dial a tailnet address through tcr's own tailnet
+/// node and hand the connection back to the local caller as a byte stream.
+///
+/// # Why this exists
+///
+/// The knock, the first pairing and the join run in the CLI process, and the
+/// TcrBar Trust button spawns that CLI. tcr's own node lives in THIS process,
+/// and a Mac in node mode has no `utun` for the kernel to route a `100.x`
+/// address through. So the CLI asks here; its Noise code is unchanged, and
+/// only where its socket comes from differs. See `crate::peer::tailnet_node`.
+///
+/// # What guards it
+///
+/// [`local_endpoint_gate`], like every `/_tcr/` route: loopback caller, the
+/// api key when one is set, a loopback host, not cross-site. Then it dials
+/// only a tailnet address, and only through the node: it is never a general
+/// connect-anywhere relay, and it does nothing in a process running no node.
+/// The dial happens BEFORE the `101`, so a refusal is an ordinary answer the
+/// CLI can read, not a stream that closes.
+async fn peer_dial_handler(State(manager): State<Arc<Manager>>, request: Request) -> Response {
+    let (mut parts, _body) = request.into_parts();
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, PEER_DIAL_ROUTE.name) {
+        return refusal;
+    }
+    let refuse = |status: StatusCode, message: &str| {
+        route_error(&PEER_DIAL_ROUTE, status, ErrorKind::InvalidRequest, message)
+    };
+    let wants_upgrade = parts
+        .headers
+        .get(axum::http::header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case(PEER_DIAL_UPGRADE));
+    if !wants_upgrade {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            &format!("The tcr peer dial endpoint answers `Upgrade: {PEER_DIAL_UPGRADE}` only."),
+        );
+    }
+    let Some(target) = parts
+        .headers
+        .get(PEER_DIAL_TARGET_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<SocketAddr>().ok())
+    else {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "The tcr peer dial endpoint needs a socket address in `{PEER_DIAL_TARGET_HEADER}`."
+            ),
+        );
+    };
+    let Some(on_upgrade) = parts.extensions.remove::<hyper::upgrade::OnUpgrade>() else {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "The tcr peer dial endpoint needs an HTTP/1.1 connection it can upgrade.",
+        );
+    };
+    use crate::peer::tailnet_node::RouteDial;
+    let stream = match crate::peer::tailnet_node::dial_for_route(
+        target,
+        crate::peer::tailnet_node::DIAL_TIMEOUT,
+    )
+    .await
+    {
+        RouteDial::NoNode | RouteDial::NotTailnet => {
+            return route_error(
+                &PEER_DIAL_ROUTE,
+                StatusCode::CONFLICT,
+                ErrorKind::InvalidRequest,
+                &format!(
+                    "This tcr is not running its own tailnet node, or {target} is not a tailnet \
+                     address."
+                ),
+            );
+        }
+        // Gil, 2026-10-20: peer ports only, refused before the node is asked
+        // for anything (`tailnet_node::allowed_dial_ports`).
+        RouteDial::PortRefused(why) => {
+            return route_error(
+                &PEER_DIAL_ROUTE,
+                StatusCode::FORBIDDEN,
+                ErrorKind::Permission,
+                &format!("The tcr peer dial endpoint refused: {why}."),
+            );
+        }
+        RouteDial::Failed(err) => {
+            return route_error(
+                &PEER_DIAL_ROUTE,
+                StatusCode::BAD_GATEWAY,
+                ErrorKind::Api,
+                &format!("Could not reach {target} through the tailnet node: {err:#}"),
+            );
+        }
+        RouteDial::Dialled(stream) => stream,
+    };
+
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                let (up, down) = crate::peer::tailnet_node::splice_until_either_ends(
+                    hyper_util::rt::TokioIo::new(upgraded),
+                    stream,
+                )
+                .await;
+                tracing::debug!(
+                    target = %target,
+                    bytes_up = up,
+                    bytes_down = down,
+                    "peer dial: a CLI dial through the tailnet node ended"
+                );
+            }
+            Err(err) => tracing::debug!(
+                target = %target,
+                error = %err,
+                "peer dial: the CLI's connection was not upgraded"
+            ),
+        }
+    });
+
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONNECTION,
+        HeaderValue::from_static("upgrade"),
+    );
+    headers.insert(
+        axum::http::header::UPGRADE,
+        HeaderValue::from_static(PEER_DIAL_UPGRADE),
+    );
+    stamp(&PEER_DIAL_ROUTE, response)
+}
 
 /// Add [`ENDPOINT_HEADER`] to a response, naming which local route produced it
 /// (and [`PROVIDERS_HEADER`] beside it where the route advertises them): the one
@@ -11406,6 +11566,176 @@ mod tests {
     /// A routable, definitely-not-loopback peer (TEST-NET-3, RFC 5737).
     fn remote_peer() -> SocketAddr {
         SocketAddr::from(([203, 0, 113, 7], 44_444))
+    }
+
+    // --- POST /_tcr/peer/dial -----------------------------------------------
+
+    /// A request to the peer dial route, with the upgrade and target headers,
+    /// from `peer`, through the router.
+    async fn peer_dial_request(
+        manager: Arc<Manager>,
+        peer: SocketAddr,
+        api_key: Option<&str>,
+    ) -> StatusCode {
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(PEER_DIAL_PATH)
+            .header("connection", "upgrade")
+            .header("upgrade", PEER_DIAL_UPGRADE)
+            .header(PEER_DIAL_TARGET_HEADER, "100.64.0.9:7755");
+        if let Some(key) = api_key {
+            builder = builder.header("x-api-key", key);
+        }
+        let mut req = builder.body(Body::empty()).expect("build request");
+        req.extensions_mut().insert(ClientAddr(peer));
+        app(manager)
+            .oneshot(req)
+            .await
+            .expect("router response")
+            .status()
+    }
+
+    /// **The peer dial route answers loopback callers holding the key, and
+    /// nobody else**: a caller off this Mac is 403, a keyless local one 401,
+    /// before the route reads anything else.
+    ///
+    /// Watch it fail by deleting the `local_endpoint_gate` call in
+    /// `peer_dial_handler`: both refusals then become the route's own 400
+    /// (the router-driven request has no connection to upgrade).
+    #[tokio::test]
+    async fn peer_dial_refuses_a_caller_that_is_not_local() {
+        let manager = Manager::with_live_refresher(
+            dummy_config(Some("secret-proxy-key"), "http://127.0.0.1:1"),
+            None,
+        );
+        assert_eq!(
+            peer_dial_request(
+                Arc::clone(&manager),
+                remote_peer(),
+                Some("secret-proxy-key")
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "a caller off this Mac is refused even with the key"
+        );
+        assert_eq!(
+            peer_dial_request(Arc::clone(&manager), loopback_peer(), None).await,
+            StatusCode::UNAUTHORIZED,
+            "a local caller without the key is refused"
+        );
+        assert_eq!(
+            peer_dial_request(manager, loopback_peer(), Some("secret-proxy-key")).await,
+            StatusCode::BAD_REQUEST,
+            "a local caller with the key reaches the route, which wants a real connection"
+        );
+    }
+
+    /// Clears the process's node slot when a test that set it ends, pass or
+    /// fail.
+    struct ClearSlot;
+
+    impl Drop for ClearSlot {
+        fn drop(&mut self) {
+            crate::peer::tailnet_node::server_slot().set(None);
+        }
+    }
+
+    /// **Through the real listener, a dial carries bytes both ways and ends
+    /// both ways**: the CLI's half (`dial_through_server`) gets a `101` and a
+    /// byte stream; what it writes reaches the far end the node dialled, what
+    /// the far end writes comes back; and when the CLI hangs up, the far end
+    /// sees the stream end rather than waiting on a half-close the node cannot
+    /// carry.
+    ///
+    /// Watch it fail by serving the hybrid listener without upgrades
+    /// (`serve_connection` in `mitm::serve_http`): the dial then never gets
+    /// its stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_dial_splices_bytes_both_ways_through_the_listener() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (far_tx, mut far_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(SocketAddr, tokio::io::DuplexStream)>();
+        let dial: crate::peer::tailnet_node::DialFn = Arc::new(move |addr| {
+            let far_tx = far_tx.clone();
+            Box::pin(async move {
+                let (ours, theirs) = tokio::io::duplex(64 * 1024);
+                far_tx
+                    .send((addr, theirs))
+                    .map_err(|_| anyhow::anyhow!("the test stopped listening"))?;
+                Ok(Box::new(ours) as crate::peer::serve::PeerStream)
+            })
+        });
+        let _clear = ClearSlot;
+        let peers_dir = tempfile::tempdir().expect("tempdir");
+        crate::peer::tailnet_node::server_slot().set(Some(crate::peer::tailnet_node::Published {
+            dial,
+            listen: "100.64.0.7:7755".parse().expect("addr"),
+            peers: peers_dir.path().join("tcr-peers.json"),
+        }));
+
+        let manager = Manager::with_live_refresher(
+            dummy_config(Some("secret-proxy-key"), "http://127.0.0.1:1"),
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let target: SocketAddr = "100.64.0.9:7755".parse().expect("addr");
+        let mut cli = crate::peer::tailnet_node::dial_through_server(
+            port,
+            Some("secret-proxy-key"),
+            target,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the running tcr dials and answers 101");
+        let (dialled, mut far) = tokio::time::timeout(Duration::from_secs(5), far_rx.recv())
+            .await
+            .expect("the node was asked to dial")
+            .expect("a far end");
+        assert_eq!(dialled, target);
+
+        cli.write_all(b"ping").await.expect("write");
+        let mut got = [0_u8; 4];
+        far.read_exact(&mut got).await.expect("far read");
+        assert_eq!(&got, b"ping");
+        far.write_all(b"pong").await.expect("far write");
+        cli.read_exact(&mut got).await.expect("cli read");
+        assert_eq!(&got, b"pong");
+
+        drop(cli);
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), far.read_to_end(&mut rest))
+            .await
+            .expect("the far end sees the CLI hang up")
+            .expect("read");
+        assert!(rest.is_empty());
+
+        // Gil, 2026-10-20: a port that is not a peer port is refused, as an
+        // answer the CLI reads, and the node is never asked to dial it.
+        let refused = crate::peer::tailnet_node::dial_through_server(
+            port,
+            Some("secret-proxy-key"),
+            "100.64.0.9:22".parse().expect("addr"),
+            Duration::from_secs(5),
+        )
+        .await
+        .err()
+        .map(|err| format!("{err:#}"))
+        .expect("port 22 is refused");
+        assert!(
+            refused.contains("403") && refused.contains("port 22"),
+            "{refused}"
+        );
+        assert!(
+            far_rx.try_recv().is_err(),
+            "the node was not asked to dial port 22"
+        );
     }
 
     /// The endpoint ALWAYS says what this process's MITM listener can intercept,

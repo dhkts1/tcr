@@ -348,6 +348,11 @@ pub trait TailnetDevice: Send + Sync + 'static {
     /// Stop, gracefully within `deadline`, then by force. Reports whether it
     /// stopped gracefully.
     fn shutdown(self, deadline: Duration) -> impl Future<Output = bool> + Send;
+
+    /// Open a TCP connection to `addr` through the tailnet. Waits for
+    /// control (the library asks for its own address first); every caller
+    /// bounds it.
+    fn connect(&self, addr: SocketAddr) -> impl Future<Output = Result<Self::Stream>> + Send;
 }
 
 /// What builds a [`TailnetDevice`] from a key file.
@@ -561,6 +566,10 @@ pub struct Supervisor<F: DeviceFactory> {
     build_timeout: Duration,
     /// How long a device gets to stop, [`SHUTDOWN_DEADLINE`] outside tests.
     shutdown_deadline: Duration,
+    /// Where the running device's dialler is published, if anywhere.
+    dial_slot: Option<DialSlot>,
+    /// Flipped when the running device stops, to cancel its dials in flight.
+    cancel_dials: Option<tokio::sync::watch::Sender<bool>>,
     /// Whether the last wake read the mode as `node`.
     was_node: bool,
     /// Whether the mode left `node` and the `nodeReleased` record has not
@@ -600,6 +609,8 @@ impl<F: DeviceFactory> Supervisor<F> {
             shutdown_deadline: SHUTDOWN_DEADLINE,
             was_node: false,
             release_owed: false,
+            dial_slot: None,
+            cancel_dials: None,
             builds: 0,
         }
     }
@@ -620,6 +631,14 @@ impl<F: DeviceFactory> Supervisor<F> {
     /// The same supervisor with a shorter shutdown deadline, for a test.
     pub const fn with_shutdown_deadline(mut self, limit: Duration) -> Self {
         self.shutdown_deadline = limit;
+        self
+    }
+
+    /// Publish the running device's dialler in `slot` (the server passes
+    /// [`server_slot`]), so the process's peer dials and the CLI's dial route
+    /// reach the tailnet through it.
+    pub fn with_dial_slot(mut self, slot: DialSlot) -> Self {
+        self.dial_slot = Some(slot);
         self
     }
 
@@ -1083,6 +1102,15 @@ impl<F: DeviceFactory> Supervisor<F> {
             "peer tailnet node: on the tailnet, listening on the node's own address"
         );
         self.starting = None;
+        if let Some(slot) = &self.dial_slot {
+            let (cancel, cancelled) = tokio::sync::watch::channel(false);
+            self.cancel_dials = Some(cancel);
+            slot.set(Some(Published {
+                dial: dialler(&device, &self.live, cancelled),
+                listen: SocketAddr::from((me.address, self.port)),
+                peers: self.paths.peers.clone(),
+            }));
+        }
         self.running = Some(Running { device, accept, me });
         self.backoff = None;
         self.since_health = Duration::ZERO;
@@ -1119,6 +1147,17 @@ impl<F: DeviceFactory> Supervisor<F> {
         let Some(running) = self.running.take() else {
             return;
         };
+        // Unpublished first, so no new dial starts on a device being shut
+        // down, then every dial in flight is cancelled, so none holds the
+        // device past `settle`'s wait.
+        if let Some(slot) = &self.dial_slot {
+            slot.set(None);
+        }
+        if let Some(cancel) = self.cancel_dials.take()
+            && cancel.send(true).is_err()
+        {
+            tracing::debug!("peer tailnet node: no dial was listening for the stop");
+        }
         running.accept.abort();
         self.settle(running.device).await;
     }
@@ -1212,6 +1251,501 @@ async fn accept_loop<L: TailnetListener>(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dialling through the node
+// ---------------------------------------------------------------------------
+
+/// How long one dial through the node may take, connect included.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One dial through the running node, type-erased so the proxy's route and
+/// the peer dialler need not know the device type.
+pub type DialFn = Arc<
+    dyn Fn(
+            SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::peer::serve::PeerStream>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Where a running node's dialler is published for the rest of the process.
+///
+/// Set by the [`Supervisor`] when a device is on the tailnet and cleared
+/// before it is shut down. The dialler holds the device weakly, so a
+/// published dialler never keeps a device alive past its shutdown.
+#[derive(Clone, Default)]
+pub struct DialSlot(Arc<Mutex<Option<Published>>>);
+
+/// What a running node publishes: how to dial through it, and the socket it
+/// listens on (its address at the peer port), which the `Hello` advertises.
+#[derive(Clone)]
+pub struct Published {
+    /// One dial through the node.
+    pub dial: DialFn,
+    /// The node's own listening socket.
+    pub listen: SocketAddr,
+    /// The peers file this node serves, whose rows decide which ports the
+    /// dial route may reach (`dial_for_route`).
+    pub peers: PathBuf,
+}
+
+impl DialSlot {
+    /// Publish a running node, or clear the slot with `None`.
+    pub fn set(&self, published: Option<Published>) {
+        match self.0.lock() {
+            Ok(mut held) => *held = published,
+            Err(poisoned) => *poisoned.into_inner() = published,
+        }
+    }
+
+    /// The dialler, when a node is running.
+    pub fn get(&self) -> Option<DialFn> {
+        self.published().map(|published| published.dial)
+    }
+
+    /// The node's listening socket, when a node is running.
+    pub fn listen(&self) -> Option<SocketAddr> {
+        self.published().map(|published| published.listen)
+    }
+
+    /// What the running node published, when one is running.
+    pub fn published(&self) -> Option<Published> {
+        match self.0.lock() {
+            Ok(held) => held.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+/// The socket this process's node listens on, for the `Hello`
+/// (`crate::peer::listener::NodeFacts::listening`): `None` when this process
+/// runs no node.
+pub fn advertised_listen() -> Option<SocketAddr> {
+    server_slot().listen()
+}
+
+/// The serving process's slot: the one [`run_in_server`] hands its
+/// supervisor, and the one [`dial_through_node`] reads.
+pub fn server_slot() -> &'static DialSlot {
+    static SLOT: std::sync::OnceLock<DialSlot> = std::sync::OnceLock::new();
+    SLOT.get_or_init(DialSlot::default)
+}
+
+/// Whether `ip` is a tailnet address: `100.64.0.0/10` or
+/// `fd7a:115c:a1e0::/48`, the ranges Tailscale numbers a tailnet out of.
+pub fn is_tailnet_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => crate::peer::listener::is_carrier_grade_nat(v4),
+        IpAddr::V6(v6) => crate::peer::listener::is_tailscale_v6(v6),
+    }
+}
+
+/// A stream counted in [`LiveConnections`] for as long as it is open.
+struct Counted<S> {
+    inner: S,
+    _live: LiveGuard,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Counted<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// A dialler over `device`, held weakly, counting what it opens in `live`.
+///
+/// A dial holds the device only while its connect runs, and `cancel` ends
+/// that connect the moment the supervisor stops the device: an in-flight dial
+/// cannot keep a device alive past its shutdown and into a rebuild from the
+/// same keys.
+fn dialler<D: TailnetDevice>(
+    device: &Arc<D>,
+    live: &Arc<LiveConnections>,
+    cancel: tokio::sync::watch::Receiver<bool>,
+) -> DialFn {
+    let device = Arc::downgrade(device);
+    let live = Arc::clone(live);
+    Arc::new(move |addr| {
+        let device = std::sync::Weak::clone(&device);
+        let live = Arc::clone(&live);
+        let mut cancel = cancel.clone();
+        Box::pin(async move {
+            if *cancel.borrow() {
+                bail!("tcr's tailnet node is stopping, so {addr} was not dialled");
+            }
+            let Some(device) = device.upgrade() else {
+                bail!("tcr's tailnet node stopped before {addr} could be dialled");
+            };
+            let stream = tokio::select! {
+                connected = device.connect(addr) => connected?,
+                _ = cancel.wait_for(|stopping| *stopping) => {
+                    bail!("tcr's tailnet node stopped while {addr} was being dialled")
+                }
+            };
+            drop(device);
+            let counted = Counted {
+                inner: stream,
+                _live: live.enter(addr.ip()),
+            };
+            Ok(Box::new(counted) as crate::peer::serve::PeerStream)
+        })
+    })
+}
+
+/// Dial `addr` through this process's node, when there is one to dial
+/// through: `None` when this process runs no node or `addr` is not a tailnet
+/// address, so the caller dials through the kernel as before.
+///
+/// The dialler picks the transport, not the endpoint: the same pinned
+/// `100.x` row is dialled through the kernel on a Mac with the Tailscale app
+/// and through the node here.
+pub async fn dial_through_node(
+    addr: SocketAddr,
+    within: Duration,
+) -> Option<Result<crate::peer::serve::PeerStream>> {
+    dial_in_slot(server_slot(), addr, within).await
+}
+
+/// [`dial_through_node`] against an explicit slot, for a test.
+pub async fn dial_in_slot(
+    slot: &DialSlot,
+    addr: SocketAddr,
+    within: Duration,
+) -> Option<Result<crate::peer::serve::PeerStream>> {
+    if !is_tailnet_ip(addr.ip()) {
+        return None;
+    }
+    let dial = slot.get()?;
+    Some(bounded(within, "a dial through the tailnet node", dial(addr)).await)
+}
+
+/// The peer port every Mac listens on unless its peers file says otherwise
+/// (`crate::peer::config::default_listen`).
+pub fn default_peer_port() -> u16 {
+    crate::peer::config::default_listen().port()
+}
+
+/// The ports `/_tcr/peer/dial` may reach through the node: the default peer
+/// port, this Mac's own configured `listen` port, and every port in a direct
+/// endpoint of any row in `file`.
+///
+/// Gil, 2026-10-20: the route connects only to a peer port. In node mode tcr
+/// is this Mac's only presence on the tailnet, so a route that dialled any
+/// port would hand every local process this machine's reach to every service
+/// the tailnet's ACLs let it see. Pending invites carry no address, so they
+/// add no port.
+pub fn allowed_dial_ports(file: &crate::peer::config::PeerFile) -> std::collections::BTreeSet<u16> {
+    let mut ports = std::collections::BTreeSet::from([default_peer_port()]);
+    if let Some(listen) = file.listen {
+        ports.insert(listen.port());
+    }
+    for row in &file.peers {
+        for endpoint in &row.endpoints {
+            if let Some(addr) = endpoint.direct_addr() {
+                ports.insert(addr.port());
+            }
+        }
+    }
+    ports
+}
+
+/// What `/_tcr/peer/dial` got when it asked to dial.
+pub enum RouteDial {
+    /// No node runs in this process.
+    NoNode,
+    /// The target is not a tailnet address.
+    NotTailnet,
+    /// The target's port is not a peer port; nothing was dialled. The
+    /// sentence says which port and why.
+    PortRefused(String),
+    /// The dial was tried and failed.
+    Failed(anyhow::Error),
+    /// The stream to the target.
+    Dialled(crate::peer::serve::PeerStream),
+}
+
+/// The dial route's dial: through this process's node, to a tailnet address
+/// at a peer port ([`allowed_dial_ports`]) only. The port is checked against
+/// the node's own peers file BEFORE the node is asked for anything.
+pub async fn dial_for_route(target: SocketAddr, within: Duration) -> RouteDial {
+    dial_for_route_in(server_slot(), target, within).await
+}
+
+/// [`dial_for_route`] against an explicit slot, for a test.
+pub async fn dial_for_route_in(slot: &DialSlot, target: SocketAddr, within: Duration) -> RouteDial {
+    let Some(published) = slot.published() else {
+        return RouteDial::NoNode;
+    };
+    if !is_tailnet_ip(target.ip()) {
+        return RouteDial::NotTailnet;
+    }
+    let file = match crate::peer::config::read_or_default(&published.peers) {
+        Ok(file) => file,
+        Err(err) => {
+            return RouteDial::Failed(err.context(
+                "the peers file did not read, so the peer ports are unknown and nothing was dialled",
+            ));
+        }
+    };
+    let allowed = allowed_dial_ports(&file);
+    if !allowed.contains(&target.port()) {
+        let list = allowed
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return RouteDial::PortRefused(format!(
+            "port {} is not a peer port, so tcr's tailnet node will not dial {target}; this \
+             route reaches only peer ports ({list}): the default, this Mac's own listen port, \
+             and the ports of the rows in the peers file",
+            target.port()
+        ));
+    }
+    match bounded(
+        within,
+        "a dial through the tailnet node",
+        (published.dial)(target),
+    )
+    .await
+    {
+        Ok(stream) => RouteDial::Dialled(stream),
+        Err(err) => RouteDial::Failed(err),
+    }
+}
+/// This Mac's node address, as the serving process recorded it: a fresh
+/// `ready` record in node mode. What `tcr peer invite` (a separate process,
+/// with no node of its own) puts first in a key, the way it reads the router
+/// mapping off the same file.
+pub fn recorded_node_address(state_path: &Path, now_ms: i64) -> Option<Ipv4Addr> {
+    let record = crate::peer::state::load(state_path, now_ms).ok()?.tailnet?;
+    (record.mode.effective() == TailnetMode::Node
+        && record.state == TailnetState::Ready
+        && !record.is_stale(now_ms))
+    .then_some(record.address)
+    .flatten()
+}
+
+/// Read an HTTP/1.1 response head off `stream`, one byte at a time so not a
+/// byte of what follows a `101` is taken. At most 8 KiB.
+async fn read_response_head<S: AsyncRead + Unpin>(stream: &mut S) -> Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut head = Vec::with_capacity(256);
+    let mut byte = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() >= 8 * 1024 {
+            bail!("the running tcr's answer had no end to its head within 8 KiB");
+        }
+        let read = stream
+            .read(&mut byte)
+            .await
+            .context("reading the running tcr's answer")?;
+        if read == 0 {
+            bail!("the running tcr closed the connection without answering");
+        }
+        head.push(byte[0]);
+    }
+    String::from_utf8(head).context("the running tcr's answer was not text")
+}
+
+/// Ask the running tcr on `127.0.0.1:port` to dial `target` through its node,
+/// and return the connection it splices to it.
+///
+/// One `POST /_tcr/peer/dial` with `Upgrade: tcr-peer-dial` and the target
+/// in a header, the api key on it when one is set (no local route has a
+/// loopback exemption), and a `101` back. After the `101` the socket is a
+/// byte stream to `target`; anything else is the route's refusal, read and
+/// named.
+pub async fn dial_through_server(
+    port: u16,
+    api_key: Option<&str>,
+    target: SocketAddr,
+    within: Duration,
+) -> Result<tokio::net::TcpStream> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let local = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = bounded(within, "the running tcr", async {
+        tokio::net::TcpStream::connect(local)
+            .await
+            .with_context(|| format!("no tcr answered on {local} to dial through its node"))
+    })
+    .await?;
+    let mut request = format!(
+        "POST {} HTTP/1.1\r\nHost: {local}\r\nConnection: Upgrade\r\nUpgrade: {}\r\n{}: \
+         {target}\r\nContent-Length: 0\r\n",
+        crate::proxy::PEER_DIAL_PATH,
+        crate::proxy::PEER_DIAL_UPGRADE,
+        crate::proxy::PEER_DIAL_TARGET_HEADER,
+    );
+    if let Some(key) = api_key {
+        request.push_str("x-api-key: ");
+        request.push_str(key);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .context("asking the running tcr to dial")?;
+
+    let head = bounded(
+        within,
+        "the running tcr's dial",
+        read_response_head(&mut stream),
+    )
+    .await?;
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| anyhow!("the running tcr's answer had no status"))?;
+    if status == 101 {
+        // Only the dial route answers this upgrade, and it stamps the answer:
+        // a `101` without the stamp is something else on that port.
+        let stamped = head.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.trim()
+                    .eq_ignore_ascii_case(crate::proxy::ENDPOINT_HEADER)
+                    && value.trim() == crate::proxy::PEER_DIAL_ENDPOINT
+            })
+        });
+        if !stamped {
+            bail!(
+                "something on {local} answered the dial with a 101 but is not tcr's dial route; \
+                 is the configured port another program's?"
+            );
+        }
+        return Ok(stream);
+    }
+    // The refusal's body says why; read what it promises, bounded.
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0)
+        .min(16 * 1024);
+    let mut body = vec![0_u8; length];
+    let said = match tokio::time::timeout(within, stream.read_exact(&mut body)).await {
+        Ok(Ok(_)) => String::from_utf8_lossy(&body).into_owned(),
+        _ => String::new(),
+    };
+    bail!("the running tcr would not dial {target} through its tailnet node ({status}): {said}")
+}
+
+/// The CLI's dial to a peer: through the running tcr's node when this Mac is
+/// in node mode and `addr` is a tailnet address, through the kernel
+/// otherwise.
+///
+/// The knock, the first pairing and the join run in the CLI process, and the
+/// node lives in the server, so in node mode the CLI asks the server to dial
+/// ([`dial_through_server`]) and runs its Noise handshake over what comes
+/// back. On a Mac with the Tailscale app, the same `100.x` address goes
+/// through the kernel, as it always did.
+pub async fn dial_for_cli(
+    peers_path: &Path,
+    addr: SocketAddr,
+) -> Result<crate::peer::serve::PeerStream> {
+    if is_tailnet_ip(addr.ip())
+        && crate::peer::config::read_or_default(peers_path)?
+            .tailnet
+            .effective()
+            == TailnetMode::Node
+    {
+        let config_path = crate::config::default_path();
+        let config = crate::config::load(&config_path)
+            .with_context(|| format!("reading {}", config_path.display()))?;
+        let stream = dial_through_server(
+            config.proxy.port,
+            config.proxy.api_key.as_deref(),
+            addr,
+            DIAL_TIMEOUT,
+        )
+        .await?;
+        return Ok(Box::new(stream));
+    }
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("connecting to {addr}"))?;
+    Ok(Box::new(stream))
+}
+
+/// Splice the CLI's upgraded connection and the node stream, until EITHER
+/// side ends, then close both.
+///
+/// Not `copy_bidirectional`, which half-closes the side that did not end and
+/// waits for it: the node stream cannot carry a half-close
+/// (`poll_shutdown` does nothing at 0.6.1), so a CLI that hung up would leave
+/// the far Mac's socket open until its own idle limit. None of the flows that
+/// use this route (knock, first pairing, join) needs a half-close: each ends
+/// by closing.
+pub async fn splice_until_either_ends<A, B>(a: A, b: B) -> (u64, u64)
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut a_read, mut a_write) = tokio::io::split(a);
+    let (mut b_read, mut b_write) = tokio::io::split(b);
+    let mut up = 0_u64;
+    let mut down = 0_u64;
+    let forward = async {
+        let copied = tokio::io::copy(&mut a_read, &mut b_write).await;
+        match copied {
+            Ok(n) => up = n,
+            Err(err) => {
+                tracing::debug!(error = %err, "peer dial: the CLI-to-node half ended on an error");
+            }
+        }
+    };
+    let back = async {
+        let copied = tokio::io::copy(&mut b_read, &mut a_write).await;
+        match copied {
+            Ok(n) => down = n,
+            Err(err) => {
+                tracing::debug!(error = %err, "peer dial: the node-to-CLI half ended on an error");
+            }
+        }
+    };
+    tokio::select! {
+        () = forward => {}
+        () = back => {}
+    }
+    (up, down)
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,6 +1988,10 @@ impl TailnetDevice for NoDevice {
     async fn shutdown(self, _deadline: Duration) -> bool {
         match self {}
     }
+
+    async fn connect(&self, _addr: SocketAddr) -> Result<Self::Stream> {
+        match *self {}
+    }
 }
 
 impl DeviceFactory for Unsupported {
@@ -1539,6 +2077,13 @@ mod library {
 
         async fn shutdown(self, deadline: Duration) -> bool {
             self.0.shutdown(Some(deadline)).await
+        }
+
+        async fn connect(&self, addr: SocketAddr) -> Result<Self::Stream> {
+            self.0
+                .tcp_connect(addr)
+                .await
+                .with_context(|| format!("connecting to {addr} through the tailnet"))
         }
     }
 
@@ -1684,6 +2229,7 @@ pub async fn run_in_server(
         TICK * 2
     };
     Supervisor::new(BuiltFactory::default(), paths, port, serve, gateway)
+        .with_dial_slot(server_slot().clone())
         .run(every, stop)
         .await;
 }
@@ -1697,6 +2243,9 @@ mod tests {
 
     use super::*;
     use crate::peer::config::PeerFile;
+
+    /// Where the fake device hands the far end of each stream it dials.
+    type DialledTx = mpsc::UnboundedSender<(SocketAddr, DuplexStream)>;
 
     /// What the fake device does, shared with the test that drives it.
     #[derive(Clone)]
@@ -1715,6 +2264,9 @@ mod tests {
         /// `key_existed_at_shutdown`.
         watch_key: Arc<Mutex<Option<PathBuf>>>,
         key_existed_at_shutdown: Arc<AtomicBool>,
+        dialled: Arc<Mutex<Option<DialledTx>>>,
+        /// While set, a connect never answers (a dial stuck in flight).
+        connect_hangs: Arc<AtomicBool>,
     }
 
     impl Script {
@@ -1731,6 +2283,8 @@ mod tests {
                 release: Arc::new(tokio::sync::Notify::new()),
                 watch_key: Arc::new(Mutex::new(None)),
                 key_existed_at_shutdown: Arc::new(AtomicBool::new(false)),
+                dialled: Arc::new(Mutex::new(None)),
+                connect_hangs: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -1803,6 +2357,26 @@ mod tests {
             }
             self.0.shutdowns.fetch_add(1, Ordering::SeqCst);
             true
+        }
+
+        /// One end of a fresh pipe; the other goes to the test through
+        /// `dialled`, with the address it was dialled at.
+        async fn connect(&self, addr: SocketAddr) -> Result<DuplexStream> {
+            if self.0.connect_hangs.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            let (ours, theirs) = tokio::io::duplex(64 * 1024);
+            let sender = match self.0.dialled.lock() {
+                Ok(held) => held.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            let Some(sender) = sender else {
+                bail!("nothing listens at {addr}");
+            };
+            sender
+                .send((addr, theirs))
+                .map_err(|_| anyhow!("the test stopped listening"))?;
+            Ok(ours)
         }
     }
 
@@ -2657,6 +3231,203 @@ mod tests {
             "the key file did not exist yet when the device was shut down"
         );
         assert!(read_key_file(&fx.paths.key).expect("read").is_some());
+    }
+
+    /// **A running node publishes a dialler that reaches tailnet addresses
+    /// only, and withdraws it when the node stops.** This is the decision
+    /// `serve::connect_within` and the dial route ask: a LAN address, or no
+    /// node, goes through the kernel.
+    ///
+    /// Watch it fail by dropping the `slot.set(None)` in `stop_device`: the
+    /// last dial then still finds a dialler.
+    #[tokio::test]
+    async fn the_dialler_is_published_while_the_node_runs() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let fx = fixture(TailnetMode::Node);
+        write_key_file(&fx.paths.key, &some_keys()).expect("keys");
+        let script = Script::new();
+        let (dialled_tx, mut dialled_rx) = mpsc::unbounded_channel();
+        match script.dialled.lock() {
+            Ok(mut held) => *held = Some(dialled_tx),
+            Err(poisoned) => *poisoned.into_inner() = Some(dialled_tx),
+        }
+        let slot = DialSlot::default();
+        let mut sup = supervisor(FakeFactory(script.clone()), &fx.paths, fixed_gateway())
+            .with_dial_slot(slot.clone());
+        let tailnet: SocketAddr = "100.64.0.9:7755".parse().expect("addr");
+        let lan: SocketAddr = "192.168.1.20:7755".parse().expect("addr");
+
+        assert!(
+            dial_in_slot(&slot, tailnet, Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+        sup.tick(Duration::ZERO, 1_000).await;
+        assert_eq!(
+            slot.listen(),
+            Some("100.64.0.7:7755".parse().expect("addr"))
+        );
+        assert!(
+            dial_in_slot(&slot, lan, Duration::from_secs(1))
+                .await
+                .is_none(),
+            "a LAN address is the kernel's"
+        );
+        let mut stream = dial_in_slot(&slot, tailnet, Duration::from_secs(1))
+            .await
+            .expect("a tailnet address goes through the node")
+            .expect("dialled");
+        let (addr, mut far) = dialled_rx.recv().await.expect("the node dialled");
+        assert_eq!(addr, tailnet);
+        stream.write_all(b"hi").await.expect("write");
+        let mut got = [0_u8; 2];
+        far.read_exact(&mut got).await.expect("read");
+        assert_eq!(&got, b"hi");
+        assert_eq!(sup.live().distinct(), 1, "a dial counts as connected");
+        drop(stream);
+        assert_eq!(sup.live().distinct(), 0);
+
+        set_mode(&fx.paths, TailnetMode::Off);
+        sup.tick(TICK, 2_000).await;
+        assert!(slot.listen().is_none());
+        assert!(
+            dial_in_slot(&slot, tailnet, Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+    }
+
+    /// **A dial stuck in flight cannot keep the device alive into a
+    /// rebuild**: stopping the device cancels it, the old device is shut
+    /// down, and only then is the new one built.
+    ///
+    /// Watch it fail by not sending the cancel in `stop_device`: the stuck
+    /// dial keeps the device past its deadline, it lingers, and no rebuild
+    /// happens on this wake (`builds` stays 1, `shutdowns` 0).
+    #[tokio::test]
+    async fn a_dial_in_flight_is_cancelled_before_the_rebuild() {
+        let fx = fixture(TailnetMode::Node);
+        write_key_file(&fx.paths.key, &some_keys()).expect("keys");
+        let script = Script::new();
+        script.connect_hangs.store(true, Ordering::SeqCst);
+        let (router, gateway) = switchable_gateway();
+        let slot = DialSlot::default();
+        let mut sup = supervisor(FakeFactory(script.clone()), &fx.paths, gateway)
+            .with_dial_slot(slot.clone());
+        sup.tick(Duration::ZERO, 1_000).await;
+
+        let in_flight = {
+            let slot = slot.clone();
+            tokio::spawn(async move {
+                dial_in_slot(
+                    &slot,
+                    "100.64.0.9:7755".parse().expect("addr"),
+                    Duration::from_secs(30),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!in_flight.is_finished(), "the dial is stuck in its connect");
+
+        move_to(&router, Ipv4Addr::new(10, 0, 0, 1));
+        sup.tick(HEALTH_EVERY, 2_000).await;
+        assert_eq!(
+            script.shutdowns.load(Ordering::SeqCst),
+            1,
+            "the old device was shut down"
+        );
+        assert_eq!(
+            script.builds.load(Ordering::SeqCst),
+            2,
+            "and only then a new one built"
+        );
+        let dialled = tokio::time::timeout(Duration::from_secs(1), in_flight)
+            .await
+            .expect("the stuck dial ended")
+            .expect("joined")
+            .expect("it went through the node");
+        let refusal = format!("{:#}", dialled.err().expect("cancelled, not connected"));
+        assert!(refusal.contains("stopped"), "{refusal}");
+    }
+
+    /// A slot whose node counts every dial it is asked for and answers each
+    /// with a fresh pipe, serving the peers file at `peers`.
+    fn counting_slot(peers: &Path) -> (DialSlot, Arc<AtomicUsize>) {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let dial: DialFn = Arc::new(move |_addr| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                let (ours, _theirs) = tokio::io::duplex(64);
+                Ok(Box::new(ours) as crate::peer::serve::PeerStream)
+            })
+        });
+        let slot = DialSlot::default();
+        slot.set(Some(Published {
+            dial,
+            listen: "100.64.0.7:7755".parse().expect("addr"),
+            peers: peers.to_path_buf(),
+        }));
+        (slot, asked)
+    }
+
+    /// **The dial route reaches peer ports only** (Gil, 2026-10-20): the
+    /// default 7755, this Mac's own `listen` port, and a port a pinned row
+    /// carries are dialled; port 22 is refused with a sentence naming it,
+    /// and the node is never asked.
+    ///
+    /// Watch it fail by skipping the port check in `dial_for_route_in`: port
+    /// 22 is then dialled and `asked` reaches 4.
+    #[tokio::test]
+    async fn the_dial_route_reaches_peer_ports_only() {
+        use crate::peer::config::{Allow, Endpoint, EndpointSource, PeerRow};
+
+        let fx = fixture(TailnetMode::Node);
+        let mut file = crate::peer::config::read_or_default(&fx.paths.peers).expect("read");
+        file.listen = Some("0.0.0.0:9700".parse().expect("addr"));
+        let mut row = PeerRow {
+            node: tcr_peer_wire::PeerId([7_u8; 32]),
+            label: "laptop-2".to_string(),
+            endpoints: Vec::new(),
+            added_at: 0,
+            allow: Allow::default(),
+            lend: Vec::new(),
+            rendezvous_secret: None,
+            sees_us_at: None,
+        };
+        row.observe_endpoint(Endpoint::direct(
+            "100.64.0.9:9600".parse().expect("addr"),
+            1_000,
+            EndpointSource::Paired,
+        ));
+        file.peers.push(row);
+        crate::peer::config::save(&fx.paths.peers, &file).expect("save");
+        let (slot, asked) = counting_slot(&fx.paths.peers);
+        let within = Duration::from_secs(1);
+
+        for port in [7755_u16, 9700, 9600] {
+            let target = SocketAddr::from((Ipv4Addr::new(100, 64, 0, 9), port));
+            assert!(
+                matches!(
+                    dial_for_route_in(&slot, target, within).await,
+                    RouteDial::Dialled(_)
+                ),
+                "port {port} is a peer port"
+            );
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 3);
+
+        let ssh = SocketAddr::from((Ipv4Addr::new(100, 64, 0, 9), 22));
+        let RouteDial::PortRefused(why) = dial_for_route_in(&slot, ssh, within).await else {
+            panic!("port 22 must be refused");
+        };
+        assert!(
+            why.contains("port 22") && why.contains("peer port"),
+            "{why}"
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 3, "the node was never asked");
     }
 
     #[test]

@@ -722,7 +722,7 @@ final class PeersPanelWiringTests: XCTestCase {
         let pairRs = try source("src/peer/pair.rs")
         let dialBail = try slice(
             pairRs,
-            from: "async fn connect_in_key_order(token: &JoinToken)",
+            from: "async fn connect_in_key_order(",
             to: "/// How long the joiner waits")
         XCTAssertTrue(
             PeerSealedMint.theyDidNotAnswer(dialBail),
