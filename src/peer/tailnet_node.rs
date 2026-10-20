@@ -1108,6 +1108,7 @@ impl<F: DeviceFactory> Supervisor<F> {
             slot.set(Some(Published {
                 dial: dialler(&device, &self.live, cancelled),
                 listen: SocketAddr::from((me.address, self.port)),
+                peers: self.paths.peers.clone(),
             }));
         }
         self.running = Some(Running { device, accept, me });
@@ -1285,6 +1286,9 @@ pub struct Published {
     pub dial: DialFn,
     /// The node's own listening socket.
     pub listen: SocketAddr,
+    /// The peers file this node serves, whose rows decide which ports the
+    /// dial route may reach (`dial_for_route`).
+    pub peers: PathBuf,
 }
 
 impl DialSlot {
@@ -1306,7 +1310,8 @@ impl DialSlot {
         self.published().map(|published| published.listen)
     }
 
-    fn published(&self) -> Option<Published> {
+    /// What the running node published, when one is running.
+    pub fn published(&self) -> Option<Published> {
         match self.0.lock() {
             Ok(held) => held.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
@@ -1444,6 +1449,99 @@ pub async fn dial_in_slot(
     Some(bounded(within, "a dial through the tailnet node", dial(addr)).await)
 }
 
+/// The peer port every Mac listens on unless its peers file says otherwise
+/// (`crate::peer::config::default_listen`).
+pub fn default_peer_port() -> u16 {
+    crate::peer::config::default_listen().port()
+}
+
+/// The ports `/_tcr/peer/dial` may reach through the node: the default peer
+/// port, this Mac's own configured `listen` port, and every port in a direct
+/// endpoint of any row in `file`.
+///
+/// Gil, 2026-10-20: the route connects only to a peer port. In node mode tcr
+/// is this Mac's only presence on the tailnet, so a route that dialled any
+/// port would hand every local process this machine's reach to every service
+/// the tailnet's ACLs let it see. Pending invites carry no address, so they
+/// add no port.
+pub fn allowed_dial_ports(file: &crate::peer::config::PeerFile) -> std::collections::BTreeSet<u16> {
+    let mut ports = std::collections::BTreeSet::from([default_peer_port()]);
+    if let Some(listen) = file.listen {
+        ports.insert(listen.port());
+    }
+    for row in &file.peers {
+        for endpoint in &row.endpoints {
+            if let Some(addr) = endpoint.direct_addr() {
+                ports.insert(addr.port());
+            }
+        }
+    }
+    ports
+}
+
+/// What `/_tcr/peer/dial` got when it asked to dial.
+pub enum RouteDial {
+    /// No node runs in this process.
+    NoNode,
+    /// The target is not a tailnet address.
+    NotTailnet,
+    /// The target's port is not a peer port; nothing was dialled. The
+    /// sentence says which port and why.
+    PortRefused(String),
+    /// The dial was tried and failed.
+    Failed(anyhow::Error),
+    /// The stream to the target.
+    Dialled(crate::peer::serve::PeerStream),
+}
+
+/// The dial route's dial: through this process's node, to a tailnet address
+/// at a peer port ([`allowed_dial_ports`]) only. The port is checked against
+/// the node's own peers file BEFORE the node is asked for anything.
+pub async fn dial_for_route(target: SocketAddr, within: Duration) -> RouteDial {
+    dial_for_route_in(server_slot(), target, within).await
+}
+
+/// [`dial_for_route`] against an explicit slot, for a test.
+pub async fn dial_for_route_in(slot: &DialSlot, target: SocketAddr, within: Duration) -> RouteDial {
+    let Some(published) = slot.published() else {
+        return RouteDial::NoNode;
+    };
+    if !is_tailnet_ip(target.ip()) {
+        return RouteDial::NotTailnet;
+    }
+    let file = match crate::peer::config::read_or_default(&published.peers) {
+        Ok(file) => file,
+        Err(err) => {
+            return RouteDial::Failed(err.context(
+                "the peers file did not read, so the peer ports are unknown and nothing was dialled",
+            ));
+        }
+    };
+    let allowed = allowed_dial_ports(&file);
+    if !allowed.contains(&target.port()) {
+        let list = allowed
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return RouteDial::PortRefused(format!(
+            "port {} is not a peer port, so tcr's tailnet node will not dial {target}; this \
+             route reaches only peer ports ({list}): the default, this Mac's own listen port, \
+             and the ports of the rows in the peers file",
+            target.port()
+        ));
+    }
+    match bounded(
+        within,
+        "a dial through the tailnet node",
+        (published.dial)(target),
+    )
+    .await
+    {
+        Ok(stream) => RouteDial::Dialled(stream),
+        Err(err) => RouteDial::Failed(err),
+    }
+}
 /// This Mac's node address, as the serving process recorded it: a fresh
 /// `ready` record in node mode. What `tcr peer invite` (a separate process,
 /// with no node of its own) puts first in a key, the way it reads the router
@@ -3249,6 +3347,84 @@ mod tests {
             .expect("it went through the node");
         let refusal = format!("{:#}", dialled.err().expect("cancelled, not connected"));
         assert!(refusal.contains("stopped"), "{refusal}");
+    }
+
+    /// A slot whose node counts every dial it is asked for and answers each
+    /// with a fresh pipe, serving the peers file at `peers`.
+    fn counting_slot(peers: &Path) -> (DialSlot, Arc<AtomicUsize>) {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let dial: DialFn = Arc::new(move |_addr| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                let (ours, _theirs) = tokio::io::duplex(64);
+                Ok(Box::new(ours) as crate::peer::serve::PeerStream)
+            })
+        });
+        let slot = DialSlot::default();
+        slot.set(Some(Published {
+            dial,
+            listen: "100.64.0.7:7755".parse().expect("addr"),
+            peers: peers.to_path_buf(),
+        }));
+        (slot, asked)
+    }
+
+    /// **The dial route reaches peer ports only** (Gil, 2026-10-20): the
+    /// default 7755, this Mac's own `listen` port, and a port a pinned row
+    /// carries are dialled; port 22 is refused with a sentence naming it,
+    /// and the node is never asked.
+    ///
+    /// Watch it fail by skipping the port check in `dial_for_route_in`: port
+    /// 22 is then dialled and `asked` reaches 4.
+    #[tokio::test]
+    async fn the_dial_route_reaches_peer_ports_only() {
+        use crate::peer::config::{Allow, Endpoint, EndpointSource, PeerRow};
+
+        let fx = fixture(TailnetMode::Node);
+        let mut file = crate::peer::config::read_or_default(&fx.paths.peers).expect("read");
+        file.listen = Some("0.0.0.0:9700".parse().expect("addr"));
+        let mut row = PeerRow {
+            node: tcr_peer_wire::PeerId([7_u8; 32]),
+            label: "laptop-2".to_string(),
+            endpoints: Vec::new(),
+            added_at: 0,
+            allow: Allow::default(),
+            lend: Vec::new(),
+            rendezvous_secret: None,
+            sees_us_at: None,
+        };
+        row.observe_endpoint(Endpoint::direct(
+            "100.64.0.9:9600".parse().expect("addr"),
+            1_000,
+            EndpointSource::Paired,
+        ));
+        file.peers.push(row);
+        crate::peer::config::save(&fx.paths.peers, &file).expect("save");
+        let (slot, asked) = counting_slot(&fx.paths.peers);
+        let within = Duration::from_secs(1);
+
+        for port in [7755_u16, 9700, 9600] {
+            let target = SocketAddr::from((Ipv4Addr::new(100, 64, 0, 9), port));
+            assert!(
+                matches!(
+                    dial_for_route_in(&slot, target, within).await,
+                    RouteDial::Dialled(_)
+                ),
+                "port {port} is a peer port"
+            );
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 3);
+
+        let ssh = SocketAddr::from((Ipv4Addr::new(100, 64, 0, 9), 22));
+        let RouteDial::PortRefused(why) = dial_for_route_in(&slot, ssh, within).await else {
+            panic!("port 22 must be refused");
+        };
+        assert!(
+            why.contains("port 22") && why.contains("peer port"),
+            "{why}"
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 3, "the node was never asked");
     }
 
     #[test]

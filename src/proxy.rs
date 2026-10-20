@@ -2102,13 +2102,14 @@ async fn peer_dial_handler(State(manager): State<Arc<Manager>>, request: Request
             "The tcr peer dial endpoint needs an HTTP/1.1 connection it can upgrade.",
         );
     };
-    let stream = match crate::peer::tailnet_node::dial_through_node(
+    use crate::peer::tailnet_node::RouteDial;
+    let stream = match crate::peer::tailnet_node::dial_for_route(
         target,
         crate::peer::tailnet_node::DIAL_TIMEOUT,
     )
     .await
     {
-        None => {
+        RouteDial::NoNode | RouteDial::NotTailnet => {
             return route_error(
                 &PEER_DIAL_ROUTE,
                 StatusCode::CONFLICT,
@@ -2119,7 +2120,17 @@ async fn peer_dial_handler(State(manager): State<Arc<Manager>>, request: Request
                 ),
             );
         }
-        Some(Err(err)) => {
+        // Gil, 2026-10-20: peer ports only, refused before the node is asked
+        // for anything (`tailnet_node::allowed_dial_ports`).
+        RouteDial::PortRefused(why) => {
+            return route_error(
+                &PEER_DIAL_ROUTE,
+                StatusCode::FORBIDDEN,
+                ErrorKind::Permission,
+                &format!("The tcr peer dial endpoint refused: {why}."),
+            );
+        }
+        RouteDial::Failed(err) => {
             return route_error(
                 &PEER_DIAL_ROUTE,
                 StatusCode::BAD_GATEWAY,
@@ -2127,7 +2138,7 @@ async fn peer_dial_handler(State(manager): State<Arc<Manager>>, request: Request
                 &format!("Could not reach {target} through the tailnet node: {err:#}"),
             );
         }
-        Some(Ok(stream)) => stream,
+        RouteDial::Dialled(stream) => stream,
     };
 
     tokio::spawn(async move {
@@ -11657,9 +11668,11 @@ mod tests {
             })
         });
         let _clear = ClearSlot;
+        let peers_dir = tempfile::tempdir().expect("tempdir");
         crate::peer::tailnet_node::server_slot().set(Some(crate::peer::tailnet_node::Published {
             dial,
             listen: "100.64.0.7:7755".parse().expect("addr"),
+            peers: peers_dir.path().join("tcr-peers.json"),
         }));
 
         let manager = Manager::with_live_refresher(
@@ -11702,6 +11715,27 @@ mod tests {
             .expect("the far end sees the CLI hang up")
             .expect("read");
         assert!(rest.is_empty());
+
+        // Gil, 2026-10-20: a port that is not a peer port is refused, as an
+        // answer the CLI reads, and the node is never asked to dial it.
+        let refused = crate::peer::tailnet_node::dial_through_server(
+            port,
+            Some("secret-proxy-key"),
+            "100.64.0.9:22".parse().expect("addr"),
+            Duration::from_secs(5),
+        )
+        .await
+        .err()
+        .map(|err| format!("{err:#}"))
+        .expect("port 22 is refused");
+        assert!(
+            refused.contains("403") && refused.contains("port 22"),
+            "{refused}"
+        );
+        assert!(
+            far_rx.try_recv().is_err(),
+            "the node was not asked to dial port 22"
+        );
     }
 
     /// The endpoint ALWAYS says what this process's MITM listener can intercept,

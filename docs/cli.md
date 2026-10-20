@@ -3279,7 +3279,9 @@ one. The running `tcr` dials those through its node: its own peer dials, and, fo
 the first pairing and `tcr peer join` (which run in the CLI), through a local route,
 `POST /_tcr/peer/dial` with `Upgrade: tcr-peer-dial`, behind the same gate as every `/_tcr/`
 route. The route dials only tailnet addresses, only through the node, and answers `409` in a
-`tcr` running no node. `tcr peer invite` and `tcr peer moved mint` put the node's address first
+`tcr` running no node. It dials only a peer port: 7755, this Mac's own `listen` port, or a port
+in an endpoint of a row in the peers file; any other port is refused with `403`, naming the
+port, before the node is asked for anything. `tcr peer invite` and `tcr peer moved mint` put the node's address first
 in the key (`tailnet-node`), read off the state file the running `tcr` writes, and the node's
 address is advertised to pinned Macs beside the router mapping.
 
