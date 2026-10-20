@@ -326,6 +326,12 @@ jobs:
       - name: Clippy (tailnet-node feature)
         run: cargo clippy --workspace --all-targets --locked --features tailnet-node -- -D warnings
 
+      # The one test that touches the real library (keys tcr mints read back
+      # into the library's type) runs only with the feature; the rest of the
+      # module's tests run in every build already.
+      - name: Test (tailnet-node feature)
+        run: cargo test --locked --features tailnet-node --lib tailnet_node
+
       # Recorded so a runner-image bump that changes the Swift language mode is
       # attributable from the log rather than looking like a source regression.
       - name: Swift toolchain version
