@@ -629,6 +629,7 @@ fn peers_fixture_rows() -> Vec<PeerStatusRow> {
                 last_ok_ms: Some(now_ms - 30_000),
             },
         ],
+        tailnet: None,
     };
     derived.push(measured);
     derived

@@ -45,7 +45,7 @@ use std::time::Duration;
 use tcr::log_err::LogErr as _;
 
 use tcr::peer::config::{self, Allow, Endpoint, EndpointSource, PeerFile, PeerRow};
-use tcr::peer::discovery::{self, Discovered, FoundList};
+use tcr::peer::discovery::{self, Discovered, FoundList, FoundSource};
 use tcr::peer::id::NodeKey;
 use tcr::peer::listener::{self, Admission, SessionContext};
 use tcr::peer::noise;
@@ -1324,6 +1324,7 @@ fn found_row(instance: u8, addr: &str) -> Discovered {
         name: None,
         addrs: vec![addr.to_string()],
         port: 9600,
+        sources: vec![FoundSource::Lan],
     }
 }
 

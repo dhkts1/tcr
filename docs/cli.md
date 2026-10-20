@@ -2690,8 +2690,9 @@ Prints this node's own peer id, minting the keypair on first use.
 
 ### `tcr peer ls`
 
-Lists pinned peers, what each may do, what is in flight, and every Mac heard announcing on
-the LAN in the last minute and not yet trusted, a found row.
+Lists pinned peers, what each may do, what is in flight, and every Mac heard announcing in the
+last minute and not yet trusted, a found row: on the LAN (with `tcr peer find on`), or over
+the tailnet from one of your own Macs (with `tcr peer tailnet app`).
 
 A found row never comes from this command running its own scan: it reads
 `peer-state.json`, which a running server's own browse task, on the same cadence as its
@@ -2720,7 +2721,7 @@ Codex account, because no lease draws on one.
 | flag | type | default | effect |
 |---|---|---|---|
 | `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to read |
-| `--json` | bool | `false` | machine-readable output. A sibling document to `tcr status --json`, never merged into it: that is a bare array of accounts, and clients depend on exactly that shape. `peers` carries both kinds of row: a trusted one has `node`; a found one has `name`, `address`, `trusted: false`, `lastSeenMs`, and no `node` at all, because a found row carries no key to pin |
+| `--json` | bool | `false` | machine-readable output. A sibling document to `tcr status --json`, never merged into it: that is a bare array of accounts, and clients depend on exactly that shape. `peers` carries both kinds of row: a trusted one has `node`; a found one has `name`, `address`, `trusted: false`, `lastSeenMs`, `sources`, and no `node` at all, because a found row carries no key to pin. `sources` is `["lan"]`, `["tailnet"]` or `["lan", "tailnet"]`; when both heard the same Mac, `address` is its tailnet one, because that beacon came from a Mac the Tailscale app says is yours and an mDNS beacon can come from anyone on the LAN |
 | `--config <path>` | path | `~/.config/tcr.json` | main config to read: `--json` reads it for the account labels the `lentTo` block is keyed by, each account's exit lock (`exits`) and the expiry a handed-over key ends at (`handedKeyUntil`), and the text form for the Codex exit pins it lists. A config that is missing or unreadable reads as one with no accounts, so `lentTo` and `exits` are empty and no pins are listed, instead of failing the listing |
 
 ### `tcr peer find <on\|off>`
@@ -2978,6 +2979,11 @@ for a person reading one row aloud. Nothing parses `display` back. A row's `name
 operator's label through the same sanitizer `tcr peer ls` uses, so a label that is an email or
 a UUID comes out `[masked]`.
 
+A row whose newest endpoint is the tailnet address of a machine in the running `tcr`'s last
+reading of the Tailscale app (app mode, read in the last 60 seconds) carries
+`"tailnet": {"route": "direct" | "relayed" | null}`: how the app reaches that Mac, or `null`
+when it reports neither a direct path nor a relay. Any other row has no `tailnet` key.
+
 ### `tcr peer via <target>`
 
 Chooses how this Mac reaches the internet when its own connection is down.
@@ -3195,6 +3201,13 @@ new address from it. There is no separate `tcr peer drop-status` verb; this read
 lives, on `--json` under a `deadDrop` key. Publishing itself leaves nothing on this Mac to read
 back: the write lands on the store, never on the peers file, so no last-publish time is printed.
 
+It prints the tailnet as the running `tcr` last recorded it, never asking the Tailscale app
+itself: `reach: tailnet: off` whenever the setting is off, whatever was recorded before;
+`reach: tailnet: app: <tailnet address>, <n> of your Macs heard
+over it`; `reach: tailnet: app: <state>: <detail>` when the app could not be read; or a line
+saying the record is stale or that no server has recorded one. On `--json` it is the `tailnet`
+key, the same object `tcr peer tailnet --json` prints as `held`, or `null`.
+
 ### `tcr peer tailnet [off\|app\|node]`
 
 Sets, or with no argument prints, how this Mac uses a tailnet. Off by default.
@@ -3211,6 +3224,12 @@ boot-time snapshot, so it needs no restart. `node` is refused, with the file lef
 `tcr` built without the `tailnet-node` cargo feature; release builds do not have it. A word this
 `tcr` does not know (one a newer `tcr` wrote) still loads: it is treated as off, kept in the file
 as written, and the no-argument form prints a line saying so.
+
+`app` and `node` need a peer port, because the running `tcr` reads the app and sends the beacon
+from beside its peer listener. On a Mac whose peers file has no `listen`, they write
+`listen = 0.0.0.0:7755` too, exactly as `tcr peer find on` does, and say so: `peer.listen:
+0.0.0.0:7755 written into <path>`, then that the port opens the next time the proxy starts. With
+`--json` those two lines go to standard error. `off` never writes `listen` and never removes one.
 
 With no argument it prints `peer.tailnet: <mode>`, and in `app` mode one live read of the
 Tailscale app: this Mac's tailnet address, then one line per Mac of yours that is online
@@ -3260,7 +3279,11 @@ can hold two Tailscale CLIs at different versions. It runs `status --json` and i
   - `connected`: node mode, paired Macs with a live connection through the node.
   - `detail`: one plain sentence for a failure state, else `null`.
 
-No server records `held` yet, so today it is always `null`.
+A server with a peer listener records `held` every 20 seconds while the mode is `app`. It records
+nothing while the mode is `off`, so after you turn the mode off the last record stays until it
+goes stale; the setting wins, and `off` reads as off whatever the record says. In `node` mode the
+record is written by tcr's own node, not by this tick. With no listener (no `listen` in the peers
+file) nothing is recorded, so `held` stays `null`.
 
 ### `tcr peer graph <--json\|--serve>`
 

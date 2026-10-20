@@ -63,9 +63,11 @@ pub struct PeerFile {
     /// that is the default: a fresh install discloses nothing, opens no port
     /// and answers nobody. Boot-time.
     ///
-    /// **Three verbs write it, and only on an explicit opt-in.** `tcr peer find
-    /// on`, `tcr peer share on` and `tcr peer internet on` each need a port for
-    /// their answer to mean anything, and each used to leave the operator to
+    /// **Four verbs write it, and only on an explicit opt-in.** `tcr peer find
+    /// on`, `tcr peer share on`, `tcr peer internet on` and `tcr peer tailnet
+    /// app|node` each need a port for their answer to mean anything (the
+    /// tailnet beacon and its browse task run only beside a peer listener),
+    /// and the first three used to leave the operator to
     /// hand-edit this key: `find on` refused outright, and no walkthrough could
     /// get past its first command. When one of those verbs runs and this is
     /// absent, that verb writes [`default_listen`] and prints the line saying

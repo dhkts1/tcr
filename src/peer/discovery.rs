@@ -58,6 +58,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use serde::{Deserialize, Serialize};
 
 use crate::peer::config::{Endpoint, EndpointSource, PeerRow, PeerStore};
 
@@ -352,7 +353,126 @@ pub fn discovered_row(
         name: name.and_then(sanitize_name),
         addrs,
         port,
+        sources: vec![FoundSource::Lan],
     })
+}
+
+/// The first line of a tailnet beacon datagram: what it is, and the version
+/// of this encoding. A datagram that does not start with it is not read.
+pub const TAILNET_BEACON_HEADER: &str = "tcr-beacon 1";
+
+/// The largest tailnet beacon datagram read. A real one is under 150 bytes:
+/// the header, a port, the wire version, a 16-character instance id, a
+/// 16-character tag and a name of at most 32 bytes.
+pub const TAILNET_BEACON_MAX_BYTES: usize = 512;
+
+/// The key the listener port rides under in a tailnet beacon. mDNS carries
+/// the port in its SRV record, so [`beacon_txt`] has no key for it.
+const TAILNET_PORT_KEY: &str = "port";
+
+/// The mDNS beacon's payload as one UDP datagram for the tailnet: the
+/// [`TAILNET_BEACON_HEADER`] line, then `port=<port>`, then each pair of
+/// `txt` (built by [`beacon_txt`], so it carries exactly what the mDNS beacon
+/// carries and nothing else) as `key=value`, one per line.
+///
+/// Text with one pair per line works because every value is restricted
+/// already: the version and port are digits, the instance id and tag are hex,
+/// and the name has passed [`sanitize_name`]'s whitelist, which has no `=`
+/// and no line break in it.
+pub fn tailnet_beacon_datagram(txt: &[(String, String)], port: u16) -> Vec<u8> {
+    let mut out = format!("{TAILNET_BEACON_HEADER}\n{TAILNET_PORT_KEY}={port}\n");
+    for (key, value) in txt {
+        out.push_str(key);
+        out.push('=');
+        out.push_str(value);
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
+/// This node's tailnet beacon, from the same [`beacon_txt`] the mDNS beacon
+/// is built from: this boot's instance id, the network-key tag when a key is
+/// set, and `name` only when the caller passes one (it does only when
+/// *Announce my name* is on).
+pub fn tailnet_beacon(
+    port: u16,
+    name: Option<&str>,
+    network_key: Option<&crate::peer::config::NetworkKey>,
+) -> Vec<u8> {
+    let txt = beacon_txt(
+        &crate::peer::id::boot_instance_id(),
+        port,
+        name,
+        network_key,
+        now_unix_secs(),
+    );
+    tailnet_beacon_datagram(&txt, port)
+}
+
+/// A tailnet beacon datagram from `from`, as a found row, or `None` when it
+/// is not one this node will show.
+///
+/// The datagram is read strictly (the header, at most
+/// [`TAILNET_BEACON_MAX_BYTES`], UTF-8, a port, a wire version, no key
+/// twice) and then handed to [`discovered_row`], so the instance id, the
+/// network-key tag and the name get exactly the checks an mDNS beacon gets.
+/// The address is the datagram's source, never a value it carries: the
+/// caller has already checked that source is one of the operator's own Macs,
+/// and that is the only thing that makes the row worth showing. Keys this
+/// build does not know are ignored, as an mDNS TXT record's are.
+pub fn tailnet_beacon_row(
+    datagram: &[u8],
+    from: std::net::IpAddr,
+    network_key: Option<&crate::peer::config::NetworkKey>,
+    now_unix_secs: i64,
+) -> Option<Discovered> {
+    if datagram.len() > TAILNET_BEACON_MAX_BYTES {
+        return None;
+    }
+    let text = std::str::from_utf8(datagram).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != TAILNET_BEACON_HEADER {
+        return None;
+    }
+    let mut port: Option<u16> = None;
+    let mut version: Option<&str> = None;
+    let mut instance: Option<&str> = None;
+    let mut tag: Option<&str> = None;
+    let mut name: Option<&str> = None;
+    for line in lines {
+        let (key, value) = line.split_once('=')?;
+        let slot = match key {
+            TAILNET_PORT_KEY => {
+                if port.is_some() {
+                    return None;
+                }
+                port = Some(value.parse().ok().filter(|port| *port != 0)?);
+                continue;
+            }
+            TXT_VERSION_KEY => &mut version,
+            TXT_INSTANCE_KEY => &mut instance,
+            TXT_TAG_KEY => &mut tag,
+            TXT_NAME_KEY => &mut name,
+            _ => continue,
+        };
+        if slot.replace(value).is_some() {
+            return None;
+        }
+    }
+    // The version is always sent; a datagram without one was not built by
+    // `tailnet_beacon_datagram`.
+    version?.parse::<u16>().ok()?;
+    let mut row = discovered_row(
+        instance,
+        tag,
+        name,
+        vec![from.to_canonical().to_string()],
+        port?,
+        network_key,
+        now_unix_secs,
+    )?;
+    row.sources = vec![FoundSource::Tailnet];
+    Some(row)
 }
 
 /// Every address a resolved beacon announced that this node could dial, as
@@ -1135,11 +1255,11 @@ impl FoundList {
             .retain(|(_, seen)| now_ms.saturating_sub(*seen) < FOUND_TTL_MS);
         for row in scan {
             let key = row.addrs.first().cloned().unwrap_or_default();
-            if let Some(existing) = self
-                .rows
-                .iter_mut()
-                .find(|(seen, _)| seen.instance_id == row.instance_id && seen.addrs == row.addrs)
-            {
+            if let Some(existing) = self.rows.iter_mut().find(|(seen, _)| {
+                seen.instance_id == row.instance_id
+                    && seen.addrs == row.addrs
+                    && seen.sources == row.sources
+            }) {
                 existing.0 = row;
                 existing.1 = now_ms;
                 continue;
@@ -1160,13 +1280,43 @@ impl FoundList {
         self.rows.sort_by_key(|(_, seen)| std::cmp::Reverse(*seen));
     }
 
-    /// The rows to show: newest first, at most [`MAX_FOUND_ROWS`].
-    pub fn shown(&self) -> Vec<Discovered> {
+    /// Drop every row `source` heard, because that source was turned off: a
+    /// row an operator stopped asking for must not be written again while it
+    /// ages out.
+    pub fn forget(&mut self, source: FoundSource) {
+        self.rows.retain(|(row, _)| !row.sources.contains(&source));
+    }
+
+    /// How many held rows `source` heard.
+    pub fn heard_from(&self, source: FoundSource) -> usize {
         self.rows
             .iter()
-            .take(MAX_FOUND_ROWS)
-            .map(|(row, _)| row.clone())
-            .collect()
+            .filter(|(row, _)| row.sources.contains(&source))
+            .count()
+    }
+
+    /// The rows to show: newest first, at most [`MAX_FOUND_ROWS`], with a Mac
+    /// both sources heard as ONE row.
+    ///
+    /// # Which address a merged row dials, and why it is the tailnet one
+    ///
+    /// A tailnet row and every LAN row with the same instance id become one
+    /// row in the tailnet row's place. Its addresses are the tailnet address
+    /// first, then the LAN ones, so the address Trust dials is the tailnet
+    /// one. The tailnet beacon came from an address the Tailscale app says
+    /// belongs to one of the operator's own Macs, and WireGuard drops a
+    /// packet whose source is not the sending peer's own. An mDNS beacon is
+    /// anyone on this LAN, and the instance id it carries is broadcast for
+    /// anyone to copy: putting the LAN address first would let a neighbour
+    /// who copied it put their own address on the row the tailnet vouched for
+    /// (the lead, 2026-10-20). Rows only mDNS heard are unchanged, and two
+    /// LAN rows with one id stay two rows, as before.
+    ///
+    /// The caps count merged rows: [`MAX_FOUND_ROWS`] here, and
+    /// [`MAX_FOUND_PER_ADDRESS`] in [`Self::observe`] over one list holding
+    /// both sources.
+    pub fn shown(&self) -> Vec<Discovered> {
+        self.merged().into_iter().take(MAX_FOUND_ROWS).collect()
     }
 
     /// How many rows are held but not shown, the footer line's number.
@@ -1174,8 +1324,42 @@ impl FoundList {
     /// Counted rather than discarded so the UI can be honest: "12 shown, N more
     /// not shown" tells an operator their Mac is on a noisy network, and a
     /// silently truncated list tells them their Mac is broken.
-    pub const fn not_shown(&self) -> usize {
-        self.rows.len().saturating_sub(MAX_FOUND_ROWS)
+    pub fn not_shown(&self) -> usize {
+        self.merged().len().saturating_sub(MAX_FOUND_ROWS)
+    }
+
+    /// Every held row, newest first, each LAN row whose instance id a tailnet
+    /// row also carries folded into that tailnet row. See [`Self::shown`].
+    fn merged(&self) -> Vec<Discovered> {
+        let on_tailnet = |id: &tcr_peer_wire::InstanceId| {
+            self.rows.iter().any(|(row, _)| {
+                row.sources.contains(&FoundSource::Tailnet) && row.instance_id == *id
+            })
+        };
+        let mut out = Vec::with_capacity(self.rows.len());
+        for (row, _) in &self.rows {
+            if row.sources.contains(&FoundSource::Tailnet) {
+                let mut merged = row.clone();
+                for (lan, _) in &self.rows {
+                    if lan.sources.contains(&FoundSource::Lan) && lan.instance_id == row.instance_id
+                    {
+                        for addr in &lan.addrs {
+                            if !merged.addrs.contains(addr) {
+                                merged.addrs.push(addr.clone());
+                            }
+                        }
+                        if !merged.sources.contains(&FoundSource::Lan) {
+                            merged.sources.push(FoundSource::Lan);
+                        }
+                    }
+                }
+                merged.sources.sort_unstable();
+                out.push(merged);
+            } else if !on_tailnet(&row.instance_id) {
+                out.push(row.clone());
+            }
+        }
+        out
     }
 
     /// How many rows are held in total.
@@ -1254,10 +1438,44 @@ pub struct Discovered {
     /// when it announces no name, which is a setting and not a fault: the row
     /// then shows its address.
     pub name: Option<String>,
-    /// Where it says it can be reached.
+    /// Where it says it can be reached. On a row both sources saw, the
+    /// tailnet address comes first: see [`FoundList::shown`].
     pub addrs: Vec<String>,
     /// The peer port it says it listens on.
     pub port: u16,
+    /// Which sources heard it, sorted and without repeats. One source on a
+    /// row a scan produced; both on a row [`FoundList::shown`] merged.
+    pub sources: Vec<FoundSource>,
+}
+
+impl Discovered {
+    /// This row as the state file holds it, heard at `now_ms`. The dial
+    /// address is the first of [`Self::addrs`].
+    pub fn found_row(&self, now_ms: i64) -> crate::peer::state::Found {
+        crate::peer::state::Found {
+            addr: self.addrs.first().cloned().unwrap_or_default(),
+            instance_id: self.instance_id,
+            announced_name: self.name.clone(),
+            listen_port: self.port,
+            first_seen_ms: now_ms,
+            last_seen_ms: now_ms,
+            sources: self.sources.clone(),
+        }
+    }
+}
+
+/// Where a found row was heard.
+///
+/// Ordered `Lan` before `Tailnet` so a sorted list of sources reads the way
+/// `tcr peer ls --json` writes it: `["lan", "tailnet"]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FoundSource {
+    /// An mDNS beacon on this LAN.
+    Lan,
+    /// A beacon datagram over the tailnet, from one of the operator's own
+    /// Macs as the Tailscale app on this Mac names them.
+    Tailnet,
 }
 
 #[cfg(test)]
@@ -1702,9 +1920,244 @@ mod tests {
             name: Some("studio-mac".to_string()),
             addrs: vec!["127.0.0.1".to_string()],
             port: 47811,
+            sources: vec![FoundSource::Lan],
         };
         // The only thing `Discovered` supports is reading its own fields back.
         assert_eq!(row.name.as_deref(), Some("studio-mac"));
         assert_eq!(row.port, 47811);
+    }
+
+    // -----------------------------------------------------------------------
+    // The tailnet beacon and the merge across sources
+    // -----------------------------------------------------------------------
+
+    const NOW_SECS: i64 = 1_760_000_000;
+
+    fn instance(byte: u8) -> tcr_peer_wire::InstanceId {
+        tcr_peer_wire::InstanceId([byte; tcr_peer_wire::INSTANCE_ID_BYTES])
+    }
+
+    fn tailnet_ip(text: &str) -> std::net::IpAddr {
+        text.parse().expect("a literal address parses")
+    }
+
+    fn datagram(
+        id: u8,
+        port: u16,
+        name: Option<&str>,
+        key: Option<&crate::peer::config::NetworkKey>,
+    ) -> Vec<u8> {
+        tailnet_beacon_datagram(&beacon_txt(&instance(id), port, name, key, NOW_SECS), port)
+    }
+
+    /// **A tailnet beacon round-trips into the row an mDNS beacon with the
+    /// same payload would make**, with the datagram's source as the address,
+    /// and with the network-key tag checked the same way.
+    ///
+    /// Watch it fail by dropping the `tag` argument from the
+    /// `discovered_row` call in `tailnet_beacon_row` (pass `None`): the keyed
+    /// beacon is then refused, and the wrong-key one is too, so the first
+    /// keyed assertion fails.
+    #[test]
+    fn a_tailnet_beacon_round_trips_through_the_mdns_checks() {
+        let from = tailnet_ip("100.64.0.2");
+        let row = tailnet_beacon_row(
+            &datagram(4, 7755, Some("laptop-2"), None),
+            from,
+            None,
+            NOW_SECS,
+        )
+        .expect("a beacon with no key reads");
+        assert_eq!(row.instance_id, instance(4));
+        assert_eq!(row.name.as_deref(), Some("laptop-2"));
+        assert_eq!(row.addrs, ["100.64.0.2"]);
+        assert_eq!(row.port, 7755);
+        assert_eq!(row.sources, [FoundSource::Tailnet]);
+
+        let key = crate::peer::config::NetworkKey::from_bytes([7; 32]);
+        let other = crate::peer::config::NetworkKey::from_bytes([8; 32]);
+        let keyed = datagram(4, 7755, None, Some(&key));
+        assert!(
+            tailnet_beacon_row(&keyed, from, Some(&key), NOW_SECS).is_some(),
+            "the right key verifies"
+        );
+        assert!(
+            tailnet_beacon_row(&keyed, from, Some(&other), NOW_SECS).is_none(),
+            "a wrong key is refused before the row exists"
+        );
+        assert!(
+            tailnet_beacon_row(&datagram(4, 7755, None, None), from, Some(&key), NOW_SECS)
+                .is_none(),
+            "an untagged beacon is refused by a node holding a key"
+        );
+
+        // The payload is beacon_txt's and nothing else: no key material can
+        // ride in it because beacon_txt carries none.
+        let text = String::from_utf8(keyed).expect("the datagram is text");
+        let keys: Vec<&str> = text
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once('=').map(|(k, _)| k))
+            .collect();
+        assert_eq!(keys, ["port", "v", "id", "t"]);
+    }
+
+    /// **A datagram that is not a well-formed beacon is not a row**: wrong
+    /// header, oversized, a repeated key, no port, no version, a bad id, and
+    /// a hostile name drops the name and keeps the row, as over mDNS.
+    #[test]
+    fn a_malformed_tailnet_beacon_is_refused() {
+        let from = tailnet_ip("100.64.0.2");
+        let read = |bytes: &[u8]| tailnet_beacon_row(bytes, from, None, NOW_SECS);
+        let id = instance(4).to_wire();
+        assert!(read(format!("tcr-beacon 2\nport=7755\nv=1\nid={id}\n").as_bytes()).is_none());
+        assert!(
+            read(format!("{TAILNET_BEACON_HEADER}\nport=7755\nid={id}\n").as_bytes()).is_none()
+        );
+        assert!(read(format!("{TAILNET_BEACON_HEADER}\nv=1\nid={id}\n").as_bytes()).is_none());
+        assert!(
+            read(format!("{TAILNET_BEACON_HEADER}\nport=0\nv=1\nid={id}\n").as_bytes()).is_none()
+        );
+        assert!(
+            read(format!("{TAILNET_BEACON_HEADER}\nport=7755\nv=1\nid={id}\nid={id}\n").as_bytes())
+                .is_none()
+        );
+        assert!(
+            read(format!("{TAILNET_BEACON_HEADER}\nport=7755\nv=1\nid=zz\n").as_bytes()).is_none()
+        );
+        assert!(
+            read(
+                format!("{TAILNET_BEACON_HEADER}\nport=7755\nv=1\nid={id}\nnoequals\n").as_bytes()
+            )
+            .is_none()
+        );
+        let mut huge = format!("{TAILNET_BEACON_HEADER}\nport=7755\nv=1\nid={id}\n").into_bytes();
+        huge.resize(TAILNET_BEACON_MAX_BYTES + 1, b'x');
+        assert!(read(&huge).is_none());
+
+        let hostile = read(
+            format!(
+                "{TAILNET_BEACON_HEADER}\nport=7755\nv=1\nid={id}\nname=\u{1b}[2Jx\nfuture=1\n"
+            )
+            .as_bytes(),
+        )
+        .expect("a hostile name drops the name, not the row; an unknown key is ignored");
+        assert_eq!(hostile.name, None);
+    }
+
+    fn lan(id: u8, addr: &str) -> Discovered {
+        Discovered {
+            instance_id: instance(id),
+            name: Some("from-lan".to_string()),
+            addrs: vec![addr.to_string()],
+            port: 7755,
+            sources: vec![FoundSource::Lan],
+        }
+    }
+
+    fn tailnet(id: u8, addr: &str) -> Discovered {
+        Discovered {
+            instance_id: instance(id),
+            name: Some("from-tailnet".to_string()),
+            addrs: vec![addr.to_string()],
+            port: 7755,
+            sources: vec![FoundSource::Tailnet],
+        }
+    }
+
+    /// **One Mac heard over both sources is one row, listing both sources,
+    /// dialled at its tailnet address, with the LAN address kept after it.**
+    ///
+    /// Watch it fail by deleting the `else if !on_tailnet(..)` condition in
+    /// `merged` (push every LAN row): the list then holds two rows.
+    #[test]
+    fn one_mac_on_both_sources_is_one_row_dialled_over_the_tailnet() {
+        let mut list = FoundList::new();
+        list.observe(vec![lan(4, "192.168.1.20")], 1_000);
+        list.observe(
+            vec![tailnet(4, "100.64.0.2"), lan(5, "192.168.1.21")],
+            2_000,
+        );
+        let shown = list.shown();
+        assert_eq!(shown.len(), 2, "{shown:?}");
+        let merged = &shown[0];
+        assert_eq!(merged.instance_id, instance(4));
+        assert_eq!(merged.addrs, ["100.64.0.2", "192.168.1.20"]);
+        assert_eq!(merged.sources, [FoundSource::Lan, FoundSource::Tailnet]);
+        assert_eq!(merged.name.as_deref(), Some("from-tailnet"));
+        assert_eq!(
+            shown[1].sources,
+            [FoundSource::Lan],
+            "a LAN-only row is unchanged"
+        );
+        assert_eq!(merged.found_row(9).addr, "100.64.0.2");
+    }
+
+    /// **An mDNS beacon that copies a tailnet Mac's instance id cannot move
+    /// the merged row's dial address**, whichever arrives last and however
+    /// many copies there are. The instance id is broadcast on the LAN; the
+    /// tailnet source is the one the Tailscale app vouches for.
+    ///
+    /// Watch it fail by building the merged row from the LAN row and
+    /// appending the tailnet address (the spec's first draft, "LAN address
+    /// first"): `addrs[0]` is then the copier's.
+    #[test]
+    fn an_mdns_copy_of_a_tailnet_instance_id_does_not_change_the_dial_address() {
+        let mut list = FoundList::new();
+        list.observe(vec![tailnet(4, "100.64.0.2")], 1_000);
+        list.observe(vec![lan(4, "192.168.1.66")], 2_000);
+        list.observe(vec![lan(4, "192.168.1.67")], 3_000);
+        let shown = list.shown();
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert_eq!(shown[0].addrs[0], "100.64.0.2");
+        assert_eq!(shown[0].found_row(9).dial_address(), "100.64.0.2:7755");
+    }
+
+    /// **The 12-row cap counts merged rows across both sources, and the
+    /// footer counts the rest.**
+    #[test]
+    fn the_row_cap_applies_across_both_sources() {
+        let mut list = FoundList::new();
+        let scan: Vec<Discovered> = (1..=8)
+            .map(|n| lan(n, &format!("192.168.1.{n}")))
+            .chain((1..=8).map(|n| tailnet(n, &format!("100.64.0.{n}"))))
+            .chain((20..=27).map(|n| tailnet(n, &format!("100.64.1.{n}"))))
+            .collect();
+        list.observe(scan, 1_000);
+        assert_eq!(list.len(), 24, "every row is held");
+        assert_eq!(list.shown().len(), MAX_FOUND_ROWS);
+        assert_eq!(
+            list.not_shown(),
+            16 - MAX_FOUND_ROWS,
+            "8 merged + 8 tailnet-only"
+        );
+        assert_eq!(list.heard_from(FoundSource::Tailnet), 16);
+    }
+
+    /// **The per-address cap holds across sources too**: one address takes
+    /// at most two rows, whichever source they came from.
+    #[test]
+    fn the_per_address_cap_applies_across_both_sources() {
+        let mut list = FoundList::new();
+        list.observe(
+            vec![
+                lan(1, "100.64.0.2"),
+                tailnet(2, "100.64.0.2"),
+                tailnet(3, "100.64.0.2"),
+            ],
+            1_000,
+        );
+        assert_eq!(list.len(), MAX_FOUND_PER_ADDRESS);
+    }
+
+    /// **Turning one source off forgets its rows and keeps the other's.**
+    #[test]
+    fn forgetting_a_source_keeps_the_other() {
+        let mut list = FoundList::new();
+        list.observe(vec![lan(1, "192.168.1.1"), tailnet(2, "100.64.0.2")], 1_000);
+        list.forget(FoundSource::Tailnet);
+        let shown = list.shown();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].sources, [FoundSource::Lan]);
     }
 }

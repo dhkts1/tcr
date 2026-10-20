@@ -4533,6 +4533,145 @@ fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
 /// persisted anywhere today**, so the per-peer rows print the slot and say the
 /// port is unavailable rather than inventing a number from public key material,
 /// which a scanner could compute too.
+/// `tcr peer reach`'s tailnet line, from the setting in the peers file and
+/// the record the serving process last wrote.
+///
+/// The record is what the line reports, and it is never refreshed here: the
+/// Tailscale app is read by the server, not by this verb. A record older than
+/// [`peer::state::TAILNET_RECORD_STALE_MS`] says so rather than passing for
+/// the current state.
+///
+/// The setting wins over the record. A server records nothing while the mode
+/// is off, so a record left from before the mode went off is not read at all:
+/// off is off, and an unknown word is shown as written and treated as off.
+fn reach_tailnet_line(
+    setting: &peer::config::TailnetSetting,
+    record: Option<&peer::state::TailnetRecord>,
+    now_ms: i64,
+) -> String {
+    use peer::config::{TailnetMode, TailnetSetting};
+    use peer::state::TailnetState;
+
+    match setting {
+        TailnetSetting::Known(TailnetMode::Off) => return "reach: tailnet: off".to_string(),
+        TailnetSetting::Unknown(word) => {
+            return format!(
+                "reach: tailnet: off (\"{}\" is a mode this tcr does not know, so it is treated \
+                 as off)",
+                masked_label(word)
+            );
+        }
+        TailnetSetting::Known(TailnetMode::App | TailnetMode::Node) => {}
+    }
+    let Some(record) = record else {
+        return format!(
+            "reach: tailnet: {}: no serving process has recorded a tailnet reading",
+            setting.as_word()
+        );
+    };
+    if record.is_stale(now_ms) {
+        return format!(
+            "reach: tailnet: {}: the serving process last recorded one {}s ago, so it is not \
+             running or not reading the tailnet",
+            setting.as_word(),
+            now_ms.saturating_sub(record.recorded_at_ms).max(0) / 1_000
+        );
+    }
+    match record.state {
+        TailnetState::Off => "reach: tailnet: off".to_string(),
+        TailnetState::Ready => format!(
+            "reach: tailnet: {}: {}, {} of your Macs heard over it (recorded by the serving \
+             process)",
+            record.mode.as_word(),
+            record
+                .address
+                .map_or_else(|| "no tailnet address".to_string(), |addr| addr.to_string()),
+            record.found
+        ),
+        state => format!(
+            "reach: tailnet: {}: {}: {}",
+            record.mode.as_word(),
+            serde_json::to_value(state)
+                .ok()
+                .and_then(|word| word.as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("{state:?}")),
+            record.detail.as_deref().unwrap_or("no detail recorded")
+        ),
+    }
+}
+
+#[cfg(test)]
+mod reach_tailnet_line_tests {
+    use super::*;
+    use peer::config::{TailnetMode, TailnetSetting};
+    use peer::state::{TailnetRecord, TailnetState};
+
+    fn record(state: TailnetState, detail: Option<&str>) -> TailnetRecord {
+        TailnetRecord {
+            mode: TailnetMode::App.into(),
+            state,
+            address: Some(std::net::Ipv4Addr::new(100, 64, 0, 7)),
+            found: 2,
+            detail: detail.map(str::to_string),
+            recorded_at_ms: 1_000,
+            ..TailnetRecord::default()
+        }
+    }
+
+    /// **The line says what the server recorded, says stale when it is, and
+    /// says when nothing was recorded. The setting wins: off is off even
+    /// with a fresh record left from app mode, and an unknown word is shown
+    /// and treated as off.**
+    ///
+    /// Watch it fail by making the `Known(TailnetMode::Off)` arm fall through
+    /// instead of returning: the first row then reads `off: no serving process
+    /// has recorded a tailnet reading`, and the leftover-record row would
+    /// report app/ready.
+    #[test]
+    fn the_tailnet_line_for_each_case() {
+        let off = TailnetSetting::Known(TailnetMode::Off);
+        let app = TailnetSetting::Known(TailnetMode::App);
+        assert_eq!(reach_tailnet_line(&off, None, 1_000), "reach: tailnet: off");
+        assert!(reach_tailnet_line(&app, None, 1_000).contains("no serving process has recorded"));
+        let ready = record(TailnetState::Ready, None);
+        assert_eq!(
+            reach_tailnet_line(&app, Some(&ready), 2_000),
+            "reach: tailnet: app: 100.64.0.7, 2 of your Macs heard over it (recorded by the \
+             serving process)"
+        );
+        assert_eq!(
+            reach_tailnet_line(&off, Some(&ready), 2_000),
+            "reach: tailnet: off",
+            "a fresh record left from app mode does not outrank the setting"
+        );
+        assert!(
+            reach_tailnet_line(
+                &TailnetSetting::Unknown("both".to_string()),
+                Some(&ready),
+                2_000
+            )
+            .contains("\"both\" is a mode this tcr does not know"),
+        );
+        assert!(
+            reach_tailnet_line(
+                &app,
+                Some(&ready),
+                1_001 + peer::state::TAILNET_RECORD_STALE_MS
+            )
+            .contains("not running or not reading"),
+            "a stale record is reported as stale"
+        );
+        let failed = record(
+            TailnetState::AppNotRunning,
+            Some("The Tailscale app is not running on this Mac."),
+        );
+        assert_eq!(
+            reach_tailnet_line(&app, Some(&failed), 2_000),
+            "reach: tailnet: app: appNotRunning: The Tailscale app is not running on this Mac."
+        );
+    }
+}
+
 fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
     use tcr::peer::reach;
 
@@ -4593,10 +4732,17 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
     // process that died without deleting its mapping leaves behind, and
     // reporting it would tell an operator a port is open that nothing renews.
     let now_ms = peer::pair::now_ms();
-    let held = peer::state::load(&peer_state_path(&peers_path), now_ms)
-        .ok()
-        .and_then(|state| state.mapping)
+    let state = peer::state::load(&peer_state_path(&peers_path), now_ms).ok();
+    let held = state
+        .as_ref()
+        .and_then(|state| state.mapping.clone())
         .filter(|record| record.expires_at_ms > now_ms);
+    // The tailnet, as the serving process last recorded it: the same rule as
+    // the mapping, never asked of the Tailscale app here. A stale record is
+    // shown as stale, not dropped, so "the server stopped writing" and "no
+    // server ever wrote one" stay two answers.
+    let tailnet = state.and_then(|state| state.tailnet);
+    let tailnet_line = reach_tailnet_line(&file.tailnet, tailnet.as_ref(), now_ms);
 
     // Every NAT-PMP outcome is a string, including the failures, because the
     // reader of this verb wants to see WHICH refusal the router gave.
@@ -4699,6 +4845,7 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
             "mapping": mapping,
             "listenPort": internal_port,
             "heldMapping": held,
+            "tailnet": tailnet,
             "slot": slot,
             "slotSeconds": reach::SLOT_SECONDS,
             "peers": peers,
@@ -4748,6 +4895,7 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
             "reach: held-mapping: none (no serving process on this Mac holds one right now)"
         ),
     }
+    println!("{tailnet_line}");
     println!(
         "reach: slot: {slot} ({}s each, the slot before and after also accepted)",
         reach::SLOT_SECONDS
@@ -5173,6 +5321,7 @@ fn found_row_for_readers(row: &peer::state::Found) -> status::PeerFoundRow {
         address: row.dial_address(),
         trusted: false,
         last_seen_ms: row.last_seen_ms,
+        sources: row.sources.clone(),
     }
 }
 
@@ -5313,14 +5462,7 @@ impl PeerFinder for RealPeerFinder {
             // Reusing `Found::dial_address` rather than a second bracket
             // rule: the timestamps are unused by that method and are not
             // written anywhere, this row is never persisted.
-            let as_found = peer::state::Found {
-                addr: row.addrs.first().cloned().unwrap_or_default(),
-                instance_id: row.instance_id,
-                announced_name: row.name.clone(),
-                listen_port: row.port,
-                first_seen_ms: 0,
-                last_seen_ms: 0,
-            };
+            let as_found = row.found_row(0);
             let name = as_found
                 .announced_name
                 .as_deref()
@@ -5331,12 +5473,12 @@ impl PeerFinder for RealPeerFinder {
     }
 }
 
-/// Give this Mac a peer port when the operator turns one of the three features
+/// Give this Mac a peer port when the operator turns one of the features that need one
 /// on and there is none yet. Returns the address written, or `None` when
 /// `listen` was already set, which this never touches.
 ///
 /// The caller writes the file and then prints [`print_listen_written`]: the
-/// three verbs that call this already hold the peers-file lock and already have
+/// verbs that call this already hold the peers-file lock and already have
 /// a save of their own, and a second write here would be a second writer for
 /// one key.
 ///
@@ -5351,8 +5493,8 @@ fn ensure_listen_for_opt_in(file: &mut peer::config::PeerFile) -> Option<std::ne
     Some(chosen)
 }
 
-/// What every verb that just wrote a peer port says, in one place so the three
-/// of them say the same thing.
+/// What every verb that just wrote a peer port says, in one place so they
+/// all say the same thing.
 ///
 /// The second line is the honest half. The peer socket is bound once, at boot,
 /// from the file as it was then (`src/server.rs`, the `file.listen` read before
@@ -5360,15 +5502,24 @@ fn ensure_listen_for_opt_in(file: &mut peer::config::PeerFile) -> Option<std::ne
 /// of this file whenever its mtime moves but nothing re-binds a socket, so a
 /// port written now is a port that opens at the next start and not before.
 fn print_listen_written(addr: std::net::SocketAddr, peers_path: &Path) {
-    println!(
-        "peer.listen: {addr} written into {} (this Mac had no peer port, and turning this on \
-         needs one)",
-        peers_path.display()
-    );
-    println!(
+    for line in listen_written_lines(addr, peers_path) {
+        println!("{line}");
+    }
+}
+
+/// [`print_listen_written`]'s two lines, for a verb whose standard output is
+/// a JSON document and which says them on standard error instead.
+fn listen_written_lines(addr: std::net::SocketAddr, peers_path: &Path) -> [String; 2] {
+    [
+        format!(
+            "peer.listen: {addr} written into {} (this Mac had no peer port, and turning this \
+             on needs one)",
+            peers_path.display()
+        ),
         "peer.listen: nothing is listening on it yet. The port opens the next time the proxy \
          starts, so quit TcrBar and open it again to finish turning this on"
-    );
+            .to_string(),
+    ]
 }
 
 /// `tcr peer tailnet [off|app|node] [--json]`, with the Tailscale CLI looked
@@ -5397,14 +5548,33 @@ fn run_peer_tailnet_with(
                  from source with `--features tailnet-node`"
             );
         }
-        {
+        let listen_written = {
             let (_lock, mut file) = lock_peers_file(&peers_path)?;
             file.tailnet = mode.into();
+            // App and node are opt-ins that need a peer port: the server's
+            // browse task, which reads the app and sends the beacon, runs
+            // only beside a peer listener. Off is not an opt-in, so it never
+            // writes `listen` and never removes one.
+            let written = match mode {
+                TailnetMode::App | TailnetMode::Node => ensure_listen_for_opt_in(&mut file),
+                TailnetMode::Off => None,
+            };
             peer::config::save(&peers_path, &file)?;
-        }
+            written
+        };
         if !args.json {
             println!("peer.tailnet: {}", mode.as_str());
+            if let Some(chosen) = listen_written {
+                print_listen_written(chosen, &peers_path);
+            }
             return Ok(());
+        }
+        // Standard output is the JSON document, so the port lines go to
+        // standard error rather than being left unsaid.
+        if let Some(chosen) = listen_written {
+            for line in listen_written_lines(chosen, &peers_path) {
+                eprintln!("{line}");
+            }
         }
     }
 
@@ -5740,6 +5910,54 @@ mod peer_tailnet_tests {
         run_peer_tailnet_with(args(&peers_path, Some(peer_cli::PeerTailnetMode::App)), &[])
             .expect("set app over it");
         assert_eq!(written(&peers_path)["tailnet"], "app");
+    }
+
+    /// **`app` gives a Mac with no peer port the default one, the way `find
+    /// on` does; `off` never writes one and never removes one; a port that is
+    /// already set is kept.** The browse task that reads the app and sends
+    /// the beacon runs only beside a peer listener, so `app` without a port
+    /// found nothing at all.
+    ///
+    /// Watch it fail by dropping the `ensure_listen_for_opt_in` call from the
+    /// `App | Node` arm in `run_peer_tailnet_with`: the file then has no
+    /// `listen` after `app`.
+    #[test]
+    fn app_gives_a_mac_a_peer_port_and_off_never_touches_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        let set = |mode| {
+            run_peer_tailnet_with(args(&peers_path, Some(mode)), &[]).expect("set the mode");
+        };
+
+        set(peer_cli::PeerTailnetMode::Off);
+        assert!(
+            written(&peers_path).get("listen").is_none(),
+            "off is not an opt-in: {}",
+            written(&peers_path)
+        );
+
+        set(peer_cli::PeerTailnetMode::App);
+        assert_eq!(
+            written(&peers_path)["listen"],
+            peer::config::default_listen().to_string()
+        );
+
+        set(peer_cli::PeerTailnetMode::Off);
+        assert_eq!(
+            written(&peers_path)["listen"],
+            peer::config::default_listen().to_string(),
+            "off leaves the port it found"
+        );
+
+        let mut file = peer::config::read_or_default(&peers_path).expect("read");
+        file.listen = Some("127.0.0.1:9600".parse().expect("literal"));
+        peer::config::save(&peers_path, &file).expect("save");
+        set(peer_cli::PeerTailnetMode::App);
+        assert_eq!(
+            written(&peers_path)["listen"],
+            "127.0.0.1:9600",
+            "a port the operator chose is kept"
+        );
     }
 }
 

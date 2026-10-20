@@ -9,7 +9,7 @@
 //! compare.
 
 use tcr::peer::config::NetworkKey;
-use tcr::peer::discovery::{self, Discovered, FoundList};
+use tcr::peer::discovery::{self, Discovered, FoundList, FoundSource};
 use tcr_peer_wire::{INSTANCE_ID_BYTES, InstanceId, PeerId};
 
 /// An instance id distinctive enough that a fragment of it could not appear by
@@ -361,6 +361,7 @@ fn row(instance: u8, addr: &str) -> Discovered {
         name: None,
         addrs: vec![addr.to_string()],
         port: 9600,
+        sources: vec![FoundSource::Lan],
     }
 }
 
@@ -545,6 +546,7 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
         name: None,
         addrs: vec![moved_addr.ip().to_string()],
         port: moved_addr.port(),
+        sources: vec![FoundSource::Lan],
     };
 
     // ---- control: before the scan, A cannot reach B at all.
