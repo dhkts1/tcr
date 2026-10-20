@@ -2,6 +2,10 @@ name: Pages
 
 # Publishes docs/site/ to https://dhkts1.github.io/tcr/.
 #
+# THE SITE ITSELF LIVES IN dhkts1/dhkts1.github.io and answers at https://dhkts1.github.io/.
+# docs/site/ is now only a redirect there, kept so links to /tcr/ keep working; it keeps
+# og.png and mark.svg so link previews already shared still render.
+#
 # WHY A WORKFLOW AND NOT THE gh-pages BRANCH. The gh-pages branch is the TcrBar update
 # feed: SUFeedURL reads raw.githubusercontent.com/dhkts1/tcr/gh-pages/appcast.xml
 # (apps/macos/scripts/build-tcrbar.sh), and apps/macos/scripts/publish-appcast-feed.sh
