@@ -280,16 +280,19 @@ impl NoiseStream {
                                 if plain.write(&[]).await.is_err() {
                                     break Ok(());
                                 }
-                                if let Err(err) = send_end_of_stream(
-                                    &mut write_half,
-                                    &mut session,
-                                )
-                                .await
+                                // Every data byte is already delivered, so a
+                                // frame that cannot be written (the far end
+                                // reset as this end finished) is not a failed
+                                // carry: the drain below still runs, as it did
+                                // when only the half-close could fail.
+                                if let Err(err) =
+                                    send_end_of_stream(&mut write_half, &mut session).await
                                 {
-                                    break Err(err.context(
-                                        "peer tunnel: the end of the carried stream could not \
-                                         be written",
-                                    ));
+                                    tracing::debug!(
+                                        error = %err,
+                                        "peer tunnel: the end-of-stream frame was not written; \
+                                         draining what the far end still sends"
+                                    );
                                 }
                                 sent_end = true;
                                 let _shutdown = write_half.shutdown().await;

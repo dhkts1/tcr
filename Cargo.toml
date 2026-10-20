@@ -451,7 +451,7 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 # format. It brings `aws-lc-sys`, the C crypto library this repository otherwise avoids
 # (`src/http_client.rs`), and with both rustls providers compiled in rustls refuses to pick one, so
 # `http_client::install_crypto_provider` must run before the first `Device::new`. The one place
-# that calls `Device::new` (`tailnet_node::build_device`) calls it first.
+# that calls `Device::new` (`tailnet_node`'s `LibraryFactory::build`) calls it first.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 tailscale = { version = "=0.6.1", optional = true }
 

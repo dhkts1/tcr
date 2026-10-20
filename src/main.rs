@@ -5545,6 +5545,15 @@ async fn run_peer_tailnet(args: peer_cli::PeerTailnetArgs) -> anyhow::Result<()>
     {
         anyhow::bail!("peer tailnet: --name and --auth-key go with `node` only");
     }
+    // A name is asked for when joining; turning an already-joined node back
+    // on keeps the name it joined with, so a `--name` there would be ignored.
+    if args.name.is_some() && args.auth_key.is_none() {
+        anyhow::bail!(
+            "peer tailnet: --name is the name to join with, so it goes with `--auth-key -`; a \
+             node that already joined keeps its name (`tcr peer tailnet leave` to join again \
+             under another)"
+        );
+    }
     match (args.mode, args.auth_key.as_deref()) {
         (Some(peer_cli::PeerTailnetMode::Leave), _) => {
             let outcome = tailnet_node::leave_with(
@@ -8932,10 +8941,23 @@ where
 /// every later line from reaching disk, silently (see [`tcr::file_log`]).
 /// The TUI writes through the same queue for the same reason as headless: its
 /// file was behind the same lock, on the same tokio workers.
+/// The log filter when `RUST_LOG` is unset: `info`, and in a build with tcr's
+/// own tailnet node, `warn` for the `tailscale` crate and its `ts_*` and
+/// `kameo` dependencies, whose info lines would otherwise reach tcr's log on
+/// every node build and reconnect. A target directive matches by prefix, so
+/// `ts_` covers every `ts_*` crate.
+#[cfg(feature = "tailnet-node")]
+const DEFAULT_LOG_FILTER: &str = "info,tailscale=warn,ts_=warn,kameo=warn";
+
+/// The log filter when `RUST_LOG` is unset.
+#[cfg(not(feature = "tailnet-node"))]
+const DEFAULT_LOG_FILTER: &str = "info";
+
 fn init_tracing(headless: bool) -> Option<tcr::file_log::FileLog> {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::util::SubscriberInitExt as _;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     let (log_dir, log_prefix) = log_location();
     let (queue, file_log) = match open_log_appender(&log_dir, log_prefix) {
         Ok(file) => {

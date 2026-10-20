@@ -98,13 +98,27 @@ pub const BUILD_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a device gets to stop gracefully before it is killed.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
-/// How long a failed build waits before the next attempt.
+/// How long the first failed start waits before the next attempt. Each failure
+/// in a row doubles it, up to [`RETRY_CAP`]; a device that passes a health
+/// check puts it back here.
 pub const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(30);
 
 /// How long keys the tailnet refused wait before they are tried again: an
 /// operator has to act (approve the machine, or join again), so asking control
-/// every 30 s would be noise.
+/// every 30 s would be noise. The first rung for a refusal; it doubles to
+/// [`RETRY_CAP`] like any other failure.
 pub const RETRY_AFTER_REFUSAL: Duration = Duration::from_secs(300);
+
+/// The longest a failed start waits before the next attempt: an offline
+/// laptop asks control at most every ten minutes.
+pub const RETRY_CAP: Duration = Duration::from_secs(600);
+
+/// The wait after `failures` failures in a row, the first of them at `first`:
+/// `first`, doubling, capped at [`RETRY_CAP`].
+pub fn retry_wait(first: Duration, failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    first.saturating_mul(1_u32 << doublings).min(RETRY_CAP)
+}
 
 /// How long `tcr peer tailnet node --auth-key -` waits for control to accept
 /// the key.
@@ -371,26 +385,33 @@ async fn bounded<T>(
     })?
 }
 
+/// What came of shutting down a device the supervisor shares with in-flight
+/// calls.
+enum Shutdown<D> {
+    /// It was shut down; `graceful` is false when it had to be killed.
+    Stopped { graceful: bool },
+    /// Another holder still had it at the deadline, so it was NOT shut down
+    /// and is still running. Handed back so the caller keeps it, and builds
+    /// nothing from the same keys until it has been shut down.
+    StillHeld(Arc<D>),
+}
+
 /// Shut down a device the supervisor shares with in-flight calls: wait (up to
 /// `deadline`) for the other holders to let go, then shut it down in what is
 /// left of the deadline.
-async fn shutdown_shared<D: TailnetDevice>(device: Arc<D>, deadline: Duration) -> bool {
+async fn shutdown_shared<D: TailnetDevice>(device: Arc<D>, deadline: Duration) -> Shutdown<D> {
     let until = tokio::time::Instant::now() + deadline;
     let mut device = device;
     loop {
         match Arc::try_unwrap(device) {
             Ok(owned) => {
                 let left = until.saturating_duration_since(tokio::time::Instant::now());
-                return owned.shutdown(left.max(Duration::from_millis(100))).await;
+                let graceful = owned.shutdown(left.max(Duration::from_millis(100))).await;
+                return Shutdown::Stopped { graceful };
             }
             Err(shared) => {
                 if tokio::time::Instant::now() >= until {
-                    tracing::warn!(
-                        holders = Arc::strong_count(&shared),
-                        "peer tailnet node: the device was still in use at its shutdown \
-                         deadline, so it was not shut down; it stops when its last call ends"
-                    );
-                    return false;
+                    return Shutdown::StillHeld(shared);
                 }
                 device = shared;
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -494,24 +515,57 @@ struct Backoff {
     detail: String,
 }
 
+/// A device build that is still running in its own task.
+type PendingBuild<D> = tokio::task::JoinHandle<Result<D>>;
+
 /// The server's half of node mode: owns one device, keeps it alive, records
 /// what it holds. See the module docs.
+///
+/// # Never two devices from one key
+///
+/// Two devices with one node key fight over it at control. So at most one
+/// device exists at a time, counting three ways a device can be alive besides
+/// the running one: a build still in its task ([`Self::pending_build`]), a
+/// device mid-start ([`Self::starting`]), and a device another holder kept
+/// past its shutdown deadline ([`Self::lingering`]). Nothing new is built
+/// while any of them exists.
 pub struct Supervisor<F: DeviceFactory> {
-    factory: F,
+    factory: Arc<F>,
     paths: NodePaths,
     port: u16,
     serve: ServeFn<<F::Device as TailnetDevice>::Stream>,
     gateway: GatewayFn,
     live: Arc<LiveConnections>,
     running: Option<Running<F::Device>>,
+    /// A build that outlived [`BUILD_TIMEOUT`]. Kept rather than dropped:
+    /// dropping `Device::new` part way leaves whatever runtime it already
+    /// spawned with nothing to stop it. The next start waits on this one
+    /// instead of building another.
+    pending_build: Option<PendingBuild<F::Device>>,
+    /// A device built and not yet running (authorizing, listening), so a
+    /// shutdown that cancels the wake mid-start can still stop it.
+    starting: Option<Arc<F::Device>>,
+    /// A device still held by another caller at its shutdown deadline: alive,
+    /// not shut down. Shut down as soon as it is free.
+    lingering: Option<Arc<F::Device>>,
     backoff: Option<Backoff>,
+    /// Failed starts and failed checks in a row; a passed health check
+    /// resets it.
+    failures: u32,
     since_health: Duration,
     last_gateway: Option<Option<Ipv4Addr>>,
     last_record: Option<(TailnetRecord, tokio::time::Instant)>,
     /// The ceiling on each wait on control, [`CONTROL_TIMEOUT`] outside tests.
     control_timeout: Duration,
+    /// The ceiling on one build, [`BUILD_TIMEOUT`] outside tests.
+    build_timeout: Duration,
+    /// How long a device gets to stop, [`SHUTDOWN_DEADLINE`] outside tests.
+    shutdown_deadline: Duration,
     /// Whether the last wake read the mode as `node`.
     was_node: bool,
+    /// Whether the mode left `node` and the `nodeReleased` record has not
+    /// been written yet, because a device was still alive.
+    release_owed: bool,
     /// Devices built so far, for the log and for tests.
     builds: u64,
 }
@@ -526,19 +580,26 @@ impl<F: DeviceFactory> Supervisor<F> {
         gateway: GatewayFn,
     ) -> Self {
         Self {
-            factory,
+            factory: Arc::new(factory),
             paths,
             port,
             serve,
             gateway,
             live: Arc::new(LiveConnections::default()),
             running: None,
+            pending_build: None,
+            starting: None,
+            lingering: None,
             backoff: None,
+            failures: 0,
             since_health: Duration::ZERO,
             last_gateway: None,
             last_record: None,
             control_timeout: CONTROL_TIMEOUT,
+            build_timeout: BUILD_TIMEOUT,
+            shutdown_deadline: SHUTDOWN_DEADLINE,
             was_node: false,
+            release_owed: false,
             builds: 0,
         }
     }
@@ -547,6 +608,18 @@ impl<F: DeviceFactory> Supervisor<F> {
     /// a test of a hung device does not wait the real ten seconds.
     pub const fn with_control_timeout(mut self, limit: Duration) -> Self {
         self.control_timeout = limit;
+        self
+    }
+
+    /// The same supervisor with a shorter build ceiling, for a test.
+    pub const fn with_build_timeout(mut self, limit: Duration) -> Self {
+        self.build_timeout = limit;
+        self
+    }
+
+    /// The same supervisor with a shorter shutdown deadline, for a test.
+    pub const fn with_shutdown_deadline(mut self, limit: Duration) -> Self {
+        self.shutdown_deadline = limit;
         self
     }
 
@@ -566,8 +639,10 @@ impl<F: DeviceFactory> Supervisor<F> {
         self.running.is_some()
     }
 
-    /// The running device, for a caller that dials through it.
-    pub fn device(&self) -> Option<Arc<F::Device>> {
+    /// The running device, for a test that holds it the way an in-flight
+    /// call does.
+    #[cfg(test)]
+    fn running_device(&self) -> Option<Arc<F::Device>> {
         self.running
             .as_ref()
             .map(|running| Arc::clone(&running.device))
@@ -575,6 +650,11 @@ impl<F: DeviceFactory> Supervisor<F> {
 
     /// Run until `stop` flips, one [`Self::tick`] per `every`, then shut the
     /// device down.
+    ///
+    /// The stop is watched DURING a wake too: a start can take a minute (a
+    /// build plus three waits on control), and a quit that waited it out would
+    /// usually be cut by the server's shutdown grace before the device was
+    /// shut down at all.
     pub async fn run(mut self, every: Duration, mut stop: tokio::sync::watch::Receiver<bool>) {
         let mut ticker = tokio::time::interval(every);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -585,12 +665,100 @@ impl<F: DeviceFactory> Supervisor<F> {
                     let now = tokio::time::Instant::now();
                     let elapsed = now.saturating_duration_since(last);
                     last = now;
-                    self.tick(elapsed, crate::now_ms()).await;
+                    tokio::select! {
+                        () = self.tick(elapsed, crate::now_ms()) => {}
+                        _ = stop.changed() => break,
+                    }
                 }
                 _ = stop.changed() => break,
             }
         }
+        self.stop_everything().await;
+    }
+
+    /// On the way out of the process: stop every device that is alive, each
+    /// within the shutdown deadline. A build still in its task is given the
+    /// same deadline to finish and then shut down.
+    async fn stop_everything(&mut self) {
         self.stop_device().await;
+        if let Some(starting) = self.starting.take() {
+            self.settle(starting).await;
+        }
+        if let Some(lingering) = self.lingering.take() {
+            self.settle(lingering).await;
+        }
+        if let Some(pending) = self.pending_build.take() {
+            match tokio::time::timeout(self.shutdown_deadline, pending).await {
+                Ok(Ok(Ok(device))) => {
+                    device.shutdown(self.shutdown_deadline).await;
+                }
+                Ok(Ok(Err(_)) | Err(_)) => {}
+                Err(_) => tracing::warn!(
+                    "peer tailnet node: a node build was still running at shutdown and was left \
+                     to the process exit"
+                ),
+            }
+        }
+    }
+
+    /// Shut `device` down, or keep it in [`Self::lingering`] when another
+    /// holder still has it.
+    async fn settle(&mut self, device: Arc<F::Device>) {
+        match shutdown_shared(device, self.shutdown_deadline).await {
+            Shutdown::Stopped { graceful: true } => {}
+            Shutdown::Stopped { graceful: false } => tracing::warn!(
+                deadline_secs = self.shutdown_deadline.as_secs(),
+                "peer tailnet node: the node did not stop gracefully within its deadline and \
+                 was stopped by force"
+            ),
+            Shutdown::StillHeld(device) => {
+                tracing::warn!(
+                    holders = Arc::strong_count(&device),
+                    "peer tailnet node: the node was still in use at its shutdown deadline, so it \
+                     is left running; no new node is built from the same keys until it stops"
+                );
+                self.lingering = Some(device);
+            }
+        }
+    }
+
+    /// Shut down a lingering device if it is free now. Reports whether none
+    /// lingers any more.
+    async fn reap_lingering(&mut self) -> bool {
+        let Some(device) = self.lingering.take() else {
+            return true;
+        };
+        match Arc::try_unwrap(device) {
+            Ok(owned) => {
+                if !owned.shutdown(self.shutdown_deadline).await {
+                    tracing::warn!(
+                        "peer tailnet node: the previous node was stopped by force once it was \
+                         free"
+                    );
+                }
+                true
+            }
+            Err(shared) => {
+                self.lingering = Some(shared);
+                false
+            }
+        }
+    }
+
+    /// A build that finished after its wait, outside node mode: shut its
+    /// device down. Reports whether no build is pending any more.
+    async fn reap_pending_build(&mut self) -> bool {
+        let Some(pending) = self.pending_build.take() else {
+            return true;
+        };
+        if !pending.is_finished() {
+            self.pending_build = Some(pending);
+            return false;
+        }
+        if let Ok(Ok(device)) = pending.await {
+            device.shutdown(self.shutdown_deadline).await;
+        }
+        true
     }
 
     /// One wake: re-read the mode, start, check or stop the device, and record
@@ -619,6 +787,9 @@ impl<F: DeviceFactory> Supervisor<F> {
 
         let was_node = std::mem::replace(&mut self.was_node, mode == TailnetMode::Node);
         if mode != TailnetMode::Node {
+            if was_node {
+                self.release_owed = true;
+            }
             if self.running.is_some() {
                 self.stop_device().await;
                 tracing::info!(
@@ -627,17 +798,24 @@ impl<F: DeviceFactory> Supervisor<F> {
                 );
             }
             self.backoff = None;
-            // The one record this supervisor writes outside node mode: `off`,
-            // once, on the way out of `node`, so `leave` sees the node let go
-            // as soon as it has. Every other off and app record is the browse
-            // tick's, and a Mac that never used node mode never has this
-            // supervisor write the state file at all.
-            if was_node && mode == TailnetMode::Off {
+            self.failures = 0;
+            let free = self.reap_lingering().await;
+            let built = self.reap_pending_build().await;
+            // The one record this supervisor writes outside node mode:
+            // `nodeReleased`, once, on any way out of `node`, and only when no
+            // device from the node's keys is alive any more. Nothing else
+            // writes it, so `leave` can wait for it and delete the keys
+            // knowing nothing holds them. Every other off and app record is
+            // the browse tick's, and a Mac that never used node mode never has
+            // this supervisor write the state file at all.
+            if self.release_owed && free && built {
+                self.release_owed = false;
                 self.last_record = None;
-                self.record(TailnetMode::Off, TailnetState::Off, None, now_ms);
+                self.record(mode, TailnetState::NodeReleased, None, now_ms);
             }
             return;
         }
+        self.release_owed = false;
 
         if !F::SUPPORTED {
             self.record(
@@ -673,29 +851,40 @@ impl<F: DeviceFactory> Supervisor<F> {
         };
 
         if self.running.is_some() {
-            if !self.check_health().await {
-                self.stop_device().await;
-                self.record(
-                    TailnetMode::Node,
-                    TailnetState::NodeConnecting,
-                    Some(
-                        "The node stopped answering; it is being rebuilt from the same keys."
-                            .to_string(),
-                    ),
-                    now_ms,
-                );
-                self.start(&keys, now_ms).await;
+            if self.check_health().await {
+                self.record_ready(now_ms);
                 return;
             }
-            self.record_ready(now_ms);
-            return;
-        }
-
-        if let Some(backoff) = &self.backoff
+            self.stop_device().await;
+            self.fail(
+                RETRY_AFTER_FAILURE,
+                TailnetState::NodeConnecting,
+                "The node stopped answering; it is being rebuilt from the same keys.".to_string(),
+                now_ms,
+            );
+            // The first failure after a healthy run rebuilds at once; a
+            // device that keeps failing waits out its backoff.
+            if self.failures > 1 {
+                return;
+            }
+        } else if let Some(backoff) = &self.backoff
             && backoff.waited < backoff.wait
         {
             let (state, detail) = (backoff.state, backoff.detail.clone());
             self.record(TailnetMode::Node, state, Some(detail), now_ms);
+            return;
+        }
+
+        if !self.reap_lingering().await {
+            self.record(
+                TailnetMode::Node,
+                TailnetState::NodeConnecting,
+                Some(
+                    "The previous node is still in use; a new one starts once it has stopped."
+                        .to_string(),
+                ),
+                now_ms,
+            );
             return;
         }
         self.start(&keys, now_ms).await;
@@ -703,7 +892,8 @@ impl<F: DeviceFactory> Supervisor<F> {
 
     /// Whether the running device is still alive: its accept loop has not
     /// ended, and on a health wake (every [`HEALTH_EVERY`]) this Mac is on the
-    /// same network as before and control still answers a `self_node()`.
+    /// same network as before and control still answers a `self_node()`. A
+    /// passed health wake resets the failure count.
     ///
     /// The gateway is read on health wakes only, because it runs a route tool:
     /// a wake from sleep comes with an elapsed time past [`HEALTH_EVERY`], so
@@ -745,6 +935,7 @@ impl<F: DeviceFactory> Supervisor<F> {
                 if let Some(running) = &mut self.running {
                     running.me = me;
                 }
+                self.failures = 0;
                 true
             }
             Err(err) => {
@@ -774,6 +965,42 @@ impl<F: DeviceFactory> Supervisor<F> {
         }
     }
 
+    /// Build a device from `keys`, or take the one a build still in its task
+    /// produces, under [`Self::build_timeout`]. A build that outlives the
+    /// wait is kept in [`Self::pending_build`] for the next start.
+    async fn build(&mut self, keys: &NodeKeyFile) -> Result<F::Device> {
+        // Held in `self` while it is awaited, so a wake cancelled by the
+        // process stopping still leaves the build where `stop_everything`
+        // finds it.
+        if self.pending_build.is_none() {
+            self.builds += 1;
+            let factory = Arc::clone(&self.factory);
+            let keys = keys.clone();
+            self.pending_build = Some(tokio::spawn(
+                async move { factory.build(&keys, None).await },
+            ));
+        }
+        let Some(pending) = self.pending_build.as_mut() else {
+            bail!("the node's build task was not kept");
+        };
+        match tokio::time::timeout(self.build_timeout, pending).await {
+            Ok(joined) => {
+                self.pending_build = None;
+                match joined {
+                    Ok(built) => built,
+                    Err(join) => Err(anyhow!("the node's build task failed: {join}")),
+                }
+            }
+            Err(_elapsed) => {
+                bail!(
+                    "the node did not start within {}s (no network, or control is \
+                     unreachable); that build is kept and waited on again",
+                    self.build_timeout.as_secs()
+                )
+            }
+        }
+    }
+
     /// Build a device from `keys`, check it is authorized, listen on its
     /// address, and start the accept loop. Every failure is recorded and
     /// backed off.
@@ -784,14 +1011,7 @@ impl<F: DeviceFactory> Supervisor<F> {
             None,
             now_ms,
         );
-        self.builds += 1;
-        let device = match bounded(
-            BUILD_TIMEOUT,
-            "building the node",
-            self.factory.build(keys, None),
-        )
-        .await
-        {
+        let device = match self.build(keys).await {
             Ok(device) => Arc::new(device),
             Err(err) => {
                 self.fail(
@@ -803,50 +1023,49 @@ impl<F: DeviceFactory> Supervisor<F> {
                 return;
             }
         };
+        self.starting = Some(Arc::clone(&device));
 
-        match bounded(self.control_timeout, "control", device.authorization()).await {
-            Ok(Authorization::Authorized) => {}
-            Ok(Authorization::NotAuthorized) => {
-                shutdown_shared(device, SHUTDOWN_DEADLINE).await;
-                self.fail(
-                    RETRY_AFTER_REFUSAL,
-                    TailnetState::NodeNotJoined,
-                    "The tailnet no longer accepts this node's keys; join again with \
-                     `tcr peer tailnet leave` then `tcr peer tailnet node --auth-key -`."
-                        .to_string(),
-                    now_ms,
-                );
-                return;
-            }
-            Err(err) => {
-                shutdown_shared(device, SHUTDOWN_DEADLINE).await;
-                self.fail(
-                    RETRY_AFTER_FAILURE,
-                    TailnetState::NodeConnecting,
-                    format!("{err:#}"),
-                    now_ms,
-                );
-                return;
-            }
-        }
-
-        let limit = self.control_timeout;
-        let started = async {
-            let me = bounded(limit, "the node's address", device.self_node()).await?;
-            let bind = SocketAddr::from((me.address, self.port));
-            let listener = bounded(limit, "the node's listener", device.listen(bind)).await?;
-            Ok::<_, anyhow::Error>((me, listener))
+        let refusal = match bounded(self.control_timeout, "control", device.authorization()).await {
+            Ok(Authorization::Authorized) => None,
+            Ok(Authorization::NotAuthorized) => Some((
+                RETRY_AFTER_REFUSAL,
+                TailnetState::NodeNotJoined,
+                "The tailnet no longer accepts this node's keys; join again with `tcr peer \
+                 tailnet leave` then `tcr peer tailnet node --auth-key -`."
+                    .to_string(),
+            )),
+            Err(err) => Some((
+                RETRY_AFTER_FAILURE,
+                TailnetState::NodeConnecting,
+                format!("{err:#}"),
+            )),
         };
-        let (me, listener) = match started.await {
-            Ok(started) => started,
-            Err(err) => {
-                shutdown_shared(device, SHUTDOWN_DEADLINE).await;
-                self.fail(
+        let started = if let Some(refused) = refusal {
+            Err(refused)
+        } else {
+            let limit = self.control_timeout;
+            let port = self.port;
+            async {
+                let me = bounded(limit, "the node's address", device.self_node()).await?;
+                let bind = SocketAddr::from((me.address, port));
+                let listener = bounded(limit, "the node's listener", device.listen(bind)).await?;
+                Ok::<_, anyhow::Error>((me, listener))
+            }
+            .await
+            .map_err(|err| {
+                (
                     RETRY_AFTER_FAILURE,
                     TailnetState::NodeConnecting,
                     format!("{err:#}"),
-                    now_ms,
-                );
+                )
+            })
+        };
+        let (me, listener) = match started {
+            Ok(started) => started,
+            Err((first, state, detail)) => {
+                self.starting = None;
+                self.settle(device).await;
+                self.fail(first, state, detail, now_ms);
                 return;
             }
         };
@@ -863,6 +1082,7 @@ impl<F: DeviceFactory> Supervisor<F> {
             builds = self.builds,
             "peer tailnet node: on the tailnet, listening on the node's own address"
         );
+        self.starting = None;
         self.running = Some(Running { device, accept, me });
         self.backoff = None;
         self.since_health = Duration::ZERO;
@@ -872,9 +1092,14 @@ impl<F: DeviceFactory> Supervisor<F> {
         self.record_ready(now_ms);
     }
 
-    fn fail(&mut self, wait: Duration, state: TailnetState, detail: String, now_ms: i64) {
+    /// Record a failure and back off: `first` for the first failure in a
+    /// row, doubling to [`RETRY_CAP`].
+    fn fail(&mut self, first: Duration, state: TailnetState, detail: String, now_ms: i64) {
+        self.failures = self.failures.saturating_add(1);
+        let wait = retry_wait(first, self.failures);
         tracing::warn!(
             detail = %detail,
+            failures = self.failures,
             retry_secs = wait.as_secs(),
             "peer tailnet node: the node is not on the tailnet"
         );
@@ -887,19 +1112,15 @@ impl<F: DeviceFactory> Supervisor<F> {
         });
     }
 
-    /// Stop the accept loop and shut the device down, if one runs.
+    /// Stop the accept loop and shut the device down, if one runs. A device
+    /// another holder keeps past the deadline lingers (see
+    /// [`Self::settle`]).
     async fn stop_device(&mut self) {
         let Some(running) = self.running.take() else {
             return;
         };
         running.accept.abort();
-        if !shutdown_shared(running.device, SHUTDOWN_DEADLINE).await {
-            tracing::warn!(
-                deadline_secs = SHUTDOWN_DEADLINE.as_secs(),
-                "peer tailnet node: the node did not stop gracefully within its deadline and \
-                 was stopped by force"
-            );
-        }
+        self.settle(running.device).await;
     }
 
     fn record_ready(&mut self, now_ms: i64) {
@@ -1001,8 +1222,8 @@ async fn accept_loop<L: TailnetListener>(
 ///
 /// The order is the contract. A device is built in this process with the
 /// auth key; control has to say the node is authorized within `deadline`; the
-/// key file is written (0600, never over an existing one); the device is shut
-/// down; and only then is `tailnet: "node"` written, so a server never sees
+/// device is shut down; the key file is written (0600, never over an existing
+/// one); and only then is `tailnet: "node"` written, so a server never sees
 /// the mode before the keys it needs exist. A refused key leaves both files as
 /// they were.
 ///
@@ -1088,15 +1309,17 @@ pub async fn join_with<F: DeviceFactory>(
             return Err(err);
         }
     };
+    // Shut down BEFORE the key file exists: a server already in node mode
+    // starts its own device from that file on its next wake, and two devices
+    // on one key fight over it.
+    if !device.shutdown(SHUTDOWN_DEADLINE).await {
+        tracing::warn!("peer tailnet: the joining node was stopped by force");
+    }
     if fresh && let Err(err) = write_key_file(key_path, &keys) {
-        device.shutdown(SHUTDOWN_DEADLINE).await;
         return Err(err.context(
             "peer tailnet: the tailnet accepted this node but its keys could not be saved; \
              remove the machine in the Tailscale admin console and join again",
         ));
-    }
-    if !device.shutdown(SHUTDOWN_DEADLINE).await {
-        tracing::warn!("peer tailnet: the joining node was stopped by force");
     }
 
     let _lock = crate::peer::config::FileLock::acquire(peers_path)?;
@@ -1116,19 +1339,36 @@ pub enum LeaveOutcome {
 }
 
 /// `tcr peer tailnet leave`: set the mode to `off`, wait until the serving
-/// process says it holds `off`, then delete the key file.
+/// process has released the node, then delete the key file.
 ///
 /// The wait is what stops the delete pulling the keys out from under a node
-/// the server is still running. It is skipped when no server has recorded
-/// anything fresh (`held` absent or stale): then nothing holds the node. When
-/// a server is recording and has not let go within `wait`, the key file is
-/// kept and this fails, saying so.
+/// the server is still running. It waits for `nodeReleased` written after
+/// this call set the mode: the one record only the node's supervisor writes,
+/// and only once no device built from the keys is alive. `mode == off` is not
+/// enough, because the browse tick writes `off` records too, whatever the node
+/// is doing.
+///
+/// It is skipped when no fresh node-mode record exists when this starts
+/// (`held` absent, stale, or not in node mode): then no server holds a node.
+/// When a server holds one and has not released it within `wait`, the key file
+/// is kept and this fails, saying so.
 pub async fn leave_with(
     peers_path: &Path,
     key_path: &Path,
     wait: Duration,
     poll: Duration,
 ) -> Result<LeaveOutcome> {
+    let state_path = crate::peer::serve::peer_state_path(peers_path);
+    let held_at = |now_ms: i64| -> Result<Option<TailnetRecord>> {
+        Ok(crate::peer::state::load(&state_path, now_ms)
+            .with_context(|| format!("reading {}", state_path.display()))?
+            .tailnet)
+    };
+
+    let asked_ms = crate::now_ms();
+    let holds_a_node = held_at(asked_ms)?.is_some_and(|record| {
+        record.mode.effective() == TailnetMode::Node && !record.is_stale(asked_ms)
+    });
     {
         let _lock = crate::peer::config::FileLock::acquire(peers_path)?;
         let mut file = crate::peer::config::read_or_default(peers_path)?;
@@ -1136,29 +1376,25 @@ pub async fn leave_with(
         crate::peer::config::save(peers_path, &file)?;
     }
 
-    let state_path = crate::peer::serve::peer_state_path(peers_path);
     let until = tokio::time::Instant::now() + wait;
-    loop {
-        let now_ms = crate::now_ms();
-        let held = crate::peer::state::load(&state_path, now_ms)
-            .with_context(|| format!("reading {}", state_path.display()))?
-            .tailnet;
-        let let_go = match &held {
-            None => true,
-            Some(record) => record.is_stale(now_ms) || record.mode.effective() == TailnetMode::Off,
-        };
-        if let_go {
-            break;
+    if holds_a_node {
+        loop {
+            let released = held_at(crate::now_ms())?.is_some_and(|record| {
+                record.state == TailnetState::NodeReleased && record.recorded_at_ms >= asked_ms
+            });
+            if released {
+                break;
+            }
+            if tokio::time::Instant::now() >= until {
+                bail!(
+                    "peer tailnet leave: the mode is now off, but the running tcr has not released \
+                 the node after {}s, so {} was kept; run this again in a moment",
+                    wait.as_secs(),
+                    key_path.display()
+                );
+            }
+            tokio::time::sleep(poll).await;
         }
-        if tokio::time::Instant::now() >= until {
-            bail!(
-                "peer tailnet leave: the mode is now off, but the running tcr still holds the \
-                 node after {}s, so {} was kept; run this again in a moment",
-                wait.as_secs(),
-                key_path.display()
-            );
-        }
-        tokio::time::sleep(poll).await;
     }
 
     if remove_key_file(key_path)? {
@@ -1472,6 +1708,13 @@ mod tests {
         shutdowns: Arc<AtomicUsize>,
         auth_keys_seen: Arc<AtomicUsize>,
         incoming: Arc<Mutex<Option<mpsc::Receiver<Accepted<DuplexStream>>>>>,
+        /// While set, a build waits for `release` before it answers.
+        build_hangs: Arc<AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
+        /// A key file whose existence each shutdown records in
+        /// `key_existed_at_shutdown`.
+        watch_key: Arc<Mutex<Option<PathBuf>>>,
+        key_existed_at_shutdown: Arc<AtomicBool>,
     }
 
     impl Script {
@@ -1484,6 +1727,10 @@ mod tests {
                 shutdowns: Arc::new(AtomicUsize::new(0)),
                 auth_keys_seen: Arc::new(AtomicUsize::new(0)),
                 incoming: Arc::new(Mutex::new(None)),
+                build_hangs: Arc::new(AtomicBool::new(false)),
+                release: Arc::new(tokio::sync::Notify::new()),
+                watch_key: Arc::new(Mutex::new(None)),
+                key_existed_at_shutdown: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -1545,6 +1792,15 @@ mod tests {
         }
 
         async fn shutdown(self, _deadline: Duration) -> bool {
+            let watched = match self.0.watch_key.lock() {
+                Ok(held) => held.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            if let Some(path) = watched {
+                self.0
+                    .key_existed_at_shutdown
+                    .store(path.exists(), Ordering::SeqCst);
+            }
             self.0.shutdowns.fetch_add(1, Ordering::SeqCst);
             true
         }
@@ -1566,6 +1822,9 @@ mod tests {
             self.0.builds.fetch_add(1, Ordering::SeqCst);
             if auth_key.is_some() {
                 self.0.auth_keys_seen.fetch_add(1, Ordering::SeqCst);
+            }
+            if self.0.build_hangs.load(Ordering::SeqCst) {
+                self.0.release.notified().await;
             }
             if self.0.build_fails.load(Ordering::SeqCst) {
                 bail!("no network");
@@ -1627,6 +1886,7 @@ mod tests {
             Arc::new(|_accepted| Box::pin(async {}));
         Supervisor::new(factory, paths.clone(), 7755, serve, gateway)
             .with_control_timeout(Duration::from_millis(100))
+            .with_shutdown_deadline(Duration::from_millis(200))
     }
 
     fn fixed_gateway() -> GatewayFn {
@@ -1815,7 +2075,15 @@ mod tests {
         );
 
         script.authorized.store(true, Ordering::SeqCst);
+        // The second failure in a row: the refusal's 300 s rung doubled, at the cap.
         sup.tick(RETRY_AFTER_REFUSAL, 5_000).await;
+        assert_eq!(
+            held(&fx.paths).state,
+            TailnetState::NodeNotJoined,
+            "still backing off"
+        );
+        sup.tick(RETRY_CAP.saturating_sub(RETRY_AFTER_REFUSAL), 5_000)
+            .await;
         let record = held(&fx.paths);
         assert_eq!(record.state, TailnetState::Ready);
         assert_eq!(record.recorded_at_ms, 5_000);
@@ -1827,7 +2095,7 @@ mod tests {
         let record = held(&fx.paths);
         assert_eq!(
             (record.mode, record.state),
-            (TailnetMode::Off.into(), TailnetState::Off)
+            (TailnetMode::Off.into(), TailnetState::NodeReleased)
         );
     }
 
@@ -2046,10 +2314,12 @@ mod tests {
     }
 
     /// **`leave` sets the mode off first, keeps the key file while the server
-    /// still holds the node, and deletes it once the server says `off`.**
+    /// still holds the node, is not fooled by another writer's `off` record,
+    /// and deletes the keys once the supervisor writes `nodeReleased`.**
     ///
-    /// Watch it fail by deleting the key file before the wait: the mid-wait
-    /// assertion that the file is still there then fails.
+    /// Watch it fail two ways: delete the key file before the wait (the
+    /// mid-wait assertion fails), or accept `mode == off` as released again
+    /// (the keys go on the browse tick's `off` record).
     #[tokio::test]
     async fn leave_waits_for_the_server_before_deleting_the_keys() {
         let fx = fixture(TailnetMode::Node);
@@ -2082,7 +2352,16 @@ mod tests {
         );
         assert!(!leaving.is_finished());
 
+        // The browse tick's own `off` record: not the node letting go.
         save_held(&fx.paths, TailnetMode::Off, TailnetState::Off);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            read_key_file(&fx.paths.key).expect("read").is_some(),
+            "an `off` record from another writer does not release the keys"
+        );
+        assert!(!leaving.is_finished());
+
+        save_held(&fx.paths, TailnetMode::Off, TailnetState::NodeReleased);
         let outcome = leaving.await.expect("joined").expect("left");
         assert_eq!(outcome, LeaveOutcome::Deleted);
         assert!(read_key_file(&fx.paths.key).expect("read").is_none());
@@ -2116,6 +2395,268 @@ mod tests {
         .await
         .expect("no server, no wait");
         assert_eq!(outcome, LeaveOutcome::Deleted);
+    }
+
+    fn switchable_gateway() -> (Arc<Mutex<Option<Ipv4Addr>>>, GatewayFn) {
+        let router = Arc::new(Mutex::new(Some(Ipv4Addr::new(192, 168, 1, 1))));
+        let read = Arc::clone(&router);
+        let gateway: GatewayFn = Arc::new(move || match read.lock() {
+            Ok(held) => *held,
+            Err(poisoned) => *poisoned.into_inner(),
+        });
+        (router, gateway)
+    }
+
+    fn move_to(router: &Arc<Mutex<Option<Ipv4Addr>>>, to: Ipv4Addr) {
+        match router.lock() {
+            Ok(mut held) => *held = Some(to),
+            Err(poisoned) => *poisoned.into_inner() = Some(to),
+        }
+    }
+
+    /// **No second device is built while the old one is still alive.** A
+    /// caller holding the device past the shutdown deadline (a dial in
+    /// flight) leaves it running; the rebuild waits until it is free, shuts
+    /// it down, and only then builds from the same keys.
+    ///
+    /// Watch it fail by dropping the held device in `settle` instead of
+    /// keeping it in `lingering`: the rebuild then happens with `shutdowns`
+    /// still 0, two devices on one key.
+    #[tokio::test]
+    async fn a_rebuild_waits_for_the_old_device_to_stop() {
+        let fx = fixture(TailnetMode::Node);
+        write_key_file(&fx.paths.key, &some_keys()).expect("keys");
+        let script = Script::new();
+        let (router, gateway) = switchable_gateway();
+        let mut sup = supervisor(FakeFactory(script.clone()), &fx.paths, gateway);
+        sup.tick(Duration::ZERO, 1_000).await;
+        let in_flight = sup.running_device().expect("running");
+
+        move_to(&router, Ipv4Addr::new(10, 0, 0, 1));
+        sup.tick(HEALTH_EVERY, 2_000).await;
+        assert_eq!(script.shutdowns.load(Ordering::SeqCst), 0, "still held");
+        assert_eq!(
+            script.builds.load(Ordering::SeqCst),
+            1,
+            "no second device while the first is alive"
+        );
+        let record = held(&fx.paths);
+        assert_eq!(record.state, TailnetState::NodeConnecting);
+        assert!(
+            record
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("still in use")),
+            "{record:?}"
+        );
+
+        sup.tick(RETRY_AFTER_FAILURE, 3_000).await;
+        assert_eq!(script.builds.load(Ordering::SeqCst), 1, "still held");
+
+        drop(in_flight);
+        sup.tick(TICK, 4_000).await;
+        assert_eq!(
+            script.shutdowns.load(Ordering::SeqCst),
+            1,
+            "shut down once free"
+        );
+        assert_eq!(
+            script.builds.load(Ordering::SeqCst),
+            2,
+            "then the new one is built"
+        );
+        assert!(sup.is_running());
+    }
+
+    /// **The release record is written on any way out of `node`, and only
+    /// once no device from the keys is alive**: leaving for `app` while a
+    /// caller still holds the device writes nothing, and the release follows
+    /// the shutdown.
+    ///
+    /// Watch it fail by writing the release whenever the mode leaves `node`
+    /// (drop `free && built`): it is then written while the device lingers.
+    #[tokio::test]
+    async fn the_release_waits_for_the_device_and_covers_app_mode() {
+        let fx = fixture(TailnetMode::Node);
+        write_key_file(&fx.paths.key, &some_keys()).expect("keys");
+        let script = Script::new();
+        let mut sup = supervisor(FakeFactory(script.clone()), &fx.paths, fixed_gateway());
+        sup.tick(Duration::ZERO, 1_000).await;
+        let in_flight = sup.running_device().expect("running");
+
+        set_mode(&fx.paths, TailnetMode::App);
+        sup.tick(TICK, 2_000).await;
+        assert_eq!(script.shutdowns.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            held(&fx.paths).state,
+            TailnetState::Ready,
+            "nothing released while the device is alive"
+        );
+
+        drop(in_flight);
+        sup.tick(TICK, 3_000).await;
+        assert_eq!(script.shutdowns.load(Ordering::SeqCst), 1);
+        let record = held(&fx.paths);
+        assert_eq!(
+            (record.mode, record.state, record.recorded_at_ms),
+            (TailnetMode::App.into(), TailnetState::NodeReleased, 3_000)
+        );
+    }
+
+    /// The ladder: 30 s, doubling, capped at ten minutes.
+    #[test]
+    fn the_retry_ladder_doubles_to_ten_minutes() {
+        let waits: Vec<u64> = (1..=7)
+            .map(|n| retry_wait(RETRY_AFTER_FAILURE, n).as_secs())
+            .collect();
+        assert_eq!(waits, vec![30, 60, 120, 240, 480, 600, 600]);
+        assert_eq!(retry_wait(RETRY_AFTER_REFUSAL, 1).as_secs(), 300);
+        assert_eq!(retry_wait(RETRY_AFTER_REFUSAL, 2).as_secs(), 600);
+        assert_eq!(retry_wait(RETRY_AFTER_FAILURE, u32::MAX).as_secs(), 600);
+    }
+
+    /// **Failed starts back off 30 s, 60 s, 120 s; a device that passes a
+    /// health check puts the ladder back at its first rung.**
+    ///
+    /// Watch it fail by making `retry_wait` return `first` every time: the
+    /// build at 30 s into the second wait then happens.
+    #[tokio::test]
+    async fn failed_starts_back_off_and_a_healthy_device_resets_it() {
+        let fx = fixture(TailnetMode::Node);
+        write_key_file(&fx.paths.key, &some_keys()).expect("keys");
+        let script = Script::new();
+        let builds = || script.builds.load(Ordering::SeqCst);
+        let mut sup = supervisor(FakeFactory(script.clone()), &fx.paths, fixed_gateway());
+
+        script.build_fails.store(true, Ordering::SeqCst);
+        sup.tick(Duration::ZERO, 1_000).await;
+        assert_eq!(builds(), 1);
+        sup.tick(Duration::from_secs(29), 2_000).await;
+        assert_eq!(builds(), 1, "inside the first 30 s");
+        sup.tick(Duration::from_secs(1), 3_000).await;
+        assert_eq!(builds(), 2, "after 30 s");
+        sup.tick(Duration::from_secs(30), 4_000).await;
+        assert_eq!(builds(), 2, "the second wait is 60 s, not 30");
+        sup.tick(Duration::from_secs(30), 5_000).await;
+        assert_eq!(builds(), 3, "after 60 s");
+        sup.tick(Duration::from_secs(119), 6_000).await;
+        assert_eq!(builds(), 3, "the third wait is 120 s");
+
+        script.build_fails.store(false, Ordering::SeqCst);
+        sup.tick(Duration::from_secs(1), 7_000).await;
+        assert_eq!(builds(), 4);
+        assert!(sup.is_running());
+        // A passed health check: the ladder is back at its first rung.
+        sup.tick(HEALTH_EVERY, 8_000).await;
+        // It dies; the first failure rebuilds at once, and that build fails.
+        script.build_fails.store(true, Ordering::SeqCst);
+        script.hangs.store(1, Ordering::SeqCst);
+        sup.tick(HEALTH_EVERY, 9_000).await;
+        assert_eq!(
+            builds(),
+            5,
+            "the first failure after a healthy run rebuilds at once"
+        );
+        sup.tick(Duration::from_secs(59), 10_000).await;
+        assert_eq!(builds(), 5);
+        sup.tick(Duration::from_secs(1), 11_000).await;
+        assert_eq!(
+            builds(),
+            6,
+            "60 s, the second rung: the count restarted, it did not carry the old three"
+        );
+    }
+
+    /// **A build that outlives its wait is kept and waited on again, never
+    /// started a second time**: an offline Mac holds one half-started build,
+    /// not one per retry. When it finishes, the next start uses it.
+    ///
+    /// Watch it fail by spawning a fresh build on every start (ignore
+    /// `pending_build`): `builds` then reaches 2 while the first still runs.
+    #[tokio::test]
+    async fn a_slow_build_is_kept_not_repeated() {
+        let fx = fixture(TailnetMode::Node);
+        write_key_file(&fx.paths.key, &some_keys()).expect("keys");
+        let script = Script::new();
+        script.build_hangs.store(true, Ordering::SeqCst);
+        let mut sup = supervisor(FakeFactory(script.clone()), &fx.paths, fixed_gateway())
+            .with_build_timeout(Duration::from_millis(50));
+
+        sup.tick(Duration::ZERO, 1_000).await;
+        assert!(!sup.is_running());
+        assert_eq!(held(&fx.paths).state, TailnetState::NodeConnecting);
+        sup.tick(RETRY_AFTER_FAILURE, 2_000).await;
+        assert_eq!(
+            script.builds.load(Ordering::SeqCst),
+            1,
+            "the second start waits on the first build"
+        );
+
+        script.release.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sup.tick(RETRY_CAP, 3_000).await;
+        assert!(sup.is_running(), "the kept build became the node");
+        assert_eq!(script.builds.load(Ordering::SeqCst), 1);
+    }
+
+    /// **Stopping the process does not wait out a start**: the stop is seen
+    /// during a wake, and `run` returns within the shutdown deadline even
+    /// with a build that never finishes.
+    ///
+    /// Watch it fail by awaiting the wake without watching `stop`: `run`
+    /// then waits the 30 s build ceiling and the 2 s deadline here fails.
+    #[tokio::test]
+    async fn a_stop_during_a_start_is_not_kept_waiting() {
+        let fx = fixture(TailnetMode::Node);
+        write_key_file(&fx.paths.key, &some_keys()).expect("keys");
+        let script = Script::new();
+        script.build_hangs.store(true, Ordering::SeqCst);
+        let sup = supervisor(FakeFactory(script.clone()), &fx.paths, fixed_gateway());
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let running = tokio::spawn(sup.run(Duration::from_millis(10), stop_rx));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            script.builds.load(Ordering::SeqCst),
+            1,
+            "a build is under way"
+        );
+        stop_tx.send(true).expect("stop");
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("run returns without waiting out the build")
+            .expect("joined");
+    }
+
+    /// **A join shuts its device down before the key file exists**, so a
+    /// server already in node mode cannot start a second device from it
+    /// while the CLI's is still up.
+    ///
+    /// Watch it fail by writing the key file before the shutdown: the
+    /// shutdown then sees the file.
+    #[tokio::test]
+    async fn a_join_shuts_its_device_down_before_writing_the_keys() {
+        let fx = fixture(TailnetMode::Off);
+        let script = Script::new();
+        match script.watch_key.lock() {
+            Ok(mut held) => *held = Some(fx.paths.key.clone()),
+            Err(poisoned) => *poisoned.into_inner() = Some(fx.paths.key.clone()),
+        }
+        join_with(
+            &FakeFactory(script.clone()),
+            &fx.paths.peers,
+            &fx.paths.key,
+            Some("tcr-studio".to_string()),
+            AuthKey::new("tskey-auth-fake-1111").expect("key"),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("joined");
+        assert_eq!(script.shutdowns.load(Ordering::SeqCst), 1);
+        assert!(
+            !script.key_existed_at_shutdown.load(Ordering::SeqCst),
+            "the key file did not exist yet when the device was shut down"
+        );
+        assert!(read_key_file(&fx.paths.key).expect("read").is_some());
     }
 
     #[test]

@@ -3269,10 +3269,10 @@ state below; `tcr peer tailnet` prints it. `node` without `--auth-key` turns a n
 already joined back on, and is refused when there is no key file.
 
 `tcr peer tailnet leave` sets the mode to `off`, waits up to 45 seconds for the running `tcr`
-to record that it let go of the node, then deletes `tcr-tailnet.key`. If the running `tcr`
-does not let go in time, the key file is kept and the command fails. tcr cannot log a node out
-of the tailnet itself, so the machine stays in the Tailscale admin console until it is removed
-there.
+to record `nodeReleased` (every device from the node's keys shut down), then deletes
+`tcr-tailnet.key`. If the running `tcr` does not let go in time, the key file is kept and the
+command fails. tcr cannot log a node out of the tailnet itself, so the machine stays in the
+Tailscale admin console until it is removed there.
 
 `--json` prints the setting and what the running `tcr` recorded, and never runs the app:
 
@@ -3303,9 +3303,9 @@ there.
   - `state`: `off`, `ready`, `appMissing` (no Tailscale CLI at any of the three paths),
     `appNotRunning` (the app is not connected, or the CLI could not reach it), `readFailed`
     (the CLI timed out, could not start, or printed something that did not parse; `detail`
-    says which), `nodeNotJoined`, `nodeConnecting`, `nodeUnsupported`, or `unknown` (a word
-    this `tcr` does not know, from a newer server). Every field of `held` has a default, so a
-    record from a different version always reads.
+    says which), `nodeNotJoined`, `nodeConnecting`, `nodeUnsupported`, `nodeReleased`, or
+    `unknown` (a word this `tcr` does not know, from a newer server). Every field of `held` has
+    a default, so a record from a different version always reads.
   - `address`: this Mac's tailnet IPv4 in that mode, or `null`.
   - `nodeName`: node mode only, the name on the tailnet.
   - `found`: app mode, your Macs that sent a beacon in the last 60 seconds.
@@ -3320,7 +3320,8 @@ file) nothing is recorded, so `held` stays `null`.
 
 In node mode the running `tcr` records `held` itself: `nodeNotJoined`, `nodeConnecting`,
 `ready` with `address`, `nodeName` and `connected` (distinct tailnet addresses with a connection
-open through the node), or `nodeUnsupported`. The app-mode states come from the browse task.
+open through the node), or `nodeUnsupported`; and once, on the way out of `node`, `nodeReleased`
+with the mode it left for. The app-mode states come from the browse task.
 
 ### `tcr peer graph <--json\|--serve>`
 
