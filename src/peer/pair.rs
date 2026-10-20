@@ -2249,7 +2249,7 @@ mod tests {
         let peers_path = dir.path().join("tcr-peers.json");
         let file = PeerFile {
             listen: Some(socket("0.0.0.0:7755")),
-            tailnet: crate::peer::config::TailnetMode::Node,
+            tailnet: crate::peer::config::TailnetMode::Node.into(),
             ..PeerFile::default()
         };
         save(&peers_path, &file).expect("the peers file writes");
@@ -2270,7 +2270,7 @@ mod tests {
         crate::peer::state::save_tailnet(
             &crate::peer::serve::peer_state_path(&peers_path),
             crate::peer::state::TailnetRecord {
-                mode: crate::peer::config::TailnetMode::Node,
+                mode: crate::peer::config::TailnetMode::Node.into(),
                 state: crate::peer::state::TailnetState::Ready,
                 address: Some(Ipv4Addr::new(100, 64, 0, 7)),
                 node_name: Some("tcr-studio".to_string()),
@@ -2279,6 +2279,7 @@ mod tests {
                 detail: None,
                 recorded_at_ms: now_ms(),
             },
+            Vec::new(),
         )
         .expect("the record writes");
         let (_invite, token) =

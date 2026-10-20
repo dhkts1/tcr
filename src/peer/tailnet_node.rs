@@ -1548,7 +1548,7 @@ pub async fn dial_for_route_in(slot: &DialSlot, target: SocketAddr, within: Dura
 /// mapping off the same file.
 pub fn recorded_node_address(state_path: &Path, now_ms: i64) -> Option<Ipv4Addr> {
     let record = crate::peer::state::load(state_path, now_ms).ok()?.tailnet?;
-    (record.mode == TailnetMode::Node
+    (record.mode.effective() == TailnetMode::Node
         && record.state == TailnetState::Ready
         && !record.is_stale(now_ms))
     .then_some(record.address)
@@ -1682,7 +1682,10 @@ pub async fn dial_for_cli(
     addr: SocketAddr,
 ) -> Result<crate::peer::serve::PeerStream> {
     if is_tailnet_ip(addr.ip())
-        && crate::peer::config::read_or_default(peers_path)?.tailnet == TailnetMode::Node
+        && crate::peer::config::read_or_default(peers_path)?
+            .tailnet
+            .effective()
+            == TailnetMode::Node
     {
         let config_path = crate::config::default_path();
         let config = crate::config::load(&config_path)
