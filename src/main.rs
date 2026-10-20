@@ -524,7 +524,7 @@ mod peer_cli {
         Clear,
     }
 
-    /// `tcr peer tailnet [off|app|node] [--json]`.
+    /// `tcr peer tailnet [off|app|node|leave] [--name N] [--auth-key -] [--json]`.
     ///
     /// A flat args struct with the mode as an optional positional value,
     /// `PeerDropStoreArgs`'s shape and for the same measured reason: a nested
@@ -533,9 +533,17 @@ mod peer_cli {
     pub(crate) struct PeerTailnetArgs {
         #[command(flatten)]
         pub peers: PeersFile,
-        /// The mode to set. Omit to print the current one.
+        /// The mode to set, or `leave`. Omit to print the current one.
         #[arg(value_enum)]
         pub mode: Option<PeerTailnetMode>,
+        /// `node` only: the machine name to ask the tailnet for.
+        #[arg(long, value_name = "NAME")]
+        pub name: Option<String>,
+        /// `node` only: `-` reads a Tailscale auth key from standard input
+        /// and joins with it. The key is never taken as an argument, never
+        /// written anywhere and never logged.
+        #[arg(long, value_name = "-")]
+        pub auth_key: Option<String>,
         /// Print the setting and what the running proxy recorded as JSON.
         #[arg(long)]
         pub json: bool,
@@ -549,15 +557,20 @@ mod peer_cli {
         App,
         /// tcr joins a tailnet as its own node.
         Node,
+        /// Leave the tailnet as tcr's own node: mode off, then delete the
+        /// node's key file once the running tcr has let go of it.
+        Leave,
     }
 
     impl PeerTailnetMode {
-        /// The setting this word writes.
-        pub(crate) const fn mode(self) -> tcr::peer::config::TailnetMode {
+        /// The setting this word writes, or `None` for `leave`, which is a
+        /// verb rather than a setting.
+        pub(crate) const fn mode(self) -> Option<tcr::peer::config::TailnetMode> {
             match self {
-                Self::Off => tcr::peer::config::TailnetMode::Off,
-                Self::App => tcr::peer::config::TailnetMode::App,
-                Self::Node => tcr::peer::config::TailnetMode::Node,
+                Self::Off => Some(tcr::peer::config::TailnetMode::Off),
+                Self::App => Some(tcr::peer::config::TailnetMode::App),
+                Self::Node => Some(tcr::peer::config::TailnetMode::Node),
+                Self::Leave => None,
             }
         }
     }
@@ -3730,9 +3743,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         }
         PeerAction::Moved(a) => run_peer_moved(a),
         PeerAction::Reach(a) => run_peer_reach(a),
-        PeerAction::Tailnet(a) => {
-            run_peer_tailnet_with(a, &peer::tailscale_app::default_cli_paths())
-        }
+        PeerAction::Tailnet(a) => run_peer_tailnet(a).await,
         PeerAction::Internet(a) => {
             let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
             let on = matches!(a.state, peer_cli::Switch::On);
@@ -5522,12 +5533,81 @@ fn listen_written_lines(addr: std::net::SocketAddr, peers_path: &Path) -> [Strin
     ]
 }
 
+/// `tcr peer tailnet`: `leave` and a joining `node --auth-key -` are the two
+/// async verbs (they wait on the tailnet or on the running tcr); everything
+/// else is [`run_peer_tailnet_with`].
+async fn run_peer_tailnet(args: peer_cli::PeerTailnetArgs) -> anyhow::Result<()> {
+    use peer::tailnet_node;
+
+    let peers_path = args.peers.path();
+    if args.mode != Some(peer_cli::PeerTailnetMode::Node)
+        && (args.auth_key.is_some() || args.name.is_some())
+    {
+        anyhow::bail!("peer tailnet: --name and --auth-key go with `node` only");
+    }
+    match (args.mode, args.auth_key.as_deref()) {
+        (Some(peer_cli::PeerTailnetMode::Leave), _) => {
+            let outcome = tailnet_node::leave_with(
+                &peers_path,
+                &tailnet_node::key_path_for_peers(&peers_path),
+                tailnet_node::LEAVE_WAIT,
+                tailnet_node::LEAVE_POLL,
+            )
+            .await?;
+            println!("peer.tailnet: off");
+            match outcome {
+                tailnet_node::LeaveOutcome::Deleted => {
+                    println!("peer tailnet: the node's key file was deleted");
+                }
+                tailnet_node::LeaveOutcome::NoKeyFile => {
+                    println!("peer tailnet: there was no node key file to delete");
+                }
+            }
+            println!("peer tailnet: {}", tailnet_node::LEAVE_ADMIN_CONSOLE_NOTE);
+            Ok(())
+        }
+        (Some(peer_cli::PeerTailnetMode::Node), Some("-")) => {
+            if !tailnet_node::SUPPORTED {
+                anyhow::bail!(node_unsupported_refusal());
+            }
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
+                .context("peer tailnet: could not read the auth key from standard input")?;
+            let auth_key = tailnet_node::AuthKey::new(&line)?;
+            drop(line);
+            let me = tailnet_node::join(&peers_path, args.name, auth_key).await?;
+            println!("peer.tailnet: node");
+            println!("tailnet address: {}", me.address);
+            println!("tailnet name: {}", me.name);
+            println!(
+                "peer tailnet: the running tcr starts the node within {}s",
+                (tailnet_node::TICK * 2).as_secs()
+            );
+            Ok(())
+        }
+        // The value is not echoed: it is most likely the key itself.
+        (Some(peer_cli::PeerTailnetMode::Node), Some(_)) => anyhow::bail!(
+            "peer tailnet: --auth-key takes `-` and reads the key from standard input, never \
+             the key itself, which would sit in your shell history and in `ps`"
+        ),
+        _ => run_peer_tailnet_with(args, &peer::tailscale_app::default_cli_paths()),
+    }
+}
+
+/// The refusal a binary without tcr's own tailnet node gives for `node`.
+const fn node_unsupported_refusal() -> &'static str {
+    "peer tailnet: this tcr was built without tcr's own tailnet node, so `node` cannot be set; \
+     use `tcr peer tailnet app` with the Tailscale app, or build tcr from source with \
+     `--features tailnet-node` on an Apple-silicon Mac"
+}
+
 /// `tcr peer tailnet [off|app|node] [--json]`, with the Tailscale CLI looked
 /// for at `cli_paths` so a test can hand it a fake one.
 ///
 /// Setting a mode takes the peers-file lock and saves, the way
 /// [`run_peer_find_with`] writes `discovery`. `node` is refused, with the file
-/// untouched, by a binary built without the `tailnet-node` feature.
+/// untouched, by a binary that cannot run tcr's own tailnet node
+/// ([`peer::tailnet_node::SUPPORTED`]), and by one that has not joined yet.
 ///
 /// With no mode it prints the setting and, in app mode, one live read of the
 /// app. `--json` prints the setting, whether this binary can act on `node`,
@@ -5540,12 +5620,26 @@ fn run_peer_tailnet_with(
 
     let peers_path = args.peers.path();
     if let Some(wanted) = args.mode {
-        let mode = wanted.mode();
-        if mode == TailnetMode::Node && !cfg!(feature = "tailnet-node") {
+        let Some(mode) = wanted.mode() else {
+            anyhow::bail!("peer tailnet: `leave` is run by `run_peer_tailnet`");
+        };
+        if mode == TailnetMode::Node && !peer::tailnet_node::SUPPORTED {
+            anyhow::bail!(node_unsupported_refusal());
+        }
+        // `node` with no auth key turns a node that already joined back on.
+        // With no key file there is nothing for the server to start, so it
+        // is refused rather than written as a mode that can only ever say
+        // "not joined".
+        if mode == TailnetMode::Node
+            && peer::tailnet_node::read_key_file(&peer::tailnet_node::key_path_for_peers(
+                &peers_path,
+            ))?
+            .is_none()
+        {
             anyhow::bail!(
-                "peer tailnet: this tcr was built without tcr's own tailnet node, so `node` \
-                 cannot be set; use `tcr peer tailnet app` with the Tailscale app, or build tcr \
-                 from source with `--features tailnet-node`"
+                "peer tailnet: this Mac has not joined a tailnet as tcr's own node yet; join \
+                 with `tcr peer tailnet node --name <name> --auth-key -` and the key on \
+                 standard input"
             );
         }
         let listen_written = {
@@ -5600,6 +5694,27 @@ fn run_peer_tailnet_with(
     }
     if mode == TailnetMode::Node && !report.node_supported {
         println!("peer.tailnet: this tcr was built without tcr's own tailnet node");
+    }
+    if mode == TailnetMode::Node && report.node_supported {
+        match report
+            .held
+            .as_ref()
+            .filter(|held| !held.is_stale(peer::pair::now_ms()))
+        {
+            Some(held) => {
+                if let Some(address) = held.address {
+                    println!("tailnet address: {address}");
+                }
+                if let Some(name) = &held.node_name {
+                    println!("tailnet name: {name}");
+                }
+                println!("tailnet node: {:?}", held.state);
+                if let Some(detail) = &held.detail {
+                    println!("tailnet node: {detail}");
+                }
+            }
+            None => println!("tailnet node: no running tcr has recorded the node yet"),
+        }
     }
     Ok(())
 }
@@ -5806,6 +5921,8 @@ mod peer_tailnet_tests {
                 peers: Some(peers_path.to_path_buf()),
             },
             mode,
+            name: None,
+            auth_key: None,
             json: false,
         }
     }
@@ -5853,7 +5970,7 @@ mod peer_tailnet_tests {
     ///
     /// Watch it fail by removing the feature check: the call then succeeds
     /// and the file says `node`.
-    #[cfg(not(feature = "tailnet-node"))]
+    #[cfg(not(all(feature = "tailnet-node", target_os = "macos", target_arch = "aarch64")))]
     #[test]
     fn node_is_refused_without_the_feature() {
         let dir = tempfile::tempdir().expect("tempdir");

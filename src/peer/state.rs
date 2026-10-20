@@ -506,7 +506,7 @@ impl TailnetReport {
             .with_context(|| format!("reading {}", state_path.display()))?;
         Ok(Self {
             mode: file.tailnet,
-            node_supported: cfg!(feature = "tailnet-node"),
+            node_supported: crate::peer::tailnet_node::SUPPORTED,
             held: state.tailnet,
         })
     }
@@ -2183,7 +2183,7 @@ mod tests {
             serde_json::to_value(&report).expect("serialize"),
             serde_json::json!({
                 "mode": "app",
-                "nodeSupported": cfg!(feature = "tailnet-node"),
+                "nodeSupported": crate::peer::tailnet_node::SUPPORTED,
                 "held": null
             })
         );
