@@ -111,6 +111,12 @@ struct PeerRowModel: Identifiable, Equatable {
     /// the peer id the wire sends.
     var pathViaName: String? = nil
     let meter: PeerMeter
+    /// The pills the tailnet keys add (``PeerTailnetPill``): `tailnet` on a
+    /// found row a tailnet saw, and `tailnet` plus `direct` or `relayed` on a
+    /// trusted row reached over one. Kept apart from ``pills`` because those
+    /// are the tab's two-pill trailing column; these draw in a slot of their
+    /// own whose width is reserved, so a pill appearing moves nothing.
+    var tailnetPills: [PeerTailnetPill] = []
 
     /// What this row DRAWS, for the height budget.
     ///
@@ -131,7 +137,7 @@ struct PeerRowModel: Identifiable, Equatable {
             && lhs.trust == rhs.trust && lhs.freshness == rhs.freshness && lhs.awake == rhs.awake
             && lhs.pills.map(\.text) == rhs.pills.map(\.text) && lhs.carries == rhs.carries
             && lhs.serves == rhs.serves && lhs.lend == rhs.lend && lhs.meter == rhs.meter
-            && lhs.pathLines == rhs.pathLines
+            && lhs.pathLines == rhs.pathLines && lhs.tailnetPills == rhs.tailnetPills
     }
 
     /// The same row, once its knock is away.
@@ -158,7 +164,9 @@ struct PeerRowModel: Identifiable, Equatable {
             // No path line while a knock is out: nothing is pinned yet, so
             // this Mac knows no way to reach that one that it may use.
             pathLines: [],
-            meter: .none(nil))
+            meter: .none(nil),
+            // Still the same Mac, still seen on the same networks.
+            tailnetPills: tailnetPills)
     }
 }
 
@@ -458,7 +466,8 @@ enum PeersSnapshotBuilder {
                 serves: false,
                 lend: [],
                 pathLines: [],
-                meter: .none(nil))
+                meter: .none(nil),
+                tailnetPills: PeerTailnetPill.found(entry.sources))
         }
 
         // ONE meter, built once and asked twice: the pills have to agree with
@@ -512,7 +521,8 @@ enum PeersSnapshotBuilder {
                 guard case .via = path.kind else { return nil }
                 return names[path.endpoint] ?? path.endpoint
             },
-            meter: meter)
+            meter: meter,
+            tailnetPills: PeerTailnetPill.trusted(entry.tailnet))
     }
 
     private static func pills(
@@ -1953,6 +1963,15 @@ struct PeersTabV4: View {
                 // of the peer's NAME (this row's own measurement, at
                 // `freshnessDot`).
                 HStack(spacing: V4.pillGap) {
+                    switch row.trust {
+                    case .found, .waiting:
+                        // The `tailnet` pill of a Mac a tailnet saw, in a slot
+                        // reserved on every untrusted row so it appearing
+                        // costs the name nothing it was not already paying.
+                        PeerTailnetPillSlot(pills: row.tailnetPills, widest: [.tailnet])
+                    case .trusted:
+                        EmptyView()
+                    }
                     switch row.trust {
                     case .found(let dialAddress, _):
                         PeerActionButton(
@@ -3742,6 +3761,8 @@ struct PeerPill: View {
         case info
         /// Another Mac reads this in plaintext. Spent on nothing else.
         case disclosure
+        /// Works, the slow way: a tailnet peer reached through a relay.
+        case caution
 
         var tint: Color {
             switch self {
@@ -3749,13 +3770,14 @@ struct PeerPill: View {
             case .ok: return Tok.ok
             case .info: return Tok.unmeasured
             case .disclosure: return Tok.unknown
+            case .caution: return Tok.near
             }
         }
 
         var border: Color {
             switch self {
             case .neutral: return Tok.cardLine
-            case .ok, .info, .disclosure: return tint.opacity(V4.pillBorderAlpha)
+            case .ok, .info, .disclosure, .caution: return tint.opacity(V4.pillBorderAlpha)
             }
         }
     }
@@ -3782,5 +3804,41 @@ struct PeerPill: View {
             .accessibilityLabel(text)
             .accessibilityValue(help ?? "")
             .help(help ?? text)
+    }
+}
+
+extension PeerTailnetPill {
+    /// `tailnet` in the info hue the mockup's blue maps to, `direct` in the
+    /// ok green, `relayed` in amber. Existing tokens only, so no colour here
+    /// is outside the contrast gate.
+    var role: PeerPill.Role {
+        switch self {
+        case .tailnet: return .info
+        case .direct: return .ok
+        case .relayed: return .caution
+        }
+    }
+}
+
+/// The tailnet pills of one Peers-tab row, in a slot sized for the widest set
+/// that row kind can carry, so a pill appearing or going moves nothing beside
+/// it (Gil, 2026-10-14: no layout shifts).
+struct PeerTailnetPillSlot: View {
+    let pills: [PeerTailnetPill]
+    let widest: [PeerTailnetPill]
+
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            HStack(spacing: V4.pillGap) {
+                ForEach(widest, id: \.self) { PeerPill(text: $0.text, role: $0.role) }
+            }
+            .hidden()
+            .accessibilityHidden(true)
+            HStack(spacing: V4.pillGap) {
+                ForEach(pills, id: \.self) { pill in
+                    PeerPill(text: pill.text, role: pill.role, help: pill.help)
+                }
+            }
+        }
     }
 }

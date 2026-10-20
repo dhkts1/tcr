@@ -1524,6 +1524,9 @@ enum RenderStates {
             //    announced (decision row 9), so this side has an address and
             //    no name and the row is drawn rather than hidden.
             ("47-peers-found-untrusted", peersSnapshot(foundUntrustedPeers), false),
+            // 3c. The same two, seen over the tailnet: a `tailnet` pill in the
+            //     slot every found row reserves.
+            ("47c-peers-found-tailnet", peersSnapshot(foundOverTailnetPeers), false),
             // 4. The safe steady state, and the one most operators stay in:
             //    one Mac trusted and carrying, sharing still off.
             ("48-peers-trusted-share-off", peersSnapshot(trustedShareOffPeers), false),
@@ -2184,6 +2187,19 @@ enum RenderStates {
             .init(address: "10.0.1.24:7749", lastSeenMs: peerMsAgo(6)),
         ])
 
+    /// Scene 47's two found Macs, with the tailnet keys: the first seen on
+    /// both this network and the tailnet, the second on the tailnet only. Its
+    /// pair is scene 47 itself, which must match it pixel for pixel outside
+    /// the two `tailnet` pills (the slot is reserved on every found row).
+    private static let foundOverTailnetPeers = PeerListDocument(
+        finding: true,
+        peers: [
+            .init(
+                name: "studio-mac", address: "studio-mac.local:7749",
+                lastSeenMs: peerMsAgo(2), sources: [.lan, .tailnet]),
+            .init(address: "10.0.1.24:7749", lastSeenMs: peerMsAgo(6), sources: [.tailnet]),
+        ])
+
     /// Scene 48's peers: one Mac trusted and carrying, sharing still off.
     private static let trustedShareOffPeers = PeerListDocument(
         finding: true,
@@ -2264,7 +2280,10 @@ enum RenderStates {
                         id: "tcr-4b8we1r0zp", name: "studio-mac",
                         address: "studio-mac.local:7749", trusted: true,
                         lastSeenMs: peerMsAgo(3), carries: true, serves: true,
-                        leaseSpent: 0.34, leaseTtlSeconds: 240),
+                        leaseSpent: 0.34, leaseTtlSeconds: 240,
+                        // The tailnet mockup's scene 1: one Mac over the
+                        // tailnet directly, one through a relay.
+                        tailnet: .init(route: .direct)),
                     .init(
                         id: "tcr-92hbq5t7yv", name: "attic-nuc",
                         address: "attic-nuc.local:7749", trusted: true,
@@ -2281,7 +2300,8 @@ enum RenderStates {
                                 maxInFlight: 2,
                                 until: Int64(peerNow.timeIntervalSince1970) - 1800,
                                 ended: true),
-                        ]),
+                        ],
+                        tailnet: .init(route: .relayed)),
                 ],
                 name: "studio-mac",
                 // Decision row 10 turned this default OFF, and the fixture is
@@ -2323,6 +2343,20 @@ enum RenderStates {
                             fraction: 1.0),
                     ]
                 ]))
+    }
+
+    /// The Tailscale row of the pane under `--render-settings`: the mockup's
+    /// scene 1, the app mode working. Documentation-range values only.
+    static var settingsTailnetFixture: PeerTailnetRead {
+        .read(tailnetReading(.app, held: .init(
+            mode: .app, state: .ready, address: "100.64.0.7", found: 2,
+            recordedAtMs: peerMsAgo(5))))
+    }
+
+    static func tailnetReading(
+        _ mode: PeerTailnetMode, nodeSupported: Bool = false, held: PeerTailnetReading.Held?
+    ) -> PeerTailnetReading {
+        PeerTailnetReading(mode: mode, nodeSupported: nodeSupported, held: held)
     }
 
     /// Seconds ago, as Unix milliseconds against ``peerNow``, so a rendered
@@ -2991,9 +3025,101 @@ enum RenderStates {
         ]
     }
 
+    /// The Tailscale row, one PNG per state. The first seven are the tailnet
+    /// mockup's scene 3 plus stale, and they are the set whose frames must
+    /// match pixel for pixel outside the picker label and the line's glyphs
+    /// (no layout shift). The rest are the states the mockup does not draw.
+    ///
+    /// Built the way the pane builds it: `onOpenApp` is wired and the join
+    /// and details presses are not, because their sheets are not built yet.
+    @MainActor
+    private static var tailnetRowScenes: [ControlScene] {
+        let at = { (seconds: TimeInterval) in peerMsAgo(seconds) }
+        let scene = { (name: String, read: PeerTailnetRead, failure: PeerTailnetPressFailure?) in
+            ControlScene(
+                name: "tn-row-\(name)",
+                view: AnyView(
+                    PeerTailnetRow(
+                        read: read,
+                        state: PeerTailnetState.state(read, pressFailure: failure, now: peerNow),
+                        onOpenApp: {}, snapshotMode: true)))
+        }
+        let held = { (mode: PeerTailnetMode, state: PeerTailnetReading.State) in
+            PeerTailnetReading.Held(mode: mode, state: state, recordedAtMs: at(5))
+        }
+        func read(_ mode: PeerTailnetMode, _ held: PeerTailnetReading.Held?, node: Bool = true)
+            -> PeerTailnetRead
+        {
+            .read(tailnetReading(mode, nodeSupported: node, held: held))
+        }
+        return [
+            scene("1-off", read(.off, nil), nil),
+            scene(
+                "2-app-ready",
+                read(
+                    .app,
+                    .init(
+                        mode: .app, state: .ready, address: "100.64.0.7", found: 2,
+                        recordedAtMs: at(5))), nil),
+            scene("3-app-not-running", read(.app, held(.app, .appNotRunning)), nil),
+            scene("4-node-not-joined", read(.node, held(.node, .nodeNotJoined)), nil),
+            scene("5-node-connecting", read(.node, held(.node, .nodeConnecting)), nil),
+            scene(
+                "6-node-ready",
+                read(
+                    .node,
+                    .init(
+                        mode: .node, state: .ready, address: "100.64.0.9",
+                        nodeName: "tcr-studio", connected: 1, recordedAtMs: at(5))), nil),
+            scene(
+                "7-stale",
+                read(
+                    .app,
+                    .init(
+                        mode: .app, state: .ready, address: "100.64.0.7", found: 2,
+                        recordedAtMs: at(90))), nil),
+            scene("x-not-read", .notRead, nil),
+            scene("x-unsupported-tcr", .unsupported, nil),
+            scene("x-not-reported", read(.app, nil), nil),
+            scene("x-applying", read(.app, held(.off, .off)), nil),
+            scene("x-app-missing", read(.app, held(.app, .appMissing)), nil),
+            scene(
+                "x-app-unreachable",
+                read(
+                    .app,
+                    .init(
+                        mode: .app, state: .appNotRunning,
+                        detail: "tailscale status exited 1", recordedAtMs: at(5))), nil),
+            scene("x-unknown-word", read(.app, held(.app, .unknown("unknown"))), nil),
+            scene(
+                "x-unknown-setting",
+                .read(
+                    PeerTailnetReading(
+                        mode: .off, unknownModeWord: "both", nodeSupported: false, held: nil)),
+                nil),
+            scene(
+                "x-read-failed",
+                read(
+                    .app,
+                    .init(
+                        mode: .app, state: .readFailed,
+                        detail: "tailscale status timed out after 2 s", recordedAtMs: at(5))),
+                nil),
+            scene(
+                "x-node-unsupported", read(.node, held(.node, .nodeUnsupported), node: false),
+                nil),
+            scene(
+                "x-unreadable",
+                .unreadable("tcr peer tailnet answered something this build cannot read"), nil),
+            scene(
+                "x-pick-refused", read(.off, nil),
+                .pickRefused("tcr peer tailnet node failed (exit 1): not in this build")),
+        ]
+    }
+
     @MainActor
     private static var controlScenes: [ControlScene] {
-        claudeRouteSettingsScenes + [
+        claudeRouteSettingsScenes + tailnetRowScenes + [
             // The "Reachable from the internet" row, one PNG per state it can
             // be in: the switch off, the router being asked, a mapping held,
             // a router that never answered, that question asked again from
