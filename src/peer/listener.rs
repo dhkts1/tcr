@@ -1093,10 +1093,11 @@ impl SessionContext {
 /// nobody here thought of defaults to the internet, which is the side that
 /// costs a refusal rather than an admission.
 ///
-/// The list is `127.0.0.0/8`, `::1`, the three RFC 1918
-/// ranges, `100.64.0.0/10` (RFC 6598, carrier-grade NAT, which is what a Mac
-/// behind a mobile hotspot sits in), `169.254.0.0/16` (RFC 3927 link-local,
-/// the address a Mac gives itself with no DHCP), `fe80::/10` and `fc00::/7`.
+/// The list is `127.0.0.0/8`, `::1`, the three RFC 1918 ranges, `fe80::/10`
+/// and `fc00::/7` minus Tailscale's `fd7a:115c:a1e0::/48`. Three ranges are
+/// deliberately left OFF it, and [`is_lan_scope_v4`] says why:
+/// `100.64.0.0/10` and `fd7a:115c:a1e0::/48` (a tailnet, in both families)
+/// and `169.254.0.0/16` (IPv4 link-local).
 ///
 /// # This is not the switch, and it must not be read as one
 ///
@@ -1128,10 +1129,15 @@ pub fn is_lan_scope(addr: IpAddr) -> bool {
 
 /// The IPv4 half of [`is_lan_scope`].
 ///
-/// # Two prefixes this used to count as LAN, and what that admitted
+/// # Prefixes this used to count as LAN, and what that admitted
 ///
 /// `100.64.0.0/10` (RFC 6598) is the carrier-grade NAT range, and it is what
-/// Tailscale numbers a tailnet out of. Counting it as LAN meant that every
+/// Tailscale numbers a tailnet out of in IPv4. Its IPv6 twin is
+/// `fd7a:115c:a1e0::/48`, which sits inside the unique-local `fc00::/7` that
+/// [`is_lan_scope_v6`] counts as LAN, so it is carved out there
+/// ([`is_tailscale_v6`]) for the same reason: one tailnet node used to be
+/// refused a knock at its IPv4 address and answered at its IPv6 one. What
+/// follows applies to both families. Counting a tailnet as LAN meant that every
 /// node on a tailnet, anywhere in the world, reached the knock path and the
 /// operator's pairing queue: [`internet_admission`] tests the SOURCE first and
 /// answers a LAN-scope source whatever `bind` is and whatever `peer.internet`
@@ -1172,6 +1178,17 @@ pub fn is_carrier_grade_nat(addr: Ipv4Addr) -> bool {
     a == 100 && (64..128).contains(&b)
 }
 
+/// Whether `addr` is in `fd7a:115c:a1e0::/48`, the range Tailscale numbers a
+/// tailnet out of in IPv6: the IPv6 twin of [`is_carrier_grade_nat`].
+///
+/// Public for the same reason that one is: "is this a tailnet address" is a
+/// different question from "is this LAN scope", and a caller asking the first
+/// must not re-type the range.
+pub const fn is_tailscale_v6(addr: Ipv6Addr) -> bool {
+    let segments = addr.segments();
+    segments[0] == 0xfd7a && segments[1] == 0x115c && segments[2] == 0xa1e0
+}
+
 /// The IPv6 half of [`is_lan_scope`].
 const fn is_lan_scope_v6(addr: Ipv6Addr) -> bool {
     if addr.is_loopback() {
@@ -1181,6 +1198,11 @@ const fn is_lan_scope_v6(addr: Ipv6Addr) -> bool {
     // fe80::/10, link-local.
     if segments[0] & 0xffc0 == 0xfe80 {
         return true;
+    }
+    // Tailscale's range sits inside fc00::/7 and is a tailnet, not this LAN:
+    // see `is_lan_scope_v4` for why a tailnet never counts.
+    if is_tailscale_v6(addr) {
+        return false;
     }
     // fc00::/7, unique-local (RFC 4193).
     segments[0] & 0xfe00 == 0xfc00

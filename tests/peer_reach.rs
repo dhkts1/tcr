@@ -1310,6 +1310,8 @@ fn lan_scope_is_the_allow_list_row_14_names() {
         "fe80::1",
         "fd00::1",
         "fc00::1",
+        // One past the edge of Tailscale's /48, still plain unique-local.
+        "fd7a:115c:a1e1::1",
         // A dual-stack listener reports a v4 peer as v4-mapped, and that is
         // the same LAN it would be reported as on a v4 socket.
         "::ffff:10.0.0.7",
@@ -1340,6 +1342,9 @@ fn lan_scope_is_the_allow_list_row_14_names() {
         "100.127.255.254",
         "169.254.1.1",
         "169.254.169.254",
+        // Tailscale's IPv6 range, the twin of 100.64.0.0/10, carved out of
+        // the unique-local fc00::/7 above.
+        "fd7a:115c:a1e0::1",
         "2001:db8::1",
         "2606:4700::1111",
     ] {

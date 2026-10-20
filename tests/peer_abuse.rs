@@ -2046,6 +2046,68 @@ fn a_tailnet_or_link_local_source_never_reaches_the_knock_path() {
     );
 }
 
+/// **A tailnet's IPv6 address gets the same answer as its IPv4 one.**
+///
+/// Tailscale numbers a tailnet out of `fd7a:115c:a1e0::/48` as well as
+/// `100.64.0.0/10`, and that /48 sits inside the unique-local `fc00::/7`
+/// that `is_lan_scope_v6` counts as LAN. So one tailnet node was refused a
+/// knock at `100.x` and answered at `fd7a:`, and the IPv4 rule above was only
+/// half a rule.
+///
+/// Watch it fail: delete the `is_tailscale_v6` early return from
+/// `is_lan_scope_v6` and every `fd7a:` row below returns `Answer`.
+#[test]
+fn a_tailnet_ipv6_source_never_reaches_the_knock_path_either() {
+    for bind in ["0.0.0.0", "::"] {
+        let wide_open: std::net::IpAddr = bind.parse().expect("a literal address parses");
+        for source in [
+            "fd7a:115c:a1e0::1",
+            "fd7a:115c:a1e0:ab12:4843:cd96:6258:b240",
+        ] {
+            let from: std::net::IpAddr = source.parse().expect("a literal address parses");
+            for pattern in [
+                noise::Handshake::Knock,
+                noise::Handshake::KnockPsk,
+                noise::Handshake::Pair,
+            ] {
+                for internet in [false, true] {
+                    assert_eq!(
+                        listener::internet_admission(wide_open, from, pattern, internet, &[]),
+                        listener::InternetAdmission::Refuse,
+                        "{source} is a tailnet address like 100.64.0.0/10, so a {} on a \
+                         listener bound {bind} must get nothing back (internet={internet})",
+                        pattern.pattern()
+                    );
+                }
+            }
+            assert_eq!(
+                listener::internet_admission(wide_open, from, noise::Handshake::Return, false, &[]),
+                listener::InternetAdmission::Answer,
+                "{source} must still reach the pin check with an IK return visit"
+            );
+        }
+
+        // Every other unique-local address is still this LAN: only the /48
+        // moved. `fd7a:115c:a1e1::1` is one past the range's edge.
+        for neighbour in ["fd00::1", "fc00::1", "fd7a:115c:a1e1::1"] {
+            let from: std::net::IpAddr = neighbour.parse().expect("a literal address parses");
+            assert_eq!(
+                listener::internet_admission(wide_open, from, noise::Handshake::Knock, true, &[]),
+                listener::InternetAdmission::Answer,
+                "{neighbour} is unique-local outside Tailscale's /48, so it still counts as LAN"
+            );
+        }
+    }
+    assert!(listener::is_tailscale_v6(
+        "fd7a:115c:a1e0::5"
+            .parse()
+            .expect("a literal address parses")
+    ));
+    assert!(!listener::is_tailscale_v6(
+        "fd00::5".parse().expect("a literal address parses")
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // One failed accept is one connection, not the end of the mesh
 // ---------------------------------------------------------------------------
