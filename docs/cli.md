@@ -3208,7 +3208,9 @@ Sets, or with no argument prints, how this Mac uses a tailnet. Off by default.
 Setting a mode writes `"tailnet"` into the peers file under its lock, the way `tcr peer find`
 writes `discovery`; `off` removes the key. The setting is read on every use, never from a
 boot-time snapshot, so it needs no restart. `node` is refused, with the file left alone, by a
-`tcr` built without the `tailnet-node` cargo feature; release builds do not have it.
+`tcr` built without the `tailnet-node` cargo feature; release builds do not have it. A word this
+`tcr` does not know (one a newer `tcr` wrote) still loads: it is treated as off, kept in the file
+as written, and the no-argument form prints a line saying so.
 
 With no argument it prints `peer.tailnet: <mode>`, and in `app` mode one live read of the
 Tailscale app: this Mac's tailnet address, then one line per Mac of yours that is online
@@ -3239,7 +3241,8 @@ can hold two Tailscale CLIs at different versions. It runs `status --json` and i
 }
 ```
 
-- `mode`: the setting, as the peers file says now.
+- `mode`: the setting, as the peers file says now: the word as written, including one this `tcr`
+  does not know (which it treats as off).
 - `nodeSupported`: whether this binary was built with the `tailnet-node` feature.
 - `held`: what the serving process recorded on its last tailnet tick, read off
   `peer-state.json` the way `tcr peer reach` reads the router mapping. `null` when no server has
@@ -3248,7 +3251,9 @@ can hold two Tailscale CLIs at different versions. It runs `status --json` and i
   - `state`: `off`, `ready`, `appMissing` (no Tailscale CLI at any of the three paths),
     `appNotRunning` (the app is not connected, or the CLI could not reach it), `readFailed`
     (the CLI timed out, could not start, or printed something that did not parse; `detail`
-    says which), `nodeNotJoined`, `nodeConnecting` or `nodeUnsupported`.
+    says which), `nodeNotJoined`, `nodeConnecting`, `nodeUnsupported`, or `unknown` (a word
+    this `tcr` does not know, from a newer server). Every field of `held` has a default, so a
+    record from a different version always reads.
   - `address`: this Mac's tailnet IPv4 in that mode, or `null`.
   - `nodeName`: node mode only, the name on the tailnet.
   - `found`: app mode, your Macs that sent a beacon in the last 60 seconds.

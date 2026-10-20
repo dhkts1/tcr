@@ -347,12 +347,23 @@ pub const TAILNET_RECORD_STALE_MS: i64 = 60_000;
 /// shape is documented in `docs/cli.md`, `tcr peer tailnet`. A field added here
 /// later is dropped by an older build that rewrites the state file, because
 /// [`PeerState::rest`] keeps unknown keys at the top level only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// # Every field has a default, and both words tolerate the unknown
+///
+/// A record that fails to parse fails the whole state file, and [`load`]
+/// renames that file aside and starts cold: the knock queue, the bans and the
+/// leases go with it. A CLI and a server at different versions read each
+/// other's records, so a missing field takes its default, and a mode or state
+/// word this build does not know reads as [`TailnetSetting`]'s unknown word
+/// and [`TailnetState::Unknown`] instead of failing.
+///
+/// [`TailnetSetting`]: crate::peer::config::TailnetSetting
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct TailnetRecord {
-    /// The mode the server acted on. It lags the file's mode by up to one
-    /// tick.
-    pub mode: crate::peer::config::TailnetMode,
+    /// The mode the server acted on, as the word it wrote. It lags the
+    /// file's mode by up to one tick.
+    pub mode: crate::peer::config::TailnetSetting,
     /// What came of it.
     pub state: TailnetState,
     /// This Mac's tailnet IPv4 in that mode, or `None`.
@@ -379,7 +390,7 @@ impl TailnetRecord {
 
 /// What came of the tailnet setting, one word per outcome the panel draws a
 /// different line for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TailnetState {
     /// The setting is off.
@@ -401,6 +412,11 @@ pub enum TailnetState {
     NodeConnecting,
     /// The mode is `node` but this binary lacks the `tailnet-node` feature.
     NodeUnsupported,
+    /// A record with no state, or a state word this build does not know
+    /// (a newer server wrote it). Never written by this build's server.
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 /// `tcr peer tailnet --json`: the setting, whether this binary can act on
@@ -408,8 +424,9 @@ pub enum TailnetState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TailnetReport {
-    /// The setting, as the peers file says now.
-    pub mode: crate::peer::config::TailnetMode,
+    /// The setting, as the peers file says now: the word as written, a word
+    /// this build does not know included.
+    pub mode: crate::peer::config::TailnetSetting,
     /// Whether this binary was built with the `tailnet-node` cargo feature.
     pub node_supported: bool,
     /// What the serving process recorded, or `None` when none has.
@@ -2070,7 +2087,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let peers_path = dir.path().join("tcr-peers.json");
         let file = crate::peer::config::PeerFile {
-            tailnet: TailnetMode::App,
+            tailnet: TailnetMode::App.into(),
             ..Default::default()
         };
         crate::peer::config::save(&peers_path, &file).expect("save the peers file");
@@ -2086,7 +2103,7 @@ mod tests {
         );
 
         let record = TailnetRecord {
-            mode: TailnetMode::App,
+            mode: TailnetMode::App.into(),
             state: TailnetState::AppNotRunning,
             address: Some(std::net::Ipv4Addr::new(100, 64, 0, 7)),
             node_name: None,
@@ -2137,11 +2154,71 @@ mod tests {
             (TailnetState::NodeNotJoined, "nodeNotJoined"),
             (TailnetState::NodeConnecting, "nodeConnecting"),
             (TailnetState::NodeUnsupported, "nodeUnsupported"),
+            (TailnetState::Unknown, "unknown"),
         ] {
             assert_eq!(
                 serde_json::to_value(state).expect("serialize"),
                 serde_json::json!(word)
             );
         }
+    }
+
+    /// **A tailnet record from another version never costs the state file.**
+    /// A record missing fields takes their defaults, and a mode or state word
+    /// this build does not know reads as unknown. Before, either one failed
+    /// the parse, and `load` renamed the whole state file aside: the knock
+    /// queue, the bans and the leases with it.
+    ///
+    /// Watch it fail by removing `default` from `TailnetRecord`'s
+    /// `#[serde(...)]`: the sparse record no longer parses, and the state
+    /// file comes back `Quarantined`.
+    #[test]
+    fn a_tailnet_record_from_another_version_loads() {
+        use crate::peer::config::TailnetSetting;
+
+        let sparse: TailnetRecord =
+            serde_json::from_value(serde_json::json!({ "recordedAtMs": 5 }))
+                .expect("a record missing fields parses");
+        assert_eq!(sparse.state, TailnetState::Unknown);
+        assert_eq!(sparse.mode.as_word(), "off");
+        assert_eq!(sparse.address, None);
+        assert_eq!(sparse.recorded_at_ms, 5);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("peer-state.json");
+        save(&path, &PeerState::default()).expect("save a state file");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        raw["tailnet"] = serde_json::json!({
+            "mode": "both",
+            "state": "somethingNew",
+            "recordedAtMs": 5,
+            "aFieldFromLater": true
+        });
+        crate::config::write_atomic(&path, &raw.to_string()).expect("write it back");
+
+        let (state, origin) = load_with_origin(&path, 10).expect("load");
+        assert_eq!(
+            origin,
+            StateOrigin::Trusted,
+            "the file is trusted, not set aside"
+        );
+        let record = state.tailnet.expect("the record is there");
+        assert_eq!(record.mode, TailnetSetting::Unknown("both".to_string()));
+        assert_eq!(record.state, TailnetState::Unknown);
+    }
+
+    /// **`tcr peer tailnet --json` reports an unknown mode as the word
+    /// written**, not as the `off` it acts as.
+    #[test]
+    fn the_report_carries_an_unknown_mode_word_as_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        crate::config::write_atomic(&peers_path, r#"{"tailnet": "both"}"#).expect("write");
+        let report = TailnetReport::read(&peers_path, 1_000).expect("read the report");
+        assert_eq!(
+            serde_json::to_value(&report).expect("serialize")["mode"],
+            "both"
+        );
     }
 }

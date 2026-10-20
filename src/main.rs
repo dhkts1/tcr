@@ -5399,7 +5399,7 @@ fn run_peer_tailnet_with(
         }
         {
             let (_lock, mut file) = lock_peers_file(&peers_path)?;
-            file.tailnet = mode;
+            file.tailnet = mode.into();
             peer::config::save(&peers_path, &file)?;
         }
         if !args.json {
@@ -5414,11 +5414,21 @@ fn run_peer_tailnet_with(
         return Ok(());
     }
 
-    println!("peer.tailnet: {}", report.mode.as_str());
-    if report.mode == TailnetMode::App {
+    println!("peer.tailnet: {}", report.mode.as_word());
+    if let peer::config::TailnetSetting::Unknown(word) = &report.mode {
+        // The surfacing for an unknown word: it loads and acts as off, and
+        // this line is where the operator learns that.
+        println!(
+            "peer.tailnet: \"{}\" is a mode this build of tcr does not know, so it is treated \
+             as off; a newer tcr probably wrote it",
+            masked_label(word)
+        );
+    }
+    let mode = report.mode.effective();
+    if mode == TailnetMode::App {
         print_tailscale_app_read(cli_paths);
     }
-    if report.mode == TailnetMode::Node && !report.node_supported {
+    if mode == TailnetMode::Node && !report.node_supported {
         println!("peer.tailnet: this tcr was built without tcr's own tailnet node");
     }
     Ok(())
@@ -5707,6 +5717,29 @@ mod peer_tailnet_tests {
             .expect("set app");
         run_peer_tailnet_with(args(&peers_path, None), &[dir.path().join("no-cli")])
             .expect("show app with no CLI");
+    }
+
+    /// **A mode word this build does not know is shown, not refused, and
+    /// setting a known mode replaces it.**
+    #[test]
+    fn an_unknown_mode_is_shown_and_can_be_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        std::fs::write(&peers_path, r#"{"tailnet": "both"}"#).expect("write the peers file");
+        std::fs::set_permissions(
+            &peers_path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .expect("mode 0600, which the reader requires");
+        run_peer_tailnet_with(args(&peers_path, None), &[]).expect("show an unknown mode");
+        assert_eq!(
+            written(&peers_path)["tailnet"],
+            "both",
+            "showing writes nothing"
+        );
+        run_peer_tailnet_with(args(&peers_path, Some(peer_cli::PeerTailnetMode::App)), &[])
+            .expect("set app over it");
+        assert_eq!(written(&peers_path)["tailnet"], "app");
     }
 }
 

@@ -215,9 +215,11 @@ pub struct PeerFile {
     ///
     /// Hot, and never part of the boot snapshot: every reader takes it from
     /// the file as it is now, the way the browse task reads [`Self::discovery`],
-    /// so changing it costs no restart and no warm prompt cache.
-    #[serde(default, skip_serializing_if = "TailnetMode::is_off")]
-    pub tailnet: TailnetMode,
+    /// so changing it costs no restart and no warm prompt cache. Readers act
+    /// on [`TailnetSetting::effective`]; a word this build does not know is
+    /// kept and acts as off.
+    #[serde(default, skip_serializing_if = "TailnetSetting::is_unwritten")]
+    pub tailnet: TailnetSetting,
     /// Every key in this file that this build does not know, written back
     /// unread by [`save`].
     ///
@@ -296,7 +298,7 @@ impl Default for PeerFile {
             pending_invites: Vec::new(),
             default_lend: None,
             dead_drop: DeadDropConfig::default(),
-            tailnet: TailnetMode::Off,
+            tailnet: TailnetSetting::Known(TailnetMode::Off),
             rest: serde_json::Map::new(),
         }
     }
@@ -324,11 +326,6 @@ pub enum TailnetMode {
 }
 
 impl TailnetMode {
-    /// [`Self::Off`], the value that is not written to the file.
-    pub fn is_off(&self) -> bool {
-        *self == Self::Off
-    }
-
     /// The word the file and the CLI use for it.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -336,6 +333,82 @@ impl TailnetMode {
             Self::App => "app",
             Self::Node => "node",
         }
+    }
+}
+
+/// The `tailnet` value as the file holds it: a mode this build knows, or a
+/// word it does not.
+///
+/// # Why an unknown word loads instead of refusing the file
+///
+/// A newer `tcr` may write a mode this one has never heard of. A strict enum
+/// would make the whole peers file unreadable here, and with it every pinned
+/// peer, grant and lease, over one setting this build cannot act on anyway.
+/// So the word is kept as written, a save writes it back unchanged (the
+/// promise [`PeerFile::rest`] makes for unknown keys), and every reader acts
+/// on [`Self::effective`], which is [`TailnetMode::Off`] for it. Not a silent
+/// fallback: `tcr peer tailnet` says the mode is unknown and treated as off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailnetSetting {
+    /// A mode this build knows.
+    Known(TailnetMode),
+    /// A word this build does not know, kept exactly as read.
+    Unknown(String),
+}
+
+impl TailnetSetting {
+    /// The mode every reader acts on: the known mode, or
+    /// [`TailnetMode::Off`] for an unknown word.
+    pub const fn effective(&self) -> TailnetMode {
+        match self {
+            Self::Known(mode) => *mode,
+            Self::Unknown(_) => TailnetMode::Off,
+        }
+    }
+
+    /// The word as written.
+    pub fn as_word(&self) -> &str {
+        match self {
+            Self::Known(mode) => mode.as_str(),
+            Self::Unknown(word) => word,
+        }
+    }
+
+    /// Whether a save leaves the key out: only for a known `off`, the
+    /// default. An unknown word is always written back.
+    pub fn is_unwritten(&self) -> bool {
+        *self == Self::Known(TailnetMode::Off)
+    }
+}
+
+/// [`TailnetMode::Off`], what a file with no `tailnet` key holds.
+impl Default for TailnetSetting {
+    fn default() -> Self {
+        Self::Known(TailnetMode::Off)
+    }
+}
+
+impl From<TailnetMode> for TailnetSetting {
+    fn from(mode: TailnetMode) -> Self {
+        Self::Known(mode)
+    }
+}
+
+impl Serialize for TailnetSetting {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_word())
+    }
+}
+
+impl<'de> Deserialize<'de> for TailnetSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(deserializer)?;
+        Ok(match word.as_str() {
+            "off" => Self::Known(TailnetMode::Off),
+            "app" => Self::Known(TailnetMode::App),
+            "node" => Self::Known(TailnetMode::Node),
+            _ => Self::Unknown(word),
+        })
     }
 }
 
@@ -2854,6 +2927,50 @@ mod tests {
         assert!(
             written.get("rest").is_none(),
             "the map is flattened, never nested under its field name: {written}"
+        );
+    }
+
+    /// **A `tailnet` word this build does not know loads, acts as off, and
+    /// is saved back as written.** A strict enum made the whole peers file
+    /// unreadable instead, every peer and grant with it, over one setting a
+    /// newer `tcr` wrote.
+    ///
+    /// Watch it fail by making `TailnetSetting`'s deserializer refuse the
+    /// unknown arm (`Err(D::Error::custom(..))` for `_`): `read_or_default`
+    /// then refuses the file and the first `unwrap` panics.
+    #[test]
+    fn an_unknown_tailnet_word_loads_as_off_and_is_saved_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tcr-peers.json");
+        crate::config::write_atomic(&path, r#"{"discovery": true, "tailnet": "both"}"#).unwrap();
+
+        let mut file = read_or_default(&path).unwrap();
+        assert_eq!(file.tailnet, TailnetSetting::Unknown("both".to_string()));
+        assert_eq!(file.tailnet.effective(), TailnetMode::Off, "it acts as off");
+        assert_eq!(file.tailnet.as_word(), "both", "and still says what it is");
+        assert!(file.discovery, "the rest of the file loaded too");
+
+        file.announce_name = true;
+        save(&path, &file).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written["tailnet"], "both",
+            "saved back unchanged: {written}"
+        );
+
+        // The known words are still themselves, and `off` is not written.
+        for (word, mode) in [("app", TailnetMode::App), ("node", TailnetMode::Node)] {
+            let parsed: TailnetSetting = serde_json::from_value(serde_json::json!(word)).unwrap();
+            assert_eq!(parsed, TailnetSetting::Known(mode));
+        }
+        file.tailnet = TailnetMode::Off.into();
+        save(&path, &file).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            written.get("tailnet").is_none(),
+            "off is the default: {written}"
         );
     }
 }
