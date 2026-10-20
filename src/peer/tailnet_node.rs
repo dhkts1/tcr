@@ -568,6 +568,8 @@ pub struct Supervisor<F: DeviceFactory> {
     shutdown_deadline: Duration,
     /// Where the running device's dialler is published, if anywhere.
     dial_slot: Option<DialSlot>,
+    /// Flipped when the running device stops, to cancel its dials in flight.
+    cancel_dials: Option<tokio::sync::watch::Sender<bool>>,
     /// Whether the last wake read the mode as `node`.
     was_node: bool,
     /// Whether the mode left `node` and the `nodeReleased` record has not
@@ -608,6 +610,7 @@ impl<F: DeviceFactory> Supervisor<F> {
             was_node: false,
             release_owed: false,
             dial_slot: None,
+            cancel_dials: None,
             builds: 0,
         }
     }
@@ -1100,8 +1103,10 @@ impl<F: DeviceFactory> Supervisor<F> {
         );
         self.starting = None;
         if let Some(slot) = &self.dial_slot {
+            let (cancel, cancelled) = tokio::sync::watch::channel(false);
+            self.cancel_dials = Some(cancel);
             slot.set(Some(Published {
-                dial: dialler(&device, &self.live),
+                dial: dialler(&device, &self.live, cancelled),
                 listen: SocketAddr::from((me.address, self.port)),
             }));
         }
@@ -1141,10 +1146,16 @@ impl<F: DeviceFactory> Supervisor<F> {
         let Some(running) = self.running.take() else {
             return;
         };
-        // Unpublished first, so no new dial starts on a device being shut down;
-        // one already in flight holds it briefly, and `shutdown_shared` waits.
+        // Unpublished first, so no new dial starts on a device being shut
+        // down, then every dial in flight is cancelled, so none holds the
+        // device past `settle`'s wait.
         if let Some(slot) = &self.dial_slot {
             slot.set(None);
+        }
+        if let Some(cancel) = self.cancel_dials.take()
+            && cancel.send(true).is_err()
+        {
+            tracing::debug!("peer tailnet node: no dial was listening for the stop");
         }
         running.accept.abort();
         self.settle(running.device).await;
@@ -1367,17 +1378,35 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
 }
 
 /// A dialler over `device`, held weakly, counting what it opens in `live`.
-fn dialler<D: TailnetDevice>(device: &Arc<D>, live: &Arc<LiveConnections>) -> DialFn {
+///
+/// A dial holds the device only while its connect runs, and `cancel` ends
+/// that connect the moment the supervisor stops the device: an in-flight dial
+/// cannot keep a device alive past its shutdown and into a rebuild from the
+/// same keys.
+fn dialler<D: TailnetDevice>(
+    device: &Arc<D>,
+    live: &Arc<LiveConnections>,
+    cancel: tokio::sync::watch::Receiver<bool>,
+) -> DialFn {
     let device = Arc::downgrade(device);
     let live = Arc::clone(live);
     Arc::new(move |addr| {
         let device = std::sync::Weak::clone(&device);
         let live = Arc::clone(&live);
+        let mut cancel = cancel.clone();
         Box::pin(async move {
+            if *cancel.borrow() {
+                bail!("tcr's tailnet node is stopping, so {addr} was not dialled");
+            }
             let Some(device) = device.upgrade() else {
                 bail!("tcr's tailnet node stopped before {addr} could be dialled");
             };
-            let stream = device.connect(addr).await?;
+            let stream = tokio::select! {
+                connected = device.connect(addr) => connected?,
+                _ = cancel.wait_for(|stopping| *stopping) => {
+                    bail!("tcr's tailnet node stopped while {addr} was being dialled")
+                }
+            };
             drop(device);
             let counted = Counted {
                 inner: stream,
@@ -1504,6 +1533,21 @@ pub async fn dial_through_server(
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or_else(|| anyhow!("the running tcr's answer had no status"))?;
     if status == 101 {
+        // Only the dial route answers this upgrade, and it stamps the answer:
+        // a `101` without the stamp is something else on that port.
+        let stamped = head.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.trim()
+                    .eq_ignore_ascii_case(crate::proxy::ENDPOINT_HEADER)
+                    && value.trim() == crate::proxy::PEER_DIAL_ENDPOINT
+            })
+        });
+        if !stamped {
+            bail!(
+                "something on {local} answered the dial with a 101 but is not tcr's dial route; \
+                 is the configured port another program's?"
+            );
+        }
         return Ok(stream);
     }
     // The refusal's body says why; read what it promises, bounded.
@@ -2120,6 +2164,8 @@ mod tests {
         watch_key: Arc<Mutex<Option<PathBuf>>>,
         key_existed_at_shutdown: Arc<AtomicBool>,
         dialled: Arc<Mutex<Option<DialledTx>>>,
+        /// While set, a connect never answers (a dial stuck in flight).
+        connect_hangs: Arc<AtomicBool>,
     }
 
     impl Script {
@@ -2137,6 +2183,7 @@ mod tests {
                 watch_key: Arc::new(Mutex::new(None)),
                 key_existed_at_shutdown: Arc::new(AtomicBool::new(false)),
                 dialled: Arc::new(Mutex::new(None)),
+                connect_hangs: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -2214,6 +2261,9 @@ mod tests {
         /// One end of a fresh pipe; the other goes to the test through
         /// `dialled`, with the address it was dialled at.
         async fn connect(&self, addr: SocketAddr) -> Result<DuplexStream> {
+            if self.0.connect_hangs.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             let (ours, theirs) = tokio::io::duplex(64 * 1024);
             let sender = match self.0.dialled.lock() {
                 Ok(held) => held.clone(),
@@ -3145,6 +3195,60 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    /// **A dial stuck in flight cannot keep the device alive into a
+    /// rebuild**: stopping the device cancels it, the old device is shut
+    /// down, and only then is the new one built.
+    ///
+    /// Watch it fail by not sending the cancel in `stop_device`: the stuck
+    /// dial keeps the device past its deadline, it lingers, and no rebuild
+    /// happens on this wake (`builds` stays 1, `shutdowns` 0).
+    #[tokio::test]
+    async fn a_dial_in_flight_is_cancelled_before_the_rebuild() {
+        let fx = fixture(TailnetMode::Node);
+        write_key_file(&fx.paths.key, &some_keys()).expect("keys");
+        let script = Script::new();
+        script.connect_hangs.store(true, Ordering::SeqCst);
+        let (router, gateway) = switchable_gateway();
+        let slot = DialSlot::default();
+        let mut sup = supervisor(FakeFactory(script.clone()), &fx.paths, gateway)
+            .with_dial_slot(slot.clone());
+        sup.tick(Duration::ZERO, 1_000).await;
+
+        let in_flight = {
+            let slot = slot.clone();
+            tokio::spawn(async move {
+                dial_in_slot(
+                    &slot,
+                    "100.64.0.9:7755".parse().expect("addr"),
+                    Duration::from_secs(30),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!in_flight.is_finished(), "the dial is stuck in its connect");
+
+        move_to(&router, Ipv4Addr::new(10, 0, 0, 1));
+        sup.tick(HEALTH_EVERY, 2_000).await;
+        assert_eq!(
+            script.shutdowns.load(Ordering::SeqCst),
+            1,
+            "the old device was shut down"
+        );
+        assert_eq!(
+            script.builds.load(Ordering::SeqCst),
+            2,
+            "and only then a new one built"
+        );
+        let dialled = tokio::time::timeout(Duration::from_secs(1), in_flight)
+            .await
+            .expect("the stuck dial ended")
+            .expect("joined")
+            .expect("it went through the node");
+        let refusal = format!("{:#}", dialled.err().expect("cancelled, not connected"));
+        assert!(refusal.contains("stopped"), "{refusal}");
     }
 
     #[test]

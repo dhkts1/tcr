@@ -1179,9 +1179,11 @@ where
     // raise it with `.http2().max_concurrent_streams(n)` if a client ever hits it.
     //
     // `_with_upgrades` so a local route may answer `101` and take the socket:
-    // `/_tcr/peer/dial` (`proxy::peer_dial_handler`) is the one that does. A
-    // request no handler upgrades is served exactly as before, because hyper
-    // only hands the socket over when the response is a `101`.
+    // `/_tcr/peer/dial` (`proxy::peer_dial_handler`) is the one that does.
+    // hyper hands the socket over only for a `101`, or a `2xx` to a
+    // `CONNECT`; a base-URL `CONNECT` is peeked off before hyper sees it, and
+    // no route here answers one inside a tunnel with a `2xx`, so every other
+    // request is served exactly as before.
     if let Err(err) =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
             .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(io), service)
