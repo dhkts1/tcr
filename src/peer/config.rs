@@ -14,9 +14,12 @@
 //! config gains no new key and no new exception.
 //!
 //! **The split inside this file is the design: the SOCKET is boot-time, the
-//! POLICY is hot.** [`PeerFile::listen`], [`PeerFile::discovery`] and
-//! [`PeerFile::max_hops`] are read once at boot, turning a listener on is a
-//! restart-worthy act and saying so is honest. Everything under
+//! POLICY is hot.** [`PeerFile::listen`] and [`PeerFile::max_hops`] are read
+//! once at boot, turning a listener on is a restart-worthy act and saying so
+//! is honest. [`PeerFile::discovery`] is not one of them: the server's
+//! announce and browse tasks re-read this file on every 20-second wake
+//! (`spawn_beacon` and `spawn_browse` in `src/server.rs`), so `tcr peer
+//! find on|off` reaches a running server with no restart. Everything under
 //! [`PeerRow::allow`] and [`PeerRow::lend`] is re-read whenever this file's
 //! mtime moves, exactly the way `Manager::reload_groups_if_changed`
 //! (`src/manager/mod.rs:1990`) already does it for groups. One mechanism, not a
@@ -76,7 +79,8 @@ pub struct PeerFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<SocketAddr>,
     /// Multicast discovery. Off unless the operator turns finding on.
-    /// Boot-time.
+    /// Hot: the server's announce and browse tasks re-read the file on every
+    /// 20-second wake rather than trusting the boot snapshot.
     #[serde(default)]
     pub discovery: bool,
     /// The operator's own display name for this machine (`tcr peer name
@@ -205,6 +209,17 @@ pub struct PeerFile {
     /// case. Boot-time for the publisher, hot for the fetch gate.
     #[serde(default, skip_serializing_if = "DeadDropConfig::is_unset")]
     pub dead_drop: DeadDropConfig,
+    /// Every key in this file that this build does not know, written back
+    /// unread by [`save`].
+    ///
+    /// The peers file has more than one writer at different versions: the
+    /// `tcr` bundled inside TcrBar, the one on `PATH`, and the serving process
+    /// can each lag the others by a release. Without this map an older build's
+    /// read/modify/write drops a key a newer build added, silently, and the
+    /// newer build reads its own setting back as the default. The same shape
+    /// [`crate::peer::state::PeerState::rest`] uses for the state file.
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
 }
 
 /// What the three opt-in verbs write into [`PeerFile::listen`] when it is
@@ -272,6 +287,7 @@ impl Default for PeerFile {
             pending_invites: Vec::new(),
             default_lend: None,
             dead_drop: DeadDropConfig::default(),
+            rest: serde_json::Map::new(),
         }
     }
 }
@@ -1768,13 +1784,15 @@ pub struct PendingInvite {
 pub struct PeerStore {
     path: PathBuf,
     /// The whole file, as of the last successful read. Boot-time fields
-    /// ([`PeerFile::listen`], [`PeerFile::discovery`], [`PeerFile::max_hops`])
-    /// are trusted only from the FIRST read, taken in [`Self::open`]; a later
+    /// ([`PeerFile::listen`], [`PeerFile::max_hops`]) are trusted only from
+    /// the FIRST read, taken in [`Self::open`]; a later
     /// [`Self::reload_if_changed`] still holds the whole struct here (one
     /// shape, matching the module docs' "one mechanism" reasoning), but no
     /// caller reads the boot-time fields off anything but the value `open`
-    /// produced, so a later edit to `listen`/`discovery`/`maxHops` on disk has
-    /// no effect until a restart, exactly as documented.
+    /// produced, so a later edit to `listen`/`maxHops` on disk has no effect
+    /// until a restart, exactly as documented. [`PeerFile::discovery`] is not
+    /// read off this snapshot at all: the beacon and browse tasks re-read the
+    /// file on every wake.
     file: Mutex<PeerFile>,
     /// The file's mtime as of the last successful (or unmodified-since) read.
     /// `None` before the first successful read.
@@ -2746,5 +2764,49 @@ mod tests {
         let wrote = observe_seen_address(&path, &peer, "198.51.100.7:7766".parse().unwrap(), 1_000)
             .unwrap();
         assert!(wrote, "a real address must still be recorded");
+    }
+
+    /// **A key this build does not know survives a load and a save.** The
+    /// peers file has writers at different versions (the `tcr` inside
+    /// TcrBar, the one on `PATH`, the server), and a newer one's setting must
+    /// not be erased by an older one's read/modify/write.
+    ///
+    /// Watch it fail by turning `PeerFile::rest`'s `#[serde(flatten)]` into
+    /// `#[serde(skip)]`: the save then writes no `futureSetting` and the
+    /// first assertion fails with `left: Null, right: "app"`.
+    #[test]
+    fn a_key_this_build_does_not_know_survives_a_load_and_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tcr-peers.json");
+        crate::config::write_atomic(
+            &path,
+            r#"{"discovery": true, "futureSetting": "app", "futureObject": {"n": 3}}"#,
+        )
+        .unwrap();
+
+        let mut file = read_or_default(&path).unwrap();
+        assert!(file.discovery, "a known key still reads as itself");
+        file.announce_name = true;
+        save(&path, &file).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written["futureSetting"], "app",
+            "an unknown key must be written back unchanged: {written}"
+        );
+        assert_eq!(
+            written["futureObject"]["n"], 3,
+            "nested values too: {written}"
+        );
+        assert_eq!(
+            written["announceName"], true,
+            "the edit itself landed: {written}"
+        );
+        assert_eq!(written["discovery"], true);
+        assert!(
+            written.get("rest").is_none(),
+            "the map is flattened, never nested under its field name: {written}"
+        );
     }
 }
