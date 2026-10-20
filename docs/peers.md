@@ -365,7 +365,11 @@ Reaching it tries a few things, in order:
   `tcr peer ls` with `tailnet` in its sources. It listens for beacons on its own tailnet address
   only, never on the LAN, and ignores any that do not come from one of your own Macs. A Mac
   heard both on the LAN and over the tailnet is one row, and Trust dials its tailnet address,
-  because that beacon is the one the Tailscale app vouches for. A paired Mac reached over its
+  because that beacon is the one the Tailscale app vouches for. Trust works over the tailnet
+  because, in app mode, a knock and a first pairing from a tailnet address are answered when
+  they come from one of your own Macs and arrive on this Mac's own tailnet address. Everyone
+  else on the tailnet, a coworker on a shared company tailnet included, still gets nothing back,
+  and the six digits on both screens still decide. A paired Mac reached over its
   tailnet address shows `direct` or `relayed` (through a Tailscale relay, slower) in
   `tcr peer status --json`. `tcr peer reach` prints what the running `tcr` last read.
 - **A fallback port that changes with the clock, for the dialling side only.** If
