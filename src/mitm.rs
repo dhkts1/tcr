@@ -1177,9 +1177,14 @@ where
     // did not have while it was h1-only, where concurrency was bounded by the
     // client's connection count instead. Left at hyper's default deliberately;
     // raise it with `.http2().max_concurrent_streams(n)` if a client ever hits it.
+    //
+    // `_with_upgrades` so a local route may answer `101` and take the socket:
+    // `/_tcr/peer/dial` (`proxy::peer_dial_handler`) is the one that does. A
+    // request no handler upgrades is served exactly as before, because hyper
+    // only hands the socket over when the response is a `101`.
     if let Err(err) =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-            .serve_connection(hyper_util::rt::TokioIo::new(io), service)
+            .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(io), service)
             .await
     {
         tracing::debug!(error = %err, "http connection error");

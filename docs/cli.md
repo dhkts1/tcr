@@ -3274,6 +3274,15 @@ to record `nodeReleased` (every device from the node's keys shut down), then del
 command fails. tcr cannot log a node out of the tailnet itself, so the machine stays in the
 Tailscale admin console until it is removed there.
 
+In node mode this Mac has no `utun` interface for a tailnet address, so the kernel cannot reach
+one. The running `tcr` dials those through its node: its own peer dials, and, for the knock,
+the first pairing and `tcr peer join` (which run in the CLI), through a local route,
+`POST /_tcr/peer/dial` with `Upgrade: tcr-peer-dial`, behind the same gate as every `/_tcr/`
+route. The route dials only tailnet addresses, only through the node, and answers `409` in a
+`tcr` running no node. `tcr peer invite` and `tcr peer moved mint` put the node's address first
+in the key (`tailnet-node`), read off the state file the running `tcr` writes, and the node's
+address is advertised to pinned Macs beside the router mapping.
+
 `--json` prints the setting and what the running `tcr` recorded, and never runs the app:
 
 ```json

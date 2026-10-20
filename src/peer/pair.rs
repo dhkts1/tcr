@@ -58,7 +58,7 @@
 //! kept for [`pairing_window`]'s own test coverage rather than deleted, which
 //! is out of scope here.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -107,6 +107,11 @@ pub enum DialAddressKind {
     /// `100.64.0.0/10`. First, because it works from any network the friend is
     /// on without a router forwarding anything.
     Tailscale,
+    /// The address of tcr's own tailnet node, as the serving process
+    /// recorded it (`crate::peer::tailnet_node`): there is no `utun` for it,
+    /// so it is read off the state file rather than an interface. First, for
+    /// the reason [`Self::Tailscale`] is.
+    TailnetNode,
     /// The external socket a held port mapping published, which is the one
     /// address a friend anywhere on the internet can open.
     Internet,
@@ -126,6 +131,7 @@ impl DialAddressKind {
         match self {
             Self::Chosen => "chosen",
             Self::Tailscale => "tailscale",
+            Self::TailnetNode => "tailnet-node",
             Self::Internet => "internet",
             Self::Lan => "lan",
             Self::FromKey => "from-key",
@@ -550,8 +556,8 @@ fn is_tailnet(host: &HostAddress) -> bool {
 /// The rank is the order a dial should try, and each band is there because a
 /// different friend is on the other end:
 ///
-/// 1. the tailnet address, which works from any network without a router
-///    forwarding anything,
+/// 1. the tailnet address (tcr's own node's, `node`, then any `utun` one), which
+///    works from any network without a router forwarding anything,
 /// 2. the external socket a held port mapping published, the one address a
 ///    friend anywhere on the internet can open,
 /// 3. every address a real interface holds, for the friend in the next room.
@@ -567,6 +573,7 @@ pub fn dial_addresses(
     listen: SocketAddr,
     host: &[HostAddress],
     external: Option<SocketAddr>,
+    node: Option<Ipv4Addr>,
 ) -> Vec<DialAddress> {
     if listen.port() == 0 {
         return Vec::new();
@@ -590,6 +597,14 @@ pub fn dial_addresses(
         out.push(DialAddress { addr, kind });
     };
 
+    // tcr's own tailnet node listens on its address at the same port the
+    // kernel listener does (`crate::peer::tailnet_node::Supervisor`).
+    if let Some(node) = node {
+        push(
+            SocketAddr::new(IpAddr::V4(node), port),
+            DialAddressKind::TailnetNode,
+        );
+    }
     for entry in host.iter().filter(|entry| is_tailnet(entry)) {
         push(
             SocketAddr::new(entry.addr, port),
@@ -634,11 +649,20 @@ fn host_addresses() -> Vec<HostAddress> {
 /// state file a serving process's keeper wrote
 /// ([`crate::peer::reach::recorded_external_socket`]). Only a process that
 /// IS the keeper (the register is non-empty) ever needs the fallback.
-pub fn local_dial_addresses(listen: SocketAddr, external: Option<SocketAddr>) -> Vec<DialAddress> {
+///
+/// `node` is tcr's own tailnet node's address, read the same way off the state
+/// file ([`crate::peer::tailnet_node::recorded_node_address`]): the minting
+/// process holds no node of its own.
+pub fn local_dial_addresses(
+    listen: SocketAddr,
+    external: Option<SocketAddr>,
+    node: Option<Ipv4Addr>,
+) -> Vec<DialAddress> {
     dial_addresses(
         listen,
         &host_addresses(),
         external.or_else(crate::peer::reach::external_socket),
+        node,
     )
 }
 
@@ -693,7 +717,11 @@ pub fn mint_invite_as(
     };
     // Derived BEFORE the invite row is written: a mint that is going to refuse
     // must not leave a live PSK on disk behind it.
-    let addrs = local_dial_addresses(listen, external);
+    let node_address = crate::peer::tailnet_node::recorded_node_address(
+        &crate::peer::serve::peer_state_path(store.path()),
+        now_ms(),
+    );
+    let addrs = local_dial_addresses(listen, external, node_address);
     if addrs.is_empty() {
         bail!(
             "peer invite: this Mac listens on {listen} and holds no address a friend could \
@@ -924,7 +952,7 @@ pub async fn join_as(
 ) -> Result<Joined> {
     let label = sanitize_label(label).map_err(|refusal| anyhow!("peer join: {refusal}"))?;
 
-    let (addr, mut stream) = connect_in_key_order(token).await?;
+    let (addr, mut stream) = connect_in_key_order(store.path(), token).await?;
     let mut session = noise::dial_handshake(
         &mut stream,
         node.secret_bytes(),
@@ -1075,10 +1103,13 @@ pub async fn join_as(
 ///
 /// Every refusal is kept and named in the error, because "nothing answered" with
 /// no list is the sentence that made the last version of this bug invisible.
-async fn connect_in_key_order(token: &JoinToken) -> Result<(SocketAddr, tokio::net::TcpStream)> {
+async fn connect_in_key_order(
+    peers_path: &Path,
+    token: &JoinToken,
+) -> Result<(SocketAddr, crate::peer::serve::PeerStream)> {
     let mut refusals: Vec<String> = Vec::new();
     for addr in token.sockets() {
-        match tokio::net::TcpStream::connect(addr).await {
+        match crate::peer::tailnet_node::dial_for_cli(peers_path, addr).await {
             Ok(stream) => {
                 if !refusals.is_empty() {
                     tracing::debug!(
@@ -1089,7 +1120,7 @@ async fn connect_in_key_order(token: &JoinToken) -> Result<(SocketAddr, tokio::n
                 }
                 return Ok((addr, stream));
             }
-            Err(err) => refusals.push(format!("{addr} ({err})")),
+            Err(err) => refusals.push(format!("{addr} ({err:#})")),
         }
     }
     bail!(
@@ -1140,7 +1171,7 @@ fn could_not_reach(addr: SocketAddr) -> String {
 pub async fn knock(store: &PeerStore, addr: SocketAddr, proposed_name: &str) -> Result<()> {
     let file = read_or_default(store.path())?;
     let name = sanitize_label(proposed_name).ok();
-    let mut stream = tokio::net::TcpStream::connect(addr)
+    let mut stream = crate::peer::tailnet_node::dial_for_cli(store.path(), addr)
         .await
         .with_context(|| could_not_reach(addr))?;
     noise::send_knock(
@@ -1271,27 +1302,28 @@ impl PairEvent {
 /// that is the value the far side's window is keyed to
 /// ([`crate::peer::state::PeerState::accepted_window`]).
 ///
-/// The store is the skeleton's parameter and phase two has nothing to ask it: a
-/// first pairing is by definition a key nothing has pinned, so there is no row
-/// to read, and the write is [`confirm`]'s once the operator has compared the
-/// digits. Kept rather than re-signed, and named `_store` rather than discarded
-/// with a `let _`. Reported to the lead.
-pub async fn pair(_store: &PeerStore, addr: SocketAddr) -> Result<PendingPair> {
+/// The store is read for one thing, its path: whether this Mac is in tailnet
+/// node mode, which decides how `addr` is dialled
+/// ([`crate::peer::tailnet_node::dial_for_cli`]). A first pairing is by
+/// definition a key nothing has pinned, so there is no row to read, and the
+/// write is [`confirm`]'s once the operator has compared the digits.
+pub async fn pair(store: &PeerStore, addr: SocketAddr) -> Result<PendingPair> {
     let node = NodeKey::load_or_mint(&default_config_dir())
         .context("peer pair: this node has no keypair to pair with")?;
     let instance = crate::peer::id::boot_instance_id();
     let deadline = std::time::Instant::now() + PAIR_WAIT;
 
     loop {
-        let refusal = match dial_first_pairing(addr, node.secret_bytes(), &instance).await {
-            Ok(session) => {
-                return Ok(PendingPair {
-                    peer: session.peer,
-                    code: session.code,
-                });
-            }
-            Err(err) => err,
-        };
+        let refusal =
+            match dial_first_pairing(store.path(), addr, node.secret_bytes(), &instance).await {
+                Ok(session) => {
+                    return Ok(PendingPair {
+                        peer: session.peer,
+                        code: session.code,
+                    });
+                }
+                Err(err) => err,
+            };
         if std::time::Instant::now() >= deadline {
             return Err(refusal.context(format!(
                 "peer pair: {addr} did not accept a first pairing within {} seconds. That is \
@@ -1308,11 +1340,12 @@ pub async fn pair(_store: &PeerStore, addr: SocketAddr) -> Result<PendingPair> {
 /// One `XX` attempt. Split out so [`pair`]'s retry loop reads as a loop and not
 /// as a handshake.
 async fn dial_first_pairing(
+    peers_path: &Path,
     addr: SocketAddr,
     secret: &[u8; KEY_BYTES],
     instance: &tcr_peer_wire::InstanceId,
 ) -> Result<noise::PeerSession> {
-    let mut stream = tokio::net::TcpStream::connect(addr)
+    let mut stream = crate::peer::tailnet_node::dial_for_cli(peers_path, addr)
         .await
         .with_context(|| could_not_reach(addr))?;
     noise::dial_handshake_with_payload(
@@ -1912,7 +1945,7 @@ mod tests {
     /// put `0.0.0.0` in a key, because the friend then dials their own machine.
     #[test]
     fn a_wide_listener_never_yields_an_unspecified_address() {
-        let addrs = dial_addresses(wide(), &[host("en0", "192.0.2.10")], None);
+        let addrs = dial_addresses(wide(), &[host("en0", "192.0.2.10")], None, None);
         assert_eq!(
             addrs,
             vec![DialAddress {
@@ -1935,6 +1968,7 @@ mod tests {
             socket("192.0.2.10:7755"),
             &[host("en0", "198.51.100.4"), host("utun4", "100.64.0.1")],
             Some(socket("198.51.100.9:41641")),
+            Some(Ipv4Addr::new(100, 64, 0, 7)),
         );
         assert_eq!(
             addrs,
@@ -1961,6 +1995,7 @@ mod tests {
                 host("en0", "2001:db8::4"),
             ],
             Some(socket("198.51.100.9:41641")),
+            None,
         );
         assert_eq!(
             addrs
@@ -1978,12 +2013,36 @@ mod tests {
         );
     }
 
+    /// **tcr's own tailnet node's address ranks first**, ahead of a `utun`
+    /// tailnet address, the mapping and the LAN, at the listener's port.
+    #[test]
+    fn the_node_address_ranks_first() {
+        let addrs = dial_addresses(
+            wide(),
+            &[host("en0", "192.0.2.10"), host("utun4", "100.64.0.1")],
+            Some(socket("198.51.100.9:41641")),
+            Some(Ipv4Addr::new(100, 64, 0, 7)),
+        );
+        assert_eq!(
+            addrs
+                .iter()
+                .map(|entry| (entry.kind, entry.addr.to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                (DialAddressKind::TailnetNode, "100.64.0.7:7755".to_string()),
+                (DialAddressKind::Tailscale, "100.64.0.1:7755".to_string()),
+                (DialAddressKind::Internet, "198.51.100.9:41641".to_string()),
+                (DialAddressKind::Lan, "192.0.2.10:7755".to_string()),
+            ]
+        );
+    }
+
     /// The range alone is not the tailnet test: a tethered Mac holds a
     /// carrier-NAT address on a real interface, and ranking that first would
     /// put the deadest address at the top of the key.
     #[test]
     fn a_hotspot_address_is_not_ranked_as_a_tailnet_one() {
-        let addrs = dial_addresses(wide(), &[host("en0", "100.64.0.5")], None);
+        let addrs = dial_addresses(wide(), &[host("en0", "100.64.0.5")], None, None);
         assert_eq!(
             addrs,
             vec![DialAddress {
@@ -2002,6 +2061,7 @@ mod tests {
                 SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0),
                 &[host("en0", "192.0.2.10")],
                 None,
+                None,
             )
             .is_empty()
         );
@@ -2014,6 +2074,7 @@ mod tests {
         let addrs = dial_addresses(
             wide(),
             &[host("en0", "192.0.2.10"), host("bridge0", "192.0.2.10")],
+            None,
             None,
         );
         assert_eq!(
@@ -2176,6 +2237,60 @@ mod tests {
     /// because a real interface list is not this test's to control: a Mac
     /// running Tailscale ranks its tailnet address first regardless, by
     /// [`dial_addresses`]'s own documented order.
+    /// **An invite minted on a Mac in node mode lists the node's address
+    /// first**, read off the state file the serving process wrote, and an
+    /// invite minted with no fresh node record carries none.
+    ///
+    /// Watch it fail by passing `None` for the node in `mint_invite_as`: the
+    /// first address is then an interface's, not `100.64.0.7`.
+    #[test]
+    fn an_invite_minted_in_node_mode_lists_the_node_address_first() {
+        let dir = tempfile::TempDir::new().expect("a scratch dir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        let file = PeerFile {
+            listen: Some(socket("0.0.0.0:7755")),
+            tailnet: crate::peer::config::TailnetMode::Node,
+            ..PeerFile::default()
+        };
+        save(&peers_path, &file).expect("the peers file writes");
+        let store = PeerStore::open(&peers_path).expect("the store opens");
+        let node = NodeKey::load_or_mint(dir.path()).expect("a node key");
+
+        let (_invite, token) =
+            mint_invite_as(&store, &node, "laptop-2", 600, 1, None).expect("an invite");
+        assert!(
+            token
+                .addrs
+                .iter()
+                .all(|entry| entry.kind != DialAddressKind::TailnetNode),
+            "no record, no node address: {:?}",
+            token.addrs
+        );
+
+        crate::peer::state::save_tailnet(
+            &crate::peer::serve::peer_state_path(&peers_path),
+            crate::peer::state::TailnetRecord {
+                mode: crate::peer::config::TailnetMode::Node,
+                state: crate::peer::state::TailnetState::Ready,
+                address: Some(Ipv4Addr::new(100, 64, 0, 7)),
+                node_name: Some("tcr-studio".to_string()),
+                found: 0,
+                connected: 0,
+                detail: None,
+                recorded_at_ms: now_ms(),
+            },
+        )
+        .expect("the record writes");
+        let (_invite, token) =
+            mint_invite_as(&store, &node, "laptop-3", 600, 1, None).expect("an invite");
+        assert_eq!(
+            token.addrs.first().map(|entry| (entry.kind, entry.addr)),
+            Some((DialAddressKind::TailnetNode, socket("100.64.0.7:7755"))),
+            "{:?}",
+            token.addrs
+        );
+    }
+
     #[test]
     fn mint_invite_carries_a_handed_in_mapping_as_an_internet_entry() {
         let dir = tempfile::TempDir::new().expect("a scratch dir");
