@@ -1,0 +1,48 @@
+name: Pages
+
+# Publishes docs/site/ to https://dhkts1.github.io/tcr/.
+#
+# WHY A WORKFLOW AND NOT THE gh-pages BRANCH. The gh-pages branch is the TcrBar update
+# feed: SUFeedURL reads raw.githubusercontent.com/dhkts1/tcr/gh-pages/appcast.xml
+# (apps/macos/scripts/build-tcrbar.sh), and apps/macos/scripts/publish-appcast-feed.sh
+# rewrites that branch as a ONE-FILE tree on every release. A site committed there would
+# be deleted by the next release. Deploying from an artifact keeps the two apart: this
+# workflow never touches gh-pages, and the feed publisher never touches the site.
+#
+# The repository's Pages source must be "GitHub Actions" (build_type=workflow) for the
+# deploy step to succeed.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/site/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/site
+      - id: deployment
+        uses: actions/deploy-pages@v5
