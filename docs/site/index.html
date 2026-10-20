@@ -235,7 +235,7 @@ p code,li code,td code,summary code{font-size:.875em;background:var(--panel);box
 
 /* Comparison table */
 .tablewrap{overflow-x:auto;border-radius:18px;border:1px solid var(--hair);background:var(--card);scrollbar-width:thin}
-table{border-collapse:separate;border-spacing:0;width:100%;min-width:920px;font-size:.875rem}
+table{border-collapse:separate;border-spacing:0;width:100%;min-width:1080px;font-size:.875rem}
 th,td{text-align:left;vertical-align:top;padding:14px 16px;border-bottom:1px solid var(--hair)}
 thead th{font-size:.75rem;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);font-weight:650;background:var(--panel);position:sticky;top:0}
 tbody tr:last-child td,tbody tr:last-child th{border-bottom:0}
@@ -246,6 +246,25 @@ td{color:var(--dim)}
 tr.us th,tr.us td{background:color-mix(in srgb,var(--ok) 7%,var(--card));color:var(--ink)}
 tr.us th{box-shadow:inset 3px 0 0 var(--ok)}
 .note{margin-top:16px;color:var(--faint);font-size:.875rem;max-width:760px;text-wrap:pretty}
+.note b{color:var(--dim);font-weight:600}
+td.cost{white-space:nowrap}
+td.cost b{color:var(--ink);font-weight:650;font-variant-numeric:tabular-nums}
+tr.us td.cost b{color:var(--ok)}
+.perf{margin-top:clamp(40px,6vw,64px);scroll-margin-top:80px}
+.perf h3{font-size:clamp(1.25rem,1.1rem + .6vw,1.5rem);letter-spacing:-.02em}
+.perf-lead{margin-top:10px;color:var(--dim);max-width:760px;font-size:1.0625rem;text-wrap:pretty}
+.charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:24px}
+@media (max-width:760px){.charts{grid-template-columns:1fr}}
+.chart{margin:0;padding:20px 22px;border-radius:18px;background:var(--card);box-shadow:0 0 0 1px var(--hair) inset;display:grid;gap:10px}
+.chart figcaption{font-weight:650;font-size:.9375rem;margin-bottom:4px}
+.chart figcaption span{color:var(--faint);font-weight:500;margin-left:6px}
+.crow{display:grid;grid-template-columns:96px minmax(0,1fr) 72px;align-items:center;gap:12px;font-size:.875rem}
+.crow .cn{color:var(--dim)}
+.crow .ct{height:10px;border-radius:5px;background:var(--track);overflow:hidden}
+.crow .ct span{display:block;height:100%;width:var(--w);min-width:4px;border-radius:5px;background:var(--hair2)}
+.crow .cv{text-align:right;font-variant-numeric:tabular-nums;color:var(--dim)}
+.crow.us .cn,.crow.us .cv{color:var(--ink);font-weight:650}
+.crow.us .ct span{background:var(--ok)}
 .fit{margin-top:24px;max-width:760px;color:var(--dim);text-wrap:pretty}
 
 /* FAQ */
@@ -548,20 +567,57 @@ footer .wrap{display:grid;gap:18px}
     <div class="tablewrap" tabindex="0" role="region" aria-label="Comparison table, scrolls sideways">
       <table>
         <thead>
-          <tr><th scope="col">Tool</th><th scope="col">How it switches</th><th scope="col">How it picks an account</th><th scope="col">Keeps each conversation on one account</th><th scope="col">Runs on</th><th scope="col">License</th></tr>
+          <tr><th scope="col">Tool</th><th scope="col">How it switches</th><th scope="col">How it picks an account</th><th scope="col">Keeps each conversation on one account</th><th scope="col">Added to a 2 MB request</th><th scope="col">Runs on</th><th scope="col">License</th></tr>
         </thead>
         <tbody>
-          <tr class="us"><th scope="row">tcr</th><td>Local proxy in the request path</td><td>Every request, by what is left in the five-hour, weekly and per-model weekly windows</td><td>Yes, always; moves only when that account cannot serve</td><td>macOS, Linux</td><td>PolyForm Noncommercial</td></tr>
-          <tr><th scope="row"><a href="https://github.com/realiti4/claude-swap">claude-swap</a></th><td>Swaps Claude Code's stored login, for the whole machine or one terminal</td><td>By hand, next in turn, or automatically at a five-hour or seven-day threshold</td><td>Per terminal with <code>cswap run</code>; a switch moves the running session, which its README says rebuilds the cache</td><td>macOS, Linux, Windows</td><td>MIT</td></tr>
-          <tr><th scope="row"><a href="https://github.com/KarpelesLab/teamclaude">teamclaude</a></th><td>Local proxy in the request path</td><td>Rotates when the five-hour or weekly window reaches a threshold, and tracks the per-model weekly cap</td><td>Opt-in with <code>distributeSessions</code>, off by default</td><td>Node.js 20+</td><td>MIT</td></tr>
-          <tr><th scope="row"><a href="https://github.com/kaitranntt/ccs">ccs</a></th><td>Launches Claude Code with a chosen profile; account pools go through a local proxy</td><td>Profile chosen at launch; the proxy rotates round-robin by default, or fills one account first with pool routing on</td><td>Opt-in: <a href="https://docs.ccs.kaitran.ca/features/pool">pool routing</a> holds a conversation on one account for up to an hour</td><td>macOS, Linux, Windows</td><td>MIT</td></tr>
-          <tr><th scope="row"><a href="https://github.com/nguyenphutrong/quotio">Quotio</a></th><td>macOS app that manages a local proxy (CLIProxyAPI)</td><td>Round-robin or fill-first</td><td>Not stated in its README</td><td>macOS app; CLI on macOS and Linux</td><td>MIT</td></tr>
-          <tr><th scope="row"><a href="https://github.com/inulute/cux">cux</a></th><td>Swaps the login, restarts Claude Code and resumes the conversation</td><td>On a rate limit by default, with optional five-hour and seven-day thresholds</td><td>No: moving the conversation is how it works</td><td>Linux, macOS, Windows</td><td>GPL-3.0</td></tr>
-          <tr><th scope="row"><a href="https://github.com/ming86/cc-account-switcher">cc-account-switcher</a></th><td>Swaps the stored login while Claude Code is closed</td><td>By hand</td><td>Not stated in its README</td><td>macOS, Linux, WSL</td><td>MIT</td></tr>
+          <tr class="us"><th scope="row">tcr</th><td>Local proxy in the request path</td><td>Every request, by what is left in the five-hour, weekly and per-model weekly windows</td><td>Yes, always; moves only when that account cannot serve</td><td class="cost"><b>4 ms</b>, 3 ms CPU</td><td>macOS, Linux</td><td>PolyForm Noncommercial</td></tr>
+          <tr><th scope="row"><a href="https://github.com/realiti4/claude-swap">claude-swap</a></th><td>Swaps Claude Code's stored login, for the whole machine or one terminal</td><td>By hand, next in turn, or automatically at a five-hour or seven-day threshold</td><td>Per terminal with <code>cswap run</code>; a switch moves the running session, which its README says rebuilds the cache</td><td class="cost">Not in the request path</td><td>macOS, Linux, Windows</td><td>MIT</td></tr>
+          <tr><th scope="row"><a href="https://github.com/KarpelesLab/teamclaude">teamclaude</a></th><td>Local proxy in the request path</td><td>Rotates when the five-hour or weekly window reaches a threshold, and tracks the per-model weekly cap</td><td>Opt-in with <code>distributeSessions</code>, off by default</td><td class="cost"><b>44 ms</b>, 13 ms CPU</td><td>Node.js 20+</td><td>MIT</td></tr>
+          <tr><th scope="row"><a href="https://github.com/kaitranntt/ccs">ccs</a></th><td>Launches Claude Code with a chosen profile; account pools go through a local proxy</td><td>Profile chosen at launch; the proxy rotates round-robin by default, or fills one account first with pool routing on</td><td>Opt-in: <a href="https://docs.ccs.kaitran.ca/features/pool">pool routing</a> holds a conversation on one account for up to an hour</td><td class="cost"><b>157 ms</b>, 125 ms CPU, with an account pool</td><td>macOS, Linux, Windows</td><td>MIT</td></tr>
+          <tr><th scope="row"><a href="https://github.com/nguyenphutrong/quotio">Quotio</a></th><td>macOS app that manages a local proxy (CLIProxyAPI)</td><td>Round-robin or fill-first</td><td>Not stated in its README</td><td class="cost"><b>170 ms</b>, 118 ms CPU, in its CLIProxyAPI</td><td>macOS app; CLI on macOS and Linux</td><td>MIT</td></tr>
+          <tr><th scope="row"><a href="https://github.com/inulute/cux">cux</a></th><td>Swaps the login, restarts Claude Code and resumes the conversation</td><td>On a rate limit by default, with optional five-hour and seven-day thresholds</td><td>No: moving the conversation is how it works</td><td class="cost">Not in the request path</td><td>Linux, macOS, Windows</td><td>GPL-3.0</td></tr>
+          <tr><th scope="row"><a href="https://github.com/ming86/cc-account-switcher">cc-account-switcher</a></th><td>Swaps the stored login while Claude Code is closed</td><td>By hand</td><td>Not stated in its README</td><td class="cost">Not in the request path</td><td>macOS, Linux, WSL</td><td>MIT</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="note">Each row comes from that project's own README and docs, read on 2026-10-13. "Not stated" means its README does not say, not that the tool cannot.</p>
+    <p class="note">Each row comes from that project's own README and docs, read on 2026-10-13. "Not stated" means its README does not say, not that the tool cannot. The "added" column is measured; how is below.</p>
+
+    <div class="perf" id="performance">
+      <h3>Measured: what each proxy costs</h3>
+      <p class="perf-lead">On a 2 MB request, tcr adds 4 ms. The other proxies add 44 to 170 ms and use 4 to 42 times the CPU. Long Claude Code conversations send requests of several megabytes, and every one of them pays this.</p>
+      <div class="charts">
+        <figure class="chart">
+          <figcaption>Added latency, 2 MB request <span>median</span></figcaption>
+          <div class="crow us"><span class="cn">tcr</span><span class="ct"><span style="--w:2.4%"></span></span><span class="cv">4 ms</span></div>
+          <div class="crow"><span class="cn">teamclaude</span><span class="ct"><span style="--w:26%"></span></span><span class="cv">44 ms</span></div>
+          <div class="crow"><span class="cn">ccs</span><span class="ct"><span style="--w:92.2%"></span></span><span class="cv">157 ms</span></div>
+          <div class="crow"><span class="cn">CLIProxyAPI</span><span class="ct"><span style="--w:100%"></span></span><span class="cv">170 ms</span></div>
+        </figure>
+        <figure class="chart">
+          <figcaption>CPU time per 1,000 requests of 2 MB</figcaption>
+          <div class="crow us"><span class="cn">tcr</span><span class="ct"><span style="--w:2.4%"></span></span><span class="cv">3.0 s</span></div>
+          <div class="crow"><span class="cn">teamclaude</span><span class="ct"><span style="--w:10.2%"></span></span><span class="cv">12.8 s</span></div>
+          <div class="crow"><span class="cn">CLIProxyAPI</span><span class="ct"><span style="--w:94.2%"></span></span><span class="cv">117.6 s</span></div>
+          <div class="crow"><span class="cn">ccs</span><span class="ct"><span style="--w:100%"></span></span><span class="cv">124.9 s</span></div>
+        </figure>
+        <figure class="chart">
+          <figcaption>Memory while serving 2 MB requests <span>median peak</span></figcaption>
+          <div class="crow us"><span class="cn">tcr</span><span class="ct"><span style="--w:13.3%"></span></span><span class="cv">80 MB</span></div>
+          <div class="crow"><span class="cn">CLIProxyAPI</span><span class="ct"><span style="--w:28.6%"></span></span><span class="cv">172 MB</span></div>
+          <div class="crow"><span class="cn">teamclaude</span><span class="ct"><span style="--w:65.7%"></span></span><span class="cv">395 MB</span></div>
+          <div class="crow"><span class="cn">ccs</span><span class="ct"><span style="--w:100%"></span></span><span class="cv">601 MB</span></div>
+        </figure>
+        <figure class="chart">
+          <figcaption>Memory at idle</figcaption>
+          <div class="crow us"><span class="cn">tcr</span><span class="ct"><span style="--w:18.1%"></span></span><span class="cv">21 MB</span></div>
+          <div class="crow"><span class="cn">CLIProxyAPI</span><span class="ct"><span style="--w:42%"></span></span><span class="cv">48 MB</span></div>
+          <div class="crow"><span class="cn">teamclaude</span><span class="ct"><span style="--w:69.5%"></span></span><span class="cv">80 MB</span></div>
+          <div class="crow"><span class="cn">ccs</span><span class="ct"><span style="--w:100%"></span></span><span class="cv">115 MB</span></div>
+        </figure>
+      </div>
+      <p class="note"><b>Where they tie.</b> With a 10 KB request every proxy adds under 4 ms at the median, and tcr and CLIProxyAPI start up in about the same time. claude-swap, cux and cc-account-switcher add nothing per request because they are not in the request path; their cost comes at each switch, when the conversation's cached prefix is written again.</p>
+      <p class="note"><b>How it was measured.</b> 2026-10-20, on one 14-core Apple silicon Mac: tcr 1.2.14, teamclaude 1.1.25, CLIProxyAPI 8.0.35 (the proxy Quotio runs) and ccs 8.10.0 with its account pool, each against the same local stand-in for Anthropic's API, 2,400 streamed requests per tool and size, every response checked. The machine was busy (load average 136 to 232), so read the latency as an order rather than an exact figure; CPU agreed within 4% across two passes and memory within about 15%. CLIProxyAPI ran with API keys aimed at the stand-in, because its Claude logins cannot be pointed at another host.</p>
+    </div>
     <p class="fit">Another tool fits better if you need Windows (claude-swap, ccs, cux), want Gemini or other providers behind the same tool (teamclaude, ccs, Quotio), want no proxy in the request path (claude-swap, cux, cc-account-switcher), or need an open-source license for commercial use (every other row). Moving from claude-swap, Quotio, ccs or CLIProxyAPI? <code>tcr import</code> lists the logins they hold.</p>
   </div>
 </section>
