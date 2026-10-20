@@ -544,6 +544,14 @@ fn be_u32(bytes: &[u8], offset: usize) -> Result<u32, ReachError> {
     Ok(u32::from_be_bytes(quad))
 }
 
+/// This Mac's default gateway, or `None` when it has none or it could not be
+/// read: the network-change signal tcr's own tailnet node
+/// (`crate::peer::tailnet_node`) shares with the mapping keeper. Blocking: it
+/// runs a route tool on macOS.
+pub fn default_gateway_ipv4() -> Option<Ipv4Addr> {
+    default_gateway().ok()
+}
+
 /// This machine's default IPv4 gateway.
 ///
 /// Two sources, in this order, because on this box the first one alone finds

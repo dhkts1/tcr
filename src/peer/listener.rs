@@ -497,53 +497,69 @@ async fn accept_peer_connections(listener: TcpListener, context: SessionContext)
                 None
             }
         };
-        let context = context.clone();
-        tokio::spawn(async move {
-            let addr = knock_address(&from);
-            if let Err(failure) = serve_connection(stream, &context, &from, bind, accepted_on).await
-            {
-                // Every refusal closes the connection and logs. There is no
-                // arm that answers the peer: what this node will say to a
-                // stranger is nothing at all.
-                //
-                // **Both paths are bounded, and by the same type from two
-                // instances.** An earlier build logged every AUTHENTICATED failure
-                // unconditionally on the reasoning that a pinned peer's stream
-                // ending is always worth a line, which is true of the first
-                // one and false of the thousandth: a pinned peer in a reconnect
-                // loop is a pinned peer filling a disk, and `tcr peer forget`
-                // is not the remedy an operator reaches for when the log is
-                // what is broken. Two instances rather than one so that a flood
-                // of anonymous refusals cannot silence a real peer's first
-                // line.
-                let mut guard = lock_admission(&context.admission);
-                let log = if failure.authenticated {
-                    &mut guard.authenticated_refusals
-                } else {
-                    &mut guard.unauthenticated_refusals
-                };
-                let admitted = log.admit(&addr, now_ms());
-                drop(guard);
-                let Some(suppressed) = admitted else {
-                    return;
-                };
-                if failure.authenticated {
-                    tracing::warn!(
-                        peer_addr = %from,
-                        error = %failure.error,
-                        suppressed,
-                        "peer connection closed"
-                    );
-                } else {
-                    tracing::warn!(
-                        peer_addr = %from,
-                        error = %failure.error,
-                        suppressed,
-                        "peer connection refused before it authenticated"
-                    );
-                }
-            }
-        });
+        tokio::spawn(serve_one(stream, context.clone(), from, bind, accepted_on));
+    }
+}
+
+/// Serve one accepted connection to its end, logging how it ended under the
+/// same bounds the accept loop uses.
+///
+/// What the accept loop spawns per connection, and public so a second accept
+/// loop (tcr's own tailnet node, [`crate::peer::tailnet_node`]) feeds the
+/// same code rather than a copy of it: the same admission, the same bounded
+/// refusal log, with `from`, `bind` and `accepted_on` (the address the
+/// connection was sent to) taken off whatever socket it accepted.
+pub async fn serve_one<S>(
+    stream: S,
+    context: SessionContext,
+    from: SocketAddr,
+    bind: SocketAddr,
+    accepted_on: Option<SocketAddr>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let addr = knock_address(&from);
+    if let Err(failure) = serve_connection(stream, &context, &from, bind, accepted_on).await {
+        // Every refusal closes the connection and logs. There is no
+        // arm that answers the peer: what this node will say to a
+        // stranger is nothing at all.
+        //
+        // **Both paths are bounded, and by the same type from two
+        // instances.** An earlier build logged every AUTHENTICATED failure
+        // unconditionally on the reasoning that a pinned peer's stream
+        // ending is always worth a line, which is true of the first
+        // one and false of the thousandth: a pinned peer in a reconnect
+        // loop is a pinned peer filling a disk, and `tcr peer forget`
+        // is not the remedy an operator reaches for when the log is
+        // what is broken. Two instances rather than one so that a flood
+        // of anonymous refusals cannot silence a real peer's first
+        // line.
+        let mut guard = lock_admission(&context.admission);
+        let log = if failure.authenticated {
+            &mut guard.authenticated_refusals
+        } else {
+            &mut guard.unauthenticated_refusals
+        };
+        let admitted = log.admit(&addr, now_ms());
+        drop(guard);
+        let Some(suppressed) = admitted else {
+            return;
+        };
+        if failure.authenticated {
+            tracing::warn!(
+                peer_addr = %from,
+                error = %failure.error,
+                suppressed,
+                "peer connection closed"
+            );
+        } else {
+            tracing::warn!(
+                peer_addr = %from,
+                error = %failure.error,
+                suppressed,
+                "peer connection refused before it authenticated"
+            );
+        }
     }
 }
 

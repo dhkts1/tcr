@@ -420,6 +420,12 @@ pub enum TailnetState {
     NodeConnecting,
     /// The mode is `node` but this binary lacks the `tailnet-node` feature.
     NodeUnsupported,
+    /// The mode left `node` and the serving process has shut down every
+    /// device built from the node's keys. Written once, by tcr's own tailnet
+    /// node's supervisor (`crate::peer::tailnet_node`) and by nothing else, so
+    /// `tcr peer tailnet leave` can wait for exactly this before it deletes
+    /// the key file. `mode` says the mode it left `node` for.
+    NodeReleased,
     /// A record with no state, or a state word this build does not know
     /// (a newer server wrote it). Never written by this build's server.
     #[default]
@@ -506,7 +512,7 @@ impl TailnetReport {
             .with_context(|| format!("reading {}", state_path.display()))?;
         Ok(Self {
             mode: file.tailnet,
-            node_supported: cfg!(feature = "tailnet-node"),
+            node_supported: crate::peer::tailnet_node::SUPPORTED,
             held: state.tailnet,
         })
     }
@@ -2183,7 +2189,7 @@ mod tests {
             serde_json::to_value(&report).expect("serialize"),
             serde_json::json!({
                 "mode": "app",
-                "nodeSupported": cfg!(feature = "tailnet-node"),
+                "nodeSupported": crate::peer::tailnet_node::SUPPORTED,
                 "held": null
             })
         );
@@ -2240,6 +2246,7 @@ mod tests {
             (TailnetState::NodeNotJoined, "nodeNotJoined"),
             (TailnetState::NodeConnecting, "nodeConnecting"),
             (TailnetState::NodeUnsupported, "nodeUnsupported"),
+            (TailnetState::NodeReleased, "nodeReleased"),
             (TailnetState::Unknown, "unknown"),
         ] {
             assert_eq!(

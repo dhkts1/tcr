@@ -1225,6 +1225,21 @@ async fn boot_peer_listener(
     // file this process already owns.
     spawn_browse(peers_path, &state_path, local.port(), shutdown, background);
 
+    // tcr's own tailnet node, when the mode is `node`: a second accept loop
+    // on the node's address into the same `serve_one`. Everything it does is
+    // in its own module; a build without the `tailnet-node` feature only
+    // records `nodeUnsupported` there.
+    {
+        let node = crate::peer::tailnet_node::run_in_server(
+            peers_path.to_path_buf(),
+            state_path.clone(),
+            local.port(),
+            context.clone(),
+            shutdown.subscribe(),
+        );
+        background.push(tokio::spawn(supervise("peer-tailnet-node", node)));
+    }
+
     // The path traffic summary, on its own schedule, writing what the meter
     // charged into the same state file.
     spawn_path_traffic(&state_path, shutdown, background);

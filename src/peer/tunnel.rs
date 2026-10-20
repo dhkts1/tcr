@@ -236,6 +236,8 @@ impl NoiseStream {
             // read arm is off and what is still coming back from the peer is
             // pumped until the peer closes too or this deadline passes.
             let mut draining_until: Option<tokio::time::Instant> = None;
+            // Whether this side has sent its end-of-stream frame yet.
+            let mut sent_end = false;
             let outcome = loop {
                 tokio::select! {
                     frame = frames_rx.recv() => {
@@ -248,6 +250,12 @@ impl NoiseStream {
                                  session key: {err}"
                             )),
                         };
+                        // The peer's end-of-stream frame: the same fact as its
+                        // FIN, said inside the session (see
+                        // [`send_end_of_stream`]).
+                        if len == 0 {
+                            break Ok(());
+                        }
                         out.truncate(len);
                         if plain.write_all(&out).await.is_err() {
                             // The local end went away. Not an error: it is how
@@ -272,6 +280,21 @@ impl NoiseStream {
                                 if plain.write(&[]).await.is_err() {
                                     break Ok(());
                                 }
+                                // Every data byte is already delivered, so a
+                                // frame that cannot be written (the far end
+                                // reset as this end finished) is not a failed
+                                // carry: the drain below still runs, as it did
+                                // when only the half-close could fail.
+                                if let Err(err) =
+                                    send_end_of_stream(&mut write_half, &mut session).await
+                                {
+                                    tracing::debug!(
+                                        error = %err,
+                                        "peer tunnel: the end-of-stream frame was not written; \
+                                         draining what the far end still sends"
+                                    );
+                                }
+                                sent_end = true;
                                 let _shutdown = write_half.shutdown().await;
                                 draining_until =
                                     Some(tokio::time::Instant::now() + HALF_CLOSE_DRAIN);
@@ -298,8 +321,17 @@ impl NoiseStream {
                     }
                 }
             };
-            // Half-close the socket so the far end sees the end of the stream
-            // rather than a hang, then stop the framer.
+            // Say the end of the stream, inside the session and then as a
+            // half-close, so the far end sees it rather than a hang, then stop
+            // the framer. The frame is best-effort here: the pump is ending
+            // whatever happens, often because the far end already went.
+            if !sent_end && let Err(err) = send_end_of_stream(&mut write_half, &mut session).await {
+                tracing::debug!(
+                    error = %err,
+                    "peer tunnel: the end-of-stream frame was not written; the far end learns \
+                     from the socket closing instead"
+                );
+            }
             let _shutdown = write_half.shutdown().await;
             framer.abort();
             outcome
@@ -471,6 +503,31 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
 // ---------------------------------------------------------------------------
 // The splice
 // ---------------------------------------------------------------------------
+
+/// Send this side's end of a carried stream: one encrypted frame with an
+/// empty payload.
+///
+/// # Why a frame and not only a FIN
+///
+/// The pump used to say "done" by shutting its socket's write half and
+/// nothing else. A transport with no half-close loses that: tcr's own tailnet
+/// node is one, the `tailscale` crate's `poll_shutdown` does nothing at
+/// 0.6.1, and the close it sends on drop can be lost (upstream #446). The far
+/// pump then never learns the stream ended: it waits out its own drain, or
+/// forever. Said inside the session it reaches the far pump over any
+/// transport, and the half-close still follows for every transport that has
+/// one.
+///
+/// It needs no version bump. A payload is never empty otherwise (a local read
+/// of 0 bytes is the end, not a frame), and a pump from before this change
+/// writes the empty payload to its local end as zero bytes, a no-op, then
+/// sees the FIN as it always did.
+async fn send_end_of_stream<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    session: &mut PeerSession,
+) -> Result<()> {
+    noise::send_encrypted(writer, &mut session.transport, &[]).await
+}
 
 /// Sleep until `at`, or never when there is nothing to wait for.
 ///
@@ -2265,5 +2322,119 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    use crate::peer::id::NodeKey;
+
+    /// A transport whose `poll_shutdown` does nothing, the way the `tailscale`
+    /// crate's TCP stream behaves at 0.6.1 (`stream.rs:319-336`): the far end
+    /// never sees a FIN until the whole socket is dropped.
+    struct NoHalfClose(DuplexStream);
+
+    impl AsyncRead for NoHalfClose {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for NoHalfClose {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Two ends of one Return session over a duplex pipe, neither of which
+    /// can half-close.
+    async fn pumps_with_no_half_close() -> (NoiseStream, NoiseStream) {
+        let responder_dir = tempfile::tempdir().expect("tempdir");
+        let dialler_dir = tempfile::tempdir().expect("tempdir");
+        let responder = NodeKey::load_or_mint(responder_dir.path()).expect("a responder key");
+        let dialler = NodeKey::load_or_mint(dialler_dir.path()).expect("a dialler key");
+        let responder_static = responder.id().0;
+        let pinned = dialler.id();
+        let responder_secret = *responder.secret_bytes();
+
+        let (mut near, mut far) = tokio::io::duplex(64 * 1024);
+        let accepting = tokio::spawn(async move {
+            let session = noise::accept_handshake(
+                &mut far,
+                &responder_secret,
+                noise::Handshake::Return,
+                &[],
+                move |_remote| Ok(pinned),
+            )
+            .await
+            .expect("the responder's handshake");
+            (far, session)
+        });
+        let near_session = noise::dial_handshake(
+            &mut near,
+            dialler.secret_bytes(),
+            noise::Handshake::Return,
+            Some(&responder_static),
+            None,
+        )
+        .await
+        .expect("the dialler's handshake");
+        let (far, far_session) = accepting.await.expect("the responder task");
+        (
+            NoiseStream::start(NoHalfClose(near), near_session),
+            NoiseStream::start(NoHalfClose(far), far_session),
+        )
+    }
+
+    /// **Over a transport with no half-close, the far end still sees the end
+    /// of the stream at once, and the near pump stops at once too.**
+    ///
+    /// The end-of-stream frame ([`send_end_of_stream`]) is what carries it.
+    /// Watch it fail by making the pump skip the frame (or ignore an empty
+    /// one on receipt): the far read then waits for the near pump's
+    /// [`HALF_CLOSE_DRAIN`], ten seconds, and the two-second deadline fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_end_of_a_carry_crosses_a_transport_with_no_half_close() {
+        let (mut near, mut far) = pumps_with_no_half_close().await;
+
+        near.write_all(b"hello").await.expect("write");
+        near.shutdown().await.expect("shut the near side");
+
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), far.read_to_end(&mut got))
+            .await
+            .expect("the far end sees the end of the stream, not a hang")
+            .expect("read");
+        assert_eq!(got, b"hello");
+
+        // The far pump ended on the frame and said its own end, so the near
+        // pump is not left draining for ten seconds.
+        tokio::time::timeout(Duration::from_secs(2), near.finish())
+            .await
+            .expect("the near pump stops without waiting out its drain")
+            .expect("a clean end");
+        tokio::time::timeout(Duration::from_secs(2), far.finish())
+            .await
+            .expect("the far pump stops")
+            .expect("a clean end");
     }
 }
