@@ -17,6 +17,8 @@
 #   1. install the fake tailscale, up both routers and both nodes
 #   2. on both: tcr peer tailnet app
 #   3. wait for each to list the other
+#   4. node-a1 presses Trust on node-b1's tailnet address: knock, accept,
+#      six digits on both screens
 #
 # Assertions
 #   - each node's `tcr peer ls --json` holds a found row for the other node's
@@ -24,6 +26,11 @@
 #     not "lan" (find is off)
 #   - each node's `tcr peer tailnet --json` held is app/ready, its address is
 #     its own overlay address, and found >= 1
+#   - the knock and the first pairing over the tailnet are answered (your own
+#     Mac, on this Mac's own tailnet address, in app mode) and the pairing
+#     pins
+#   - node-a1's `tcr peer status --json` row for node-b1 carries
+#     `tailnet.route = relayed` (the fake reports a relay, no direct address)
 #
 # Runs under --netlab only. The fake has to be installed at a fixed path, and
 # under --native that path is the host's own /usr/local/bin.
@@ -155,5 +162,53 @@ PY
     fail "$node: held is not app/ready at $own with found >= 1: $(cat "$held")"
   fi
 done
+
+# --- Trust over the tailnet: your own Mac may knock (Gil, 2026-10-20) --------
+# The knock and the first pairing come from a tailnet address, which the
+# listener refuses with zero bytes from anyone else. node-a1 is node-b1's own
+# Mac in the fake app's reading, and it arrives on node-b1's own tailnet
+# address, so both are answered and the six digits decide.
+if pair_nodes node-a1-overlay node-b1-overlay "$B1_OVERLAY:7755"; then
+  pass "node-a1-overlay paired with node-b1-overlay over the tailnet with the six digits"
+else
+  fail "the pairing over the tailnet did not complete"
+  finish
+  exit 1
+fi
+
+# The paired row on node-a1 dials node-b1's tailnet address, and the running
+# proxy's status says how the app reaches it: the fake reports a relay and no
+# direct address, so `relayed`. The first tick after the pin records it, so
+# allow one browse interval and some margin.
+status_json="$SCRATCH/a1-status.json"
+route=""
+i=0
+while [ "$i" -lt 45 ]; do
+  nx node-a1-overlay tcr peer status --config /scratch/.config/tcr.json --json > "$status_json" 2>&1 || true
+  route="$(python3 - "$status_json" "$B1_OVERLAY" <<'PY' || true
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except ValueError:
+    sys.exit(1)
+rows = doc.get("peers", doc) if isinstance(doc, dict) else doc
+for row in rows or []:
+    if str(row.get("address", "")).startswith(sys.argv[2] + ":"):
+        tailnet = row.get("tailnet")
+        if tailnet is not None:
+            print(tailnet.get("route"))
+            sys.exit(0)
+sys.exit(1)
+PY
+)"
+  [ "$route" = "relayed" ] && break
+  sleep 1
+  i=$((i + 1))
+done
+if [ "$route" = "relayed" ]; then
+  pass "node-a1-overlay's status row for node-b1 carries tailnet.route = relayed"
+else
+  fail "node-a1-overlay's status row for node-b1 has no tailnet route [$route]: $(cat "$status_json")"
+fi
 
 finish

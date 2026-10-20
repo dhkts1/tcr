@@ -48,6 +48,104 @@ pub const MAX_HEARD_PER_TICK: usize = 16;
 /// is still seen as oversized and refused.
 pub const RECEIVE_BUFFER_BYTES: usize = discovery::TAILNET_BEACON_MAX_BYTES + 1;
 
+/// How old a reading of the Tailscale app may be when a knock from one of the
+/// operator's own Macs is decided on it: one browse interval.
+pub const OWN_MAC_READING_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The last reading of the Tailscale app, shared by the browse task (which
+/// refreshes it every wake) and the peer listener (which decides an own-Mac
+/// knock on it, and re-reads when it is older than it may be).
+///
+/// A failed read is held too, for the same time: a knock arriving while the
+/// app cannot be read is refused, and a flood of them costs one CLI run per
+/// [`OWN_MAC_READING_MAX_AGE`], not one each. The lock is held across a read,
+/// so knocks that arrive together wait for one run rather than starting one
+/// apiece.
+#[derive(Debug)]
+pub struct ReadingCache {
+    held: tokio::sync::Mutex<Option<HeldReading>>,
+}
+
+type HeldReading = (
+    std::time::Instant,
+    Result<std::sync::Arc<Status>, ReadError>,
+);
+
+impl ReadingCache {
+    /// An empty cache.
+    pub const fn new() -> Self {
+        Self {
+            held: tokio::sync::Mutex::const_new(None),
+        }
+    }
+
+    /// A reading no older than `max_age`: the held one, or a fresh one from
+    /// `read`, run on a blocking thread because it starts a process.
+    pub async fn recent<F>(
+        &self,
+        max_age: std::time::Duration,
+        read: F,
+    ) -> Result<std::sync::Arc<Status>, ReadError>
+    where
+        F: FnOnce() -> Result<Status, ReadError> + Send + 'static,
+    {
+        let mut held = self.held.lock().await;
+        if let Some((at, reading)) = held.as_ref()
+            && at.elapsed() <= max_age
+        {
+            return reading.clone();
+        }
+        let fresh = read_off_runtime(read).await;
+        *held = Some((std::time::Instant::now(), fresh.clone()));
+        fresh
+    }
+
+    /// A fresh reading from `read`, held for the next caller whatever its
+    /// age limit. What the browse task calls on each wake.
+    pub async fn refresh<F>(&self, read: F) -> Result<std::sync::Arc<Status>, ReadError>
+    where
+        F: FnOnce() -> Result<Status, ReadError> + Send + 'static,
+    {
+        let mut held = self.held.lock().await;
+        let fresh = read_off_runtime(read).await;
+        *held = Some((std::time::Instant::now(), fresh.clone()));
+        fresh
+    }
+}
+
+impl Default for ReadingCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `read` on a blocking thread. A read whose thread did not finish is a
+/// failed read, logged here, never a reading.
+async fn read_off_runtime<F>(read: F) -> Result<std::sync::Arc<Status>, ReadError>
+where
+    F: FnOnce() -> Result<Status, ReadError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(read).await {
+        Ok(reading) => reading.map(std::sync::Arc::new),
+        Err(err) => {
+            tracing::warn!(error = %err, "peer tailnet: the Tailscale app read did not finish");
+            Err(ReadError::SpawnFailed(std::io::ErrorKind::Other))
+        }
+    }
+}
+
+/// The one reading this process holds: see [`ReadingCache`].
+pub static OWN_MAC_READINGS: ReadingCache = ReadingCache::new();
+
+/// Read the Tailscale app at its usual paths, under its deadline: the
+/// reader production hands to [`ReadingCache`].
+pub fn read_the_app() -> Result<Status, ReadError> {
+    tailscale_app::read_status(
+        &tailscale_app::default_cli_paths(),
+        tailscale_app::STATUS_TIMEOUT,
+    )
+}
+
 /// The operator's own Macs' tailnet IPv4 addresses in `status`: where the
 /// beacon goes, and the only sources one is read from.
 pub fn own_mac_addresses(status: &Status) -> Vec<Ipv4Addr> {
@@ -587,5 +685,55 @@ mod tests {
         assert_eq!(from.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(socket.close());
         assert_eq!(socket.bound_to(), None);
+    }
+}
+
+#[cfg(test)]
+mod reading_cache_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+
+    fn counted(
+        runs: &Arc<AtomicUsize>,
+    ) -> impl FnOnce() -> Result<Status, ReadError> + Send + 'static {
+        let runs = Arc::clone(runs);
+        move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Err(ReadError::NotInstalled)
+        }
+    }
+
+    /// **A reading is reused inside its age limit, re-read past it, and a
+    /// failed read is held like any other.**
+    ///
+    /// Watch it fail by removing the early return in `recent`: every call
+    /// then reads, and the first count is 2.
+    #[tokio::test]
+    async fn a_reading_is_reused_until_it_is_too_old() {
+        let cache = ReadingCache::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let long = Duration::from_secs(60);
+        assert_eq!(
+            cache.recent(long, counted(&runs)).await,
+            Err(ReadError::NotInstalled)
+        );
+        assert_eq!(
+            cache.recent(long, counted(&runs)).await,
+            Err(ReadError::NotInstalled)
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the failure was held");
+        cache
+            .recent(Duration::ZERO, counted(&runs))
+            .await
+            .expect_err("still failing");
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "too old, so read again");
+        cache
+            .refresh(counted(&runs))
+            .await
+            .expect_err("refresh reads");
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
     }
 }

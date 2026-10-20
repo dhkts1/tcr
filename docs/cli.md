@@ -3219,7 +3219,15 @@ Sets, or with no argument prints, how this Mac uses a tailnet. Off by default.
 | `--json` | bool | `false` | machine-readable output, below |
 
 Setting a mode writes `"tailnet"` into the peers file under its lock, the way `tcr peer find`
-writes `discovery`; `off` removes the key. The setting is read on every use, never from a
+writes `discovery`; `off` removes the key.
+
+In `app` mode the peer listener answers a knock and a first pairing from a tailnet address
+(`100.64.0.0/10` or `fd7a:115c:a1e0::/48`) when all three hold: the connection arrived on one
+of this Mac's own tailnet addresses (not just any address in that range, which a phone hotspot
+can hand out), the source is one of your own Macs in the app's reading (same Tailscale user,
+online, untagged, not shared in), and that reading is under 20 seconds old or a fresh one
+succeeds. Anything else from a tailnet address gets the answer it always got: a return visit
+or a join key only, and nothing back for a knock. The setting is read on every use, never from a
 boot-time snapshot, so it needs no restart. `node` is refused, with the file left alone, by a
 `tcr` built without the `tailnet-node` cargo feature; release builds do not have it. A word this
 `tcr` does not know (one a newer `tcr` wrote) still loads: it is treated as off, kept in the file

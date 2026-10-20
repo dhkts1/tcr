@@ -1524,26 +1524,15 @@ fn spawn_browse(
                 network_key = file.network_key;
 
                 // The tailnet source, read only in app mode. The read runs a
-                // process under a deadline, so it goes to a blocking thread.
+                // process under a deadline, so it goes to a blocking thread,
+                // and it refreshes the reading the peer listener decides an
+                // own-Mac knock on.
                 let mode = file.tailnet.effective();
                 let app = match mode {
                     TailnetMode::App => Some(
-                        tokio::task::spawn_blocking(|| {
-                            crate::peer::tailscale_app::read_status(
-                                &crate::peer::tailscale_app::default_cli_paths(),
-                                crate::peer::tailscale_app::STATUS_TIMEOUT,
-                            )
-                        })
-                        .await
-                        .unwrap_or_else(|err| {
-                            tracing::warn!(
-                                error = %err,
-                                "peer find: the Tailscale app read did not finish"
-                            );
-                            Err(crate::peer::tailscale_app::ReadError::SpawnFailed(
-                                std::io::ErrorKind::Other,
-                            ))
-                        }),
+                        tailnet_find::OWN_MAC_READINGS
+                            .refresh(tailnet_find::read_the_app)
+                            .await,
                     ),
                     TailnetMode::Off | TailnetMode::Node => None,
                 };
@@ -1643,7 +1632,7 @@ fn spawn_browse(
                 // write nothing from here: see `tailnet_find::write_held`.
                 let reading = app
                     .as_ref()
-                    .map(|result| result.as_ref().map_err(|err| *err));
+                    .map(|result| result.as_ref().map(|status| &**status).map_err(|err| *err));
                 if let Err(err) = tailnet_find::write_held(
                     &state_path,
                     mode,
