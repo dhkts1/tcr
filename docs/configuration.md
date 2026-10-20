@@ -816,10 +816,13 @@ never merged into the main account config above; a walkthrough of what the mesh 
 `src/peer/config.rs`.
 
 A missing file is the default: nothing pinned, the listener off. A file that exists but
-cannot be parsed is a named refusal, same rule as the main config.
+cannot be parsed is a named refusal, same rule as the main config. A key this build does
+not know is kept and written back on the next save, so an older `tcr` (the one bundled in
+TcrBar, say) cannot erase a setting a newer one wrote.
 
-**Two tiers, one reload rule.** [`listen`](#top-level-keys), `discovery` and `maxHops` are
-read once at boot: turning the listener on is a restart-worthy act. Everything under a
+**Two tiers, one reload rule.** [`listen`](#top-level-keys) and `maxHops` are read once at
+boot: turning the listener on is a restart-worthy act. `discovery` is not: a running `tcr`
+re-reads it every 20 seconds, so `tcr peer find on|off` needs no restart. Everything under a
 peer's `allow` and `lend` is re-read whenever this file's mtime moves, the same
 `reload_groups_if_changed` mechanism the main config already uses for group membership, so
 `tcr peer allow` and `tcr peer lend` take effect with no restart and no cost to the prompt
@@ -830,7 +833,7 @@ cache.
 | json key | type | default | boot-time or hot | what it does |
 |---|---|---|---|---|
 | `listen` | string (`host:port`) | absent | boot-time | where the peer listener binds. **Absent means the feature is off**: a fresh install discloses nothing, opens no port, answers nobody |
-| `discovery` | bool | `false` | boot-time | whether this Mac announces itself and looks for others (`tcr peer find`) |
+| `discovery` | bool | `false` | hot, re-read every 20 s | whether this Mac announces itself and looks for others (`tcr peer find`) |
 | `name` | string | absent | hot | this Mac's display name (`tcr peer name`). Absent means "use the host name", resolved at use and never written as a fallback value, so a name the operator never chose still reads as unset |
 | `announceName` | bool | `false` | hot | whether the discovery beacon includes `name`. Off leaves the beacon as presence and a port only; it never carries a key or a peer id either way |
 | `networkKey` | string (52-char base32) | absent | boot-time for the beacon, hot for a pairing request | the opt-in office password (`tcr peer network-key`); an admission ticket to the beacon layer, not an identity |
