@@ -397,6 +397,10 @@ mod peer_cli {
         Moved(PeerMovedArgs),
         /// Print what this Mac can be reached on from off its own LAN.
         Reach(PeerReachArgs),
+        /// Show or set how this Mac uses a tailnet: `off`, `app` (read the
+        /// Tailscale app on this Mac) or `node` (tcr joins as its own node,
+        /// source builds with the `tailnet-node` feature only).
+        Tailnet(PeerTailnetArgs),
         /// Let pinned Macs reach this one from off its own LAN. Off by
         /// default: with it on, this Mac asks its router for a port mapping
         /// and answers a return visit against a pinned key from anywhere,
@@ -518,6 +522,44 @@ mod peer_cli {
         Show,
         /// Forget the store. Does not turn `peer.drop` off by itself.
         Clear,
+    }
+
+    /// `tcr peer tailnet [off|app|node] [--json]`.
+    ///
+    /// A flat args struct with the mode as an optional positional value,
+    /// `PeerDropStoreArgs`'s shape and for the same measured reason: a nested
+    /// subcommand refuses `--peers` placed before the action.
+    #[derive(clap::Args)]
+    pub(crate) struct PeerTailnetArgs {
+        #[command(flatten)]
+        pub peers: PeersFile,
+        /// The mode to set. Omit to print the current one.
+        #[arg(value_enum)]
+        pub mode: Option<PeerTailnetMode>,
+        /// Print the setting and what the running proxy recorded as JSON.
+        #[arg(long)]
+        pub json: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+    pub(crate) enum PeerTailnetMode {
+        /// No tailnet use.
+        Off,
+        /// Read the Tailscale app on this Mac to find your own other Macs.
+        App,
+        /// tcr joins a tailnet as its own node.
+        Node,
+    }
+
+    impl PeerTailnetMode {
+        /// The setting this word writes.
+        pub(crate) const fn mode(self) -> tcr::peer::config::TailnetMode {
+            match self {
+                Self::Off => tcr::peer::config::TailnetMode::Off,
+                Self::App => tcr::peer::config::TailnetMode::App,
+                Self::Node => tcr::peer::config::TailnetMode::Node,
+            }
+        }
     }
 
     #[derive(clap::Args)]
@@ -3688,6 +3730,9 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         }
         PeerAction::Moved(a) => run_peer_moved(a),
         PeerAction::Reach(a) => run_peer_reach(a),
+        PeerAction::Tailnet(a) => {
+            run_peer_tailnet_with(a, &peer::tailscale_app::default_cli_paths())
+        }
         PeerAction::Internet(a) => {
             let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
             let on = matches!(a.state, peer_cli::Switch::On);
@@ -5326,6 +5371,95 @@ fn print_listen_written(addr: std::net::SocketAddr, peers_path: &Path) {
     );
 }
 
+/// `tcr peer tailnet [off|app|node] [--json]`, with the Tailscale CLI looked
+/// for at `cli_paths` so a test can hand it a fake one.
+///
+/// Setting a mode takes the peers-file lock and saves, the way
+/// [`run_peer_find_with`] writes `discovery`. `node` is refused, with the file
+/// untouched, by a binary built without the `tailnet-node` feature.
+///
+/// With no mode it prints the setting and, in app mode, one live read of the
+/// app. `--json` prints the setting, whether this binary can act on `node`,
+/// and what the serving process recorded (`held`), and never runs the app.
+fn run_peer_tailnet_with(
+    args: peer_cli::PeerTailnetArgs,
+    cli_paths: &[PathBuf],
+) -> anyhow::Result<()> {
+    use peer::config::TailnetMode;
+
+    let peers_path = args.peers.path();
+    if let Some(wanted) = args.mode {
+        let mode = wanted.mode();
+        if mode == TailnetMode::Node && !cfg!(feature = "tailnet-node") {
+            anyhow::bail!(
+                "peer tailnet: this tcr was built without tcr's own tailnet node, so `node` \
+                 cannot be set; use `tcr peer tailnet app` with the Tailscale app, or build tcr \
+                 from source with `--features tailnet-node`"
+            );
+        }
+        {
+            let (_lock, mut file) = lock_peers_file(&peers_path)?;
+            file.tailnet = mode;
+            peer::config::save(&peers_path, &file)?;
+        }
+        if !args.json {
+            println!("peer.tailnet: {}", mode.as_str());
+            return Ok(());
+        }
+    }
+
+    let report = peer::state::TailnetReport::read(&peers_path, peer::pair::now_ms())?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("peer.tailnet: {}", report.mode.as_str());
+    if report.mode == TailnetMode::App {
+        print_tailscale_app_read(cli_paths);
+    }
+    if report.mode == TailnetMode::Node && !report.node_supported {
+        println!("peer.tailnet: this tcr was built without tcr's own tailnet node");
+    }
+    Ok(())
+}
+
+/// One live read of the Tailscale app, as lines for `tcr peer tailnet`.
+fn print_tailscale_app_read(cli_paths: &[PathBuf]) {
+    use peer::tailscale_app::{self, Route};
+
+    match tailscale_app::read_status(cli_paths, tailscale_app::STATUS_TIMEOUT) {
+        Ok(status) => {
+            match status.own_ipv4() {
+                Some(address) => println!("tailnet address: {address}"),
+                None => println!("tailnet address: none reported"),
+            }
+            let mine = tailscale_app::own_macs(&status);
+            if mine.is_empty() {
+                println!("your other Macs online: none");
+            }
+            for mac in mine {
+                let address = mac
+                    .tailscale_ips
+                    .iter()
+                    .find(|ip| ip.is_ipv4())
+                    .or_else(|| mac.tailscale_ips.first())
+                    .map_or_else(|| "no address".to_string(), ToString::to_string);
+                let route = match tailscale_app::route(mac) {
+                    Route::Direct => "direct",
+                    Route::Relayed => "relayed",
+                    Route::Unknown => "route unknown",
+                };
+                println!(
+                    "your Mac: {}  {address}  {route}",
+                    masked_label(&mac.host_name)
+                );
+            }
+        }
+        Err(err) => println!("tailscale app: {}", err.detail()),
+    }
+}
+
 async fn run_peer_find_with(
     args: peer_cli::PeerFindArgs,
     finder: &impl PeerFinder,
@@ -5476,6 +5610,103 @@ mod peer_find_tests {
             !finder.browsed.load(Ordering::SeqCst),
             "find off must not browse"
         );
+    }
+}
+
+#[cfg(test)]
+mod peer_tailnet_tests {
+    use super::*;
+
+    fn args(
+        peers_path: &Path,
+        mode: Option<peer_cli::PeerTailnetMode>,
+    ) -> peer_cli::PeerTailnetArgs {
+        peer_cli::PeerTailnetArgs {
+            peers: peer_cli::PeersFile {
+                peers: Some(peers_path.to_path_buf()),
+            },
+            mode,
+            json: false,
+        }
+    }
+
+    fn written(peers_path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(peers_path).expect("the peers file"))
+            .expect("the peers file is JSON")
+    }
+
+    /// **`tcr peer tailnet app` writes `"tailnet": "app"`, keeps every other
+    /// key, and `off` takes the key away again.**
+    ///
+    /// Watch it fail by dropping the `file.tailnet = mode;` line: the file
+    /// then never gains the key.
+    #[test]
+    fn setting_a_mode_writes_the_key_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        let seed = peer::config::PeerFile {
+            discovery: true,
+            ..Default::default()
+        };
+        peer::config::save(&peers_path, &seed).expect("seed the peers file");
+
+        run_peer_tailnet_with(args(&peers_path, Some(peer_cli::PeerTailnetMode::App)), &[])
+            .expect("set app");
+        let file = written(&peers_path);
+        assert_eq!(file["tailnet"], "app", "{file}");
+        assert_eq!(
+            file["discovery"], true,
+            "the rest of the file is kept: {file}"
+        );
+
+        run_peer_tailnet_with(args(&peers_path, Some(peer_cli::PeerTailnetMode::Off)), &[])
+            .expect("set off");
+        let file = written(&peers_path);
+        assert!(
+            file.get("tailnet").is_none(),
+            "off is the default and is not written: {file}"
+        );
+    }
+
+    /// **`node` is refused by a build without the feature, and the file is
+    /// left as it was.**
+    ///
+    /// Watch it fail by removing the feature check: the call then succeeds
+    /// and the file says `node`.
+    #[cfg(not(feature = "tailnet-node"))]
+    #[test]
+    fn node_is_refused_without_the_feature() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        run_peer_tailnet_with(args(&peers_path, Some(peer_cli::PeerTailnetMode::App)), &[])
+            .expect("set app");
+
+        let refusal = run_peer_tailnet_with(
+            args(&peers_path, Some(peer_cli::PeerTailnetMode::Node)),
+            &[],
+        )
+        .expect_err("node needs the tailnet-node feature")
+        .to_string();
+        assert!(refusal.contains("tailnet-node"), "{refusal}");
+        assert_eq!(
+            written(&peers_path)["tailnet"],
+            "app",
+            "a refused mode leaves the file alone"
+        );
+    }
+
+    /// **The no-argument form prints in every mode without failing, including
+    /// app mode with no Tailscale CLI anywhere.** A missing app is a line of
+    /// output, never an error exit.
+    #[test]
+    fn showing_the_mode_with_no_app_installed_is_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        run_peer_tailnet_with(args(&peers_path, None), &[]).expect("show off");
+        run_peer_tailnet_with(args(&peers_path, Some(peer_cli::PeerTailnetMode::App)), &[])
+            .expect("set app");
+        run_peer_tailnet_with(args(&peers_path, None), &[dir.path().join("no-cli")])
+            .expect("show app with no CLI");
     }
 }
 

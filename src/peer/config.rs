@@ -209,6 +209,15 @@ pub struct PeerFile {
     /// case. Boot-time for the publisher, hot for the fetch gate.
     #[serde(default, skip_serializing_if = "DeadDropConfig::is_unset")]
     pub dead_drop: DeadDropConfig,
+    /// How this Mac uses a tailnet (`tcr peer tailnet off|app|node`). Off by
+    /// default, and absent from a file that never turned it on, for the
+    /// reason [`DeadDropConfig::is_unset`] gives.
+    ///
+    /// Hot, and never part of the boot snapshot: every reader takes it from
+    /// the file as it is now, the way the browse task reads [`Self::discovery`],
+    /// so changing it costs no restart and no warm prompt cache.
+    #[serde(default, skip_serializing_if = "TailnetMode::is_off")]
+    pub tailnet: TailnetMode,
     /// Every key in this file that this build does not know, written back
     /// unread by [`save`].
     ///
@@ -287,7 +296,45 @@ impl Default for PeerFile {
             pending_invites: Vec::new(),
             default_lend: None,
             dead_drop: DeadDropConfig::default(),
+            tailnet: TailnetMode::Off,
             rest: serde_json::Map::new(),
+        }
+    }
+}
+
+/// How this Mac uses a tailnet: one choice, not two switches.
+///
+/// A single choice because running both gives one Mac two tailnet addresses,
+/// so every friend sees two rows for it, and "is this address in
+/// `100.64.0.0/10`" no longer says which transport to dial it over
+/// for this Mac.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TailnetMode {
+    /// No tailnet use at all. The default.
+    #[default]
+    Off,
+    /// Read the Tailscale app already running on this Mac
+    /// ([`crate::peer::tailscale_app`]) to find this operator's own other
+    /// Macs.
+    App,
+    /// tcr joins a tailnet as its own node. Only a build with the
+    /// `tailnet-node` cargo feature can act on it.
+    Node,
+}
+
+impl TailnetMode {
+    /// [`Self::Off`], the value that is not written to the file.
+    pub fn is_off(&self) -> bool {
+        *self == Self::Off
+    }
+
+    /// The word the file and the CLI use for it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::App => "app",
+            Self::Node => "node",
         }
     }
 }

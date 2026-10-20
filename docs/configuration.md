@@ -842,6 +842,7 @@ cache.
 | `paths` | object | absent | hot | policy for choosing which endpoint to dial: `paths.prefer` (`"direct"` or `"via"`), `paths.maxLossPct` (default `5`), `paths.viaAllow` (which peers may carry when `via` is preferred). Absent means the built-in order, direct first, newest endpoint first |
 | `peers` | array of peer rows | `[]` | hot | one row per pinned peer, see below |
 | `pendingInvites` | array of invites | `[]` | hot | one-use join keys minted by `tcr peer invite` that have not been spent yet |
+| `tailnet` | `"off"` \| `"app"` \| `"node"` | absent (`off`) | hot | how this Mac uses a tailnet (`tcr peer tailnet`): `app` reads the Tailscale app on this Mac, `node` joins as tcr's own node and needs a build with the `tailnet-node` feature. `off` is not written |
 | `deadDrop` | object | absent | boot-time for the publisher, hot for the fetch | where this Mac leaves its current address for a friend that has also moved. **Absent means off, which is the default**: nothing is published and nothing is fetched. A Mac that never turned it on writes no such key |
 | `deadDrop.enabled` | bool | `false` | boot-time | the switch |
 | `deadDrop.store` | object | absent | boot-time | the surface to publish on. Absent means off regardless of `enabled` |

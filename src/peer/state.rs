@@ -171,6 +171,16 @@ pub struct PeerState {
     /// last mapping ended at 18:04" and "nothing ever mapped anything".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mapping: Option<MappingRecord>,
+    /// What the serving process did with the tailnet setting on its last
+    /// tick, so `tcr peer tailnet` (a separate process) can say what the
+    /// RUNNING `tcr` holds, the way [`Self::mapping`] lets `tcr peer reach`
+    /// say what the router gave it.
+    ///
+    /// Not pruned by [`load`]: a reader compares
+    /// [`TailnetRecord::recorded_at_ms`] to its own clock and treats a record
+    /// older than [`TAILNET_RECORD_STALE_MS`] as stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet: Option<TailnetRecord>,
     /// Macs heard announcing on the LAN in the last
     /// [`crate::peer::discovery::FOUND_TTL_MS`], not trusted, not pinned. See
     /// [`Found`]. Written by the serving process's browse task and read by
@@ -324,6 +334,104 @@ pub struct MappingRecord {
     /// and treats a passed deadline as no mapping, because a record outlives
     /// the process that wrote it and a crashed keeper renews nothing.
     pub expires_at_ms: i64,
+}
+
+/// How old a [`TailnetRecord`] may be before a reader treats it as stale.
+/// The server records one per 20-second tick, so 60 s is three missed ticks.
+pub const TAILNET_RECORD_STALE_MS: i64 = 60_000;
+
+/// What a serving process recorded about its tailnet use on its last tick:
+/// `held` in `tcr peer tailnet --json`.
+///
+/// Written by the server, read by `tcr peer tailnet` and the panel. The
+/// shape is documented in `docs/cli.md`, `tcr peer tailnet`. A field added here
+/// later is dropped by an older build that rewrites the state file, because
+/// [`PeerState::rest`] keeps unknown keys at the top level only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailnetRecord {
+    /// The mode the server acted on. It lags the file's mode by up to one
+    /// tick.
+    pub mode: crate::peer::config::TailnetMode,
+    /// What came of it.
+    pub state: TailnetState,
+    /// This Mac's tailnet IPv4 in that mode, or `None`.
+    pub address: Option<std::net::Ipv4Addr>,
+    /// Node mode only: the name on the tailnet.
+    pub node_name: Option<String>,
+    /// App mode: own Macs that sent a beacon in the last 60 s.
+    pub found: u32,
+    /// Node mode: paired Macs with a live connection through the node.
+    pub connected: u32,
+    /// One plain sentence for a failure state, else `None`.
+    pub detail: Option<String>,
+    /// When the server wrote this, Unix milliseconds.
+    pub recorded_at_ms: i64,
+}
+
+impl TailnetRecord {
+    /// Whether this record is older than [`TAILNET_RECORD_STALE_MS`] at
+    /// `now_ms`.
+    pub const fn is_stale(&self, now_ms: i64) -> bool {
+        now_ms.saturating_sub(self.recorded_at_ms) > TAILNET_RECORD_STALE_MS
+    }
+}
+
+/// What came of the tailnet setting, one word per outcome the panel draws a
+/// different line for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TailnetState {
+    /// The setting is off.
+    Off,
+    /// App mode read the app, or node mode is on the tailnet.
+    Ready,
+    /// No Tailscale CLI at any of the paths
+    /// [`crate::peer::tailscale_app::CLI_PATHS`] names.
+    AppMissing,
+    /// The app answered but is not connected (`BackendState` is not
+    /// `Running`), or the CLI could not reach it at all.
+    AppNotRunning,
+    /// The CLI timed out, could not be started, or printed something that
+    /// did not parse.
+    ReadFailed,
+    /// Node mode, and no node key yet.
+    NodeNotJoined,
+    /// Node mode, joining or rebuilding after a failure.
+    NodeConnecting,
+    /// The mode is `node` but this binary lacks the `tailnet-node` feature.
+    NodeUnsupported,
+}
+
+/// `tcr peer tailnet --json`: the setting, whether this binary can act on
+/// `node`, and what the serving process last recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailnetReport {
+    /// The setting, as the peers file says now.
+    pub mode: crate::peer::config::TailnetMode,
+    /// Whether this binary was built with the `tailnet-node` cargo feature.
+    pub node_supported: bool,
+    /// What the serving process recorded, or `None` when none has.
+    /// Serialized as `null`, never left out: a reader tells "no server has
+    /// recorded one" from a missing key by this.
+    pub held: Option<TailnetRecord>,
+}
+
+impl TailnetReport {
+    /// The report for the peers file at `peers_path` and the state file
+    /// beside it.
+    pub fn read(peers_path: &Path, now_ms: i64) -> Result<Self> {
+        let file = crate::peer::config::read_or_default(peers_path)?;
+        let state_path = crate::peer::serve::peer_state_path(peers_path);
+        let state = load(&state_path, now_ms)
+            .with_context(|| format!("reading {}", state_path.display()))?;
+        Ok(Self {
+            mode: file.tailnet,
+            node_supported: cfg!(feature = "tailnet-node"),
+            held: state.tailnet,
+        })
+    }
 }
 
 /// One knock waiting on the operator, as the Peers tab renders it.
@@ -1945,5 +2053,95 @@ mod tests {
             std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// **`tcr peer tailnet --json` has exactly the keys the panel reads**:
+    /// `mode`, `nodeSupported` and `held`, with `held` written as `null`
+    /// rather than left out when no server has recorded one, and the record
+    /// itself in camelCase with its own nulls kept.
+    ///
+    /// Watch it fail by giving `TailnetReport::held` a
+    /// `skip_serializing_if = "Option::is_none"`: the first object then has
+    /// no `held` key and the first assertion fails.
+    #[test]
+    fn the_tailnet_report_has_the_contract_shape() {
+        use crate::peer::config::TailnetMode;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        let file = crate::peer::config::PeerFile {
+            tailnet: TailnetMode::App,
+            ..Default::default()
+        };
+        crate::peer::config::save(&peers_path, &file).expect("save the peers file");
+
+        let report = TailnetReport::read(&peers_path, 1_000).expect("read the report");
+        assert_eq!(
+            serde_json::to_value(&report).expect("serialize"),
+            serde_json::json!({
+                "mode": "app",
+                "nodeSupported": cfg!(feature = "tailnet-node"),
+                "held": null
+            })
+        );
+
+        let record = TailnetRecord {
+            mode: TailnetMode::App,
+            state: TailnetState::AppNotRunning,
+            address: Some(std::net::Ipv4Addr::new(100, 64, 0, 7)),
+            node_name: None,
+            found: 2,
+            connected: 0,
+            detail: Some("The Tailscale app is not running on this Mac.".to_string()),
+            recorded_at_ms: 1_000,
+        };
+        let state = PeerState {
+            tailnet: Some(record.clone()),
+            ..Default::default()
+        };
+        save(&crate::peer::serve::peer_state_path(&peers_path), &state)
+            .expect("save the state file");
+
+        let report = TailnetReport::read(&peers_path, 1_000).expect("read the report");
+        assert_eq!(
+            report.held.as_ref(),
+            Some(&record),
+            "the record round-trips"
+        );
+        assert_eq!(
+            serde_json::to_value(&report).expect("serialize")["held"],
+            serde_json::json!({
+                "mode": "app",
+                "state": "appNotRunning",
+                "address": "100.64.0.7",
+                "nodeName": null,
+                "found": 2,
+                "connected": 0,
+                "detail": "The Tailscale app is not running on this Mac.",
+                "recordedAtMs": 1_000
+            })
+        );
+        assert!(!record.is_stale(1_000 + TAILNET_RECORD_STALE_MS));
+        assert!(record.is_stale(1_001 + TAILNET_RECORD_STALE_MS));
+    }
+
+    /// **Every state word is the contract's spelling.**
+    #[test]
+    fn every_tailnet_state_has_its_contract_word() {
+        for (state, word) in [
+            (TailnetState::Off, "off"),
+            (TailnetState::Ready, "ready"),
+            (TailnetState::AppMissing, "appMissing"),
+            (TailnetState::AppNotRunning, "appNotRunning"),
+            (TailnetState::ReadFailed, "readFailed"),
+            (TailnetState::NodeNotJoined, "nodeNotJoined"),
+            (TailnetState::NodeConnecting, "nodeConnecting"),
+            (TailnetState::NodeUnsupported, "nodeUnsupported"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(state).expect("serialize"),
+                serde_json::json!(word)
+            );
+        }
     }
 }
