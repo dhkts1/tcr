@@ -53,6 +53,15 @@ import CoreGraphics
 /// and both are the owner's call: a taller Settings window, or two sections
 /// instead of three.
 ///
+/// **That fit no longer holds, and has not since the internet switch.** The
+/// "Reachable from the internet" row added 78 pt and nothing here counted it
+/// (the drawn document was 615 pt while this type still said 537), and the
+/// Tailscale row adds 81 more: 696 pt against 540, measured 2026-10-20 by the
+/// same command. The Advanced row is below the fold until one of the two
+/// levers above is pulled. ``drawnContent(trustedMacs:pendingKnocks:advancedOpen:advancedRows:holdsCodex:thisMacNetworkRows:)``
+/// now counts both rows, and its `thisMacNetworkRows: false` form is the
+/// pane the older claims are about.
+///
 /// # What "fits" means here
 ///
 /// The pane is a `Form`, so it scrolls when it overflows and nothing is lost:
@@ -113,13 +122,30 @@ public enum PeerPaneLayout {
     ///
     /// A figure changed by hand rather than by that command is a guess with a
     /// test's authority attached.
+    ///
+    /// The last two are This Mac's two explained rows, each measured as the
+    /// growth of the drawn document when it was added (2026-10-20, light and
+    /// dark agree): "Reachable from the internet" with its switch off is
+    /// 78 pt (the pane without it is the 537 the other figures model, with it
+    /// 615), and "Tailscale" is 81 pt (615 to 696). Each is one figure rather
+    /// than a row plus a sentence because each is a block of its own: a title,
+    /// a two-line sub-line at this width, and for Tailscale a state line whose
+    /// height is reserved in every state.
     public static let drawnMetrics = Metrics(
         sectionHeadHeight: 21, rowHeight: 37, rowDetailHeight: 26, knockRowHeight: 40,
         peerRowHeight: 37, groupChrome: 0, groupGap: 35, disclosureHeight: 44,
-        subLineHeight: 14, sectionSentenceHeight: 14, outerMargins: 46, unheadedGap: 10)
+        subLineHeight: 14, sectionSentenceHeight: 14, outerMargins: 46, unheadedGap: 10,
+        internetRowHeight: 78, tailnetRowHeight: 81)
 
     /// What the drawn pane draws: no top-level row carries its own sentence,
-    /// and two section heads carry one.
+    /// two section heads carry one, and This Mac carries its two explained
+    /// rows, the internet switch and the Tailscale picker.
+    ///
+    /// `thisMacNetworkRows: false` is the pane as it was measured BEFORE
+    /// those two rows, and it is kept because the claims made about that
+    /// pane (two Macs and a knock fit, a third Mac scrolls) are still true of
+    /// everything else on it; ``PeerPaneLayoutTests`` says which claim is
+    /// about which pane.
     ///
     /// In a fleet holding a Codex account (`holdsCodex`) the Sharing head also
     /// carries the line that says Codex requests always leave from this Mac, which
@@ -129,13 +155,14 @@ public enum PeerPaneLayout {
     /// taller window, would move a Claude-only fleet's pane too.
     public static func drawnContent(
         trustedMacs: Int, pendingKnocks: Int, advancedOpen: Bool = false,
-        advancedRows: Int = 7, holdsCodex: Bool = false
+        advancedRows: Int = 7, holdsCodex: Bool = false, thisMacNetworkRows: Bool = true
     ) -> Content {
         Content(
             trustedMacs: trustedMacs, pendingKnocks: pendingKnocks,
             advancedOpen: advancedOpen, advancedRows: advancedRows,
             explainedRows: 0, sectionSentences: 2,
-            headLines: holdsCodex ? codexHeadLines : 0)
+            headLines: holdsCodex ? codexHeadLines : 0,
+            internetRow: thisMacNetworkRows, tailnetRow: thisMacNetworkRows)
     }
 
     /// How many lines the Codex line under the Sharing head takes: "Codex requests
@@ -187,14 +214,25 @@ public enum PeerPaneLayout {
         /// alone. Not zero for a drawn `Form`, and the reason the arithmetic
         /// used to read 180 pt under the pane it was modelling.
         public let outerMargins: CGFloat
+        /// This Mac's "Reachable from the internet" row, switch off: title,
+        /// sub-line and the row's own padding. Zero for the mockup, which
+        /// predates it.
+        public let internetRowHeight: CGFloat
+        /// This Mac's "Tailscale" row: title, sub-line, the reserved state
+        /// line and the row's own padding. The same in every state, which is
+        /// what the row reserves its state line for. Zero for the mockup.
+        public let tailnetRowHeight: CGFloat
 
         public init(
             sectionHeadHeight: CGFloat, rowHeight: CGFloat, rowDetailHeight: CGFloat,
             knockRowHeight: CGFloat, peerRowHeight: CGFloat, groupChrome: CGFloat,
             groupGap: CGFloat, disclosureHeight: CGFloat, subLineHeight: CGFloat = 0,
             sectionSentenceHeight: CGFloat = 0, outerMargins: CGFloat = 0,
-            unheadedGap: CGFloat? = nil
+            unheadedGap: CGFloat? = nil, internetRowHeight: CGFloat = 0,
+            tailnetRowHeight: CGFloat = 0
         ) {
+            self.internetRowHeight = internetRowHeight
+            self.tailnetRowHeight = tailnetRowHeight
             self.sectionHeadHeight = sectionHeadHeight
             self.rowHeight = rowHeight
             self.rowDetailHeight = rowDetailHeight
@@ -241,12 +279,19 @@ public enum PeerPaneLayout {
         /// more line of a head: the Codex line under the Sharing head, in a fleet
         /// holding a Codex account. Zero in every other fleet, and in the mockup.
         public let headLines: Int
+        /// Whether This Mac draws its internet switch row, and its Tailscale
+        /// row. Off by default, because the mockup this type is cross-checked
+        /// against has neither.
+        public let internetRow: Bool
+        public let tailnetRow: Bool
 
         public init(
             trustedMacs: Int, pendingKnocks: Int, advancedOpen: Bool = false,
             advancedRows: Int = 7, explainedRows: Int = 3, sectionSentences: Int = 0,
-            headLines: Int = 0
+            headLines: Int = 0, internetRow: Bool = false, tailnetRow: Bool = false
         ) {
+            self.internetRow = internetRow
+            self.tailnetRow = tailnetRow
             self.trustedMacs = trustedMacs
             self.pendingKnocks = pendingKnocks
             self.advancedOpen = advancedOpen
@@ -263,7 +308,8 @@ public enum PeerPaneLayout {
     /// mockup:
     ///
     /// 1. **This Mac**, Name, Announce my name. Two rows, both with a
-    ///    sentence.
+    ///    sentence. Then, on the drawn pane, the internet switch and the
+    ///    Tailscale row, each its own measured block.
     /// 2. **Sharing**, the Share switch (with a sentence) and the Defaults
     ///    row with `Customize…` (one line of numbers, no sentence).
     /// 3. **Trusted Macs**, one knock row per request, then one compact row
@@ -274,6 +320,8 @@ public enum PeerPaneLayout {
             m.sectionHeadHeight + m.groupChrome
             + 2 * m.rowHeight
             + m.subLineHeight  // this Mac's id, under its name
+            + (content.internetRow ? m.internetRowHeight : 0)
+            + (content.tailnetRow ? m.tailnetRowHeight : 0)
         let sharing =
             m.sectionHeadHeight + m.groupChrome
             + 2 * m.rowHeight  // the Share switch, and Defaults on one line

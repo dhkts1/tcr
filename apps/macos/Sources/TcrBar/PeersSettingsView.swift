@@ -183,6 +183,7 @@ struct PeersSettingsPane: View {
             openRequestedRenderSheet()
         }
         .onDisappear { controller.stop() }
+        .task { await pollTailnet() }
         .onChange(of: snapshot.name) { latest in fillNameIfEmpty(latest) }
         .sheet(isPresented: $showingJoinKey) {
             PeerInviteSheet(
@@ -325,6 +326,15 @@ struct PeersSettingsPane: View {
             PeerInternetRow(
                 on: internetOn, state: internetState, onPress: pressInternet,
                 onRetry: retryReach)
+
+            // Under the internet switch, because both answer "what does this
+            // Mac put on a network" (the tailnet mockup, scene 1).
+            PeerTailnetRow(
+                read: tailnetRead, state: tailnetState,
+                pending: PeerTailnetMode.allCases.contains {
+                    controller.isPending(PeerCommand.tailnet($0))
+                },
+                onPick: pickTailnet, onOpenApp: openTailscaleApp, snapshotMode: true)
         } header: {
             peersSectionHead(
                 "This Mac", "Press return to commit. Only the name is announced.")
@@ -395,16 +405,9 @@ struct PeersSettingsPane: View {
                         Text(row.title)
                             .foregroundStyle(Tok.ink)
                         Spacer(minLength: 0)
+                        tailnetPillSlot(row.tailnetPills)
                         ForEach(row.pills, id: \.text) { pill in
-                            Text(pill.text)
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(pillTint(pill.role))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 6)
-                                        .strokeBorder(
-                                            pillTint(pill.role).opacity(0.4), lineWidth: 1))
+                            settingsPill(pill.text, role: pill.role)
                         }
                         Image(systemName: "chevron.right")
                             .font(.caption.weight(.semibold))
@@ -1367,7 +1370,43 @@ struct PeersSettingsPane: View {
         // The same source ``PeerPill/Role`` reads, so a pill on this pane and
         // the identical pill on the Peers tab cannot end up two colours.
         case .info: return Tok.unmeasured
+        case .caution: return Tok.near
         case .neutral: return Tok.inkFaint
+        }
+    }
+
+    /// One pill in this pane's idiom. One spelling for the trusted list's
+    /// own pills and the tailnet ones beside them, so the two cannot drift.
+    private func settingsPill(_ text: String, role: PeerPill.Role) -> some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(pillTint(role))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(pillTint(role).opacity(0.4), lineWidth: 1))
+    }
+
+    /// The tailnet pills of a trusted row, in a slot sized for the widest set
+    /// (`tailnet` and `relayed`) and drawn on every row, so a pill appearing
+    /// moves neither the name nor the pills beside it. It sits AHEAD of the
+    /// row's own pills, where an empty slot is only more of the gap the name
+    /// already has.
+    private func tailnetPillSlot(_ pills: [PeerTailnetPill]) -> some View {
+        ZStack(alignment: .trailing) {
+            HStack(spacing: 8) {
+                ForEach(PeerTailnetPill.widestTrusted, id: \.self) {
+                    settingsPill($0.text, role: $0.role)
+                }
+            }
+            .hidden()
+            .accessibilityHidden(true)
+            HStack(spacing: 8) {
+                ForEach(pills, id: \.self) { pill in
+                    settingsPill(pill.text, role: pill.role).help(pill.help)
+                }
+            }
         }
     }
 
@@ -1420,6 +1459,13 @@ struct PeersSettingsPane: View {
     /// answer has not arrived yet. Cleared the moment `reachReading` is set
     /// again, by the same capture that clears it.
     @State private var isRetryingReach = false
+    /// The last `tcr peer tailnet --json` answer, polled while the pane is on
+    /// screen. A render run starts from the harness's fixture and polls
+    /// nothing.
+    @State private var tailnetRead: PeerTailnetRead =
+        RenderSettings.requestedDirectory() != nil ? RenderStates.settingsTailnetFixture : .notRead
+    /// The row's last press that failed, until the next press.
+    @State private var tailnetPressFailure: PeerTailnetPressFailure?
 
     // MARK: - Values
 
@@ -1542,6 +1588,88 @@ struct PeersSettingsPane: View {
                     externalAddress: nil, listenPort: nil, mapping: .refused(message),
                     readAt: Date())
             }
+        }
+    }
+
+    /// The Tailscale row's state, judged against this pane's own clock.
+    private var tailnetState: PeerTailnetState {
+        PeerTailnetState.state(tailnetRead, pressFailure: tailnetPressFailure, now: now)
+    }
+
+    /// How often the pane re-reads `tcr peer tailnet --json` while it is on
+    /// screen. The serving process ticks every 20 s, so five is enough to
+    /// show a change within one tick, and the verb only reads two files.
+    static let tailnetPollSeconds: UInt64 = 5
+
+    /// The poll, for as long as the pane is on screen: `.task` cancels it on
+    /// disappear. Unlike `peer reach --map`, this verb writes nothing, so
+    /// polling it is safe. A render run reads nothing at all.
+    private func pollTailnet() async {
+        guard RenderSettings.requestedDirectory() == nil else { return }
+        while !Task.isCancelled {
+            readTailnet()
+            try? await Task.sleep(nanoseconds: Self.tailnetPollSeconds * 1_000_000_000)
+        }
+    }
+
+    private func readTailnet() {
+        controller.capture(PeerCommand.tailnetRead) { capture in
+            switch capture {
+            case .text(let output): tailnetRead = .output(output)
+            case .failed(let message): tailnetRead = .failure(message)
+            }
+        }
+    }
+
+    /// The pick: write the mode, then read again as soon as the write lands,
+    /// so the line follows the press rather than the next poll. A refused
+    /// write is said on this row's own line
+    /// (``PeerTailnetState/pressFailed(_:)``): `run` records it in the
+    /// controller's refusal, which only the Peers tab draws.
+    private func pickTailnet(_ mode: PeerTailnetMode) {
+        let argv = PeerCommand.tailnet(mode)
+        tailnetPressFailure = nil
+        controller.run(argv)
+        Task { @MainActor in
+            while controller.isPending(argv) {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            if controller.refusal.verb == argv, let message = controller.refusal.message {
+                showTailnetPressFailure(.pickRefused(message))
+            }
+            readTailnet()
+        }
+    }
+
+    /// Say a failed press on the row's line, for 30 seconds or until the next
+    /// press. Not forever: a failure left up after the setting has moved on
+    /// would be the line contradicting the state it covers.
+    private func showTailnetPressFailure(_ failure: PeerTailnetPressFailure) {
+        tailnetPressFailure = failure
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
+            if tailnetPressFailure == failure { tailnetPressFailure = nil }
+        }
+    }
+
+    /// "Open Tailscale", on the app-not-running line. Either build of the app,
+    /// the standalone one first. Neither installed, or a refusal to open, is
+    /// said on the row's line rather than swallowed.
+    private func openTailscaleApp() {
+        tailnetPressFailure = nil
+        let ids = ["io.tailscale.ipn.macsys", "io.tailscale.ipn.macos"]
+        guard
+            let url = ids.lazy.compactMap({
+                NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)
+            }).first
+        else {
+            showTailnetPressFailure(.appNotOpened(nil))
+            return
+        }
+        NSWorkspace.shared.openApplication(at: url, configuration: .init()) { _, error in
+            guard let error else { return }
+            let reason = error.localizedDescription
+            Task { @MainActor in showTailnetPressFailure(.appNotOpened(reason)) }
         }
     }
 

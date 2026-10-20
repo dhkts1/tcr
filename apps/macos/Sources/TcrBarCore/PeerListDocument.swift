@@ -328,6 +328,14 @@ public struct PeerListDocument: Decodable, Equatable, Sendable {
         /// one invented path. The figures on each path are the prober's and
         /// arrive `nil` until it lands; see ``PeerPath``.
         public var paths: [PeerPath]
+        /// Found rows: every source that saw this Mac in the last 60 s
+        /// (tailnet contract section 3). Empty from a `tcr` that predates the
+        /// key, which draws as before: no `tailnet` pill.
+        public var sources: [PeerSource]
+        /// Trusted rows: present when the row's newest endpoint is a tailnet
+        /// address this Mac knows. `nil` when absent or `null`, and from a
+        /// `tcr` that predates the key.
+        public var tailnet: PeerTailnetPath?
 
         public init(
             id: String? = nil, display: String? = nil, name: String? = nil, address: String? = nil,
@@ -336,7 +344,8 @@ public struct PeerListDocument: Decodable, Equatable, Sendable {
             inFlight: Int? = nil, leaseSpent: Double? = nil, leaseTtlSeconds: Int? = nil,
             bytesPerHour: Int64? = nil, byteCapPerHour: Int64? = nil, noHeadroom: Bool = false,
             until: Int64? = nil, ended: Bool? = nil, lend: [PeerLendGrant] = [],
-            tokensPerHour: Int64? = nil, paths: [PeerPath] = []
+            tokensPerHour: Int64? = nil, paths: [PeerPath] = [], sources: [PeerSource] = [],
+            tailnet: PeerTailnetPath? = nil
         ) {
             self.id = id
             self.display = display
@@ -357,6 +366,8 @@ public struct PeerListDocument: Decodable, Equatable, Sendable {
             self.lend = lend
             self.tokensPerHour = tokensPerHour
             self.paths = paths
+            self.sources = sources
+            self.tailnet = tailnet
         }
 
         /// One pinned Mac's row, in EITHER of the two spellings this app is
@@ -436,12 +447,18 @@ public struct PeerListDocument: Decodable, Equatable, Sendable {
             // server too old to know the key have both told this Mac no way to
             // reach that one, and the row draws the address line it always did.
             self.paths = try c.decodeIfPresent([PeerPath].self, forKey: .paths) ?? []
+            // Tailnet contract section 3. Both optional on the wire, so an
+            // older `tcr` without them decodes exactly as before.
+            self.sources =
+                (try c.decodeIfPresent([String].self, forKey: .sources) ?? [])
+                .map(PeerSource.init(token:))
+            self.tailnet = try c.decodeIfPresent(PeerTailnetPath.self, forKey: .tailnet)
         }
 
         private enum Keys: String, CodingKey {
             case id, display, name, address, trusted, lastSeenMs, carries, serves, inFlight
             case leaseSpent, leaseTtlSeconds, bytesPerHour, byteCapPerHour, noHeadroom
-            case until, ended, lend, tokensPerHour, paths
+            case until, ended, lend, tokensPerHour, paths, sources, tailnet
             // The `tcr peer ls --json` spellings of the first four.
             case node, label, endpoints, allow
         }
@@ -733,6 +750,10 @@ extension PeerListDocument.PeerEntry {
         out.ended = measured.ended ?? ended
         out.lend = measured.lend.isEmpty ? lend : measured.lend
         out.paths = measured.paths.isEmpty ? paths : measured.paths
+        // Tailnet keys are measurements too (the running process saw the Mac
+        // on a tailnet), so the live half wins where it said anything.
+        out.sources = measured.sources.isEmpty ? sources : measured.sources
+        out.tailnet = measured.tailnet ?? tailnet
         return out
     }
 }
