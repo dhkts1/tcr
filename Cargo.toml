@@ -457,6 +457,9 @@ tcr = { path = ".", features = ["test-support"] }
 # Compiles `src/test_support` into the library for the integration tests (see the
 # dev-dependency above). Never on in a release build: nothing outside tests enables it.
 test-support = []
+# tcr joins a tailnet as its own node (`tcr peer tailnet node`). Off by default and in release
+# builds; empty until the node itself lands. Without it, `tcr peer tailnet node` is refused.
+tailnet-node = []
 
 # Incremental compilation is off, and stays off. sccache cannot serve an incremental compile
 # (`sccache --show-stats` lists it under `Non-cacheable reasons: incremental`), so with it on every

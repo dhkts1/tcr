@@ -3195,6 +3195,73 @@ new address from it. There is no separate `tcr peer drop-status` verb; this read
 lives, on `--json` under a `deadDrop` key. Publishing itself leaves nothing on this Mac to read
 back: the write lands on the store, never on the peers file, so no last-publish time is printed.
 
+### `tcr peer tailnet [off\|app\|node]`
+
+Sets, or with no argument prints, how this Mac uses a tailnet. Off by default.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `[off\|app\|node]` | positional | prints current | `off`: no tailnet use. `app`: read the Tailscale app already running on this Mac to find your own other Macs. `node`: tcr joins a tailnet as its own node |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file (and the state file beside it) to use |
+| `--json` | bool | `false` | machine-readable output, below |
+
+Setting a mode writes `"tailnet"` into the peers file under its lock, the way `tcr peer find`
+writes `discovery`; `off` removes the key. The setting is read on every use, never from a
+boot-time snapshot, so it needs no restart. `node` is refused, with the file left alone, by a
+`tcr` built without the `tailnet-node` cargo feature; release builds do not have it. A word this
+`tcr` does not know (one a newer `tcr` wrote) still loads: it is treated as off, kept in the file
+as written, and the no-argument form prints a line saying so.
+
+With no argument it prints `peer.tailnet: <mode>`, and in `app` mode one live read of the
+Tailscale app: this Mac's tailnet address, then one line per Mac of yours that is online
+(signed in to Tailscale as the same user as this Mac, untagged, not shared in from another
+tailnet, and reporting macOS or no OS), with its address and `direct`, `relayed` or `route
+unknown`. A missing or stopped app is a line saying so, not an error exit. The CLI is looked
+for at `/Applications/Tailscale.app/Contents/MacOS/Tailscale`, then
+`/usr/local/bin/tailscale`, then `/opt/homebrew/bin/tailscale`, never on `PATH`, because a Mac
+can hold two Tailscale CLIs at different versions. It runs `status --json` and is killed after
+5 seconds.
+
+`--json` prints the setting and what the running `tcr` recorded, and never runs the app:
+
+```json
+{
+  "mode": "app",
+  "nodeSupported": false,
+  "held": {
+    "mode": "app",
+    "state": "ready",
+    "address": "100.64.0.7",
+    "nodeName": null,
+    "found": 2,
+    "connected": 0,
+    "detail": null,
+    "recordedAtMs": 1760000000000
+  }
+}
+```
+
+- `mode`: the setting, as the peers file says now: the word as written, including one this `tcr`
+  does not know (which it treats as off).
+- `nodeSupported`: whether this binary was built with the `tailnet-node` feature.
+- `held`: what the serving process recorded on its last tailnet tick, read off
+  `peer-state.json` the way `tcr peer reach` reads the router mapping. `null` when no server has
+  recorded one. A `recordedAtMs` older than 60 seconds is stale.
+  - `mode`: the mode the server acted on, which lags `mode` by up to 20 seconds.
+  - `state`: `off`, `ready`, `appMissing` (no Tailscale CLI at any of the three paths),
+    `appNotRunning` (the app is not connected, or the CLI could not reach it), `readFailed`
+    (the CLI timed out, could not start, or printed something that did not parse; `detail`
+    says which), `nodeNotJoined`, `nodeConnecting`, `nodeUnsupported`, or `unknown` (a word
+    this `tcr` does not know, from a newer server). Every field of `held` has a default, so a
+    record from a different version always reads.
+  - `address`: this Mac's tailnet IPv4 in that mode, or `null`.
+  - `nodeName`: node mode only, the name on the tailnet.
+  - `found`: app mode, your Macs that sent a beacon in the last 60 seconds.
+  - `connected`: node mode, paired Macs with a live connection through the node.
+  - `detail`: one plain sentence for a failure state, else `null`.
+
+No server records `held` yet, so today it is always `null`.
+
 ### `tcr peer graph <--json\|--serve>`
 
 Prints, or serves, the mesh as this Mac currently sees it: pinned peers, the paths to each,

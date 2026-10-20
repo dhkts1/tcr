@@ -160,3 +160,7 @@ pub mod dialaddrs;
 /// The sealed exchange: an ask that names no address, and a reply sealed to
 /// it that names no address either.
 pub mod ask;
+
+/// Reading the Tailscale app already running on this Mac: its CLI, under a
+/// deadline, parsed once. Called by `tcr peer tailnet` only, so far.
+pub mod tailscale_app;
