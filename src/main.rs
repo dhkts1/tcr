@@ -6546,7 +6546,7 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         }
         let helpers = if matches!(launch, CodexLaunch::SeeThrough { .. }) {
             let (helpers, lines) =
-                tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path)?;
+                tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path, false)?;
             for line in lines {
                 eprintln!("{line}");
             }
@@ -6636,7 +6636,7 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
             Some(ca) => {
                 let mut lines = apply_see_through_env(&mut cmd, port, &ca, &launch_key);
                 let (owner, notices) =
-                    tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path)?;
+                    tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path, true)?;
                 helpers = Some(owner);
                 lines.extend(notices);
                 lines

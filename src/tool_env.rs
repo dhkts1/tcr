@@ -140,18 +140,22 @@ pub(crate) fn apply(
     cmd: &mut Command,
     claude: &Path,
     config: &Path,
+    claude_shell: bool,
 ) -> anyhow::Result<(tempfile::TempDir, Vec<String>)> {
     let claude = executable(claude);
-    let tcr = std::env::current_exe()?;
+    let tcr = std::env::current_exe()?.canonicalize()?;
     let config = std::path::absolute(config)?;
     let codex_bin = tcr::codex_local::find_codex()
         .ok()
         .and_then(|found| executable(&found.path));
+    let helper_parent = std::path::absolute(tcr::paths::cache_dir().root().join("tool-env"))?;
     let original = |key: &str, saved: &str| {
         inherited(cmd, key)
             .filter(|v| !v.is_empty())
             .and_then(|value| {
-                if tcr::codex_local::is_tool_launcher(Path::new(&value)) {
+                if tcr::codex_local::is_tool_launcher(Path::new(&value))
+                    || Path::new(&value).starts_with(&helper_parent)
+                {
                     std::env::var(saved).ok().filter(|v| !v.is_empty())
                 } else {
                     Some(value)
@@ -163,7 +167,10 @@ pub(crate) fn apply(
     // executable breaks every shell command. Refuse unsupported flag syntax
     // before starting the agent rather than silently changing its meaning.
     anyhow::ensure!(
-        !prefix.as_ref().is_some_and(|p| p.contains(" -")),
+        !claude_shell
+            || !prefix
+                .as_ref()
+                .is_some_and(|p| p.contains(" -") && !Path::new(p).is_file()),
         "CLAUDE_CODE_SHELL_PREFIX with flags is not supported by tcr's shell routing; use an executable wrapper script instead"
     );
     let env_file = original("CLAUDE_ENV_FILE", "TCR_TOOL_ORIGINAL_ENV_FILE");
@@ -228,10 +235,10 @@ pub(crate) fn apply(
     cmd.env("TCR_TOOL_CLAUDE_CA", tcr::mitm::minted_ca_path());
     let prepend = format!("export PATH={}:\"$PATH\"\n", quote(path_text(root)?));
     let mut env_script = String::from("#!/bin/sh\n# tcr tool launcher\n");
+    env_script.push_str(&cleanup);
     if let Some(file) = &env_file {
         env_script.push_str(&format!(". {}\n", quote(file)));
     }
-    env_script.push_str(&cleanup);
     env_script.push_str(&prepend);
     publish(&root.join("shell-env"), &env_script)?;
     let exec = match prefix {
@@ -247,11 +254,17 @@ pub(crate) fn apply(
         quote(path_text(&root.join("shell-prefix"))?),
         quote(path_text(&root.join("shell-env"))?),
     );
+    let mut nested_cleanup = String::new();
+    for key in ["HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS"] {
+        nested_cleanup.push_str(&format!(
+            "if [ \"${{{key}:-}}\" = \"${{TCR_TOOL_CALLER_{key}:-}}\" ]; then unset {key}; fi\n"
+        ));
+    }
     if let Some(bin) = claude {
         publish(
             &root.join("claude"),
             &format!(
-                "#!/bin/sh\n# tcr tool launcher\n{restore}: \"${{HTTPS_PROXY:=${{TCR_TOOL_CLAUDE_PROXY}}}}\"\n: \"${{https_proxy:=$HTTPS_PROXY}}\"\n: \"${{NODE_EXTRA_CA_CERTS:=${{TCR_TOOL_CLAUDE_CA}}}}\"\n: \"${{ANTHROPIC_BASE_URL:=https://api.anthropic.com}}\"\nexport HTTPS_PROXY https_proxy NODE_EXTRA_CA_CERTS ANTHROPIC_BASE_URL\nexec {} \"$@\"\n",
+                "#!/bin/sh\n# tcr tool launcher\n{restore}{nested_cleanup}: \"${{HTTPS_PROXY:=${{TCR_TOOL_CLAUDE_PROXY}}}}\"\n: \"${{https_proxy:=$HTTPS_PROXY}}\"\n: \"${{NODE_EXTRA_CA_CERTS:=${{TCR_TOOL_CLAUDE_CA}}}}\"\n: \"${{ANTHROPIC_BASE_URL:=https://api.anthropic.com}}\"\nexport HTTPS_PROXY https_proxy NODE_EXTRA_CA_CERTS ANTHROPIC_BASE_URL\nexec {} \"$@\"\n",
                 quote(path_text(&bin)?),
             ),
         )?;
@@ -276,5 +289,12 @@ pub(crate) fn apply(
     );
     cmd.env("CLAUDE_CODE_SHELL_PREFIX", root.join("shell-prefix"));
     cmd.env("CLAUDE_ENV_FILE", root.join("shell-env"));
-    Ok((directory, vec!["[tcr] shell tools use the caller's proxy and CA settings; nested claude/codex on PATH use the pool unless explicitly overridden".into()]))
+    Ok((
+        directory,
+        if claude_shell {
+            vec!["[tcr] shell tools use the caller's proxy and CA settings; nested claude/codex on PATH use the pool unless explicitly overridden".into()]
+        } else {
+            Vec::new()
+        },
+    ))
 }
