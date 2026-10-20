@@ -319,6 +319,13 @@ jobs:
       - name: Clippy (macOS-only code)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # tcr's own tailnet node (`src/peer/tailnet_node.rs`) compiles only with
+      # the `tailnet-node` feature on Apple silicon, which no release build and
+      # no other step here turns on. Without this the library adapter can rot
+      # unseen. macos-latest is Apple silicon, the one target it supports.
+      - name: Clippy (tailnet-node feature)
+        run: cargo clippy --workspace --all-targets --locked --features tailnet-node -- -D warnings
+
       # Recorded so a runner-image bump that changes the Swift language mode is
       # attributable from the log rather than looking like a source regression.
       - name: Swift toolchain version
