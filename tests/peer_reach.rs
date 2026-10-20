@@ -1655,6 +1655,49 @@ async fn bind_one_of(ports: &[u16]) -> (tokio::net::TcpListener, u16) {
     panic!("none of {ports:?} could be bound on loopback");
 }
 
+/// How many stand-in handshake hashes [`a_handshake_whose_current_port_binds`]
+/// tries. Each one's current-slot port is an independent draw from forty
+/// thousand, so needing more than a couple means loopback is nearly full, and
+/// that is worth a failure rather than a longer search.
+const STAND_IN_HANDSHAKES: u8 = 8;
+
+/// A stand-in handshake hash whose pair's CURRENT-slot port this process can
+/// bind on loopback, with that port bound and returned.
+///
+/// One derived port is a single machine-chosen number in 20000..60000, and a
+/// CI runner had it taken on 2026-10-20 (`none of [55978] could be bound`),
+/// which failed a test whose subject is the derivation and not that port. A
+/// test that stands in for a handshake may pick its handshake, so this tries
+/// `[seed; 48]` first and then the same bytes with the first one stepped, and
+/// keeps the first whose current port binds. The dialler tries the current
+/// port first (`reach::accepted_ports` order), so holding exactly that one is
+/// what keeps the dial from landing on whatever owns a busy port.
+///
+/// Panics, never skips, when none of them bind.
+async fn a_handshake_whose_current_port_binds(
+    seed: u8,
+) -> ([u8; 48], tokio::net::TcpListener, u16) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs();
+    let slot = reach::current_slot(now);
+    let mut busy = Vec::new();
+    for step in 0..STAND_IN_HANDSHAKES {
+        let mut handshake_hash = [seed; 48];
+        handshake_hash[0] = seed.wrapping_add(step);
+        let port = reach::accepted_ports(&reach::port_secret(&handshake_hash), slot)[0];
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(bound) => return (handshake_hash, bound, port),
+            Err(err) => busy.push(format!("{port} ({err})")),
+        }
+    }
+    panic!(
+        "none of {STAND_IN_HANDSHAKES} stand-in handshakes had a current-slot port this \
+         process could bind on loopback: {busy:?}"
+    );
+}
+
 /// **The gate for item 3**: the recorded port is dead, and the dial lands on
 /// the pair's rendezvous port for the current slot.
 ///
@@ -2088,8 +2131,10 @@ async fn a_restart_reaches_a_peer_on_the_derived_port_from_the_peers_file() {
 
     let node = tcr_peer_wire::PeerId([0x44; 32]);
     // Stands in for a completed handshake: the value never leaves this test,
-    // and what matters is that the FILE holds something else.
-    let handshake_hash = [0x7e_u8; 48];
+    // and what matters is that the FILE holds something else. Chosen so its
+    // current-slot port is free here, and that port is held from now until the
+    // dial: see `a_handshake_whose_current_port_binds`.
+    let (handshake_hash, listening, port) = a_handshake_whose_current_port_binds(0x7e).await;
     let secret = reach::port_secret(&handshake_hash);
     let hash_hex: String = handshake_hash.iter().map(|b| format!("{b:02x}")).collect();
     let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
@@ -2150,12 +2195,6 @@ async fn a_restart_reaches_a_peer_on_the_derived_port_from_the_peers_file() {
         "and the register holds exactly what the file did, byte for byte"
     );
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("a clock after 1970")
-        .as_secs();
-    let ports = reach::accepted_ports(&secret, reach::current_slot(now));
-    let (listening, port) = bind_one_of(&ports[..1]).await;
     let accepting = tokio::spawn(async move { listening.accept().await.map(|(_, from)| from) });
 
     let dead = a_closed_loopback_port().await;
