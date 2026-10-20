@@ -50,15 +50,23 @@ public enum PeerTailnetMode: String, CaseIterable, Equatable, Sendable {
 
 /// One `tcr peer tailnet --json` answer.
 public struct PeerTailnetReading: Equatable, Sendable {
-    /// The setting as the file says now.
+    /// The setting as the file says now, as `tcr` acts on it: a word this
+    /// build does not know is ``PeerTailnetMode/off``, which is what `tcr`
+    /// itself treats it as (`TailnetSetting::effective`).
     public var mode: PeerTailnetMode
+    /// The setting's own word when it is not one of the three, kept so the
+    /// row can say so rather than draw a plain Off. `nil` for a known mode.
+    public var unknownModeWord: String?
     /// This `tcr` was built with the `tailnet-node` feature.
     public var nodeSupported: Bool
     /// What the serving process last recorded, or `nil` when none has.
     public var held: Held?
 
-    public init(mode: PeerTailnetMode, nodeSupported: Bool, held: Held?) {
+    public init(
+        mode: PeerTailnetMode, unknownModeWord: String? = nil, nodeSupported: Bool, held: Held?
+    ) {
         self.mode = mode
+        self.unknownModeWord = unknownModeWord
         self.nodeSupported = nodeSupported
         self.held = held
     }
@@ -99,9 +107,10 @@ public struct PeerTailnetReading: Equatable, Sendable {
         }
     }
 
-    /// Every `held.state` the contract names, plus the raw token for one
-    /// this build does not know, which draws as itself rather than as a
-    /// state it is not.
+    /// Every `held.state` the contract names. `"unknown"` (a newer `tcr`'s
+    /// word, as the writer recorded it) and any token this build does not
+    /// know both land in ``unknown(_:)`` with the word kept, and the row
+    /// treats that record like a stale one: nothing in it is drawn as true.
     public enum State: Equatable, Sendable {
         case off
         case ready
@@ -130,11 +139,16 @@ public struct PeerTailnetReading: Equatable, Sendable {
 
     /// Decode one `tcr peer tailnet --json` payload.
     ///
-    /// `mode` is required and must be one of the three: a setting this build
-    /// cannot name is not a setting the picker can show, so it throws and the
-    /// row says it could not read the answer. `held` is optional, and a
-    /// `held` missing `mode`, `state` or `recordedAtMs` reads as no record:
-    /// a partial record is not a state to draw.
+    /// `mode` must be a string; a word that is not one of the three decodes
+    /// as Off with the word kept (``unknownModeWord``), the way `tcr` reads
+    /// its own file, so a newer `tcr`'s mode does not blank the row. A `mode`
+    /// that is missing or not a string throws: that is not `tcr`'s shape.
+    ///
+    /// `held` is optional, and a `held` missing `mode`, `state` or
+    /// `recordedAtMs` reads as no record: a partial record is not a state to
+    /// draw. A `held.mode` word this build does not know makes the record's
+    /// state ``State/unknown(_:)`` with that word, so it is treated like a
+    /// stale record rather than read as a mode it is not.
     public static func decode(_ data: Data) throws -> PeerTailnetReading {
         let top = try JSONSerialization.jsonObject(with: data)
         guard let object = top as? [String: Any] else {
@@ -144,17 +158,16 @@ public struct PeerTailnetReading: Equatable, Sendable {
                     debugDescription:
                         "tcr peer tailnet --json emits a JSON object; got \(type(of: top))"))
         }
-        guard let token = object["mode"] as? String, let mode = PeerTailnetMode(rawValue: token)
-        else {
+        guard let token = object["mode"] as? String else {
             throw DecodingError.dataCorrupted(
                 .init(
                     codingPath: [],
-                    debugDescription:
-                        "tcr peer tailnet --json named no mode this build knows: "
-                        + String(describing: object["mode"] ?? "nothing")))
+                    debugDescription: "tcr peer tailnet --json named no mode"))
         }
+        let mode = PeerTailnetMode(rawValue: token)
         return PeerTailnetReading(
-            mode: mode,
+            mode: mode ?? .off,
+            unknownModeWord: mode == nil ? token : nil,
             nodeSupported: object["nodeSupported"] as? Bool ?? false,
             held: held(object["held"]))
     }
@@ -162,13 +175,13 @@ public struct PeerTailnetReading: Equatable, Sendable {
     static func held(_ value: Any?) -> Held? {
         guard let object = value as? [String: Any],
             let modeToken = object["mode"] as? String,
-            let mode = PeerTailnetMode(rawValue: modeToken),
             let stateToken = object["state"] as? String,
             let recorded = (object["recordedAtMs"] as? NSNumber)?.int64Value
         else { return nil }
+        let mode = PeerTailnetMode(rawValue: modeToken)
         return Held(
-            mode: mode,
-            state: State(token: stateToken),
+            mode: mode ?? .off,
+            state: mode == nil ? .unknown(modeToken) : State(token: stateToken),
             address: object["address"] as? String,
             nodeName: object["nodeName"] as? String,
             found: object["found"] as? Int,
@@ -291,13 +304,23 @@ public enum PeerTailnetState: Equatable, Sendable {
     case applying
     case appReady(address: String?, found: Int?)
     case appMissing
-    case appNotRunning
+    /// The app is not connected, or the CLI could not reach it (contract
+    /// section 2). `detail` is the record's own sentence when it gave one,
+    /// which is how the second case is told from the first: the mockup's
+    /// "not running" is only said when nothing more specific was recorded.
+    case appNotRunning(detail: String?)
     case readFailed(String?)
     case nodeReady(name: String?, address: String?, connected: Int?)
     case nodeNotJoined
     case nodeConnecting
     case nodeUnsupported
+    /// The record carries a state or mode word this build does not know
+    /// (`"unknown"` included, a newer `tcr`'s word). Treated like a stale
+    /// record: amber, nothing in it drawn as true.
     case unknownState(String)
+    /// The setting itself is a word this build does not know, which `tcr`
+    /// treats as off.
+    case unknownSetting(String)
 
     /// A record older than this is stale (contract section 2).
     public static let staleAfterMs: Int64 = 60_000
@@ -325,10 +348,14 @@ public enum PeerTailnetState: Equatable, Sendable {
         case .unreadable(let message): return .unreadable(message)
         case .read(let r): reading = r
         }
+        if let word = reading.unknownModeWord { return .unknownSetting(word) }
         guard reading.mode != .off else { return .off }
         guard let held = reading.held else { return .notReported }
         let nowMs = Int64((now.timeIntervalSince1970 * 1000).rounded())
         guard nowMs - held.recordedAtMs <= staleAfterMs else { return .stale }
+        // Before the mode comparison: a record with a word this build cannot
+        // read is treated like a stale one, whatever mode it names.
+        if case .unknown(let word) = held.state { return .unknownState(word) }
         guard held.mode == reading.mode else { return .applying }
         switch held.state {
         case .off: return .applying
@@ -337,7 +364,7 @@ public enum PeerTailnetState: Equatable, Sendable {
                 ? .nodeReady(name: held.nodeName, address: held.address, connected: held.connected)
                 : .appReady(address: held.address, found: held.found)
         case .appMissing: return .appMissing
-        case .appNotRunning: return .appNotRunning
+        case .appNotRunning: return .appNotRunning(detail: held.detail)
         case .readFailed: return .readFailed(held.detail)
         case .nodeNotJoined: return .nodeNotJoined
         case .nodeConnecting: return .nodeConnecting
@@ -371,8 +398,9 @@ public enum PeerTailnetState: Equatable, Sendable {
                 .compactMap { $0 }.joined(separator: " \u{00B7} ")
         case .appMissing:
             return "No Tailscale app was found on this Mac."
-        case .appNotRunning:
-            return "The Tailscale app is not running on this Mac."
+        case .appNotRunning(let detail):
+            return detail.map { "The Tailscale app did not answer: \($0)" }
+                ?? "The Tailscale app is not running on this Mac."
         case .readFailed(let detail):
             return detail.map { "Could not read the Tailscale app: \($0)" }
                 ?? "Could not read the Tailscale app."
@@ -385,8 +413,11 @@ public enum PeerTailnetState: Equatable, Sendable {
             return "Connecting to Tailscale\u{2026}"
         case .nodeUnsupported:
             return "tcr's own node is not in this build of tcr."
-        case .unknownState(let token):
-            return "tcr reported a Tailscale state this build cannot read: \(token)."
+        case .unknownState(let word):
+            return "Update TcrBar: it cannot read tcr's Tailscale state (\(word))."
+        case .unknownSetting(let word):
+            return "The Tailscale setting is \"\(word)\", which this TcrBar does not know. "
+                + "tcr treats it as off."
         }
     }
 
@@ -394,7 +425,7 @@ public enum PeerTailnetState: Equatable, Sendable {
         switch self {
         case .appReady, .nodeReady: return .ok
         case .unreadable, .pressFailed, .stale, .appMissing, .appNotRunning, .readFailed, .nodeNotJoined,
-            .nodeUnsupported, .unknownState:
+            .nodeUnsupported, .unknownState, .unknownSetting:
             return .warn
         case .notRead, .unsupportedTcr, .off, .notReported, .applying, .nodeConnecting:
             return .plain

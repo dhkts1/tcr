@@ -59,13 +59,55 @@ final class PeerTailnetTests: XCTestCase {
         XCTAssertFalse(reading.nodeSupported, "an absent nodeSupported is not a supported node")
     }
 
-    /// A mode this build cannot name is not a picker selection: it throws, and
-    /// the read becomes `unreadable`, never a guessed mode.
-    func testAnUnknownModeIsUnreadableNotGuessed() {
-        XCTAssertThrowsError(try PeerTailnetReading.decode(Data(#"{"mode":"funnel"}"#.utf8)))
-        guard case .unreadable = PeerTailnetRead.output(#"{"mode":"funnel"}"#) else {
-            return XCTFail("an unknown mode must read as unreadable")
+    /// A setting word this build cannot name decodes the way `tcr` reads its
+    /// own file, as Off, with the word kept and said on the row. Only a
+    /// payload with no string `mode` at all is unreadable.
+    func testAnUnknownModeWordIsOffAndSaidNotAFailedRead() throws {
+        let reading = try PeerTailnetReading.decode(
+            Data(#"{"mode":"both","nodeSupported":false,"held":null}"#.utf8))
+        XCTAssertEqual(reading.mode, .off)
+        XCTAssertEqual(reading.unknownModeWord, "both")
+        let state = PeerTailnetState.state(.read(reading), now: now)
+        XCTAssertEqual(state, .unknownSetting("both"))
+        XCTAssertTrue(state.line.contains("\"both\""))
+        XCTAssertEqual(state.tone, .warn)
+
+        XCTAssertThrowsError(try PeerTailnetReading.decode(Data(#"{"held":null}"#.utf8)))
+        guard case .unreadable = PeerTailnetRead.output(#"{"mode":7}"#) else {
+            return XCTFail("a mode that is not a string must read as unreadable")
         }
+    }
+
+    /// The contract's `"unknown"` state word (a newer tcr's) decodes, keeps
+    /// the rest of the payload, and is treated like a stale record: amber,
+    /// no link, nothing drawn as working. Same for a record whose MODE word is
+    /// unknown, which must not be read as a mode change in progress.
+    func testTheUnknownStateWordDoesNotFailTheDecodeAndReadsLikeStale() throws {
+        let json = """
+            {"mode":"app","nodeSupported":false,"held":{"mode":"app","state":"unknown",
+             "address":"100.64.0.7","found":2,"recordedAtMs":\(freshMs)}}
+            """
+        let reading = try PeerTailnetReading.decode(Data(json.utf8))
+        XCTAssertEqual(reading.held?.state, .unknown("unknown"))
+        XCTAssertEqual(reading.held?.address, "100.64.0.7", "the rest of the record still decodes")
+        let state = PeerTailnetState.state(.read(reading), now: now)
+        XCTAssertEqual(state, .unknownState("unknown"))
+        XCTAssertEqual(state.tone, PeerTailnetState.stale.tone)
+        XCTAssertEqual(state.link, PeerTailnetState.stale.link)
+
+        let futureMode = PeerTailnetRead.output(
+            #"{"mode":"app","held":{"mode":"both","state":"ready","recordedAtMs":\#(freshMs)}}"#)
+        XCTAssertEqual(PeerTailnetState.state(futureMode, now: now), .unknownState("both"))
+    }
+
+    /// `appNotRunning` also covers a CLI that could not reach the app. When
+    /// the record says why, the row says that instead of "not running".
+    func testAnUnreachableAppSaysTheRecordsReason() {
+        let state = PeerTailnetState.state(
+            read(.app, .appNotRunning, detail: "tailscale status exited 1"), now: now)
+        XCTAssertEqual(state.line, "The Tailscale app did not answer: tailscale status exited 1")
+        XCTAssertEqual(state.link, .openApp)
+        XCTAssertEqual(state.tone, .warn)
     }
 
     /// A state token added on the Rust side draws as itself.
@@ -193,7 +235,8 @@ final class PeerTailnetTests: XCTestCase {
         let states: [PeerTailnetState] = [
             .notRead, .unsupportedTcr, .unreadable("x"), .pressFailed("x"), .off, .notReported,
             .stale, .applying, .appReady(address: nil, found: nil),
-            .appReady(address: "100.64.0.7", found: 0), .appMissing, .appNotRunning,
+            .appReady(address: "100.64.0.7", found: 0), .appMissing,
+            .appNotRunning(detail: nil), .appNotRunning(detail: "x"), .unknownSetting("x"),
             .readFailed(nil), .readFailed("timed out"),
             .nodeReady(name: nil, address: nil, connected: nil),
             .nodeReady(name: "tcr-studio", address: "100.64.0.9", connected: 2), .nodeNotJoined,
@@ -278,6 +321,34 @@ final class PeerTailnetTests: XCTestCase {
         XCTAssertNil(document.peers[2].tailnet)
         XCTAssertEqual(document.peers[3].sources, [])
         XCTAssertNil(document.peers[3].tailnet)
+    }
+
+    /// The trusted row's `tailnet` key ships in the SERVER's payload,
+    /// `tcr peer status --json` (`PeerStatusRow`), not in `peer ls`. Decoded
+    /// through the live read and folded onto the file's row by id, it reaches
+    /// the pills; an unknown route word keeps the row and its `tailnet` pill.
+    func testTheStatusPayloadsTailnetKeyReachesTheTrustedRow() throws {
+        let status = """
+            {"supported": true, "peers": [
+              {"id": "tcr-aaaa", "display": "tcr-aaaa", "name": "office-mini",
+               "address": "100.64.0.8:7755", "trusted": true, "tailnet": {"route": "relayed"}},
+              {"id": "tcr-bbbb", "name": "laptop-2", "address": "100.64.0.9:7755",
+               "trusted": true, "tailnet": {"route": "peerRelay"}},
+              {"id": "tcr-cccc", "name": "desk", "trusted": true, "tailnet": null}
+            ]}
+            """
+        let live = try PeerListDocument.decodeLivePeers(Data(status.utf8))
+        XCTAssertEqual(live.unreadable, 0, "a tailnet key must not make a status row unreadable")
+        let file = PeerListDocument(
+            peers: [
+                .init(id: "tcr-aaaa", name: "office-mini", trusted: true),
+                .init(id: "tcr-bbbb", name: "laptop-2", trusted: true),
+                .init(id: "tcr-cccc", name: "desk", trusted: true),
+            ])
+        let merged = file.mergingLive(live).peers
+        XCTAssertEqual(
+            merged.map { PeerTailnetPill.trusted($0.tailnet) },
+            [[.tailnet, .relayed], [.tailnet], []])
     }
 
     /// The live half is where the tailnet keys are measured, so it wins, and

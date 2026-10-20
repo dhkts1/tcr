@@ -3084,6 +3084,20 @@ enum RenderStates {
             scene("x-applying", read(.app, held(.off, .off)), nil),
             scene("x-app-missing", read(.app, held(.app, .appMissing)), nil),
             scene(
+                "x-app-unreachable",
+                read(
+                    .app,
+                    .init(
+                        mode: .app, state: .appNotRunning,
+                        detail: "tailscale status exited 1", recordedAtMs: at(5))), nil),
+            scene("x-unknown-word", read(.app, held(.app, .unknown("unknown"))), nil),
+            scene(
+                "x-unknown-setting",
+                .read(
+                    PeerTailnetReading(
+                        mode: .off, unknownModeWord: "both", nodeSupported: false, held: nil)),
+                nil),
+            scene(
                 "x-read-failed",
                 read(
                     .app,
