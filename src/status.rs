@@ -1177,6 +1177,21 @@ pub struct PeerStatusRow {
     /// Every way this Mac knows to reach that one, newest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<PathStatus>,
+    /// Present when the newest endpoint is the tailnet address of a machine
+    /// in the serving process's last fresh reading of the Tailscale app
+    /// ([`crate::peer::state::PeerState::tailnet_route_of`]); absent
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet: Option<PeerTailnetStatus>,
+}
+
+/// The `tailnet` object on a trusted row in the status payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerTailnetStatus {
+    /// How the Tailscale app reaches that Mac, or `null` when it reports
+    /// neither a direct path nor a relay.
+    pub route: Option<crate::peer::state::TailnetRoute>,
 }
 
 /// A peer label, through the shared sanitizer, or `[masked]`.
@@ -1215,6 +1230,18 @@ pub fn peer_status_rows(
             let paths = peer_paths(row, last_seen_ms, state, now_ms);
             let (until, ended) = row_ends(row, state, now_s);
             let live = newest_live_lease(row, state, now_ms);
+            // The newest endpoint, the one `address` below shows.
+            let tailnet = row
+                .endpoints
+                .first()
+                .and_then(|endpoint| match endpoint.locator {
+                    crate::peer::config::Locator::Direct { addr } => {
+                        state.tailnet_route_of(addr.ip(), now_ms)
+                    }
+                    crate::peer::config::Locator::Via { .. }
+                    | crate::peer::config::Locator::Reverse { .. } => None,
+                })
+                .map(|route| PeerTailnetStatus { route });
             PeerStatusRow {
                 id: row.node.to_wire(),
                 display: row.node.display(),
@@ -1242,6 +1269,7 @@ pub fn peer_status_rows(
                 ended,
                 lend: row.lend.clone(),
                 paths,
+                tailnet,
             }
         })
         .collect()
@@ -1984,6 +2012,10 @@ pub struct PeerFoundRow {
     pub trusted: bool,
     /// When it was last heard, Unix milliseconds.
     pub last_seen_ms: i64,
+    /// Every source that heard it: `"lan"` (mDNS) and/or `"tailnet"`. When
+    /// both did, [`Self::address`] is the tailnet one: see
+    /// [`crate::peer::discovery::FoundList::shown`].
+    pub sources: Vec<crate::peer::discovery::FoundSource>,
 }
 
 /// One entry in `tcr peer ls --json`'s `peers` array: a pinned Mac or a found
@@ -3274,6 +3306,7 @@ mod tests {
             address: "198.51.100.7:7755".to_string(),
             trusted: false,
             last_seen_ms: 12_000,
+            sources: vec![crate::peer::discovery::FoundSource::Lan],
         });
         let value = serde_json::to_value(&found).expect("serialize a found row");
         let object = value.as_object().expect("a found row is an object");
@@ -3289,6 +3322,96 @@ mod tests {
             object.get("trusted"),
             Some(&serde_json::Value::Bool(false)),
             "trusted must be written explicitly as false: {object:?}"
+        );
+    }
+
+    /// **A found row carries `sources` as the contract spells it.**
+    #[test]
+    fn a_found_peer_lists_its_sources() {
+        use crate::peer::discovery::FoundSource;
+        let found = PeerFoundRow {
+            name: None,
+            address: "100.64.0.2:7755".to_string(),
+            trusted: false,
+            last_seen_ms: 1,
+            sources: vec![FoundSource::Lan, FoundSource::Tailnet],
+        };
+        assert_eq!(
+            serde_json::to_value(&found).expect("serialize")["sources"],
+            serde_json::json!(["lan", "tailnet"])
+        );
+    }
+
+    /// **A trusted row gains `tailnet: {route}` exactly when its newest
+    /// endpoint is the tailnet address of a machine in the server's last
+    /// fresh reading**, and has no `tailnet` key otherwise.
+    ///
+    /// Watch it fail by building `tailnet` from `row.endpoints.last()`
+    /// instead of `.first()`: the tailnet row then reads its older LAN
+    /// endpoint and loses the key.
+    #[test]
+    fn a_trusted_row_on_a_tailnet_address_carries_its_route() {
+        use crate::peer::config::{Allow, Endpoint, EndpointSource, PeerRow, TailnetMode};
+        use crate::peer::state::{
+            PeerState, TailnetPeer, TailnetRecord, TailnetRoute, TailnetState,
+        };
+
+        let row = |byte: u8, endpoints: &[&str]| PeerRow {
+            node: tcr_peer_wire::PeerId([byte; 32]),
+            label: format!("laptop-{byte}"),
+            endpoints: endpoints
+                .iter()
+                .map(|addr| {
+                    Endpoint::direct(addr.parse().expect("literal"), 1, EndpointSource::Hello)
+                })
+                .collect(),
+            added_at: 1,
+            allow: Allow::default(),
+            lend: Vec::new(),
+            rendezvous_secret: None,
+            sees_us_at: None,
+        };
+        let rows = [
+            row(2, &["100.64.0.2:7755", "192.168.1.20:7755"]),
+            row(3, &["192.168.1.30:7755", "100.64.0.3:7755"]),
+        ];
+        let state = PeerState {
+            tailnet: Some(TailnetRecord {
+                mode: TailnetMode::App.into(),
+                state: TailnetState::Ready,
+                address: Some(std::net::Ipv4Addr::new(100, 64, 0, 1)),
+                recorded_at_ms: 1_000,
+                ..TailnetRecord::default()
+            }),
+            tailnet_peers: vec![
+                TailnetPeer {
+                    addresses: vec!["100.64.0.2".parse().expect("literal")],
+                    route: Some(TailnetRoute::Relayed),
+                },
+                TailnetPeer {
+                    addresses: vec!["100.64.0.3".parse().expect("literal")],
+                    route: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let out = serde_json::to_value(peer_status_rows(&rows, &state, 2_000)).expect("serialize");
+        assert_eq!(out[0]["tailnet"], serde_json::json!({"route": "relayed"}));
+        assert!(
+            out[1].get("tailnet").is_none(),
+            "the newest endpoint is a LAN one: {}",
+            out[1]
+        );
+
+        let stale = serde_json::to_value(peer_status_rows(
+            &rows,
+            &state,
+            1_001 + crate::peer::state::TAILNET_RECORD_STALE_MS,
+        ))
+        .expect("serialize");
+        assert!(
+            stale[0].get("tailnet").is_none(),
+            "a stale reading puts no pill on a row"
         );
     }
 }

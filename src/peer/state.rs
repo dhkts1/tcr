@@ -181,6 +181,14 @@ pub struct PeerState {
     /// older than [`TAILNET_RECORD_STALE_MS`] as stale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tailnet: Option<TailnetRecord>,
+    /// The tailnet machines, in the same reading as [`Self::tailnet`], that
+    /// hold an address some pinned row has as an endpoint, with how the app
+    /// reaches each. Written beside [`Self::tailnet`] by [`save_tailnet`], so
+    /// the status payload can say `tailnet: {route}` on a trusted row without
+    /// running the Tailscale CLI per request. Only pinned Macs are recorded:
+    /// on a shared tailnet the full peer list is other people's machines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tailnet_peers: Vec<TailnetPeer>,
     /// Macs heard announcing on the LAN in the last
     /// [`crate::peer::discovery::FOUND_TTL_MS`], not trusted, not pinned. See
     /// [`Found`]. Written by the serving process's browse task and read by
@@ -419,6 +427,59 @@ pub enum TailnetState {
     Unknown,
 }
 
+/// One tailnet machine a pinned row can be dialled at, as the serving
+/// process last read it from the Tailscale app.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailnetPeer {
+    /// Every tailnet address the app lists for it.
+    pub addresses: Vec<std::net::IpAddr>,
+    /// How the app reaches it, or `None` when the app reports neither a
+    /// direct address nor a relay.
+    #[serde(default)]
+    pub route: Option<TailnetRoute>,
+}
+
+/// How the Tailscale app reaches one machine: `route` in the status
+/// payload's `tailnet` object on a trusted row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TailnetRoute {
+    /// A direct path.
+    Direct,
+    /// Through a Tailscale relay, slower.
+    Relayed,
+}
+
+impl PeerState {
+    /// What the last tailnet reading says about `addr`: `Some(route)` when
+    /// it is the tailnet address of a machine recorded in
+    /// [`Self::tailnet_peers`], `None` otherwise.
+    ///
+    /// `None` too when that reading is no longer one to trust: no record, a
+    /// record older than [`TAILNET_RECORD_STALE_MS`] at `now_ms`, or one that
+    /// did not read the app ([`TailnetState::Ready`] in app mode). A server
+    /// that stopped writing must not keep a pill on a row.
+    pub fn tailnet_route_of(
+        &self,
+        addr: std::net::IpAddr,
+        now_ms: i64,
+    ) -> Option<Option<TailnetRoute>> {
+        let record = self.tailnet.as_ref()?;
+        if record.is_stale(now_ms)
+            || record.mode.effective() != crate::peer::config::TailnetMode::App
+            || record.state != TailnetState::Ready
+        {
+            return None;
+        }
+        let addr = addr.to_canonical();
+        self.tailnet_peers
+            .iter()
+            .find(|peer| peer.addresses.contains(&addr))
+            .map(|peer| peer.route)
+    }
+}
+
 /// `tcr peer tailnet --json`: the setting, whether this binary can act on
 /// `node`, and what the serving process last recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -591,6 +652,16 @@ pub struct Found {
     /// When it was last heard. A row is dropped
     /// [`crate::peer::discovery::FOUND_TTL_MS`] after this.
     pub last_seen_ms: i64,
+    /// Which sources heard it: `lan`, `tailnet`, or both. A file written
+    /// before this key existed reads as `lan`, the only source there was.
+    #[serde(default = "lan_only")]
+    pub sources: Vec<crate::peer::discovery::FoundSource>,
+}
+
+/// [`Found::sources`] for a row written before the key existed: mDNS was
+/// the only way a row was found then.
+fn lan_only() -> Vec<crate::peer::discovery::FoundSource> {
+    vec![crate::peer::discovery::FoundSource::Lan]
 }
 
 impl Found {
@@ -1710,6 +1781,20 @@ pub fn save_found(path: &Path, rows: Vec<Found>, not_shown: usize, now_ms: i64) 
     })
 }
 
+/// Replace ONLY the tailnet record and the pinned tailnet machines read with
+/// it, keeping every other key.
+///
+/// One section for the two because they are one reading: a record saying
+/// "ready" next to machines from an older reading would put a route on a row
+/// the app no longer reaches. The same locked read-modify-write as
+/// [`save_found`], for the same reason.
+pub fn save_tailnet(path: &Path, record: TailnetRecord, peers: Vec<TailnetPeer>) -> Result<()> {
+    replace_section(path, "the tailnet record", move |state| {
+        state.tailnet = Some(record);
+        state.tailnet_peers = peers;
+    })
+}
+
 /// Replace ONLY the held-mapping record, keeping every other key.
 ///
 /// The same locked read-modify-write as [`save_paths`], and its own section
@@ -1998,6 +2083,7 @@ mod tests {
             listen_port: 7755,
             first_seen_ms: last_seen_ms,
             last_seen_ms,
+            sources: lan_only(),
         }
     }
 
@@ -2220,5 +2306,91 @@ mod tests {
             serde_json::to_value(&report).expect("serialize")["mode"],
             "both"
         );
+    }
+
+    /// **A `peer-state.json` written before found rows had sources still
+    /// loads, and each of its rows reads as heard on the LAN.**
+    ///
+    /// Watch it fail by removing `#[serde(default = "lan_only")]` from
+    /// `Found::sources`: the load then fails on the missing key.
+    #[test]
+    fn an_old_state_file_without_sources_still_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("peer-state.json");
+        let id = InstanceId([7_u8; tcr_peer_wire::INSTANCE_ID_BYTES]).to_wire();
+        crate::config::write_atomic(
+            &path,
+            &format!(
+                r#"{{"version": 1, "found": [{{"addr": "192.168.1.20", "instanceId": "{id}",
+                "listenPort": 7755, "firstSeenMs": 1000, "lastSeenMs": 1000}}]}}"#
+            ),
+        )
+        .expect("write an old state file");
+        let (state, origin) = load_with_origin(&path, 1_000).expect("an old file loads");
+        assert!(
+            matches!(origin, StateOrigin::Trusted),
+            "the old file is read and trusted, not put aside: {origin:?}"
+        );
+        assert_eq!(state.found.len(), 1);
+        assert_eq!(
+            state.found[0].sources,
+            [crate::peer::discovery::FoundSource::Lan]
+        );
+    }
+
+    /// **A route is answered only from a fresh, ready, app-mode reading, and
+    /// only for an address a recorded machine holds.**
+    ///
+    /// Watch it fail by removing the `record.is_stale(now_ms)` clause: the
+    /// stale case then still answers `Direct`.
+    #[test]
+    fn a_tailnet_route_comes_only_from_a_fresh_ready_reading() {
+        use crate::peer::config::TailnetMode;
+        let laptop: std::net::IpAddr = "100.64.0.2".parse().expect("literal");
+        let record = |mode: TailnetMode, state| TailnetRecord {
+            mode: mode.into(),
+            state,
+            address: Some(std::net::Ipv4Addr::new(100, 64, 0, 1)),
+            found: 1,
+            recorded_at_ms: 1_000,
+            ..Default::default()
+        };
+        let mut state = PeerState {
+            tailnet: Some(record(TailnetMode::App, TailnetState::Ready)),
+            tailnet_peers: vec![TailnetPeer {
+                addresses: vec![laptop, "fd7a:115c:a1e0::2".parse().expect("literal")],
+                route: Some(TailnetRoute::Direct),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            state.tailnet_route_of(laptop, 2_000),
+            Some(Some(TailnetRoute::Direct))
+        );
+        assert_eq!(
+            state.tailnet_route_of("::ffff:100.64.0.2".parse().expect("literal"), 2_000),
+            Some(Some(TailnetRoute::Direct)),
+            "a v4-mapped endpoint is the same address"
+        );
+        assert_eq!(
+            state.tailnet_route_of("192.168.1.20".parse().expect("literal"), 2_000),
+            None
+        );
+        assert_eq!(
+            state.tailnet_route_of(laptop, 1_001 + TAILNET_RECORD_STALE_MS),
+            None,
+            "stale"
+        );
+        state.tailnet = Some(record(TailnetMode::App, TailnetState::AppNotRunning));
+        assert_eq!(state.tailnet_route_of(laptop, 2_000), None, "not ready");
+        state.tailnet = Some(record(TailnetMode::Off, TailnetState::Off));
+        assert_eq!(state.tailnet_route_of(laptop, 2_000), None, "off");
+
+        // The section round-trips under its camelCase key and is left out
+        // when empty, so an older file is byte-for-byte what it was.
+        let json = serde_json::to_value(&state).expect("serialize");
+        assert_eq!(json["tailnetPeers"][0]["route"], "direct");
+        let empty = serde_json::to_value(PeerState::default()).expect("serialize");
+        assert!(empty.get("tailnetPeers").is_none());
     }
 }

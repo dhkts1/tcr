@@ -162,5 +162,10 @@ pub mod dialaddrs;
 pub mod ask;
 
 /// Reading the Tailscale app already running on this Mac: its CLI, under a
-/// deadline, parsed once. Called by `tcr peer tailnet` only, so far.
+/// deadline, parsed once. Called by `tcr peer tailnet` and the serving
+/// process's browse task.
 pub mod tailscale_app;
+
+/// Finding the operator's own Macs over the tailnet: the beacon socket, the
+/// intake that bounds what it hears, and the record each tick writes.
+pub mod tailnet_find;
