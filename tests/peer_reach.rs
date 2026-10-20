@@ -1640,19 +1640,64 @@ async fn a_closed_loopback_port() -> SocketAddr {
     addr
 }
 
-/// Bind a loopback listener on the FIRST of `ports` the kernel will give.
+/// How many stand-in inputs [`a_stand_in_whose_port_binds`] tries. Each one's
+/// derived port is an independent draw from forty thousand, so needing more
+/// than a couple means loopback is nearly full, and that is worth a failure
+/// rather than a longer search.
+const STAND_INS: u8 = 8;
+
+/// `[seed; N]` with its first byte stepped by `step`: the stand-in secret or
+/// handshake hash [`a_stand_in_whose_port_binds`] tries at `step`. Step 0 is
+/// the plain `[seed; N]`.
+fn stepped<const N: usize>(seed: u8, step: u8) -> [u8; N] {
+    let mut bytes = [seed; N];
+    bytes[0] = seed.wrapping_add(step);
+    bytes
+}
+
+/// A stand-in derivation input (a port secret, or a handshake hash standing in
+/// for a completed handshake) whose derived port this process can bind on
+/// loopback, with that port bound and returned.
 ///
-/// The derived ports are real numbers in 20000..60000 and this machine runs
-/// other things, so a test that insisted on one exact port would be a flake
-/// with a security-shaped failure message. Which of the three it got is
-/// returned, because that is what the assertion is about.
-async fn bind_one_of(ports: &[u16]) -> (tokio::net::TcpListener, u16) {
-    for port in ports {
-        if let Ok(bound) = tokio::net::TcpListener::bind(("127.0.0.1", *port)).await {
-            return (bound, *port);
+/// One derived port is a single machine-chosen number in 20000..60000, and a
+/// CI runner had it taken on 2026-10-20 (`none of [55978] could be bound`),
+/// which failed a test whose subject is the derivation and not that port. A
+/// test that stands in for a handshake may pick its input, so this tries
+/// `stand_in(0)`, `stand_in(1)` and on, and keeps the first whose port binds.
+/// `port_in_slot` names WHICH derived port the test needs (the current slot's,
+/// the previous one's) for the slot this reads off the clock. The listener is
+/// handed back so the caller holds the port until its dial.
+///
+/// Panics, never skips, when none of them bind.
+async fn a_stand_in_whose_port_binds<T>(
+    stand_in: impl Fn(u8) -> T,
+    port_in_slot: impl Fn(&T, u64) -> u16,
+) -> (T, tokio::net::TcpListener, u16) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs();
+    let slot = reach::current_slot(now);
+    let mut busy = Vec::new();
+    for step in 0..STAND_INS {
+        let input = stand_in(step);
+        let port = port_in_slot(&input, slot);
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(bound) => return (input, bound, port),
+            Err(err) => busy.push(format!("{port} ({err})")),
         }
     }
-    panic!("none of {ports:?} could be bound on loopback");
+    panic!(
+        "none of {STAND_INS} stand-in inputs had a derived port this process could bind on \
+         loopback: {busy:?}"
+    );
+}
+
+/// The CURRENT slot's port for `secret`, which is `reach::accepted_ports`'s
+/// first entry and the first rendezvous port a dialler tries, so holding it
+/// keeps the dial from landing on whatever owns a busy port.
+fn current_port(secret: &[u8; 32], slot: u64) -> u16 {
+    reach::accepted_ports(secret, slot)[0]
 }
 
 /// **The gate for item 3**: the recorded port is dead, and the dial lands on
@@ -1665,17 +1710,13 @@ async fn bind_one_of(ports: &[u16]) -> (tokio::net::TcpListener, u16) {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dead_recorded_port_falls_through_to_the_pairs_rendezvous_port() {
     let node = tcr_peer_wire::PeerId([0x31; 32]);
-    let secret = [0x5a_u8; 32];
+    // The CURRENT slot's port, which is `accepted_ports`'s first entry. The
+    // two neighbours are the skew case and get their own test below. The
+    // secret is chosen so that port is free here, and held until the dial.
+    let (secret, listening, port) =
+        a_stand_in_whose_port_binds(|step| stepped::<32>(0x5a, step), current_port).await;
     reach::remember_port_secret(node, secret);
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("a clock after 1970")
-        .as_secs();
-    let ports = reach::accepted_ports(&secret, reach::current_slot(now));
-    // The CURRENT slot's port, which is `accepted_ports`'s first entry. The
-    // two neighbours are the skew case and get their own test below.
-    let (listening, port) = bind_one_of(&ports[..1]).await;
     let accepting = tokio::spawn(async move { listening.accept().await.map(|(_, from)| from) });
 
     let dead = a_closed_loopback_port().await;
@@ -1708,16 +1749,15 @@ async fn a_dead_recorded_port_falls_through_to_the_pairs_rendezvous_port() {
 #[tokio::test(flavor = "multi_thread")]
 async fn one_slot_of_skew_still_meets() {
     let node = tcr_peer_wire::PeerId([0x32; 32]);
-    let secret = [0x77_u8; 32];
+    // The PREVIOUS slot's port, with the secret chosen so that port is free
+    // here, and held until the dial.
+    let (secret, listening, port) = a_stand_in_whose_port_binds(
+        |step| stepped::<32>(0x77, step),
+        |secret, slot| reach::derived_port(secret, slot - 1),
+    )
+    .await;
     reach::remember_port_secret(node, secret);
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("a clock after 1970")
-        .as_secs();
-    let slot = reach::current_slot(now);
-    let previous = reach::derived_port(&secret, slot - 1);
-    let (listening, port) = bind_one_of(&[previous]).await;
     let accepting = tokio::spawn(async move { listening.accept().await.map(|(_, from)| from) });
 
     let dead = a_closed_loopback_port().await;
@@ -1748,15 +1788,16 @@ async fn one_slot_of_skew_still_meets() {
 #[tokio::test(flavor = "multi_thread")]
 async fn with_no_secret_for_the_pair_nothing_but_the_recorded_endpoint_is_tried() {
     let node = tcr_peer_wire::PeerId([0x33; 32]);
-    let secret = [0x11_u8; 32];
-    // Deliberately NOT registered against `node`.
+    // A listener on what WOULD be this pair's current port, had its secret
+    // been registered. The secret is deliberately NOT registered against
+    // `node`, and is chosen so that port is free here.
+    let (_secret, listening, _port) =
+        a_stand_in_whose_port_binds(|step| stepped::<32>(0x11, step), current_port).await;
+    let _held = listening;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("a clock after 1970")
         .as_secs();
-    let ports = reach::accepted_ports(&secret, reach::current_slot(now));
-    let (listening, _port) = bind_one_of(&ports[..1]).await;
-    let _held = listening;
 
     let dead = a_closed_loopback_port().await;
     let row = row_at(node, dead);
@@ -2088,8 +2129,14 @@ async fn a_restart_reaches_a_peer_on_the_derived_port_from_the_peers_file() {
 
     let node = tcr_peer_wire::PeerId([0x44; 32]);
     // Stands in for a completed handshake: the value never leaves this test,
-    // and what matters is that the FILE holds something else.
-    let handshake_hash = [0x7e_u8; 48];
+    // and what matters is that the FILE holds something else. Chosen so its
+    // current-slot port is free here, and that port is held from now until the
+    // dial: see `a_stand_in_whose_port_binds`.
+    let (handshake_hash, listening, port) = a_stand_in_whose_port_binds(
+        |step| stepped::<48>(0x7e, step),
+        |hash, slot| current_port(&reach::port_secret(hash), slot),
+    )
+    .await;
     let secret = reach::port_secret(&handshake_hash);
     let hash_hex: String = handshake_hash.iter().map(|b| format!("{b:02x}")).collect();
     let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
@@ -2150,12 +2197,6 @@ async fn a_restart_reaches_a_peer_on_the_derived_port_from_the_peers_file() {
         "and the register holds exactly what the file did, byte for byte"
     );
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("a clock after 1970")
-        .as_secs();
-    let ports = reach::accepted_ports(&secret, reach::current_slot(now));
-    let (listening, port) = bind_one_of(&ports[..1]).await;
     let accepting = tokio::spawn(async move { listening.accept().await.map(|(_, from)| from) });
 
     let dead = a_closed_loopback_port().await;

@@ -142,6 +142,18 @@ impl Upstream {
     fn requests(&self) -> usize {
         self.seen.lock().map_or(0, |seen| seen.len())
     }
+
+    /// Whether a request for `path` on `credential` arrived after the first
+    /// `before` requests. The upstream records an arrival before it starts
+    /// holding the answer, so for [`spawn_slow_upstream`] a `true` here means
+    /// that request is in flight right now.
+    fn saw_since(&self, before: usize, path: &str, credential: &str) -> bool {
+        self.seen.lock().is_ok_and(|seen| {
+            seen.iter()
+                .skip(before)
+                .any(|(seen_path, seen_cred)| seen_path == path && seen_cred == credential)
+        })
+    }
 }
 
 /// A fake `api.anthropic.com`: records the credential, answers a canned body and
@@ -3071,7 +3083,9 @@ async fn no_ipv6_endpoint_falls_through_to_a_forwarder() {
 /// stripped so every borrow must go through `carrier`. The upstream answers
 /// slowly (1.5s), so there is a real window between the borrower opening the
 /// forwarded stream and the reply landing; `carrier` is killed inside that
-/// window. `borrow_once` (`src/peer/serve.rs`) is mid-stream against a socket
+/// window, once the upstream has recorded the borrowed request on the lender's
+/// token (never on a timer, which can fire while the lease is still being
+/// asked for). `borrow_once` (`src/peer/serve.rs`) is mid-stream against a socket
 /// whose other end just vanished, so the read must fail with an I/O error
 /// almost immediately, and that is the case [`open_serve_within`]'s own doc
 /// distinguishes from a lender that is merely slow: that one is `Ok(None)` at
@@ -3085,7 +3099,7 @@ async fn no_ipv6_endpoint_falls_through_to_a_forwarder() {
 /// borrow still fails, but the line this test greps for is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn forwarder_killed_mid_borrow_releases_the_client_promptly() {
-    let (upstream, _seen) = spawn_slow_upstream(Duration::from_millis(1500)).await;
+    let (upstream, seen) = spawn_slow_upstream(Duration::from_millis(1500)).await;
     let (mut lender, mut carrier, mut borrower) = boot_lender_carrier_borrower(&upstream);
 
     step(2, "warm the lender's own account against the slow upstream");
@@ -3124,14 +3138,44 @@ async fn forwarder_killed_mid_borrow_releases_the_client_promptly() {
         7,
         "start one borrow against the slow upstream, then kill carrier while it is in flight",
     );
+    // The kill waits for the borrowed request to reach the upstream on the
+    // lender's token, which the slow upstream records before it holds the
+    // answer for 1.5s. A fixed sleep here raced the lease ask instead: on a
+    // loaded CI runner the carrier died before the lease was granted, the
+    // borrower logged `asking for a lease failed` and answered 429 without
+    // any SERVE stream ever opening, and neither line asserted below exists.
+    let before = seen.requests();
     let start = Instant::now();
     let proxy = borrower.proxy.clone();
     let task = tokio::spawn(async move { post_messages(&proxy).await });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let arrival_deadline = Instant::now() + LINE_TIMEOUT;
+    while !seen.saw_since(before, "/v1/messages", "Bearer at-fake-lender") {
+        assert!(
+            !task.is_finished(),
+            "the borrow ended before it reached the upstream through carrier, so carrier was \
+             never killed mid-borrow. Borrower tail:\n{}\nCarrier tail:\n{}",
+            tail(&borrower.log(), 20),
+            tail(&carrier.log(), 20)
+        );
+        assert!(
+            Instant::now() < arrival_deadline,
+            "the borrow never reached the upstream on the lender's token within \
+             {LINE_TIMEOUT:?}. Borrower tail:\n{}\nCarrier tail:\n{}\nLender tail:\n{}",
+            tail(&borrower.log(), 20),
+            tail(&carrier.log(), 20),
+            tail(&lender.log(), 20)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let in_flight_after = start.elapsed();
     carrier.shutdown();
     let (status, _body) = task.await.expect("the borrow task panicked");
     let elapsed = start.elapsed();
-    println!("         borrow status={status} elapsed={elapsed:?}");
+    println!(
+        "         borrow status={status} elapsed={elapsed:?} (in flight at the upstream after \
+         {in_flight_after:?}, released {:?} after the kill)",
+        elapsed.saturating_sub(in_flight_after)
+    );
 
     assert_ne!(
         status, 200,
@@ -3150,7 +3194,8 @@ async fn forwarder_killed_mid_borrow_releases_the_client_promptly() {
     // exists for is the other one: a stream that FAILED, against the
     // deadline-reached line a slow-but-alive lender would produce.
     //
-    // The delivered line is the one this fixture usually takes, and it is not
+    // The delivered line is the one this fixture takes, since the kill waits
+    // for the body to reach the upstream, and it is not
     // the SERVE-stream-failed line any more: a borrow whose body has crossed
     // stops the ladder rather than offering the same request to the next
     // lender, so it is reported as delivered-and-unknown. See
