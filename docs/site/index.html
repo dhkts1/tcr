@@ -1,0 +1,708 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tcr: Run Claude Code and Codex on Multiple Accounts</title>
+<meta name="description" content="Run Claude Code and Codex across several subscription accounts. tcr picks the account with quota left and keeps each conversation on its warm prompt cache.">
+<link rel="canonical" href="https://dhkts1.github.io/tcr/">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#090c10" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f9fafb" media="(prefers-color-scheme: light)">
+<link rel="icon" href="mark.svg" type="image/svg+xml">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="tcr">
+<meta property="og:url" content="https://dhkts1.github.io/tcr/">
+<meta property="og:title" content="tcr: Run Claude Code and Codex on Multiple Accounts">
+<meta property="og:description" content="A local proxy that sends each request to the account with quota left and keeps every conversation on its warm prompt cache. TcrBar shows every account from the macOS menu bar.">
+<meta property="og:image" content="https://dhkts1.github.io/tcr/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The TcrBar panel showing ten accounts, seven ready to take work">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+/* Colors are TcrBar's own tokens (apps/macos/Sources/TcrBar/Tokens.swift), dark and light. */
+:root{
+  color-scheme:dark light;
+  --void:#090c10;--panel:#13161b;--raised:#1d2126;--hover:#272c32;--track:#2f3339;--hair:#393e43;--hair2:#535960;
+  --ink:#f2f2ef;--dim:#bfbeb9;--faint:#94928d;
+  --ok:#66d081;--near:#ffd16b;--spent:#ea5a56;--seg-out:#8a3735;--seg-off:#3a3e44;--link:#5aa7ff;
+  --cta:#66d081;--cta-ink:#04110a;--cta-hover:#80dc9a;
+  --card:#101318;
+  --glow:rgb(102 208 129 / .14);
+  --desk:radial-gradient(120% 90% at 85% -10%,#1f4a33 0%,transparent 55%),radial-gradient(100% 80% at -10% 110%,#17304a 0%,transparent 55%),linear-gradient(#0d1116,#0a0d11);
+  --menubar:rgb(22 25 30 / .62);--menubar-ink:#f4f4f2;--menubar-sel:rgb(255 255 255 / .18);
+  --panel-shadow:0 0 0 .5px rgb(0 0 0 / .8),0 1px 0 0 rgb(255 255 255 / .06) inset,0 28px 56px -18px rgb(0 0 0 / .75),0 10px 24px -10px rgb(0 0 0 / .6);
+  --img-outline:oklch(1 0 0 / .1);
+  --ease:cubic-bezier(.2,0,0,1);
+}
+@media (prefers-color-scheme:light){
+  :root{
+    --void:#f9fafb;--panel:#f2f3f5;--raised:#e8eaec;--hover:#dbdee2;--track:#d2d4d8;--hair:#c5c7cb;--hair2:#a1a5aa;
+    --ink:#12120f;--dim:#494843;--faint:#62605a;
+    --ok:#06652d;--near:#925d0b;--spent:#940015;--seg-out:#a8323d;--seg-off:#c3c6cb;--link:#0a5fd0;
+    --cta:#06652d;--cta-ink:#fff;--cta-hover:#0b7838;
+    --card:#fff;
+    --glow:rgb(6 101 45 / .08);
+    --desk:radial-gradient(120% 90% at 85% -10%,#cfe9d8 0%,transparent 55%),radial-gradient(100% 80% at -10% 110%,#d3e2f2 0%,transparent 55%),linear-gradient(#eef1f4,#e6eaee);
+    --menubar:rgb(246 247 249 / .66);--menubar-ink:#111;--menubar-sel:rgb(0 0 0 / .1);
+    --panel-shadow:0 0 0 .5px rgb(0 0 0 / .22),0 28px 56px -20px rgb(20 30 40 / .35),0 10px 24px -12px rgb(20 30 40 / .25);
+    --img-outline:oklch(0 0 0 / .1);
+  }
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%;scroll-padding-top:72px}
+body{margin:0;background:var(--void);color:var(--ink);font:400 1rem/1.55 system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility}
+a{color:inherit}
+p{margin:0}
+code,kbd,pre,.mono{font-family:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace}
+:focus-visible{outline:2px solid var(--ok);outline-offset:3px;border-radius:6px}
+.skip{position:absolute;left:12px;top:-48px;padding:8px 12px;background:var(--cta);color:var(--cta-ink);border-radius:8px;font-weight:600;z-index:10;text-decoration:none}
+.skip:focus{top:12px}
+.wrap{width:min(1120px,100% - 40px);margin-inline:auto}
+h1,h2,h3{margin:0;text-wrap:balance;font-weight:700}
+h2{font-size:clamp(1.75rem,1.2rem + 2vw,2.5rem);line-height:1.1;letter-spacing:-.025em}
+h3{font-size:1.0625rem;line-height:1.3;letter-spacing:-.01em;font-weight:650}
+.lead{font-size:clamp(1.0625rem,1rem + .35vw,1.25rem);line-height:1.5;color:var(--dim);text-wrap:pretty}
+.muted{color:var(--faint)}
+.kicker{font-size:.8125rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ok);margin-bottom:12px}
+section{padding-block:clamp(64px,9vw,120px)}
+.sec-head{max-width:680px;margin-bottom:clamp(32px,4vw,48px)}
+.sec-head .lead{margin-top:14px}
+
+/* Header: a translucent bar the page scrolls under */
+.top{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--void) 72%,transparent);backdrop-filter:blur(18px) saturate(170%);-webkit-backdrop-filter:blur(18px) saturate(170%);box-shadow:0 1px 0 color-mix(in srgb,var(--hair) 55%,transparent)}
+.top .wrap{display:flex;align-items:center;gap:28px;height:60px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:1.125rem;letter-spacing:-.02em;text-decoration:none}
+.brand img{width:26px;height:26px;border-radius:7px}
+.nav{display:flex;gap:4px;margin-left:auto}
+.nav a{color:var(--dim);text-decoration:none;font-size:.9375rem;padding:8px 10px;border-radius:8px;transition:color .15s ease,background-color .15s ease}
+.nav a:hover{color:var(--ink);background:var(--panel)}
+.top-cta{display:flex;align-items:center;gap:8px}
+@media (max-width:820px){.nav{display:none}.top-cta{margin-left:auto}}
+
+/* Buttons */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;padding:0 18px;border-radius:12px;font-weight:600;font-size:.9688rem;text-decoration:none;white-space:nowrap;transition:background-color .15s ease,box-shadow .15s ease,transform .1s ease-out;-webkit-tap-highlight-color:transparent}
+.btn:active{transform:scale(.96)}
+.btn svg{width:18px;height:18px;flex:none}
+.btn-primary{background:var(--cta);color:var(--cta-ink);box-shadow:0 1px 0 rgb(255 255 255 / .25) inset,0 6px 20px -6px color-mix(in srgb,var(--cta) 60%,transparent)}
+.btn-primary:hover{background:var(--cta-hover)}
+.btn-ghost{background:var(--panel);color:var(--ink);box-shadow:0 0 0 1px var(--hair) inset}
+.btn-ghost:hover{background:var(--raised)}
+.btn-sm{min-height:36px;padding:0 12px;border-radius:9px;font-size:.875rem}
+.btn-sm svg{width:16px;height:16px}
+
+/* Hero */
+.hero{padding-block:clamp(40px,6vw,88px) clamp(24px,4vw,48px);position:relative;overflow:clip}
+.hero::before{content:"";position:absolute;inset:-20% -10% auto 30%;height:720px;background:radial-gradient(closest-side,var(--glow),transparent);pointer-events:none}
+.hero .wrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,520px);gap:clamp(32px,5vw,72px);align-items:center;position:relative}
+@media (max-width:960px){.hero .wrap{grid-template-columns:minmax(0,1fr)}}
+.hero h1{font-size:clamp(2.5rem,1.4rem + 4.2vw,4.25rem);line-height:1.02;letter-spacing:-.04em;font-weight:750}
+.hero .lead{margin-top:22px;max-width:36em}
+.cta-row{display:flex;flex-wrap:wrap;gap:12px;margin-top:32px}
+.facts{display:flex;flex-wrap:wrap;gap:6px 18px;margin:22px 0 0;padding:0;list-style:none;color:var(--faint);font-size:.875rem}
+.facts li{display:flex;align-items:center;gap:7px}
+.facts svg{width:15px;height:15px;color:var(--ok)}
+
+/* Install command */
+.cmd{margin-top:28px;max-width:600px}
+.cmd-label{font-size:.8125rem;color:var(--faint);margin-bottom:8px}
+.cmd-box{display:flex;align-items:center;gap:8px;background:var(--panel);border-radius:12px;box-shadow:0 0 0 1px var(--hair) inset;padding:6px 6px 6px 14px}
+.cmd-box pre{margin:0;flex:1;min-width:0;overflow-x:auto;font-size:.8125rem;line-height:1.5;padding:8px 0;scrollbar-width:thin;color:var(--ink)}
+.cmd-box pre .p{color:var(--faint);user-select:none;-webkit-user-select:none}
+.copy{position:relative;flex:none;width:40px;height:40px;border:0;border-radius:9px;background:transparent;color:var(--dim);cursor:pointer;transition:background-color .15s ease,color .15s ease,transform .1s ease-out}
+.copy:hover{background:var(--raised);color:var(--ink)}
+.copy:active{transform:scale(.96)}
+.copy svg{position:absolute;inset:0;margin:auto;width:17px;height:17px;transition:opacity .2s var(--ease),scale .2s var(--ease),filter .2s var(--ease)}
+.copy .i-check{opacity:0;scale:.25;filter:blur(4px);color:var(--ok)}
+.copy[data-state=done] .i-copy{opacity:0;scale:.25;filter:blur(4px)}
+.copy[data-state=done] .i-check{opacity:1;scale:1;filter:blur(0)}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+
+/* The scene: a slice of desktop with the menu bar, and the panel hanging from it */
+.scene{margin:0;position:relative;border-radius:22px;background:var(--desk);box-shadow:0 0 0 1px var(--img-outline) inset,0 40px 80px -40px rgb(0 0 0 / .5);overflow:hidden;padding:0 clamp(12px,3vw,28px) clamp(18px,3vw,28px);display:flex;flex-direction:column;align-items:flex-end}
+.menubar{align-self:stretch;margin-inline:calc(-1 * clamp(12px,3vw,28px));height:28px;display:flex;align-items:center;justify-content:flex-end;gap:14px;padding-inline:16px;background:var(--menubar);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);color:var(--menubar-ink);font-size:13px;font-weight:600;letter-spacing:.005em}
+.menubar svg{width:16px;height:16px}
+.mb-item{display:flex;align-items:center;gap:6px;height:22px;padding:0 7px;border-radius:5px;font-variant-numeric:tabular-nums}
+.mb-item.sel{background:var(--menubar-sel)}
+.mb-item img{width:15px;height:15px;border-radius:4px}
+.mb-dim{opacity:.92}
+
+/* Panel replica, at TcrBar's own point sizes (1 pt = 1 css px) */
+.panel{--w:372px;width:var(--w);max-width:100%;margin-top:6px;margin-right:clamp(0px,4vw,36px);background:var(--panel);color:var(--ink);border-radius:14px;box-shadow:var(--panel-shadow);padding:12px 0 6px;font-size:13px;line-height:1.25;font-variant-numeric:tabular-nums;transform-origin:85% -12px;text-align:left;user-select:none;-webkit-user-select:none}
+@media (max-width:420px){.panel{zoom:.9}}
+@media (max-width:370px){.panel{zoom:.84}}
+.p-head{display:flex;align-items:center;gap:8px;padding:0 10px 0 14px}
+.p-head b{font-size:16.5px;letter-spacing:-.02em;margin-right:auto}
+.p-head .t{color:var(--faint)}
+.p-gear{width:26px;height:26px;border-radius:7px;background:var(--raised);display:grid;place-items:center;color:var(--dim)}
+.p-gear svg{width:15px;height:15px}
+.p-tabs{display:grid;grid-template-columns:repeat(4,1fr);margin:10px 10px 0;padding:3px;border-radius:11px;background:var(--raised)}
+.p-tabs span{display:flex;align-items:center;justify-content:center;gap:5px;height:30px;border-radius:8px;font-weight:600;color:var(--dim)}
+.p-tabs span.on{background:var(--hover);color:var(--ink)}
+.p-tabs svg{width:14px;height:14px}
+.p-sum{padding:12px 14px 0;color:var(--dim);font-size:13.5px;line-height:1.45}
+.p-ready{display:flex;justify-content:space-between;padding:0 14px;font-size:13.5px;line-height:1.55}
+.p-ready:first-of-type{margin-top:8px}
+.p-ready em{font-style:normal;font-weight:600}
+.ok{color:var(--ok)}.nr{color:var(--near)}.bad{color:var(--spent)}.dm{color:var(--dim)}.fa{color:var(--faint)}
+.p-strip{display:flex;gap:6px;padding:8px 14px 0}
+.p-strip .g{display:flex;gap:2px;flex:var(--n)}
+.p-strip i{flex:1;height:13px;border-radius:2.5px;background:var(--track);position:relative;overflow:hidden}
+.p-strip i::after{content:"";position:absolute;inset:auto 0 0;height:calc(var(--f,0) * 100%);min-height:2px;background:var(--c,var(--ok));transform-origin:bottom;animation:fill .7s var(--ease) both;animation-delay:calc(.35s + var(--d,0) * 40ms)}
+.p-strip i.near{--c:var(--near)}
+.p-strip i.out{--f:1;--c:var(--seg-out)}
+.p-sec{display:flex;align-items:baseline;gap:6px;padding:14px 14px 6px;font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--faint);font-weight:700}
+.p-sec .n{letter-spacing:.02em;text-transform:none;font-weight:500}
+.p-sec .r{margin-left:auto;letter-spacing:.01em;text-transform:none;font-weight:600}
+.p-card{margin:0 10px;border-radius:10px;background:color-mix(in srgb,var(--raised) 70%,var(--panel));box-shadow:0 0 0 1px var(--hair) inset;padding:1px 0}
+.p-row{display:grid;grid-template-columns:7px minmax(0,1fr) 16px 30px 34px 16px 30px 34px 52px;column-gap:5px;align-items:center;height:27px;padding:0 10px}
+.p-row+.p-row{background:linear-gradient(var(--hair),var(--hair)) top center/calc(100% - 20px) 1px no-repeat}
+.p-row .dot{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+.p-row .nm{font-size:14px;font-weight:650;letter-spacing:-.01em;padding-left:4px;white-space:nowrap}
+.p-row .w{color:var(--faint);font-size:12px;text-align:right}
+.p-row .bar{height:6px;border-radius:3px;background:var(--track);overflow:hidden}
+.p-row .bar::after{content:"";display:block;height:100%;width:calc(var(--u) * 100%);min-width:3px;border-radius:3px;background:var(--c,var(--ok));transform-origin:left;animation:grow .8s var(--ease) both;animation-delay:.45s}
+.p-row .bar.hi{--c:var(--near)}
+.p-row .pc{text-align:right;font-weight:500}
+.p-row .st{text-align:right;color:var(--faint);white-space:nowrap}
+.p-row .use{grid-column:3/7;color:var(--faint);font-size:12.5px;padding-left:2px;white-space:nowrap}
+.p-row .st.wide{grid-column:7/10}
+.p-row.near .dot{background:var(--near)}
+.p-row.out .dot{background:var(--spent)}
+.p-foot{display:flex;justify-content:space-between;margin:12px 14px 0;padding-top:8px;border-top:1px solid var(--hair);color:var(--faint);font-size:12px}
+@keyframes fill{from{transform:scaleY(0)}}
+@keyframes grow{from{transform:scaleX(0)}}
+@keyframes open{from{opacity:0;transform:scale(.97) translateY(-6px);filter:blur(6px)}}
+.panel{animation:open .5s var(--ease) both .1s}
+
+/* Steps */
+.steps{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;counter-reset:s;margin:0;padding:0;list-style:none}
+@media (max-width:860px){.steps{grid-template-columns:1fr}}
+.step{background:var(--card);border-radius:18px;box-shadow:0 0 0 1px var(--hair) inset;padding:22px;display:flex;flex-direction:column;gap:10px}
+.step .num{counter-increment:s;width:28px;height:28px;border-radius:8px;display:grid;place-items:center;background:var(--raised);color:var(--ok);font-weight:700;font-size:.875rem}
+.step .num::before{content:counter(s)}
+.step p{color:var(--dim);font-size:.9688rem;text-wrap:pretty}
+.code{margin:6px 0 0;background:var(--panel);border-radius:10px;box-shadow:0 0 0 1px var(--hair) inset;padding:12px 14px;font-size:.8125rem;line-height:1.7;overflow-x:auto}
+.code .c{color:var(--faint)}
+.code .p{color:var(--faint);user-select:none;-webkit-user-select:none}
+p code,li code,td code,summary code{font-size:.875em;background:var(--panel);box-shadow:0 0 0 1px var(--hair) inset;padding:.08em .38em;border-radius:5px;white-space:nowrap}
+
+/* Cache band */
+.band{background:var(--panel);box-shadow:0 1px 0 var(--hair) inset,0 -1px 0 var(--hair) inset}
+.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-top:8px}
+@media (max-width:860px){.stats{grid-template-columns:1fr}}
+.stat{padding:24px;border-radius:18px;background:var(--void);box-shadow:0 0 0 1px var(--hair) inset}
+.stat .big{margin:0;color:var(--ink);font-size:clamp(2.5rem,1.8rem + 2.5vw,3.5rem);line-height:1;font-weight:750;letter-spacing:-.04em;font-variant-numeric:tabular-nums}
+.stat .big small{font-size:.5em;letter-spacing:-.02em;margin-left:2px}
+.stat p{margin-top:12px;color:var(--dim);font-size:.9688rem;text-wrap:pretty}
+.stat .src{display:block;margin-top:10px;color:var(--faint);font-size:.8125rem}
+.math{margin-top:clamp(28px,4vw,40px);display:grid;gap:10px;max-width:760px}
+.math-head{color:var(--faint);font-size:.8125rem;margin-bottom:2px}
+.math-row{display:grid;grid-template-columns:160px minmax(0,1fr) 56px;align-items:center;gap:14px;font-size:.9375rem}
+.math-row .lbl{color:var(--dim)}
+.math-row .track{height:12px;border-radius:6px;background:var(--track);overflow:hidden}
+.math-row .track span{display:block;height:100%;border-radius:6px;width:var(--w);background:var(--c)}
+.math-row .val{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+
+/* Feature grid */
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+@media (max-width:960px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:640px){.grid{grid-template-columns:1fr}}
+.tile{background:var(--card);border-radius:20px;box-shadow:0 0 0 1px var(--hair) inset;padding:8px 8px 22px;display:flex;flex-direction:column}
+.viz{height:148px;border-radius:13px;background:var(--panel);box-shadow:0 0 0 1px color-mix(in srgb,var(--hair) 60%,transparent) inset;display:flex;flex-direction:column;justify-content:center;gap:7px;padding:14px 16px;font-size:12.5px;font-variant-numeric:tabular-nums;overflow:hidden}
+.tile h3{margin:20px 14px 0}
+.tile p{margin:8px 14px 0;color:var(--dim);font-size:.9375rem;text-wrap:pretty}
+.vr{display:flex;align-items:center;gap:8px;height:26px;padding:0 10px;border-radius:8px;background:var(--raised)}
+.vr .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);flex:none}
+.vr b{font-weight:650}
+.vr .r{margin-left:auto;color:var(--faint)}
+.vr.pick{box-shadow:0 0 0 1.5px var(--ok) inset;background:color-mix(in srgb,var(--ok) 10%,var(--raised))}
+.vr.pick .r{color:var(--ok);font-weight:600}
+.vr .arr{color:var(--faint)}
+.vbig{font-size:2rem;font-weight:750;letter-spacing:-.03em;line-height:1}
+.digits{display:flex;align-items:center;justify-content:center;gap:14px}
+.mac{display:grid;justify-items:center;gap:6px;color:var(--dim)}
+.mac svg{width:44px;height:44px;stroke-width:1.25}
+.code6{font:700 1.25rem/1 ui-monospace,"SF Mono",Menlo,monospace;letter-spacing:.12em;color:var(--ink);padding:8px 10px;border-radius:8px;background:var(--raised)}
+.files{display:grid;gap:6px;font:500 12.5px/1.2 ui-monospace,"SF Mono",Menlo,monospace}
+.files span{display:flex;align-items:center;gap:8px;color:var(--dim)}
+.files svg{width:14px;height:14px;color:var(--faint);flex:none}
+.prov{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.prov div{border-radius:10px;background:var(--raised);padding:10px 12px}
+.prov b{display:block;font-size:13px}
+.prov span{color:var(--faint)}
+
+/* Comparison table */
+.tablewrap{overflow-x:auto;border-radius:18px;border:1px solid var(--hair);background:var(--card);scrollbar-width:thin}
+table{border-collapse:separate;border-spacing:0;width:100%;min-width:920px;font-size:.875rem}
+th,td{text-align:left;vertical-align:top;padding:14px 16px;border-bottom:1px solid var(--hair)}
+thead th{font-size:.75rem;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);font-weight:650;background:var(--panel);position:sticky;top:0}
+tbody tr:last-child td,tbody tr:last-child th{border-bottom:0}
+tbody th{font-weight:650;white-space:nowrap;position:sticky;left:0;background:var(--card)}
+tbody th a{text-decoration:none;border-bottom:1px solid var(--hair2)}
+tbody th a:hover{border-color:var(--ink)}
+td{color:var(--dim)}
+tr.us th,tr.us td{background:color-mix(in srgb,var(--ok) 7%,var(--card));color:var(--ink)}
+tr.us th{box-shadow:inset 3px 0 0 var(--ok)}
+.note{margin-top:16px;color:var(--faint);font-size:.875rem;max-width:760px;text-wrap:pretty}
+.fit{margin-top:24px;max-width:760px;color:var(--dim);text-wrap:pretty}
+
+/* FAQ */
+.faq{max-width:820px;border-top:1px solid var(--hair)}
+.faq details{border-bottom:1px solid var(--hair)}
+.faq summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:16px;padding:20px 4px;font-weight:650;font-size:1.0625rem;letter-spacing:-.01em}
+.faq summary::-webkit-details-marker{display:none}
+.faq summary::after{content:"";margin-left:auto;flex:none;width:9px;height:9px;border-right:1.75px solid var(--faint);border-bottom:1.75px solid var(--faint);transform:translateY(-3px) rotate(45deg);transition:transform .2s var(--ease)}
+.faq details[open] summary::after{transform:translateY(2px) rotate(225deg)}
+.faq summary:hover{color:var(--ok)}
+.faq .a{padding:0 4px 22px;color:var(--dim);display:grid;gap:12px;max-width:720px;text-wrap:pretty}
+.faq .a a{color:var(--link)}
+
+/* Closing call to action */
+.end{text-align:center}
+.end .wrap{display:grid;grid-template-columns:minmax(0,1fr);justify-items:center}
+.end .lead{margin-top:14px;max-width:34em}
+.end .cmd{width:100%;max-width:880px;text-align:left}
+.end .cta-row{justify-content:center}
+
+footer{border-top:1px solid var(--hair);padding:36px 0 48px;color:var(--faint);font-size:.875rem}
+footer .wrap{display:grid;gap:18px}
+.flinks{display:flex;flex-wrap:wrap;gap:6px 22px}
+.flinks a{text-decoration:none;color:var(--dim)}
+.flinks a:hover{color:var(--ink)}
+.legal{max-width:760px;text-wrap:pretty}
+
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition-duration:.01ms!important}
+}
+@media (prefers-reduced-transparency:reduce){
+  .top,.menubar{backdrop-filter:none;-webkit-backdrop-filter:none;background:var(--void)}
+}
+@media (prefers-contrast:more){
+  :root{--hair:var(--hair2)}
+}
+</style>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "tcr",
+  "alternateName": "Team Capacity Router",
+  "description": "A local proxy that runs Claude Code and Codex across multiple subscription accounts. It sends each request to the account with quota left and keeps each conversation on the account that holds its prompt cache.",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "macOS, Linux",
+  "url": "https://dhkts1.github.io/tcr/",
+  "downloadUrl": "https://github.com/dhkts1/tcr/releases/latest",
+  "codeRepository": "https://github.com/dhkts1/tcr",
+  "sameAs": ["https://github.com/dhkts1/tcr"],
+  "license": "https://polyformproject.org/licenses/noncommercial/1.0.0/",
+  "image": "https://dhkts1.github.io/tcr/og.png"
+}
+</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="./" aria-label="tcr home"><img src="mark.svg" alt="" width="26" height="26">tcr</a>
+    <nav class="nav" aria-label="Sections">
+      <a href="#how">How it works</a>
+      <a href="#cache">Prompt cache</a>
+      <a href="#why">Why tcr</a>
+      <a href="#compare">Compare</a>
+      <a href="#faq">FAQ</a>
+    </nav>
+    <div class="top-cta">
+      <a class="btn btn-ghost btn-sm" href="https://github.com/dhkts1/tcr" aria-label="tcr on GitHub">
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        <span>GitHub</span>
+      </a>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+<section class="hero" aria-labelledby="hero-title">
+  <div class="wrap">
+    <div>
+      <h1 id="hero-title">Run Claude Code and Codex across multiple accounts</h1>
+      <p class="lead">tcr is a local proxy for Claude Code and Codex. It sends each request to the account with quota left, and keeps every conversation on the account that already holds its prompt cache. TcrBar, a menu-bar app for macOS, shows every account.</p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="https://github.com/dhkts1/tcr/releases/latest">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+          Download for macOS
+        </a>
+        <a class="btn btn-ghost" href="#how">How it works</a>
+      </div>
+      <div class="cmd">
+        <p class="cmd-label" id="install-label">Or install from the terminal, on macOS or Linux</p>
+        <div class="cmd-box">
+          <pre aria-labelledby="install-label"><span class="p">$ </span><code id="install">curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/dhkts1/tcr/main/install.sh | sh</code></pre>
+          <button class="copy" type="button" data-copy="install" aria-label="Copy the install command">
+            <svg class="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9A1.5 1.5 0 0 1 15 4.5V5"/></svg>
+            <svg class="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          </button>
+        </div>
+      </div>
+      <ul class="facts">
+        <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>Free for noncommercial use</li>
+        <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>No telemetry</li>
+        <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>Subscriptions, not API keys</li>
+      </ul>
+    </div>
+
+    <figure class="scene">
+      <div class="menubar" aria-hidden="true">
+        <span class="mb-item sel"><img src="mark.svg" alt="" width="15" height="15">5/7 · 2/3</span>
+        <svg class="mb-dim" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1" fill="currentColor"/></svg>
+        <svg class="mb-dim" viewBox="0 0 26 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="1.5" y="6.5" width="20" height="11" rx="3"/><rect x="3.5" y="8.5" width="13" height="7" rx="1.5" fill="currentColor" stroke="none"/><path d="M24 10.5v3" stroke-linecap="round"/></svg>
+        <span class="mb-dim">Tue 9:41</span>
+      </div>
+      <div class="panel" role="img" aria-label="The TcrBar panel with ten accounts. Claude: five of seven ready, one near its limit, one back in 42 minutes. Codex: two of three ready.">
+        <div class="p-head"><b>tcr fleet</b><span class="t">updated 2s ago</span><span class="p-gear"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span></div>
+        <div class="p-tabs">
+          <span class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="m12 13 3.5-3.5"/></svg>Accts</span>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>Sessions</span>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7 9 3 3-3 3"/><path d="M13 15h4"/></svg>Tools</span>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18z"/></svg>Peers</span>
+        </div>
+        <p class="p-sum">$184 today · cache 96%<br>Codex 1.4M tokens</p>
+        <div class="p-ready"><span>Claude · <em class="ok">5 of 7 ready</em></span><span class="dm">next back <em class="bad">in 42m</em></span></div>
+        <div class="p-ready"><span>Codex · <em class="ok">2 of 3 ready</em></span><span class="dm">next back <em class="bad">in 3d 4h</em></span></div>
+        <div class="p-strip">
+          <div class="g" style="--n:7"><i style="--f:.82;--d:0"></i><i style="--f:.7;--d:1"></i><i style="--f:.59;--d:2"></i><i style="--f:.67;--d:3"></i><i style="--f:.48;--d:4"></i><i class="near" style="--f:.07;--d:5"></i><i class="out" style="--d:6"></i></div>
+          <div class="g" style="--n:3"><i style="--f:.78;--d:7"></i><i style="--f:.6;--d:8"></i><i class="out" style="--d:9"></i></div>
+        </div>
+        <div class="p-sec">Claude <span class="n">· 7 accounts</span></div>
+        <div class="p-card">
+          <div class="p-row"><i class="dot"></i><span class="nm">alice</span><span class="w">5h</span><span class="bar" style="--u:.12"></span><span class="pc">12%</span><span class="w">7d</span><span class="bar" style="--u:.18"></span><span class="pc">18%</span><span class="st">ready</span></div>
+          <div class="p-row"><i class="dot"></i><span class="nm">bob</span><span class="w">5h</span><span class="bar" style="--u:.24"></span><span class="pc">24%</span><span class="w">7d</span><span class="bar" style="--u:.3"></span><span class="pc">30%</span><span class="st">ready</span></div>
+          <div class="p-row"><i class="dot"></i><span class="nm">carol</span><span class="w">5h</span><span class="bar" style="--u:.08"></span><span class="pc">8%</span><span class="w">7d</span><span class="bar" style="--u:.41"></span><span class="pc">41%</span><span class="st">ready</span></div>
+          <div class="p-row"><i class="dot"></i><span class="nm">dave</span><span class="w">5h</span><span class="bar" style="--u:.33"></span><span class="pc">33%</span><span class="w">7d</span><span class="bar" style="--u:.27"></span><span class="pc">27%</span><span class="st">ready</span></div>
+          <div class="p-row"><i class="dot"></i><span class="nm">erin</span><span class="w">5h</span><span class="bar" style="--u:.46"></span><span class="pc">46%</span><span class="w">7d</span><span class="bar" style="--u:.52"></span><span class="pc">52%</span><span class="st">ready</span></div>
+          <div class="p-row near"><i class="dot"></i><span class="nm">frank</span><span class="w">5h</span><span class="bar hi" style="--u:.93"></span><span class="pc">93%</span><span class="w">7d</span><span class="bar" style="--u:.71"></span><span class="pc">71%</span><span class="st nr">in 47m</span></div>
+        </div>
+        <div class="p-sec">Out of tokens <span class="n">· 1</span><span class="r fa">first back <span class="bad">in 42m</span></span></div>
+        <div class="p-card">
+          <div class="p-row out"><i class="dot"></i><span class="nm">grace</span><span class="use">week 58% used</span><span class="st wide bad">back in 42m</span></div>
+        </div>
+        <div class="p-sec">Codex <span class="n">· 3 accounts</span></div>
+        <div class="p-card">
+          <div class="p-row"><i class="dot"></i><span class="nm">heidi</span><span class="w">5h</span><span class="bar" style="--u:.15"></span><span class="pc">15%</span><span class="w">7d</span><span class="bar" style="--u:.22"></span><span class="pc">22%</span><span class="st">ready</span></div>
+          <div class="p-row"><i class="dot"></i><span class="nm">ivan</span><span class="w">5h</span><span class="bar" style="--u:.31"></span><span class="pc">31%</span><span class="w">7d</span><span class="bar" style="--u:.4"></span><span class="pc">40%</span><span class="st">ready</span></div>
+        </div>
+        <div class="p-sec">Out of tokens <span class="n">· 1</span><span class="r fa">first back <span class="bad">in 3d 4h</span></span></div>
+        <div class="p-card">
+          <div class="p-row out"><i class="dot"></i><span class="nm">judy</span><span class="use">week 100% used</span><span class="st wide bad">back in 3d 4h</span></div>
+        </div>
+        <div class="p-foot"><span>TcrBar</span><span>server 4f2c9e1</span></div>
+      </div>
+    </figure>
+  </div>
+</section>
+
+<section id="how" aria-labelledby="how-title">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">How it works</p>
+      <h2 id="how-title">Log in each account once, then start Claude Code through tcr</h2>
+      <p class="lead">Every request goes through the proxy on your own machine, which picks an account from the pool. Claude Code keeps one setup and never needs to know there is more than one account.</p>
+    </div>
+    <ol class="steps">
+      <li class="step">
+        <span class="num" aria-hidden="true"></span>
+        <h3>Add your accounts</h3>
+        <p>Sign in through the browser, once per account. Already logged in to Claude Code? The first run imports that login, and Claude Code asks you to sign in once more.</p>
+        <pre class="code"><span class="p">$ </span>tcr login
+<span class="p">$ </span>tcr login --codex  <span class="c"># for codex</span></pre>
+      </li>
+      <li class="step">
+        <span class="num" aria-hidden="true"></span>
+        <h3>Start the proxy</h3>
+        <p>It opens a live terminal dashboard. On a Mac, TcrBar can run it for you from the menu bar instead.</p>
+        <pre class="code"><span class="p">$ </span>tcr</pre>
+      </li>
+      <li class="step">
+        <span class="num" aria-hidden="true"></span>
+        <h3>Run Claude Code through it</h3>
+        <p><code>tcr run</code> starts Claude Code pointed at the proxy. <code>tcr setup shell</code> makes a plain <code>claude</code> do the same.</p>
+        <pre class="code"><span class="p">$ </span>tcr run
+<span class="p">$ </span>tcr run --codex    <span class="c"># codex</span></pre>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section id="cache" class="band" aria-labelledby="cache-title">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">Prompt cache</p>
+      <h2 id="cache-title">Switch accounts without losing the prompt cache</h2>
+      <p class="lead">Anthropic keeps the prompt cache per account. A conversation that moves to another account arrives cold and writes its whole cached prefix again. So tcr keeps each conversation on one account, and moves it only when that account cannot serve the request.</p>
+    </div>
+    <div class="stats">
+      <div class="stat">
+        <p class="big">97.6<small>%</small></p>
+        <p>of prompt tokens were read from cache over 30 days of the author's own traffic.</p>
+        <span class="src">30 days ending 2026-10-13</span>
+      </div>
+      <div class="stat">
+        <p class="big">12.5<small>×</small></p>
+        <p>the warm price, at least: what the first request after a move pays for its cached prefix. On Opus 5.5 it is 25 times.</p>
+        <span class="src">At API list price: a cache write is 1.25× input (2× for the one-hour cache), a read 0.1× or less</span>
+      </div>
+      <div class="stat">
+        <p class="big">1<small> hour</small></p>
+        <p>how long the cache stays warm, instead of five minutes. On a subscription the hour costs the five-hour window what five minutes does.</p>
+        <span class="src">Quota cost measured 2026-10-06. Turn it off with <code>cacheTtlRewrite</code></span>
+      </div>
+    </div>
+    <div class="math" role="img" aria-label="Price of the same cached prefix at API list price, as a multiple of the input price: read warm 0.1; written again after a move 1.25, or 2 with the one-hour cache.">
+      <p class="math-head">The same cached prefix, at API list price</p>
+      <div class="math-row"><span class="lbl">Stays warm</span><span class="track"><span style="--w:5%;--c:var(--ok)"></span></span><span class="val">0.1×</span></div>
+      <div class="math-row"><span class="lbl">Moved, cold</span><span class="track"><span style="--w:62.5%;--c:var(--spent)"></span></span><span class="val">1.25×</span></div>
+      <div class="math-row"><span class="lbl">Moved, 1-hour cache</span><span class="track"><span style="--w:100%;--c:var(--spent)"></span></span><span class="val">2×</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="why" aria-labelledby="why-title">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">Why tcr</p>
+      <h2 id="why-title">Built for when Claude Code hits its usage limit</h2>
+    </div>
+    <div class="grid">
+      <article class="tile">
+        <div class="viz" aria-hidden="true">
+          <div class="vr pick"><i class="dot"></i><b>carol</b><span class="r">resets in 38m</span></div>
+          <div class="vr"><i class="dot"></i><b>alice</b><span class="r">resets in 2h 10m</span></div>
+          <div class="vr"><i class="dot"></i><b>bob</b><span class="r">resets in 4d</span></div>
+        </div>
+        <h3>Chooses by quota, not by turn</h3>
+        <p>It reads the five-hour, weekly and per-model weekly window on every account, and spends first the quota that resets soonest, so less of it expires unused.</p>
+      </article>
+      <article class="tile">
+        <div class="viz" aria-hidden="true">
+          <div class="vr"><b>web-app</b><span class="arr">→</span><span>alice</span><span class="r">cache warm</span></div>
+          <div class="vr"><b>api</b><span class="arr">→</span><span>bob</span><span class="r">cache warm</span></div>
+          <div class="vr"><b>docs</b><span class="arr">→</span><span>alice</span><span class="r">cache warm</span></div>
+        </div>
+        <h3>One proxy for every session</h3>
+        <p>Each Claude Code session on the machine stays on its own account. You can add, disable or remove accounts while the proxy runs.</p>
+      </article>
+      <article class="tile">
+        <div class="viz" aria-hidden="true">
+          <div class="prov">
+            <div><b>Claude</b><span>5 of 7 ready</span></div>
+            <div><b>Codex</b><span>2 of 3 ready</span></div>
+          </div>
+          <div class="vr"><b>claude</b><span class="arr">·</span><b>codex</b><span class="arr">·</span><b>openclaw</b><span class="r">one proxy</span></div>
+        </div>
+        <h3>Claude Code and Codex</h3>
+        <p>Point Claude Code, OpenAI's <code>codex</code> CLI, or a tool built on them such as OpenClaw at the same proxy. Each provider gets its own pool.</p>
+      </article>
+      <article class="tile">
+        <div class="viz" aria-hidden="true">
+          <span class="vbig">$184 <span class="muted" style="font-size:.5em;font-weight:600;letter-spacing:0">today at list price</span></span>
+          <span class="muted">cache 96% · 10 accounts · 14 sessions</span>
+        </div>
+        <h3>See what it would have cost</h3>
+        <p>TcrBar and the terminal dashboard show every window and every session. TcrBar also shows what the Claude traffic would have cost at list price.</p>
+      </article>
+      <article class="tile">
+        <div class="viz" aria-hidden="true">
+          <div class="digits">
+            <span class="mac"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></svg></span>
+            <span class="code6">482 913</span>
+            <span class="mac"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></svg></span>
+          </div>
+        </div>
+        <h3>Lend part of an account to another Mac</h3>
+        <p>Pair two Macs by comparing the same six digits on both screens, then lend up to half of a window. A borrowed request is served from the lender's own account, so the borrower's credential never leaves the borrower's Mac. Off by default.</p>
+      </article>
+      <article class="tile">
+        <div class="viz" aria-hidden="true">
+          <div class="files">
+            <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>~/.config/tcr.json</span>
+            <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a1 1 0 0 0 1-1V8a1 1 0 0 0-1-1h-8l-2-3H4a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1z"/></svg>~/.cache/tcr/</span>
+            <span class="muted" style="font-family:inherit">0 telemetry endpoints</span>
+          </div>
+        </div>
+        <h3>Stays on your machine</h3>
+        <p>No telemetry and no crash reporting. Your config, logs and tokens are files on your own disk.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="compare" class="band" aria-labelledby="compare-title">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">Compare</p>
+      <h2 id="compare-title">Compared with claude-swap, ccs, teamclaude and others</h2>
+      <p class="lead">Several tools let Claude Code use more than one account. A proxy in the request path chooses an account for every request, while a switcher changes which login Claude Code itself holds.</p>
+    </div>
+    <div class="tablewrap" tabindex="0" role="region" aria-label="Comparison table, scrolls sideways">
+      <table>
+        <thead>
+          <tr><th scope="col">Tool</th><th scope="col">How it switches</th><th scope="col">How it picks an account</th><th scope="col">Keeps each conversation on one account</th><th scope="col">Runs on</th><th scope="col">License</th></tr>
+        </thead>
+        <tbody>
+          <tr class="us"><th scope="row">tcr</th><td>Local proxy in the request path</td><td>Every request, by what is left in the five-hour, weekly and per-model weekly windows</td><td>Yes, always; moves only when that account cannot serve</td><td>macOS, Linux</td><td>PolyForm Noncommercial</td></tr>
+          <tr><th scope="row"><a href="https://github.com/realiti4/claude-swap">claude-swap</a></th><td>Swaps Claude Code's stored login, for the whole machine or one terminal</td><td>By hand, next in turn, or automatically at a five-hour or seven-day threshold</td><td>Per terminal with <code>cswap run</code>; a switch moves the running session, which its README says rebuilds the cache</td><td>macOS, Linux, Windows</td><td>MIT</td></tr>
+          <tr><th scope="row"><a href="https://github.com/KarpelesLab/teamclaude">teamclaude</a></th><td>Local proxy in the request path</td><td>Rotates when the five-hour or weekly window reaches a threshold, and tracks the per-model weekly cap</td><td>Opt-in with <code>distributeSessions</code>, off by default</td><td>Node.js 20+</td><td>MIT</td></tr>
+          <tr><th scope="row"><a href="https://github.com/kaitranntt/ccs">ccs</a></th><td>Launches Claude Code with a chosen profile; account pools go through a local proxy</td><td>Profile chosen at launch; the proxy rotates round-robin by default, or fills one account first with pool routing on</td><td>Opt-in: <a href="https://docs.ccs.kaitran.ca/features/pool">pool routing</a> holds a conversation on one account for up to an hour</td><td>macOS, Linux, Windows</td><td>MIT</td></tr>
+          <tr><th scope="row"><a href="https://github.com/nguyenphutrong/quotio">Quotio</a></th><td>macOS app that manages a local proxy (CLIProxyAPI)</td><td>Round-robin or fill-first</td><td>Not stated in its README</td><td>macOS app; CLI on macOS and Linux</td><td>MIT</td></tr>
+          <tr><th scope="row"><a href="https://github.com/inulute/cux">cux</a></th><td>Swaps the login, restarts Claude Code and resumes the conversation</td><td>On a rate limit by default, with optional five-hour and seven-day thresholds</td><td>No: moving the conversation is how it works</td><td>Linux, macOS, Windows</td><td>GPL-3.0</td></tr>
+          <tr><th scope="row"><a href="https://github.com/ming86/cc-account-switcher">cc-account-switcher</a></th><td>Swaps the stored login while Claude Code is closed</td><td>By hand</td><td>Not stated in its README</td><td>macOS, Linux, WSL</td><td>MIT</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Each row comes from that project's own README and docs, read on 2026-10-13. "Not stated" means its README does not say, not that the tool cannot.</p>
+    <p class="fit">Another tool fits better if you need Windows (claude-swap, ccs, cux), want Gemini or other providers behind the same tool (teamclaude, ccs, Quotio), want no proxy in the request path (claude-swap, cux, cc-account-switcher), or need an open-source license for commercial use (every other row). Moving from claude-swap, Quotio, ccs or CLIProxyAPI? <code>tcr import</code> lists the logins they hold.</p>
+  </div>
+</section>
+
+<section id="faq" aria-labelledby="faq-title">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">FAQ</p>
+      <h2 id="faq-title">Questions people ask first</h2>
+    </div>
+    <div class="faq">
+      <details>
+        <summary>How do I use Claude Code with more than one Claude account?</summary>
+        <div class="a">
+          <p>Install tcr, run <code>tcr login</code> once for each account, start the proxy with <code>tcr</code> (or let TcrBar run it), and launch Claude Code with <code>tcr run</code>. Every request then goes through the proxy, which picks an account from the pool. If you are already logged in to Claude Code, the first run imports that login, so you only log in to the others. Claude Code then asks you to sign in once more, because a refresh token works only once.</p>
+          <p>Claude Code has its own answer: <code>CLAUDE_CONFIG_DIR</code> moves its configuration directory, and <a href="https://code.claude.com/docs/en/env-vars">Anthropic's docs</a> suggest it for running accounts side by side. There you pick the account by picking the directory when you start a session. tcr keeps one Claude Code setup and picks the account for every request instead. It imports Claude Code's default login and does not read <code>CLAUDE_CONFIG_DIR</code>.</p>
+        </div>
+      </details>
+      <details>
+        <summary>Can I use Claude Code with several Max subscriptions?</summary>
+        <div class="a">
+          <p>Yes. Each subscription is one account in the pool: run <code>tcr login</code> once for each. tcr reads every account's five-hour, weekly and per-model weekly windows, and sends each request to one that has quota left.</p>
+        </div>
+      </details>
+      <details>
+        <summary>How do I switch between Codex accounts?</summary>
+        <div class="a">
+          <p>You stop switching by hand. A Codex account is the ChatGPT login <code>codex</code> uses. Sign each one in with <code>tcr login --codex</code>, or import the one <code>codex</code> already has with <code>tcr login --from-codex</code>, then start codex with <code>tcr run --codex</code>. Codex accounts are picked, refreshed and checked for quota the same way Claude accounts are, and a Codex request is only ever served by a Codex account.</p>
+        </div>
+      </details>
+      <details>
+        <summary>Does switching accounts lose the prompt cache?</summary>
+        <div class="a">
+          <p>Yes. Anthropic keeps the prompt cache per account, so a conversation that moves arrives cold and writes its whole cached prefix again. A cache write bills at 1.25 times the input price and a cache read at a tenth of it or less, so the first request after a move pays at least 12.5 times as much for that prefix (25 times on Opus 5.5).</p>
+          <p>That is why tcr keeps each conversation on one account, even past the point where it would send new conversations elsewhere. tcr saves which account each conversation is on, so a restart keeps that for conversations still within the cache lifetime.</p>
+        </div>
+      </details>
+      <details>
+        <summary>How long does the cache stay warm?</summary>
+        <div class="a">
+          <p>Five minutes after its last use, unless the request asks for an hour. From 1.1.19 tcr asks for the one-hour cache on every Claude request, so a conversation you come back to within the hour resumes warm. On a subscription the hour costs the five-hour window what five minutes does (measured 2026-10-06). <code>cacheTtlRewrite</code> turns it off.</p>
+        </div>
+      </details>
+      <details>
+        <summary>What happens when an account runs out?</summary>
+        <div class="a">
+          <p>New conversations skip any account that is close to a limit, on a rate-limit hold, or out of the model window a request needs, and go to the account the quota rules pick next. A conversation already on that account moves once, and pays one cache rebuild.</p>
+        </div>
+      </details>
+      <details>
+        <summary>Does it run on Linux, and with API keys?</summary>
+        <div class="a">
+          <p>The tcr CLI and terminal dashboard run on Linux as static builds for x86_64 and aarch64. TcrBar, the menu-bar app, is macOS only.</p>
+          <p>Accounts are Claude subscriptions logged in through the browser, or Codex accounts. tcr does not serve Anthropic API keys, and refuses a Codex login made with an API key too.</p>
+        </div>
+      </details>
+      <details>
+        <summary>Is tcr free?</summary>
+        <div class="a">
+          <p>Yes, for noncommercial use. tcr is source-available under the <a href="https://github.com/dhkts1/tcr/blob/main/LICENSE">PolyForm Noncommercial License 1.0.0</a>, which is not an open-source license. If you need an open-source license for commercial use, the comparison above lists the tools that have one.</p>
+        </div>
+      </details>
+      <details>
+        <summary>Does tcr send my data anywhere?</summary>
+        <div class="a">
+          <p>No telemetry and no crash reporting. Your config, logs and tokens are files on your own disk. tcr calls Anthropic on your behalf (and OpenAI, for Codex accounts) and GitHub to check for a newer version. If you turn on peers, it also talks to the other Macs you trust, and a Mac that lends you an account sees the requests it serves for you.</p>
+        </div>
+      </details>
+      <details>
+        <summary>Is it safe to run?</summary>
+        <div class="a">
+          <p>tcr holds your account tokens, so get it from the <a href="https://github.com/dhkts1/tcr/releases">release page</a> or the install script, never a copy repackaged elsewhere. Each CLI archive has a <code>.sha256</code> file beside it, and TcrBar is signed with a Developer ID certificate and notarized by Apple.</p>
+          <p>It listens only on 127.0.0.1, but every process and container on the machine can reach that address, and by default nothing asks it for a key. Read the <a href="https://github.com/dhkts1/tcr#security">security notes</a> before you run it.</p>
+        </div>
+      </details>
+    </div>
+  </div>
+</section>
+
+<section class="end band" aria-labelledby="end-title">
+  <div class="wrap">
+    <h2 id="end-title">Install it in one line</h2>
+    <p class="lead">The script installs the tcr CLI, and on a Mac also installs TcrBar and opens it. Look for it at the top right of the screen.</p>
+    <div class="cmd">
+      <div class="cmd-box">
+        <pre aria-label="Install command"><span class="p">$ </span><code id="install2">curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/dhkts1/tcr/main/install.sh | sh</code></pre>
+        <button class="copy" type="button" data-copy="install2" aria-label="Copy the install command">
+          <svg class="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9A1.5 1.5 0 0 1 15 4.5V5"/></svg>
+          <svg class="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="https://github.com/dhkts1/tcr/releases/latest">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+        Download for macOS
+      </a>
+      <a class="btn btn-ghost" href="https://github.com/dhkts1/tcr#readme">Read the docs</a>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <nav class="flinks" aria-label="Project links">
+      <a href="https://github.com/dhkts1/tcr">GitHub</a>
+      <a href="https://github.com/dhkts1/tcr/releases">Releases</a>
+      <a href="https://github.com/dhkts1/tcr/blob/main/docs/cli.md">CLI reference</a>
+      <a href="https://github.com/dhkts1/tcr/blob/main/docs/configuration.md">Configuration</a>
+      <a href="https://github.com/dhkts1/tcr/blob/main/docs/troubleshooting.md">Troubleshooting</a>
+      <a href="https://github.com/dhkts1/tcr#security">Security</a>
+      <a href="https://github.com/dhkts1/tcr/blob/main/LICENSE">License</a>
+    </nav>
+    <p class="legal">tcr is source-available under the PolyForm Noncommercial License 1.0.0. It is not affiliated with Anthropic or OpenAI. Claude is a trademark of Anthropic; Codex and ChatGPT are trademarks of OpenAI.</p>
+  </div>
+</footer>
+
+<p class="sr" role="status" aria-live="polite" id="copy-status"></p>
+<script>
+(function () {
+  var status = document.getElementById('copy-status');
+  document.querySelectorAll('[data-copy]').forEach(function (btn) {
+    var timer;
+    btn.addEventListener('click', function () {
+      var text = document.getElementById(btn.dataset.copy).textContent.trim();
+      if (!navigator.clipboard) {
+        status.textContent = 'Copy is not available here. Select the command and copy it.';
+        return;
+      }
+      navigator.clipboard.writeText(text).then(function () {
+        btn.dataset.state = 'done';
+        status.textContent = 'Copied the install command';
+        clearTimeout(timer);
+        timer = setTimeout(function () { btn.dataset.state = ''; }, 1600);
+      }, function (err) {
+        status.textContent = 'Copy failed: ' + err.message + '. Select the command and copy it.';
+      });
+    });
+  });
+})();
+</script>
+</body>
+</html>
