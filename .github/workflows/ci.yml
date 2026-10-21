@@ -378,6 +378,11 @@ jobs:
       - name: Test (install.sh)
         run: scripts/test-install-sh.sh
 
+      # release-tcrbar.sh's upload step against a stub `gh`: the appcast-guard race, the
+      # read-backs, and the TcrBar.dmg copy the site's Download button links to.
+      - name: Test (release upload)
+        run: apps/macos/scripts/release-upload-race-fixture-test.sh
+
   audit:
     name: audit
     runs-on: ubuntu-latest
