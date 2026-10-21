@@ -978,7 +978,7 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn review_guidance_requires_a_compatible_incumbent() {
+    fn the_stand_down_line_names_the_first_version_with_handoff() {
         assert!(stand_down_message(12345, 42).contains("if it runs tcr 1.2.17 or newer"));
     }
     use super::*;

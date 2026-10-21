@@ -265,15 +265,15 @@ mod tests {
     }
 
     #[test]
-    fn review_restart_faults_are_recoverable() {
-        const CHILD: &str = "TCR_REVIEW_RESTART_CHILD";
+    fn the_handoff_endpoint_survives_descriptor_exhaustion() {
+        const CHILD: &str = "TCR_RESTART_EMFILE_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new("/bin/sh")
                 .args(["-c", "ulimit -n 128; exec \"$@\"", "restart-fixture"])
                 .arg(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "restart::tests::review_restart_faults_are_recoverable",
+                    "restart::tests::the_handoff_endpoint_survives_descriptor_exhaustion",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")

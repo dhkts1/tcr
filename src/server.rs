@@ -2920,7 +2920,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn review2_failed_send_keeps_accepting() {
+    async fn a_handoff_whose_send_fails_keeps_serving_and_owning_the_port() {
         for missing_listener in [false, true] {
             let mut config = boot_line_test_config();
             config.proxy.port = 0;

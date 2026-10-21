@@ -4791,7 +4791,7 @@ pub fn wrap(config_path: &Path, days: u32, json: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn review_guidance_requires_a_compatible_incumbent() {
+    fn the_restart_hint_names_the_first_version_with_handoff() {
         assert!(RESTART_HINT.contains("stop it"));
         assert!(RESTART_HINT.contains("if it runs tcr 1.2.17 or newer"));
     }

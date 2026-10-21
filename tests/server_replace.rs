@@ -672,9 +672,9 @@ fn assert_stand_down_flushes_the_actual_log_owner() {
 }
 
 #[test]
-fn review_exit_paths_keep_logging_and_serving() {
+fn a_stand_down_flushes_its_log_and_a_taken_handoff_socket_still_serves() {
     use std::os::unix::process::CommandExt;
-    if std::env::var_os("TCR_REVIEW_BIND_COLLISION").is_some() {
+    if std::env::var_os("TCR_HANDOFF_SOCKET_TAKEN").is_some() {
         let path = tcr::restart::socket_path(std::process::id());
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let listener: std::os::fd::OwnedFd = listener.into();
@@ -701,11 +701,11 @@ fn review_exit_paths_keep_logging_and_serving() {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "server_replace::review_exit_paths_keep_logging_and_serving",
+            "server_replace::a_stand_down_flushes_its_log_and_a_taken_handoff_socket_still_serves",
             "--nocapture",
         ])
         .env_clear()
-        .env("TCR_REVIEW_BIND_COLLISION", "1")
+        .env("TCR_HANDOFF_SOCKET_TAKEN", "1")
         .env("HOME", home.path())
         .env("PATH", "/usr/bin:/bin")
         .env("TCR_CLAUDE_CODE_CREDENTIALS", home.path().join("no-login"))

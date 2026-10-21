@@ -1269,7 +1269,7 @@ mod tests {
     use crate::log_err::LogErr as _;
 
     #[tokio::test]
-    async fn review_restart_serves_already_queued_http_before_draining() {
+    async fn a_handoff_serves_already_queued_http_before_draining() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (mut client, server) = tokio::io::duplex(4096);
         client

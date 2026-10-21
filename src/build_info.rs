@@ -519,7 +519,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_guidance_requires_a_compatible_incumbent() {
+    fn the_skew_line_and_docs_say_when_replace_can_hand_over() {
         let ours = build("9f3a1b2", Some(false));
         for running in [
             None,
