@@ -274,6 +274,39 @@ final class PanelHeightTests: XCTestCase {
             "nothing measured yet — the budget, never a zero-height panel")
     }
 
+    /// How far a list may grow into a panel a taller tab has set: down to the
+    /// end of its own content, never past it, and never below its viewport.
+    ///
+    /// The defect (Sessions and Tools, 1.2.17): both lists were framed at
+    /// exactly ``PanelHeight/viewportHeight(contentHeight:budget:)``, so on a
+    /// panel the Accounts tab made taller, a list with rows left to scroll to
+    /// stopped at the budget and the spacer above the footer drew an empty
+    /// band under it.
+    func testAListGrowsToItsOwnContentAndNoFurther() {
+        let budget = PanelHeight.panelMaxHeight
+        XCTAssertEqual(
+            PanelHeight.viewportMaxHeight(contentHeight: 980, budget: budget), 980,
+            "a list longer than the budget may take the room a taller tab left")
+        XCTAssertEqual(
+            PanelHeight.viewportMaxHeight(contentHeight: 184, budget: budget), 184,
+            "a short list stays its own height, with no empty scroll area under it")
+        XCTAssertEqual(
+            PanelHeight.viewportMaxHeight(contentHeight: 0, budget: budget), budget,
+            "nothing measured yet: the viewport's own first-frame height, the budget")
+    }
+
+    /// The ceiling is never under the viewport, on any input, or the flexible
+    /// frame it bounds would be asked for a minimum above its maximum.
+    func testTheCeilingIsNeverBelowTheViewport() {
+        let budget = PanelHeight.listBudget(headerOverflow: 28, minimum: 120)
+        for content: CGFloat in [0, 1, 120, budget - 1, budget, budget + 1, 4000] {
+            XCTAssertGreaterThanOrEqual(
+                PanelHeight.viewportMaxHeight(contentHeight: content, budget: budget),
+                PanelHeight.viewportHeight(contentHeight: content, budget: budget),
+                "content \(content)")
+        }
+    }
+
     /// The budget, not the cap: a wrapped header spends part of it, and the
     /// viewport is clamped to what is left rather than to 520.
     func testTheViewportIsClampedToTheBudgetTheHeaderLeft() {

@@ -1799,10 +1799,7 @@ struct FleetView: View {
                             }
                         )
                 }
-                .frame(
-                    height: PanelHeight.viewportHeight(
-                        contentHeight: sessionsContentHeight, budget: listBudget(for: fleet))
-                )
+                .tabListFrame(contentHeight: sessionsContentHeight, budget: listBudget(for: fleet))
                 .onPreferenceChange(V4ContentHeightKey.self) {
                     sessionsContentHeight = PanelHeight.settled(sessionsContentHeight, $0)
                 }
@@ -2206,10 +2203,7 @@ struct FleetView: View {
                         }
                     )
             }
-            .frame(
-                height: PanelHeight.viewportHeight(
-                    contentHeight: toolsContentHeight, budget: listBudget(for: fleet))
-            )
+            .tabListFrame(contentHeight: toolsContentHeight, budget: listBudget(for: fleet))
             .onPreferenceChange(V4ContentHeightKey.self) {
                 toolsContentHeight = PanelHeight.settled(toolsContentHeight, $0)
             }
@@ -4664,6 +4658,38 @@ struct V4ContentHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
+    }
+}
+
+extension View {
+    /// The Sessions and Tools lists' viewport: ideally its clamped content
+    /// height, and free to run down to the footer when the panel is taller.
+    ///
+    /// Every tab is measured at its ideal height and then drawn at the
+    /// tallest one's (`TallestTabLayout`), so the IDEAL is what sets the
+    /// panel's height and it is unchanged:
+    /// ``PanelHeight/viewportHeight(contentHeight:budget:)``. What changed is
+    /// placement. A fixed height left a list with rows still to scroll to
+    /// stopping at the budget on a panel the Accounts tab had made taller, with
+    /// the spacer above the footer drawing an empty band under it (1.2.17).
+    /// Now the frame accepts up to ``PanelHeight/viewportMaxHeight(contentHeight:budget:)``,
+    /// and the priority hands it that room ahead of the spacer, so the list
+    /// ends at the footer, or at its own last row when that comes first.
+    ///
+    /// The measurement cannot feed back: the reader sits on the content inside
+    /// the scroll view, which is laid out at its own height whatever height the
+    /// viewport is given.
+    func tabListFrame(contentHeight: CGFloat, budget: CGFloat) -> some View {
+        let viewport = PanelHeight.viewportHeight(contentHeight: contentHeight, budget: budget)
+        return
+            self
+            .frame(
+                minHeight: viewport, idealHeight: viewport,
+                maxHeight: PanelHeight.viewportMaxHeight(
+                    contentHeight: contentHeight, budget: budget),
+                alignment: .top
+            )
+            .layoutPriority(1)
     }
 }
 

@@ -152,6 +152,25 @@ public enum PanelHeight {
         return min(contentHeight, budget)
     }
 
+    /// The most height a list's viewport may take when the panel has more room
+    /// than the list's own tab asked for: its whole content, and never less
+    /// than ``viewportHeight(contentHeight:budget:)``.
+    ///
+    /// Every tab is drawn at the tallest tab's height
+    /// (``sharedTabHeight(_:)``), so on the Sessions and Tools tabs there is
+    /// often room under a list that the Accounts tab's taller summary made.
+    /// The viewport's IDEAL height stays ``viewportHeight(contentHeight:budget:)``,
+    /// which is what each tab is measured at and so what sets the panel's
+    /// height; this is the ceiling it may stretch to when placed, so a list
+    /// with rows left to scroll to runs down to the footer instead of stopping
+    /// at the budget over an empty band. A list shorter than that room stops
+    /// at its own end.
+    ///
+    /// `0` (nothing measured yet) is the budget, the same first-frame rule.
+    public static func viewportMaxHeight(contentHeight: CGFloat, budget: CGFloat) -> CGFloat {
+        max(viewportHeight(contentHeight: contentHeight, budget: budget), contentHeight)
+    }
+
     /// The height every tab of the panel is drawn at: the tallest tab's own
     /// height, so switching tabs never resizes the panel (Gil, 2026-10-16).
     ///
