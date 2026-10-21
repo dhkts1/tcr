@@ -534,3 +534,30 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" 'INNER=yes claude'
     }
     assert!(failures.is_empty(), "shell boundary defects: {failures:?}");
 }
+
+#[test]
+fn keyed_codex_unit_test_ignores_the_ambient_proxy() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("codex-home")).unwrap();
+    let out = Command::new("cargo")
+        .args([
+            "test",
+            "--bin",
+            "tcr",
+            "tests::a_keyed_codex_launch_keeps_the_marker_and_restores_shell_settings",
+            "--locked",
+        ])
+        .env(
+            "HTTPS_PROXY",
+            "http://tcr:obviously-fake-probe-key@127.0.0.1:9",
+        )
+        .env("CODEX_HOME", root.path().join("codex-home"))
+        .output()
+        .unwrap();
+    let printed =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && !printed.contains("obviously-fake-probe-key"),
+        "keyed unit test must pass with an isolated environment and print no ambient key: {printed}"
+    );
+}
