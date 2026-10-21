@@ -9432,6 +9432,31 @@ mod tests {
     /// Keyed model traffic retains the marker; shell defaults contain no key.
     #[test]
     fn a_keyed_codex_launch_keeps_the_marker_and_restores_shell_settings() {
+        const ISOLATED: &str = "TCR_TEST_KEYED_LAUNCH_CHILD";
+        if std::env::var_os(ISOLATED).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("codex-home")).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::a_keyed_codex_launch_keeps_the_marker_and_restores_shell_settings",
+                ])
+                .env_clear()
+                .env("HOME", root.path())
+                .env("CODEX_HOME", root.path().join("codex-home"))
+                .env("PATH", "/usr/bin:/bin")
+                .env("TMPDIR", root.path())
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated keyed launch assertion failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let pooled = CodexLaunch::SeeThrough {
             ca: PathBuf::from("/tmp/ca.pem"),
             no_proxy: Vec::new(),
