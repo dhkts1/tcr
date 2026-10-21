@@ -3087,7 +3087,7 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reviewer_handoff_stops_the_predecessor_fan_before_release() {
+    async fn a_handoff_stops_the_predecessor_fan_before_releasing_the_listener() {
         use std::io::{Read, Write};
         use tcr_fan::controller::{Command, FanDesired};
         let dir = tempfile::tempdir().unwrap();
@@ -3131,7 +3131,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reviewer_control_handoff_with_fan_already_stopped() {
+    async fn a_handoff_completes_when_the_fan_controller_has_already_stopped() {
         use std::io::{Read, Write};
         use tcr_fan::controller::{Command, FanDesired};
         let dir = tempfile::tempdir().unwrap();

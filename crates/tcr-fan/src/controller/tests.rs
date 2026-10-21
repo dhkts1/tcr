@@ -1895,7 +1895,7 @@ fn a_command_taken_mid_entry_settles_after_its_own_round() {
 }
 
 #[test]
-fn reviewer_control_stopped_predecessor_preserves_successor_auto() {
+fn a_stopped_predecessor_writes_no_fan_after_the_successor_hands_back_to_auto() {
     let mut old = holding(fixed(5000));
     old.send(Command::Shutdown {
         deadline: old.clock.now() + Duration::from_secs(3),
