@@ -128,7 +128,7 @@ chooses an account for it from the start.
 
 By default a second `tcr` stands down rather than killing the incumbent, because two
 proxies sharing one config both hold the same single-use refresh tokens, and the first
-refresh by either revokes the other's. Stop it, or use `tcr server --replace` if it runs this version or newer and listener handoff is enabled.
+refresh by either revokes the other's. Stop it, or use `tcr server --replace` if it runs tcr 1.2.17 or newer and listener handoff is enabled.
 Prefer standing down: a restart costs every live session its prompt cache, which is
 per-account at Anthropic's end and the most expensive event in this system.
 

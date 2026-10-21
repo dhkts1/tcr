@@ -331,7 +331,7 @@ pub fn stand_down_build_report(
             line: format!(
                 "[tcr] note build-skew-unknown: this_binary={} but the proxy on :{port} did not \
                  report its build — it may be serving older code. `tcr status` reports the \
-                 running build; stop it, or use `tcr --replace` if it runs this version or newer.",
+                 running build; stop it, or use `tcr --replace` if it runs tcr 1.2.17 or newer.",
                 ours.sha
             ),
         };
@@ -360,7 +360,7 @@ pub fn stand_down_build_report(
             verdict: StandDownBuild::Unknown,
             line: format!(
                 "[tcr] note build-skew-unknown: {keys} — cannot tell whether the proxy on :{port} \
-                 is running this binary's code. stop it, or use `tcr --replace` if it runs this version or newer."
+                 is running this binary's code. stop it, or use `tcr --replace` if it runs tcr 1.2.17 or newer."
             ),
         };
     }
@@ -370,7 +370,7 @@ pub fn stand_down_build_report(
             line: format!(
                 "[tcr] WARNING stale-server: {keys} — the proxy on :{port} is NOT running this \
                  binary's code and will keep serving its own until it is restarted. \
-                 stop it, or use `tcr --replace` if it runs this version or newer."
+                 stop it, or use `tcr --replace` if it runs tcr 1.2.17 or newer."
             ),
         };
     }

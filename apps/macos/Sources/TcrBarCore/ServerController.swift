@@ -74,7 +74,7 @@ public final class ServerController: ObservableObject {
                     return """
                         Listener handoff is unavailable. Stop the existing proxy from its own \
                         terminal or supervisor, then start the server here. Use --replace only \
-                        when the existing proxy runs this version or newer and handoff is enabled. \(message)
+                        when the existing proxy runs tcr 1.2.17 or newer and handoff is enabled. \(message)
                         """
                 }
                 return """
@@ -100,7 +100,7 @@ public final class ServerController: ObservableObject {
                 return """
                     Already running — not ours, left alone. It is serving an older \
                     build than the `tcr` on disk, so a fix you just built is not \
-                    live on the port. Stop it, or use "Take over port…" if it runs this version or newer \
+                    live on the port. Stop it, or use "Take over port…" if it runs tcr 1.2.17 or newer \
                     and listener handoff is enabled. \(message)
                     """
             case .exited(let code, let message):

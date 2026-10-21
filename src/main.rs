@@ -8746,7 +8746,7 @@ const fn wedged_incumbent_recovery(kind: singleton::ProxyKind) -> &'static str {
              start it again to recover a wedged embedded proxy."
         }
         singleton::ProxyKind::Tcr => {
-            "Stop the proxy explicitly, or use `tcr --replace` if it runs this version or newer \
+            "Stop the proxy explicitly, or use `tcr --replace` if it runs tcr 1.2.17 or newer \
              and its listener handoff endpoint still answers."
         }
     }

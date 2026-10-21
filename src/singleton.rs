@@ -850,7 +850,7 @@ fn stand_down_message(port: u16, pid: u32) -> String {
         "[tcr] {INCUMBENT_MARKER} :{port} (pid {pid}) and it is still listening — leaving it \
          alone and exiting without binding. Replacing it would wipe its session→account pin map \
          and cold-start every live session's prompt cache, the most expensive event in this \
-         system. Stop it, or use --replace if it runs this version or newer."
+         system. Stop it, or use --replace if it runs tcr 1.2.17 or newer."
     )
 }
 

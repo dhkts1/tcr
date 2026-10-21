@@ -206,7 +206,7 @@ pub async fn request_listener(port: u16) -> anyhow::Result<Option<std::net::TcpL
     );
     let mut peer = tokio::time::timeout(TIMEOUT, UnixStream::connect(socket_path(incumbent.pid)))
         .await.context("tcr-handoff-unavailable: timed out connecting to the incumbent handoff endpoint; stop it explicitly")?
-        .context("tcr-handoff-unavailable: could not connect to the incumbent listener handoff endpoint; stop it explicitly, or use --replace if it runs this version or newer and handoff is enabled; no process was signalled")?;
+        .context("tcr-handoff-unavailable: could not connect to the incumbent listener handoff endpoint; stop it explicitly, or use --replace if it runs tcr 1.2.17 or newer and handoff is enabled; no process was signalled")?;
     verify_same_user(&peer)?;
     tokio::time::timeout(TIMEOUT, peer.write_all(REQUEST))
         .await
