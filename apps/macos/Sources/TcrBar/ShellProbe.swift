@@ -704,9 +704,8 @@ enum ShellProbe {
     // MARK: - Assertion 7
 
     /// Retired the "the gauge differs between appearances" half of this check:
-    /// the coffee-mark rework removed the
-    /// separate gauge glyph this assertion used to split against by colour —
-    /// there is now one cup, and its own colour IS the awake tint end to end.
+    /// there is one glyph, the ray mark, and its own colour IS the awake tint
+    /// end to end.
     /// What is still real and still worth a shell-level check, since a unit
     /// test never touches the real `NSStatusBarButton`: the composed image's
     /// dynamic tint (`Tok.awakeNSColor`, a different hex in each appearance)
@@ -716,8 +715,8 @@ enum ShellProbe {
     /// composed — the same claim ``MenuBarMark``'s own doc-comment makes.
     @MainActor
     private static func appearanceCheck() -> Check {
+        let mark = MenuBarMark.image(fraction: 1.0, tint: .awake(Tok.awakeNSColor))
         guard
-            let mark = MenuBarMark.image(fraction: 1.0, tint: .awake(Tok.awakeNSColor)),
             let aqua = NSAppearance(named: .aqua),
             let dark = NSAppearance(named: .darkAqua),
             let light = rasterise(mark, in: aqua),
@@ -727,10 +726,10 @@ enum ShellProbe {
                 7, "ON image re-resolves the awake tint per appearance", passed: false,
                 detail: "could not compose or rasterise the mark")
         }
-        let cupHeld = light.cyan > 0 && night.cyan > 0
+        let tintHeld = light.cyan > 0 && night.cyan > 0
         return Check(
-            7, "ON image: the cup carries the awake tint under both .aqua and .darkAqua",
-            passed: cupHeld,
+            7, "ON image: the mark carries the awake tint under both .aqua and .darkAqua",
+            passed: tintHeld,
             detail: String(format: "aqua cyan=%d · dark cyan=%d", light.cyan, night.cyan))
     }
 

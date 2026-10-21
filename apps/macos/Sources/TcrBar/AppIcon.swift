@@ -5,83 +5,101 @@ import Foundation
 ///
 /// ## Why code and not an asset
 ///
-/// A committed `.icns` is a binary that drifts from the palette silently: change a
-/// token and the icon keeps the old colour, and nothing fails. Drawing it from the
-/// same `Tok` values means the mark cannot disagree with the app, and the whole
+/// A committed `.icns` is a binary that drifts silently: change the mark and the
+/// icon keeps the old one, and nothing fails. Drawing it here means the whole
 /// icon set regenerates from one command.
 ///
 /// ## What it means
 ///
-/// An almost-closed ring with a single bright dot at its leading end. The ring is
-/// the pool of accounts and the gap is the one being spent; the dot is the account
-/// currently serving, and its position is where rotation has reached. It reads as
-/// rotation and as progress, which is what this proxy does.
+/// The site's mark (`docs/site/mark.svg`): a radial quota chart. Eight rays round
+/// a hub, one per account, each as long as that account's quota left, in the
+/// panel's ready green, near amber and spent red, over dim full-length tracks.
+/// The white hub is the proxy. The tracks and the hub are what keep it from
+/// reading as a spark or a spinner. The lengths are a fixed picture of a healthy
+/// pool with one account near its limit and one nearly spent, the same as the
+/// site, not a live reading.
 ///
-/// Deliberately ONE mark with ONE accent. At 16pt — the size that actually matters,
-/// because that is the Finder list and the Login Items row — anything with more
-/// than two elements turns to mush. The design was checked at 16pt first and scaled
-/// up, not the reverse.
+/// ## Small sizes
+///
+/// At 32 px and below (the Finder list and the Login Items row, which is where
+/// the icon is mostly seen) the tracks blur into the rays, so those slots drop
+/// them and draw thicker rays and a bigger hub.
 enum AppIcon {
+
+    /// Each ray's length as a fraction of its track, clockwise from 12 o'clock,
+    /// and its colour: the site mark's eight rays, measured off `mark.svg`.
+    private static let rays: [(length: CGFloat, color: NSColor)] = [
+        (1.00, ready), (0.75, ready), (0.94, ready), (0.57, ready),
+        (0.81, ready), (0.35, near), (0.69, ready), (0.15, spent),
+    ]
+    private static let ready = srgb(0x66, 0xd0, 0x81)
+    private static let near = srgb(0xff, 0xd1, 0x6b)
+    private static let spent = srgb(0xea, 0x5a, 0x56)
+    private static let track = srgb(0x2f, 0x33, 0x39)
+    private static let hub = srgb(0xf2, 0xf2, 0xef)
+
+    private static func srgb(_ r: Int, _ g: Int, _ b: Int) -> NSColor {
+        NSColor(
+            srgbRed: CGFloat(r) / 255, green: CGFloat(g) / 255, blue: CGFloat(b) / 255, alpha: 1)
+    }
 
     /// Draw the mark at `size` points, square.
     static func image(size: CGFloat) -> NSImage {
         NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
             let s = size / 1024.0  // design space is 1024, the largest icns slot
+            let small = size <= 32
 
             // macOS icons do not fill their square: the grid leaves a margin so
             // adjacent icons breathe. ~10% inset matches the system look.
             let ground = rect.insetBy(dx: 100 * s, dy: 100 * s)
 
-            // Warm near-black, matching the panel's darkest surface rather than
-            // pure black, which reads as a hole next to real macOS icons.
+            // The site's near-black rather than pure black, which reads as a
+            // hole next to real macOS icons.
             let squircle = NSBezierPath(
                 roundedRect: ground, xRadius: 185 * s, yRadius: 185 * s)
-            NSColor(srgbRed: 0x09 / 255, green: 0x0c / 255, blue: 0x10 / 255, alpha: 1).setFill()
+            srgb(0x09, 0x0c, 0x10).setFill()
             squircle.fill()
 
             // A hairline lip so the mark still has an edge on a dark wallpaper.
-            NSColor(srgbRed: 0x53 / 255, green: 0x59 / 255, blue: 0x60 / 255, alpha: 1).setStroke()
+            srgb(0x53, 0x59, 0x60).setStroke()
             squircle.lineWidth = 6 * s
             squircle.stroke()
 
             let centre = NSPoint(x: rect.midX, y: rect.midY)
-            let radius = 250 * s
-            let ringWidth = 84 * s
+            let inner = (small ? 120 : 130) * s
+            let outer = (small ? 330 : 340) * s
+            let width = (small ? 78 : 62) * s
+            let hubRadius = (small ? 70 : 64) * s
 
-            // The pool: an open ring. The gap is deliberate — a closed circle reads
-            // as a status light, an open one reads as rotation with somewhere left
-            // to go.
-            let ring = NSBezierPath()
-            ring.appendArc(
-                withCenter: centre, radius: radius, startAngle: 118, endAngle: 62,
-                clockwise: false)
-            ring.lineWidth = ringWidth
-            ring.lineCapStyle = .round
-            NSColor(srgbRed: 0x39 / 255, green: 0x3e / 255, blue: 0x43 / 255, alpha: 1).setStroke()
-            ring.stroke()
+            func ray(_ index: Int, length: CGFloat) -> NSBezierPath {
+                // 0 is 12 o'clock, counting clockwise; y grows upwards here.
+                let angle = 2 * Double.pi * Double(index) / Double(rays.count)
+                let dx = CGFloat(sin(angle))
+                let dy = CGFloat(cos(angle))
+                let end = inner + max(length, 0.02) * (outer - inner)
+                let path = NSBezierPath()
+                path.move(to: NSPoint(x: centre.x + dx * inner, y: centre.y + dy * inner))
+                path.line(to: NSPoint(x: centre.x + dx * end, y: centre.y + dy * end))
+                path.lineWidth = width
+                path.lineCapStyle = .round
+                return path
+            }
 
-            // The served portion, in the ready green. Stops short of the dot so the
-            // two read as one motion rather than a single blob.
-            let served = NSBezierPath()
-            served.appendArc(
-                withCenter: centre, radius: radius, startAngle: 118, endAngle: 300,
-                clockwise: true)
-            served.lineWidth = ringWidth
-            served.lineCapStyle = .round
-            NSColor(srgbRed: 0x66 / 255, green: 0xd0 / 255, blue: 0x81 / 255, alpha: 1).setStroke()
-            served.stroke()
+            if !small {
+                track.setStroke()
+                for index in rays.indices { ray(index, length: 1).stroke() }
+            }
+            for (index, value) in rays.enumerated() {
+                value.color.setStroke()
+                ray(index, length: value.length).stroke()
+            }
 
-            // The live account: one bright dot at the leading edge.
-            let angle = 300.0 * .pi / 180.0
-            let dot = NSPoint(
-                x: centre.x + radius * cos(angle), y: centre.y + radius * sin(angle))
-            let dotRadius = 86 * s
-            let dotPath = NSBezierPath(
+            hub.setFill()
+            NSBezierPath(
                 ovalIn: NSRect(
-                    x: dot.x - dotRadius, y: dot.y - dotRadius,
-                    width: dotRadius * 2, height: dotRadius * 2))
-            NSColor(srgbRed: 0xf2 / 255, green: 0xf2 / 255, blue: 0xef / 255, alpha: 1).setFill()
-            dotPath.fill()
+                    x: centre.x - hubRadius, y: centre.y - hubRadius,
+                    width: hubRadius * 2, height: hubRadius * 2)
+            ).fill()
 
             return true
         }
