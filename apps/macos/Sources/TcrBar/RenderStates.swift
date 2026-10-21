@@ -694,6 +694,43 @@ enum RenderStates {
         ]
     }
 
+    /// A panel drawn in a real window with its lists in their scroll views
+    /// (``FleetView/snapshotKeepsScrollViews``), on one tab.
+    ///
+    /// Every other panel scene lays its lists out unclipped, so none of them
+    /// can show where a list that overflows stops against the footer: the
+    /// band between the last row and the footer existed only in the live
+    /// popover. These scenes draw what the popover draws.
+    ///
+    /// `fixtures` names the scene whose per-scene fixtures (session files,
+    /// process readings) it borrows. Each fleet's three tabs share one fleet
+    /// and one `fixtures`, so the three PNGs differ by the selected tab alone
+    /// and must come out the same height.
+    struct LiveListScene {
+        let name: String
+        let fixtures: String
+        let fleet: Fleet
+        let tab: PanelTab
+    }
+
+    private static var liveListScenes: [LiveListScene] {
+        let fleets: [(name: String, fixtures: String, fleet: Fleet)] = [
+            // Thirteen accounts and lists longer than the space: the Accounts
+            // tab is the tallest, and Sessions and Tools both overflow.
+            ("long-lists", "28-live-list-long-lists", longListsFleet),
+            // The live fleet's shape: two accounts, a short Sessions list (the
+            // warm-ups fold), a Tools list that fits.
+            ("real-fleet", "22-tools-tab-real-fleet", realShapeFleet),
+        ]
+        return fleets.flatMap { entry in
+            [(PanelTab.accounts, "accounts"), (.sessions, "sessions"), (.tools, "tools")].map {
+                LiveListScene(
+                    name: "28-live-list-\(entry.name)-\($0.1)", fixtures: entry.fixtures,
+                    fleet: entry.fleet, tab: $0.0)
+            }
+        }
+    }
+
     /// Which tab a scene opens on — `.accounts` for every scene above scene
     /// 16, so this stays a lookup by name rather than a fifth tuple element
     /// every existing scene would have to grow.
@@ -931,6 +968,19 @@ enum RenderStates {
                 }
             }
         }
+        for live in liveListScenes where filter.admits(live.name) {
+            matched += 1
+            let scene = (
+                name: live.fixtures, state: PollState.loaded(live.fleet), awake: false,
+                control: String?.none
+            )
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if render(scene, appearance: appearance, density: .auto, live: live, into: directory) {
+                    written += 1
+                }
+            }
+        }
         for scene in sheetScenes where filter.admits(scene.name) {
             matched += 1
             for appearance in Appearance.allCases {
@@ -1081,6 +1131,7 @@ enum RenderStates {
         _ scene: (name: String, state: PollState, awake: Bool, control: String?),
         appearance: Appearance,
         density: PanelDensity,
+        live: LiveListScene? = nil,
         into directory: URL
     ) -> Bool {
         // The appearance has to be current for the duration of the rasterisation:
@@ -1088,7 +1139,7 @@ enum RenderStates {
         // CURRENT appearance, not one baked into the view.
         return withDrawingAppearance(appearance.nsAppearance) {
             renderUnderCurrentAppearance(
-                scene, appearance: appearance, density: density, into: directory)
+                scene, appearance: appearance, density: density, live: live, into: directory)
         }
     }
 
@@ -1104,6 +1155,7 @@ enum RenderStates {
         _ scene: (name: String, state: PollState, awake: Bool, control: String?),
         appearance: Appearance,
         density: PanelDensity,
+        live: LiveListScene? = nil,
         into directory: URL
     ) -> Bool {
         // `V4.compact` reads this key straight out of `UserDefaults`
@@ -1200,7 +1252,8 @@ enum RenderStates {
                     notes: codexNotesFixture(for: scene.name, opening: scene.state.loadedFleet)),
                 codexBannerSnapshot: bannerSnapshot,
                 snapshotMode: true,
-                initialTab: initialTab(for: scene.name),
+                snapshotKeepsScrollViews: live != nil,
+                initialTab: live?.tab ?? initialTab(for: scene.name),
                 // A heat scene is scene 17 in every fixture but the machine
                 // reading, so the two differ by the numbers line alone.
                 initialSessionFiles: sessionFilesFixture(
@@ -1238,6 +1291,13 @@ enum RenderStates {
         let hoverCard = hoverCardFixture(for: scene.name)
         let litAccount = litAccountFixture(for: scene.name)
         let view = panel(hoverCard, litAccount, claudeRouteFixture(for: scene.name), nil)
+
+        if let live {
+            return rasteriseInWindow(
+                view, appearance: appearance,
+                named: "\(live.name)-\(density.rawValue)-\(appearance.rawValue).png",
+                into: directory)
+        }
 
         // The main pass is `.auto`, the shipped default, so its files are
         // `<scene>-auto-<appearance>.png`; the forced `.comfortable` variant's
@@ -3347,6 +3407,77 @@ enum RenderStates {
         }
     }
 
+    /// Draw `view` in a real window, sized the way the popover sizes the panel,
+    /// and capture what the window server composited (``liveListScenes``).
+    ///
+    /// `ImageRenderer` does not draw a `ScrollView` and performs one layout
+    /// pass, so the measured list heights never arrive; a window does both.
+    /// The capture is `CGWindowListCreateImage` on this process's own window,
+    /// as `RenderSettings` does it, which needs no Screen Recording grant. The
+    /// window is ordered front without activating the app and closed after.
+    @MainActor
+    private static func rasteriseInWindow<V: View>(
+        _ view: V, appearance: Appearance, named name: String, into directory: URL
+    ) -> Bool {
+        let hosting = NSHostingController(rootView: view)
+        // What `MenuBarShell.hosting(rootView:)` sets: the popover takes the
+        // panel's own ideal size.
+        hosting.sizingOptions = [.preferredContentSize]
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 400),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        window.appearance = appearance.nsAppearance
+        window.contentViewController = hosting
+        window.center()
+        window.orderFrontRegardless()
+        // Until two turns in a row agree: the lists measure their content in
+        // one pass and take that height in the next.
+        var size = NSSize.zero
+        var stable = 0
+        for _ in 0..<40 where stable < 2 {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+            let preferred = hosting.preferredContentSize
+            if preferred == size {
+                stable += 1
+            } else {
+                stable = 0
+                size = preferred
+                window.setContentSize(preferred)
+                window.contentView?.layoutSubtreeIfNeeded()
+            }
+        }
+        for _ in 0..<3 {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        guard stable >= 2, size.height > 0,
+            let cgImage = CGWindowListCreateImage(
+                .null, .optionIncludingWindow, CGWindowID(window.windowNumber),
+                [.boundsIgnoreFraming, .bestResolution])
+        else {
+            window.close()
+            FileHandle.standardError.write(
+                Data("render failed: \(name) (size \(size), stable \(stable))\n".utf8))
+            return false
+        }
+        window.close()
+        let rep = NSBitmapImageRep(cgImage: cgImage)
+        guard let png = rep.representation(using: .png, properties: [:]) else {
+            FileHandle.standardError.write(Data("render failed: \(name)\n".utf8))
+            return false
+        }
+        let url = directory.appendingPathComponent(name)
+        do {
+            try png.write(to: url)
+            print(
+                "  \(name)  panel \(String(format: "%.1f", size.width))x"
+                    + "\(String(format: "%.1f", size.height))pt  \(cgImage.width)x\(cgImage.height)px")
+            return true
+        } catch {
+            FileHandle.standardError.write(Data("write failed \(name): \(error)\n".utf8))
+            return false
+        }
+    }
+
     /// `wait` open on the one scene that reviews the disclosure — the
     /// biggest class, and the one `sessionsFixture` gives commands to from
     /// both of its tool-carrying sessions.
@@ -4438,6 +4569,55 @@ enum RenderStates {
                             ToolCall(tool: "Bash", commandHead: "cargo build", startedMs: lastSeen)
                         ])
                     : SessionTools())
+        }
+        return Fleet(
+            accounts: base.accounts, unreadable: base.unreadable, sessions: sessions,
+            sessionsSupported: true)
+    }
+
+    /// Twenty-four accounts and forty working sessions, ten of them with a
+    /// call running and each with a slow call today: an Accounts list at its
+    /// budget, and a Sessions list and a Tools list each longer than the whole
+    /// room the panel has under their summaries, so the Accounts tab, with its
+    /// strip and buttons, is the tallest of the three (``liveListScenes``).
+    /// Every session has made tool calls, so none folds as a warm-up.
+    private static var longListsFleet: Fleet {
+        let rows = (1...24).map {
+            account("acct-\($0)@example.com", quota: "0.\(10 + $0)", state: "ok")
+        }
+        let base = fleet("[\(rows.joined(separator: ","))]")
+        func msAgo(_ seconds: TimeInterval) -> Int64 {
+            Int64(Date().addingTimeInterval(-seconds).timeIntervalSince1970 * 1000)
+        }
+        let sessions: [Session] = (0..<40).map { (index: Int) -> Session in
+            let running: [ToolCall] =
+                index < 10
+                ? [
+                    ToolCall(
+                        tool: "Bash", commandHead: "cargo test --workspace > run-\(index).log",
+                        startedMs: msAgo(TimeInterval(30 + index * 25)))
+                ]
+                : []
+            let slowest = ToolCall(
+                tool: "Bash", commandHead: "swift build -c release --target T\(index)",
+                commandClass: "build", endedMs: msAgo(TimeInterval(600 + index * 60)),
+                seconds: Double(60 + index * 5))
+            // Four sessions with timeouts, so TIMED OUT TODAY draws its card
+            // too: with the Running and Slowest cards folded to their first
+            // rows, it is what takes the Tools list past the panel's room.
+            let timeoutsByClass: [String: Int] =
+                index < 4 ? ["build": 3, "test": 2, "git-net": 1, "wait": 4, "other": 1] : [:]
+            let tools = SessionTools(
+                calls: 20 + index, errors: 0, timeouts: timeoutsByClass.values.reduce(0, +),
+                running: running, slowest: [slowest], timeoutsByClass: timeoutsByClass)
+            let model = index.isMultiple(of: 3) ? "claude-opus-5" : "claude-sonnet-5"
+            let account: String = base.accounts[index % base.accounts.count].name
+            return Session(
+                sessionId: String(format: "%08x-1111-2222-3333-444444444444", index),
+                account: account, model: model,
+                firstSeenMs: msAgo(TimeInterval(2 * 3600 + index * 60)),
+                lastSeenMs: msAgo(TimeInterval(30 + index * 20)),
+                requests: 40 + index * 7, tools: tools)
         }
         return Fleet(
             accounts: base.accounts, unreadable: base.unreadable, sessions: sessions,

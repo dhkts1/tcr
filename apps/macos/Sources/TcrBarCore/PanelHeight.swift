@@ -152,6 +152,50 @@ public enum PanelHeight {
         return min(contentHeight, budget)
     }
 
+    /// The most height a list's viewport may take when the panel has more room
+    /// than the list's own tab asked for: its whole content, and never less
+    /// than ``viewportHeight(contentHeight:budget:)``.
+    ///
+    /// Every tab is drawn at the tallest tab's height
+    /// (``sharedTabHeight(_:)``), so on the Sessions and Tools tabs there is
+    /// often room under a list that the Accounts tab's taller summary made.
+    /// The viewport's IDEAL height stays ``viewportHeight(contentHeight:budget:)``,
+    /// which is what each tab is measured at and so what sets the panel's
+    /// height; this is the ceiling it may stretch to when placed, so a list
+    /// with rows left to scroll to runs down to the footer instead of stopping
+    /// at the budget over an empty band. A list shorter than that room stops
+    /// at its own end.
+    ///
+    /// `0` (nothing measured yet) is the budget, the same first-frame rule.
+    public static func viewportMaxHeight(contentHeight: CGFloat, budget: CGFloat) -> CGFloat {
+        max(viewportHeight(contentHeight: contentHeight, budget: budget), contentHeight)
+    }
+
+    /// A list's viewport height (`list`) and the height it takes in its tab
+    /// (`occupied`) when the tab offers it `offered`.
+    public struct FilledList: Equatable {
+        public let list: CGFloat
+        public let occupied: CGFloat
+    }
+
+    /// Where a list that stretches into a taller tab's room stops: `gap`
+    /// above the footer, which it keeps as its own so the spacer cannot take it.
+    ///
+    /// `viewport` is the list's own height
+    /// (``viewportHeight(contentHeight:budget:)``) and `ceiling` the most it
+    /// can show (``viewportMaxHeight(contentHeight:budget:)``). Measured with
+    /// no height (`nil`, how every tab is measured for the panel's height), or
+    /// offered too little room to stretch past the gap, it is exactly
+    /// `viewport` and takes no gap, so the panel's height and an unstretched
+    /// list are what they were before lists stretched.
+    public static func filledList(
+        offered: CGFloat?, viewport: CGFloat, ceiling: CGFloat, gap: CGFloat
+    ) -> FilledList {
+        guard let offered else { return FilledList(list: viewport, occupied: viewport) }
+        let list = min(ceiling, max(viewport, offered - gap))
+        return FilledList(list: list, occupied: list > viewport ? list + gap : list)
+    }
+
     /// The height every tab of the panel is drawn at: the tallest tab's own
     /// height, so switching tabs never resizes the panel (Gil, 2026-10-16).
     ///

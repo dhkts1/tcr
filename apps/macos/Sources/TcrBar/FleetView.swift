@@ -74,6 +74,17 @@ struct FleetView: View {
     /// whatever the panel happens to show. Runtime is untouched — the default is
     /// `false` and the live panel still scrolls.
     var snapshotMode: Bool = false
+    /// Keep the live `ScrollView` lists in `snapshotMode`, for the harness's
+    /// window-hosted scenes only (`RenderStates.liveListScenes`).
+    ///
+    /// Those scenes draw the panel in a real window and capture what the window
+    /// server composited, so the scroll views do draw there, and the clipped
+    /// list is the thing they exist to show: where a list that overflows ends
+    /// against the footer. Everything else `snapshotMode` pins stays pinned.
+    var snapshotKeepsScrollViews: Bool = false
+    /// The Accounts, Sessions and Tools lists drawn as plain stacks
+    /// (``snapshotMode``) rather than in their scroll views.
+    private var listsUnscrolled: Bool { snapshotMode && !snapshotKeepsScrollViews }
     /// Opens the "What's new" window. A closure rather than the controller so
     /// the render harness passes `{}` and can neither fetch nor open anything.
     var onWhatsNew: () -> Void = {}
@@ -338,6 +349,7 @@ struct FleetView: View {
         codexBannerSnapshot: CodexBannerSnapshot? = nil,
         bundledTcrWithoutCLI: String? = nil,
         snapshotMode: Bool = false,
+        snapshotKeepsScrollViews: Bool = false,
         onWhatsNew: @escaping () -> Void = {},
         onSettings: @escaping () -> Void = {},
         runOpenPanel: @escaping (NSOpenPanel) -> URL? = { _ in nil },
@@ -428,6 +440,7 @@ struct FleetView: View {
         self.codexNotes = codexNotes ?? CodexNoteStore()
         self.bundledTcrWithoutCLI = bundledTcrWithoutCLI
         self.snapshotMode = snapshotMode
+        self.snapshotKeepsScrollViews = snapshotKeepsScrollViews
         self.onWhatsNew = onWhatsNew
         self.onSettings = onSettings
         self.runOpenPanel = runOpenPanel
@@ -893,7 +906,7 @@ struct FleetView: View {
                 if fleet.source.countersAreStructural {
                     offlineNotice(fleet.source)
                 }
-                if snapshotMode {
+                if listsUnscrolled {
                     accountsTabV4(fleet)
                         .hoverCardList()
                 } else {
@@ -1774,7 +1787,7 @@ struct FleetView: View {
             let fold = SessionsFold(joined, now: Date())
             let displayed = warmupsExpanded ? joined : fold.visible
             let trafficNotice = codexSessionsNotice(fleet)
-            if snapshotMode {
+            if listsUnscrolled {
                 sessionsTabBody(displayed: displayed, fold: fold, trafficNotice: trafficNotice)
             } else {
                 ScrollView {
@@ -1786,10 +1799,7 @@ struct FleetView: View {
                             }
                         )
                 }
-                .frame(
-                    height: PanelHeight.viewportHeight(
-                        contentHeight: sessionsContentHeight, budget: listBudget(for: fleet))
-                )
+                .tabListFrame(contentHeight: sessionsContentHeight, budget: listBudget(for: fleet))
                 .onPreferenceChange(V4ContentHeightKey.self) {
                     sessionsContentHeight = PanelHeight.settled(sessionsContentHeight, $0)
                 }
@@ -2181,7 +2191,7 @@ struct FleetView: View {
                 title: "No tool data yet",
                 detail: detail,
                 tint: Tok.unknown)
-        } else if snapshotMode {
+        } else if listsUnscrolled {
             toolsList(fleet)
         } else {
             ScrollView {
@@ -2193,10 +2203,7 @@ struct FleetView: View {
                         }
                     )
             }
-            .frame(
-                height: PanelHeight.viewportHeight(
-                    contentHeight: toolsContentHeight, budget: listBudget(for: fleet))
-            )
+            .tabListFrame(contentHeight: toolsContentHeight, budget: listBudget(for: fleet))
             .onPreferenceChange(V4ContentHeightKey.self) {
                 toolsContentHeight = PanelHeight.settled(toolsContentHeight, $0)
             }
@@ -4651,6 +4658,72 @@ struct V4ContentHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
+    }
+}
+
+extension View {
+    /// The Sessions and Tools lists' viewport: ideally its clamped content
+    /// height, and free to run down to the footer when the panel is taller.
+    ///
+    /// Every tab is measured at its ideal height and then drawn at the
+    /// tallest one's (`TallestTabLayout`), so the IDEAL is what sets the
+    /// panel's height and it is unchanged:
+    /// ``PanelHeight/viewportHeight(contentHeight:budget:)``. What changed is
+    /// placement. A fixed height left a list with rows still to scroll to
+    /// stopping at the budget on a panel the Accounts tab had made taller, with
+    /// the spacer above the footer drawing an empty band under it (1.2.17).
+    /// Now the list accepts up to ``PanelHeight/viewportMaxHeight(contentHeight:budget:)``,
+    /// and the priority hands it that room ahead of the spacer, so the list
+    /// ends `V4.actsMarginTop` above the footer, the gap the Accounts list
+    /// leaves above its action row, or at its own last row when that comes
+    /// first (``PanelHeight/filledList(offered:viewport:ceiling:gap:)``).
+    ///
+    /// The measurement cannot feed back: the reader sits on the content inside
+    /// the scroll view, which is laid out at its own height whatever height the
+    /// viewport is given.
+    func tabListFrame(contentHeight: CGFloat, budget: CGFloat) -> some View {
+        TabListLayout(
+            viewport: PanelHeight.viewportHeight(contentHeight: contentHeight, budget: budget),
+            ceiling: PanelHeight.viewportMaxHeight(contentHeight: contentHeight, budget: budget),
+            gap: V4.actsMarginTop
+        ) {
+            self
+        }
+        .layoutPriority(1)
+    }
+}
+
+/// Sizes and places one list by ``PanelHeight/filledList(offered:viewport:ceiling:gap:)``:
+/// the list at its viewport when measured, stretched toward its content when
+/// offered more, and the gap under a stretched list kept as part of its own
+/// height so the spacer below cannot take it.
+struct TabListLayout: Layout {
+    let viewport: CGFloat
+    let ceiling: CGFloat
+    let gap: CGFloat
+
+    private func filled(_ proposal: ProposedViewSize) -> PanelHeight.FilledList {
+        PanelHeight.filledList(
+            offered: proposal.height, viewport: viewport, ceiling: ceiling, gap: gap)
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width =
+            proposal.width
+            ?? subviews.first?.sizeThatFits(ProposedViewSize(width: nil, height: viewport)).width
+            ?? 0
+        return CGSize(width: width, height: filled(proposal).occupied)
+    }
+
+    func placeSubviews(
+        in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
+    ) {
+        let list = filled(ProposedViewSize(width: bounds.width, height: bounds.height)).list
+        for subview in subviews {
+            subview.place(
+                at: bounds.origin, anchor: .topLeading,
+                proposal: ProposedViewSize(width: bounds.width, height: list))
+        }
     }
 }
 
