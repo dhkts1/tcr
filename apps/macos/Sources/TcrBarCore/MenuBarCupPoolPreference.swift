@@ -26,22 +26,22 @@ public enum MenuBarCupPool: String, CaseIterable, Sendable {
     }
 
     /// The Settings row's label.
-    public static let settingsLabel = "Cup shows"
+    public static let settingsLabel = "Icon shows"
 
     /// The caption under that row.
     public static let settingsCaption =
-        "With Claude and Codex accounts, the cup fills to the pool with less ready. "
+        "With Claude and Codex accounts, the icon lights its rays for the pool with less ready. "
         + "The count beside it shows both, Claude first."
 
     /// The counts toggle's caption in a fleet holding both providers, where the count it
     /// turns on has one part per pool. A fleet with one provider keeps the toggle's own
     /// caption.
     public static let mixedCountsCaption =
-        "The cup's fill level already shows capacity; this spells it out as "
+        "The icon's lit rays already show capacity; this spells it out as "
         + "\u{201c}9/13 \u{00b7} 2/3\u{201d}, Claude first, in tabular digits."
 }
 
-/// "Cup shows", persisted in `UserDefaults`. The same shape as
+/// "Icon shows", persisted in `UserDefaults`. The same shape as
 /// ``MenuBarCountsPreference``, for the same reason: there is no `App` or `View` to hang
 /// an `@AppStorage` off, and a plain read would not publish the change back to the picker
 /// that made it.
