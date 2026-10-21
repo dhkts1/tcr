@@ -8661,6 +8661,8 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
                 tracing::warn!("replacement drain deadline reached; shutting down");
             }
         }
+        // Not the close the successor waits for: the handle holds its own copy
+        // of the channel until `shutdown` below has drained the usage ledger.
         drop(peer);
     }
     drop(restart_endpoint);

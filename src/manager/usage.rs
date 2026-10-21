@@ -220,12 +220,30 @@ impl Manager {
         dir: PathBuf,
         retention_days: u32,
     ) -> crate::usage::ReplayReport {
+        let accounts = self.ledger_accounts();
+        self.usage
+            .attach_ledger(dir, retention_days, &accounts, crate::now_ms())
+    }
+
+    /// Replace today's usage totals with a fresh replay of the ledger files —
+    /// see [`crate::usage::UsageTracker::rebuild_from_ledger`]. Called once a
+    /// listener handoff's predecessor has finished writing to them. Blocks on
+    /// file I/O and holds up recording while it runs: call it off the async
+    /// workers.
+    pub fn rebuild_usage_from_ledger(
+        &self,
+    ) -> Result<crate::usage::ReplayReport, crate::usage::RebuildSkipped> {
+        let accounts = self.ledger_accounts();
+        self.usage.rebuild_from_ledger(&accounts, crate::now_ms())
+    }
+
+    /// Every account as the ledger resolves lines to it, in rotation order.
+    fn ledger_accounts(&self) -> Vec<crate::usage::LedgerAccount> {
         // The whole identity, not the name: the same email in two orgs is two
         // accounts (`identity.rs`) and a name alone cannot tell them apart,
         // while the org key alone moves under a re-login's backfill and strands
         // every line written before it.
-        let accounts: Vec<crate::usage::LedgerAccount> = self
-            .accounts
+        self.accounts
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
@@ -237,9 +255,7 @@ impl Manager {
                 org_name: a.org_name.clone().filter(|s| !s.is_empty()),
                 provider: a.provider,
             })
-            .collect();
-        self.usage
-            .attach_ledger(dir, retention_days, &accounts, crate::now_ms())
+            .collect()
     }
 
     /// This account's usage row as of `now_ms` (see [`crate::usage::UsageTracker::row`]), plus a

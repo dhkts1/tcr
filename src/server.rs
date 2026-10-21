@@ -429,6 +429,12 @@ pub struct ServerHandle {
     /// a `listen` of `:0` without reading the peers file back, the same way
     /// [`Self::addr`] answers it for the proxy's own socket.
     peer_addr: Option<SocketAddr>,
+    /// The handoff channel, once [`Self::handoff`] has sent the listener over
+    /// it. Held until [`Self::shutdown_within`] has drained the usage ledger:
+    /// its close tells the successor the day file now holds every line this
+    /// process will write, which is when it recounts (see
+    /// [`crate::restart::Handover`]).
+    successor: Option<std::os::unix::net::UnixStream>,
 }
 
 impl ServerHandle {
@@ -492,6 +498,17 @@ impl ServerHandle {
             listener,
             peer,
         )?;
+        // The listener is on its way, so the successor is serving or about to
+        // be. From here the channel stays open until the ledger is on disk,
+        // whatever the caller does with its own copy and whatever fails below.
+        match peer.try_clone() {
+            Ok(channel) => self.successor = Some(channel),
+            Err(error) => tracing::warn!(
+                %error,
+                "could not keep the handoff channel open; the successor will recount usage \
+                 before this process's last lines are written"
+            ),
+        }
         crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
         // The controller also mutates hardware and saves its wish. Finish its
         // last save before the successor can take ownership and save Auto;
@@ -668,6 +685,9 @@ impl ServerHandle {
                  it served are not on disk"
             ),
         }
+        // Only now may a successor recount the day file: everything this
+        // process will ever write to it is there (or reported lost above).
+        drop(self.successor.take());
 
         ShutdownReport {
             tasks_joined: self.tasks_joined,
@@ -2064,6 +2084,66 @@ fn park_reverse_carriers(
     Some(release)
 }
 
+/// How long a successor waits for its predecessor's handoff channel to close
+/// before recounting usage without it. The predecessor's handoff and drain are
+/// bounded by the drain ceiling, and its shutdown after them by one grace for
+/// the joins and at most one more for the ledger's drain.
+fn predecessor_wait() -> Duration {
+    crate::restart::drain_ceiling() + DEFAULT_SHUTDOWN_GRACE * 2
+}
+
+/// The successor's half of a handoff's usage accounting. The boot replay ran
+/// while the predecessor was still draining and writing to the same day file;
+/// once its channel closes the file holds every line it will write, and the
+/// day is recounted from the files (see `UsageTracker::rebuild_from_ledger`).
+async fn recount_usage_after_predecessor(
+    predecessor: std::os::unix::net::UnixStream,
+    manager: Arc<Manager>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let wait = predecessor_wait();
+    let closed = tokio::select! {
+        closed = tokio::time::timeout(wait, predecessor_closed(predecessor)) => closed,
+        _ = stop.changed() => return,
+    };
+    match closed {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            %error,
+            "could not read the handoff channel; recounting usage from the ledger now"
+        ),
+        Err(_) => tracing::warn!(
+            wait_secs = wait.as_secs(),
+            "the predecessor still holds the handoff channel; recounting usage without its last lines"
+        ),
+    }
+    match tokio::task::spawn_blocking(move || manager.rebuild_usage_from_ledger()).await {
+        Ok(Ok(report)) => tracing::info!(
+            replayed = report.replayed,
+            unresolved = report.unresolved,
+            malformed = report.malformed,
+            "the predecessor finished writing; usage recounted from the ledger"
+        ),
+        Ok(Err(skipped)) => tracing::warn!(
+            ?skipped,
+            "usage was not recounted after the handoff; the predecessor's last requests are \
+             missing from today's totals until the next restart"
+        ),
+        Err(error) => tracing::warn!(%error, "the usage recount after the handoff did not run"),
+    }
+}
+
+/// Resolves when the predecessor closes the handoff channel. Nothing is sent on
+/// it after the release confirmation, so this reads to the end.
+async fn predecessor_closed(channel: std::os::unix::net::UnixStream) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt as _;
+    channel.set_nonblocking(true)?;
+    let mut channel = tokio::net::UnixStream::from_std(channel)?;
+    let mut buf = [0u8; 64];
+    while channel.read(&mut buf).await? > 0 {}
+    Ok(())
+}
+
 /// Write this fleet's lendable headroom, per window, into the lender's ledger.
 ///
 /// `Ledger::may_relay` refuses an ABSENT measurement (see `Ledger::headroom`),
@@ -2625,7 +2705,15 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         Some(handover) => (Some(handover.listener), Some(handover.predecessor)),
         None => (None, None),
     };
-    drop(predecessor);
+    // With no ledger there is nothing to recount, and dropping the channel
+    // costs the predecessor nothing: it never reads it.
+    if let (Some(predecessor), Some(_)) = (predecessor, &usage_dir) {
+        background.push(tokio::spawn(recount_usage_after_predecessor(
+            predecessor,
+            Arc::clone(&manager),
+            shutdown_tx.subscribe(),
+        )));
+    }
     let listener = match inherited_listener {
         // Adopted, not bound. `set_nonblocking` is required before tokio may
         // own it: the descriptor arrives with whatever mode the predecessor had
@@ -2835,6 +2923,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         server_finished: false,
         background,
         peer_addr,
+        successor: None,
     }))
 }
 
@@ -3251,6 +3340,7 @@ mod tests {
             // No peer socket: a hand-built handle in a unit test opens no port
             // at all, least of all a second one on the LAN.
             peer_addr: None,
+            successor: None,
         }
     }
 
