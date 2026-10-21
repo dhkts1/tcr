@@ -18,6 +18,9 @@ const PROXIES: [&str; 6] = [
     "all_proxy",
 ];
 const CAS: [&str; 2] = ["NODE_EXTRA_CA_CERTS", "CODEX_CA_CERTIFICATE"];
+/// What the nested-`claude` launcher resets to the pool when it was inherited
+/// rather than set on the command.
+const NESTED_CLAUDE_KEYS: [&str; 3] = ["HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS"];
 
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -257,6 +260,13 @@ pub(crate) fn apply(
     env_script.push_str(&cleanup);
     if let Some(file) = &env_file {
         env_script.push_str(&format!(". {}\n", quote(file)));
+        // Record what the caller's env file left set. Those values are for shell
+        // tools such as `git`, not a choice to take a nested `claude` off the pool.
+        for key in NESTED_CLAUDE_KEYS {
+            env_script.push_str(&format!(
+                "TCR_TOOL_ENV_FILE_{key}=\"${{{key}-}}\"; export TCR_TOOL_ENV_FILE_{key}\n"
+            ));
+        }
     }
     env_script.push_str(&prepend);
     publish(&root.join("shell-env"), &env_script)?;
@@ -273,10 +283,14 @@ pub(crate) fn apply(
         quote(path_text(&root.join("shell-prefix"))?),
         quote(path_text(&root.join("shell-env"))?),
     );
+    // A value equal to the caller's restored one, or to what the caller's env
+    // file exported, is inherited shell configuration: unset it so the nested
+    // `claude` uses the pool. Any other value was set on the command itself and
+    // is an explicit override.
     let mut nested_cleanup = String::new();
-    for key in ["HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS"] {
+    for key in NESTED_CLAUDE_KEYS {
         nested_cleanup.push_str(&format!(
-            "if [ \"${{{key}:-}}\" = \"${{TCR_TOOL_CALLER_{key}:-}}\" ]; then unset {key}; fi\n"
+            "if [ \"${{{key}:-}}\" = \"${{TCR_TOOL_CALLER_{key}:-}}\" ] || {{ [ -n \"${{TCR_TOOL_ENV_FILE_{key}+set}}\" ] && [ \"${{{key}:-}}\" = \"${{TCR_TOOL_ENV_FILE_{key}}}\" ]; }}; then unset {key}; fi\n"
         ));
     }
     if let Some(bin) = claude {

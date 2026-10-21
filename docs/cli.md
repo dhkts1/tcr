@@ -239,7 +239,9 @@ caller CA bundles. Model clients and their own auxiliary HTTP traffic still use 
 
 tcr prepends private `claude` and `codex` launchers to PATH. Nested Claude restores its plain
 proxy marker and own CA only when the caller supplied no value; an explicit
-`ANTHROPIC_BASE_URL`, proxy or CA override is respected. Nested Codex uses `tcr run --codex`,
+`ANTHROPIC_BASE_URL`, proxy or CA override is respected. A proxy or CA value the caller's
+`CLAUDE_ENV_FILE` exported is for shell tools, not an override, so nested Claude still uses the
+pool; set one on the `claude` command itself to override it. Nested Codex uses `tcr run --codex`,
 respecting caller binary overrides. tcr's own client lookups skip these launchers, so an explicit
 nested `tcr run --config other.json` uses that config. Explicit executable paths, a replaced PATH
 or client configuration can bypass the launchers. Claude's `CLAUDE_ENV_FILE` and bare executable
