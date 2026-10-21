@@ -102,6 +102,8 @@ mod peer_status;
 mod peer_wire;
 #[path = "../peer_wire_saved.rs"]
 mod peer_wire_saved;
+#[path = "../server_replace.rs"]
+mod server_replace;
 #[path = "../setup_route.rs"]
 mod setup_route;
 #[path = "../status_check.rs"]

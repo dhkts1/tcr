@@ -45,6 +45,11 @@ use std::os::unix::net::UnixStream;
 
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 
+/// The kernel effective uid, without requiring a Tokio runtime.
+pub fn effective_uid() -> u32 {
+    nix::unistd::geteuid().as_raw()
+}
+
 /// The single payload byte that rides along with the descriptor.
 ///
 /// **Not decoration.** `SCM_RIGHTS` is ancillary data attached to a normal
@@ -86,13 +91,17 @@ pub fn recv_listener(stream: &UnixStream) -> io::Result<std::net::TcpListener> {
     // are seen, which is what makes every early return below leak-free: a
     // rejected handoff closes what it was sent instead of stranding it in this
     // process for the rest of its life.
+    #[cfg(target_os = "linux")]
+    let receive_flags = MsgFlags::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let receive_flags = MsgFlags::empty();
     let (bytes, mut fds) = {
         let mut iov = [io::IoSliceMut::new(&mut byte)];
         let msg = recvmsg::<()>(
             stream.as_raw_fd(),
             &mut iov,
             Some(&mut space),
-            MsgFlags::empty(),
+            receive_flags,
         )
         .map_err(io::Error::from)?;
 
@@ -143,6 +152,13 @@ pub fn recv_listener(stream: &UnixStream) -> io::Result<std::net::TcpListener> {
             "handoff message carried no SCM_RIGHTS descriptor",
         ));
     };
+    // SCM_RIGHTS does not preserve descriptor flags. Linux also sets this
+    // atomically at recvmsg; macOS needs fcntl before exposing the descriptor.
+    nix::fcntl::fcntl(
+        &fd,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    )
+    .map_err(io::Error::from)?;
     Ok(std::net::TcpListener::from(fd))
 }
 
@@ -185,6 +201,18 @@ mod tests {
             .join()
             .expect("client thread")
             .expect("connecting to the handed-over port");
+    }
+
+    #[test]
+    fn received_listener_is_close_on_exec() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        send_listener(&sender, &listener).unwrap();
+        let received = recv_listener(&receiver).unwrap();
+        let flags = nix::fcntl::fcntl(&received, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert!(
+            nix::fcntl::FdFlag::from_bits_truncate(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC)
+        );
     }
 
     /// A plain byte with no ancillary data must be refused rather than taken as

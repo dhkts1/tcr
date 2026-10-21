@@ -850,7 +850,7 @@ fn stand_down_message(port: u16, pid: u32) -> String {
         "[tcr] {INCUMBENT_MARKER} :{port} (pid {pid}) and it is still listening — leaving it \
          alone and exiting without binding. Replacing it would wipe its session→account pin map \
          and cold-start every live session's prompt cache, the most expensive event in this \
-         system. Pass --replace to take the port over anyway."
+         system. Stop it, or use --replace if it runs tcr 1.2.17 or newer."
     )
 }
 
@@ -869,6 +869,19 @@ fn embedded_stand_down_message(port: u16, pid: u32) -> String {
          shutdown, losing the session→account pin map. Quit the host application to stop this \
          proxy."
     )
+}
+
+/// The stand-down line for `incumbent` on `port`, carrying [`INCUMBENT_MARKER`].
+/// An embedded incumbent gets the line that names its host application instead
+/// of offering `--replace`. [`takeover_port`] prints it; a caller that stands
+/// down without going through `takeover_port` (the CLI's `--replace`, which
+/// serves with the never-signal policy) prints it itself.
+pub fn stand_down_notice(port: u16, incumbent: Incumbent) -> String {
+    if incumbent.kind == ProxyKind::TcrEmbedded {
+        embedded_stand_down_message(port, incumbent.pid)
+    } else {
+        stand_down_message(port, incumbent.pid)
+    }
 }
 
 /// Resolve `port` down to one proxy for this server.
@@ -911,11 +924,7 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
         // `replaceable` for the same predicate: two copies of "is this one
         // embedded?" is how the generic message — which offers `--replace` — ends
         // up printed for the one kind `--replace` cannot take over.
-        if incumbent.kind == ProxyKind::TcrEmbedded {
-            eprintln!("{}", embedded_stand_down_message(port, incumbent.pid));
-        } else {
-            eprintln!("{}", stand_down_message(port, incumbent.pid));
-        }
+        eprintln!("{}", stand_down_notice(port, incumbent));
     }
 
     // Not `else`: standing down for an EMBEDDED incumbent still lets an explicit
@@ -968,6 +977,10 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_stand_down_line_names_the_first_version_with_handoff() {
+        assert!(stand_down_message(12345, 42).contains("if it runs tcr 1.2.17 or newer"));
+    }
     use super::*;
 
     /// How long [`port_listeners_finds_this_process_on_an_ephemeral_port`]

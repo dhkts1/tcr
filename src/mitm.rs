@@ -98,7 +98,7 @@ pub const ALLOWED_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com",
 
 /// Proxy URL userinfo set by `tcr run --codex`, selecting Codex interception on CONNECT.
 /// This is a route marker, not process authentication. The launch makes shell-tool
-/// proxies unmarked through Codex's shell policy; explicit MCP proxy env and other
+/// proxies empty through Codex's shell policy; explicit MCP proxy env and other
 /// helper processes can still inherit the marker and must opt out when needed.
 pub const CODEX_PROXY_USERNAME: &str = "tcr-codex";
 /// Basic encoding of `tcr-codex:` sent by both Codex transports, including an empty password.
@@ -865,11 +865,53 @@ async fn serve_with_shutdown_using_connector(
     shutdown: impl Future<Output = ()>,
     connector: TunnelConnector,
 ) {
+    let (connections, _drain) = tokio::sync::mpsc::channel(1);
+    serve_tracked_with_shutdown_using_connector(
+        listener,
+        manager,
+        tls,
+        shutdown,
+        connector,
+        connections,
+    )
+    .await;
+}
+
+/// Each accepted connection holds a sender until it finishes. Once acceptance
+/// stops, receiver closure proves all accepted connections have drained.
+pub(crate) async fn serve_tracked_with_shutdown(
+    listener: TcpListener,
+    manager: Arc<Manager>,
+    tls: Option<Arc<TlsAcceptor>>,
+    shutdown: impl Future<Output = ()>,
+    connections: tokio::sync::mpsc::Sender<()>,
+) {
+    serve_tracked_with_shutdown_using_connector(
+        listener,
+        manager,
+        tls,
+        shutdown,
+        direct_tunnel_connector(),
+        connections,
+    )
+    .await;
+}
+
+async fn serve_tracked_with_shutdown_using_connector(
+    listener: TcpListener,
+    manager: Arc<Manager>,
+    tls: Option<Arc<TlsAcceptor>>,
+    shutdown: impl Future<Output = ()>,
+    connector: TunnelConnector,
+    connections: tokio::sync::mpsc::Sender<()>,
+) {
     let mut shutdown = std::pin::pin!(shutdown);
+    let (draining, _) = tokio::sync::watch::channel(false);
     loop {
         let accepted = tokio::select! {
             biased;
             () = &mut shutdown => {
+                draining.send_replace(true);
                 tracing::info!("accept loop shutting down; no longer accepting connections");
                 return;
             }
@@ -887,9 +929,12 @@ async fn serve_with_shutdown_using_connector(
         let manager = Arc::clone(&manager);
         let tls = tls.clone();
         let connector = Arc::clone(&connector);
+        let connection = connections.clone();
+        let drain = draining.subscribe();
         tokio::spawn(
             async move {
-                if let Err(err) = handle_conn(stream, peer, manager, tls, connector).await {
+                let _connection = connection;
+                if let Err(err) = handle_conn(stream, peer, manager, tls, connector, drain).await {
                     tracing::debug!(error = %err, "connection ended with error");
                 }
             }
@@ -905,14 +950,15 @@ async fn handle_conn(
     manager: Arc<Manager>,
     tls: Option<Arc<TlsAcceptor>>,
     connector: TunnelConnector,
+    drain: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     if peek_is_connect(&stream).await? {
-        handle_connect(stream, peer, manager, tls, connector).await
+        handle_connect(stream, peer, manager, tls, connector, drain).await
     } else {
         // Base-URL mode: cleartext straight through the router. `serve_http`
         // auto-negotiates, so an h2-prior-knowledge client is served as h2 here
         // and everything else stays h1. No tunnel, so no intercepted host.
-        serve_http(stream, peer, manager, None).await;
+        serve_http(stream, peer, manager, None, drain).await;
         Ok(())
     }
 }
@@ -953,6 +999,7 @@ async fn handle_connect(
     manager: Arc<Manager>,
     tls: Option<Arc<TlsAcceptor>>,
     connector: TunnelConnector,
+    drain: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     let head = read_request_head(&mut stream).await?;
     let first_line = head.lines().next().unwrap_or("");
@@ -1037,6 +1084,7 @@ async fn handle_connect(
             host,
             keyed: credential.key_ok,
         }),
+        drain,
     )
     .await;
     Ok(())
@@ -1121,8 +1169,13 @@ struct Tunnel {
 /// to, not to the one the request declares. A tunnel whose `CONNECT` carried the
 /// request key also stamps [`crate::proxy::TunnelKeyed`], so its requests are not
 /// judged again on their headers.
-async fn serve_http<I>(io: I, peer: SocketAddr, manager: Arc<Manager>, intercepted: Option<Tunnel>)
-where
+async fn serve_http<I>(
+    io: I,
+    peer: SocketAddr,
+    manager: Arc<Manager>,
+    intercepted: Option<Tunnel>,
+    mut drain: tokio::sync::watch::Receiver<bool>,
+) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // Session affinity (opt-in): when enabled, mint ONE session key for this whole
@@ -1184,12 +1237,29 @@ where
     // `CONNECT`; a base-URL `CONNECT` is peeked off before hyper sees it, and
     // no route here answers one inside a tunnel with a `2xx`, so every other
     // request is served exactly as before.
-    if let Err(err) =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-            .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(io), service)
-            .await
-    {
-        tracing::debug!(error = %err, "http connection error");
+    let builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    let connection =
+        builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(io), service);
+    tokio::pin!(connection);
+    tokio::select! {
+        // Poll ready request bytes before applying shutdown, including a task
+        // first scheduled after the handoff signal. Already accepted requests
+        // then get their response instead of a reset at the migration boundary.
+        biased;
+        result = &mut connection => {
+            if let Err(err) = result { tracing::debug!(error = %err, "http connection error"); }
+            return;
+        }
+        () = async {
+            if !*drain.borrow() { crate::log_err::LogErr::log_debug(drain.changed().await, "waiting for connection drain"); }
+        } => {}
+    }
+    // h1 completes the current response then closes; h2 sends GOAWAY. Blind
+    // CONNECT byte-pipes never enter this function and retain their streams.
+    connection.as_mut().graceful_shutdown();
+    if let Err(err) = connection.await {
+        tracing::debug!(error = %err, "http connection drain error");
     }
 }
 
@@ -1197,6 +1267,35 @@ where
 mod tests {
     use super::*;
     use crate::log_err::LogErr as _;
+
+    #[tokio::test]
+    async fn a_handoff_serves_already_queued_http_before_draining() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"GET /_tcr/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let (_signal, drain) = tokio::sync::watch::channel(true);
+        let serving = tokio::spawn(serve_http(
+            server,
+            "127.0.0.1:12345".parse().unwrap(),
+            dummy_manager(),
+            None,
+            drain,
+        ));
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        serving.await.unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "an already queued request must get HTTP 200 during drain, got {} bytes",
+            response.len()
+        );
+    }
 
     /// `write_file`'s `mode` must be enforced when the destination ALREADY exists,
     /// not only when it is created. `OpenOptionsExt::mode()` applies solely to the
@@ -1908,8 +2007,15 @@ mod tests {
                     // never swallowed silently, so a test that fails because the
                     // connection died has the reason in the captured log rather
                     // than presenting as an unexplained client-side error.
-                    if let Err(err) =
-                        handle_conn(stream, peer, manager, None, direct_tunnel_connector()).await
+                    if let Err(err) = handle_conn(
+                        stream,
+                        peer,
+                        manager,
+                        None,
+                        direct_tunnel_connector(),
+                        tokio::sync::watch::channel(false).1,
+                    )
+                    .await
                     {
                         tracing::debug!(error = %err, "connection ended with error");
                     }

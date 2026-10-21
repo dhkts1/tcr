@@ -17,6 +17,8 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
+mod tool_env;
+
 use tcr::cli::{self, PriorityArg, validate_group_label_chars};
 use tcr::config::{self, Config, ConfigError};
 use tcr::doctor::{no_proxy_entry_exempts, points_at_tcr};
@@ -1707,10 +1709,9 @@ struct ServerArgs {
     /// Run without the TUI, logging to stdout.
     #[arg(long)]
     headless: bool,
-    /// Take over the port: kill a proxy already listening on it, then bind. The
-    /// default is to leave a healthy incumbent alone and exit — replacing it wipes
-    /// its session→account pin map and cold-starts every live session's prompt
-    /// cache, which is the most expensive event in this system.
+    /// Take over the listening socket without unbinding the port. The old server
+    /// drains its accepted connections. An older server without handoff support
+    /// is left running and must be stopped explicitly once to upgrade.
     #[arg(long)]
     replace: bool,
     /// DEPRECATED and now a no-op: this is the default. Kept accepted so existing
@@ -7099,16 +7100,18 @@ fn claude_bin() -> String {
 /// spawns or would spawn the user's harness, so every call site resolves the
 /// same way.
 fn claude_command() -> std::process::Command {
-    std::process::Command::new(claude_bin())
+    let name = claude_bin();
+    std::process::Command::new(
+        tool_env::executable(Path::new(&name)).unwrap_or_else(|| PathBuf::from(name)),
+    )
 }
 
 /// A fresh [`std::process::Command`] for the `codex` binary `tcr run --codex` launches:
 /// [`claude_command`]'s twin, resolved by `codex_local::find_codex`, the rule `tcr login
 /// --codex` and the doctor use too. `TCR_CODEX_BIN`, then `CODEX_BIN`, always decide when set;
 /// otherwise `PATH`, TcrBar's directories and npm's global prefix. A miss is the search's own
-/// sentence, so nothing has been printed or read yet when it bails. The child keeps the shell's
-/// `PATH` as it is: every command the agent runs inherits that `PATH`, so tcr must not reorder
-/// it.
+/// sentence, so nothing has been printed or read yet when it bails. Resolve before
+/// adding the nested-agent launchers to PATH, so they cannot resolve to themselves.
 fn codex_command() -> anyhow::Result<(std::process::Command, PathBuf)> {
     let codex =
         tcr::codex_local::find_codex().map_err(|miss| anyhow::anyhow!("{}", miss.sentence()))?;
@@ -7153,14 +7156,31 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // The same read decides the request key: sent only to a server that
         // reports `requestKeyMode`.
         let launch_key = LaunchKey::decide(config.proxy.request_key.as_deref(), &live);
-        for line in apply_codex_launch(&mut cmd, port, &launch, &launch_key) {
+        for line in apply_codex_launch(
+            &mut cmd,
+            port,
+            &launch,
+            &launch_key,
+            &tool_env::Host::current(),
+        ) {
             eprintln!("{line}");
         }
+        let helpers = if matches!(launch, CodexLaunch::SeeThrough { .. }) {
+            let (helpers, lines) =
+                tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path, false)?;
+            for line in lines {
+                eprintln!("{line}");
+            }
+            Some(helpers)
+        } else {
+            None
+        };
         // Generated shell-tool defaults precede explicit caller overrides.
         cmd.args(&args.args);
         let status = cmd
             .status()
             .with_context(|| format!("failed to launch `{}`", codex.display()))?;
+        drop(helpers);
         std::process::exit(status.code().unwrap_or(1));
     }
 
@@ -7195,6 +7215,7 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let mut cmd = claude_command();
+    let mut helpers = None;
     cmd.args(&args.args);
     mark_run_active(&mut cmd);
 
@@ -7233,7 +7254,14 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // Anything missing from the MITM material lands us in base-URL mode, which
         // always works; there is no half-applied third state.
         let mut lines = match see_through_ca() {
-            Some(ca) => apply_see_through_env(&mut cmd, port, &ca, &launch_key),
+            Some(ca) => {
+                let mut lines = apply_see_through_env(&mut cmd, port, &ca, &launch_key);
+                let (owner, notices) =
+                    tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path, true)?;
+                helpers = Some(owner);
+                lines.extend(notices);
+                lines
+            }
             None => apply_base_url_env(&mut cmd, port, &launch_key),
         };
         lines.extend(launch_key.notice(port));
@@ -7247,6 +7275,7 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
     let status = cmd
         .status()
         .context("failed to launch `claude` — is it on PATH?")?;
+    drop(helpers);
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -7469,13 +7498,15 @@ fn no_claude_account_warning(port: u16, payload: &status::StatusPayload) -> Opti
 
 /// Carry out [`codex_launch`]'s decision on `cmd`, and return its stderr lines
 /// for the caller to print. `key` applies to a see-through launch only: a direct
-/// one never reaches tcr.
+/// one never reaches tcr. Everything it reads from the machine (the caller's
+/// environment, the Codex config file, tcr's CA path) comes from `host`.
 #[must_use]
 fn apply_codex_launch(
     cmd: &mut std::process::Command,
     port: u16,
     launch: &CodexLaunch,
     key: &LaunchKey,
+    host: &tool_env::Host<'_>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     match launch {
@@ -7484,23 +7515,11 @@ fn apply_codex_launch(
                 cmd,
                 port,
                 ca,
-                std::env::var_os("CODEX_CA_CERTIFICATE").is_some_and(|value| !value.is_empty()),
+                (host.env)("CODEX_CA_CERTIFICATE").is_some_and(|value| !value.is_empty()),
                 key,
             ));
-            apply_nested_claude_ca(cmd, ca, std::env::var_os("NODE_EXTRA_CA_CERTS").is_some());
-            // This affects shell-like tools, not Codex's own HTTP/WebSocket clients.
-            // Scalar overrides preserve the caller's other policy entries and filters.
-            // Unmarked, so a shell tool keeps its own ChatGPT login; keyed like
-            // a Claude launch, so the server does not count it as a stranger.
-            let shell =
-                loopback_proxy_url(key.key().map(|_| PLAIN_PROXY_USERNAME), key.key(), port);
-            for var in ["HTTPS_PROXY", "https_proxy"] {
-                cmd.arg("-c").arg(format!(
-                    "shell_environment_policy.set.{var}=\"{}\"",
-                    shell.env
-                ));
-            }
-            lines.push(shell_tools_notice(port, key.key().is_some()));
+            apply_nested_claude_ca(cmd, ca, (host.env)("NODE_EXTRA_CA_CERTS").is_some());
+            lines.extend(tool_env::apply_codex_shell_policy(cmd, host));
             lines.extend(key.notice(port));
             for rewrite in no_proxy {
                 cmd.env(rewrite.var, &rewrite.kept);
@@ -7514,23 +7533,6 @@ fn apply_codex_launch(
     }
     lines.extend(launch.notices(port));
     lines
-}
-
-/// What a pooled codex launch says about its shell tools' proxy. Keyed, a
-/// helper the user points at tcr by hand needs the key too, so the line says
-/// where to get it, and never prints it.
-fn shell_tools_notice(port: u16, keyed: bool) -> String {
-    if keyed {
-        format!(
-            "[tcr] shell tools use an unmarked, keyed proxy and keep their own ChatGPT login. \
-             Other helpers can inherit Codex's marker; for those commands set HTTPS_PROXY and \
-             https_proxy to http://tcr:<key>@127.0.0.1:{port}, the key from `tcr request-key`."
-        )
-    } else {
-        "[tcr] shell tools use an unmarked proxy and keep their own ChatGPT login. Other helpers \
-         can inherit Codex's marker; use unmarked HTTPS_PROXY and https_proxy for those commands."
-            .to_string()
-    }
 }
 
 /// Every spelling of a proxy variable `codex`'s HTTP stack reads for an
@@ -8073,8 +8075,9 @@ fn apply_codex_see_through_env(
     }
     vec![
         format!(
-            "[tcr] see-through mode: codex keeps its own backend URL, tunnelling via {}; a \
-             FedRAMP or residency-routed login runs on its own credential, unpooled",
+            "[tcr] see-through mode: codex keeps its own backend URL, proxy via {}; only marked \
+             chatgpt.com traffic is eligible for pooling; custom backends, FedRAMP and \
+             residency-routed logins run unpooled",
             proxy.shown
         ),
         if caller_ca_exported {
@@ -8094,8 +8097,8 @@ fn apply_codex_see_through_env(
 /// `NODE_EXTRA_CA_CERTS` to tcr's CA on the codex child, unless the caller
 /// exported one (`caller_exported`), which the child then inherits untouched.
 ///
-/// The codex child carries `HTTPS_PROXY` aimed at tcr, and so does everything it
-/// starts. A `claude` among them meets tcr's leaf for `api.anthropic.com`, and
+/// The codex child carries `HTTPS_PROXY` aimed at tcr. The nested-agent launcher
+/// restores it for a `claude` started by a shell tool. It meets tcr's leaf for `api.anthropic.com`, and
 /// node trusts that leaf only through this variable; without it the nested
 /// session fails TLS. codex itself reads only `CODEX_CA_CERTIFICATE`, so this
 /// changes nothing for codex. Silent, as the rest of the launch's defaults are.
@@ -8365,6 +8368,25 @@ const fn stand_down_exit_code(
 async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     let config_path = args.config.path();
     let (config, persist_path) = load_config(&config_path)?;
+    let restart_endpoint = match tcr::restart::Endpoint::bind() {
+        Ok(endpoint) => Some(endpoint),
+        Err(error) => {
+            eprintln!("[tcr] warning: listener handoff disabled: {error}");
+            None
+        }
+    };
+    let inherited_listener = if args.replace {
+        tcr::restart::request_listener(args.port.unwrap_or(config.proxy.port)).await?
+    } else {
+        None
+    };
+    // The predecessor's final token flush precedes sending the socket. Read it
+    // now, not from the snapshot taken before asking the predecessor to stop.
+    let (config, persist_path) = if inherited_listener.is_some() {
+        load_config(&config_path)?
+    } else {
+        (config, persist_path)
+    };
 
     // A first boot with an empty fleet imports this machine's Claude Code
     // login, if it has one — here, BEFORE the manager and the fleet are built
@@ -8440,7 +8462,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         persist_path,
         port: args.port,
         incumbent: if args.replace {
-            server::IncumbentPolicy::kill_the_incumbent_proxy()
+            server::IncumbentPolicy::never_signal()
         } else {
             server::IncumbentPolicy::report_and_stand_down()
         },
@@ -8467,15 +8489,31 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         // `serve`, and the two silently disagreeing means a claim named for a port
         // this process never bound — which every reader looks straight past.
         owner_dir: Some(singleton::default_owner_dir()),
-        // The binary always binds for itself. A handed-over socket arrives
-        // through the handoff path, which constructs its own options.
-        inherited_listener: None,
+        inherited_listener,
     };
 
     let handle = match server::serve(options).await? {
         server::ServeOutcome::Started(handle) => handle,
         // A binary may exit; the library returned this as a value.
-        server::ServeOutcome::StoodDown(stand_down) => stand_down_exit(&stand_down, file_log),
+        server::ServeOutcome::StoodDown(stand_down) => {
+            // `--replace` serves with the never-signal policy, which stands down
+            // without reaching `takeover_port`, the only other place that prints
+            // the marker line TcrBar reads to tell a stand-down from a crash.
+            if args.replace {
+                eprintln!(
+                    "{}",
+                    singleton::stand_down_notice(
+                        stand_down.port,
+                        singleton::Incumbent {
+                            pid: stand_down.pid,
+                            kind: stand_down.kind,
+                        },
+                    )
+                );
+            }
+            drop(restart_endpoint);
+            stand_down_exit(&stand_down, file_log)
+        }
     };
     let bound = handle.addr();
 
@@ -8490,86 +8528,142 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     }
 
     let mut handle = handle;
-    if args.headless {
-        // Installed BEFORE the "listening" line below, not after: that line is
-        // what a caller (or `tests/headless_sigterm.rs`) waits on before it
-        // treats this process as ready to signal. A handler installed after
-        // the print leaves a real window, small, but wide enough for a
-        // heavily loaded box to hit it, where a SIGTERM sent the instant the
-        // line appears finds no handler yet and the default disposition kills
-        // the process immediately, skipping `handle.shutdown()` below
-        // entirely: no drain, no final session->account pin flush, no
-        // owner-file removal. Registering first closes that window: by the
-        // time the readiness line is on the wire, the handler is already
-        // armed.
-        //
-        // TcrBar always launches this process with `--headless` and stops it
-        // with `process.terminate()` — a SIGTERM, not Ctrl-C
-        // (`apps/macos/.../ServerController.swift`). Mirror the TUI branch's
-        // SIGTERM handling (below) so a supervised stop falls through to the
-        // same shared cleanup instead of a hard kill.
-        //
-        // This cannot turn into an unkillable process: `handle.shutdown()`
-        // is `shutdown_within(DEFAULT_SHUTDOWN_GRACE)` (5s, see
-        // `server::DEFAULT_SHUTDOWN_GRACE`), documented as bounded — tasks
-        // that miss the grace are aborted and counted in
-        // `report.tasks_aborted`, warned about just below.
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = signal(SignalKind::terminate()).ok();
-        if sigterm.is_none() {
-            tracing::warn!(
-                "could not install SIGTERM handler; a supervised stop will kill this process without draining"
-            );
-        }
-        tracing::info!("tcr listening on http://{bound} (headless)");
-        // Block until Ctrl-C, SIGTERM, or the server task exits.
-        let trigger = tokio::select! {
-            _ = tokio::signal::ctrl_c() => ShutdownTrigger::CtrlC,
-            () = async {
-                match sigterm.as_mut() {
-                    Some(sig) => {
-                        sig.recv().await;
-                    }
-                    None => std::future::pending::<()>().await,
-                }
-            } => ShutdownTrigger::Sigterm,
-            () = handle.serving_stopped() => ShutdownTrigger::ServingStopped,
-        };
-        tracing::info!("{}", trigger.shutdown_line());
-    } else {
-        // The TUI owns the foreground. Under raw mode Ctrl-C arrives as a keystroke,
-        // so the loop (not a signal) handles it. But an EXTERNAL SIGTERM — e.g. the
-        // singleton replacing us on the port — would otherwise terminate the process
-        // with the terminal still in raw + alternate-screen mode, wrecking the
-        // caller's shell. Race the TUI against SIGTERM: on the signal the `select`
-        // drops the TUI future, and dropping it runs `TerminalGuard`'s destructor,
-        // which restores the terminal (the same restore path as a clean quit or a
-        // panic) BEFORE the shutdown/flush below and any SIGKILL fallback.
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = signal(SignalKind::terminate()).ok();
-        if sigterm.is_none() {
-            tracing::warn!("could not install SIGTERM handler; terminal may not restore if killed");
-        }
-        let tui_fut = tui::run(Arc::clone(handle.manager()));
-        tokio::pin!(tui_fut);
-        tokio::select! {
-            res = &mut tui_fut => {
-                if let Err(err) = res {
-                    tracing::error!(error = %err, "tui error");
-                }
-            }
-            () = async {
-                match sigterm.as_mut() {
-                    Some(sig) => {
-                        sig.recv().await;
-                    }
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
-                tracing::info!("SIGTERM received; restoring terminal and shutting down");
-            }
-        }
+    let mut successor = None;
+    let mut replacement_deadline = None;
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).ok();
+    if sigterm.is_none() {
+        tracing::warn!("could not install SIGTERM handler");
     }
+    loop {
+        if args.headless {
+            // Installed BEFORE the "listening" line below, not after: that line is
+            // what a caller (or `tests/headless_sigterm.rs`) waits on before it
+            // treats this process as ready to signal. A handler installed after
+            // the print leaves a real window, small, but wide enough for a
+            // heavily loaded box to hit it, where a SIGTERM sent the instant the
+            // line appears finds no handler yet and the default disposition kills
+            // the process immediately, skipping `handle.shutdown()` below
+            // entirely: no drain, no final session->account pin flush, no
+            // owner-file removal. Registering first closes that window: by the
+            // time the readiness line is on the wire, the handler is already
+            // armed.
+            //
+            // TcrBar always launches this process with `--headless` and stops it
+            // with `process.terminate()` — a SIGTERM, not Ctrl-C
+            // (`apps/macos/.../ServerController.swift`). Mirror the TUI branch's
+            // SIGTERM handling (below) so a supervised stop falls through to the
+            // same shared cleanup instead of a hard kill.
+            //
+            // This cannot turn into an unkillable process: `handle.shutdown()`
+            // is `shutdown_within(DEFAULT_SHUTDOWN_GRACE)` (5s, see
+            // `server::DEFAULT_SHUTDOWN_GRACE`), documented as bounded — tasks
+            // that miss the grace are aborted and counted in
+            // `report.tasks_aborted`, warned about just below.
+            tracing::info!("tcr listening on http://{bound} (headless)");
+            // Block until Ctrl-C, SIGTERM, or the server task exits.
+            let trigger = tokio::select! {
+                _ = tokio::signal::ctrl_c() => ShutdownTrigger::CtrlC,
+                () = async {
+                    match sigterm.as_mut() {
+                        Some(sig) => {
+                            sig.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => ShutdownTrigger::Sigterm,
+                () = handle.serving_stopped() => ShutdownTrigger::ServingStopped,
+                peer = tcr::restart::accept(restart_endpoint.as_ref()) => {
+                    successor = Some(peer);
+                    ShutdownTrigger::Replaced
+                },
+            };
+            tracing::info!("{}", trigger.shutdown_line());
+        } else {
+            // The TUI owns the foreground. Under raw mode Ctrl-C arrives as a keystroke,
+            // so the loop (not a signal) handles it. But an EXTERNAL SIGTERM — e.g. the
+            // singleton replacing us on the port — would otherwise terminate the process
+            // with the terminal still in raw + alternate-screen mode, wrecking the
+            // caller's shell. Race the TUI against SIGTERM: on the signal the `select`
+            // drops the TUI future, and dropping it runs `TerminalGuard`'s destructor,
+            // which restores the terminal (the same restore path as a clean quit or a
+            // panic) BEFORE the shutdown/flush below and any SIGKILL fallback.
+            let tui_fut = tui::run(Arc::clone(handle.manager()));
+            tokio::pin!(tui_fut);
+            tokio::select! {
+                peer = tcr::restart::accept(restart_endpoint.as_ref()) => {
+                    successor = Some(peer);
+                }
+
+                res = &mut tui_fut => {
+                    if let Err(err) = res {
+                        tracing::error!(error = %err, "tui error");
+                    }
+                }
+                () = async {
+                    match sigterm.as_mut() {
+                        Some(sig) => {
+                            sig.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    tracing::info!("SIGTERM received; restoring terminal and shutting down");
+                }
+            }
+        }
+
+        let Some(peer) = successor.take() else {
+            break;
+        };
+        let deadline = tokio::time::Instant::now() + tcr::restart::drain_ceiling();
+        let result = tokio::select! {
+            result = handle.handoff(&peer) => result,
+            _ = tokio::signal::ctrl_c() => break,
+            () = async { match sigterm.as_mut() {
+                Some(signal) => { signal.recv().await; },
+                None => std::future::pending::<()>().await,
+            }} => break,
+            () = tokio::time::sleep_until(deadline) => {
+                tracing::warn!("replacement handoff deadline reached; shutting down"); break;
+            }
+        };
+        if let Err(error) = result {
+            if !handle.manager().mutation_is_released() {
+                tracing::warn!(%error, "listener handoff failed before send; incumbent keeps serving");
+                continue;
+            }
+            tracing::warn!(%error, "listener handoff failed; draining before shutdown");
+        }
+        successor = Some(peer);
+        replacement_deadline = Some(deadline);
+        break;
+    }
+
+    if let Some(peer) = successor {
+        // One budget includes the handshake and draining. A failed or interrupted
+        // handshake still falls through to shutdown and the usage-ledger flush.
+        let replacement = async {
+            tracing::info!("listener handed over; draining accepted connections");
+            handle.drain_connections().await;
+            tracing::info!("accepted connections drained");
+        };
+        tokio::select! {
+            () = replacement => {},
+            _ = tokio::signal::ctrl_c() => tracing::info!("shutdown signal received during drain"),
+            () = async {
+                match sigterm.as_mut() {
+                    Some(sig) => { sig.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => tracing::info!("SIGTERM received during drain; shutting down"),
+            () = tokio::time::sleep_until(replacement_deadline.unwrap_or_else(tokio::time::Instant::now)) => {
+                tracing::warn!("replacement drain deadline reached; shutting down");
+            }
+        }
+        drop(peer);
+    }
+    drop(restart_endpoint);
 
     // Stop serving, then flush the config and the affinity pins. The whole
     // sequence — including the final pin write a clean shutdown owes the next
@@ -8606,6 +8700,7 @@ enum ShutdownTrigger {
     CtrlC,
     Sigterm,
     ServingStopped,
+    Replaced,
 }
 
 impl ShutdownTrigger {
@@ -8627,6 +8722,7 @@ impl ShutdownTrigger {
             Self::CtrlC => "shutdown signal received",
             Self::Sigterm => "SIGTERM received; shutting down",
             Self::ServingStopped => "serving stopped on its own; shutting down",
+            Self::Replaced => "replacement requested; handing over the listener",
         }
     }
 }
@@ -8650,9 +8746,8 @@ const fn wedged_incumbent_recovery(kind: singleton::ProxyKind) -> &'static str {
              start it again to recover a wedged embedded proxy."
         }
         singleton::ProxyKind::Tcr => {
-            "Run `tcr --replace` to take the port over; that is the recovery for a wedged proxy, \
-             and it is not being done automatically because it also wipes the pin map of a proxy \
-             that was merely slow to answer."
+            "Stop the proxy explicitly, or use `tcr --replace` if it runs tcr 1.2.17 or newer \
+             and its listener handoff endpoint still answers."
         }
     }
 }
@@ -9357,64 +9452,98 @@ mod tests {
         )
     }
 
-    /// (b) and (c): keyed, codex keeps the `tcr-codex` marker with the key as its
-    /// password, and its shell tools get the unmarked `tcr` user with the key. The
-    /// server's own parse reads the first as marked and keyed, the second as keyed
-    /// only. Unkeyed, both are today's URLs. A direct launch never reaches tcr and
-    /// gets neither.
+    /// Every variable the Codex shell policy sets, in order.
+    const SHELL_POLICY_VARS: [&str; 8] = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NODE_EXTRA_CA_CERTS",
+        "CODEX_CA_CERTIFICATE",
+    ];
+
+    /// The `shell_environment_policy.set.*` arguments on `cmd`, as (name, value).
+    fn shell_policy(cmd: &std::process::Command) -> Vec<(String, String)> {
+        cmd.get_args()
+            .filter_map(|arg| {
+                let arg = arg.to_string_lossy();
+                let (name, value) = arg
+                    .strip_prefix("shell_environment_policy.set.")?
+                    .split_once('=')?;
+                let value: String = serde_json::from_str(value).expect("a JSON string");
+                Some((name.to_string(), value))
+            })
+            .collect()
+    }
+
+    /// Fail unless `cmd`'s shell policy sets exactly `want`, in [`SHELL_POLICY_VARS`]
+    /// order. The message names the variables that differ and never their values,
+    /// because a value may be a proxy URL that carries a request key.
+    fn assert_shell_policy(cmd: &std::process::Command, want: &[(&str, &str)], context: &str) {
+        let got = shell_policy(cmd);
+        let names: Vec<&str> = got.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(
+            names == SHELL_POLICY_VARS,
+            "{context}: shell policy names {names:?}"
+        );
+        let differ: Vec<&str> = got
+            .iter()
+            .filter(|(name, value)| {
+                let want = want.iter().find(|(n, _)| n == name).map_or("", |(_, v)| *v);
+                value != want
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(
+            differ.is_empty(),
+            "{context}: shell policy values differ for {differ:?}"
+        );
+    }
+
+    /// Keyed model traffic retains the marker; shell defaults contain no key.
+    /// The caller's environment and Codex config are injected and empty, so the
+    /// result does not depend on the machine, or on a `tcr run` session around it.
     #[test]
-    fn a_keyed_codex_launch_keeps_the_marker_and_keys_its_shell_tools() {
+    fn a_keyed_codex_launch_keeps_the_marker_and_restores_shell_settings() {
         let pooled = CodexLaunch::SeeThrough {
             ca: PathBuf::from("/tmp/ca.pem"),
             no_proxy: Vec::new(),
         };
-        let shell_args = |cmd: &std::process::Command| -> Vec<String> {
-            cmd.get_args()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .filter(|arg| arg.starts_with("shell_environment_policy.set."))
-                .collect()
-        };
+        let caller = inherited(&[]);
+        let host = test_host(&caller);
 
         let mut cmd = std::process::Command::new("true");
-        let lines = apply_codex_launch(&mut cmd, 3999, &pooled, &sent(KEY));
+        let lines = apply_codex_launch(&mut cmd, 3999, &pooled, &sent(KEY), &host);
         let codex_url = format!("http://tcr-codex:{KEY}@127.0.0.1:3999");
-        let shell_url = format!("http://tcr:{KEY}@127.0.0.1:3999");
+
         let env = env_changes(&cmd);
-        assert_eq!(env.get("HTTPS_PROXY"), Some(&Some(codex_url.clone())));
-        assert_eq!(env.get("https_proxy"), Some(&Some(codex_url.clone())));
-        assert_eq!(
-            shell_args(&cmd),
-            [
-                format!("shell_environment_policy.set.HTTPS_PROXY=\"{shell_url}\""),
-                format!("shell_environment_policy.set.https_proxy=\"{shell_url}\""),
-            ]
-        );
+        for var in ["HTTPS_PROXY", "https_proxy"] {
+            assert!(
+                env.get(var) == Some(&Some(codex_url.clone())),
+                "{var} is not the keyed codex URL"
+            );
+        }
+        assert_shell_policy(&cmd, &[], "keyed");
         let codex = server_reads(&codex_url);
         assert!(codex.codex_marked && codex.key_ok, "{codex:?}");
-        let shell = server_reads(&shell_url);
-        assert!(!shell.codex_marked && shell.key_ok, "{shell:?}");
         assert!(
-            lines.iter().any(|line| line.contains("tcr request-key")),
-            "the shell-tool line says where a hand-set helper gets the key: {lines:?}"
+            lines
+                .iter()
+                .any(|line| line.contains("caller's proxy and CA"))
         );
 
         for decision in unkeyed_decisions() {
             let mut cmd = std::process::Command::new("true");
-            let lines = apply_codex_launch(&mut cmd, 3999, &pooled, &decision);
+            let lines = apply_codex_launch(&mut cmd, 3999, &pooled, &decision, &host);
             let env = env_changes(&cmd);
-            assert_eq!(
-                env.get("HTTPS_PROXY"),
-                Some(&Some("http://tcr-codex@127.0.0.1:3999".to_string())),
-                "{decision:?}"
+            assert!(
+                env.get("HTTPS_PROXY")
+                    == Some(&Some("http://tcr-codex@127.0.0.1:3999".to_string())),
+                "{decision:?}: HTTPS_PROXY is not the unkeyed codex URL"
             );
-            assert_eq!(
-                shell_args(&cmd),
-                [
-                    "shell_environment_policy.set.HTTPS_PROXY=\"http://127.0.0.1:3999\"",
-                    "shell_environment_policy.set.https_proxy=\"http://127.0.0.1:3999\"",
-                ],
-                "{decision:?}"
-            );
+            assert_shell_policy(&cmd, &[], &format!("{decision:?}"));
             assert_eq!(
                 lines
                     .iter()
@@ -9434,12 +9563,71 @@ mod tests {
                 unset: Vec::new(),
             },
             &sent(KEY),
+            &host,
         );
         assert!(env_changes(&cmd).is_empty(), "a direct launch sets nothing");
-        assert!(shell_args(&cmd).is_empty());
+        assert!(shell_policy(&cmd).is_empty());
         assert!(
             !lines.iter().any(|line| line.contains("request key")),
             "{lines:?}"
+        );
+    }
+
+    /// The shell policy is built from the caller's environment and Codex config as
+    /// injected: a caller proxy aimed at this tcr (carrying its key) and tcr's own
+    /// CA are dropped, a caller's other proxy is kept, and a proxy the Codex config
+    /// sets wins.
+    #[test]
+    fn the_codex_shell_policy_reads_the_injected_environment_and_codex_config() {
+        let home = tempfile::tempdir().expect("a temporary HOME");
+        std::fs::create_dir(home.path().join(".codex")).expect("a .codex dir");
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "[shell_environment_policy.set]\nALL_PROXY = \"http://config.example:8080\"\n",
+        )
+        .expect("a codex config");
+        let home_text = home.path().to_str().expect("a UTF-8 path");
+        let pooled = CodexLaunch::SeeThrough {
+            ca: PathBuf::from("/tmp/ca.pem"),
+            no_proxy: Vec::new(),
+        };
+        let caller = inherited(&[
+            ("HOME", home_text),
+            ("HTTPS_PROXY", "http://k:secret@127.0.0.1:3999"),
+            ("http_proxy", "http://corp.example:3128"),
+            ("NODE_EXTRA_CA_CERTS", "/tmp/ca.pem"),
+        ]);
+        let mut cmd = std::process::Command::new("true");
+        let _lines = apply_codex_launch(&mut cmd, 3999, &pooled, &sent(KEY), &test_host(&caller));
+        assert_shell_policy(
+            &cmd,
+            &[
+                ("http_proxy", "http://corp.example:3128"),
+                ("ALL_PROXY", "http://config.example:8080"),
+            ],
+            "HOME's codex config",
+        );
+
+        // CODEX_HOME names the config directory and wins over HOME.
+        let codex_home = tempfile::tempdir().expect("a CODEX_HOME");
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            "[shell_environment_policy.set]\nALL_PROXY = \"http://codex-home.example:8080\"\n",
+        )
+        .expect("a codex config");
+        let caller = inherited(&[
+            ("HOME", home_text),
+            (
+                "CODEX_HOME",
+                codex_home.path().to_str().expect("a UTF-8 path"),
+            ),
+        ]);
+        let mut cmd = std::process::Command::new("true");
+        let _lines = apply_codex_launch(&mut cmd, 3999, &pooled, &sent(KEY), &test_host(&caller));
+        assert_shell_policy(
+            &cmd,
+            &[("ALL_PROXY", "http://codex-home.example:8080")],
+            "CODEX_HOME's codex config",
         );
     }
 
@@ -9504,6 +9692,7 @@ mod tests {
                 no_proxy: Vec::new(),
             },
             &key,
+            &test_host(&inherited(&[])),
         ));
         lines.extend(unkeyed_decisions().iter().filter_map(|d| d.notice(3999)));
         assert!(
@@ -9570,8 +9759,8 @@ mod tests {
         // advice having been dropped for everyone.
         let advice = wedged_incumbent_recovery(singleton::ProxyKind::Tcr);
         assert!(
-            advice.contains("Run `tcr --replace`"),
-            "Tcr is recoverable by --replace: {advice}"
+            advice.contains("Stop the proxy explicitly") && advice.contains("tcr 1.2.17 or newer"),
+            "standalone recovery must explain when handoff is available: {advice}"
         );
     }
 
@@ -9957,6 +10146,15 @@ mod tests {
             wire["mitm"] = mitm;
         }
         Ok(serde_json::from_value(wire).expect("a status payload"))
+    }
+
+    /// A launch host that reads only `env` (no process environment, no real
+    /// `HOME`) and names `/tmp/ca.pem` as tcr's CA.
+    fn test_host(env: &dyn Fn(&str) -> Option<String>) -> tool_env::Host<'_> {
+        tool_env::Host {
+            env,
+            own_ca: PathBuf::from("/tmp/ca.pem"),
+        }
     }
 
     /// An inherited environment holding exactly `vars`.
@@ -10435,7 +10633,13 @@ mod tests {
         )
         .expect("a direct launch");
         let mut cmd = std::process::Command::new("true");
-        let _lines = apply_codex_launch(&mut cmd, 3999, &launch, &LaunchKey::NoKeyInConfig);
+        let _lines = apply_codex_launch(
+            &mut cmd,
+            3999,
+            &launch,
+            &LaunchKey::NoKeyInConfig,
+            &test_host(&env),
+        );
         assert_eq!(
             env_changes(&cmd),
             [
@@ -10524,7 +10728,13 @@ mod tests {
         );
 
         let mut cmd = std::process::Command::new("true");
-        let _lines = apply_codex_launch(&mut cmd, 3999, &launch, &LaunchKey::NoKeyInConfig);
+        let _lines = apply_codex_launch(
+            &mut cmd,
+            3999,
+            &launch,
+            &LaunchKey::NoKeyInConfig,
+            &test_host(&env),
+        );
         let env = env_changes(&cmd);
         assert_eq!(
             env.get("NO_PROXY"),
@@ -11790,6 +12000,7 @@ mod tests {
             ShutdownTrigger::CtrlC,
             ShutdownTrigger::Sigterm,
             ShutdownTrigger::ServingStopped,
+            ShutdownTrigger::Replaced,
         ];
         let mut seen: Vec<&str> = Vec::new();
         for trigger in triggers {
@@ -12003,25 +12214,30 @@ mod tests {
             "the caller's own value is inherited, not replaced"
         );
 
-        let mut cmd = std::process::Command::new("true");
-        let _lines = apply_codex_launch(
-            &mut cmd,
-            3999,
-            &CodexLaunch::SeeThrough {
-                ca: ca.to_path_buf(),
-                no_proxy: Vec::new(),
-            },
-            &LaunchKey::NoKeyInConfig,
-        );
-        let expected = match std::env::var_os("NODE_EXTRA_CA_CERTS") {
-            None => Some(Some("/tmp/ca.pem".to_string())),
-            Some(_) => None,
-        };
-        assert_eq!(
-            env_changes(&cmd).get("NODE_EXTRA_CA_CERTS").cloned(),
-            expected,
-            "a pooled launch sets the CA for a nested claude unless this process exported one"
-        );
+        for (caller, expected) in [
+            (inherited(&[]), Some(Some("/tmp/ca.pem".to_string()))),
+            (
+                inherited(&[("NODE_EXTRA_CA_CERTS", "/tmp/corporate-ca.pem")]),
+                None,
+            ),
+        ] {
+            let mut cmd = std::process::Command::new("true");
+            let _lines = apply_codex_launch(
+                &mut cmd,
+                3999,
+                &CodexLaunch::SeeThrough {
+                    ca: ca.to_path_buf(),
+                    no_proxy: Vec::new(),
+                },
+                &LaunchKey::NoKeyInConfig,
+                &test_host(&caller),
+            );
+            assert_eq!(
+                env_changes(&cmd).get("NODE_EXTRA_CA_CERTS").cloned(),
+                expected,
+                "a pooled launch sets the CA for a nested claude unless the caller exported one"
+            );
+        }
 
         let mut cmd = std::process::Command::new("true");
         let _lines = apply_codex_launch(
@@ -12032,6 +12248,7 @@ mod tests {
                 unset: Vec::new(),
             },
             &LaunchKey::NoKeyInConfig,
+            &test_host(&inherited(&[])),
         );
         assert_eq!(env_changes(&cmd).get("NODE_EXTRA_CA_CERTS"), None);
     }

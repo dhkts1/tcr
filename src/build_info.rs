@@ -331,7 +331,7 @@ pub fn stand_down_build_report(
             line: format!(
                 "[tcr] note build-skew-unknown: this_binary={} but the proxy on :{port} did not \
                  report its build — it may be serving older code. `tcr status` reports the \
-                 running build; `tcr --replace` restarts the port onto this binary.",
+                 running build; stop it, or use `tcr --replace` if it runs tcr 1.2.17 or newer.",
                 ours.sha
             ),
         };
@@ -360,7 +360,7 @@ pub fn stand_down_build_report(
             verdict: StandDownBuild::Unknown,
             line: format!(
                 "[tcr] note build-skew-unknown: {keys} — cannot tell whether the proxy on :{port} \
-                 is running this binary's code. `tcr --replace` restarts the port onto this binary."
+                 is running this binary's code. stop it, or use `tcr --replace` if it runs tcr 1.2.17 or newer."
             ),
         };
     }
@@ -370,7 +370,7 @@ pub fn stand_down_build_report(
             line: format!(
                 "[tcr] WARNING stale-server: {keys} — the proxy on :{port} is NOT running this \
                  binary's code and will keep serving its own until it is restarted. \
-                 `tcr --replace` takes the port over with this build."
+                 stop it, or use `tcr --replace` if it runs tcr 1.2.17 or newer."
             ),
         };
     }
@@ -517,6 +517,46 @@ fn git_in(root: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_skew_line_and_docs_say_when_replace_can_hand_over() {
+        let ours = build("9f3a1b2", Some(false));
+        for running in [
+            None,
+            Some(build("unknown", None)),
+            Some(build("cd146ce", Some(false))),
+        ] {
+            let report = stand_down_build_report(12345, &ours, running.as_ref(), None);
+            assert!(
+                report.line.contains("if it runs tcr 1.2.17 or newer"),
+                "first-upgrade guidance: {}",
+                report.line
+            );
+            assert!(report.line.contains("stop it"), "{}", report.line);
+        }
+        let cli = include_str!("../docs/cli.md");
+        for clause in [
+            "five-minute ceiling",
+            "HTTP/2 receives GOAWAY",
+            "cannot refresh tokens after releasing ownership",
+            "failed handshake shuts it down",
+            "Shell tools use the caller's network settings.",
+            "private helper directory",
+        ] {
+            assert!(
+                cli.contains(clause),
+                "missing shipped CLI contract: {clause}"
+            );
+        }
+        assert!(
+            include_str!("../README.md").contains("docs/cli.md#tcr-run----args"),
+            "README run link must resolve"
+        );
+        assert!(
+            include_str!("../docs/troubleshooting.md").contains("if it runs tcr 1.2.17 or newer"),
+            "troubleshooting must explain first upgrade"
+        );
+    }
 
     fn build(sha: &str, dirty: Option<bool>) -> BuildInfo {
         BuildInfo {

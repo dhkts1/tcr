@@ -1894,6 +1894,26 @@ fn a_command_taken_mid_entry_settles_after_its_own_round() {
     );
 }
 
+#[test]
+fn reviewer_control_stopped_predecessor_preserves_successor_auto() {
+    let mut old = holding(fixed(5000));
+    old.send(Command::Shutdown {
+        deadline: old.clock.now() + Duration::from_secs(3),
+    });
+    old.clear_requests();
+    // The successor has handed every fan back and root now has no holder.
+    // These are the same hardware reads root's real HandBack produces.
+    for fan in &mut old.world.lock().reading.as_mut().unwrap().fans {
+        fan.mode = FanMode::Auto;
+    }
+    old.next_tick();
+    assert!(
+        old.written().is_empty(),
+        "predecessor issued new fan writes after successor Auto: {:?}",
+        old.written()
+    );
+}
+
 /// Two commands drained in one pump are acted on in one step, under the later
 /// number: the earlier one reads as acted on, and the wish shown is the later
 /// one's, which is what tells the earlier command it was replaced.

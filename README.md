@@ -148,11 +148,15 @@ trust it. When `tcr` starts it prints the CA path to use and the variable to put
 
 With the certificate tcr made itself (CA `~/.config/tcr-ca.pem`), it decrypts `chatgpt.com` only
 on a connection that uses `HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port>`, and only while the pool
-holds a Codex account. `tcr run --codex` sets that marker and the CA for you. Without the marker,
-`chatgpt.com` passes through untouched and the client keeps its own login, and that includes the
-`HTTPS_PROXY` a Claude `tcr run` session hands down. On a marked connection, paths outside
-`/backend-api/` go out under the client's own credential. Keep the marker inside
-`tcr run --codex`; do not export it in a shell.
+holds a Codex account. `tcr run --codex` sets that marker and the CA for you. A nested `codex`
+on PATH uses the same launch checks through a private helper, so it can use the pool too.
+Both launchers keep shell tools such as `git`, `gh` and `curl` off tcr, without a host
+whitelist. Nested `claude`/`codex` commands on PATH regain the session's proxy; the agents'
+own auxiliary traffic still uses it. See [the shell routing
+contract](docs/cli.md#tcr-run----args).
+Without the marker, `chatgpt.com` passes through untouched and the client keeps its own login. On a marked
+connection, paths outside `/backend-api/` go out under the client's own credential. Keep the
+marker inside `tcr run --codex`; do not export it in a shell.
 
 Each client takes its CA from a different place:
 
@@ -161,8 +165,8 @@ Each client takes its CA from a different place:
 - A Claude launch sets only `NODE_EXTRA_CA_CERTS`, so a Codex client started inside it keeps its
   own CA setting.
 - A pooled Codex launch sets `CODEX_CA_CERTIFICATE` only if you have not, and leaves an explicit
-  `NODE_EXTRA_CA_CERTS` alone. The shell tools it starts get a proxy URL without the marker, so
-  their ChatGPT requests keep their own TLS and login, unless you set their environment yourself.
+  `NODE_EXTRA_CA_CERTS` alone. Shell tools retain the caller's proxy and CA settings,
+  connecting directly when the caller configured no proxy.
 
 The config lives at `~/.config/tcr.json`. `name` and `accessToken` are the only required keys.
 Every other key, its default and the file's permissions are in

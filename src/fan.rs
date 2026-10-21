@@ -495,24 +495,26 @@ impl FanHandle {
     }
 
     /// Ask the controller to hand back what it holds and stop, and wait at
-    /// most `grace` for it. Blocking: call it off the runtime.
-    pub fn shutdown(&self, grace: Duration) {
+    /// most `grace` for it. Returns whether it stopped; a timeout is false.
+    /// Blocking: call it off the runtime.
+    pub fn shutdown(&self, grace: Duration) -> bool {
         let wait = grace.min(SHUTDOWN_HAND_BACK);
         let deadline = Instant::now() + wait;
         // Not a numbered command: the controller does not count a shutdown.
         let seq = *self.sent.lock().unwrap_or_else(PoisonError::into_inner);
         let command = Command::Shutdown { deadline };
         if self.tx.send(Input::Command { seq, command }).is_err() {
-            return;
+            return true;
         }
         let done = self.done.lock().unwrap_or_else(PoisonError::into_inner);
-        if done
-            .recv_timeout(wait + Duration::from_millis(500))
-            .is_err()
-        {
-            tracing::warn!(
-                "fan control: the controller did not stop in time; the helper hands back when this process exits"
-            );
+        match done.recv_timeout(wait + Duration::from_millis(500)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    "fan control: the controller did not stop in time; the helper hands back when this process exits"
+                );
+                false
+            }
         }
     }
 }
@@ -883,6 +885,168 @@ mod platform {
 mod tests {
     use super::*;
     use tcr_fan::controller::Detail;
+
+    /// Real controller and `FileStore`; only the hardware/helper are fake.
+    #[derive(Clone)]
+    struct HandoffMachine(Arc<Mutex<tcr_smc::HeatReading>>);
+
+    impl tcr_fan::controller::Heat for HandoffMachine {
+        fn read(&mut self) -> Option<tcr_smc::HeatReading> {
+            Some(self.0.lock().unwrap().clone())
+        }
+    }
+
+    impl tcr_fan::controller::Helper for HandoffMachine {
+        fn open(
+            &mut self,
+            _: tcr_fan::controller::Generation,
+        ) -> Result<(), tcr_fan::controller::Fault> {
+            Ok(())
+        }
+
+        fn send(
+            &mut self,
+            request: &tcr_fan::wire::Request,
+            _: Duration,
+        ) -> Result<tcr_fan::wire::Reply, tcr_fan::controller::Fault> {
+            use tcr_fan::wire::{PROTOCOL_VERSION, Reply, Request};
+            let mut reading = self.0.lock().unwrap();
+            Ok(match *request {
+                Request::Version => Reply::Version {
+                    protocol: PROTOCOL_VERSION,
+                    build: "test".into(),
+                },
+                Request::SetManual { fan } => {
+                    reading.fans[usize::from(fan.get())].mode = tcr_smc::FanMode::Manual;
+                    Reply::Manual { unlocked: false }
+                }
+                Request::SetTarget { fan, rpm } => {
+                    reading.fans[usize::from(fan.get())].target_rpm = Some(rpm);
+                    Reply::Target { rpm }
+                }
+                Request::HandBack => {
+                    for fan in &mut reading.fans {
+                        fan.mode = tcr_smc::FanMode::Auto;
+                    }
+                    Reply::HandedBack
+                }
+            })
+        }
+
+        fn close(&mut self) {}
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_keeps_successor_auto_saved_after_predecessor_shutdown() {
+        use crate::server::{ServeOptions, TlsSetup};
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fan.json");
+        let old_saved = held_by(100, true);
+        let (mut store, _) = FileStore::open(path.clone(), 100);
+        store.save(&old_saved);
+        let machine = HandoffMachine(Arc::new(Mutex::new(tcr_smc::HeatReading {
+            cpu_celsius: Some(50.0),
+            fans: vec![tcr_smc::FanReading {
+                index: fan(0),
+                actual_rpm: 5000.0,
+                min_rpm: 1350.0,
+                max_rpm: 5777.0,
+                mode: tcr_smc::FanMode::Manual,
+                target_rpm: Some(5000.0),
+            }],
+            ftst: Some(false),
+        })));
+        let (tx, rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let shown = Arc::new(Mutex::new(snapshot(State::Off, &[], None)));
+        let published = Arc::clone(&shown);
+        let sent = Arc::clone(&store.sent);
+        let commands_before = *sent.lock().unwrap();
+        let controller = Controller::new(
+            Parts {
+                helper: machine.clone(),
+                heat: machine.clone(),
+                probe: inert::NoMacs,
+                clock: SystemClock,
+                store,
+                inbox: rx,
+                log: Box::new(|_, _| {}),
+                publish: Box::new(move |s| *published.lock().unwrap() = s.clone()),
+                pid: 100,
+                commands_before,
+            },
+            Some(old_saved.clone()),
+        );
+        let thread = std::thread::spawn(move || {
+            controller.run();
+            done_tx.send(()).unwrap();
+        });
+        let fan = Arc::new(FanHandle {
+            tx,
+            shown,
+            sent,
+            done: Mutex::new(done_rx),
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fan.row().state != FanStateRow::Holding {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("predecessor holds Fixed before handoff");
+        assert_eq!(load(&path).unwrap().desired, old_saved.desired);
+        let config = serde_json::from_str(r#"{"accounts":[]}"#).unwrap();
+        let mut options = ServeOptions::new(config);
+        options.port = Some(0);
+        options.tls = TlsSetup::Disabled;
+        let mut handle = crate::server::serve(options)
+            .await
+            .unwrap()
+            .expect_started();
+        handle.manager().install_fan(Arc::clone(&fan));
+        let (ours, mut successor) = std::os::unix::net::UnixStream::pair().unwrap();
+        let receiver = std::thread::spawn(move || {
+            successor
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let listener = tcr_fdpass::recv_listener(&successor).unwrap();
+            successor.write_all(b"listener-received\n").unwrap();
+            let mut released = [0u8; 18];
+            successor.read_exact(&mut released).unwrap();
+            assert_eq!(&released, b"listener-released\n");
+            drop(listener);
+        });
+        handle.handoff(&ours).await.unwrap();
+        receiver.join().unwrap();
+        assert!(
+            handle.manager().mutation_is_released(),
+            "handoff must finish first"
+        );
+        // Successor Auto returns the hardware and saves its wish after release.
+        for fan in &mut machine.0.lock().unwrap().fans {
+            fan.mode = tcr_smc::FanMode::Auto;
+        }
+        let (mut new, _) = FileStore::open(path.clone(), 200);
+        new.save(&held_by(200, true));
+        let automatic = Saved {
+            desired: FanDesired::Auto,
+            hold: None,
+        };
+        new.save(&automatic);
+        assert_eq!(
+            load(&path),
+            Some(automatic.clone()),
+            "successor Auto must be saved first"
+        );
+        handle.shutdown().await;
+        thread.join().unwrap();
+        assert_eq!(
+            load(&path),
+            Some(automatic),
+            "old draining process overwrote the successor's saved Auto mode"
+        );
+    }
 
     fn fixture() -> serde_json::Map<String, serde_json::Value> {
         let path =

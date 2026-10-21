@@ -202,6 +202,11 @@ path = "tests/it/main.rs"
 # Each of these stays its own process because it owns process-wide state a sibling module
 # would see or break. The reason is beside each one, and in the file's own docs where it has one.
 # A process-wide `tracing` subscriber, installed once with `set_global_default`:
+# Owns MITM's process-global loaded leaf while preparing isolated agent fixtures.
+[[test]]
+name = "tool_proxy_env"
+path = "tests/tool_proxy_env.rs"
+
 [[test]]
 name = "codex_log_lines"
 path = "tests/codex_log_lines.rs"
@@ -308,6 +313,8 @@ oauth2 = { version = "5", default-features = false }
 # via oauth2+reqwest), so promoting it to a direct dep adds ZERO packages — it
 # just stops us hand-rolling %XX/`+` decoding in oauth.rs.
 form_urlencoded = "1"
+# Already in the lockfile: preserve Codex shell policy set entries when routing tools.
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 
 # TUI
 ratatui = "0.30"

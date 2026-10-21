@@ -107,13 +107,13 @@ impl IncumbentPolicy {
         Self(Signal::Report)
     }
 
-    /// `tcr server --replace`: **SIGTERM, then SIGKILL after 800ms**, whichever
+    /// Legacy explicit takeover: **SIGTERM, then SIGKILL after 800ms**, whichever
     /// recognized proxy holds the port — including a live `tcr` serving real
-    /// traffic. That wipes its in-memory session→account pin map and every live
-    /// session then pays a full cold prompt-cache prefix.
+    /// traffic. This cuts its live connections. The CLI's `--replace` now uses
+    /// listener handoff instead, leaving accepted connections to drain.
     ///
-    /// Reserve this for an operator who typed `--replace`. Nothing in a test or
-    /// an embedder should call it.
+    /// Reserve this for an operator who explicitly requested a destructive
+    /// takeover. An embedder should use `never_signal`.
     pub const fn kill_the_incumbent_proxy() -> Self {
         Self(Signal::Recognized)
     }
@@ -154,7 +154,8 @@ pub struct ServeOptions {
     /// contending for the configured one.
     pub port: Option<u16>,
     /// What to do about a recognized proxy already holding the port. Defaults to
-    /// [`IncumbentPolicy::never_signal`]; the binary maps `--replace` onto it.
+    /// [`IncumbentPolicy::never_signal`]. The CLI's `--replace` supplies an
+    /// inherited listener and uses this default rather than signalling its peer.
     pub incumbent: IncumbentPolicy,
     /// The session-affinity pin cache, or `None` to keep pins **in memory only**
     /// — nothing is read at boot and nothing is written at shutdown.
@@ -390,6 +391,9 @@ pub struct ShutdownReport {
 /// aborts them and [`shutdown`](Self::shutdown) stops them in order and gives
 /// the affinity map its final write.
 pub struct ServerHandle {
+    /// A second descriptor keeps the accept queue bound through a handoff.
+    listener: Option<std::net::TcpListener>,
+    connections: Option<tokio::sync::mpsc::Receiver<()>>,
     addr: SocketAddr,
     shutdown: watch::Sender<bool>,
     manager: Arc<Manager>,
@@ -470,6 +474,83 @@ impl ServerHandle {
         }
     }
 
+    /// Stop acceptance and background mutation, flush the predecessor, then
+    /// transfer the still-bound listener. The receiver starts only after the
+    /// existing handoff ownership gate has been released.
+    pub async fn handoff(&mut self, peer: &std::os::unix::net::UnixStream) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + DEFAULT_SHUTDOWN_GRACE;
+        self.flush_cache_finally(SavedCache::BoundTokens);
+        self.flush_cache_finally(SavedCache::WireSessions);
+        let listener = self.listener.as_ref().context("no listener to hand over")?;
+        crate::handoff::complete_handoff(
+            &self.manager,
+            self.affinity_path.as_deref(),
+            listener,
+            peer,
+        )?;
+        crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
+        // The controller also mutates hardware and saves its wish. Finish its
+        // last save before the successor can take ownership and save Auto;
+        // accepted connections may keep draining after that release.
+        if let Some(fan) = self.manager.fan() {
+            let fan = Arc::clone(fan);
+            let stop = tokio::task::spawn_blocking(move || fan.shutdown(DEFAULT_SHUTDOWN_GRACE));
+            let stopped = tokio::time::timeout_at(deadline, stop)
+                .await
+                .context("fan control exceeded the handoff shutdown grace")?
+                .context("fan control shutdown task failed")?;
+            anyhow::ensure!(stopped, "fan control did not stop before handoff");
+        }
+        self.stop_tasks(deadline).await;
+        crate::restart::wait_for_listener_receipt(peer).await?;
+        self.listener.take();
+        crate::restart::confirm_listener_released(peer)?;
+        Ok(())
+    }
+
+    /// Wait for accepted connections after HTTP graceful shutdown. The binary
+    /// bounds this wait and continues polling termination signals.
+    pub async fn drain_connections(&mut self) {
+        if let Some(connections) = self.connections.as_mut() {
+            connections.recv().await;
+        }
+        self.connections.take();
+    }
+
+    async fn stop_tasks(&mut self, deadline: tokio::time::Instant) {
+        if let Some(server) = self.server.as_mut() {
+            // `&mut JoinHandle` polls the join without consuming it: losing the
+            // race to the caller's own timeout leaves the task owned here.
+            let stopped = self.server_finished
+                || if tokio::time::timeout_at(deadline, &mut *server)
+                    .await
+                    .is_ok()
+                {
+                    true
+                } else {
+                    // A wedged synchronous write cannot be awaited after abort.
+                    server.abort();
+                    false
+                };
+            self.server = None;
+            if stopped {
+                self.server_finished = true;
+                self.tasks_joined += 1;
+            } else {
+                self.tasks_aborted += 1;
+            }
+        }
+        while let Some(task) = self.background.last_mut() {
+            if tokio::time::timeout_at(deadline, &mut *task).await.is_ok() {
+                self.tasks_joined += 1;
+            } else {
+                task.abort();
+                self.tasks_aborted += 1;
+            }
+            self.background.pop();
+        }
+    }
+
     /// Stop serving, then flush.
     ///
     /// The order is `run_server`'s: stop the accept loop, persist the config
@@ -513,10 +594,8 @@ impl ServerHandle {
     /// (so `Drop` still aborts them), and may simply call it again — the counters
     /// carry over and the flushes are idempotent.
     pub async fn shutdown_within(&mut self, grace: Duration) -> ShutdownReport {
-        crate::log_err::LogErr::log_debug(
-            self.shutdown.send(true),
-            "signalling shutdown to a stopped server",
-        );
+        self.listener.take();
+        crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
         let deadline = tokio::time::Instant::now() + grace;
 
         // Fans first, while the process is still whole: the controller hands
@@ -532,39 +611,7 @@ impl ServerHandle {
             }
         }
 
-        if let Some(server) = self.server.as_mut() {
-            // `&mut JoinHandle` polls the join without consuming it: losing the
-            // race to the caller's own timeout leaves the task owned here.
-            let stopped = self.server_finished
-                || if tokio::time::timeout_at(deadline, &mut *server)
-                    .await
-                    .is_ok()
-                {
-                    true
-                } else {
-                    // NOT awaited after the abort: a task wedged in a
-                    // synchronous write never reaches a cancellation point,
-                    // so awaiting it back would reintroduce the hang.
-                    server.abort();
-                    false
-                };
-            self.server = None;
-            if stopped {
-                self.server_finished = true;
-                self.tasks_joined += 1;
-            } else {
-                self.tasks_aborted += 1;
-            }
-        }
-        while let Some(task) = self.background.last_mut() {
-            if tokio::time::timeout_at(deadline, &mut *task).await.is_ok() {
-                self.tasks_joined += 1;
-            } else {
-                task.abort();
-                self.tasks_aborted += 1;
-            }
-            self.background.pop();
-        }
+        self.stop_tasks(deadline).await;
 
         // Withdraw the port claim once the accept loop is done, so the next `tcr`
         // does not read a claim for a proxy that has stopped listening. Ordered
@@ -672,6 +719,9 @@ impl ServerHandle {
     /// The shutdown write of one cache file, as a value. Logs for the binary's operator, and
     /// returns the same fact for a caller with no subscriber.
     fn flush_cache_finally(&self, cache: SavedCache) -> CacheFlush {
+        if self.manager.mutation_is_released() {
+            return CacheFlush::Disabled;
+        }
         let Some(path) = cache.path(
             self.affinity_path.as_deref(),
             self.wire_sessions_path.as_deref(),
@@ -2166,9 +2216,8 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
 
     // Resolve the port to ONE proxy BEFORE the Manager starts probing/refreshing,
     // so our own startup can never token-war with the incumbent. Only a
-    // command-verified `tcr` server on THIS port is ever signalled, and only
-    // under `--replace`. `--no-replace` is the default now, and clap rejects it
-    // alongside `--replace`.
+    // command-verified `tcr` server on THIS port can be signalled only under
+    // the caller's explicit policy. The CLI uses listener handoff.
     //
     // Which of those a caller gets is [`IncumbentPolicy`], and the default sends
     // no signal at all: it uses `live_proxy_server`, the detection-only half of
@@ -2585,6 +2634,9 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
             .with_context(|| format!("failed to bind 127.0.0.1:{port}"))?,
     };
     let bound = listener.local_addr()?;
+    let std_listener = listener.into_std()?;
+    let handoff_listener = std_listener.try_clone()?;
+    let listener = tokio::net::TcpListener::from_std(std_listener)?;
 
     // The boot marker. The durable log at `~/.cache/tcr/logs/` rotates
     // daily (5 files kept) rather than growing forever, but within one day's
@@ -2743,19 +2795,25 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         None => None,
     };
 
+    let (connections, drain) = tokio::sync::mpsc::channel(1);
     let serve_manager = Arc::clone(&manager);
     let mut stop = shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
-        mitm::serve_with_shutdown(listener, serve_manager, tls, async move {
-            crate::log_err::LogErr::log_debug(
-                stop.changed().await,
-                "waiting for the shutdown signal",
-            );
-        })
+        mitm::serve_tracked_with_shutdown(
+            listener,
+            serve_manager,
+            tls,
+            async move {
+                crate::log_err::LogErr::log_debug(stop.changed().await, "waiting for shutdown");
+            },
+            connections,
+        )
         .await;
     });
 
     Ok(ServeOutcome::Started(ServerHandle {
+        listener: Some(handoff_listener),
+        connections: Some(drain),
         addr: bound,
         shutdown: shutdown_tx,
         manager,
@@ -2786,7 +2844,241 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
 /// that do not.
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn independent_fan_survives_failed_descriptor_send() {
+        use tcr_fan::controller::{Command, FanDesired};
+        let mut config = boot_line_test_config();
+        config.proxy.port = 0;
+        config.upstream = "http://127.0.0.1:0".into();
+        config.codex_upstream = "http://127.0.0.1:0".into();
+        config
+            .extra
+            .insert("quotaProbeSeconds".into(), serde_json::json!(0));
+        config
+            .extra
+            .insert("warmupSeconds".into(), serde_json::json!(0));
+        let mut handle = serve(ServeOptions {
+            tls: TlsSetup::Disabled,
+            ..ServeOptions::new(config)
+        })
+        .await
+        .unwrap()
+        .expect_started();
+        let fan = crate::fan::start_inert();
+        assert!(
+            fan.send(Command::Set(FanDesired::Auto)).is_ok(),
+            "positive control: controller must accept before handoff"
+        );
+        handle.manager().install_fan(Arc::clone(&fan));
+        let http = crate::http_client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let fan_url = format!("http://{}/_tcr/fan", handle.addr());
+        let before_status = http
+            .post(&fan_url)
+            .json(&serde_json::json!({"mode":"auto"}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            before_status.as_u16(),
+            202,
+            "positive control: HTTP fan route accepts before handoff"
+        );
+        let (ours, successor) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(successor);
+        let error = handle.handoff(&ours).await.unwrap_err();
+        let accepting = !*handle.shutdown.borrow();
+        let owning = !handle.manager().mutation_is_released();
+        let fan_accepts = fan.send(Command::Set(FanDesired::Auto)).is_ok();
+        let after_response = http
+            .post(&fan_url)
+            .json(&serde_json::json!({"mode":"auto"}))
+            .send()
+            .await;
+        let (after_status, after_body) = match after_response {
+            Ok(response) => (response.status().as_u16(), response.text().await.unwrap()),
+            Err(error) => (0, error.to_string()),
+        };
+        let healthy = crate::http_client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!("http://{}/_tcr/status", handle.addr()))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success());
+        handle.shutdown().await;
+        assert!(
+            accepting && owning && healthy && fan_accepts && after_status == 202,
+            "failed pre-send handoff must preserve all service: accepting={accepting}, owning={owning}, http200={healthy}, fan_accepts={fan_accepts}, fan_http_before={before_status}, fan_http_after={after_status}, fan_body={after_body}, error={error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handoff_whose_send_fails_keeps_serving_and_owning_the_port() {
+        for missing_listener in [false, true] {
+            let mut config = boot_line_test_config();
+            config.proxy.port = 0;
+            config.upstream = "http://127.0.0.1:0".into();
+            config.codex_upstream = "http://127.0.0.1:0".into();
+            config
+                .extra
+                .insert("quotaProbeSeconds".into(), serde_json::json!(0));
+            config
+                .extra
+                .insert("warmupSeconds".into(), serde_json::json!(0));
+            let mut handle = serve(ServeOptions {
+                tls: TlsSetup::Disabled,
+                ..ServeOptions::new(config)
+            })
+            .await
+            .unwrap()
+            .expect_started();
+            let fan = crate::fan::start_inert();
+            assert!(
+                fan.send(tcr_fan::controller::Command::Set(
+                    tcr_fan::controller::FanDesired::Auto
+                ))
+                .is_ok()
+            );
+            handle.manager().install_fan(Arc::clone(&fan));
+            let addr = handle.addr();
+            let (ours, successor) = std::os::unix::net::UnixStream::pair().unwrap();
+            drop(successor);
+            let retained = if missing_listener {
+                handle.listener.take()
+            } else {
+                None
+            };
+            let error = handle.handoff(&ours).await.unwrap_err();
+            let accepting = !*handle.shutdown.borrow();
+            let owning = !handle.manager().mutation_is_released();
+            let response = crate::http_client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+                .get(format!("http://{addr}/_tcr/status"))
+                .send()
+                .await;
+            let healthy = response.is_ok_and(|r| r.status().is_success());
+            let fan_response = crate::http_client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+                .post(format!("http://{addr}/_tcr/fan"))
+                .json(&serde_json::json!({"mode":"auto"}))
+                .send()
+                .await;
+            let fan_accepted = fan_response.is_ok_and(|response| response.status().as_u16() == 202);
+            drop(retained);
+            handle.shutdown().await;
+            assert!(
+                accepting && owning && healthy && fan_accepted,
+                "pre-send failure must retain accepting, ownership and HTTP 200: missing={missing_listener}, accepting={accepting}, owning={owning}, healthy={healthy}, fan_accepted={fan_accepted}, error={error}"
+            );
+        }
+    }
+
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_handoff_stops_the_predecessor_fan_before_release() {
+        use std::io::{Read, Write};
+        use tcr_fan::controller::{Command, FanDesired};
+        let dir = tempfile::tempdir().unwrap();
+        let fan = crate::fan::start(dir.path().join("fan.json")).unwrap();
+        let manager = inert_manager();
+        manager.install_fan(Arc::clone(&fan));
+        let (shutdown, _rx) = watch::channel(false);
+        let mut handle = handle_full(
+            shutdown,
+            tokio::spawn(async {}),
+            Vec::new(),
+            Arc::clone(&manager),
+            None,
+        );
+        handle.listener = Some(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let (ours, mut successor) = std::os::unix::net::UnixStream::pair().unwrap();
+        let receiver = std::thread::spawn(move || {
+            successor
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let listener = tcr_fdpass::recv_listener(&successor).unwrap();
+            successor.write_all(b"listener-received\n").unwrap();
+            let mut released = [0u8; 18];
+            successor.read_exact(&mut released).unwrap();
+            assert_eq!(&released, b"listener-released\n");
+            drop(listener);
+        });
+        handle.handoff(&ours).await.unwrap();
+        receiver.join().unwrap();
+        assert!(manager.mutation_is_released(), "handoff must finish first");
+        let still_accepts = fan.send(Command::Set(FanDesired::Auto)).is_ok();
+        // Close our own thread even when the assertion below fails.
+        tokio::task::spawn_blocking(move || fan.shutdown(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        handle.shutdown().await;
+        assert!(
+            !still_accepts,
+            "predecessor fan controller still accepts mutations after the listener and ownership were released"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_control_handoff_with_fan_already_stopped() {
+        use std::io::{Read, Write};
+        use tcr_fan::controller::{Command, FanDesired};
+        let dir = tempfile::tempdir().unwrap();
+        let fan = crate::fan::start(dir.path().join("fan.json")).unwrap();
+        let manager = inert_manager();
+        manager.install_fan(Arc::clone(&fan));
+        let (shutdown, _rx) = watch::channel(false);
+        let mut handle = handle_full(
+            shutdown,
+            tokio::spawn(async {}),
+            Vec::new(),
+            Arc::clone(&manager),
+            None,
+        );
+        handle.listener = Some(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let (ours, mut successor) = std::os::unix::net::UnixStream::pair().unwrap();
+        let receiver = std::thread::spawn(move || {
+            successor
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let listener = tcr_fdpass::recv_listener(&successor).unwrap();
+            successor.write_all(b"listener-received\n").unwrap();
+            let mut released = [0u8; 18];
+            successor.read_exact(&mut released).unwrap();
+            assert_eq!(&released, b"listener-released\n");
+            drop(listener);
+        });
+        let stopped_fan = Arc::clone(&fan);
+        tokio::task::spawn_blocking(move || stopped_fan.shutdown(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        handle.handoff(&ours).await.unwrap();
+        receiver.join().unwrap();
+        assert!(manager.mutation_is_released(), "handoff must finish first");
+        let still_accepts = fan.send(Command::Set(FanDesired::Auto)).is_ok();
+        // Close our own thread even when the assertion below fails.
+        tokio::task::spawn_blocking(move || fan.shutdown(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        handle.shutdown().await;
+        assert!(
+            !still_accepts,
+            "predecessor fan controller still accepts mutations after the listener and ownership were released"
+        );
+    }
 
     #[test]
     fn worker_threads_default_to_four_or_the_cores_and_honour_the_override() {
@@ -2928,6 +3220,8 @@ mod tests {
         affinity_path: Option<PathBuf>,
     ) -> ServerHandle {
         ServerHandle {
+            listener: None,
+            connections: None,
             addr: "127.0.0.1:0"
                 .parse()
                 .expect("a literal loopback addr parses"),

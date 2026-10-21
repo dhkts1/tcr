@@ -148,10 +148,25 @@ impl CodexSearch {
     }
 }
 
+/// Private launchers must never be mistaken for installed clients by tcr itself.
+pub fn is_tool_launcher(path: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0; 64];
+    let Ok(n) = file.read(&mut head) else {
+        return false;
+    };
+    head[..n].starts_with(b"#!/bin/sh\n# tcr tool launcher\n")
+}
+
 /// The `codex` this process should run, by the one rule in the module doc, reading this
 /// process's environment.
 pub fn find_codex() -> Result<CodexBin, CodexSearch> {
-    find_codex_from(&env_value, &home_dir(), &is_executable_file)
+    find_codex_from(&env_value, &home_dir(), &|path| {
+        is_executable_file(path) && !is_tool_launcher(path)
+    })
 }
 
 /// [`find_codex`] over values already read: `env` answers a variable's value, `home` is the

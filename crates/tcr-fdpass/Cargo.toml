@@ -11,7 +11,7 @@ description = "SCM_RIGHTS listening-socket passing, isolated so the main crate k
 workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["socket", "uio"] }
+nix = { version = "0.31", features = ["socket", "uio", "fs", "user"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Peer code-signature verification (`peer.rs`).

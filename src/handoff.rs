@@ -80,18 +80,9 @@ pub const PEER_REQUIREMENT: &str = concat!(
 /// That gating is also what makes the order *testable*: reorder the release
 /// above the flush and the file simply does not get written.
 ///
-/// # Why the send comes last, and what it costs
-///
-/// Sending before releasing would leave a window in which the successor is
-/// serving while this process may still rotate a single-use refresh token. Two
-/// live rotators is the token war, and it costs accounts.
-///
-/// Releasing first fails the other way: if the send then fails, this process
-/// can no longer refresh and no successor has the socket. That is a proxy which
-/// serves on its existing tokens until they expire and must then be restarted.
-/// Degraded and recoverable, against invalidated credentials and a manual
-/// re-auth. The caller should treat an `Err` here as "shut down now", because a
-/// process that has released ownership has no useful life left.
+/// The receiver must wait for the caller's release confirmation before booting.
+/// Send failure retains ownership; receipt or release failure after a successful
+/// send is a committed handoff and drains through normal shutdown.
 pub fn complete_handoff(
     manager: &Manager,
     affinity_path: Option<&Path>,
@@ -114,12 +105,10 @@ pub fn complete_handoff(
     }
     manager.persist_now();
 
-    // 2. Ownership moves here, and only here.
-    manager.release_mutation_ownership();
-
-    // 3. The successor may now start. Anything this process does from here is
-    //    draining, not owning.
+    // The CLI receiver waits for listener-released before starting. A failed
+    // send therefore leaves both acceptance and mutation ownership intact.
     tcr_fdpass::send_listener(peer, listener)?;
+    manager.release_mutation_ownership();
     tracing::info!("listening socket handed to the successor");
     Ok(())
 }
