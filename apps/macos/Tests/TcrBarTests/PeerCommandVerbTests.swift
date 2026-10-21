@@ -57,6 +57,8 @@ final class PeerCommandVerbTests: XCTestCase {
             ("pair(address:)", PeerCommand.pair(address: "127.0.0.1:1")),
             ("forget(peer:)", PeerCommand.forget(peer: "p")),
             ("join(key:)", PeerCommand.join(key: "tcr-join:x").arguments),
+            ("tailnetRead", PeerCommand.tailnetRead),
+            ("tailnet(_:)", PeerCommand.tailnet(.app)),
         ]
 
         for invocation in invocations {

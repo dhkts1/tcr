@@ -399,6 +399,10 @@ mod peer_cli {
         Moved(PeerMovedArgs),
         /// Print what this Mac can be reached on from off its own LAN.
         Reach(PeerReachArgs),
+        /// Show or set how this Mac uses a tailnet: `off`, `app` (read the
+        /// Tailscale app on this Mac) or `node` (tcr joins as its own node,
+        /// source builds with the `tailnet-node` feature only).
+        Tailnet(PeerTailnetArgs),
         /// Let pinned Macs reach this one from off its own LAN. Off by
         /// default: with it on, this Mac asks its router for a port mapping
         /// and answers a return visit against a pinned key from anywhere,
@@ -520,6 +524,57 @@ mod peer_cli {
         Show,
         /// Forget the store. Does not turn `peer.drop` off by itself.
         Clear,
+    }
+
+    /// `tcr peer tailnet [off|app|node|leave] [--name N] [--auth-key -] [--json]`.
+    ///
+    /// A flat args struct with the mode as an optional positional value,
+    /// `PeerDropStoreArgs`'s shape and for the same measured reason: a nested
+    /// subcommand refuses `--peers` placed before the action.
+    #[derive(clap::Args)]
+    pub(crate) struct PeerTailnetArgs {
+        #[command(flatten)]
+        pub peers: PeersFile,
+        /// The mode to set, or `leave`. Omit to print the current one.
+        #[arg(value_enum)]
+        pub mode: Option<PeerTailnetMode>,
+        /// `node` only: the machine name to ask the tailnet for.
+        #[arg(long, value_name = "NAME")]
+        pub name: Option<String>,
+        /// `node` only: `-` reads a Tailscale auth key from standard input
+        /// and joins with it. The key is never taken as an argument, never
+        /// written anywhere and never logged.
+        #[arg(long, value_name = "-")]
+        pub auth_key: Option<String>,
+        /// Print the setting and what the running proxy recorded as JSON.
+        #[arg(long)]
+        pub json: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+    pub(crate) enum PeerTailnetMode {
+        /// No tailnet use.
+        Off,
+        /// Read the Tailscale app on this Mac to find your own other Macs.
+        App,
+        /// tcr joins a tailnet as its own node.
+        Node,
+        /// Leave the tailnet as tcr's own node: mode off, then delete the
+        /// node's key file once the running tcr has let go of it.
+        Leave,
+    }
+
+    impl PeerTailnetMode {
+        /// The setting this word writes, or `None` for `leave`, which is a
+        /// verb rather than a setting.
+        pub(crate) const fn mode(self) -> Option<tcr::peer::config::TailnetMode> {
+            match self {
+                Self::Off => Some(tcr::peer::config::TailnetMode::Off),
+                Self::App => Some(tcr::peer::config::TailnetMode::App),
+                Self::Node => Some(tcr::peer::config::TailnetMode::Node),
+                Self::Leave => None,
+            }
+        }
     }
 
     #[derive(clap::Args)]
@@ -3689,6 +3744,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         }
         PeerAction::Moved(a) => run_peer_moved(a),
         PeerAction::Reach(a) => run_peer_reach(a),
+        PeerAction::Tailnet(a) => run_peer_tailnet(a).await,
         PeerAction::Internet(a) => {
             let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
             let on = matches!(a.state, peer_cli::Switch::On);
@@ -4250,7 +4306,14 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
         .collect();
     let ranked = file
         .listen
-        .map(|listen| peer::pair::dial_addresses(listen, &host, external))
+        .map(|listen| {
+            peer::pair::dial_addresses(
+                listen,
+                &host,
+                external,
+                peer::tailnet_node::recorded_node_address(&peer_state_path(peers_path), now_ms),
+            )
+        })
         .unwrap_or_default();
 
     let mut carried: Vec<std::net::SocketAddr> = Vec::new();
@@ -4489,6 +4552,145 @@ fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
 /// persisted anywhere today**, so the per-peer rows print the slot and say the
 /// port is unavailable rather than inventing a number from public key material,
 /// which a scanner could compute too.
+/// `tcr peer reach`'s tailnet line, from the setting in the peers file and
+/// the record the serving process last wrote.
+///
+/// The record is what the line reports, and it is never refreshed here: the
+/// Tailscale app is read by the server, not by this verb. A record older than
+/// [`peer::state::TAILNET_RECORD_STALE_MS`] says so rather than passing for
+/// the current state.
+///
+/// The setting wins over the record. A server records nothing while the mode
+/// is off, so a record left from before the mode went off is not read at all:
+/// off is off, and an unknown word is shown as written and treated as off.
+fn reach_tailnet_line(
+    setting: &peer::config::TailnetSetting,
+    record: Option<&peer::state::TailnetRecord>,
+    now_ms: i64,
+) -> String {
+    use peer::config::{TailnetMode, TailnetSetting};
+    use peer::state::TailnetState;
+
+    match setting {
+        TailnetSetting::Known(TailnetMode::Off) => return "reach: tailnet: off".to_string(),
+        TailnetSetting::Unknown(word) => {
+            return format!(
+                "reach: tailnet: off (\"{}\" is a mode this tcr does not know, so it is treated \
+                 as off)",
+                masked_label(word)
+            );
+        }
+        TailnetSetting::Known(TailnetMode::App | TailnetMode::Node) => {}
+    }
+    let Some(record) = record else {
+        return format!(
+            "reach: tailnet: {}: no serving process has recorded a tailnet reading",
+            setting.as_word()
+        );
+    };
+    if record.is_stale(now_ms) {
+        return format!(
+            "reach: tailnet: {}: the serving process last recorded one {}s ago, so it is not \
+             running or not reading the tailnet",
+            setting.as_word(),
+            now_ms.saturating_sub(record.recorded_at_ms).max(0) / 1_000
+        );
+    }
+    match record.state {
+        TailnetState::Off => "reach: tailnet: off".to_string(),
+        TailnetState::Ready => format!(
+            "reach: tailnet: {}: {}, {} of your Macs heard over it (recorded by the serving \
+             process)",
+            record.mode.as_word(),
+            record
+                .address
+                .map_or_else(|| "no tailnet address".to_string(), |addr| addr.to_string()),
+            record.found
+        ),
+        state => format!(
+            "reach: tailnet: {}: {}: {}",
+            record.mode.as_word(),
+            serde_json::to_value(state)
+                .ok()
+                .and_then(|word| word.as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("{state:?}")),
+            record.detail.as_deref().unwrap_or("no detail recorded")
+        ),
+    }
+}
+
+#[cfg(test)]
+mod reach_tailnet_line_tests {
+    use super::*;
+    use peer::config::{TailnetMode, TailnetSetting};
+    use peer::state::{TailnetRecord, TailnetState};
+
+    fn record(state: TailnetState, detail: Option<&str>) -> TailnetRecord {
+        TailnetRecord {
+            mode: TailnetMode::App.into(),
+            state,
+            address: Some(std::net::Ipv4Addr::new(100, 64, 0, 7)),
+            found: 2,
+            detail: detail.map(str::to_string),
+            recorded_at_ms: 1_000,
+            ..TailnetRecord::default()
+        }
+    }
+
+    /// **The line says what the server recorded, says stale when it is, and
+    /// says when nothing was recorded. The setting wins: off is off even
+    /// with a fresh record left from app mode, and an unknown word is shown
+    /// and treated as off.**
+    ///
+    /// Watch it fail by making the `Known(TailnetMode::Off)` arm fall through
+    /// instead of returning: the first row then reads `off: no serving process
+    /// has recorded a tailnet reading`, and the leftover-record row would
+    /// report app/ready.
+    #[test]
+    fn the_tailnet_line_for_each_case() {
+        let off = TailnetSetting::Known(TailnetMode::Off);
+        let app = TailnetSetting::Known(TailnetMode::App);
+        assert_eq!(reach_tailnet_line(&off, None, 1_000), "reach: tailnet: off");
+        assert!(reach_tailnet_line(&app, None, 1_000).contains("no serving process has recorded"));
+        let ready = record(TailnetState::Ready, None);
+        assert_eq!(
+            reach_tailnet_line(&app, Some(&ready), 2_000),
+            "reach: tailnet: app: 100.64.0.7, 2 of your Macs heard over it (recorded by the \
+             serving process)"
+        );
+        assert_eq!(
+            reach_tailnet_line(&off, Some(&ready), 2_000),
+            "reach: tailnet: off",
+            "a fresh record left from app mode does not outrank the setting"
+        );
+        assert!(
+            reach_tailnet_line(
+                &TailnetSetting::Unknown("both".to_string()),
+                Some(&ready),
+                2_000
+            )
+            .contains("\"both\" is a mode this tcr does not know"),
+        );
+        assert!(
+            reach_tailnet_line(
+                &app,
+                Some(&ready),
+                1_001 + peer::state::TAILNET_RECORD_STALE_MS
+            )
+            .contains("not running or not reading"),
+            "a stale record is reported as stale"
+        );
+        let failed = record(
+            TailnetState::AppNotRunning,
+            Some("The Tailscale app is not running on this Mac."),
+        );
+        assert_eq!(
+            reach_tailnet_line(&app, Some(&failed), 2_000),
+            "reach: tailnet: app: appNotRunning: The Tailscale app is not running on this Mac."
+        );
+    }
+}
+
 fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
     use tcr::peer::reach;
 
@@ -4549,10 +4751,17 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
     // process that died without deleting its mapping leaves behind, and
     // reporting it would tell an operator a port is open that nothing renews.
     let now_ms = peer::pair::now_ms();
-    let held = peer::state::load(&peer_state_path(&peers_path), now_ms)
-        .ok()
-        .and_then(|state| state.mapping)
+    let state = peer::state::load(&peer_state_path(&peers_path), now_ms).ok();
+    let held = state
+        .as_ref()
+        .and_then(|state| state.mapping.clone())
         .filter(|record| record.expires_at_ms > now_ms);
+    // The tailnet, as the serving process last recorded it: the same rule as
+    // the mapping, never asked of the Tailscale app here. A stale record is
+    // shown as stale, not dropped, so "the server stopped writing" and "no
+    // server ever wrote one" stay two answers.
+    let tailnet = state.and_then(|state| state.tailnet);
+    let tailnet_line = reach_tailnet_line(&file.tailnet, tailnet.as_ref(), now_ms);
 
     // Every NAT-PMP outcome is a string, including the failures, because the
     // reader of this verb wants to see WHICH refusal the router gave.
@@ -4655,6 +4864,7 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
             "mapping": mapping,
             "listenPort": internal_port,
             "heldMapping": held,
+            "tailnet": tailnet,
             "slot": slot,
             "slotSeconds": reach::SLOT_SECONDS,
             "peers": peers,
@@ -4704,6 +4914,7 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
             "reach: held-mapping: none (no serving process on this Mac holds one right now)"
         ),
     }
+    println!("{tailnet_line}");
     println!(
         "reach: slot: {slot} ({}s each, the slot before and after also accepted)",
         reach::SLOT_SECONDS
@@ -5129,6 +5340,7 @@ fn found_row_for_readers(row: &peer::state::Found) -> status::PeerFoundRow {
         address: row.dial_address(),
         trusted: false,
         last_seen_ms: row.last_seen_ms,
+        sources: row.sources.clone(),
     }
 }
 
@@ -5269,14 +5481,7 @@ impl PeerFinder for RealPeerFinder {
             // Reusing `Found::dial_address` rather than a second bracket
             // rule: the timestamps are unused by that method and are not
             // written anywhere, this row is never persisted.
-            let as_found = peer::state::Found {
-                addr: row.addrs.first().cloned().unwrap_or_default(),
-                instance_id: row.instance_id,
-                announced_name: row.name.clone(),
-                listen_port: row.port,
-                first_seen_ms: 0,
-                last_seen_ms: 0,
-            };
+            let as_found = row.found_row(0);
             let name = as_found
                 .announced_name
                 .as_deref()
@@ -5287,12 +5492,12 @@ impl PeerFinder for RealPeerFinder {
     }
 }
 
-/// Give this Mac a peer port when the operator turns one of the three features
+/// Give this Mac a peer port when the operator turns one of the features that need one
 /// on and there is none yet. Returns the address written, or `None` when
 /// `listen` was already set, which this never touches.
 ///
 /// The caller writes the file and then prints [`print_listen_written`]: the
-/// three verbs that call this already hold the peers-file lock and already have
+/// verbs that call this already hold the peers-file lock and already have
 /// a save of their own, and a second write here would be a second writer for
 /// one key.
 ///
@@ -5307,8 +5512,8 @@ fn ensure_listen_for_opt_in(file: &mut peer::config::PeerFile) -> Option<std::ne
     Some(chosen)
 }
 
-/// What every verb that just wrote a peer port says, in one place so the three
-/// of them say the same thing.
+/// What every verb that just wrote a peer port says, in one place so they
+/// all say the same thing.
 ///
 /// The second line is the honest half. The peer socket is bound once, at boot,
 /// from the file as it was then (`src/server.rs`, the `file.listen` read before
@@ -5316,15 +5521,255 @@ fn ensure_listen_for_opt_in(file: &mut peer::config::PeerFile) -> Option<std::ne
 /// of this file whenever its mtime moves but nothing re-binds a socket, so a
 /// port written now is a port that opens at the next start and not before.
 fn print_listen_written(addr: std::net::SocketAddr, peers_path: &Path) {
-    println!(
-        "peer.listen: {addr} written into {} (this Mac had no peer port, and turning this on \
-         needs one)",
-        peers_path.display()
-    );
-    println!(
+    for line in listen_written_lines(addr, peers_path) {
+        println!("{line}");
+    }
+}
+
+/// [`print_listen_written`]'s two lines, for a verb whose standard output is
+/// a JSON document and which says them on standard error instead.
+fn listen_written_lines(addr: std::net::SocketAddr, peers_path: &Path) -> [String; 2] {
+    [
+        format!(
+            "peer.listen: {addr} written into {} (this Mac had no peer port, and turning this \
+             on needs one)",
+            peers_path.display()
+        ),
         "peer.listen: nothing is listening on it yet. The port opens the next time the proxy \
          starts, so quit TcrBar and open it again to finish turning this on"
-    );
+            .to_string(),
+    ]
+}
+
+/// `tcr peer tailnet`: `leave` and a joining `node --auth-key -` are the two
+/// async verbs (they wait on the tailnet or on the running tcr); everything
+/// else is [`run_peer_tailnet_with`].
+async fn run_peer_tailnet(args: peer_cli::PeerTailnetArgs) -> anyhow::Result<()> {
+    use peer::tailnet_node;
+
+    let peers_path = args.peers.path();
+    if args.mode != Some(peer_cli::PeerTailnetMode::Node)
+        && (args.auth_key.is_some() || args.name.is_some())
+    {
+        anyhow::bail!("peer tailnet: --name and --auth-key go with `node` only");
+    }
+    // A name is asked for when joining; turning an already-joined node back
+    // on keeps the name it joined with, so a `--name` there would be ignored.
+    if args.name.is_some() && args.auth_key.is_none() {
+        anyhow::bail!(
+            "peer tailnet: --name is the name to join with, so it goes with `--auth-key -`; a \
+             node that already joined keeps its name (`tcr peer tailnet leave` to join again \
+             under another)"
+        );
+    }
+    match (args.mode, args.auth_key.as_deref()) {
+        (Some(peer_cli::PeerTailnetMode::Leave), _) => {
+            let outcome = tailnet_node::leave_with(
+                &peers_path,
+                &tailnet_node::key_path_for_peers(&peers_path),
+                tailnet_node::LEAVE_WAIT,
+                tailnet_node::LEAVE_POLL,
+            )
+            .await?;
+            println!("peer.tailnet: off");
+            match outcome {
+                tailnet_node::LeaveOutcome::Deleted => {
+                    println!("peer tailnet: the node's key file was deleted");
+                }
+                tailnet_node::LeaveOutcome::NoKeyFile => {
+                    println!("peer tailnet: there was no node key file to delete");
+                }
+            }
+            println!("peer tailnet: {}", tailnet_node::LEAVE_ADMIN_CONSOLE_NOTE);
+            Ok(())
+        }
+        (Some(peer_cli::PeerTailnetMode::Node), Some("-")) => {
+            if !tailnet_node::SUPPORTED {
+                anyhow::bail!(node_unsupported_refusal());
+            }
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
+                .context("peer tailnet: could not read the auth key from standard input")?;
+            let auth_key = tailnet_node::AuthKey::new(&line)?;
+            drop(line);
+            let me = tailnet_node::join(&peers_path, args.name, auth_key).await?;
+            println!("peer.tailnet: node");
+            println!("tailnet address: {}", me.address);
+            println!("tailnet name: {}", me.name);
+            println!(
+                "peer tailnet: the running tcr starts the node within {}s",
+                (tailnet_node::TICK * 2).as_secs()
+            );
+            Ok(())
+        }
+        // The value is not echoed: it is most likely the key itself.
+        (Some(peer_cli::PeerTailnetMode::Node), Some(_)) => anyhow::bail!(
+            "peer tailnet: --auth-key takes `-` and reads the key from standard input, never \
+             the key itself, which would sit in your shell history and in `ps`"
+        ),
+        _ => run_peer_tailnet_with(args, &peer::tailscale_app::default_cli_paths()),
+    }
+}
+
+/// The refusal a binary without tcr's own tailnet node gives for `node`.
+const fn node_unsupported_refusal() -> &'static str {
+    "peer tailnet: this tcr was built without tcr's own tailnet node, so `node` cannot be set; \
+     use `tcr peer tailnet app` with the Tailscale app, or build tcr from source with \
+     `--features tailnet-node` on an Apple-silicon Mac"
+}
+
+/// `tcr peer tailnet [off|app|node] [--json]`, with the Tailscale CLI looked
+/// for at `cli_paths` so a test can hand it a fake one.
+///
+/// Setting a mode takes the peers-file lock and saves, the way
+/// [`run_peer_find_with`] writes `discovery`. `node` is refused, with the file
+/// untouched, by a binary that cannot run tcr's own tailnet node
+/// ([`peer::tailnet_node::SUPPORTED`]), and by one that has not joined yet.
+///
+/// With no mode it prints the setting and, in app mode, one live read of the
+/// app. `--json` prints the setting, whether this binary can act on `node`,
+/// and what the serving process recorded (`held`), and never runs the app.
+fn run_peer_tailnet_with(
+    args: peer_cli::PeerTailnetArgs,
+    cli_paths: &[PathBuf],
+) -> anyhow::Result<()> {
+    use peer::config::TailnetMode;
+
+    let peers_path = args.peers.path();
+    if let Some(wanted) = args.mode {
+        let Some(mode) = wanted.mode() else {
+            anyhow::bail!("peer tailnet: `leave` is run by `run_peer_tailnet`");
+        };
+        if mode == TailnetMode::Node && !peer::tailnet_node::SUPPORTED {
+            anyhow::bail!(node_unsupported_refusal());
+        }
+        // `node` with no auth key turns a node that already joined back on.
+        // With no key file there is nothing for the server to start, so it
+        // is refused rather than written as a mode that can only ever say
+        // "not joined".
+        if mode == TailnetMode::Node
+            && peer::tailnet_node::read_key_file(&peer::tailnet_node::key_path_for_peers(
+                &peers_path,
+            ))?
+            .is_none()
+        {
+            anyhow::bail!(
+                "peer tailnet: this Mac has not joined a tailnet as tcr's own node yet; join \
+                 with `tcr peer tailnet node --name <name> --auth-key -` and the key on \
+                 standard input"
+            );
+        }
+        let listen_written = {
+            let (_lock, mut file) = lock_peers_file(&peers_path)?;
+            file.tailnet = mode.into();
+            // App and node are opt-ins that need a peer port: the server's
+            // browse task, which reads the app and sends the beacon, runs
+            // only beside a peer listener. Off is not an opt-in, so it never
+            // writes `listen` and never removes one.
+            let written = match mode {
+                TailnetMode::App | TailnetMode::Node => ensure_listen_for_opt_in(&mut file),
+                TailnetMode::Off => None,
+            };
+            peer::config::save(&peers_path, &file)?;
+            written
+        };
+        if !args.json {
+            println!("peer.tailnet: {}", mode.as_str());
+            if let Some(chosen) = listen_written {
+                print_listen_written(chosen, &peers_path);
+            }
+            return Ok(());
+        }
+        // Standard output is the JSON document, so the port lines go to
+        // standard error rather than being left unsaid.
+        if let Some(chosen) = listen_written {
+            for line in listen_written_lines(chosen, &peers_path) {
+                eprintln!("{line}");
+            }
+        }
+    }
+
+    let report = peer::state::TailnetReport::read(&peers_path, peer::pair::now_ms())?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("peer.tailnet: {}", report.mode.as_word());
+    if let peer::config::TailnetSetting::Unknown(word) = &report.mode {
+        // The surfacing for an unknown word: it loads and acts as off, and
+        // this line is where the operator learns that.
+        println!(
+            "peer.tailnet: \"{}\" is a mode this build of tcr does not know, so it is treated \
+             as off; a newer tcr probably wrote it",
+            masked_label(word)
+        );
+    }
+    let mode = report.mode.effective();
+    if mode == TailnetMode::App {
+        print_tailscale_app_read(cli_paths);
+    }
+    if mode == TailnetMode::Node && !report.node_supported {
+        println!("peer.tailnet: this tcr was built without tcr's own tailnet node");
+    }
+    if mode == TailnetMode::Node && report.node_supported {
+        match report
+            .held
+            .as_ref()
+            .filter(|held| !held.is_stale(peer::pair::now_ms()))
+        {
+            Some(held) => {
+                if let Some(address) = held.address {
+                    println!("tailnet address: {address}");
+                }
+                if let Some(name) = &held.node_name {
+                    println!("tailnet name: {name}");
+                }
+                println!("tailnet node: {:?}", held.state);
+                if let Some(detail) = &held.detail {
+                    println!("tailnet node: {detail}");
+                }
+            }
+            None => println!("tailnet node: no running tcr has recorded the node yet"),
+        }
+    }
+    Ok(())
+}
+
+/// One live read of the Tailscale app, as lines for `tcr peer tailnet`.
+fn print_tailscale_app_read(cli_paths: &[PathBuf]) {
+    use peer::tailscale_app::{self, Route};
+
+    match tailscale_app::read_status(cli_paths, tailscale_app::STATUS_TIMEOUT) {
+        Ok(status) => {
+            match status.own_ipv4() {
+                Some(address) => println!("tailnet address: {address}"),
+                None => println!("tailnet address: none reported"),
+            }
+            let mine = tailscale_app::own_macs(&status);
+            if mine.is_empty() {
+                println!("your other Macs online: none");
+            }
+            for mac in mine {
+                let address = mac
+                    .tailscale_ips
+                    .iter()
+                    .find(|ip| ip.is_ipv4())
+                    .or_else(|| mac.tailscale_ips.first())
+                    .map_or_else(|| "no address".to_string(), ToString::to_string);
+                let route = match tailscale_app::route(mac) {
+                    Route::Direct => "direct",
+                    Route::Relayed => "relayed",
+                    Route::Unknown => "route unknown",
+                };
+                println!(
+                    "your Mac: {}  {address}  {route}",
+                    masked_label(&mac.host_name)
+                );
+            }
+        }
+        Err(err) => println!("tailscale app: {}", err.detail()),
+    }
 }
 
 async fn run_peer_find_with(
@@ -5476,6 +5921,176 @@ mod peer_find_tests {
         assert!(
             !finder.browsed.load(Ordering::SeqCst),
             "find off must not browse"
+        );
+    }
+}
+
+#[cfg(test)]
+mod peer_tailnet_tests {
+    use super::*;
+
+    fn args(
+        peers_path: &Path,
+        mode: Option<peer_cli::PeerTailnetMode>,
+    ) -> peer_cli::PeerTailnetArgs {
+        peer_cli::PeerTailnetArgs {
+            peers: peer_cli::PeersFile {
+                peers: Some(peers_path.to_path_buf()),
+            },
+            mode,
+            name: None,
+            auth_key: None,
+            json: false,
+        }
+    }
+
+    fn written(peers_path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(peers_path).expect("the peers file"))
+            .expect("the peers file is JSON")
+    }
+
+    /// **`tcr peer tailnet app` writes `"tailnet": "app"`, keeps every other
+    /// key, and `off` takes the key away again.**
+    ///
+    /// Watch it fail by dropping the `file.tailnet = mode;` line: the file
+    /// then never gains the key.
+    #[test]
+    fn setting_a_mode_writes_the_key_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        let seed = peer::config::PeerFile {
+            discovery: true,
+            ..Default::default()
+        };
+        peer::config::save(&peers_path, &seed).expect("seed the peers file");
+
+        run_peer_tailnet_with(args(&peers_path, Some(peer_cli::PeerTailnetMode::App)), &[])
+            .expect("set app");
+        let file = written(&peers_path);
+        assert_eq!(file["tailnet"], "app", "{file}");
+        assert_eq!(
+            file["discovery"], true,
+            "the rest of the file is kept: {file}"
+        );
+
+        run_peer_tailnet_with(args(&peers_path, Some(peer_cli::PeerTailnetMode::Off)), &[])
+            .expect("set off");
+        let file = written(&peers_path);
+        assert!(
+            file.get("tailnet").is_none(),
+            "off is the default and is not written: {file}"
+        );
+    }
+
+    /// **`node` is refused by a build without the feature, and the file is
+    /// left as it was.**
+    ///
+    /// Watch it fail by removing the feature check: the call then succeeds
+    /// and the file says `node`.
+    #[cfg(not(all(feature = "tailnet-node", target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn node_is_refused_without_the_feature() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        run_peer_tailnet_with(args(&peers_path, Some(peer_cli::PeerTailnetMode::App)), &[])
+            .expect("set app");
+
+        let refusal = run_peer_tailnet_with(
+            args(&peers_path, Some(peer_cli::PeerTailnetMode::Node)),
+            &[],
+        )
+        .expect_err("node needs the tailnet-node feature")
+        .to_string();
+        assert!(refusal.contains("tailnet-node"), "{refusal}");
+        assert_eq!(
+            written(&peers_path)["tailnet"],
+            "app",
+            "a refused mode leaves the file alone"
+        );
+    }
+
+    /// **The no-argument form prints in every mode without failing, including
+    /// app mode with no Tailscale CLI anywhere.** A missing app is a line of
+    /// output, never an error exit.
+    #[test]
+    fn showing_the_mode_with_no_app_installed_is_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        run_peer_tailnet_with(args(&peers_path, None), &[]).expect("show off");
+        run_peer_tailnet_with(args(&peers_path, Some(peer_cli::PeerTailnetMode::App)), &[])
+            .expect("set app");
+        run_peer_tailnet_with(args(&peers_path, None), &[dir.path().join("no-cli")])
+            .expect("show app with no CLI");
+    }
+
+    /// **A mode word this build does not know is shown, not refused, and
+    /// setting a known mode replaces it.**
+    #[test]
+    fn an_unknown_mode_is_shown_and_can_be_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        std::fs::write(&peers_path, r#"{"tailnet": "both"}"#).expect("write the peers file");
+        std::fs::set_permissions(
+            &peers_path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .expect("mode 0600, which the reader requires");
+        run_peer_tailnet_with(args(&peers_path, None), &[]).expect("show an unknown mode");
+        assert_eq!(
+            written(&peers_path)["tailnet"],
+            "both",
+            "showing writes nothing"
+        );
+        run_peer_tailnet_with(args(&peers_path, Some(peer_cli::PeerTailnetMode::App)), &[])
+            .expect("set app over it");
+        assert_eq!(written(&peers_path)["tailnet"], "app");
+    }
+
+    /// **`app` gives a Mac with no peer port the default one, the way `find
+    /// on` does; `off` never writes one and never removes one; a port that is
+    /// already set is kept.** The browse task that reads the app and sends
+    /// the beacon runs only beside a peer listener, so `app` without a port
+    /// found nothing at all.
+    ///
+    /// Watch it fail by dropping the `ensure_listen_for_opt_in` call from the
+    /// `App | Node` arm in `run_peer_tailnet_with`: the file then has no
+    /// `listen` after `app`.
+    #[test]
+    fn app_gives_a_mac_a_peer_port_and_off_never_touches_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        let set = |mode| {
+            run_peer_tailnet_with(args(&peers_path, Some(mode)), &[]).expect("set the mode");
+        };
+
+        set(peer_cli::PeerTailnetMode::Off);
+        assert!(
+            written(&peers_path).get("listen").is_none(),
+            "off is not an opt-in: {}",
+            written(&peers_path)
+        );
+
+        set(peer_cli::PeerTailnetMode::App);
+        assert_eq!(
+            written(&peers_path)["listen"],
+            peer::config::default_listen().to_string()
+        );
+
+        set(peer_cli::PeerTailnetMode::Off);
+        assert_eq!(
+            written(&peers_path)["listen"],
+            peer::config::default_listen().to_string(),
+            "off leaves the port it found"
+        );
+
+        let mut file = peer::config::read_or_default(&peers_path).expect("read");
+        file.listen = Some("127.0.0.1:9600".parse().expect("literal"));
+        peer::config::save(&peers_path, &file).expect("save");
+        set(peer_cli::PeerTailnetMode::App);
+        assert_eq!(
+            written(&peers_path)["listen"],
+            "127.0.0.1:9600",
+            "a port the operator chose is kept"
         );
     }
 }
@@ -8380,10 +8995,23 @@ where
 /// every later line from reaching disk, silently (see [`tcr::file_log`]).
 /// The TUI writes through the same queue for the same reason as headless: its
 /// file was behind the same lock, on the same tokio workers.
+/// The log filter when `RUST_LOG` is unset: `info`, and in a build with tcr's
+/// own tailnet node, `warn` for the `tailscale` crate and its `ts_*` and
+/// `kameo` dependencies, whose info lines would otherwise reach tcr's log on
+/// every node build and reconnect. A target directive matches by prefix, so
+/// `ts_` covers every `ts_*` crate.
+#[cfg(feature = "tailnet-node")]
+const DEFAULT_LOG_FILTER: &str = "info,tailscale=warn,ts_=warn,kameo=warn";
+
+/// The log filter when `RUST_LOG` is unset.
+#[cfg(not(feature = "tailnet-node"))]
+const DEFAULT_LOG_FILTER: &str = "info";
+
 fn init_tracing(headless: bool) -> Option<tcr::file_log::FileLog> {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::util::SubscriberInitExt as _;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     let (log_dir, log_prefix) = log_location();
     let (queue, file_log) = match open_log_appender(&log_dir, log_prefix) {
         Ok(file) => {

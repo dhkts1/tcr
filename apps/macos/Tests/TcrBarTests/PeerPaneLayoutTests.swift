@@ -198,9 +198,24 @@ final class PeerPaneLayoutTests: XCTestCase {
     ///     apps/macos/.build/debug/TcrBar --render-settings /tmp/peers
     ///     # peers: scrolled to 0 pt … (document 538 pt, viewport 540 pt,
     ///     #        resting -52 pt, pane estimate 537 pt)
-    private let measuredDrawnPane: CGFloat = 538
+    ///
+    /// That is the pane BEFORE This Mac's two network rows (the internet
+    /// switch and the Tailscale picker), which every claim below marked
+    /// `thisMacNetworkRows: false` is about.
+    private let measuredDrawnPaneBeforeNetworkRows: CGFloat = 538
 
-    /// **The gate this fit check exists for.** The pane an operator opens fits the
+    /// The same scene as drawn today, with both network rows:
+    ///
+    ///     apps/macos/.build/debug/TcrBar --render-settings /tmp/peers
+    ///     # peers: scrolled to 156 pt … (document 696 pt, viewport 540 pt,
+    ///     #        resting -52 pt, pane estimate 696 pt)
+    ///
+    /// Measured 2026-10-20 on the branch that added the Tailscale row; the
+    /// pane without that row measured 615 the same day.
+    private let measuredDrawnPane: CGFloat = 696
+
+    /// **The gate this fit check exists for, for everything but This Mac's
+    /// two network rows.** Without them the pane an operator opens fits the
     /// part of the window they can see, with nothing scrolling.
     ///
     /// `availableHeight` (500) is the MOCKUP's hole and the right target for
@@ -208,32 +223,65 @@ final class PeerPaneLayoutTests: XCTestCase {
     /// ``PeerPaneLayout/visibleDocumentHeight``, 540 pt, the shipped window's
     /// 592 pt of content less the toolbar's 52 pt inset, both printed by the
     /// harness.
-    func testTheDrawnPaneFitsWhatTheWindowActuallyShows() {
+    func testTheDrawnPaneWithoutTheNetworkRowsFitsWhatTheWindowShows() {
         let drawn = PeerPaneLayout.height(
-            PeerPaneLayout.drawnContent(trustedMacs: 2, pendingKnocks: 1),
+            PeerPaneLayout.drawnContent(
+                trustedMacs: 2, pendingKnocks: 1, thisMacNetworkRows: false),
             metrics: PeerPaneLayout.drawnMetrics)
         XCTAssertLessThanOrEqual(
             drawn, PeerPaneLayout.visibleDocumentHeight,
-            "the Peers pane is \(drawn) pt against the \(PeerPaneLayout.visibleDocumentHeight) "
-                + "pt an operator sees without scrolling, so the Advanced row at the bottom is "
-                + "below the fold again, which is the whole point of shrinking the pane")
+            "the Peers pane without its two network rows is \(drawn) pt against the "
+                + "\(PeerPaneLayout.visibleDocumentHeight) pt an operator sees without "
+                + "scrolling, so something other than those rows grew it")
     }
 
-    /// And the arithmetic is the same pane AppKit drew, not a wish about it.
+    /// **The honest envelope today: the two network rows push Advanced below
+    /// the fold**, and by exactly what they cost. This is the claim the owner
+    /// decides on (a taller window, or fewer sections), stated as a number so
+    /// it cannot quietly get worse: a third block in This Mac, or a row that
+    /// grows, moves the overflow past the two rows' own cost and fails here.
+    func testTheTwoNetworkRowsPushTheAdvancedRowBelowTheFold() {
+        let m = PeerPaneLayout.drawnMetrics
+        let drawn = PeerPaneLayout.height(
+            PeerPaneLayout.drawnContent(trustedMacs: 2, pendingKnocks: 1), metrics: m)
+        let without = PeerPaneLayout.height(
+            PeerPaneLayout.drawnContent(
+                trustedMacs: 2, pendingKnocks: 1, thisMacNetworkRows: false),
+            metrics: m)
+        XCTAssertEqual(
+            drawn - without, m.internetRowHeight + m.tailnetRowHeight,
+            "This Mac's two network rows are charged as something other than their own two "
+                + "measured blocks")
+        XCTAssertGreaterThan(drawn, PeerPaneLayout.visibleDocumentHeight)
+        XCTAssertLessThanOrEqual(
+            drawn - PeerPaneLayout.visibleDocumentHeight, m.internetRowHeight + m.tailnetRowHeight,
+            "the pane overflows by more than the two network rows cost, so something else "
+                + "grew too")
+    }
+
+    /// And the arithmetic is the same pane AppKit drew, not a wish about it,
+    /// for both panes: before the network rows and with them.
     ///
-    /// This is the cross-check that keeps the gate above honest: a metric
-    /// tuned to make the assertion pass would move the model away from the
+    /// This is the cross-check that keeps the gates above honest: a metric
+    /// tuned to make an assertion pass would move the model away from the
     /// measurement, and the measurement is a figure the harness prints.
     func testTheArithmeticReproducesTheDrawnPaneHeight() {
+        let m = PeerPaneLayout.drawnMetrics
         let drawn = PeerPaneLayout.height(
-            PeerPaneLayout.drawnContent(trustedMacs: 2, pendingKnocks: 1),
-            metrics: PeerPaneLayout.drawnMetrics)
+            PeerPaneLayout.drawnContent(trustedMacs: 2, pendingKnocks: 1), metrics: m)
         XCTAssertEqual(
             drawn, measuredDrawnPane, accuracy: 0.02 * measuredDrawnPane,
             "the model says \(drawn) pt and the render harness measured "
                 + "\(measuredDrawnPane) pt for the same scene. Re-run "
                 + "--render-settings: either a metric here is now a guess, or the pane "
                 + "changed and this figure was not re-measured")
+        let before = PeerPaneLayout.height(
+            PeerPaneLayout.drawnContent(
+                trustedMacs: 2, pendingKnocks: 1, thisMacNetworkRows: false),
+            metrics: m)
+        XCTAssertEqual(
+            before, measuredDrawnPaneBeforeNetworkRows,
+            accuracy: 0.02 * measuredDrawnPaneBeforeNetworkRows)
     }
 
     /// What this reduction actually removed, in points: the same scene was 675 pt
@@ -243,7 +291,7 @@ final class PeerPaneLayoutTests: XCTestCase {
     func testTheDrawnPaneIsFarShorterThanTheOneWaveFiveInherited() {
         let inherited: CGFloat = 675
         let drawn = PeerPaneLayout.height(
-            PeerPaneLayout.drawnContent(trustedMacs: 2, pendingKnocks: 1),
+            PeerPaneLayout.drawnContent(trustedMacs: 2, pendingKnocks: 1, thisMacNetworkRows: false),
             metrics: PeerPaneLayout.drawnMetrics)
         XCTAssertLessThan(drawn, 0.85 * inherited)
     }
@@ -256,7 +304,8 @@ final class PeerPaneLayoutTests: XCTestCase {
         let m = PeerPaneLayout.drawnMetrics
         XCTAssertLessThan(m.sectionSentenceHeight, m.rowDetailHeight)
         let asHeads = PeerPaneLayout.height(
-            PeerPaneLayout.drawnContent(trustedMacs: 2, pendingKnocks: 1), metrics: m)
+            PeerPaneLayout.drawnContent(trustedMacs: 2, pendingKnocks: 1, thisMacNetworkRows: false),
+            metrics: m)
         let asCaptions = PeerPaneLayout.height(
             PeerPaneLayout.Content(
                 trustedMacs: 2, pendingKnocks: 1, explainedRows: 2, sectionSentences: 0),
@@ -280,7 +329,8 @@ final class PeerPaneLayoutTests: XCTestCase {
         let m = PeerPaneLayout.drawnMetrics
         func fits(macs: Int, knocks: Int) -> Bool {
             PeerPaneLayout.height(
-                PeerPaneLayout.drawnContent(trustedMacs: macs, pendingKnocks: knocks),
+                PeerPaneLayout.drawnContent(
+                    trustedMacs: macs, pendingKnocks: knocks, thisMacNetworkRows: false),
                 metrics: m) <= PeerPaneLayout.visibleDocumentHeight
         }
         XCTAssertTrue(fits(macs: 2, knocks: 1))
@@ -300,7 +350,8 @@ final class PeerPaneLayoutTests: XCTestCase {
         func height(macs: Int, knocks: Int, holdsCodex: Bool) -> CGFloat {
             PeerPaneLayout.height(
                 PeerPaneLayout.drawnContent(
-                    trustedMacs: macs, pendingKnocks: knocks, holdsCodex: holdsCodex),
+                    trustedMacs: macs, pendingKnocks: knocks, holdsCodex: holdsCodex,
+                    thisMacNetworkRows: false),
                 metrics: m)
         }
         XCTAssertEqual(
@@ -311,7 +362,8 @@ final class PeerPaneLayoutTests: XCTestCase {
         XCTAssertEqual(
             height(macs: 2, knocks: 1, holdsCodex: false),
             PeerPaneLayout.height(
-                PeerPaneLayout.drawnContent(trustedMacs: 2, pendingKnocks: 1), metrics: m),
+                PeerPaneLayout.drawnContent(trustedMacs: 2, pendingKnocks: 1, thisMacNetworkRows: false),
+                metrics: m),
             "a Claude-only fleet's pane is charged for a line it does not draw")
         let window = PeerPaneLayout.visibleDocumentHeight
         XCTAssertLessThanOrEqual(height(macs: 2, knocks: 0, holdsCodex: true), window)

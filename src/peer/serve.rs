@@ -2944,6 +2944,24 @@ fn last_seen_by_peer(store: &PeerStore) -> Vec<(PeerId, i64)> {
 /// the next one", and both are logged with the address so a reader can tell
 /// which of the four attempts against one host it was.
 async fn connect_within(addr: SocketAddr, within: Duration) -> Option<PeerStream> {
+    // A tailnet address, from a process running tcr's own tailnet node, goes
+    // through the node: this Mac has no `utun` for it, so the kernel cannot
+    // route it. Every other dial, and every dial on a Mac with the Tailscale
+    // app, goes through the kernel as before.
+    if let Some(through_node) = crate::peer::tailnet_node::dial_through_node(addr, within).await {
+        return match through_node {
+            Ok(stream) => Some(stream),
+            Err(err) => {
+                tracing::debug!(
+                    addr = %addr,
+                    error = %err,
+                    "peer serve: that address did not answer through the tailnet node; trying \
+                     the next one"
+                );
+                None
+            }
+        };
+    }
     match tokio::time::timeout(within, tokio::net::TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => Some(Box::new(stream) as PeerStream),
         Ok(Err(err)) => {

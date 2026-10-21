@@ -1273,7 +1273,22 @@ async fn boot_peer_listener(
 
     // The browse, on the same cadence, writing what it heard into the state
     // file this process already owns.
-    spawn_browse(peers_path, &state_path, shutdown, background);
+    spawn_browse(peers_path, &state_path, local.port(), shutdown, background);
+
+    // tcr's own tailnet node, when the mode is `node`: a second accept loop
+    // on the node's address into the same `serve_one`. Everything it does is
+    // in its own module; a build without the `tailnet-node` feature only
+    // records `nodeUnsupported` there.
+    {
+        let node = crate::peer::tailnet_node::run_in_server(
+            peers_path.to_path_buf(),
+            state_path.clone(),
+            local.port(),
+            context.clone(),
+            shutdown.subscribe(),
+        );
+        background.push(tokio::spawn(supervise("peer-tailnet-node", node)));
+    }
 
     // The path traffic summary, on its own schedule, writing what the meter
     // charged into the same state file.
@@ -1482,13 +1497,28 @@ fn spawn_beacon(
 /// A peers file, or a state file, that does not read or write for a moment
 /// is not the same fact as `find` being off: logged and left as it is until
 /// the next wake, the same containment [`spawn_beacon`] already has.
+///
+/// # The second source: the tailnet, in app mode
+///
+/// The same task is the only writer of the found list, because
+/// `state::save_found` replaces the whole section and a second writer would
+/// erase the first one's rows every wake. So it also owns the tailnet beacon
+/// socket ([`crate::peer::tailnet_find`]): between wakes it reads datagrams
+/// from the operator's own Macs, and on each wake it reads the Tailscale app
+/// (on a blocking thread, since that runs a process), binds or rebinds the
+/// socket to this Mac's own tailnet IPv4, sends this Mac's beacon to each own
+/// Mac, merges what it heard with the mDNS scan, writes the found list once,
+/// and writes `held` (`state::save_tailnet`) while the mode is app.
 fn spawn_browse(
     peers_path: &std::path::Path,
     state_path: &std::path::Path,
+    port: u16,
     shutdown: &watch::Sender<bool>,
     background: &mut Vec<JoinHandle<()>>,
 ) {
-    use crate::peer::discovery;
+    use crate::peer::config::TailnetMode;
+    use crate::peer::discovery::{self, FoundSource};
+    use crate::peer::tailnet_find::{self, BeaconIntake, BeaconSocket};
 
     let peers_path = peers_path.to_path_buf();
     let state_path = state_path.to_path_buf();
@@ -1498,8 +1528,52 @@ fn spawn_browse(
             let mut found = discovery::FoundList::new();
             let mut ticker = tokio::time::interval(discovery::BROWSE_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut socket = BeaconSocket::new(port);
+            let mut intake = BeaconIntake::new();
+            // The latest reading's own-Mac addresses, and the network key as
+            // of the last wake: what a datagram between wakes is checked
+            // against.
+            let mut own_macs: Vec<std::net::Ipv4Addr> = Vec::new();
+            let mut network_key: Option<crate::peer::config::NetworkKey> = None;
+            // The address a bind last failed on, so the warning is logged
+            // once per address rather than every wake.
+            let mut bind_failed_on: Option<std::net::Ipv4Addr> = None;
+            let mut buf = [0_u8; tailnet_find::RECEIVE_BUFFER_BYTES];
             loop {
-                ticker.tick().await;
+                let received = tokio::select! {
+                    _ = ticker.tick() => None,
+                    received = socket.recv(&mut buf) => Some(received),
+                };
+                if let Some(received) = received {
+                    match received {
+                        Ok((len, from)) => {
+                            let intake_result = intake.offer(
+                                from.ip(),
+                                &buf[..len],
+                                &own_macs,
+                                network_key.as_ref(),
+                                crate::now_ms(),
+                            );
+                            tracing::debug!(
+                                from = %from,
+                                outcome = ?intake_result,
+                                "peer find: a tailnet datagram"
+                            );
+                        }
+                        // Closed rather than read again, so an error that
+                        // repeats cannot spin this arm; the next wake binds
+                        // a fresh socket.
+                        Err(err) => {
+                            socket.close();
+                            tracing::debug!(
+                                error = %err,
+                                "peer find: the tailnet beacon socket failed; it is reopened \
+                                 on the next wake"
+                            );
+                        }
+                    }
+                    continue;
+                }
                 let file = match crate::peer::config::read_or_default(&peers_path) {
                     Ok(file) => file,
                     Err(err) => {
@@ -1512,63 +1586,130 @@ fn spawn_browse(
                         continue;
                     }
                 };
-                // `AnnounceStep` is the beacon's own re-stamp decision and not
-                // what this task reads; the flag itself is: browsing while
-                // `find` is off would show rows an operator who turned
-                // discovery off never asked to see.
-                if !file.discovery {
-                    continue;
+                network_key = file.network_key;
+
+                // The tailnet source, read only in app mode. The read runs a
+                // process under a deadline, so it goes to a blocking thread,
+                // and it refreshes the reading the peer listener decides an
+                // own-Mac knock on.
+                let mode = file.tailnet.effective();
+                let app = match mode {
+                    TailnetMode::App => Some(
+                        tailnet_find::OWN_MAC_READINGS
+                            .refresh(tailnet_find::read_the_app)
+                            .await,
+                    ),
+                    TailnetMode::Off | TailnetMode::Node => None,
+                };
+                let mut scan: Vec<discovery::Discovered> = Vec::new();
+                let mut tailnet_peers = Vec::new();
+                if let Some(Ok(status)) = &app {
+                    {
+                        own_macs = tailnet_find::own_mac_addresses(status);
+                        match status.own_ipv4() {
+                            Some(own) => match socket.bind_to(own).await {
+                                Ok(()) => bind_failed_on = None,
+                                Err(err) => {
+                                    if bind_failed_on != Some(own) {
+                                        tracing::warn!(
+                                            address = %own,
+                                            peer_port = port,
+                                            error = %err,
+                                            "peer find: could not listen for tailnet beacons on \
+                                             this Mac's tailnet address; your other Macs are \
+                                             not found over the tailnet until it binds"
+                                        );
+                                    }
+                                    bind_failed_on = Some(own);
+                                }
+                            },
+                            None => {
+                                socket.close();
+                            }
+                        }
+                        let name = file.announce_name.then(|| file.display_name());
+                        let beacon =
+                            discovery::tailnet_beacon(port, name.as_deref(), network_key.as_ref());
+                        socket.send(&own_macs, &beacon).await;
+                        scan.extend(intake.take(&own_macs));
+                        tailnet_peers = tailnet_find::pinned_peers(status, &file.peers);
+                    }
+                } else {
+                    // Off, node, or a read that failed: no reading to trust,
+                    // so nothing is heard and nothing heard before is shown.
+                    own_macs.clear();
+                    socket.close();
+                    intake.clear();
+                    found.forget(FoundSource::Tailnet);
                 }
-                let store = match crate::peer::config::PeerStore::open(&peers_path) {
-                    Ok(store) => store,
-                    Err(err) => {
-                        tracing::warn!(
+
+                // The LAN source. `AnnounceStep` is the beacon's own re-stamp
+                // decision and not what this task reads; the flag itself is:
+                // browsing while `find` is off would show rows an operator
+                // who turned discovery off never asked to see.
+                if file.discovery {
+                    match crate::peer::config::PeerStore::open(&peers_path) {
+                        Ok(store) => match discovery::browse(&store).await {
+                            Ok(lan) => scan.extend(lan),
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                "peer find: this node could not browse the LAN this wake"
+                            ),
+                        },
+                        Err(err) => tracing::warn!(
                             error = %err,
                             "peer find: the peers file did not open, so no browse ran this wake"
-                        );
-                        continue;
+                        ),
                     }
-                };
-                let scan = match discovery::browse(&store).await {
-                    Ok(scan) => scan,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "peer find: this node could not browse the LAN this wake"
-                        );
-                        continue;
-                    }
-                };
+                } else {
+                    found.forget(FoundSource::Lan);
+                }
+
                 let now_ms = crate::now_ms();
-                // Never by address: one Mac has several, and two containers
-                // share a host. The instance id is the only sound key for
-                // "this is my own beacon".
-                let this_instance = crate::peer::id::boot_instance_id();
-                let scan: Vec<discovery::Discovered> = scan
-                    .into_iter()
-                    .filter(|row| row.instance_id != this_instance)
-                    .collect();
-                found.observe(scan, now_ms);
-                let rows: Vec<crate::peer::state::Found> = found
-                    .shown()
-                    .into_iter()
-                    .map(|row| crate::peer::state::Found {
-                        addr: row.addrs.first().cloned().unwrap_or_default(),
-                        instance_id: row.instance_id,
-                        announced_name: row.name,
-                        listen_port: row.port,
-                        first_seen_ms: now_ms,
-                        last_seen_ms: now_ms,
-                    })
-                    .collect();
-                if let Err(err) =
-                    crate::peer::state::save_found(&state_path, rows, found.not_shown(), now_ms)
-                {
+                if file.discovery || mode == TailnetMode::App {
+                    // Never by address: one Mac has several, and two
+                    // containers share a host. The instance id is the only
+                    // sound key for "this is my own beacon", over either
+                    // source.
+                    let this_instance = crate::peer::id::boot_instance_id();
+                    scan.retain(|row| row.instance_id != this_instance);
+                    found.observe(scan, now_ms);
+                    let rows: Vec<crate::peer::state::Found> = found
+                        .shown()
+                        .iter()
+                        .map(|row| row.found_row(now_ms))
+                        .collect();
+                    if let Err(err) =
+                        crate::peer::state::save_found(&state_path, rows, found.not_shown(), now_ms)
+                    {
+                        tracing::warn!(
+                            path = %state_path.display(),
+                            error = %err,
+                            "peer find: the found list did not write, so the last scan's rows \
+                             are only in this process's memory"
+                        );
+                    }
+                }
+
+                // `held`, on every wake while the mode is app, so `tcr peer
+                // tailnet --json` and the panel can tell a server acting on
+                // the setting from one that stopped writing. Off and node
+                // write nothing from here: see `tailnet_find::write_held`.
+                let reading = app
+                    .as_ref()
+                    .map(|result| result.as_ref().map(|status| &**status).map_err(|err| *err));
+                if let Err(err) = tailnet_find::write_held(
+                    &state_path,
+                    mode,
+                    reading,
+                    found.heard_from(FoundSource::Tailnet),
+                    tailnet_peers,
+                    now_ms,
+                ) {
                     tracing::warn!(
                         path = %state_path.display(),
                         error = %err,
-                        "peer find: the found list did not write, so the last scan's rows are \
-                         only in this process's memory"
+                        "peer find: the tailnet record did not write"
                     );
                 }
             }

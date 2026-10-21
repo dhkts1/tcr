@@ -484,52 +484,82 @@ async fn accept_peer_connections(listener: TcpListener, context: SessionContext)
                 return Err(anyhow::Error::new(err).context("peer listener: accept failed"));
             }
         };
-        let context = context.clone();
-        tokio::spawn(async move {
-            let addr = knock_address(&from);
-            if let Err(failure) = serve_connection(stream, &context, &from, bind).await {
-                // Every refusal closes the connection and logs. There is no
-                // arm that answers the peer: what this node will say to a
-                // stranger is nothing at all.
-                //
-                // **Both paths are bounded, and by the same type from two
-                // instances.** An earlier build logged every AUTHENTICATED failure
-                // unconditionally on the reasoning that a pinned peer's stream
-                // ending is always worth a line, which is true of the first
-                // one and false of the thousandth: a pinned peer in a reconnect
-                // loop is a pinned peer filling a disk, and `tcr peer forget`
-                // is not the remedy an operator reaches for when the log is
-                // what is broken. Two instances rather than one so that a flood
-                // of anonymous refusals cannot silence a real peer's first
-                // line.
-                let mut guard = lock_admission(&context.admission);
-                let log = if failure.authenticated {
-                    &mut guard.authenticated_refusals
-                } else {
-                    &mut guard.unauthenticated_refusals
-                };
-                let admitted = log.admit(&addr, now_ms());
-                drop(guard);
-                let Some(suppressed) = admitted else {
-                    return;
-                };
-                if failure.authenticated {
-                    tracing::warn!(
-                        peer_addr = %from,
-                        error = %failure.error,
-                        suppressed,
-                        "peer connection closed"
-                    );
-                } else {
-                    tracing::warn!(
-                        peer_addr = %from,
-                        error = %failure.error,
-                        suppressed,
-                        "peer connection refused before it authenticated"
-                    );
-                }
+        // The address THIS connection was sent to, which on a wildcard bind
+        // is the one fact that says which interface it came in on. Only the
+        // own-Mac tailnet rule reads it; with none, that rule refuses.
+        let accepted_on = match stream.local_addr() {
+            Ok(local) => Some(local),
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "peer listener: an accepted socket has no local address"
+                );
+                None
             }
-        });
+        };
+        tokio::spawn(serve_one(stream, context.clone(), from, bind, accepted_on));
+    }
+}
+
+/// Serve one accepted connection to its end, logging how it ended under the
+/// same bounds the accept loop uses.
+///
+/// What the accept loop spawns per connection, and public so a second accept
+/// loop (tcr's own tailnet node, [`crate::peer::tailnet_node`]) feeds the
+/// same code rather than a copy of it: the same admission, the same bounded
+/// refusal log, with `from`, `bind` and `accepted_on` (the address the
+/// connection was sent to) taken off whatever socket it accepted.
+pub async fn serve_one<S>(
+    stream: S,
+    context: SessionContext,
+    from: SocketAddr,
+    bind: SocketAddr,
+    accepted_on: Option<SocketAddr>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let addr = knock_address(&from);
+    if let Err(failure) = serve_connection(stream, &context, &from, bind, accepted_on).await {
+        // Every refusal closes the connection and logs. There is no
+        // arm that answers the peer: what this node will say to a
+        // stranger is nothing at all.
+        //
+        // **Both paths are bounded, and by the same type from two
+        // instances.** An earlier build logged every AUTHENTICATED failure
+        // unconditionally on the reasoning that a pinned peer's stream
+        // ending is always worth a line, which is true of the first
+        // one and false of the thousandth: a pinned peer in a reconnect
+        // loop is a pinned peer filling a disk, and `tcr peer forget`
+        // is not the remedy an operator reaches for when the log is
+        // what is broken. Two instances rather than one so that a flood
+        // of anonymous refusals cannot silence a real peer's first
+        // line.
+        let mut guard = lock_admission(&context.admission);
+        let log = if failure.authenticated {
+            &mut guard.authenticated_refusals
+        } else {
+            &mut guard.unauthenticated_refusals
+        };
+        let admitted = log.admit(&addr, now_ms());
+        drop(guard);
+        let Some(suppressed) = admitted else {
+            return;
+        };
+        if failure.authenticated {
+            tracing::warn!(
+                peer_addr = %from,
+                error = %failure.error,
+                suppressed,
+                "peer connection closed"
+            );
+        } else {
+            tracing::warn!(
+                peer_addr = %from,
+                error = %failure.error,
+                suppressed,
+                "peer connection refused before it authenticated"
+            );
+        }
     }
 }
 
@@ -1093,10 +1123,11 @@ impl SessionContext {
 /// nobody here thought of defaults to the internet, which is the side that
 /// costs a refusal rather than an admission.
 ///
-/// The list is `127.0.0.0/8`, `::1`, the three RFC 1918
-/// ranges, `100.64.0.0/10` (RFC 6598, carrier-grade NAT, which is what a Mac
-/// behind a mobile hotspot sits in), `169.254.0.0/16` (RFC 3927 link-local,
-/// the address a Mac gives itself with no DHCP), `fe80::/10` and `fc00::/7`.
+/// The list is `127.0.0.0/8`, `::1`, the three RFC 1918 ranges, `fe80::/10`
+/// and `fc00::/7` minus Tailscale's `fd7a:115c:a1e0::/48`. Three ranges are
+/// deliberately left OFF it, and [`is_lan_scope_v4`] says why:
+/// `100.64.0.0/10` and `fd7a:115c:a1e0::/48` (a tailnet, in both families)
+/// and `169.254.0.0/16` (IPv4 link-local).
 ///
 /// # This is not the switch, and it must not be read as one
 ///
@@ -1128,10 +1159,15 @@ pub fn is_lan_scope(addr: IpAddr) -> bool {
 
 /// The IPv4 half of [`is_lan_scope`].
 ///
-/// # Two prefixes this used to count as LAN, and what that admitted
+/// # Prefixes this used to count as LAN, and what that admitted
 ///
 /// `100.64.0.0/10` (RFC 6598) is the carrier-grade NAT range, and it is what
-/// Tailscale numbers a tailnet out of. Counting it as LAN meant that every
+/// Tailscale numbers a tailnet out of in IPv4. Its IPv6 twin is
+/// `fd7a:115c:a1e0::/48`, which sits inside the unique-local `fc00::/7` that
+/// [`is_lan_scope_v6`] counts as LAN, so it is carved out there
+/// ([`is_tailscale_v6`]) for the same reason: one tailnet node used to be
+/// refused a knock at its IPv4 address and answered at its IPv6 one. What
+/// follows applies to both families. Counting a tailnet as LAN meant that every
 /// node on a tailnet, anywhere in the world, reached the knock path and the
 /// operator's pairing queue: [`internet_admission`] tests the SOURCE first and
 /// answers a LAN-scope source whatever `bind` is and whatever `peer.internet`
@@ -1148,6 +1184,21 @@ pub fn is_lan_scope(addr: IpAddr) -> bool {
 /// visit against a pinned key, which is the path a peer that really is on the
 /// far side of a tailnet uses. What they no longer reach, on a listener bound
 /// wide open, is the knock and the first pairing.
+///
+/// # The one tailnet knock that is answered: your own Macs (Gil, 2026-10-20)
+///
+/// The refusal above is about strangers: on a shared company tailnet every
+/// coworker's machine is a tailnet node, and none of them should reach the
+/// operator's pairing queue. It is not about the operator's own other Macs,
+/// which `tcr peer tailnet app` finds over the tailnet and which Trust must be
+/// able to pair with. So with the mode at `app`, a knock or a first pairing
+/// from a tailnet address is answered when it arrived on this Mac's own
+/// tailnet address and the Tailscale app names the sender as one of the
+/// operator's own Macs (same Tailscale user, untagged, not shared in). That
+/// rule is [`own_mac_admission`], and this function still says "not LAN" for
+/// every tailnet address: everyone else on the tailnet keeps the refusal, and
+/// being let knock still grants nothing without the six-digit compare on both
+/// screens.
 fn is_lan_scope_v4(addr: Ipv4Addr) -> bool {
     let [a, b, _, _] = addr.octets();
     // 127.0.0.0/8, loopback.
@@ -1172,6 +1223,17 @@ pub fn is_carrier_grade_nat(addr: Ipv4Addr) -> bool {
     a == 100 && (64..128).contains(&b)
 }
 
+/// Whether `addr` is in `fd7a:115c:a1e0::/48`, the range Tailscale numbers a
+/// tailnet out of in IPv6: the IPv6 twin of [`is_carrier_grade_nat`].
+///
+/// Public for the same reason that one is: "is this a tailnet address" is a
+/// different question from "is this LAN scope", and a caller asking the first
+/// must not re-type the range.
+pub const fn is_tailscale_v6(addr: Ipv6Addr) -> bool {
+    let segments = addr.segments();
+    segments[0] == 0xfd7a && segments[1] == 0x115c && segments[2] == 0xa1e0
+}
+
 /// The IPv6 half of [`is_lan_scope`].
 const fn is_lan_scope_v6(addr: Ipv6Addr) -> bool {
     if addr.is_loopback() {
@@ -1181,6 +1243,11 @@ const fn is_lan_scope_v6(addr: Ipv6Addr) -> bool {
     // fe80::/10, link-local.
     if segments[0] & 0xffc0 == 0xfe80 {
         return true;
+    }
+    // Tailscale's range sits inside fc00::/7 and is a tailnet, not this LAN:
+    // see `is_lan_scope_v4` for why a tailnet never counts.
+    if is_tailscale_v6(addr) {
+        return false;
     }
     // fc00::/7, unique-local (RFC 4193).
     segments[0] & 0xfe00 == 0xfc00
@@ -1284,6 +1351,81 @@ pub fn internet_admission(
     }
 }
 
+/// Whether `addr` is a tailnet address in either family: `100.64.0.0/10` or
+/// `fd7a:115c:a1e0::/48`, a v4-mapped form read as its IPv4 self.
+pub fn is_tailnet_address(addr: IpAddr) -> bool {
+    match addr.to_canonical() {
+        IpAddr::V4(v4) => is_carrier_grade_nat(v4),
+        IpAddr::V6(v6) => is_tailscale_v6(v6),
+    }
+}
+
+/// The cheap half of [`own_mac_admission`]: everything it asks that needs no
+/// reading of the Tailscale app. Checked first, so a connection that could
+/// never be an own-Mac knock (a LAN host, a hotspot neighbour arriving on a
+/// non-tailnet address, any mode but `app`) never starts the Tailscale CLI.
+pub fn may_be_an_own_mac_knock(
+    mode: config::TailnetMode,
+    accepted_on: Option<IpAddr>,
+    from: IpAddr,
+    pattern: Handshake,
+) -> bool {
+    matches!(
+        pattern,
+        Handshake::Pair | Handshake::Knock | Handshake::KnockPsk
+    ) && mode == config::TailnetMode::App
+        && accepted_on.is_some_and(is_tailnet_address)
+        && is_tailnet_address(from)
+}
+
+/// A knock or a first pairing from one of the operator's own Macs over the
+/// tailnet, which [`internet_admission`] refuses: answered when ALL hold.
+///
+/// 1. The tailnet mode is `app`.
+/// 2. The connection arrived on one of this Mac's own tailnet addresses
+///    (`Self.TailscaleIPs` in `reading`). `accepted_on` is the accepted
+///    socket's OWN local address, the one the packet was sent to, never the
+///    listener's `0.0.0.0` bind. That rules out a hotspot neighbour whose
+///    carrier-grade NAT address falls in `100.64.0.0/10`: its packet comes in
+///    on Wi-Fi, to this Mac's Wi-Fi address.
+/// 3. The source is an address of one of the operator's own Macs in
+///    `reading` ([`crate::peer::tailscale_app::own_macs`]: online, untagged,
+///    not shared in, the same Tailscale user, macOS or no OS). WireGuard drops
+///    a packet whose source is not the sending peer's own address, so another
+///    machine on the tailnet cannot borrow it.
+///
+/// `reading` is a failed read when the app could not be read, and a failed
+/// read refuses. Return and Enrol are not decided here: [`internet_admission`]
+/// already answers them from anywhere.
+pub fn own_mac_admission(
+    mode: config::TailnetMode,
+    accepted_on: Option<IpAddr>,
+    from: IpAddr,
+    pattern: Handshake,
+    reading: Result<&crate::peer::tailscale_app::Status, crate::peer::tailscale_app::ReadError>,
+) -> InternetAdmission {
+    if !may_be_an_own_mac_knock(mode, accepted_on, from, pattern) {
+        return InternetAdmission::Refuse;
+    }
+    let (Some(accepted_on), Ok(status)) = (accepted_on, reading) else {
+        return InternetAdmission::Refuse;
+    };
+    let accepted_on = accepted_on.to_canonical();
+    let from = from.to_canonical();
+    let on_my_tailnet_address = status
+        .self_node
+        .as_ref()
+        .is_some_and(|me| me.tailscale_ips.contains(&accepted_on));
+    let from_my_own_mac = crate::peer::tailscale_app::own_macs(status)
+        .iter()
+        .any(|mac| mac.tailscale_ips.contains(&from));
+    if on_my_tailnet_address && from_my_own_mac {
+        InternetAdmission::Answer
+    } else {
+        InternetAdmission::Refuse
+    }
+}
+
 /// Is this listener bound to an address nothing off this machine can dial?
 ///
 /// The one bind class [`internet_admission`] answers unconditionally. An
@@ -1341,21 +1483,55 @@ pub fn shares_a_global_v6_prefix(from: IpAddr, own_global_v6: &[Ipv6Addr]) -> bo
 /// Read per connection rather than cached at boot for the reason the peers
 /// file is: a Mac that moves between networks gets a new prefix, and a cached
 /// one would answer about the network it used to be on.
-fn admission_for_this_host(
+///
+/// Then, for what is still refused, [`own_mac_admission`]: a knock from one
+/// of the operator's own Macs over the tailnet in app mode, decided on a
+/// reading of the Tailscale app no older than
+/// [`crate::peer::tailnet_find::OWN_MAC_READING_MAX_AGE`] from `readings`,
+/// re-read with `read` when it is older. The read happens only after
+/// [`may_be_an_own_mac_knock`] says it could matter.
+async fn admission_for_this_host<F>(
     bind: IpAddr,
+    accepted_on: Option<IpAddr>,
     from: IpAddr,
     pattern: Handshake,
-    internet: bool,
-) -> InternetAdmission {
+    file: &PeerFile,
+    readings: &crate::peer::tailnet_find::ReadingCache,
+    read: F,
+) -> InternetAdmission
+where
+    F: FnOnce() -> std::result::Result<
+            crate::peer::tailscale_app::Status,
+            crate::peer::tailscale_app::ReadError,
+        > + Send
+        + 'static,
+{
+    let internet = file.internet;
     if internet_admission(bind, from, pattern, internet, &[]) == InternetAdmission::Answer {
         return InternetAdmission::Answer;
     }
-    internet_admission(
+    if internet_admission(
         bind,
         from,
         pattern,
         internet,
         &crate::peer::reach::global_v6_addresses(),
+    ) == InternetAdmission::Answer
+    {
+        return InternetAdmission::Answer;
+    }
+    if !may_be_an_own_mac_knock(file.tailnet.effective(), accepted_on, from, pattern) {
+        return InternetAdmission::Refuse;
+    }
+    let reading = readings
+        .recent(crate::peer::tailnet_find::OWN_MAC_READING_MAX_AGE, read)
+        .await;
+    own_mac_admission(
+        file.tailnet.effective(),
+        accepted_on,
+        from,
+        pattern,
+        reading.as_deref().map_err(|err| *err),
     )
 }
 
@@ -1384,6 +1560,7 @@ async fn serve_connection<S>(
     context: &SessionContext,
     from: &SocketAddr,
     bind: SocketAddr,
+    accepted_on: Option<SocketAddr>,
 ) -> std::result::Result<(), ConnectionFailure>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1494,15 +1671,26 @@ where
     // bucket, the queue or the operator's screen. Gated on `bind`, the socket
     // this listener is bound to, and on `file.internet` for the one case the
     // bind class alone got wrong: two Macs on one home LAN with ISP-delegated
-    // IPv6. See [`internet_admission`]'s own doc for both halves.
-    if admission_for_this_host(bind.ip(), from.ip(), pattern, file.internet)
+    // IPv6. See [`internet_admission`]'s own doc for both halves. Then the one
+    // tailnet case: a knock from the operator's own Mac, arriving on this
+    // Mac's own tailnet address in app mode ([`own_mac_admission`]).
+    if admission_for_this_host(
+        bind.ip(),
+        accepted_on.map(|local| local.ip()),
+        from.ip(),
+        pattern,
+        &file,
+        &crate::peer::tailnet_find::OWN_MAC_READINGS,
+        crate::peer::tailnet_find::read_the_app,
+    )
+    .await
         == InternetAdmission::Refuse
     {
         return Err(ConnectionFailure::unauthenticated(anyhow::anyhow!(
             "peer listener: this listener is bound to a globally routable address and {addr} \
              is neither on this LAN nor in one of this Mac's own IPv6 /64 prefixes, so a {} \
              gets nothing back; only a return visit against a pinned key is answered from off \
-             the LAN",
+             the LAN, and over the tailnet a knock from one of your own Macs in app mode",
             pattern.pattern()
         )));
     }
@@ -1626,7 +1814,7 @@ pub async fn serve_accepted<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    serve_connection(stream, context, from, bind)
+    serve_connection(stream, context, from, bind, None)
         .await
         .map_err(|failure| failure.error)
 }
@@ -2378,7 +2566,8 @@ pub async fn park_one_carrier(friend: &PeerRow, context: &SessionContext) -> Res
     // the off-LAN admission gate, which asks whether the FAR end is off this
     // network. Answering it with the address the far end is actually at is the
     // honest reading.
-    serve_connection(stream, context, &addr, addr)
+    // No accepted socket of this Mac's own, so no own-Mac tailnet knock.
+    serve_connection(stream, context, &addr, addr, None)
         .await
         .map_err(|failure| failure.error)
 }
@@ -3812,6 +4001,15 @@ impl NodeFacts {
         facts.addrs = listen
             .map(|addr| vec![addr.to_string()])
             .unwrap_or_default();
+        // tcr's own tailnet node, when this process runs one: its address at
+        // the peer port. After the configured socket for the same reason the
+        // mapping is, and before the mapping, because it needs no router.
+        if let Some(node) = crate::peer::tailnet_node::advertised_listen() {
+            let node = node.to_string();
+            if !facts.addrs.contains(&node) {
+                facts.addrs.push(node);
+            }
+        }
         // The router mapping, when this node holds one. It goes AFTER the
         // configured socket rather than before it: a peer on the same LAN
         // should reach the LAN address first, and the mapped one is what is
@@ -3934,3 +4132,121 @@ impl std::fmt::Display for StreamRefusal {
 }
 
 impl std::error::Error for StreamRefusal {}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::peer::config::{PeerFile, TailnetMode};
+    use crate::peer::tailnet_find::ReadingCache;
+    use crate::peer::tailscale_app::{ReadError, Status};
+
+    const STATUS: &str = r#"{
+      "BackendState": "Running",
+      "Self": {"UserID": 111, "TailscaleIPs": ["100.64.0.1"]},
+      "Peer": {"nodekey:01": {"HostName": "laptop-2", "OS": "macOS", "UserID": 111,
+        "Online": true, "TailscaleIPs": ["100.64.0.2"]}}
+    }"#;
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().expect("a literal address parses")
+    }
+
+    fn app_mode() -> PeerFile {
+        PeerFile {
+            tailnet: TailnetMode::App.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A reader that counts its runs and answers `answer`.
+    fn counting(
+        runs: &Arc<AtomicUsize>,
+        answer: Result<(), ReadError>,
+    ) -> impl FnOnce() -> Result<Status, ReadError> + Send + 'static {
+        let runs = Arc::clone(runs);
+        move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            answer.and_then(|()| Status::parse(STATUS.as_bytes()))
+        }
+    }
+
+    /// **The listener answers an own-Mac knock through the cache, reads the
+    /// app once for two knocks, never reads it for a connection that could
+    /// not be one, and refuses on a failed read.**
+    ///
+    /// Watch it fail by dropping the `may_be_an_own_mac_knock` early return
+    /// in `admission_for_this_host`: the LAN-address knock, which comes first
+    /// against an empty cache, then runs the reader and the first count is 1.
+    #[tokio::test]
+    async fn the_listener_decides_an_own_mac_knock_on_a_recent_reading() {
+        let cache = ReadingCache::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let file = app_mode();
+        let knock = |accepted_on: &str, from: &str| (Some(ip(accepted_on)), ip(from));
+
+        // First, against an empty cache: a knock that arrived on a LAN
+        // address can never be an own-Mac knock, so it must not start the
+        // Tailscale CLI at all.
+        let (on, from) = knock("192.168.1.5", "100.64.0.2");
+        let lan_side = admission_for_this_host(
+            ip("0.0.0.0"),
+            on,
+            from,
+            Handshake::Knock,
+            &file,
+            &cache,
+            counting(&runs, Ok(())),
+        )
+        .await;
+        assert_eq!(lan_side, InternetAdmission::Refuse);
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "no read for a LAN-side knock"
+        );
+
+        let (on, from) = knock("100.64.0.1", "100.64.0.2");
+        let first = admission_for_this_host(
+            ip("0.0.0.0"),
+            on,
+            from,
+            Handshake::Knock,
+            &file,
+            &cache,
+            counting(&runs, Ok(())),
+        )
+        .await;
+        assert_eq!(first, InternetAdmission::Answer);
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "one read so far");
+
+        let (on, from) = knock("100.64.0.1", "100.64.0.2");
+        let second = admission_for_this_host(
+            ip("0.0.0.0"),
+            on,
+            from,
+            Handshake::Pair,
+            &file,
+            &cache,
+            counting(&runs, Ok(())),
+        )
+        .await;
+        assert_eq!(second, InternetAdmission::Answer);
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the reading was reused");
+
+        let failing = ReadingCache::new();
+        let refused = admission_for_this_host(
+            ip("0.0.0.0"),
+            Some(ip("100.64.0.1")),
+            ip("100.64.0.2"),
+            Handshake::Knock,
+            &file,
+            &failing,
+            counting(&runs, Err(ReadError::TimedOut)),
+        )
+        .await;
+        assert_eq!(refused, InternetAdmission::Refuse, "a failed read refuses");
+    }
+}

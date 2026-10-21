@@ -244,8 +244,13 @@ fn public_from_secret(secret: &[u8; 32]) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("unexpected public key length"))
 }
 
-/// Write a 32-byte key file at `mode`, refusing to follow a pre-existing
-/// symlink the way [`crate::config::write_atomic`] does for the main config.
+/// Write a key file at `mode`, refusing to follow a pre-existing symlink the
+/// way [`crate::config::write_atomic`] does for the main config.
+///
+/// Two callers: the 32-byte Noise static here, and tcr's own tailnet node's
+/// key file (`crate::peer::tailnet_node::write_key_file`), which needs the same
+/// 0600-on-a-fresh-inode, never-overwrite rule and not the library's own
+/// writer (it leaves the process umask, 0644, upstream issue #449).
 ///
 /// `create_new` (`O_EXCL`) is what makes that sentence true, and it became
 /// true late: the previous `create(true)` FOLLOWED a symlink on
@@ -256,7 +261,7 @@ fn public_from_secret(secret: &[u8; 32]) -> Result<[u8; 32]> {
 /// nothing.) `open(2)` applies `mode` only on creation, which is the second
 /// thing `O_EXCL` buys: without a guaranteed fresh inode, the 0600 below is
 /// silently ignored for a pre-existing file.
-fn write_key_file(path: &Path, bytes: &[u8; 32], mode: u32) -> Result<()> {
+pub(crate) fn write_key_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     // STAGED beside the destination, then linked into place, because the path
     // appearing is what `load_or_mint` treats as "this node already has a key".
     // Creating the file and then writing it is two steps, and a crash, a full

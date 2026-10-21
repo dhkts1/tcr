@@ -355,6 +355,23 @@ Reaching it tries a few things, in order:
   If neither protocol will open a port, two things still work: forward the peer listener's port
   to this Mac by hand in your router's own settings, or put both Macs on one private network
   (Tailscale, or any VPN they both join) and pair over that.
+- **Your tailnet, with the Tailscale app.** Run `tcr peer tailnet app` on both Macs. On a Mac
+  with no peer port yet it writes one, as `tcr peer find on` does, and that port opens at the
+  next start of the proxy. Every 20
+  seconds the running `tcr` reads the Tailscale app on this Mac, picks out your own other Macs
+  (online, signed in to Tailscale as you, not tagged, not shared in from another tailnet), and
+  sends each one this Mac's beacon over the tailnet: the same instance id, network-key tag and
+  optional name the LAN beacon carries, and nothing else. A Mac that hears it lists this one in
+  `tcr peer ls` with `tailnet` in its sources. It listens for beacons on its own tailnet address
+  only, never on the LAN, and ignores any that do not come from one of your own Macs. A Mac
+  heard both on the LAN and over the tailnet is one row, and Trust dials its tailnet address,
+  because that beacon is the one the Tailscale app vouches for. Trust works over the tailnet
+  because, in app mode, a knock and a first pairing from a tailnet address are answered when
+  they come from one of your own Macs and arrive on this Mac's own tailnet address. Everyone
+  else on the tailnet, a coworker on a shared company tailnet included, still gets nothing back,
+  and the six digits on both screens still decide. A paired Mac reached over its
+  tailnet address shows `direct` or `relayed` (through a Tailscale relay, slower) in
+  `tcr peer status --json`. `tcr peer reach` prints what the running `tcr` last read.
 - **A fallback port that changes with the clock, for the dialling side only.** If
   the address this Mac last saw the peer at stops answering, both sides already know, without
   saying so to each other, a small set of ports that are "accepted" for right now: they are

@@ -155,7 +155,7 @@ allow_attributes_without_reason = "warn"
 
 [package]
 name = "tcr"
-version = "1.2.15"
+version = "1.2.16"
 edition = "2024"
 # The toolchain itself is pinned in rust-toolchain.toml; this is the floor a
 # build with any other toolchain is held to.
@@ -450,6 +450,18 @@ sha2 = "0.11"
 # off, `git diff Cargo.lock` is one line.
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 
+# tcr's own tailnet node (`src/peer/tailnet_node.rs`), behind the `tailnet-node` feature below and
+# only on Apple silicon, the one Mac target the crate supports (no Intel macOS). Gil approved it on
+# 2026-10-20 for source builds only; no release build turns the feature on.
+#
+# Pinned exactly: the crate is pre-1.0 and 0.5.0 and 0.6.0 each broke its Rust API and its key
+# format. It brings `aws-lc-sys`, the C crypto library this repository otherwise avoids
+# (`src/http_client.rs`), and with both rustls providers compiled in rustls refuses to pick one, so
+# `http_client::install_crypto_provider` must run before the first `Device::new`. The one place
+# that calls `Device::new` (`tailnet_node`'s `LibraryFactory::build`) calls it first.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+tailscale = { version = "=0.6.1", optional = true }
+
 [dev-dependencies]
 # Property tests over the peer-mesh wire's parse/decode boundary
 # (`tests/peer_props.rs`). Gil approved this as a dev-dependency on
@@ -464,6 +476,10 @@ tcr = { path = ".", features = ["test-support"] }
 # Compiles `src/test_support` into the library for the integration tests (see the
 # dev-dependency above). Never on in a release build: nothing outside tests enables it.
 test-support = []
+# tcr joins a tailnet as its own node (`tcr peer tailnet node`). Off by default and in release
+# builds. It compiles the node only on Apple silicon (the `tailscale` crate above); on any other
+# target the feature is accepted and does nothing, and `tcr peer tailnet node` is refused.
+tailnet-node = ["dep:tailscale"]
 
 # Incremental compilation is off, and stays off. sccache cannot serve an incremental compile
 # (`sccache --show-stats` lists it under `Non-cacheable reasons: incremental`), so with it on every
