@@ -118,21 +118,54 @@ struct PanelV4<Summary: View, Content: View, Footer: View>: View {
     ///
     /// The footer sits at the bottom of the shared height on every tab, after
     /// a spacer, so Quit stays where it is too.
+    ///
+    /// The Sessions and Tools lists take the spacer's room ahead of it when
+    /// they have rows to fill it with (`View.tabListFrame`), at a layout
+    /// priority above their siblings'. A stack hands a higher-priority child
+    /// everything down to its siblings' MINIMUM heights, so on those two tabs
+    /// the summary and the footer are held at their own heights: without that
+    /// the list took up to two points from the footer and moved its rows
+    /// (measured in the `28-live-list` renders). Only those two: holding the
+    /// Accounts tab's summary and footer too changed how its own list shares
+    /// the room a taller tab leaves, and moved its group boxes by two points
+    /// (scenes 15 and 19).
     private var tabLayers: some View {
         TallestTabLayout {
             ForEach(tabs, id: \.self) { tab in
                 let shown = tab == selected
                 VStack(alignment: .leading, spacing: 0) {
-                    summary(tab)
+                    heldWhereAListFills(summary(tab), on: tab)
                     content(tab)
                     Spacer(minLength: 0)
-                    footer(tab)
+                    heldWhereAListFills(footer(tab), on: tab)
                 }
                 .opacity(shown ? 1 : 0)
                 .allowsHitTesting(shown)
                 .accessibilityHidden(!shown)
                 .disabled(!shown)
             }
+        }
+    }
+
+    /// `part` at its own height on a tab whose list fills the room above the
+    /// footer (`PanelTab.listFillsPanel`), and untouched on every other tab.
+    @ViewBuilder
+    private func heldWhereAListFills<Part: View>(_ part: Part, on tab: PanelTab) -> some View {
+        if tab.listFillsPanel {
+            part.fixedSize(horizontal: false, vertical: true)
+        } else {
+            part
+        }
+    }
+}
+
+extension PanelTab {
+    /// The tabs whose list takes the room a taller tab leaves, down to the
+    /// footer (`View.tabListFrame`).
+    var listFillsPanel: Bool {
+        switch self {
+        case .sessions, .tools: return true
+        case .accounts, .peers: return false
         }
     }
 }
