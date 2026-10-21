@@ -528,7 +528,7 @@ mod tests {
         ] {
             let report = stand_down_build_report(12345, &ours, running.as_ref(), None);
             assert!(
-                report.line.contains("if it runs this version or newer"),
+                report.line.contains("if it runs tcr 1.2.17 or newer"),
                 "first-upgrade guidance: {}",
                 report.line
             );
@@ -553,7 +553,7 @@ mod tests {
             "README run link must resolve"
         );
         assert!(
-            include_str!("../docs/troubleshooting.md").contains("if it runs this version or newer"),
+            include_str!("../docs/troubleshooting.md").contains("if it runs tcr 1.2.17 or newer"),
             "troubleshooting must explain first upgrade"
         );
     }

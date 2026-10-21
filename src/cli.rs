@@ -4793,7 +4793,7 @@ mod tests {
     #[test]
     fn review_guidance_requires_a_compatible_incumbent() {
         assert!(RESTART_HINT.contains("stop it"));
-        assert!(RESTART_HINT.contains("if it runs this version or newer"));
+        assert!(RESTART_HINT.contains("if it runs tcr 1.2.17 or newer"));
     }
     use super::*;
     use crate::oauth::{OAuthError, RefreshFuture};

@@ -9759,8 +9759,7 @@ mod tests {
         // advice having been dropped for everyone.
         let advice = wedged_incumbent_recovery(singleton::ProxyKind::Tcr);
         assert!(
-            advice.contains("Stop the proxy explicitly")
-                && advice.contains("this version or newer"),
+            advice.contains("Stop the proxy explicitly") && advice.contains("tcr 1.2.17 or newer"),
             "standalone recovery must explain when handoff is available: {advice}"
         );
     }

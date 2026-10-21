@@ -659,7 +659,7 @@ final class ChildStderrTests: XCTestCase {
         )
         guard case .takeoverRefused = state else { return XCTFail("wrong state: \(state)") }
         XCTAssertTrue(state.summary.contains("Stop the existing proxy"))
-        XCTAssertTrue(state.summary.contains("this version or newer"))
+        XCTAssertTrue(state.summary.contains("tcr 1.2.17 or newer"))
     }
 
 }

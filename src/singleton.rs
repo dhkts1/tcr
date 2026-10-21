@@ -979,7 +979,7 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
 mod tests {
     #[test]
     fn review_guidance_requires_a_compatible_incumbent() {
-        assert!(stand_down_message(12345, 42).contains("if it runs this version or newer"));
+        assert!(stand_down_message(12345, 42).contains("if it runs tcr 1.2.17 or newer"));
     }
     use super::*;
 
