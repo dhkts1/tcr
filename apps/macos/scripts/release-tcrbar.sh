@@ -521,7 +521,8 @@ quarantine_if_assetless() {
 # The DMG also goes up a second time as TcrBar.dmg. The site's Download buttons
 # (dhkts1.github.io) link to releases/latest/download/TcrBar.dmg, and that "latest" link only
 # resolves an asset whose name is the same on every release; TcrBar-<version>.dmg changes on
-# each one. install.sh keeps using the versioned name.
+# each one. install.sh keeps using the versioned name. check_latest_dmg reads the copy back
+# once the release is latest.
 upload_release_assets() {
   local tag="$1" repo="$2" dmg="$3" appcast="$4" check latest_dmg
   latest_dmg="$(dirname "$dmg")/TcrBar.dmg"
@@ -544,17 +545,27 @@ upload_release_assets() {
   fi
   rm -rf "$check"
   note "the release's appcast.xml is this release's own (read back and compared)"
-  # After the appcast, which is the worse failure (no update offered to anyone).
+}
+
+# Read TcrBar.dmg back from the release and compare it with the built DMG. Called once the
+# release is already latest, and it only warns: a missing copy costs the site's Download link,
+# never the update, so it must not hold a release back or turn a published one into a failure
+# exit (see report_release_outcome). The warning carries the one command that repairs it.
+check_latest_dmg() {
+  local tag="$1" repo="$2" dmg="$3" check
   check="$(mktemp -d)"
-  if ! gh release download "$tag" --repo "$repo" --pattern TcrBar.dmg --dir "$check" >/dev/null 2>&1 \
-    || ! cmp -s "$check/TcrBar.dmg" "$dmg"; then
+  if gh release download "$tag" --repo "$repo" --pattern TcrBar.dmg --dir "$check" >/dev/null 2>&1 \
+    && cmp -s "$check/TcrBar.dmg" "$dmg"; then
     rm -rf "$check"
-    die "$tag does not carry this release's DMG as TcrBar.dmg, so the site's Download button would miss it." \
-        "  Upload it:" \
-        "    gh release upload $tag '$latest_dmg' --clobber --repo $repo"
+    note "the release's TcrBar.dmg is this release's DMG (read back and compared)"
+    return 0
   fi
   rm -rf "$check"
-  note "the release's TcrBar.dmg is this release's DMG (read back and compared)"
+  printf '::warning::%s does not carry this release'"'"'s DMG as TcrBar.dmg, so releases/latest/download/TcrBar.dmg (the site'"'"'s Download button) misses it\n' "$tag"
+  printf 'WARNING: %s\n' "$tag does not carry this release's DMG as TcrBar.dmg; the update is unaffected." \
+    "  The site's Download button links to releases/latest/download/TcrBar.dmg. Repair it:" \
+    "    cp '$dmg' '$(dirname "$dmg")/TcrBar.dmg'" \
+    "    gh release upload $tag '$(dirname "$dmg")/TcrBar.dmg' --clobber --repo $repo" >&2
 }
 
 # Runs quarantine_if_assetless in the background every 10s for the whole
@@ -975,6 +986,7 @@ main() {
              "  Flip it by hand:" \
              "    gh release edit $tag --prerelease=false --latest --repo $repo"
     note "uploaded to https://github.com/$repo/releases/tag/$tag"
+    check_latest_dmg "$tag" "$repo" "$dmg"
   fi
 
   report_release_outcome "$tag" "$dry_run"

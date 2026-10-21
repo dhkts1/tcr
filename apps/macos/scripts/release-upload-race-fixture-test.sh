@@ -97,6 +97,8 @@ run_case() {
     # shellcheck source=SCRIPTDIR/release-tcrbar.sh
     source "$real_script"
     upload_release_assets v9.9.9 acme/tcrbar "$work/TcrBar-9.9.9.dmg" "$work/new/appcast.xml"
+    # main() runs this once the release is latest; it only ever warns.
+    check_latest_dmg v9.9.9 acme/tcrbar "$work/TcrBar-9.9.9.dmg"
   ) >"$work/$name.out" 2>&1
   local rc=$?
   set -e
@@ -116,7 +118,8 @@ fi
 #    fixed name the site's releases/latest/download/TcrBar.dmg link resolves.
 rc=$(run_case clean)
 if [ "$rc" = 0 ] && [ "$(cat "$work/clean/uploads")" = 1 ] \
-  && grep -q 'read back and compared' "$work/clean.out" \
+  && grep -q 'appcast.xml is this release.s own' "$work/clean.out" \
+  && grep -q 'TcrBar.dmg is this release.s DMG' "$work/clean.out" \
   && cmp -s "$work/clean/assets/TcrBar.dmg" "$work/TcrBar-9.9.9.dmg" \
   && cmp -s "$work/clean/assets/TcrBar-9.9.9.dmg" "$work/TcrBar-9.9.9.dmg"; then
   pass "without a race it uploads once, reads the appcast back, and carries the DMG under both names"
@@ -124,10 +127,13 @@ else
   fail "clean: rc=$rc assets=$(ls "$work/clean/assets" 2>/dev/null | tr '\n' ' ') output: $(cat "$work/clean.out")"
 fi
 
-# 5. The upload exits 0 but TcrBar.dmg never lands: must refuse, naming the missing file.
+# 5. The upload exits 0 but TcrBar.dmg never lands: a loud warning with the repair command,
+#    and still exit 0, because the update itself is fine and must not be held back.
 rc=$(run_case nolatest STUB_SKIP=TcrBar.dmg)
-if [ "$rc" != 0 ] && grep -q 'as TcrBar.dmg' "$work/nolatest.out"; then
-  pass "a release missing TcrBar.dmg is refused, not reported as uploaded"
+if [ "$rc" = 0 ] && grep -q '^::warning::v9.9.9 does not carry' "$work/nolatest.out" \
+  && grep -q 'gh release upload v9.9.9 .*TcrBar.dmg' "$work/nolatest.out" \
+  && ! grep -q 'TcrBar.dmg is this release.s DMG' "$work/nolatest.out"; then
+  pass "a release missing TcrBar.dmg warns with the repair command and does not fail the release"
 else
   fail "nolatest: rc=$rc output: $(cat "$work/nolatest.out")"
 fi

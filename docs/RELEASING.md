@@ -209,7 +209,9 @@ upgrade notice. Copy them into the first release that ships Codex pooling.
    twice: as `TcrBar-<version>.dmg`, which `install.sh` downloads, and as `TcrBar.dmg`, so that
    `releases/latest/download/TcrBar.dmg` (the site's Download button) always names the newest
    one. GitHub's `latest` link resolves an asset by exact name, which a versioned name defeats.
-   `TcrBar.dmg` and `appcast.xml` are read back from the release and compared with the local files.
+   `appcast.xml` is read back and compared before the release is marked latest; `TcrBar.dmg` is
+   read back after, and a mismatch only warns with the repair command, because it costs the
+   site's link and never the update.
 10. **Publish the feed** — outside `release-tcrbar.sh` (which makes no git writes): once that
     `<item>` is committed to main, `apps/macos/scripts/publish-appcast-feed.sh` pushes it to
     `gh-pages`. `ship-release.sh` runs it; a hand release has to. This is the step
