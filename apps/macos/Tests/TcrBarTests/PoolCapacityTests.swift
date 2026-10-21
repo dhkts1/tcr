@@ -507,7 +507,7 @@ final class PoolCapacityTests: XCTestCase {
         XCTAssertEqual(
             state.tooltipSentence(cupPool: .emptier, now: fixtureNow),
             "Claude · 0 of 2 accounts ready · 1 near their limit · next in 3d\n"
-                + "Codex · 0 of 2 accounts ready · next in 3d 4h · shown on the cup")
+                + "Codex · 0 of 2 accounts ready · next in 3d 4h · shown on the icon")
     }
 
     /// A pool with no enabled account is out of the count and out of the cup, and a pin to
@@ -552,7 +552,7 @@ final class PoolCapacityTests: XCTestCase {
         }
         XCTAssertEqual(
             state.tooltipSentence(cupPool: .emptier, now: fixtureNow),
-            "Claude · 3 of 4 accounts ready · shown on the cup\nCodex · 2 parked")
+            "Claude · 3 of 4 accounts ready · shown on the icon\nCodex · 2 parked")
     }
 
     /// In a fleet holding both providers, Settings can pin the cup to one pool. The count
@@ -578,18 +578,18 @@ final class PoolCapacityTests: XCTestCase {
         XCTAssertEqual(
             state.menuBarToolTip(
                 awake: true, showRunningTools: false, knocks: 0, cupPool: .emptier, now: fixtureNow),
-            "Claude · 0 of 2 accounts ready · next in 2h 39m · shown on the cup\n"
+            "Claude · 0 of 2 accounts ready · next in 2h 39m · shown on the icon\n"
                 + "Codex · 1 of 2 accounts ready\nKeeping this Mac awake")
         XCTAssertEqual(
             state.menuBarToolTip(
                 awake: true, showRunningTools: false, knocks: 0, cupPool: .codex, now: fixtureNow),
             "Claude · 0 of 2 accounts ready · next in 2h 39m\n"
-                + "Codex · 1 of 2 accounts ready · shown on the cup\nKeeping this Mac awake")
+                + "Codex · 1 of 2 accounts ready · shown on the icon\nKeeping this Mac awake")
         XCTAssertEqual(
             state.menuBarToolTip(
                 awake: false, showRunningTools: false, knocks: 0, cupPool: .emptier,
                 now: fixtureNow),
-            "Claude · 0 of 2 accounts ready · next in 2h 39m · shown on the cup\n"
+            "Claude · 0 of 2 accounts ready · next in 2h 39m · shown on the icon\n"
                 + "Codex · 1 of 2 accounts ready")
         let knocked = state.menuBarToolTip(
             awake: false, showRunningTools: false, knocks: 1, cupPool: .emptier, now: fixtureNow)
@@ -618,7 +618,7 @@ final class PoolCapacityTests: XCTestCase {
             state.menuBarToolTip(
                 awake: true, showRunningTools: true, knocks: 1, cupPool: .emptier, now: fixtureNow),
             "1 Mac is asking to connect. Open the Peers tab to answer it.\n"
-                + "Claude · 0 of 2 accounts ready · next in 2h 39m · shown on the cup\n"
+                + "Claude · 0 of 2 accounts ready · next in 2h 39m · shown on the icon\n"
                 + "Codex · 1 of 2 accounts ready\n"
                 + "2 tools running · Keeping this Mac awake")
     }

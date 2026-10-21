@@ -269,7 +269,7 @@ enum RenderSettings {
     }
 
     /// The panes that draw something of their own over a fleet holding both
-    /// Claude and Codex accounts: Menu Bar's "Cup shows" row and its counts
+    /// Claude and Codex accounts: Menu Bar's "Icon shows" row and its counts
     /// caption, and Peers, whose promises name Claude and whose Sharing head says
     /// that Codex requests always leave from this Mac; General's Codex row under
     /// Server, Updates' flag on a command-line tcr that predates Codex accounts, and

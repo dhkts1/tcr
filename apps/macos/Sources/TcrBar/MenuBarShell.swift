@@ -90,7 +90,7 @@ final class MenuBarShell {
     /// the Settings window happens to be open.
     let runningToolsPreference: ShowRunningToolsPreference
     let defaultTabPreference: DefaultTabPreference
-    /// "Cup shows" (Settings window, Menu Bar pane): which pool the cup follows
+    /// "Icon shows" (Settings window, Menu Bar pane): which pool the cup follows
     /// in a fleet holding both Claude and Codex accounts. Owned here for the
     /// same reason as `countsPreference`: the mark it steers is composed on
     /// every poll tick, not just while the Settings window is open.
@@ -266,7 +266,7 @@ final class MenuBarShell {
         // The knock count is combined in here for the same reason the other
         // three are: the mark is recomposed whenever ANY of them changes, and
         // a knock arriving between two polls must move the bar without
-        // waiting for an account figure to change. "Cup shows" joins them for
+        // waiting for an account figure to change. "Icon shows" joins them for
         // the same reason: picking a pool must move the cup at once.
         self.poller.$state
             .combineLatest(self.awake.$isOn, self.countsPreference.$showCounts)
@@ -423,7 +423,7 @@ final class MenuBarShell {
     /// Which colour the one coffee-cup glyph wears. `PollState.capacityTintKind(awake:cupPool:)`
     /// (`TcrBarCore/StatusPoller.swift`) is the whole decision — testable there,
     /// against no `NSColor` at all — and this is the one place `Tok`'s actual
-    /// colours attach to it. `cupPool` is "Cup shows": in a fleet holding Codex
+    /// colours attach to it. `cupPool` is "Icon shows": in a fleet holding Codex
     /// accounts the colour follows the same pool the fill does.
     static func cupTint(
         for state: PollState, awake: Bool, cupPool: MenuBarCupPool
@@ -606,22 +606,13 @@ final class MenuBarShell {
         knocks: Int, cupPool: MenuBarCupPool
     ) {
         guard let button = statusItem.button else { return }
-        if let mark = MenuBarMark.image(
+        button.image = MenuBarMark.image(
             fraction: state.capacityFraction(cupPool: cupPool),
             tint: Self.cupTint(for: state, awake: isOn, cupPool: cupPool),
             knocks: knocks, fleet: state.loadedFleet)
-        {
-            button.image = mark
-            button.attributedTitle = Self.markTitle(
-                state: state, showCounts: showCounts, showRunningTools: showRunningTools,
-                knocks: knocks)
-        } else if button.image == nil {
-            // Only reachable if an SF Symbol this build names has gone missing.
-            // A status item with neither image nor title is zero points wide and
-            // invisible, which reads as "the app did not launch" — so say
-            // something rather than disappear.
-            button.title = "tcr"
-        }
+        button.attributedTitle = Self.markTitle(
+            state: state, showCounts: showCounts, showRunningTools: showRunningTools,
+            knocks: knocks)
         button.toolTip = Self.toolTip(
             state: state, awake: isOn, showRunningTools: showRunningTools, knocks: knocks,
             cupPool: cupPool)

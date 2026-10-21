@@ -2,7 +2,7 @@ import XCTest
 
 @testable import TcrBarCore
 
-/// Settings › Menu Bar › "Cup shows": which pool the menu-bar cup follows in a fleet that
+/// Settings › Menu Bar › "Icon shows": which pool the menu-bar cup follows in a fleet that
 /// holds both Claude and Codex accounts. The same storage shape as
 /// `MenuBarCountsPreferenceTests`, with the default the cup needs: the emptier pool.
 @MainActor
@@ -48,17 +48,17 @@ final class MenuBarCupPoolPreferenceTests: XCTestCase {
 
     /// The row's words, verbatim.
     func testTheSettingsWordsAreVerbatim() {
-        XCTAssertEqual(MenuBarCupPool.settingsLabel, "Cup shows")
+        XCTAssertEqual(MenuBarCupPool.settingsLabel, "Icon shows")
         XCTAssertEqual(
             MenuBarCupPool.allCases.map(\.title),
             ["Whichever pool is emptier", "Claude accounts", "Codex accounts"])
         XCTAssertEqual(
             MenuBarCupPool.settingsCaption,
-            "With Claude and Codex accounts, the cup fills to the pool with less ready. "
+            "With Claude and Codex accounts, the icon lights its rays for the pool with less ready. "
                 + "The count beside it shows both, Claude first.")
         XCTAssertEqual(
             MenuBarCupPool.mixedCountsCaption,
-            "The cup's fill level already shows capacity; this spells it out as "
+            "The icon's lit rays already show capacity; this spells it out as "
                 + "\u{201c}9/13 \u{00b7} 2/3\u{201d}, Claude first, in tabular digits.")
     }
 }
