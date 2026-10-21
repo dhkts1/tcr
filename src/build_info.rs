@@ -536,7 +536,7 @@ mod tests {
         }
         let cli = include_str!("../docs/cli.md");
         for clause in [
-            "30-second ceiling",
+            "five-minute ceiling",
             "HTTP/2 receives GOAWAY",
             "cannot refresh tokens after releasing ownership",
             "failed handshake shuts it down",

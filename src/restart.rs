@@ -16,8 +16,34 @@ const REQUEST: &[u8] = b"tcr-replace/2\n";
 const RECEIPT: &[u8] = b"listener-received\n";
 const RELEASED: &[u8] = b"listener-released\n";
 const TIMEOUT: Duration = Duration::from_secs(15);
-/// Total time the predecessor may spend handing off and draining.
-pub const DRAIN_CEILING: Duration = Duration::from_secs(30);
+/// Total time the predecessor may spend handing off and draining. Minutes, not
+/// seconds: a thinking response can stream for minutes, and the drain is what
+/// lets it finish on the old process instead of being cut off.
+pub const DRAIN_CEILING: Duration = Duration::from_secs(300);
+
+/// Milliseconds that replace [`DRAIN_CEILING`] for one process. For tests only:
+/// a test that holds a connection open forever would otherwise wait out the
+/// full ceiling.
+pub const DRAIN_CEILING_TEST_ENV: &str = "TCR_TEST_DRAIN_CEILING_MS";
+
+/// The drain ceiling this process uses: [`DRAIN_CEILING`], unless
+/// [`DRAIN_CEILING_TEST_ENV`] holds a whole number of milliseconds. A value that
+/// does not parse is reported and ignored.
+pub fn drain_ceiling() -> Duration {
+    let Some(value) = std::env::var_os(DRAIN_CEILING_TEST_ENV) else {
+        return DRAIN_CEILING;
+    };
+    match value.to_str().map(str::parse::<u64>) {
+        Some(Ok(ms)) => Duration::from_millis(ms),
+        _ => {
+            tracing::warn!(
+                value = %value.to_string_lossy(),
+                "{DRAIN_CEILING_TEST_ENV} is not a whole number of milliseconds; using the default drain ceiling"
+            );
+            DRAIN_CEILING
+        }
+    }
+}
 
 fn current_uid() -> u32 {
     tcr_fdpass::effective_uid()

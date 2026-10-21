@@ -19,6 +19,10 @@ struct Proxy {
 
 impl Proxy {
     fn spawn(home: &Path, port: u16, replace: bool) -> Self {
+        Self::spawn_with_env(home, port, replace, &[])
+    }
+
+    fn spawn_with_env(home: &Path, port: u16, replace: bool, env: &[(&str, &str)]) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_tcr"));
         cmd.args([
             "server",
@@ -37,6 +41,7 @@ impl Proxy {
         if replace {
             cmd.arg("--replace");
         }
+        cmd.envs(env.iter().copied());
         let mut child = cmd.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = mpsc::channel();
@@ -463,15 +468,24 @@ fn wait_exit(proxy: &mut Proxy, seconds: u64) {
     }
 }
 
+/// The predecessor's ceiling is shortened to 3 s here (the real one is minutes,
+/// which a test cannot wait out): it must be gone shortly after it.
 #[test]
 fn a_never_ending_tunnel_has_a_drain_ceiling() {
+    const CEILING: Duration = Duration::from_secs(3);
     let home = scratch_home();
-    let mut old = Proxy::spawn(home.path(), 0, false);
+    let ceiling_ms = CEILING.as_millis().to_string();
+    let mut old = Proxy::spawn_with_env(
+        home.path(),
+        0,
+        false,
+        &[(tcr::restart::DRAIN_CEILING_TEST_ENV, &ceiling_ms)],
+    );
     let addr = old.ready();
     let _held = held_tunnel(addr);
     let mut successor = Proxy::spawn(home.path(), addr.port(), true);
     successor.ready();
-    wait_exit(&mut old, tcr::restart::DRAIN_CEILING.as_secs() + 10);
+    wait_exit(&mut old, CEILING.as_secs() + 10);
 }
 
 #[test]

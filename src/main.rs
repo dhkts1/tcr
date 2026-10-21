@@ -8616,7 +8616,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         let Some(peer) = successor.take() else {
             break;
         };
-        let deadline = tokio::time::Instant::now() + tcr::restart::DRAIN_CEILING;
+        let deadline = tokio::time::Instant::now() + tcr::restart::drain_ceiling();
         let result = tokio::select! {
             result = handle.handoff(&peer) => result,
             _ = tokio::signal::ctrl_c() => break,

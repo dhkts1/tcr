@@ -52,7 +52,7 @@ By default, starting a second `tcr` while one is already serving does **not** di
 incumbent: the new process stands down and exits. With `--replace`, a current standalone
 `tcr` hands its listening socket to the new process. The port stays bound, new connections
 queue until the successor is ready, and the predecessor stays alive until its accepted
-connections finish, up to a 30-second ceiling for the entire handoff and drain. HTTP/1
+connections finish, up to a five-minute ceiling for the entire handoff and drain. HTTP/1
 connections close after their in-flight response; HTTP/2 receives GOAWAY. Blind CONNECT
 streams can continue until that ceiling, a termination signal, or EOF. The old process
 cannot refresh tokens after releasing ownership. It flushes pins, bound tokens and the
