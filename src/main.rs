@@ -8496,6 +8496,21 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         server::ServeOutcome::Started(handle) => handle,
         // A binary may exit; the library returned this as a value.
         server::ServeOutcome::StoodDown(stand_down) => {
+            // `--replace` serves with the never-signal policy, which stands down
+            // without reaching `takeover_port`, the only other place that prints
+            // the marker line TcrBar reads to tell a stand-down from a crash.
+            if args.replace {
+                eprintln!(
+                    "{}",
+                    singleton::stand_down_notice(
+                        stand_down.port,
+                        singleton::Incumbent {
+                            pid: stand_down.pid,
+                            kind: stand_down.kind,
+                        },
+                    )
+                );
+            }
             drop(restart_endpoint);
             stand_down_exit(&stand_down, file_log)
         }

@@ -871,6 +871,19 @@ fn embedded_stand_down_message(port: u16, pid: u32) -> String {
     )
 }
 
+/// The stand-down line for `incumbent` on `port`, carrying [`INCUMBENT_MARKER`].
+/// An embedded incumbent gets the line that names its host application instead
+/// of offering `--replace`. [`takeover_port`] prints it; a caller that stands
+/// down without going through `takeover_port` (the CLI's `--replace`, which
+/// serves with the never-signal policy) prints it itself.
+pub fn stand_down_notice(port: u16, incumbent: Incumbent) -> String {
+    if incumbent.kind == ProxyKind::TcrEmbedded {
+        embedded_stand_down_message(port, incumbent.pid)
+    } else {
+        stand_down_message(port, incumbent.pid)
+    }
+}
+
 /// Resolve `port` down to one proxy for this server.
 ///
 /// With `replace`, a recognized proxy incumbent is terminated (SIGTERM, then
@@ -911,11 +924,7 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
         // `replaceable` for the same predicate: two copies of "is this one
         // embedded?" is how the generic message — which offers `--replace` — ends
         // up printed for the one kind `--replace` cannot take over.
-        if incumbent.kind == ProxyKind::TcrEmbedded {
-            eprintln!("{}", embedded_stand_down_message(port, incumbent.pid));
-        } else {
-            eprintln!("{}", stand_down_message(port, incumbent.pid));
-        }
+        eprintln!("{}", stand_down_notice(port, incumbent));
     }
 
     // Not `else`: standing down for an EMBEDDED incumbent still lets an explicit
