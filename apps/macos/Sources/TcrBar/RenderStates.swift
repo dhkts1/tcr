@@ -4575,12 +4575,12 @@ enum RenderStates {
             sessionsSupported: true)
     }
 
-    /// Twenty-four accounts and as many working sessions, ten of them with a
+    /// Twenty-four accounts and forty working sessions, ten of them with a
     /// call running and each with a slow call today: an Accounts list at its
-    /// budget, and a Sessions list and a Tools list each longer than the panel
-    /// has room for, so the Accounts tab, with its strip and buttons, is the
-    /// tallest of the three (``liveListScenes``). Every session has made tool
-    /// calls, so none folds as a warm-up.
+    /// budget, and a Sessions list and a Tools list each longer than the whole
+    /// room the panel has under their summaries, so the Accounts tab, with its
+    /// strip and buttons, is the tallest of the three (``liveListScenes``).
+    /// Every session has made tool calls, so none folds as a warm-up.
     private static var longListsFleet: Fleet {
         let rows = (1...24).map {
             account("acct-\($0)@example.com", quota: "0.\(10 + $0)", state: "ok")
@@ -4589,7 +4589,7 @@ enum RenderStates {
         func msAgo(_ seconds: TimeInterval) -> Int64 {
             Int64(Date().addingTimeInterval(-seconds).timeIntervalSince1970 * 1000)
         }
-        let sessions: [Session] = (0..<24).map { (index: Int) -> Session in
+        let sessions: [Session] = (0..<40).map { (index: Int) -> Session in
             let running: [ToolCall] =
                 index < 10
                 ? [
@@ -4602,8 +4602,14 @@ enum RenderStates {
                 tool: "Bash", commandHead: "swift build -c release --target T\(index)",
                 commandClass: "build", endedMs: msAgo(TimeInterval(600 + index * 60)),
                 seconds: Double(60 + index * 5))
+            // Four sessions with timeouts, so TIMED OUT TODAY draws its card
+            // too: with the Running and Slowest cards folded to their first
+            // rows, it is what takes the Tools list past the panel's room.
+            let timeoutsByClass: [String: Int] =
+                index < 4 ? ["build": 3, "test": 2, "git-net": 1, "wait": 4, "other": 1] : [:]
             let tools = SessionTools(
-                calls: 20 + index, errors: 0, timeouts: 0, running: running, slowest: [slowest])
+                calls: 20 + index, errors: 0, timeouts: timeoutsByClass.values.reduce(0, +),
+                running: running, slowest: [slowest], timeoutsByClass: timeoutsByClass)
             let model = index.isMultiple(of: 3) ? "claude-opus-5" : "claude-sonnet-5"
             let account: String = base.accounts[index % base.accounts.count].name
             return Session(
