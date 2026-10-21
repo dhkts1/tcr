@@ -612,3 +612,68 @@ fn a_tcr_run_alias_does_not_double_run_for_a_nested_codex() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// The caller's env file sets proxy and CA values for shell tools such as `git`.
+/// Sourcing it is not a choice to leave the pool, so a nested `claude` that
+/// inherits exactly those values still reaches the pool with tcr's CA.
+#[test]
+fn an_env_file_proxy_keeps_a_nested_claude_on_the_pool() {
+    let fixture = AgentFixture::new();
+    std::fs::write(
+        fixture.home.path().join("caller.env"),
+        "export HTTPS_PROXY=http://env-file.example:8124\nexport NODE_EXTRA_CA_CERTS=/env/ca.pem\n",
+    )
+    .unwrap();
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"
+if [ "${INNER:-}" = yes ]; then
+    test "$HTTPS_PROXY" = "$EXPECTED_MODEL" || { printf 'nested HTTPS_PROXY=%s\n' "$HTTPS_PROXY" >&2; exit 81; }
+    test "$NODE_EXTRA_CA_CERTS" = "$HOME/.config/tcr-ca.pem" || { printf 'nested NODE_EXTRA_CA_CERTS=%s\n' "$NODE_EXTRA_CA_CERTS" >&2; exit 82; }
+    exit
+fi
+exec "$CLAUDE_CODE_SHELL_PREFIX" '. "$CLAUDE_ENV_FILE"; test "$HTTPS_PROXY" = http://env-file.example:8124; INNER=yes claude'
+"#,
+    );
+    let output = fixture
+        .command()
+        .env("CLAUDE_ENV_FILE", fixture.home.path().join("caller.env"))
+        .env("EXPECTED_MODEL", pooled_model_url(&fixture))
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "a proxy exported by the caller's env file took a nested claude off the pool",
+    );
+}
+
+/// A proxy set on the nested `claude` command itself is an explicit override,
+/// even when the caller's env file exported a different one.
+#[test]
+fn a_command_proxy_overrides_the_pool_for_a_nested_claude() {
+    let fixture = AgentFixture::new();
+    std::fs::write(
+        fixture.home.path().join("caller.env"),
+        "export HTTPS_PROXY=http://env-file.example:8124\n",
+    )
+    .unwrap();
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"
+if [ "${INNER:-}" = yes ]; then
+    test "$HTTPS_PROXY" = http://command.example:9000 || { printf 'nested HTTPS_PROXY=%s\n' "$HTTPS_PROXY" >&2; exit 83; }
+    exit
+fi
+exec "$CLAUDE_CODE_SHELL_PREFIX" '. "$CLAUDE_ENV_FILE"; INNER=yes HTTPS_PROXY=http://command.example:9000 claude'
+"#,
+    );
+    let output = fixture
+        .command()
+        .env("CLAUDE_ENV_FILE", fixture.home.path().join("caller.env"))
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "a proxy set on the nested claude command was not kept as an override",
+    );
+}
