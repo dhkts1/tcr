@@ -307,6 +307,46 @@ final class PanelHeightTests: XCTestCase {
         }
     }
 
+    /// A list that stretches into a taller tab's room stops `gap` above the
+    /// footer, the same gap the Accounts tab leaves above its action row, and
+    /// a list that does not stretch is placed exactly as before.
+    ///
+    /// The defect: stretched to the footer itself, the Sessions list's cut
+    /// row touched "Not supervised by TcrBar" (2.5 pt of ink between them),
+    /// where the Accounts list stops 12 pt above its first footer row.
+    func testAStretchedListStopsTheGapAboveTheFooter() {
+        let gap: CGFloat = 12
+        let stretched = PanelHeight.filledList(
+            offered: 650, viewport: 520, ceiling: 1400, gap: gap)
+        XCTAssertEqual(stretched.list, 638, "the room less the gap")
+        XCTAssertEqual(stretched.occupied, 650, "the gap is its own, not the spacer's")
+
+        let shortContent = PanelHeight.filledList(
+            offered: 650, viewport: 520, ceiling: 560, gap: gap)
+        XCTAssertEqual(shortContent.list, 560, "a list ends at its own last row")
+        XCTAssertEqual(shortContent.occupied, 572)
+
+        let fits = PanelHeight.filledList(offered: 650, viewport: 300, ceiling: 300, gap: gap)
+        XCTAssertEqual(fits.list, 300, "a list that fits is its own height")
+        XCTAssertEqual(fits.occupied, 300, "and takes no gap: the spacer keeps the room")
+    }
+
+    /// Measured with no height, at its minimum, or with less room than the
+    /// gap: the viewport, so the panel's height and the unstretched list never
+    /// change.
+    func testAnUnstretchedListIsItsViewport() {
+        for offered: CGFloat? in [nil, 0, 520, 525, 531.9] {
+            let out = PanelHeight.filledList(
+                offered: offered, viewport: 520, ceiling: 1400, gap: 12)
+            XCTAssertEqual(out.list, 520, "offered \(String(describing: offered))")
+            XCTAssertEqual(out.occupied, 520, "offered \(String(describing: offered))")
+        }
+        let unbounded = PanelHeight.filledList(
+            offered: .infinity, viewport: 520, ceiling: 1400, gap: 12)
+        XCTAssertEqual(unbounded.list, 1400, "the most it can ever take is its content")
+        XCTAssertEqual(unbounded.occupied, 1412)
+    }
+
     /// The budget, not the cap: a wrapped header spends part of it, and the
     /// viewport is clamped to what is left rather than to 520.
     func testTheViewportIsClampedToTheBudgetTheHeaderLeft() {

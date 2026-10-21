@@ -4672,24 +4672,58 @@ extension View {
     /// placement. A fixed height left a list with rows still to scroll to
     /// stopping at the budget on a panel the Accounts tab had made taller, with
     /// the spacer above the footer drawing an empty band under it (1.2.17).
-    /// Now the frame accepts up to ``PanelHeight/viewportMaxHeight(contentHeight:budget:)``,
+    /// Now the list accepts up to ``PanelHeight/viewportMaxHeight(contentHeight:budget:)``,
     /// and the priority hands it that room ahead of the spacer, so the list
-    /// ends at the footer, or at its own last row when that comes first.
+    /// ends `V4.actsMarginTop` above the footer, the gap the Accounts list
+    /// leaves above its action row, or at its own last row when that comes
+    /// first (``PanelHeight/filledList(offered:viewport:ceiling:gap:)``).
     ///
     /// The measurement cannot feed back: the reader sits on the content inside
     /// the scroll view, which is laid out at its own height whatever height the
     /// viewport is given.
     func tabListFrame(contentHeight: CGFloat, budget: CGFloat) -> some View {
-        let viewport = PanelHeight.viewportHeight(contentHeight: contentHeight, budget: budget)
-        return
+        TabListLayout(
+            viewport: PanelHeight.viewportHeight(contentHeight: contentHeight, budget: budget),
+            ceiling: PanelHeight.viewportMaxHeight(contentHeight: contentHeight, budget: budget),
+            gap: V4.actsMarginTop
+        ) {
             self
-            .frame(
-                minHeight: viewport, idealHeight: viewport,
-                maxHeight: PanelHeight.viewportMaxHeight(
-                    contentHeight: contentHeight, budget: budget),
-                alignment: .top
-            )
-            .layoutPriority(1)
+        }
+        .layoutPriority(1)
+    }
+}
+
+/// Sizes and places one list by ``PanelHeight/filledList(offered:viewport:ceiling:gap:)``:
+/// the list at its viewport when measured, stretched toward its content when
+/// offered more, and the gap under a stretched list kept as part of its own
+/// height so the spacer below cannot take it.
+struct TabListLayout: Layout {
+    let viewport: CGFloat
+    let ceiling: CGFloat
+    let gap: CGFloat
+
+    private func filled(_ proposal: ProposedViewSize) -> PanelHeight.FilledList {
+        PanelHeight.filledList(
+            offered: proposal.height, viewport: viewport, ceiling: ceiling, gap: gap)
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width =
+            proposal.width
+            ?? subviews.first?.sizeThatFits(ProposedViewSize(width: nil, height: viewport)).width
+            ?? 0
+        return CGSize(width: width, height: filled(proposal).occupied)
+    }
+
+    func placeSubviews(
+        in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
+    ) {
+        let list = filled(ProposedViewSize(width: bounds.width, height: bounds.height)).list
+        for subview in subviews {
+            subview.place(
+                at: bounds.origin, anchor: .topLeading,
+                proposal: ProposedViewSize(width: bounds.width, height: list))
+        }
     }
 }
 
