@@ -33,16 +33,14 @@ pub fn drain_ceiling() -> Duration {
     let Some(value) = std::env::var_os(DRAIN_CEILING_TEST_ENV) else {
         return DRAIN_CEILING;
     };
-    match value.to_str().map(str::parse::<u64>) {
-        Some(Ok(ms)) => Duration::from_millis(ms),
-        _ => {
-            tracing::warn!(
-                value = %value.to_string_lossy(),
-                "{DRAIN_CEILING_TEST_ENV} is not a whole number of milliseconds; using the default drain ceiling"
-            );
-            DRAIN_CEILING
-        }
-    }
+    let Some(Ok(ms)) = value.to_str().map(str::parse::<u64>) else {
+        tracing::warn!(
+            value = %value.to_string_lossy(),
+            "{DRAIN_CEILING_TEST_ENV} is not a whole number of milliseconds; using the default drain ceiling"
+        );
+        return DRAIN_CEILING;
+    };
+    Duration::from_millis(ms)
 }
 
 fn current_uid() -> u32 {
