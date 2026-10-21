@@ -478,8 +478,17 @@ impl ServerHandle {
     /// transfer the still-bound listener. The receiver starts only after the
     /// existing handoff ownership gate has been released.
     pub async fn handoff(&mut self, peer: &std::os::unix::net::UnixStream) -> anyhow::Result<()> {
-        crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
         let deadline = tokio::time::Instant::now() + DEFAULT_SHUTDOWN_GRACE;
+        self.flush_cache_finally(SavedCache::BoundTokens);
+        self.flush_cache_finally(SavedCache::WireSessions);
+        let listener = self.listener.as_ref().context("no listener to hand over")?;
+        crate::handoff::complete_handoff(
+            &self.manager,
+            self.affinity_path.as_deref(),
+            listener,
+            peer,
+        )?;
+        crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
         // The controller also mutates hardware and saves its wish. Finish its
         // last save before the successor can take ownership and save Auto;
         // accepted connections may keep draining after that release.
@@ -493,15 +502,6 @@ impl ServerHandle {
             anyhow::ensure!(stopped, "fan control did not stop before handoff");
         }
         self.stop_tasks(deadline).await;
-        self.flush_cache_finally(SavedCache::BoundTokens);
-        self.flush_cache_finally(SavedCache::WireSessions);
-        let listener = self.listener.as_ref().context("no listener to hand over")?;
-        crate::handoff::complete_handoff(
-            &self.manager,
-            self.affinity_path.as_deref(),
-            listener,
-            peer,
-        )?;
         crate::restart::wait_for_listener_receipt(peer).await?;
         self.listener.take();
         crate::restart::confirm_listener_released(peer)?;
