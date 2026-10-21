@@ -517,11 +517,18 @@ quarantine_if_assetless() {
 #
 # Then read the asset back and compare it byte for byte with the local file. gh's exit status
 # says the upload went through, not what the release ends up serving.
+#
+# The DMG also goes up a second time as TcrBar.dmg. The site's Download buttons
+# (dhkts1.github.io) link to releases/latest/download/TcrBar.dmg, and that "latest" link only
+# resolves an asset whose name is the same on every release; TcrBar-<version>.dmg changes on
+# each one. install.sh keeps using the versioned name.
 upload_release_assets() {
-  local tag="$1" repo="$2" dmg="$3" appcast="$4" check
-  if ! gh release upload "$tag" "$dmg" "$appcast" --clobber --repo "$repo"; then
+  local tag="$1" repo="$2" dmg="$3" appcast="$4" check latest_dmg
+  latest_dmg="$(dirname "$dmg")/TcrBar.dmg"
+  cp "$dmg" "$latest_dmg"
+  if ! gh release upload "$tag" "$dmg" "$latest_dmg" "$appcast" --clobber --repo "$repo"; then
     note "upload failed once; retrying (the appcast guard can attach its copy between gh's --clobber check and its upload)"
-    gh release upload "$tag" "$dmg" "$appcast" --clobber --repo "$repo" \
+    gh release upload "$tag" "$dmg" "$latest_dmg" "$appcast" --clobber --repo "$repo" \
       || die "gh release upload failed for $tag."
   fi
   check="$(mktemp -d)"
@@ -537,6 +544,17 @@ upload_release_assets() {
   fi
   rm -rf "$check"
   note "the release's appcast.xml is this release's own (read back and compared)"
+  # After the appcast, which is the worse failure (no update offered to anyone).
+  check="$(mktemp -d)"
+  if ! gh release download "$tag" --repo "$repo" --pattern TcrBar.dmg --dir "$check" >/dev/null 2>&1 \
+    || ! cmp -s "$check/TcrBar.dmg" "$dmg"; then
+    rm -rf "$check"
+    die "$tag does not carry this release's DMG as TcrBar.dmg, so the site's Download button would miss it." \
+        "  Upload it:" \
+        "    gh release upload $tag '$latest_dmg' --clobber --repo $repo"
+  fi
+  rm -rf "$check"
+  note "the release's TcrBar.dmg is this release's DMG (read back and compared)"
 }
 
 # Runs quarantine_if_assetless in the background every 10s for the whole
@@ -904,8 +922,10 @@ main() {
             "    gh run list --repo $repo --branch $tag" \
             "  The DMG is built, notarized and stapled at:" \
             "    $dmg" \
-            "  Re-run with --verify-only, or upload by hand once it appears:" \
-            "    gh release upload $tag '$dmg' '$appcast_path' --clobber --repo $repo"
+            "  Re-run with --verify-only, or upload by hand once it appears" \
+            "  (TcrBar.dmg is the copy the site's Download button links to):" \
+            "    cp '$dmg' '$(dirname "$dmg")/TcrBar.dmg'" \
+            "    gh release upload $tag '$dmg' '$(dirname "$dmg")/TcrBar.dmg' '$appcast_path' --clobber --repo $repo"
       fi
       # `${tag}`, braced. A bare `$tag` here was followed directly by the UTF-8
       # ellipsis, and the shell read that character's leading byte as part of the

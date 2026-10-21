@@ -46,7 +46,11 @@ case "$1 $2" in
     fi
     # An upload that reports success and changes nothing: the case only a read-back catches.
     [ "${STUB_UPLOAD_NOOP:-0}" = 1 ] && exit 0
-    for f in "${files[@]}"; do cp "$f" "$state/assets/$(basename "$f")"; done
+    for f in "${files[@]}"; do
+      # STUB_SKIP drops one named file: an upload that loses an asset and still exits 0.
+      [ "$(basename "$f")" = "${STUB_SKIP:-}" ] && continue
+      cp "$f" "$state/assets/$(basename "$f")"
+    done
     ;;
   "release download")
     shift 3
@@ -108,13 +112,24 @@ else
   fail "race: rc=$rc uploads=$(cat "$work/race/uploads" 2>/dev/null) output: $(cat "$work/race.out")"
 fi
 
-# 2. No race: one upload, verified.
+# 2. No race: one upload, verified, and the DMG is also on the release as TcrBar.dmg, the
+#    fixed name the site's releases/latest/download/TcrBar.dmg link resolves.
 rc=$(run_case clean)
 if [ "$rc" = 0 ] && [ "$(cat "$work/clean/uploads")" = 1 ] \
-  && grep -q 'read back and compared' "$work/clean.out"; then
-  pass "without a race it uploads once and still reads the appcast back"
+  && grep -q 'read back and compared' "$work/clean.out" \
+  && cmp -s "$work/clean/assets/TcrBar.dmg" "$work/TcrBar-9.9.9.dmg" \
+  && cmp -s "$work/clean/assets/TcrBar-9.9.9.dmg" "$work/TcrBar-9.9.9.dmg"; then
+  pass "without a race it uploads once, reads the appcast back, and carries the DMG under both names"
 else
-  fail "clean: rc=$rc output: $(cat "$work/clean.out")"
+  fail "clean: rc=$rc assets=$(ls "$work/clean/assets" 2>/dev/null | tr '\n' ' ') output: $(cat "$work/clean.out")"
+fi
+
+# 5. The upload exits 0 but TcrBar.dmg never lands: must refuse, naming the missing file.
+rc=$(run_case nolatest STUB_SKIP=TcrBar.dmg)
+if [ "$rc" != 0 ] && grep -q 'as TcrBar.dmg' "$work/nolatest.out"; then
+  pass "a release missing TcrBar.dmg is refused, not reported as uploaded"
+else
+  fail "nolatest: rc=$rc output: $(cat "$work/nolatest.out")"
 fi
 
 # 3. The upload reports success but the release still serves the guard's copy: must refuse.

@@ -205,7 +205,11 @@ upgrade notice. Copy them into the first release that ships Codex pooling.
 7. **Sparkle signature** — `sign_update` produces the EdDSA signature and byte length.
 8. **Appcast** — a new `<item>` is inserted at the marker comment in `apps/macos/appcast.xml`.
 9. **Publish** — `gh release upload` puts the DMG and `appcast.xml` on the release for the tag,
-   all while the release is marked prerelease. Only then is it marked latest.
+   all while the release is marked prerelease. Only then is it marked latest. The DMG goes up
+   twice: as `TcrBar-<version>.dmg`, which `install.sh` downloads, and as `TcrBar.dmg`, so that
+   `releases/latest/download/TcrBar.dmg` (the site's Download button) always names the newest
+   one. GitHub's `latest` link resolves an asset by exact name, which a versioned name defeats.
+   `TcrBar.dmg` and `appcast.xml` are read back from the release and compared with the local files.
 10. **Publish the feed** — outside `release-tcrbar.sh` (which makes no git writes): once that
     `<item>` is committed to main, `apps/macos/scripts/publish-appcast-feed.sh` pushes it to
     `gh-pages`. `ship-release.sh` runs it; a hand release has to. This is the step
