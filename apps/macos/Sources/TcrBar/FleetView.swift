@@ -74,6 +74,17 @@ struct FleetView: View {
     /// whatever the panel happens to show. Runtime is untouched — the default is
     /// `false` and the live panel still scrolls.
     var snapshotMode: Bool = false
+    /// Keep the live `ScrollView` lists in `snapshotMode`, for the harness's
+    /// window-hosted scenes only (`RenderStates.liveListScenes`).
+    ///
+    /// Those scenes draw the panel in a real window and capture what the window
+    /// server composited, so the scroll views do draw there, and the clipped
+    /// list is the thing they exist to show: where a list that overflows ends
+    /// against the footer. Everything else `snapshotMode` pins stays pinned.
+    var snapshotKeepsScrollViews: Bool = false
+    /// The Accounts, Sessions and Tools lists drawn as plain stacks
+    /// (``snapshotMode``) rather than in their scroll views.
+    private var listsUnscrolled: Bool { snapshotMode && !snapshotKeepsScrollViews }
     /// Opens the "What's new" window. A closure rather than the controller so
     /// the render harness passes `{}` and can neither fetch nor open anything.
     var onWhatsNew: () -> Void = {}
@@ -338,6 +349,7 @@ struct FleetView: View {
         codexBannerSnapshot: CodexBannerSnapshot? = nil,
         bundledTcrWithoutCLI: String? = nil,
         snapshotMode: Bool = false,
+        snapshotKeepsScrollViews: Bool = false,
         onWhatsNew: @escaping () -> Void = {},
         onSettings: @escaping () -> Void = {},
         runOpenPanel: @escaping (NSOpenPanel) -> URL? = { _ in nil },
@@ -428,6 +440,7 @@ struct FleetView: View {
         self.codexNotes = codexNotes ?? CodexNoteStore()
         self.bundledTcrWithoutCLI = bundledTcrWithoutCLI
         self.snapshotMode = snapshotMode
+        self.snapshotKeepsScrollViews = snapshotKeepsScrollViews
         self.onWhatsNew = onWhatsNew
         self.onSettings = onSettings
         self.runOpenPanel = runOpenPanel
@@ -893,7 +906,7 @@ struct FleetView: View {
                 if fleet.source.countersAreStructural {
                     offlineNotice(fleet.source)
                 }
-                if snapshotMode {
+                if listsUnscrolled {
                     accountsTabV4(fleet)
                         .hoverCardList()
                 } else {
@@ -1774,7 +1787,7 @@ struct FleetView: View {
             let fold = SessionsFold(joined, now: Date())
             let displayed = warmupsExpanded ? joined : fold.visible
             let trafficNotice = codexSessionsNotice(fleet)
-            if snapshotMode {
+            if listsUnscrolled {
                 sessionsTabBody(displayed: displayed, fold: fold, trafficNotice: trafficNotice)
             } else {
                 ScrollView {
@@ -2181,7 +2194,7 @@ struct FleetView: View {
                 title: "No tool data yet",
                 detail: detail,
                 tint: Tok.unknown)
-        } else if snapshotMode {
+        } else if listsUnscrolled {
             toolsList(fleet)
         } else {
             ScrollView {
