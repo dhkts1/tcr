@@ -752,3 +752,67 @@ fn review_exit_paths_keep_logging_and_serving() {
     }
     reader.join().unwrap();
 }
+
+/// `--replace` cannot take over a proxy served from inside another process (an
+/// embedded host): it stands down. TcrBar tells a stand-down from a crash only by
+/// `singleton::INCUMBENT_MARKER` on stderr, so this path must print it too, or the
+/// panel reports "Server exited" for a server that never bound.
+#[test]
+fn replace_against_an_embedded_proxy_prints_the_stand_down_marker() {
+    let home = scratch_home();
+    // This test process plays the embedded host: it holds the port and claims it.
+    let held = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    let owner_dir = tcr::paths::cache_dir_in(&tcr::paths::Roots {
+        home: Some(home.path().to_path_buf()),
+        xdg_cache_home: None,
+    })
+    .affinity_file()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    std::fs::create_dir_all(&owner_dir).unwrap();
+    tcr::singleton::write_owner_file(
+        &tcr::singleton::owner_path_in(&owner_dir, port),
+        &tcr::singleton::ProxyOwner {
+            pid: std::process::id(),
+            port,
+            sha: "0000000".to_string(),
+            host: tcr::singleton::ProxyHost::Embedded,
+        },
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tcr"))
+        .args([
+            "server",
+            "--headless",
+            "--replace",
+            "--port",
+            &port.to_string(),
+            "--config",
+        ])
+        .arg(home.path().join("config.json"))
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env(
+            "TCR_CLAUDE_CODE_CREDENTIALS",
+            home.path().join("no-login.json"),
+        )
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(tcr::singleton::INCUMBENT_MARKER),
+        "--replace against an embedded proxy must print the stand-down marker; status {}, \
+         stderr: {stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("served from inside its host application"),
+        "the line must name the embedded host, not offer --replace; stderr: {stderr}"
+    );
+    drop(held);
+}
