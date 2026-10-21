@@ -228,6 +228,16 @@ pub async fn accept(endpoint: Option<&Endpoint>) -> std::os::unix::net::UnixStre
 mod tests {
     use super::*;
 
+    /// A thinking response can stream for minutes; a predecessor that stops
+    /// draining after 30 s cuts it off mid-answer.
+    #[test]
+    fn the_drain_ceiling_outlasts_a_long_thinking_stream() {
+        assert!(
+            DRAIN_CEILING >= Duration::from_secs(300),
+            "drain ceiling is {DRAIN_CEILING:?}"
+        );
+    }
+
     #[test]
     fn review_restart_faults_are_recoverable() {
         const CHILD: &str = "TCR_REVIEW_RESTART_CHILD";
