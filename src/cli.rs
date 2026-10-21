@@ -1646,7 +1646,11 @@ fn write_disabled_flag(config_path: &Path, query: &str, disabled: bool) -> anyho
 /// One copy, because the four warnings that print it all named a `restart`
 /// subcommand that never existed, and four copies is how that happened. `main.rs`'s `restart_hint_names_only_commands_that_parse` parses
 /// every backticked `tcr` command in this text with the real clap definition.
-pub const RESTART_HINT: &str = "Restart it when a cold prompt cache is acceptable: if TcrBar runs the proxy, use Restart in TcrBar's Settings > General; otherwise stop it, or use `tcr server --replace` if it runs tcr 1.2.17 or newer.";
+pub const RESTART_HINT: &str = concat!(
+    "Restart it when a cold prompt cache is acceptable: if TcrBar runs the proxy, use Restart in TcrBar's Settings > General; otherwise stop it, or use `tcr server --replace` if it runs tcr ",
+    crate::handoff_since!(),
+    " or newer."
+);
 
 /// What a verb that asks the running proxy first may do with its file.
 enum Live<T> {
@@ -4793,7 +4797,10 @@ mod tests {
     #[test]
     fn the_restart_hint_names_the_first_version_with_handoff() {
         assert!(RESTART_HINT.contains("stop it"));
-        assert!(RESTART_HINT.contains("if it runs tcr 1.2.17 or newer"));
+        assert!(RESTART_HINT.contains(&format!(
+            "if it runs tcr {} or newer",
+            crate::restart::HANDOFF_SINCE
+        )));
     }
     use super::*;
     use crate::oauth::{OAuthError, RefreshFuture};

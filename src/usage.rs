@@ -1199,6 +1199,34 @@ pub struct ReplayReport {
     pub pruned: usize,
 }
 
+/// Why [`UsageTracker::rebuild_from_ledger`] left the totals as they were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebuildSkipped {
+    /// No ledger directory was ever attached, so there is nothing to read.
+    NoLedger,
+    /// The writer is failing or has been detached, so lines of ours may be
+    /// missing from the files.
+    NotPersisting,
+    /// This many lines found the queue full and were never written.
+    LinesDropped(u64),
+    /// The writer did not confirm the flush inside [`REBUILD_FLUSH_BUDGET`].
+    FlushTimedOut,
+}
+
+/// How long [`UsageTracker::rebuild_from_ledger`] waits for this process's own
+/// queued lines to reach the file. Requests wait on the rebuild for at most
+/// this plus the replay, so it is the request path's bound too.
+pub const REBUILD_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether any of these accounts is a Codex account, whose weekly window makes
+/// a replay read the week and keeps its files from being pruned.
+fn holds_codex(accounts: &[LedgerAccount]) -> bool {
+    accounts.iter().any(|a| match a.provider {
+        Provider::Anthropic => false,
+        Provider::Codex => true,
+    })
+}
+
 /// A live account as the ledger knows it: the display name it is recorded
 /// under, plus the identity fields that make that name resolvable. Built from
 /// the rotation by `Manager::attach_usage_ledger`.
@@ -1260,6 +1288,14 @@ pub struct UsageTracker {
     dropping: Arc<AtomicBool>,
     /// Lines the queue had no room for, over the life of the process.
     dropped: Arc<AtomicU64>,
+    /// The directory [`Self::attach_ledger`] was given, kept for
+    /// [`Self::rebuild_from_ledger`], which reads the same files again.
+    dir: Mutex<Option<PathBuf>>,
+    /// Makes one [`Self::record`] (its ledger line AND its buckets) a single
+    /// step as far as [`Self::rebuild_from_ledger`] can see. A record holds it
+    /// shared, so records never wait on each other here; a rebuild holds it
+    /// exclusively, so no record is half done while it flushes and replays.
+    rebuild_gate: RwLock<()>,
 }
 
 impl UsageTracker {
@@ -1275,6 +1311,8 @@ impl UsageTracker {
             healthy: Arc::new(AtomicBool::new(true)),
             dropping: Arc::new(AtomicBool::new(false)),
             dropped: Arc::new(AtomicU64::new(0)),
+            dir: Mutex::new(None),
+            rebuild_gate: RwLock::new(()),
         }
     }
 
@@ -1556,6 +1594,12 @@ impl UsageTracker {
         account_uuid: Option<&str>,
         account_org: Option<&str>,
     ) {
+        // Held to the end: the line and the buckets below are one step to a
+        // rebuild, so a line it reads from disk is never added in memory again.
+        let _gate = self
+            .rebuild_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.attached.load(Ordering::Relaxed) {
             let line = LedgerLine {
                 t: record.ts_ms,
@@ -1601,19 +1645,15 @@ impl UsageTracker {
     ) -> ReplayReport {
         let mut report = ReplayReport::default();
         let today = ledger_date(now_ms);
-        // A Codex row's weekly window reaches back seven days, so a fleet holding a Codex account
-        // replays the eight UTC files its lines can be in (today and the seven before it), oldest
-        // first, and never prunes one of them. A Claude-only fleet replays yesterday and today and
-        // prunes as it always has.
-        let holds_codex = accounts.iter().any(|a| match a.provider {
-            Provider::Anthropic => false,
-            Provider::Codex => true,
-        });
-        let days_back: i64 = if holds_codex { 7 } else { 1 };
-        for back in (0..=days_back).rev() {
-            let date = ledger_date(now_ms - back * 86_400_000);
-            self.replay_day(&dir, date, accounts, &mut report);
-        }
+        // A fleet holding a Codex account replays the eight UTC files its lines
+        // can be in and never prunes one of them. A Claude-only fleet replays
+        // yesterday and today and prunes as it always has.
+        let holds_codex = holds_codex(accounts);
+        self.replay_window(&dir, accounts, now_ms, &mut report);
+        *self
+            .dir
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir.clone());
         let keep_days = if holds_codex {
             retention_days.max(7)
         } else {
@@ -1668,6 +1708,96 @@ impl UsageTracker {
             }
         }
         report
+    }
+
+    /// Replace the in-memory totals with a fresh replay of the ledger files.
+    /// For a successor whose predecessor has just finished writing to them.
+    ///
+    /// After a listener handoff both processes append to the same day file,
+    /// and this one replayed it at boot while the predecessor was still
+    /// draining, so every line the predecessor wrote after that replay is on
+    /// disk and missing here. A line names no writer, so the two processes'
+    /// lines cannot be told apart. They need not be: once the predecessor is
+    /// done the files hold every line of both exactly once, and replaying all
+    /// of them is the count.
+    ///
+    /// This process's own lines must be on disk first, so the queue is flushed
+    /// under the gate every [`Self::record`] holds: no record sits between
+    /// queueing its line and adding it to the buckets while the flush and the
+    /// replay run, and one that arrives meanwhile waits and lands on the
+    /// rebuilt totals. Requests wait for one flush and one replay of the
+    /// window's files, once per handoff. The replay fills a separate tracker
+    /// and is swapped in whole, so a reader sees the old totals or the new
+    /// ones, never a half-built day.
+    ///
+    /// Leaves the totals alone when the files cannot be trusted to hold this
+    /// process's lines; the error says which. They then keep missing the
+    /// predecessor's tail, which is the smaller loss than replacing them with
+    /// a file that lacks lines of ours.
+    pub fn rebuild_from_ledger(
+        &self,
+        accounts: &[LedgerAccount],
+        now_ms: i64,
+    ) -> Result<ReplayReport, RebuildSkipped> {
+        let dir = self
+            .dir
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(RebuildSkipped::NoLedger)?;
+        let _gate = self
+            .rebuild_gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let trusted = |tracker: &Self| {
+            let dropped = tracker.dropped_lines();
+            if dropped > 0 {
+                Err(RebuildSkipped::LinesDropped(dropped))
+            } else if tracker.is_persisting() {
+                Ok(())
+            } else {
+                Err(RebuildSkipped::NotPersisting)
+            }
+        };
+        trusted(self)?;
+        if !self.flush_ledger_within(REBUILD_FLUSH_BUDGET) {
+            return Err(RebuildSkipped::FlushTimedOut);
+        }
+        // A write that failed during the flush lost a line just as surely.
+        trusted(self)?;
+        let fresh = Self::new(accounts.len(), self.pricing.clone());
+        let mut report = ReplayReport::default();
+        fresh.replay_window(&dir, accounts, now_ms, &mut report);
+        let mut rebuilt = fresh
+            .accounts
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut live = self
+            .accounts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if rebuilt.len() < live.len() {
+            rebuilt.resize_with(live.len(), Mutex::default);
+        }
+        *live = rebuilt;
+        Ok(report)
+    }
+
+    /// Replay the files a boot replays into this tracker's buckets: today's and
+    /// yesterday's UTC files, and when the fleet holds a Codex account, whose
+    /// weekly window reaches back seven days, the six before them, oldest first.
+    fn replay_window(
+        &self,
+        dir: &Path,
+        accounts: &[LedgerAccount],
+        now_ms: i64,
+        report: &mut ReplayReport,
+    ) {
+        let days_back: i64 = if holds_codex(accounts) { 7 } else { 1 };
+        for back in (0..=days_back).rev() {
+            let date = ledger_date(now_ms - back * 86_400_000);
+            self.replay_day(dir, date, accounts, report);
+        }
     }
 
     fn replay_day(
@@ -2147,6 +2277,91 @@ mod tests {
             "the second account's line was attributed to it, not to the first"
         );
 
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
+    }
+
+    /// After a listener handoff two processes append to one day file: the
+    /// successor replayed it at boot while the predecessor was still draining,
+    /// so every line the predecessor wrote after that replay is on disk and
+    /// missing from the successor's totals. Rebuilding from the whole file once
+    /// the predecessor is done counts every line of both writers exactly once,
+    /// including the successor's own lines and the ones it records while the
+    /// rebuild runs.
+    #[test]
+    fn a_rebuild_counts_every_line_of_both_writers_once() {
+        let dir = scratch("rebuild");
+        let names = vec![named("alice@example.com")];
+        let now = crate::now_ms();
+        let line = move || record(now, "claude-opus-5", 10);
+
+        // Lines on disk before either process below started.
+        let earlier = tracker();
+        earlier.attach_ledger(dir.clone(), 90, &names, now);
+        for _ in 0..3 {
+            earlier.record(0, &line(), &names[0].name, None, None);
+        }
+        assert_eq!(
+            earlier.shutdown_ledger(std::time::Duration::from_secs(5)),
+            LedgerShutdown::Flushed
+        );
+
+        // The successor boots and replays them.
+        let successor = Arc::new(tracker());
+        let report = successor.attach_ledger(dir.clone(), 90, &names, now);
+        assert_eq!(
+            report.replayed, 3,
+            "positive control: the boot replay read the file"
+        );
+
+        // The predecessor, still draining, writes to the same file after that replay.
+        let predecessor = tracker();
+        predecessor.attach_ledger(dir.clone(), 90, &names, now);
+        for _ in 0..4 {
+            predecessor.record(0, &line(), &names[0].name, None, None);
+        }
+        assert_eq!(
+            predecessor.shutdown_ledger(std::time::Duration::from_secs(5)),
+            LedgerShutdown::Flushed
+        );
+
+        // The successor serves requests of its own in the same window.
+        for _ in 0..2 {
+            successor.record(0, &line(), &names[0].name, None, None);
+        }
+        assert_eq!(
+            successor.row(0, now, None).today.requests,
+            5,
+            "positive control: before the rebuild the predecessor's four lines are missing"
+        );
+
+        // Requests that land while the rebuild runs.
+        let recording = Arc::clone(&successor);
+        let alice = names[0].name.clone();
+        let during = std::thread::spawn(move || {
+            for _ in 0..50 {
+                recording.record(0, &line(), &alice, None, None);
+            }
+        });
+        let rebuilt = successor.rebuild_from_ledger(&names, now);
+        during.join().expect("the recording thread finished");
+
+        assert!(rebuilt.is_ok(), "the rebuild ran: {rebuilt:?}");
+        assert_eq!(
+            successor.row(0, now, None).today.requests,
+            3 + 4 + 2 + 50,
+            "every line of both writers, and every request recorded during the rebuild, \
+             counted exactly once"
+        );
+        assert!(successor.flush_ledger(), "the writer answered the flush");
+        assert_eq!(
+            lines_in(&dir, now),
+            3 + 4 + 2 + 50,
+            "the file holds the same lines the totals count"
+        );
+        assert_eq!(
+            successor.shutdown_ledger(std::time::Duration::from_secs(5)),
+            LedgerShutdown::Flushed
+        );
         std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 

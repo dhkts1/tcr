@@ -57,6 +57,9 @@ connections close after their in-flight response; HTTP/2 receives GOAWAY. Blind 
 streams can continue until that ceiling, a termination signal, or EOF. The old process
 cannot refresh tokens after releasing ownership. It flushes pins, bound tokens and the
 Sessions/Tools cache before handing over; the successor reads the final config before booting.
+Both processes write the same usage ledger while the old one drains. When the old process
+exits, after its last usage line is on disk, the successor recounts today's usage from the
+ledger, so `tcr status` counts every request either process served, each once.
 
 Both processes must run as the same local user. An unavailable handoff endpoint is reported
 as an error before disturbing the incumbent; stop it, or use `--replace` if it runs this version

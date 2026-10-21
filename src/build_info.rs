@@ -37,6 +37,8 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::restart::HANDOFF_SINCE;
+
 /// What a build or checkout field reads when git could not be consulted: a
 /// source tarball with no `.git`, no git on `PATH`, an unborn HEAD.
 pub const UNKNOWN: &str = "unknown";
@@ -331,7 +333,7 @@ pub fn stand_down_build_report(
             line: format!(
                 "[tcr] note build-skew-unknown: this_binary={} but the proxy on :{port} did not \
                  report its build — it may be serving older code. `tcr status` reports the \
-                 running build; stop it, or use `tcr --replace` if it runs tcr 1.2.17 or newer.",
+                 running build; stop it, or use `tcr --replace` if it runs tcr {HANDOFF_SINCE} or newer.",
                 ours.sha
             ),
         };
@@ -360,7 +362,7 @@ pub fn stand_down_build_report(
             verdict: StandDownBuild::Unknown,
             line: format!(
                 "[tcr] note build-skew-unknown: {keys} — cannot tell whether the proxy on :{port} \
-                 is running this binary's code. stop it, or use `tcr --replace` if it runs tcr 1.2.17 or newer."
+                 is running this binary's code. stop it, or use `tcr --replace` if it runs tcr {HANDOFF_SINCE} or newer."
             ),
         };
     }
@@ -370,7 +372,7 @@ pub fn stand_down_build_report(
             line: format!(
                 "[tcr] WARNING stale-server: {keys} — the proxy on :{port} is NOT running this \
                  binary's code and will keep serving its own until it is restarted. \
-                 stop it, or use `tcr --replace` if it runs tcr 1.2.17 or newer."
+                 stop it, or use `tcr --replace` if it runs tcr {HANDOFF_SINCE} or newer."
             ),
         };
     }
@@ -528,7 +530,9 @@ mod tests {
         ] {
             let report = stand_down_build_report(12345, &ours, running.as_ref(), None);
             assert!(
-                report.line.contains("if it runs tcr 1.2.17 or newer"),
+                report
+                    .line
+                    .contains(&format!("if it runs tcr {HANDOFF_SINCE} or newer")),
                 "first-upgrade guidance: {}",
                 report.line
             );
@@ -553,7 +557,8 @@ mod tests {
             "README run link must resolve"
         );
         assert!(
-            include_str!("../docs/troubleshooting.md").contains("if it runs tcr 1.2.17 or newer"),
+            include_str!("../docs/troubleshooting.md")
+                .contains(&format!("if it runs tcr {HANDOFF_SINCE} or newer")),
             "troubleshooting must explain first upgrade"
         );
     }

@@ -229,7 +229,8 @@ pub struct ServeOptions {
     /// existed. It is only an *embedded* proxy that the matcher cannot see, and an
     /// embedder must therefore pass a directory.
     pub owner_dir: Option<PathBuf>,
-    /// A listening socket handed over by a predecessor instead of bound here.
+    /// A listening socket handed over by a predecessor instead of bound here,
+    /// with the handoff channel it came over.
     ///
     /// When set, this proxy does not bind and does not consult the incumbent
     /// policy: the predecessor gave us its socket, so there is no port to
@@ -237,10 +238,13 @@ pub struct ServeOptions {
     /// across the swap, and a connection arriving mid-handoff waits in the
     /// kernel's accept queue instead of being refused.
     ///
+    /// The channel closes when the predecessor's usage ledger is on disk; see
+    /// [`crate::restart::Handover`] for what this process does then.
+    ///
     /// The caller is responsible for having verified who it took this from.
     /// `serve` cannot: by the time the descriptor is in hand the peer may
     /// already be gone, and a socket is not self-describing.
-    pub inherited_listener: Option<std::net::TcpListener>,
+    pub handover: Option<crate::restart::Handover>,
 }
 
 impl ServeOptions {
@@ -269,7 +273,7 @@ impl ServeOptions {
             // write a file spell the pair out together.
             host: singleton::ProxyHost::Cli,
             owner_dir: None,
-            inherited_listener: None,
+            handover: None,
         }
     }
 }
@@ -425,6 +429,12 @@ pub struct ServerHandle {
     /// a `listen` of `:0` without reading the peers file back, the same way
     /// [`Self::addr`] answers it for the proxy's own socket.
     peer_addr: Option<SocketAddr>,
+    /// The handoff channel, once [`Self::handoff`] has sent the listener over
+    /// it. Held until [`Self::shutdown_within`] has drained the usage ledger:
+    /// its close tells the successor the day file now holds every line this
+    /// process will write, which is when it recounts (see
+    /// [`crate::restart::Handover`]).
+    successor: Option<std::os::unix::net::UnixStream>,
 }
 
 impl ServerHandle {
@@ -488,6 +498,17 @@ impl ServerHandle {
             listener,
             peer,
         )?;
+        // The listener is on its way, so the successor is serving or about to
+        // be. From here the channel stays open until the ledger is on disk,
+        // whatever the caller does with its own copy and whatever fails below.
+        match peer.try_clone() {
+            Ok(channel) => self.successor = Some(channel),
+            Err(error) => tracing::warn!(
+                %error,
+                "could not keep the handoff channel open; the successor will recount usage \
+                 before this process's last lines are written"
+            ),
+        }
         crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
         // The controller also mutates hardware and saves its wish. Finish its
         // last save before the successor can take ownership and save Auto;
@@ -664,6 +685,9 @@ impl ServerHandle {
                  it served are not on disk"
             ),
         }
+        // Only now may a successor recount the day file: everything this
+        // process will ever write to it is there (or reported lost above).
+        drop(self.successor.take());
 
         ShutdownReport {
             tasks_joined: self.tasks_joined,
@@ -2060,6 +2084,66 @@ fn park_reverse_carriers(
     Some(release)
 }
 
+/// How long a successor waits for its predecessor's handoff channel to close
+/// before recounting usage without it. The predecessor's handoff and drain are
+/// bounded by the drain ceiling, and its shutdown after them by one grace for
+/// the joins and at most one more for the ledger's drain.
+fn predecessor_wait() -> Duration {
+    crate::restart::drain_ceiling() + DEFAULT_SHUTDOWN_GRACE * 2
+}
+
+/// The successor's half of a handoff's usage accounting. The boot replay ran
+/// while the predecessor was still draining and writing to the same day file;
+/// once its channel closes the file holds every line it will write, and the
+/// day is recounted from the files (see `UsageTracker::rebuild_from_ledger`).
+async fn recount_usage_after_predecessor(
+    predecessor: std::os::unix::net::UnixStream,
+    manager: Arc<Manager>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let wait = predecessor_wait();
+    let closed = tokio::select! {
+        closed = tokio::time::timeout(wait, predecessor_closed(predecessor)) => closed,
+        _ = stop.changed() => return,
+    };
+    match closed {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            %error,
+            "could not read the handoff channel; recounting usage from the ledger now"
+        ),
+        Err(_) => tracing::warn!(
+            wait_secs = wait.as_secs(),
+            "the predecessor still holds the handoff channel; recounting usage without its last lines"
+        ),
+    }
+    match tokio::task::spawn_blocking(move || manager.rebuild_usage_from_ledger()).await {
+        Ok(Ok(report)) => tracing::info!(
+            replayed = report.replayed,
+            unresolved = report.unresolved,
+            malformed = report.malformed,
+            "the predecessor finished writing; usage recounted from the ledger"
+        ),
+        Ok(Err(skipped)) => tracing::warn!(
+            ?skipped,
+            "usage was not recounted after the handoff; the predecessor's last requests are \
+             missing from today's totals until the next restart"
+        ),
+        Err(error) => tracing::warn!(%error, "the usage recount after the handoff did not run"),
+    }
+}
+
+/// Resolves when the predecessor closes the handoff channel. Nothing is sent on
+/// it after the release confirmation, so this reads to the end.
+async fn predecessor_closed(channel: std::os::unix::net::UnixStream) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt as _;
+    channel.set_nonblocking(true)?;
+    let mut channel = tokio::net::UnixStream::from_std(channel)?;
+    let mut buf = [0u8; 64];
+    while channel.read(&mut buf).await? > 0 {}
+    Ok(())
+}
+
 /// Write this fleet's lendable headroom, per window, into the lender's ledger.
 ///
 /// `Ledger::may_relay` refuses an ABSENT measurement (see `Ledger::headroom`),
@@ -2185,7 +2269,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         tls,
         host,
         owner_dir,
-        inherited_listener,
+        handover,
     } = options;
 
     if let Some(port) = port_override {
@@ -2230,7 +2314,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         // the predecessor is not an incumbent to displace, it is the peer that
         // just gave us its listener. Signalling it here would kill the process
         // that is still draining the connections it accepted.
-        _ if inherited_listener.is_some() => singleton::Takeover::Proceed,
+        _ if handover.is_some() => singleton::Takeover::Proceed,
         (0, _) => singleton::Takeover::Proceed,
         (_, Signal::Never) => match singleton::live_proxy_server(port) {
             Some(incumbent) => singleton::Takeover::IncumbentPresent(incumbent),
@@ -2617,6 +2701,19 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
 
     // Hybrid proxy server task: base-URL mode and HTTPS_PROXY/CONNECT mode on the
     // same port. The listener peeks each connection and routes accordingly.
+    let (inherited_listener, predecessor) = match handover {
+        Some(handover) => (Some(handover.listener), Some(handover.predecessor)),
+        None => (None, None),
+    };
+    // With no ledger there is nothing to recount, and dropping the channel
+    // costs the predecessor nothing: it never reads it.
+    if let (Some(predecessor), Some(_)) = (predecessor, &usage_dir) {
+        background.push(tokio::spawn(recount_usage_after_predecessor(
+            predecessor,
+            Arc::clone(&manager),
+            shutdown_tx.subscribe(),
+        )));
+    }
     let listener = match inherited_listener {
         // Adopted, not bound. `set_nonblocking` is required before tokio may
         // own it: the descriptor arrives with whatever mode the predecessor had
@@ -2826,6 +2923,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         server_finished: false,
         background,
         peer_addr,
+        successor: None,
     }))
 }
 
@@ -2989,7 +3087,7 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reviewer_handoff_stops_the_predecessor_fan_before_release() {
+    async fn a_handoff_stops_the_predecessor_fan_before_releasing_the_listener() {
         use std::io::{Read, Write};
         use tcr_fan::controller::{Command, FanDesired};
         let dir = tempfile::tempdir().unwrap();
@@ -3033,7 +3131,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reviewer_control_handoff_with_fan_already_stopped() {
+    async fn a_handoff_completes_when_the_fan_controller_has_already_stopped() {
         use std::io::{Read, Write};
         use tcr_fan::controller::{Command, FanDesired};
         let dir = tempfile::tempdir().unwrap();
@@ -3242,6 +3340,7 @@ mod tests {
             // No peer socket: a hand-built handle in a unit test opens no port
             // at all, least of all a second one on the LAN.
             peer_addr: None,
+            successor: None,
         }
     }
 
@@ -3808,10 +3907,15 @@ mod tests {
         let predecessor =
             std::net::TcpListener::bind("127.0.0.1:0").expect("binding the predecessor's socket");
         let addr = predecessor.local_addr().expect("reading the bound address");
+        let (channel, _predecessor_end) =
+            std::os::unix::net::UnixStream::pair().expect("a handoff channel");
 
         let mut handle = serve(ServeOptions {
             tls: TlsSetup::Disabled,
-            inherited_listener: Some(predecessor),
+            handover: Some(crate::restart::Handover {
+                listener: predecessor,
+                predecessor: channel,
+            }),
             ..ServeOptions::new(boot_line_test_config())
         })
         .await
@@ -3828,6 +3932,184 @@ mod tests {
             .expect("the inherited socket must still accept connections after adoption");
 
         handle.shutdown().await;
+    }
+
+    /// Today's requests on account 0, as `tcr status` would report them.
+    fn requests_today(manager: &Manager) -> u64 {
+        manager
+            .snapshot(time::OffsetDateTime::now_utc())
+            .accounts
+            .first()
+            .and_then(|account| account.usage.as_ref())
+            .map_or(0, |usage| usage.today.requests)
+    }
+
+    fn one_request(now: i64) -> crate::usage::UsageRecord {
+        crate::usage::UsageRecord::from_quota_input(
+            now,
+            Some("claude-opus-5".to_string()),
+            None,
+            10,
+            0,
+            0,
+            0,
+            1,
+        )
+    }
+
+    /// The successor half of a handoff's usage accounting. It replays the day
+    /// file at boot while the predecessor is still draining, so the
+    /// predecessor's later lines reach the file after that replay. Once the
+    /// handoff channel closes the successor must count them, and count its own
+    /// requests from the same window exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_successor_counts_its_predecessors_last_lines_once_the_channel_closes() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let usage_dir = dir.path().join("usage");
+        let mut config = boot_line_test_config();
+        config.upstream = "http://127.0.0.1:0".into();
+        config.codex_upstream = "http://127.0.0.1:0".into();
+        config
+            .extra
+            .insert("quotaProbeSeconds".into(), serde_json::json!(0));
+        config
+            .extra
+            .insert("warmupSeconds".into(), serde_json::json!(0));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let (channel, predecessor_end) =
+            std::os::unix::net::UnixStream::pair().expect("a handoff channel");
+        let mut handle = serve(ServeOptions {
+            tls: TlsSetup::Disabled,
+            usage_dir: Some(usage_dir.clone()),
+            handover: Some(crate::restart::Handover {
+                listener,
+                predecessor: channel,
+            }),
+            ..ServeOptions::new(config)
+        })
+        .await
+        .expect("serving on a handed-over listener")
+        .expect_started();
+        let manager = Arc::clone(handle.manager());
+        let now = crate::now_ms();
+
+        // The predecessor, still draining, writes four lines after the boot replay.
+        let names = [crate::usage::LedgerAccount {
+            name: "test-fixture-account".to_string(),
+            ..crate::usage::LedgerAccount::default()
+        }];
+        let predecessor =
+            crate::usage::UsageTracker::new(1, crate::pricing::PricingTable::default());
+        predecessor.attach_ledger(usage_dir.clone(), 90, &names, now);
+        for _ in 0..4 {
+            predecessor.record(0, &one_request(now), &names[0].name, None, None);
+        }
+        assert_eq!(
+            predecessor.shutdown_ledger(Duration::from_secs(5)),
+            crate::usage::LedgerShutdown::Flushed
+        );
+        // The successor serves two of its own in the same window.
+        for _ in 0..2 {
+            manager.record_usage(0, one_request(now));
+        }
+        assert_eq!(
+            requests_today(&manager),
+            2,
+            "positive control: before the channel closes the predecessor's lines are not counted"
+        );
+
+        // The predecessor's ledger is on disk and it exits.
+        drop(predecessor_end);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while requests_today(&manager) != 6 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let counted = requests_today(&manager);
+        handle.shutdown().await;
+        assert_eq!(
+            counted, 6,
+            "the predecessor's four lines and the successor's two, each counted once"
+        );
+    }
+
+    /// The predecessor half: the handoff channel stays open until the
+    /// predecessor's usage ledger is on disk, because its close is what tells
+    /// the successor the day file is complete. A request that finishes during
+    /// the drain queues a line that only the final shutdown writes, so a
+    /// channel that closed when the drain ended would let the successor count
+    /// the file without it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_handoff_channel_closes_only_after_the_predecessors_ledger_is_on_disk() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let usage_dir = dir.path().join("usage");
+        let manager = manager_with(
+            r#"{"accounts": [{"name": "alice@example.com", "accessToken": "at-fake"}],
+                "quotaProbeSeconds": 0, "warmupSeconds": 0}"#,
+        );
+        manager.attach_usage_ledger(usage_dir.clone(), 90);
+        let (shutdown, _rx) = watch::channel(false);
+        let mut handle = handle_full(
+            shutdown,
+            tokio::spawn(async {}),
+            Vec::new(),
+            Arc::clone(&manager),
+            None,
+        );
+        handle.listener = Some(std::net::TcpListener::bind("127.0.0.1:0").expect("a listener"));
+        let now = crate::now_ms();
+        let (ours, mut successor) = std::os::unix::net::UnixStream::pair().expect("a channel");
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let reader_dir = usage_dir.clone();
+        let receiver = std::thread::spawn(move || {
+            successor
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .expect("a read timeout");
+            let listener = tcr_fdpass::recv_listener(&successor).expect("the listener arrives");
+            successor
+                .write_all(b"listener-received\n")
+                .expect("the receipt is sent");
+            let mut released = [0u8; 18];
+            successor
+                .read_exact(&mut released)
+                .expect("the release is confirmed");
+            drop(listener);
+            // What the successor reads when the channel closes.
+            let mut rest = Vec::new();
+            let closed = successor.read_to_end(&mut rest);
+            let on_disk =
+                crate::usage::parse_ledger_day(&reader_dir, crate::usage::ledger_date(now))
+                    .0
+                    .len();
+            closed_tx
+                .send((closed.map(|_| ()).map_err(|e| e.to_string()), on_disk))
+                .expect("the test is waiting for this");
+        });
+        handle.handoff(&ours).await.expect("the handoff completes");
+
+        // A request finishes during the drain, and the writer is held so its
+        // line is provably still queued.
+        let wedge = manager.wedge_usage_writer_for_test();
+        manager.record_usage(0, one_request(now));
+        // The binary drops its own copy of the channel when the drain ends.
+        drop(ours);
+        let mut closed_rx = closed_rx;
+        let early = tokio::time::timeout(Duration::from_millis(500), &mut closed_rx).await;
+        drop(wedge);
+        handle.shutdown().await;
+        let (closed, on_disk) = match early {
+            Ok(result) => result,
+            Err(_) => tokio::time::timeout(Duration::from_secs(10), closed_rx)
+                .await
+                .expect("the channel closes once shutdown has written the ledger"),
+        }
+        .expect("the receiver reported");
+        receiver.join().expect("the receiver thread finished");
+        assert_eq!(
+            (closed, on_disk),
+            (Ok(()), 1),
+            "the channel closed before the predecessor's last line was on disk"
+        );
     }
 
     /// THE bite: every knob this unit added to the "server started" boot line

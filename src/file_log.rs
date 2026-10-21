@@ -523,7 +523,7 @@ mod tests {
     /// `scenario`, and return the child's log file.
     fn run_child(scenario: &str) -> String {
         let (_dir, path) = scratch_file("child.log");
-        let status = Command::new(std::env::current_exe().expect("the test binary"))
+        let output = Command::new(std::env::current_exe().expect("the test binary"))
             .args([
                 "file_log::tests::child_entry",
                 "--exact",
@@ -532,14 +532,16 @@ mod tests {
             ])
             .env(CHILD_ENV, scenario)
             .env(CHILD_FILE_ENV, &path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .output()
             .expect("run the child");
+        crate::test_support::libtest::assert_ran_one_test(&output.stdout, &output.stderr);
         assert_eq!(
-            status.code(),
+            output.status.code(),
             Some(7),
-            "the child did not reach its exit ({status:?})"
+            "the child did not reach its exit ({:?})\n--- child stdout\n{}\n--- child stderr\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
         std::fs::read_to_string(&path).expect("read the child's log")
     }

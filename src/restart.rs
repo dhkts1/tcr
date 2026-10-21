@@ -12,6 +12,26 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::singleton::{self, ProxyKind};
 
+/// The first tcr release with listener handoff, the version every "use
+/// `--replace` if it runs tcr X or newer" message names. A macro so `concat!`
+/// can build a constant message from it; read it as [`HANDOFF_SINCE`]
+/// everywhere else.
+///
+/// Copies no Rust constant can reach, to change with this one:
+/// - `apps/macos/Sources/TcrBarCore/ServerController.swift` (two messages)
+/// - `apps/macos/Tests/TcrBarTests/TakeoverIntentTests.swift`
+/// - `docs/troubleshooting.md` (a `build_info` test checks it names this
+///   version)
+#[macro_export]
+macro_rules! handoff_since {
+    () => {
+        "1.2.17"
+    };
+}
+
+/// [`handoff_since!`] as a constant.
+pub const HANDOFF_SINCE: &str = handoff_since!();
+
 const REQUEST: &[u8] = b"tcr-replace/2\n";
 const RECEIPT: &[u8] = b"listener-received\n";
 const RELEASED: &[u8] = b"listener-released\n";
@@ -184,11 +204,25 @@ pub(crate) fn confirm_listener_released(peer: &std::os::unix::net::UnixStream) -
     peer.write_all(RELEASED)
 }
 
+/// What a successor takes from its predecessor: the listening socket, and the
+/// handoff channel it came over.
+///
+/// The channel is kept open on purpose. The predecessor holds its end until its
+/// usage ledger is on disk, after its drain, so end-of-file on `predecessor` is
+/// the moment the day file holds every line the predecessor will ever write.
+/// Nothing more is sent on it; the close is the whole message, and a crash
+/// sends it too.
+#[derive(Debug)]
+pub struct Handover {
+    pub listener: std::net::TcpListener,
+    pub predecessor: std::os::unix::net::UnixStream,
+}
+
 /// Request a socket only from a recognized standalone proxy on this port.
 /// Failure leaves the incumbent alone: a kill-and-bind fallback would recreate
 /// the refusal window this protocol exists to remove. Old binaries need one
 /// explicit stop to upgrade; subsequent replacements use this handoff.
-pub async fn request_listener(port: u16) -> anyhow::Result<Option<std::net::TcpListener>> {
+pub async fn request_listener(port: u16) -> anyhow::Result<Option<Handover>> {
     if port == 0 {
         return Ok(None);
     }
@@ -204,7 +238,7 @@ pub async fn request_listener(port: u16) -> anyhow::Result<Option<std::net::TcpL
     );
     let mut peer = tokio::time::timeout(TIMEOUT, UnixStream::connect(socket_path(incumbent.pid)))
         .await.context("tcr-handoff-unavailable: timed out connecting to the incumbent handoff endpoint; stop it explicitly")?
-        .context("tcr-handoff-unavailable: could not connect to the incumbent listener handoff endpoint; stop it explicitly, or use --replace if it runs tcr 1.2.17 or newer and handoff is enabled; no process was signalled")?;
+        .context(concat!("tcr-handoff-unavailable: could not connect to the incumbent listener handoff endpoint; stop it explicitly, or use --replace if it runs tcr ", handoff_since!(), " or newer and handoff is enabled; no process was signalled"))?;
     verify_same_user(&peer)?;
     tokio::time::timeout(TIMEOUT, peer.write_all(REQUEST))
         .await
@@ -213,7 +247,7 @@ pub async fn request_listener(port: u16) -> anyhow::Result<Option<std::net::TcpL
     peer.set_nonblocking(false)?;
     peer.set_read_timeout(Some(TIMEOUT))?;
     peer.set_write_timeout(Some(TIMEOUT))?;
-    let listener = tokio::task::spawn_blocking(move || {
+    let handover = tokio::task::spawn_blocking(move || {
         use std::io::{Read as _, Write as _};
         let listener = tcr_fdpass::recv_listener(&peer)?;
         if listener.local_addr()? != std::net::SocketAddr::from(([127, 0, 0, 1], port)) {
@@ -232,12 +266,15 @@ pub async fn request_listener(port: u16) -> anyhow::Result<Option<std::net::TcpL
                 "invalid listener release confirmation",
             ));
         }
-        Ok(listener)
+        Ok(Handover {
+            listener,
+            predecessor: peer,
+        })
     })
     .await
     .context("restart receiver task failed")?
     .context("the incumbent did not hand over its listener; no process was signalled")?;
-    Ok(Some(listener))
+    Ok(Some(handover))
 }
 
 /// Disabled handoff must leave the ordinary server and its signal paths usable.
@@ -278,6 +315,7 @@ mod tests {
                 .env("XDG_CACHE_HOME", "different-fixture-cache")
                 .output()
                 .unwrap();
+            crate::test_support::libtest::assert_ran_one_test(&output.stdout, &output.stderr);
             assert!(
                 output.status.success(),
                 "restart accept must survive EMFILE and remain usable: {} {}",

@@ -8375,14 +8375,14 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
             None
         }
     };
-    let inherited_listener = if args.replace {
+    let handover = if args.replace {
         tcr::restart::request_listener(args.port.unwrap_or(config.proxy.port)).await?
     } else {
         None
     };
     // The predecessor's final token flush precedes sending the socket. Read it
     // now, not from the snapshot taken before asking the predecessor to stop.
-    let (config, persist_path) = if inherited_listener.is_some() {
+    let (config, persist_path) = if handover.is_some() {
         load_config(&config_path)?
     } else {
         (config, persist_path)
@@ -8489,7 +8489,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         // `serve`, and the two silently disagreeing means a claim named for a port
         // this process never bound — which every reader looks straight past.
         owner_dir: Some(singleton::default_owner_dir()),
-        inherited_listener,
+        handover,
     };
 
     let handle = match server::serve(options).await? {
@@ -8661,6 +8661,8 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
                 tracing::warn!("replacement drain deadline reached; shutting down");
             }
         }
+        // Not the close the successor waits for: the handle holds its own copy
+        // of the channel until `shutdown` below has drained the usage ledger.
         drop(peer);
     }
     drop(restart_endpoint);
@@ -8746,8 +8748,11 @@ const fn wedged_incumbent_recovery(kind: singleton::ProxyKind) -> &'static str {
              start it again to recover a wedged embedded proxy."
         }
         singleton::ProxyKind::Tcr => {
-            "Stop the proxy explicitly, or use `tcr --replace` if it runs tcr 1.2.17 or newer \
-             and its listener handoff endpoint still answers."
+            concat!(
+                "Stop the proxy explicitly, or use `tcr --replace` if it runs tcr ",
+                tcr::handoff_since!(),
+                " or newer and its listener handoff endpoint still answers."
+            )
         }
     }
 }
@@ -9759,7 +9764,8 @@ mod tests {
         // advice having been dropped for everyone.
         let advice = wedged_incumbent_recovery(singleton::ProxyKind::Tcr);
         assert!(
-            advice.contains("Stop the proxy explicitly") && advice.contains("tcr 1.2.17 or newer"),
+            advice.contains("Stop the proxy explicitly")
+                && advice.contains(&format!("tcr {} or newer", tcr::restart::HANDOFF_SINCE)),
             "standalone recovery must explain when handoff is available: {advice}"
         );
     }
