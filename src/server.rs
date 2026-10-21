@@ -478,8 +478,17 @@ impl ServerHandle {
     /// transfer the still-bound listener. The receiver starts only after the
     /// existing handoff ownership gate has been released.
     pub async fn handoff(&mut self, peer: &std::os::unix::net::UnixStream) -> anyhow::Result<()> {
-        crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
         let deadline = tokio::time::Instant::now() + DEFAULT_SHUTDOWN_GRACE;
+        self.flush_cache_finally(SavedCache::BoundTokens);
+        self.flush_cache_finally(SavedCache::WireSessions);
+        let listener = self.listener.as_ref().context("no listener to hand over")?;
+        crate::handoff::complete_handoff(
+            &self.manager,
+            self.affinity_path.as_deref(),
+            listener,
+            peer,
+        )?;
+        crate::log_err::LogErr::log_debug(self.shutdown.send(true), "signalling server shutdown");
         // The controller also mutates hardware and saves its wish. Finish its
         // last save before the successor can take ownership and save Auto;
         // accepted connections may keep draining after that release.
@@ -493,15 +502,6 @@ impl ServerHandle {
             anyhow::ensure!(stopped, "fan control did not stop before handoff");
         }
         self.stop_tasks(deadline).await;
-        self.flush_cache_finally(SavedCache::BoundTokens);
-        self.flush_cache_finally(SavedCache::WireSessions);
-        let listener = self.listener.as_ref().context("no listener to hand over")?;
-        crate::handoff::complete_handoff(
-            &self.manager,
-            self.affinity_path.as_deref(),
-            listener,
-            peer,
-        )?;
         crate::restart::wait_for_listener_receipt(peer).await?;
         self.listener.take();
         crate::restart::confirm_listener_released(peer)?;
@@ -2844,6 +2844,148 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
 /// that do not.
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn independent_fan_survives_failed_descriptor_send() {
+        use tcr_fan::controller::{Command, FanDesired};
+        let mut config = boot_line_test_config();
+        config.proxy.port = 0;
+        config.upstream = "http://127.0.0.1:0".into();
+        config.codex_upstream = "http://127.0.0.1:0".into();
+        config
+            .extra
+            .insert("quotaProbeSeconds".into(), serde_json::json!(0));
+        config
+            .extra
+            .insert("warmupSeconds".into(), serde_json::json!(0));
+        let mut handle = serve(ServeOptions {
+            tls: TlsSetup::Disabled,
+            ..ServeOptions::new(config)
+        })
+        .await
+        .unwrap()
+        .expect_started();
+        let fan = crate::fan::start_inert();
+        assert!(
+            fan.send(Command::Set(FanDesired::Auto)).is_ok(),
+            "positive control: controller must accept before handoff"
+        );
+        handle.manager().install_fan(Arc::clone(&fan));
+        let http = crate::http_client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let fan_url = format!("http://{}/_tcr/fan", handle.addr());
+        let before_status = http
+            .post(&fan_url)
+            .json(&serde_json::json!({"mode":"auto"}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            before_status.as_u16(),
+            202,
+            "positive control: HTTP fan route accepts before handoff"
+        );
+        let (ours, successor) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(successor);
+        let error = handle.handoff(&ours).await.unwrap_err();
+        let accepting = !*handle.shutdown.borrow();
+        let owning = !handle.manager().mutation_is_released();
+        let fan_accepts = fan.send(Command::Set(FanDesired::Auto)).is_ok();
+        let after_response = http
+            .post(&fan_url)
+            .json(&serde_json::json!({"mode":"auto"}))
+            .send()
+            .await;
+        let (after_status, after_body) = match after_response {
+            Ok(response) => (response.status().as_u16(), response.text().await.unwrap()),
+            Err(error) => (0, error.to_string()),
+        };
+        let healthy = crate::http_client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!("http://{}/_tcr/status", handle.addr()))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success());
+        handle.shutdown().await;
+        assert!(
+            accepting && owning && healthy && fan_accepts && after_status == 202,
+            "failed pre-send handoff must preserve all service: accepting={accepting}, owning={owning}, http200={healthy}, fan_accepts={fan_accepts}, fan_http_before={before_status}, fan_http_after={after_status}, fan_body={after_body}, error={error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review2_failed_send_keeps_accepting() {
+        for missing_listener in [false, true] {
+            let mut config = boot_line_test_config();
+            config.proxy.port = 0;
+            config.upstream = "http://127.0.0.1:0".into();
+            config.codex_upstream = "http://127.0.0.1:0".into();
+            config
+                .extra
+                .insert("quotaProbeSeconds".into(), serde_json::json!(0));
+            config
+                .extra
+                .insert("warmupSeconds".into(), serde_json::json!(0));
+            let mut handle = serve(ServeOptions {
+                tls: TlsSetup::Disabled,
+                ..ServeOptions::new(config)
+            })
+            .await
+            .unwrap()
+            .expect_started();
+            let fan = crate::fan::start_inert();
+            assert!(
+                fan.send(tcr_fan::controller::Command::Set(
+                    tcr_fan::controller::FanDesired::Auto
+                ))
+                .is_ok()
+            );
+            handle.manager().install_fan(Arc::clone(&fan));
+            let addr = handle.addr();
+            let (ours, successor) = std::os::unix::net::UnixStream::pair().unwrap();
+            drop(successor);
+            let retained = if missing_listener {
+                handle.listener.take()
+            } else {
+                None
+            };
+            let error = handle.handoff(&ours).await.unwrap_err();
+            let accepting = !*handle.shutdown.borrow();
+            let owning = !handle.manager().mutation_is_released();
+            let response = crate::http_client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+                .get(format!("http://{addr}/_tcr/status"))
+                .send()
+                .await;
+            let healthy = response.is_ok_and(|r| r.status().is_success());
+            let fan_response = crate::http_client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+                .post(format!("http://{addr}/_tcr/fan"))
+                .json(&serde_json::json!({"mode":"auto"}))
+                .send()
+                .await;
+            let fan_accepted = fan_response.is_ok_and(|response| response.status().as_u16() == 202);
+            drop(retained);
+            handle.shutdown().await;
+            assert!(
+                accepting && owning && healthy && fan_accepted,
+                "pre-send failure must retain accepting, ownership and HTTP 200: missing={missing_listener}, accepting={accepting}, owning={owning}, healthy={healthy}, fan_accepted={fan_accepted}, error={error}"
+            );
+        }
+    }
+
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

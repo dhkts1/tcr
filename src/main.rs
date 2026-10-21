@@ -8506,97 +8506,122 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
 
     let mut handle = handle;
     let mut successor = None;
+    let mut replacement_deadline = None;
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).ok();
     if sigterm.is_none() {
         tracing::warn!("could not install SIGTERM handler");
     }
-    if args.headless {
-        // Installed BEFORE the "listening" line below, not after: that line is
-        // what a caller (or `tests/headless_sigterm.rs`) waits on before it
-        // treats this process as ready to signal. A handler installed after
-        // the print leaves a real window, small, but wide enough for a
-        // heavily loaded box to hit it, where a SIGTERM sent the instant the
-        // line appears finds no handler yet and the default disposition kills
-        // the process immediately, skipping `handle.shutdown()` below
-        // entirely: no drain, no final session->account pin flush, no
-        // owner-file removal. Registering first closes that window: by the
-        // time the readiness line is on the wire, the handler is already
-        // armed.
-        //
-        // TcrBar always launches this process with `--headless` and stops it
-        // with `process.terminate()` — a SIGTERM, not Ctrl-C
-        // (`apps/macos/.../ServerController.swift`). Mirror the TUI branch's
-        // SIGTERM handling (below) so a supervised stop falls through to the
-        // same shared cleanup instead of a hard kill.
-        //
-        // This cannot turn into an unkillable process: `handle.shutdown()`
-        // is `shutdown_within(DEFAULT_SHUTDOWN_GRACE)` (5s, see
-        // `server::DEFAULT_SHUTDOWN_GRACE`), documented as bounded — tasks
-        // that miss the grace are aborted and counted in
-        // `report.tasks_aborted`, warned about just below.
-        tracing::info!("tcr listening on http://{bound} (headless)");
-        // Block until Ctrl-C, SIGTERM, or the server task exits.
-        let trigger = tokio::select! {
-            _ = tokio::signal::ctrl_c() => ShutdownTrigger::CtrlC,
-            () = async {
-                match sigterm.as_mut() {
-                    Some(sig) => {
-                        sig.recv().await;
+    loop {
+        if args.headless {
+            // Installed BEFORE the "listening" line below, not after: that line is
+            // what a caller (or `tests/headless_sigterm.rs`) waits on before it
+            // treats this process as ready to signal. A handler installed after
+            // the print leaves a real window, small, but wide enough for a
+            // heavily loaded box to hit it, where a SIGTERM sent the instant the
+            // line appears finds no handler yet and the default disposition kills
+            // the process immediately, skipping `handle.shutdown()` below
+            // entirely: no drain, no final session->account pin flush, no
+            // owner-file removal. Registering first closes that window: by the
+            // time the readiness line is on the wire, the handler is already
+            // armed.
+            //
+            // TcrBar always launches this process with `--headless` and stops it
+            // with `process.terminate()` — a SIGTERM, not Ctrl-C
+            // (`apps/macos/.../ServerController.swift`). Mirror the TUI branch's
+            // SIGTERM handling (below) so a supervised stop falls through to the
+            // same shared cleanup instead of a hard kill.
+            //
+            // This cannot turn into an unkillable process: `handle.shutdown()`
+            // is `shutdown_within(DEFAULT_SHUTDOWN_GRACE)` (5s, see
+            // `server::DEFAULT_SHUTDOWN_GRACE`), documented as bounded — tasks
+            // that miss the grace are aborted and counted in
+            // `report.tasks_aborted`, warned about just below.
+            tracing::info!("tcr listening on http://{bound} (headless)");
+            // Block until Ctrl-C, SIGTERM, or the server task exits.
+            let trigger = tokio::select! {
+                _ = tokio::signal::ctrl_c() => ShutdownTrigger::CtrlC,
+                () = async {
+                    match sigterm.as_mut() {
+                        Some(sig) => {
+                            sig.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
                     }
-                    None => std::future::pending::<()>().await,
+                } => ShutdownTrigger::Sigterm,
+                () = handle.serving_stopped() => ShutdownTrigger::ServingStopped,
+                peer = tcr::restart::accept(restart_endpoint.as_ref()) => {
+                    successor = Some(peer);
+                    ShutdownTrigger::Replaced
+                },
+            };
+            tracing::info!("{}", trigger.shutdown_line());
+        } else {
+            // The TUI owns the foreground. Under raw mode Ctrl-C arrives as a keystroke,
+            // so the loop (not a signal) handles it. But an EXTERNAL SIGTERM — e.g. the
+            // singleton replacing us on the port — would otherwise terminate the process
+            // with the terminal still in raw + alternate-screen mode, wrecking the
+            // caller's shell. Race the TUI against SIGTERM: on the signal the `select`
+            // drops the TUI future, and dropping it runs `TerminalGuard`'s destructor,
+            // which restores the terminal (the same restore path as a clean quit or a
+            // panic) BEFORE the shutdown/flush below and any SIGKILL fallback.
+            let tui_fut = tui::run(Arc::clone(handle.manager()));
+            tokio::pin!(tui_fut);
+            tokio::select! {
+                peer = tcr::restart::accept(restart_endpoint.as_ref()) => {
+                    successor = Some(peer);
                 }
-            } => ShutdownTrigger::Sigterm,
-            () = handle.serving_stopped() => ShutdownTrigger::ServingStopped,
-            peer = tcr::restart::accept(restart_endpoint.as_ref()) => {
-                successor = Some(peer);
-                ShutdownTrigger::Replaced
-            },
-        };
-        tracing::info!("{}", trigger.shutdown_line());
-    } else {
-        // The TUI owns the foreground. Under raw mode Ctrl-C arrives as a keystroke,
-        // so the loop (not a signal) handles it. But an EXTERNAL SIGTERM — e.g. the
-        // singleton replacing us on the port — would otherwise terminate the process
-        // with the terminal still in raw + alternate-screen mode, wrecking the
-        // caller's shell. Race the TUI against SIGTERM: on the signal the `select`
-        // drops the TUI future, and dropping it runs `TerminalGuard`'s destructor,
-        // which restores the terminal (the same restore path as a clean quit or a
-        // panic) BEFORE the shutdown/flush below and any SIGKILL fallback.
-        let tui_fut = tui::run(Arc::clone(handle.manager()));
-        tokio::pin!(tui_fut);
-        tokio::select! {
-            peer = tcr::restart::accept(restart_endpoint.as_ref()) => {
-                successor = Some(peer);
-            }
 
-            res = &mut tui_fut => {
-                if let Err(err) = res {
-                    tracing::error!(error = %err, "tui error");
-                }
-            }
-            () = async {
-                match sigterm.as_mut() {
-                    Some(sig) => {
-                        sig.recv().await;
+                res = &mut tui_fut => {
+                    if let Err(err) = res {
+                        tracing::error!(error = %err, "tui error");
                     }
-                    None => std::future::pending::<()>().await,
                 }
-            } => {
-                tracing::info!("SIGTERM received; restoring terminal and shutting down");
+                () = async {
+                    match sigterm.as_mut() {
+                        Some(sig) => {
+                            sig.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    tracing::info!("SIGTERM received; restoring terminal and shutting down");
+                }
             }
         }
+
+        let Some(peer) = successor.take() else {
+            break;
+        };
+        let deadline = tokio::time::Instant::now() + tcr::restart::DRAIN_CEILING;
+        let result = tokio::select! {
+            result = handle.handoff(&peer) => result,
+            _ = tokio::signal::ctrl_c() => break,
+            () = async { match sigterm.as_mut() {
+                Some(signal) => { signal.recv().await; },
+                None => std::future::pending::<()>().await,
+            }} => break,
+            () = tokio::time::sleep_until(deadline) => {
+                tracing::warn!("replacement handoff deadline reached; shutting down"); break;
+            }
+        };
+        if let Err(error) = result {
+            if !handle.manager().mutation_is_released() {
+                tracing::warn!(%error, "listener handoff failed before send; incumbent keeps serving");
+                continue;
+            }
+            tracing::warn!(%error, "listener handoff failed; draining before shutdown");
+        }
+        successor = Some(peer);
+        replacement_deadline = Some(deadline);
+        break;
     }
 
     if let Some(peer) = successor {
         // One budget includes the handshake and draining. A failed or interrupted
         // handshake still falls through to shutdown and the usage-ledger flush.
         let replacement = async {
-            if let Err(error) = handle.handoff(&peer).await {
-                tracing::warn!(%error, "listener handoff failed; draining before shutdown");
-            } else {
-                tracing::info!("listener handed over; draining accepted connections");
-            }
+            tracing::info!("listener handed over; draining accepted connections");
             handle.drain_connections().await;
             tracing::info!("accepted connections drained");
         };
@@ -8609,7 +8634,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
                     None => std::future::pending::<()>().await,
                 }
             } => tracing::info!("SIGTERM received during drain; shutting down"),
-            () = tokio::time::sleep(tcr::restart::DRAIN_CEILING) => {
+            () = tokio::time::sleep_until(replacement_deadline.unwrap_or_else(tokio::time::Instant::now)) => {
                 tracing::warn!("replacement drain deadline reached; shutting down");
             }
         }

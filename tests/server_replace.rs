@@ -286,6 +286,118 @@ fn predecessor_retains_its_listener_until_the_receiver_acknowledges_it() {
 }
 
 #[test]
+fn incumbent_keeps_serving_after_failed_descriptor_send() {
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+
+    let home = scratch_home();
+    let mut old = Proxy::spawn(home.path(), 0, false);
+    let addr = old.ready();
+    let endpoint = tcr::restart::socket_path(old.child.id());
+    let mut peer = UnixStream::connect(&endpoint).unwrap();
+    peer.set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    // Refuse incoming descriptors before requesting one. The request still
+    // reaches the incumbent, but its send fails without a timing race.
+    peer.shutdown(Shutdown::Read).unwrap();
+    peer.write_all(b"tcr-replace/2\n").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    loop {
+        if let Ok(line) = old.lines.recv_timeout(Duration::from_millis(100)) {
+            let failed = line.contains("listener handoff failed");
+            seen.push(line);
+            if failed {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "incumbent did not report the failed descriptor send: {seen:?}"
+        );
+    }
+    assert!(
+        seen.iter().any(|line| {
+            line.contains("listener handoff failed")
+                && (line.contains("os error 22") || line.contains("os error 32"))
+        }),
+        "the descriptor send must fail before testing recovery: {seen:?}"
+    );
+    drop(peer);
+
+    let second_peer = (|| -> std::io::Result<UnixStream> {
+        let mut peer = UnixStream::connect(&endpoint)?;
+        peer.set_write_timeout(Some(Duration::from_secs(5)))?;
+        peer.shutdown(Shutdown::Read)?;
+        peer.write_all(b"tcr-replace/2\n")?;
+        Ok(peer)
+    })();
+    assert!(
+        second_peer.is_ok(),
+        "incumbent did not answer the second replacement request: {second_peer:?}; {seen:?}"
+    );
+    let second_peer = second_peer.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(line) = old.lines.recv_timeout(Duration::from_millis(100)) {
+            let failed = line.contains("listener handoff failed");
+            seen.push(line);
+            if failed {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "incumbent did not answer the second replacement request: {seen:?}"
+        );
+    }
+    drop(second_peer);
+
+    // Check continued service after the failed handoff has been processed,
+    // including time for an erroneous fall-through to drain and shutdown.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        assert!(
+            old.child.try_wait().unwrap().is_none(),
+            "incumbent stopped after the failed descriptor send: {seen:?}"
+        );
+        let response = (|| -> std::io::Result<String> {
+            let mut http = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
+            http.set_read_timeout(Some(Duration::from_secs(1)))?;
+            http.set_write_timeout(Some(Duration::from_secs(1)))?;
+            http.write_all(
+                b"GET /_tcr/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )?;
+            let mut status = String::new();
+            BufReader::new(http).read_line(&mut status)?;
+            Ok(status)
+        })();
+        assert!(
+            matches!(&response, Ok(status) if status.starts_with("HTTP/1.1 200")),
+            "incumbent stopped serving HTTP 200 after the failed descriptor send: {response:?}; {seen:?}"
+        );
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-TERM", &old.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_exit(&mut old, 8);
+    assert!(
+        !endpoint.exists(),
+        "incumbent must remove its restart socket"
+    );
+}
+
+#[test]
 fn replacement_closes_an_idle_http_keep_alive_connection() {
     let home = scratch_home();
     let mut old = Proxy::spawn(home.path(), 0, false);
