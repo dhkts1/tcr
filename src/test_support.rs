@@ -11,6 +11,7 @@
 //! - [`log_capture`]: a tracing writer a test can read back.
 //! - [`live_proxy`]: a real proxy served in-process, for code that dials `proxy.port`.
 //! - [`child`]: a spawned `tcr` killed when its test ends, even if the test binary is killed.
+//! - [`libtest`]: proof that a test binary re-run as a child ran the one test it was asked for.
 
 // `clippy.toml`'s test exemption reaches only a `#[cfg(test)]` module, and this one is also
 // compiled under the feature; a helper that cannot do its job fails the test that called it,
@@ -21,6 +22,7 @@
 )]
 
 pub mod child;
+pub mod libtest;
 pub mod live_proxy;
 pub mod log_capture;
 pub mod loopback;

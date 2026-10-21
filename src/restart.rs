@@ -295,6 +295,7 @@ mod tests {
                 .env("XDG_CACHE_HOME", "different-fixture-cache")
                 .output()
                 .unwrap();
+            crate::test_support::libtest::assert_ran_one_test(&output.stdout, &output.stderr);
             assert!(
                 output.status.success(),
                 "restart accept must survive EMFILE and remain usable: {} {}",

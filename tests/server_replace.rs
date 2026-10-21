@@ -64,6 +64,12 @@ impl Proxy {
                 seen.push(line);
             }
             if let Some(status) = self.child.try_wait().unwrap() {
+                // The rest of its stdout too: a test binary re-run as this
+                // child with a stale `--exact` name says `running 0 tests`
+                // there and exits 0, and that line is the diagnosis.
+                while let Ok(line) = self.lines.recv_timeout(Duration::from_secs(1)) {
+                    seen.push(line);
+                }
                 let mut error = String::new();
                 self.child
                     .stderr
