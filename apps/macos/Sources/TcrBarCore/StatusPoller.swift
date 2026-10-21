@@ -167,7 +167,7 @@ public enum PollState: Equatable {
     ///   ``summary`` when nothing is enabled, as today.
     /// - A fleet holding both providers: one line per pool,
     ///   `Claude · 3 of 4 accounts ready · 1 parked`, or `Codex · 2 parked`
-    ///   for a pool with nothing enabled, and ` · shown on the cup` on the
+    ///   for a pool with nothing enabled, and ` · shown on the icon` on the
     ///   line of the pool the cup follows.
     ///
     /// An unreadable row's notice closes the last line, as it always has.
@@ -181,7 +181,7 @@ public enum PollState: Equatable {
             sentence = pools.map { pool in
                 let line =
                     "\(pool.name) · " + (pool.countsSentence() ?? "\(pool.parkedCount) parked")
-                return pool.provider == governing ? line + " · shown on the cup" : line
+                return pool.provider == governing ? line + " · shown on the icon" : line
             }.joined(separator: "\n")
         } else {
             guard let only = pools.first?.countsSentence(nounPrefix: "Codex ") else {

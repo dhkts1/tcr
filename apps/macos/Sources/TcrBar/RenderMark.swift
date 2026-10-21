@@ -81,7 +81,7 @@ enum RenderMark {
     /// The cup and the count over a fleet holding Codex accounts, rendered
     /// after ``scenes``, each with the counts on and keep-awake off so the
     /// fill, the tint and the two-part count are all a scene shows.
-    /// `cupPool` is "Cup shows": the cup follows the emptier pool unless it is
+    /// `cupPool` is "Icon shows": the cup follows the emptier pool unless it is
     /// pinned, and the count shows both pools, Claude first, whatever the pin.
     private static var poolScenes:
         [
@@ -159,14 +159,9 @@ enum RenderMark {
         into directory: URL
     ) -> Bool {
         let tint = MenuBarShell.cupTint(for: scene.state, awake: scene.awake, cupPool: cupPool)
-        guard
-            let mark = MenuBarMark.image(
-                fraction: scene.state.capacityFraction(cupPool: cupPool), tint: tint,
-                knocks: scene.knocks, fleet: scene.state.loadedFleet)
-        else {
-            FileHandle.standardError.write(Data("no such SF Symbol: \(MenuBarMark.symbolName)\n".utf8))
-            return false
-        }
+        let mark = MenuBarMark.image(
+            fraction: scene.state.capacityFraction(cupPool: cupPool), tint: tint,
+            knocks: scene.knocks, fleet: scene.state.loadedFleet)
 
         let label = scene.showCounts ? scene.state.countsLabel : nil
         let running = scene.state.runningToolsCount(showRunningTools: scene.showRunningTools)
