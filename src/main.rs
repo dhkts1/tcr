@@ -8748,8 +8748,11 @@ const fn wedged_incumbent_recovery(kind: singleton::ProxyKind) -> &'static str {
              start it again to recover a wedged embedded proxy."
         }
         singleton::ProxyKind::Tcr => {
-            "Stop the proxy explicitly, or use `tcr --replace` if it runs tcr 1.2.17 or newer \
-             and its listener handoff endpoint still answers."
+            concat!(
+                "Stop the proxy explicitly, or use `tcr --replace` if it runs tcr ",
+                tcr::handoff_since!(),
+                " or newer and its listener handoff endpoint still answers."
+            )
         }
     }
 }
@@ -9761,7 +9764,8 @@ mod tests {
         // advice having been dropped for everyone.
         let advice = wedged_incumbent_recovery(singleton::ProxyKind::Tcr);
         assert!(
-            advice.contains("Stop the proxy explicitly") && advice.contains("tcr 1.2.17 or newer"),
+            advice.contains("Stop the proxy explicitly")
+                && advice.contains(&format!("tcr {} or newer", tcr::restart::HANDOFF_SINCE)),
             "standalone recovery must explain when handoff is available: {advice}"
         );
     }
