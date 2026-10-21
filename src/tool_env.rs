@@ -28,10 +28,33 @@ fn path_text(path: &Path) -> anyhow::Result<&str> {
         .context("agent helper paths must be valid UTF-8")
 }
 
-fn inherited(cmd: &Command, name: &str) -> Option<String> {
+/// What a launch reads from the machine it runs on: the environment it inherits
+/// (which also names `HOME` and `CODEX_HOME`, so the Codex config file to read)
+/// and tcr's own CA path. Production uses [`Host::current`]; a test passes its
+/// own, so a test run inside a `tcr run` session never sees that session's proxy.
+pub(crate) struct Host<'a> {
+    pub env: &'a dyn Fn(&str) -> Option<String>,
+    pub own_ca: PathBuf,
+}
+
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+impl Host<'static> {
+    /// This process's environment and tcr's minted CA path.
+    pub(crate) fn current() -> Self {
+        Self {
+            env: &process_env,
+            own_ca: tcr::mitm::minted_ca_path(),
+        }
+    }
+}
+
+fn inherited(cmd: &Command, name: &str, host: &Host<'_>) -> Option<String> {
     match cmd.get_envs().find(|(key, _)| *key == name) {
         Some((_, value)) => value.map(|v| v.to_string_lossy().into_owned()),
-        None => std::env::var(name).ok(),
+        None => (host.env)(name),
     }
 }
 
@@ -62,21 +85,20 @@ fn publish(path: &Path, contents: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn model_port(cmd: &Command) -> Option<u16> {
-    reqwest::Url::parse(&inherited(cmd, "HTTPS_PROXY")?)
+fn model_port(cmd: &Command, host: &Host<'_>) -> Option<u16> {
+    reqwest::Url::parse(&inherited(cmd, "HTTPS_PROXY", host)?)
         .ok()?
         .port_or_known_default()
 }
 
-fn caller_env(port: Option<u16>) -> BTreeMap<String, String> {
-    let ca = tcr::mitm::minted_ca_path();
+fn caller_env(port: Option<u16>, host: &Host<'_>) -> BTreeMap<String, String> {
     PROXIES
         .iter()
         .chain(CAS.iter())
         .filter_map(|key| {
-            let value = std::env::var(key).ok()?;
+            let value = (host.env)(key)?;
             // Strip only our own CA; caller bundles remain part of the shell env.
-            if (CAS.contains(key) && Path::new(&value) == ca)
+            if (CAS.contains(key) && Path::new(&value) == host.own_ca)
                 || (PROXIES.contains(key)
                     && port.is_some_and(|port| tcr::doctor::points_at_tcr(&value, port)))
             {
@@ -89,18 +111,14 @@ fn caller_env(port: Option<u16>) -> BTreeMap<String, String> {
 
 /// Preserve explicit config-file set entries. CLI arguments appended by the
 /// caller can override these defaults again. This reads, never edits, Codex's file.
-fn codex_policy(cmd: &Command) -> BTreeMap<String, String> {
-    let mut values = caller_env(model_port(cmd));
-    let file = std::env::var_os("CODEX_HOME")
-        .filter(|v| !v.is_empty())
-        .map_or_else(
-            || {
-                PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                    .join(".codex/config.toml")
-            },
-            |home| PathBuf::from(home).join("config.toml"),
-        );
-    if let Ok(text) = std::fs::read_to_string(file)
+fn codex_policy(cmd: &Command, host: &Host<'_>) -> BTreeMap<String, String> {
+    let mut values = caller_env(model_port(cmd, host), host);
+    let nonempty = |name| (host.env)(name).filter(|v| !v.is_empty());
+    let file = nonempty("CODEX_HOME")
+        .map(|home| PathBuf::from(home).join("config.toml"))
+        .or_else(|| nonempty("HOME").map(|home| PathBuf::from(home).join(".codex/config.toml")));
+    if let Some(file) = file
+        && let Ok(text) = std::fs::read_to_string(file)
         && let Ok(document) = text.parse::<toml_edit::DocumentMut>()
         && let Some(set) = document
             .get("shell_environment_policy")
@@ -119,8 +137,8 @@ fn codex_policy(cmd: &Command) -> BTreeMap<String, String> {
     values
 }
 
-pub(crate) fn apply_codex_shell_policy(cmd: &mut Command) -> Vec<String> {
-    let values = codex_policy(cmd);
+pub(crate) fn apply_codex_shell_policy(cmd: &mut Command, host: &Host<'_>) -> Vec<String> {
+    let values = codex_policy(cmd, host);
     for key in PROXIES.iter().chain(CAS.iter()) {
         let value = values.get(*key).cloned().unwrap_or_default();
         cmd.args([
@@ -148,15 +166,16 @@ pub(crate) fn apply(
     let codex_bin = tcr::codex_local::find_codex()
         .ok()
         .and_then(|found| executable(&found.path));
+    let host = Host::current();
     let helper_parent = std::path::absolute(tcr::paths::cache_dir().root().join("tool-env"))?;
     let original = |key: &str, saved: &str| {
-        inherited(cmd, key)
+        inherited(cmd, key, &host)
             .filter(|v| !v.is_empty())
             .and_then(|value| {
                 if tcr::codex_local::is_tool_launcher(Path::new(&value))
                     || Path::new(&value).starts_with(&helper_parent)
                 {
-                    std::env::var(saved).ok().filter(|v| !v.is_empty())
+                    (host.env)(saved).filter(|v| !v.is_empty())
                 } else {
                     Some(value)
                 }
@@ -182,8 +201,8 @@ pub(crate) fn apply(
         "TCR_TOOL_ORIGINAL_ENV_FILE",
         env_file.as_deref().unwrap_or_default(),
     );
-    let shell = inherited(cmd, "CLAUDE_CODE_SHELL")
-        .or_else(|| inherited(cmd, "SHELL"))
+    let shell = inherited(cmd, "CLAUDE_CODE_SHELL", &host)
+        .or_else(|| inherited(cmd, "SHELL", &host))
         .filter(|s| {
             matches!(
                 Path::new(s).file_name().and_then(|v| v.to_str()),
@@ -207,7 +226,7 @@ pub(crate) fn apply(
         .tempdir_in(&parent)?;
     let root = directory.path();
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
-    let caller = caller_env(model_port(cmd));
+    let caller = caller_env(model_port(cmd, &host), &host);
     let mut cleanup = String::new();
     for key in PROXIES.iter().chain(CAS.iter()) {
         let saved = format!("TCR_TOOL_CALLER_{key}");
@@ -221,7 +240,7 @@ pub(crate) fn apply(
     }
     // Runtime environment only: no request key or proxy credential is written
     // into a helper file or used to choose its directory.
-    if let Some(value) = inherited(cmd, "HTTPS_PROXY") {
+    if let Some(value) = inherited(cmd, "HTTPS_PROXY", &host) {
         let mut proxy = reqwest::Url::parse(&value)?;
         proxy
             .set_username(if proxy.password().is_some() {
@@ -232,7 +251,7 @@ pub(crate) fn apply(
             .map_err(|()| anyhow::anyhow!("invalid nested Claude proxy URL"))?;
         cmd.env("TCR_TOOL_CLAUDE_PROXY", proxy.as_str());
     }
-    cmd.env("TCR_TOOL_CLAUDE_CA", tcr::mitm::minted_ca_path());
+    cmd.env("TCR_TOOL_CLAUDE_CA", &host.own_ca);
     let prepend = format!("export PATH={}:\"$PATH\"\n", quote(path_text(root)?));
     let mut env_script = String::from("#!/bin/sh\n# tcr tool launcher\n");
     env_script.push_str(&cleanup);

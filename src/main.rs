@@ -7156,7 +7156,13 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // The same read decides the request key: sent only to a server that
         // reports `requestKeyMode`.
         let launch_key = LaunchKey::decide(config.proxy.request_key.as_deref(), &live);
-        for line in apply_codex_launch(&mut cmd, port, &launch, &launch_key) {
+        for line in apply_codex_launch(
+            &mut cmd,
+            port,
+            &launch,
+            &launch_key,
+            &tool_env::Host::current(),
+        ) {
             eprintln!("{line}");
         }
         let helpers = if matches!(launch, CodexLaunch::SeeThrough { .. }) {
@@ -7492,13 +7498,15 @@ fn no_claude_account_warning(port: u16, payload: &status::StatusPayload) -> Opti
 
 /// Carry out [`codex_launch`]'s decision on `cmd`, and return its stderr lines
 /// for the caller to print. `key` applies to a see-through launch only: a direct
-/// one never reaches tcr.
+/// one never reaches tcr. Everything it reads from the machine (the caller's
+/// environment, the Codex config file, tcr's CA path) comes from `host`.
 #[must_use]
 fn apply_codex_launch(
     cmd: &mut std::process::Command,
     port: u16,
     launch: &CodexLaunch,
     key: &LaunchKey,
+    host: &tool_env::Host<'_>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     match launch {
@@ -7507,11 +7515,11 @@ fn apply_codex_launch(
                 cmd,
                 port,
                 ca,
-                std::env::var_os("CODEX_CA_CERTIFICATE").is_some_and(|value| !value.is_empty()),
+                (host.env)("CODEX_CA_CERTIFICATE").is_some_and(|value| !value.is_empty()),
                 key,
             ));
-            apply_nested_claude_ca(cmd, ca, std::env::var_os("NODE_EXTRA_CA_CERTS").is_some());
-            lines.extend(tool_env::apply_codex_shell_policy(cmd));
+            apply_nested_claude_ca(cmd, ca, (host.env)("NODE_EXTRA_CA_CERTS").is_some());
+            lines.extend(tool_env::apply_codex_shell_policy(cmd, host));
             lines.extend(key.notice(port));
             for rewrite in no_proxy {
                 cmd.env(rewrite.var, &rewrite.kept);
@@ -9429,41 +9437,80 @@ mod tests {
         )
     }
 
+    /// Every variable the Codex shell policy sets, in order.
+    const SHELL_POLICY_VARS: [&str; 8] = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NODE_EXTRA_CA_CERTS",
+        "CODEX_CA_CERTIFICATE",
+    ];
+
+    /// The `shell_environment_policy.set.*` arguments on `cmd`, as (name, value).
+    fn shell_policy(cmd: &std::process::Command) -> Vec<(String, String)> {
+        cmd.get_args()
+            .filter_map(|arg| {
+                let arg = arg.to_string_lossy();
+                let (name, value) = arg
+                    .strip_prefix("shell_environment_policy.set.")?
+                    .split_once('=')?;
+                let value: String = serde_json::from_str(value).expect("a JSON string");
+                Some((name.to_string(), value))
+            })
+            .collect()
+    }
+
+    /// Fail unless `cmd`'s shell policy sets exactly `want`, in [`SHELL_POLICY_VARS`]
+    /// order. The message names the variables that differ and never their values,
+    /// because a value may be a proxy URL that carries a request key.
+    fn assert_shell_policy(cmd: &std::process::Command, want: &[(&str, &str)], context: &str) {
+        let got = shell_policy(cmd);
+        let names: Vec<&str> = got.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(
+            names == SHELL_POLICY_VARS,
+            "{context}: shell policy names {names:?}"
+        );
+        let differ: Vec<&str> = got
+            .iter()
+            .filter(|(name, value)| {
+                let want = want.iter().find(|(n, _)| n == name).map_or("", |(_, v)| *v);
+                value != want
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(
+            differ.is_empty(),
+            "{context}: shell policy values differ for {differ:?}"
+        );
+    }
+
     /// Keyed model traffic retains the marker; shell defaults contain no key.
+    /// The caller's environment and Codex config are injected and empty, so the
+    /// result does not depend on the machine, or on a `tcr run` session around it.
     #[test]
     fn a_keyed_codex_launch_keeps_the_marker_and_restores_shell_settings() {
         let pooled = CodexLaunch::SeeThrough {
             ca: PathBuf::from("/tmp/ca.pem"),
             no_proxy: Vec::new(),
         };
-        let shell_args = |cmd: &std::process::Command| -> Vec<String> {
-            cmd.get_args()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .filter(|arg| arg.starts_with("shell_environment_policy.set."))
-                .collect()
-        };
+        let caller = inherited(&[]);
+        let host = test_host(&caller);
 
         let mut cmd = std::process::Command::new("true");
-        let lines = apply_codex_launch(&mut cmd, 3999, &pooled, &sent(KEY));
+        let lines = apply_codex_launch(&mut cmd, 3999, &pooled, &sent(KEY), &host);
         let codex_url = format!("http://tcr-codex:{KEY}@127.0.0.1:3999");
 
         let env = env_changes(&cmd);
-        assert_eq!(env.get("HTTPS_PROXY"), Some(&Some(codex_url.clone())));
-        assert_eq!(env.get("https_proxy"), Some(&Some(codex_url.clone())));
-        let expected: Vec<_> = [
-            "HTTPS_PROXY",
-            "https_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "NODE_EXTRA_CA_CERTS",
-            "CODEX_CA_CERTIFICATE",
-        ]
-        .iter()
-        .map(|var| format!("shell_environment_policy.set.{var}=\"\""))
-        .collect();
-        assert_eq!(shell_args(&cmd), expected);
+        for var in ["HTTPS_PROXY", "https_proxy"] {
+            assert!(
+                env.get(var) == Some(&Some(codex_url.clone())),
+                "{var} is not the keyed codex URL"
+            );
+        }
+        assert_shell_policy(&cmd, &[], "keyed");
         let codex = server_reads(&codex_url);
         assert!(codex.codex_marked && codex.key_ok, "{codex:?}");
         assert!(
@@ -9474,14 +9521,14 @@ mod tests {
 
         for decision in unkeyed_decisions() {
             let mut cmd = std::process::Command::new("true");
-            let lines = apply_codex_launch(&mut cmd, 3999, &pooled, &decision);
+            let lines = apply_codex_launch(&mut cmd, 3999, &pooled, &decision, &host);
             let env = env_changes(&cmd);
-            assert_eq!(
-                env.get("HTTPS_PROXY"),
-                Some(&Some("http://tcr-codex@127.0.0.1:3999".to_string())),
-                "{decision:?}"
+            assert!(
+                env.get("HTTPS_PROXY")
+                    == Some(&Some("http://tcr-codex@127.0.0.1:3999".to_string())),
+                "{decision:?}: HTTPS_PROXY is not the unkeyed codex URL"
             );
-            assert_eq!(shell_args(&cmd), expected, "{decision:?}");
+            assert_shell_policy(&cmd, &[], &format!("{decision:?}"));
             assert_eq!(
                 lines
                     .iter()
@@ -9501,12 +9548,71 @@ mod tests {
                 unset: Vec::new(),
             },
             &sent(KEY),
+            &host,
         );
         assert!(env_changes(&cmd).is_empty(), "a direct launch sets nothing");
-        assert!(shell_args(&cmd).is_empty());
+        assert!(shell_policy(&cmd).is_empty());
         assert!(
             !lines.iter().any(|line| line.contains("request key")),
             "{lines:?}"
+        );
+    }
+
+    /// The shell policy is built from the caller's environment and Codex config as
+    /// injected: a caller proxy aimed at this tcr (carrying its key) and tcr's own
+    /// CA are dropped, a caller's other proxy is kept, and a proxy the Codex config
+    /// sets wins.
+    #[test]
+    fn the_codex_shell_policy_reads_the_injected_environment_and_codex_config() {
+        let home = tempfile::tempdir().expect("a temporary HOME");
+        std::fs::create_dir(home.path().join(".codex")).expect("a .codex dir");
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "[shell_environment_policy.set]\nALL_PROXY = \"http://config.example:8080\"\n",
+        )
+        .expect("a codex config");
+        let home_text = home.path().to_str().expect("a UTF-8 path");
+        let pooled = CodexLaunch::SeeThrough {
+            ca: PathBuf::from("/tmp/ca.pem"),
+            no_proxy: Vec::new(),
+        };
+        let caller = inherited(&[
+            ("HOME", home_text),
+            ("HTTPS_PROXY", "http://k:secret@127.0.0.1:3999"),
+            ("http_proxy", "http://corp.example:3128"),
+            ("NODE_EXTRA_CA_CERTS", "/tmp/ca.pem"),
+        ]);
+        let mut cmd = std::process::Command::new("true");
+        let _lines = apply_codex_launch(&mut cmd, 3999, &pooled, &sent(KEY), &test_host(&caller));
+        assert_shell_policy(
+            &cmd,
+            &[
+                ("http_proxy", "http://corp.example:3128"),
+                ("ALL_PROXY", "http://config.example:8080"),
+            ],
+            "HOME's codex config",
+        );
+
+        // CODEX_HOME names the config directory and wins over HOME.
+        let codex_home = tempfile::tempdir().expect("a CODEX_HOME");
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            "[shell_environment_policy.set]\nALL_PROXY = \"http://codex-home.example:8080\"\n",
+        )
+        .expect("a codex config");
+        let caller = inherited(&[
+            ("HOME", home_text),
+            (
+                "CODEX_HOME",
+                codex_home.path().to_str().expect("a UTF-8 path"),
+            ),
+        ]);
+        let mut cmd = std::process::Command::new("true");
+        let _lines = apply_codex_launch(&mut cmd, 3999, &pooled, &sent(KEY), &test_host(&caller));
+        assert_shell_policy(
+            &cmd,
+            &[("ALL_PROXY", "http://codex-home.example:8080")],
+            "CODEX_HOME's codex config",
         );
     }
 
@@ -9571,6 +9677,7 @@ mod tests {
                 no_proxy: Vec::new(),
             },
             &key,
+            &test_host(&inherited(&[])),
         ));
         lines.extend(unkeyed_decisions().iter().filter_map(|d| d.notice(3999)));
         assert!(
@@ -10025,6 +10132,15 @@ mod tests {
             wire["mitm"] = mitm;
         }
         Ok(serde_json::from_value(wire).expect("a status payload"))
+    }
+
+    /// A launch host that reads only `env` (no process environment, no real
+    /// `HOME`) and names `/tmp/ca.pem` as tcr's CA.
+    fn test_host(env: &dyn Fn(&str) -> Option<String>) -> tool_env::Host<'_> {
+        tool_env::Host {
+            env,
+            own_ca: PathBuf::from("/tmp/ca.pem"),
+        }
     }
 
     /// An inherited environment holding exactly `vars`.
@@ -10503,7 +10619,13 @@ mod tests {
         )
         .expect("a direct launch");
         let mut cmd = std::process::Command::new("true");
-        let _lines = apply_codex_launch(&mut cmd, 3999, &launch, &LaunchKey::NoKeyInConfig);
+        let _lines = apply_codex_launch(
+            &mut cmd,
+            3999,
+            &launch,
+            &LaunchKey::NoKeyInConfig,
+            &test_host(&env),
+        );
         assert_eq!(
             env_changes(&cmd),
             [
@@ -10592,7 +10714,13 @@ mod tests {
         );
 
         let mut cmd = std::process::Command::new("true");
-        let _lines = apply_codex_launch(&mut cmd, 3999, &launch, &LaunchKey::NoKeyInConfig);
+        let _lines = apply_codex_launch(
+            &mut cmd,
+            3999,
+            &launch,
+            &LaunchKey::NoKeyInConfig,
+            &test_host(&env),
+        );
         let env = env_changes(&cmd);
         assert_eq!(
             env.get("NO_PROXY"),
@@ -12072,25 +12200,30 @@ mod tests {
             "the caller's own value is inherited, not replaced"
         );
 
-        let mut cmd = std::process::Command::new("true");
-        let _lines = apply_codex_launch(
-            &mut cmd,
-            3999,
-            &CodexLaunch::SeeThrough {
-                ca: ca.to_path_buf(),
-                no_proxy: Vec::new(),
-            },
-            &LaunchKey::NoKeyInConfig,
-        );
-        let expected = match std::env::var_os("NODE_EXTRA_CA_CERTS") {
-            None => Some(Some("/tmp/ca.pem".to_string())),
-            Some(_) => None,
-        };
-        assert_eq!(
-            env_changes(&cmd).get("NODE_EXTRA_CA_CERTS").cloned(),
-            expected,
-            "a pooled launch sets the CA for a nested claude unless this process exported one"
-        );
+        for (caller, expected) in [
+            (inherited(&[]), Some(Some("/tmp/ca.pem".to_string()))),
+            (
+                inherited(&[("NODE_EXTRA_CA_CERTS", "/tmp/corporate-ca.pem")]),
+                None,
+            ),
+        ] {
+            let mut cmd = std::process::Command::new("true");
+            let _lines = apply_codex_launch(
+                &mut cmd,
+                3999,
+                &CodexLaunch::SeeThrough {
+                    ca: ca.to_path_buf(),
+                    no_proxy: Vec::new(),
+                },
+                &LaunchKey::NoKeyInConfig,
+                &test_host(&caller),
+            );
+            assert_eq!(
+                env_changes(&cmd).get("NODE_EXTRA_CA_CERTS").cloned(),
+                expected,
+                "a pooled launch sets the CA for a nested claude unless the caller exported one"
+            );
+        }
 
         let mut cmd = std::process::Command::new("true");
         let _lines = apply_codex_launch(
@@ -12101,6 +12234,7 @@ mod tests {
                 unset: Vec::new(),
             },
             &LaunchKey::NoKeyInConfig,
+            &test_host(&inherited(&[])),
         );
         assert_eq!(env_changes(&cmd).get("NODE_EXTRA_CA_CERTS"), None);
     }
