@@ -104,10 +104,10 @@ final class MenuBarMarkTests: XCTestCase {
         XCTAssertEqual(scan.tinted, 0, "the template tint is coloured, so it cannot follow the menu bar")
     }
 
-    /// The fill level: an empty cup draws no liquid at all — every opaque pixel
-    /// is the outline's rim — while a full cup draws substantially more opaque
-    /// pixels, the liquid filling the body the rim alone leaves hollow.
-    func testAHigherFractionOpaquesMorePixelsThanAnEmptyCup() throws {
+    /// The capacity reading: an empty mark lights no ray, so its only opaque
+    /// pixels are the hub (the dim tracks fall under the scan's alpha floor),
+    /// while a full mark lights all eight.
+    func testAHigherFractionOpaquesMorePixelsThanAnEmptyMark() throws {
         let empty = try XCTUnwrap(MenuBarMark.image(fraction: 0, tint: .awake(loudTint)))
         let full = try XCTUnwrap(MenuBarMark.image(fraction: 1, tint: .awake(loudTint)))
         let emptyScan = try XCTUnwrap(rasterise(empty, in: XCTUnwrap(NSAppearance(named: .darkAqua))))
@@ -115,12 +115,47 @@ final class MenuBarMarkTests: XCTestCase {
 
         XCTAssertGreaterThan(
             fullScan.opaque, emptyScan.opaque,
-            "a full cup must draw more ink than an empty one — the fill level is not being drawn")
+            "a full mark must draw more ink than an empty one: the lit rays are not being drawn")
     }
 
-    /// `nil` fraction is documented to draw exactly like `0` — an all-disabled
+    /// Which rays light for which reading. The two ends are exact: none only
+    /// when nothing is ready, all eight only when everything is. In between
+    /// the count rounds, but never to either end, so 1 of 13 ready still
+    /// lights a ray and 12 of 13 still leaves one dark.
+    func testLitRaysNeverRoundToEmptyOrFull() {
+        XCTAssertEqual(MenuBarMark.litRays(for: nil), 0)
+        XCTAssertEqual(MenuBarMark.litRays(for: .nan), 0)
+        XCTAssertEqual(MenuBarMark.litRays(for: -0.5), 0)
+        XCTAssertEqual(MenuBarMark.litRays(for: 0), 0)
+        XCTAssertEqual(MenuBarMark.litRays(for: 1.0 / 13), 1)
+        XCTAssertEqual(MenuBarMark.litRays(for: 0.5), 4)
+        XCTAssertEqual(MenuBarMark.litRays(for: 8.0 / 13), 5)
+        XCTAssertEqual(MenuBarMark.litRays(for: 12.0 / 13), 7)
+        // Plain rounding would give 0 and 8 here: 1 of 20 ready, 19 of 20.
+        XCTAssertEqual(MenuBarMark.litRays(for: 0.05), 1)
+        XCTAssertEqual(MenuBarMark.litRays(for: 0.95), 7)
+        XCTAssertEqual(MenuBarMark.litRays(for: 1), 8)
+        XCTAssertEqual(MenuBarMark.litRays(for: 1.4), 8)
+    }
+
+    /// A failed poll has no reading and no proxy to show: tracks only, no hub.
+    /// The centre pixel tells the two apart without relying on colour; the
+    /// empty mark in the same colour is the positive control that the probe
+    /// finds a hub when there is one.
+    func testAFailedMarkDrawsNoHub() throws {
+        let failed = MenuBarMark.image(fraction: nil, tint: .failed(loudTint))
+        let empty = MenuBarMark.image(fraction: nil, tint: .near(loudTint))
+        let dark = try XCTUnwrap(NSAppearance(named: .darkAqua))
+        let failedScan = try XCTUnwrap(rasterise(failed, in: dark))
+        let emptyScan = try XCTUnwrap(rasterise(empty, in: dark))
+        XCTAssertGreaterThan(failedScan.opaque, 0, "nothing was rasterised: the scan proves nothing")
+        XCTAssertGreaterThan(emptyScan.centreAlpha, 0.5, "the probe found no hub on a mark that has one")
+        XCTAssertLessThan(failedScan.centreAlpha, 0.1, "a failed poll still draws the hub")
+    }
+
+    /// `nil` fraction is documented to draw exactly like `0`: an all-disabled
     /// fleet or a poll with nothing loaded yet must never draw a fault-coloured
-    /// cup that also happens to be full.
+    /// mark that also happens to be full.
     func testANilFractionDrawsLikeZero() throws {
         let nilFraction = try XCTUnwrap(MenuBarMark.image(fraction: nil, tint: .awake(loudTint)))
         let zeroFraction = try XCTUnwrap(MenuBarMark.image(fraction: 0, tint: .awake(loudTint)))
@@ -131,16 +166,8 @@ final class MenuBarMarkTests: XCTestCase {
 
     /// A fraction outside `0...1` (a stale reading from a fleet that shrank
     /// mid-poll, or a negative value `Double` does not itself forbid) must
-    /// never draw more ink than a full cup or less than an empty one — the
-    /// caller's contract is a sane image for any `Double`, not a crash or a
-    /// cup that overflows its own rim. Measured, not merely asserted from the
-    /// clamp's presence: with the `min`/`max` deliberately removed in a scratch
-    /// build, both assertions here still held, because `NSRect.clip()` already
-    /// normalises an over-tall or negative-height rect on this OS — so this
-    /// test locks in the OUTPUT contract the function actually promises,
-    /// leaving `min`/`max` as defensive belt-and-braces the platform's own
-    /// clipping already backs up, not as the one thing standing between this
-    /// function and a torn image.
+    /// never draw more ink than a full mark or less than an empty one: the
+    /// caller's contract is a sane image for any `Double`, not a crash.
     func testAnOutOfRangeFractionStaysBoundedByEmptyAndFull() throws {
         let empty = try XCTUnwrap(MenuBarMark.image(fraction: 0, tint: .awake(loudTint)))
         let full = try XCTUnwrap(MenuBarMark.image(fraction: 1, tint: .awake(loudTint)))
@@ -184,16 +211,6 @@ final class MenuBarMarkTests: XCTestCase {
         XCTAssertGreaterThan(
             distance, 0.3,
             "the same pixels came back the same colour in both appearances — the dynamic tint was baked in")
-    }
-
-    /// `nil` only when the cup symbol itself cannot be created — that is a
-    /// missing SF Symbol, which the caller has to notice rather than paper over
-    /// with an empty status item. Exercised through `KeepAwakeGlyph`'s own
-    /// symbol name is not possible without a broken build, so this only pins
-    /// the documented contract: a real symbol name always succeeds.
-    func testARealFractionAndTintAlwaysProducesAnImage() {
-        XCTAssertNotNil(MenuBarMark.image(fraction: 0, tint: .template))
-        XCTAssertNotNil(MenuBarMark.image(fraction: 1, tint: .failed(loudTint)))
     }
 
     /// The menu bar has no room for a label, so this string is the only place the
@@ -294,12 +311,14 @@ final class MenuBarMarkTests: XCTestCase {
 
     private struct Scan {
         var opaque = 0
-        /// Pixels that carry the tint — i.e. any part of the cup drawn with a
+        /// Pixels that carry the tint — i.e. any part of the mark drawn with a
         /// non-template colour.
         var tinted = 0
         /// Mean (r, g, b) of the opaque pixels, for telling one solid colour
         /// from another rather than merely "some colour, some other colour".
         var meanColour: (r: Double, g: Double, b: Double) = (0, 0, 0)
+        /// Alpha of the pixel at the centre of the image, where the hub sits.
+        var centreAlpha: Double = 0
     }
 
     /// Draw at 2x under a chosen appearance and count. `performAsCurrentDrawingAppearance`
@@ -328,6 +347,8 @@ final class MenuBarMarkTests: XCTestCase {
         }
 
         var scan = Scan()
+        scan.centreAlpha = Double(
+            rep.colorAt(x: rep.pixelsWide / 2, y: rep.pixelsHigh / 2)?.alphaComponent ?? 0)
         var rSum = 0.0
         var gSum = 0.0
         var bSum = 0.0

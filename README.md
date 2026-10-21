@@ -264,7 +264,7 @@ and no window. Its icon shows the capacity left across the whole pool rather tha
 account, because in a rotating pool one used-up account is the rotation working, not an alarm.
 
 TcrBar and the terminal dashboard both show Claude and Codex separately. TcrBar counts each
-provider on its own: the menu-bar count reads Claude first ("3/4 · 1/2"), the cup icon follows
+provider on its own: the menu-bar count reads Claude first ("3/4 · 1/2"), the menu-bar icon follows
 whichever provider has less left unless Settings pins it to one, the strip under the tabs gives
 each provider its own row, and the Accounts tab has a CLAUDE and a CODEX section. The dashboard's
 banner gives each provider its own segment (`CLAUDE 1/3 eligible │ CODEX 2/4 eligible`), and its
