@@ -1670,6 +1670,15 @@ impl UsageTracker {
         report
     }
 
+    pub fn rebuild_from_ledger(
+        &self,
+        accounts: &[LedgerAccount],
+        now_ms: i64,
+    ) -> Option<ReplayReport> {
+        drop((accounts, now_ms));
+        None
+    }
+
     fn replay_day(
         &self,
         dir: &Path,
@@ -2147,6 +2156,91 @@ mod tests {
             "the second account's line was attributed to it, not to the first"
         );
 
+        std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
+    }
+
+    /// After a listener handoff two processes append to one day file: the
+    /// successor replayed it at boot while the predecessor was still draining,
+    /// so every line the predecessor wrote after that replay is on disk and
+    /// missing from the successor's totals. Rebuilding from the whole file once
+    /// the predecessor is done counts every line of both writers exactly once,
+    /// including the successor's own lines and the ones it records while the
+    /// rebuild runs.
+    #[test]
+    fn a_rebuild_counts_every_line_of_both_writers_once() {
+        let dir = scratch("rebuild");
+        let names = vec![named("alice@example.com")];
+        let now = crate::now_ms();
+        let line = move || record(now, "claude-opus-5", 10);
+
+        // Lines on disk before either process below started.
+        let earlier = tracker();
+        earlier.attach_ledger(dir.clone(), 90, &names, now);
+        for _ in 0..3 {
+            earlier.record(0, &line(), &names[0].name, None, None);
+        }
+        assert_eq!(
+            earlier.shutdown_ledger(std::time::Duration::from_secs(5)),
+            LedgerShutdown::Flushed
+        );
+
+        // The successor boots and replays them.
+        let successor = Arc::new(tracker());
+        let report = successor.attach_ledger(dir.clone(), 90, &names, now);
+        assert_eq!(
+            report.replayed, 3,
+            "positive control: the boot replay read the file"
+        );
+
+        // The predecessor, still draining, writes to the same file after that replay.
+        let predecessor = tracker();
+        predecessor.attach_ledger(dir.clone(), 90, &names, now);
+        for _ in 0..4 {
+            predecessor.record(0, &line(), &names[0].name, None, None);
+        }
+        assert_eq!(
+            predecessor.shutdown_ledger(std::time::Duration::from_secs(5)),
+            LedgerShutdown::Flushed
+        );
+
+        // The successor serves requests of its own in the same window.
+        for _ in 0..2 {
+            successor.record(0, &line(), &names[0].name, None, None);
+        }
+        assert_eq!(
+            successor.row(0, now, None).today.requests,
+            5,
+            "positive control: before the rebuild the predecessor's four lines are missing"
+        );
+
+        // Requests that land while the rebuild runs.
+        let recording = Arc::clone(&successor);
+        let alice = names[0].name.clone();
+        let during = std::thread::spawn(move || {
+            for _ in 0..50 {
+                recording.record(0, &line(), &alice, None, None);
+            }
+        });
+        let rebuilt = successor.rebuild_from_ledger(&names, now);
+        during.join().expect("the recording thread finished");
+
+        assert!(rebuilt.is_some(), "the rebuild ran: {rebuilt:?}");
+        assert_eq!(
+            successor.row(0, now, None).today.requests,
+            3 + 4 + 2 + 50,
+            "every line of both writers, and every request recorded during the rebuild, \
+             counted exactly once"
+        );
+        assert!(successor.flush_ledger(), "the writer answered the flush");
+        assert_eq!(
+            lines_in(&dir, now),
+            3 + 4 + 2 + 50,
+            "the file holds the same lines the totals count"
+        );
+        assert_eq!(
+            successor.shutdown_ledger(std::time::Duration::from_secs(5)),
+            LedgerShutdown::Flushed
+        );
         std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
     }
 

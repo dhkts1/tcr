@@ -8,7 +8,7 @@
 //! ordered sequence a predecessor performs once a verified successor has
 //! connected.
 //!
-//! The successor's side is [`crate::server::ServeOptions::inherited_listener`],
+//! The successor's side is [`crate::server::ServeOptions::handover`],
 //! and the descriptor transport plus the peer check live in `tcr-fdpass`,
 //! which exists so the `unsafe` those need stays out of this crate.
 

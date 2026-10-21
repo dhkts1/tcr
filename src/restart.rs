@@ -184,11 +184,25 @@ pub(crate) fn confirm_listener_released(peer: &std::os::unix::net::UnixStream) -
     peer.write_all(RELEASED)
 }
 
+/// What a successor takes from its predecessor: the listening socket, and the
+/// handoff channel it came over.
+///
+/// The channel is kept open on purpose. The predecessor holds its end until its
+/// usage ledger is on disk, after its drain, so end-of-file on `predecessor` is
+/// the moment the day file holds every line the predecessor will ever write.
+/// Nothing more is sent on it; the close is the whole message, and a crash
+/// sends it too.
+#[derive(Debug)]
+pub struct Handover {
+    pub listener: std::net::TcpListener,
+    pub predecessor: std::os::unix::net::UnixStream,
+}
+
 /// Request a socket only from a recognized standalone proxy on this port.
 /// Failure leaves the incumbent alone: a kill-and-bind fallback would recreate
 /// the refusal window this protocol exists to remove. Old binaries need one
 /// explicit stop to upgrade; subsequent replacements use this handoff.
-pub async fn request_listener(port: u16) -> anyhow::Result<Option<std::net::TcpListener>> {
+pub async fn request_listener(port: u16) -> anyhow::Result<Option<Handover>> {
     if port == 0 {
         return Ok(None);
     }
@@ -213,7 +227,7 @@ pub async fn request_listener(port: u16) -> anyhow::Result<Option<std::net::TcpL
     peer.set_nonblocking(false)?;
     peer.set_read_timeout(Some(TIMEOUT))?;
     peer.set_write_timeout(Some(TIMEOUT))?;
-    let listener = tokio::task::spawn_blocking(move || {
+    let handover = tokio::task::spawn_blocking(move || {
         use std::io::{Read as _, Write as _};
         let listener = tcr_fdpass::recv_listener(&peer)?;
         if listener.local_addr()? != std::net::SocketAddr::from(([127, 0, 0, 1], port)) {
@@ -232,12 +246,15 @@ pub async fn request_listener(port: u16) -> anyhow::Result<Option<std::net::TcpL
                 "invalid listener release confirmation",
             ));
         }
-        Ok(listener)
+        Ok(Handover {
+            listener,
+            predecessor: peer,
+        })
     })
     .await
     .context("restart receiver task failed")?
     .context("the incumbent did not hand over its listener; no process was signalled")?;
-    Ok(Some(listener))
+    Ok(Some(handover))
 }
 
 /// Disabled handoff must leave the ordinary server and its signal paths usable.

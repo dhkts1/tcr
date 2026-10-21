@@ -100,7 +100,7 @@ fn options(profile: &Profile) -> ServeOptions {
         tls: TlsSetup::Disabled,
         host: ProxyHost::Cli,
         owner_dir: None,
-        inherited_listener: None,
+        handover: None,
     }
 }
 

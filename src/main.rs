@@ -8375,14 +8375,14 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
             None
         }
     };
-    let inherited_listener = if args.replace {
+    let handover = if args.replace {
         tcr::restart::request_listener(args.port.unwrap_or(config.proxy.port)).await?
     } else {
         None
     };
     // The predecessor's final token flush precedes sending the socket. Read it
     // now, not from the snapshot taken before asking the predecessor to stop.
-    let (config, persist_path) = if inherited_listener.is_some() {
+    let (config, persist_path) = if handover.is_some() {
         load_config(&config_path)?
     } else {
         (config, persist_path)
@@ -8489,7 +8489,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         // `serve`, and the two silently disagreeing means a claim named for a port
         // this process never bound — which every reader looks straight past.
         owner_dir: Some(singleton::default_owner_dir()),
-        inherited_listener,
+        handover,
     };
 
     let handle = match server::serve(options).await? {

@@ -124,7 +124,7 @@ fn options(tag: &str) -> ServeOptions {
         host: ProxyHost::Cli,
         owner_dir: None,
         // This path binds its own port; nothing is handed to it.
-        inherited_listener: None,
+        handover: None,
     }
 }
 

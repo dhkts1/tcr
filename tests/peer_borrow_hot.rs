@@ -112,7 +112,7 @@ fn options(config_path: std::path::PathBuf) -> ServeOptions {
         tls: TlsSetup::Disabled,
         host: ProxyHost::Cli,
         owner_dir: None,
-        inherited_listener: None,
+        handover: None,
     }
 }
 
