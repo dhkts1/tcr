@@ -209,6 +209,11 @@ enum RenderStates {
             ("17j-tools-tab-fan-fixed", .loaded(sessionsTabFleet), false, nil),
             ("17k-tools-tab-fan-follow-cpu", .loaded(sessionsTabFleet), false, nil),
             ("17l-tools-tab-fan-another-app", .loaded(sessionsTabFleet), false, nil),
+            // Scene 17 with no machine reading at all, the panel's state
+            // before its first read lands: the numbers block holds only the
+            // fleet's errors and timeouts, and the first card's top must still
+            // sit at the same pixel row as in 17. See ``noMachineScenes``.
+            ("17m-tools-tab-no-machine", .loaded(sessionsTabFleet), false, nil),
             // The same two tabs at the LIVE fleet's measured dimensions
             // instead of the mockup's — see `realShapeFleet`. These are the
             // only scenes where TIMED OUT TODAY is absent (the real fleet
@@ -747,7 +752,8 @@ enum RenderStates {
             "27-one-height-tools", "17d-tools-tab-heat-manual", "17e-tools-tab-heat-fans-off",
             "17f-tools-tab-heat-no-fans", "17g-tools-tab-heat-worst-case",
             "17h-tools-tab-fan-install", "17i-tools-tab-fan-approval", "17j-tools-tab-fan-fixed",
-            "17k-tools-tab-fan-follow-cpu", "17l-tools-tab-fan-another-app":
+            "17k-tools-tab-fan-follow-cpu", "17l-tools-tab-fan-another-app",
+            "17m-tools-tab-no-machine":
             return .tools
         case "27-one-height-peers":
             return .peers
@@ -1254,14 +1260,13 @@ enum RenderStates {
                 snapshotMode: true,
                 snapshotKeepsScrollViews: live != nil,
                 initialTab: live?.tab ?? initialTab(for: scene.name),
-                // A heat scene is scene 17 in every fixture but the machine
-                // reading, so the two differ by the numbers line alone.
-                initialSessionFiles: sessionFilesFixture(
-                    for: heatScenes[scene.name] == nil ? scene.name : "17-tools-tab"),
-                initialMachineStats: heatScenes[scene.name] ?? machineFixture,
+                // A heat or no-machine scene is scene 17 in every fixture but
+                // the machine reading, so the two differ by the numbers alone.
+                initialSessionFiles: sessionFilesFixture(for: machineSceneBase(scene.name)),
+                initialMachineStats: noMachineScenes.contains(scene.name)
+                    ? nil : heatScenes[scene.name] ?? machineFixture,
                 initialRunningProcesses: runningProcessesFixture(
-                    for: heatScenes[scene.name] == nil ? scene.name : "17-tools-tab",
-                    state: scene.state),
+                    for: machineSceneBase(scene.name), state: scene.state),
                 initialExpandedTimeoutClasses: expandedTimeoutClassesFixture(for: scene.name),
                 initialZeroRequestsSince: claudeBannerScenes.contains(scene.name)
                     ? noRequestsBannerZeroSince : nil,
@@ -2408,9 +2413,12 @@ enum RenderStates {
     /// The Tailscale row of the pane under `--render-settings`: the mockup's
     /// scene 1, the app mode working. Documentation-range values only.
     static var settingsTailnetFixture: PeerTailnetRead {
-        .read(tailnetReading(.app, held: .init(
-            mode: .app, state: .ready, address: "100.64.0.7", found: 2,
-            recordedAtMs: peerMsAgo(5))))
+        .read(
+            tailnetReading(
+                .app,
+                held: .init(
+                    mode: .app, state: .ready, address: "100.64.0.7", found: 2,
+                    recordedAtMs: peerMsAgo(5))))
     }
 
     static func tailnetReading(
@@ -3693,6 +3701,19 @@ enum RenderStates {
         }
     }
 
+    /// Scenes drawn with no machine reading (`initialMachineStats: nil`), the
+    /// panel before its first read lands. Scene 17 otherwise, like
+    /// ``heatScenes``.
+    private static let noMachineScenes: Set<String> = ["17m-tools-tab-no-machine"]
+
+    /// The scene whose session files and process readings a scene borrows:
+    /// scene 17 for every scene that differs from it by the machine reading
+    /// alone, the scene itself otherwise.
+    private static func machineSceneBase(_ sceneName: String) -> String {
+        heatScenes[sceneName] != nil || noMachineScenes.contains(sceneName)
+            ? "17-tools-tab" : sceneName
+    }
+
     /// Scene 17's fleet plus one session that carries no running call, sized
     /// so the fleet's totals read `99 err today · 9999 timed out`: the
     /// mockup's widest errors and a four-digit timeout count, a design figure
@@ -3728,10 +3749,10 @@ enum RenderStates {
 
     /// Every scene drawn with a running, supervised proxy: the parity scenes,
     /// the README's top image, which should look like a reader's own panel
-    /// rather than a stopped one, and the heat scenes, which must differ from
-    /// scene 17 by the numbers line alone.
+    /// rather than a stopped one, and the heat and no-machine scenes, which
+    /// must differ from scene 17 by the numbers line alone.
     private static let supervisedScenes: Set<String> =
-        parityScenes.union(["01b-healthy-running"]).union(heatScenes.keys)
+        parityScenes.union(["01b-healthy-running"]).union(heatScenes.keys).union(noMachineScenes)
 
     /// The poll time every scene's header shows. "updated … ago" is measured
     /// against the real clock, so a poll pinned to `referenceDate` read
