@@ -260,12 +260,12 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" 'NESTED=yes ANTHROPIC_BASE_URL=http://127.0.0.1
     assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
 }
 
-/// tcr starts without the CLAUDE_CODE_SHELL that Claude reads from settings.json,
+/// tcr starts without the `CLAUDE_CODE_SHELL` that Claude reads from `settings.json`,
 /// so the prefix must take it from the command's own environment, and fall back
 /// to the launch-time shell when it is unset or names no runnable bash/zsh.
 #[test]
 fn shell_prefix_runs_the_shell_claude_names_at_command_time() {
-    if !std::path::Path::new("/bin/zsh").exists() {
+    if !Path::new("/bin/zsh").exists() {
         eprintln!("no /bin/zsh on this machine; skipping the shell-choice check");
         return;
     }
