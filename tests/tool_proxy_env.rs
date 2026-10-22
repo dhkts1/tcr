@@ -260,6 +260,30 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" 'NESTED=yes ANTHROPIC_BASE_URL=http://127.0.0.1
     assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
 }
 
+/// tcr starts without the CLAUDE_CODE_SHELL that Claude reads from settings.json,
+/// so the prefix must take it from the command's own environment, and fall back
+/// to the launch-time shell when it is unset or names no runnable bash/zsh.
+#[test]
+fn shell_prefix_runs_the_shell_claude_names_at_command_time() {
+    if !std::path::Path::new("/bin/zsh").exists() {
+        eprintln!("no /bin/zsh on this machine; skipping the shell-choice check");
+        return;
+    }
+    let fixture = AgentFixture::new();
+    let output = fixture.run(
+        r#"
+probe='printf "%s\n" "${ZSH_VERSION:+zsh}${BASH_VERSION:+bash}"'
+printf 'set=%s\n' "$(CLAUDE_CODE_SHELL=/bin/zsh "$CLAUDE_CODE_SHELL_PREFIX" "$probe")"
+printf 'unset=%s\n' "$(env -u CLAUDE_CODE_SHELL "$CLAUDE_CODE_SHELL_PREFIX" "$probe")"
+printf 'bogus=%s\n' "$(CLAUDE_CODE_SHELL=/nonexistent/zsh "$CLAUDE_CODE_SHELL_PREFIX" "$probe")"
+"#,
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    for expected in ["set=zsh", "unset=bash", "bogus=bash"] {
+        assert!(out.contains(expected), "missing {expected}: {out}");
+    }
+}
+
 #[test]
 fn nested_claude_from_codex_has_a_plain_marker_and_claudes_ca() {
     let fixture = AgentFixture::new();
