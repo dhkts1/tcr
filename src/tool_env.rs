@@ -272,7 +272,14 @@ pub(crate) fn apply(
     publish(&root.join("shell-env"), &env_script)?;
     let exec = match prefix {
         Some(prefix) => format!("exec {} \"$@\"\n", quote(&prefix)),
-        None => format!("exec {} -c \"$1\"\n", quote(&shell)),
+        // Once CLAUDE_CODE_SHELL_PREFIX is set, Claude Code runs every command as
+        // `<prefix> '<script>'`, so this line picks the shell, not Claude. Its
+        // CLAUDE_CODE_SHELL usually comes from settings.json, which this launch never
+        // sees, so read it when the command runs; the launch-time shell is the fallback.
+        None => format!(
+            "shell={}\ncase \"${{CLAUDE_CODE_SHELL:-}}\" in\n  bash|zsh|*/bash|*/zsh) command -v \"$CLAUDE_CODE_SHELL\" >/dev/null 2>&1 && shell=$CLAUDE_CODE_SHELL;;\nesac\nexec \"$shell\" -c \"$1\"\n",
+            quote(&shell)
+        ),
     };
     publish(
         &root.join("shell-prefix"),
