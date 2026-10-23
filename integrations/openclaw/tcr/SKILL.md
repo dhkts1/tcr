@@ -1,7 +1,7 @@
 ---
 name: tcr
 description: "Run OpenClaw on tcr, a local proxy that pools your own Claude and ChatGPT subscriptions: check the pool, start the Gateway on it, and confirm turns go through it."
-homepage: https://github.com/dhkts1/tcr
+homepage: https://dhkts1.github.io/
 disable-model-invocation: true
 metadata:
   {
@@ -42,7 +42,7 @@ Read this before you route anything through tcr.
   - a list of recent sessions with up to 120 characters of each slow or running tool command;
   - a server log that names accounts by email (`~/.cache/tcr/`).
 - **It sends requests only to Anthropic and OpenAI**, unless you turn on tcr's peer sharing with
-  other Macs, which is off by default.
+  your other Macs, on your network or over your tailnet, which is off by default.
 
 ## What this skill runs
 
@@ -74,6 +74,12 @@ tcr login            # add each Claude account
 tcr login --codex    # add each ChatGPT account
 tcr server           # or open TcrBar on macOS, which runs it for you
 ```
+
+On macOS, TcrBar is the menu-bar app that runs the proxy and shows every account. Get it from
+[the website](https://dhkts1.github.io/) or as
+[`TcrBar.dmg`](https://github.com/dhkts1/tcr/releases/latest/download/TcrBar.dmg), signed and
+notarized by Apple. It runs its own copy of tcr, so this skill still needs the CLI above on your
+PATH.
 
 ## Check the pool
 
