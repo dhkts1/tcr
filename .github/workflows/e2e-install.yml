@@ -80,7 +80,7 @@ jobs:
       # bind 3456, so it is safe on a developer Mac. Runs no real tcr.
       - name: First-run script is safe on a developer Mac
         run: scripts/check-e2e-first-run-safe.sh
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: Build tcr from this ref
         run: cargo build --release
