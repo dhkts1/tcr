@@ -20,7 +20,9 @@
 //! with a 2xx is re-bound to that account ([`Manager::rebind_served_history`]), so a hold names
 //! the account that minted the history OR last served it after a move: the cache is warm where
 //! the conversation last ran, not where it began. The one exception is a thinking block an
-//! org-bound model dropped on an account in another organization; it stays where it was minted.
+//! org-bound model dropped on an account in another organization. It is never re-bound to the
+//! account that dropped it, which does not read it; it is forgotten, so it no longer pulls the
+//! conversation back to the account it left.
 //!
 //! "Can hold it" is [`Manager::bound_account_holds`], and it is deliberately narrower than "is
 //! bound". Claude Code recovers from the advisor and thread-state rejections on its own, in one
@@ -114,6 +116,13 @@ impl BoundTokenMap {
         };
         self.by_age.insert((value.2, Arc::clone(&key)));
         self.by_hash.insert(key, value);
+    }
+
+    /// Drop `hash`'s entry, from both halves.
+    pub(super) fn remove(&mut self, hash: &str) {
+        if let Some((key, (_, _, ms))) = self.by_hash.remove_entry(hash) {
+            self.by_age.remove(&(ms, key));
+        }
     }
 
     /// Set `hash`'s entry only when it has none, because the entry already here is fresher.
@@ -257,6 +266,17 @@ impl ShardedBoundTokens {
         true
     }
 
+    /// Drop `hash` only while it still names account `from`, checked and dropped under one
+    /// lock, for the same reason as [`Self::rebind`].
+    pub(super) fn forget(&self, hash: &str, from: usize) -> bool {
+        let mut shard = self.shard(hash);
+        if shard.get(hash).is_none_or(|(idx, _, _)| idx != from) {
+            return false;
+        }
+        shard.remove(hash);
+        true
+    }
+
     /// Set `hash`'s entry only when it has none, without bounding: restore's path, whose
     /// entries were bounded when they were written.
     pub(super) fn insert_if_absent(&self, hash: &str, value: Minted) {
@@ -342,10 +362,21 @@ impl Manager {
     /// account it moved to.
     ///
     /// A 2xx on a request that carried a token proves the serving account reads it, with one
-    /// exception this keeps in place: Sonnet 5.5 and Haiku 5.5 drop a thinking block minted in
-    /// another organization and still answer 200 (this module's doc). So a thinking token stays
-    /// on its minting account when `model` is org-bound and `served_idx` is not a sibling in its
-    /// organization ([`Self::outside_org_of`], where an unknown organization counts as outside).
+    /// exception: Sonnet 5.5 and Haiku 5.5 drop a thinking block minted in another organization
+    /// and still answer 200 (this module's doc). So when `model` is org-bound and `served_idx`
+    /// is not a sibling in the minting account's organization ([`Self::outside_org_of`], where
+    /// an unknown organization counts as outside), a thinking token is never re-bound to
+    /// `served_idx`, because that account does not read it. It is dropped instead.
+    ///
+    /// It used to stay on its minting account, and that pulled the moved conversation back
+    /// there the moment that account recovered: a cold cache, a 404 `thread_not_found` for
+    /// thread state that now lived on the new account, and, once the old account ran out
+    /// again, a fresh switch warning and another cold replay (measured 2026-10-22: twelve
+    /// warnings in five minutes). The hold bought nothing, because the 200 had already shown
+    /// the conversation running on without that thinking. Dropped, the token names no account,
+    /// so the next request is held to the session's pin, where it now runs.
+    ///
+    /// Returns how many entries changed: re-bound or dropped.
     pub fn rebind_served_history(
         &self,
         tokens: &[String],
@@ -371,6 +402,7 @@ impl Manager {
         let org_bound = model.is_some_and(crate::model::thinking_is_org_bound);
         let mut outside_org: HashMap<usize, bool> = HashMap::new();
         let mut moves: Vec<(usize, Minted)> = Vec::with_capacity(elsewhere.len());
+        let mut drops: Vec<(usize, usize)> = Vec::new();
         for (i, minted) in elsewhere {
             let (from, kind, _) = minted;
             let thinking = matches!(
@@ -382,13 +414,11 @@ impl Manager {
                     .entry(from)
                     .or_insert_with(|| self.outside_org_of(from).contains(&served_idx));
                 if outside {
+                    drops.push((i, from));
                     continue;
                 }
             }
             moves.push((i, minted));
-        }
-        if moves.is_empty() {
-            return 0;
         }
         let mut moved = 0;
         for (i, (from, kind, _)) in moves {
@@ -401,15 +431,24 @@ impl Manager {
                 moved += 1;
             }
         }
-        if moved > 0 {
+        let mut dropped = 0;
+        for (i, from) in drops {
+            // The same check as the re-bind: a fresher mint since the read is kept.
+            if self.bound_tokens.forget(&hashes[i], from) {
+                dropped += 1;
+            }
+        }
+        if moved + dropped > 0 {
             self.mark_bound_tokens_dirty();
             tracing::debug!(
                 account_index = served_idx,
                 moved,
-                "re-bound a served history's tokens to the account that served it"
+                dropped,
+                "re-bound a served history's tokens to the account that served it, and dropped \
+                 the thinking it did not read"
             );
         }
-        moved
+        moved + dropped
     }
 
     /// The account that minted any of `tokens`, if this process knows one: the account index,
@@ -1285,25 +1324,70 @@ mod tests {
     }
 
     /// Sonnet 5.5 dropped the block on an account in another organization and still answered
-    /// 200, so that 200 proves nothing about the signature: it stays on its minting account.
+    /// 200, so that 200 proves nothing about the signature: it never names the serving account.
+    /// It no longer names the minting account either, or it would pull the moved conversation
+    /// back there. The message id beside it proves the serving account reads it, so it moves.
     #[test]
-    fn an_org_bound_thinking_signature_does_not_move_across_organizations() {
+    fn an_org_bound_thinking_signature_served_across_organizations_is_dropped() {
         let manager = two_orgs();
         let now = crate::now_ms();
-        manager.record_bound_tokens(&sig("sig_fake_1"), 0, now - 60_000);
+        manager.record_bound_tokens(
+            &[
+                (BoundTokenKind::ThinkingSignature, "sig_fake_1".into()),
+                (BoundTokenKind::MessageId, "msg_fake_1".into()),
+            ],
+            0,
+            now - 60_000,
+        );
+        assert!(manager.take_bound_tokens_dirty());
         assert_eq!(
             manager.rebind_served_history(
-                &tokens(&["sig_fake_1"]),
+                &tokens(&["sig_fake_1", "msg_fake_1"]),
                 2,
                 Some("claude-sonnet-5-5"),
                 now
             ),
-            0
+            2,
+            "one moved, one dropped"
         );
         assert_eq!(
             manager.bound_token_account(&tokens(&["sig_fake_1"])),
-            Some((0, BoundTokenKind::ThinkingSignature)),
-            "the signature still names the account that minted it"
+            None,
+            "the signature names neither the account that minted it nor the one that dropped it"
+        );
+        assert_eq!(
+            manager.bound_token_account(&tokens(&["msg_fake_1"])),
+            Some((2, BoundTokenKind::MessageId))
+        );
+        assert!(manager.take_bound_tokens_dirty(), "a drop is saved");
+    }
+
+    /// A thinking mint that landed on the minting account after the served request read the
+    /// map is fresher than the drop, and is kept: the drop checks the entry under the same lock.
+    #[test]
+    fn a_drop_keeps_an_entry_that_no_longer_names_the_account_it_was_read_on() {
+        let manager = two_orgs();
+        let now = crate::now_ms();
+        manager.record_bound_tokens(&sig("sig_fake_1"), 1, now);
+        assert!(
+            !manager
+                .bound_tokens
+                .forget(&bound_tokens::hash_token("sig_fake_1"), 0)
+        );
+        assert_eq!(
+            manager.bound_token_account(&tokens(&["sig_fake_1"])),
+            Some((1, BoundTokenKind::ThinkingSignature))
+        );
+        assert!(
+            manager
+                .bound_tokens
+                .forget(&bound_tokens::hash_token("sig_fake_1"), 1)
+        );
+        assert_eq!(manager.bound_token_account(&tokens(&["sig_fake_1"])), None);
+        assert_eq!(
+            manager.bound_tokens.len(),
+            0,
+            "gone from both halves' count"
         );
     }
 

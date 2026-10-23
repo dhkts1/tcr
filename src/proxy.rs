@@ -16102,6 +16102,12 @@ mod tests {
     /// `stable_session_key`), and each signature is echoed back inside an assistant `thinking`
     /// block exactly as Claude Code echoes them.
     fn thinking_turn_body(user_id: &str, signatures: &[&str]) -> String {
+        thinking_turn_body_for("claude-sonnet-5", user_id, signatures)
+    }
+
+    /// [`thinking_turn_body`] for `model`, for a test whose model decides where thinking
+    /// survives ([`crate::model::thinking_is_org_bound`]).
+    fn thinking_turn_body_for(model: &str, user_id: &str, signatures: &[&str]) -> String {
         let mut messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         for signature in signatures {
             messages.push(serde_json::json!({
@@ -16112,7 +16118,7 @@ mod tests {
             }));
         }
         serde_json::json!({
-            "model": "claude-sonnet-5",
+            "model": model,
             "metadata": {"user_id": user_id},
             "messages": messages,
         })
@@ -16337,6 +16343,86 @@ mod tests {
              account it left: {}",
             seen.lock().expect("recorder")[2]
         );
+    }
+
+    /// The same move across organizations, for a model whose thinking survives only inside the
+    /// minting account's organization. The two fixture accounts sit in different organizations,
+    /// so the release is `cross_org` and the 200 on the new account drops the old thinking. The
+    /// signature used to keep naming the account it left, so once that account came back the
+    /// conversation was pulled back there: a cold cache, a 404 for thread state that now lives
+    /// on the new account, and a fresh switch warning when the old account ran out again.
+    #[tokio::test]
+    async fn a_sonnet_conversation_moved_across_organizations_is_not_pulled_back() {
+        let model = "claude-sonnet-5-5";
+        let (upstream, _hits, seen) = spawn_bound_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+        assert!(
+            manager.outside_org_of(0).contains(&1),
+            "precondition: the two accounts sit in different organizations"
+        );
+
+        // Turn 1 is served on account 0 and mints `sig_fake_1` there.
+        let (status, _) = drive_conversation(
+            Arc::clone(&manager),
+            &thinking_turn_body_for(model, "sess-cross-org", &[]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            seen.lock().expect("recorder")[0].contains("at-aaaaaaaaaaaa"),
+            "precondition: account 0 served the conversation first"
+        );
+        let turn = thinking_turn_body_for(model, "sess-cross-org", &["sig_fake_1"]);
+
+        // Account 0 goes out: one switch warning, then the retry moves to account 1.
+        assert_eq!(
+            manager.set_disabled(0, true),
+            DisablePersist::NoConfigFile,
+            "disabled in memory, with no config file behind this manager to write"
+        );
+        let (status, _) = drive_conversation(Arc::clone(&manager), &turn).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "the switch warning");
+        let (status, _) = drive_conversation(Arc::clone(&manager), &turn).await;
+        assert_eq!(status, StatusCode::OK, "the retry moves");
+        assert!(
+            seen.lock().expect("recorder")[1].contains("at-bbbbbbbbbbbb"),
+            "precondition: account 1 served the moved conversation"
+        );
+
+        // Account 0 comes back, and the warning has run its life.
+        assert_eq!(
+            manager.set_disabled(0, false),
+            DisablePersist::NoConfigFile,
+            "re-enabled in memory"
+        );
+        manager.expire_switch_warnings();
+        let (status, _) = drive_conversation(
+            Arc::clone(&manager),
+            &thinking_turn_body_for(model, "sess-fresh-cross-org", &[]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            seen.lock().expect("recorder")[2].contains("at-aaaaaaaaaaaa"),
+            "control: account 0 is back and serving, so only the history keeps a turn off it"
+        );
+
+        for (n, nth) in [(1, 3), (2, 4)] {
+            let (status, body) = drive_conversation(Arc::clone(&manager), &turn).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "turn {n} after the return is served, not warned: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(
+                seen.lock().expect("recorder")[nth].contains("at-bbbbbbbbbbbb"),
+                "turn {n} after the return must stay on the account the conversation moved to, \
+                 not be pulled back to the one it left: {}",
+                seen.lock().expect("recorder")[nth]
+            );
+        }
     }
 
     /// A bound account over the SOFT threshold still holds its conversation
