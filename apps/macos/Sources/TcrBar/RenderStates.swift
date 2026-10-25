@@ -192,8 +192,8 @@ enum RenderStates {
             // Heat and fans on the machine line, `docs/design/fan-readout-mockup.html`
             // panels 2, 4, 5 and 6. Each is scene 17 with only the machine
             // reading changed (``heatScenes``), so the first card's top must
-            // sit at the same pixel row as in 17: the numbers line reserves its
-            // lines whatever it holds (`FleetView.toolsNumbersReservedLines`).
+            // sit at the same pixel row as in 17: the numbers block is two
+            // one-line rows whatever it holds (`ToolsNumbers.rowCount`).
             ("17d-tools-tab-heat-manual", .loaded(sessionsTabFleet), false, nil),
             ("17e-tools-tab-heat-fans-off", .loaded(sessionsTabFleet), false, nil),
             ("17f-tools-tab-heat-no-fans", .loaded(sessionsTabFleet), false, nil),
@@ -3558,7 +3558,8 @@ enum RenderStates {
     /// heat figures of panel 2 are the ones measured on a Mac16,7 on
     /// 2026-10-18; panels 4 and 5 are the mockup's illustrative ones. Panel
     /// 6 is every clause at its widest, design figures, none of them measured:
-    /// it is the line that must still fit the reserved lines.
+    /// it is the block whose rows must still hold their one line each, row 2
+    /// cut at its tail and row 1's load clause intact.
     private static let heatScenes: [String: MachineStats] = {
         func machine(_ heat: HeatReading, _ fanControl: FanControl? = nil) -> MachineStats {
             MachineStats(
@@ -3584,11 +3585,11 @@ enum RenderStates {
                 HeatReading(cpuCelsius: 46, fans: [fan(0, 0, manual: false), fan(1, 0, manual: false)])),
             // "CPU 61°C", a Mac with no fans
             "17f-tools-tab-heat-no-fans": machine(HeatReading(cpuCelsius: 61, fans: [])),
-            // "load 168.4/14 · CPU 105°C · fans 100% manual · 128/128 GB ·
-            // 999 compiles · 1024 GB free", then the fleet's "99 err today ·
+            // "load 168.4/14 · 128/128 GB · 999 compiles · 1024 GB free" over
+            // "CPU 105°C · fans 100% manual", then the fleet's "99 err today ·
             // 9999 timed out" from ``heatWorstCaseFleet``. Three-digit
             // compiles and four-digit timeouts are design figures, not
-            // measured: wider than any seen, so the reserve is tested past them.
+            // measured: wider than any seen, so the rows are tested past them.
             "17g-tools-tab-heat-worst-case": MachineStats(
                 loadAverage: 168.4, cores: 14, memoryUsedBytes: 128 * 1_073_741_824,
                 memoryTotalBytes: 128 * 1_073_741_824, compiles: 999,

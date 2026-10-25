@@ -3026,9 +3026,9 @@ struct FleetView: View {
         }
     }
 
-    /// Tools tab summary — two lines: a state sentence ("3 running, 1 near
-    /// timeout") with a right-aligned "N in warning" account count, then the
-    /// machine/error numbers line.
+    /// Tools tab summary — a state sentence ("3 running, 1 near timeout")
+    /// with a right-aligned "N in warning" account count, then the two fixed
+    /// numbers rows, machine then heat/errors/timeouts (``ToolsNumbers``).
     ///
     /// The "near timeout" count is
     /// ``Fleet/toolsNearTimeoutCount(now:timeoutSeconds:warnWithinSeconds:)`` —
@@ -3043,28 +3043,8 @@ struct FleetView: View {
         let running = fleet.toolsRunning.count
         let nearTimeout = fleet.toolsNearTimeoutCount(
             now: now, timeoutSeconds: bashTimeoutSeconds, warnWithinSeconds: V4.toolTimeoutWarnSeconds)
-        var numbers: [Text] = []
-        if let machine {
-            numbers.append(
-                summaryPhrase(machine.loadClause).foregroundColor(machineLoadTint(machine.loadTint)))
-            // Heat right after load, because both describe the box, and never
-            // tinted: load stays the line's only coloured clause. The CPU and
-            // the fans are two phrases, so a wrap can fall between them. Each
-            // is a LINK inside the one wrapping Text, so it opens the fan
-            // popover without splitting the line into views that wrap apart.
-            for phrase in machine.heatPhrases {
-                numbers.append(heatLink(phrase))
-            }
-            numbers.append(summaryPhrase(machine.restClause))
-        }
-        if fleet.toolsTotalErrors > 0 {
-            numbers.append(summaryPhrase("\(fleet.toolsTotalErrors) err today"))
-        }
-        numbers.append(summaryPhrase("\(fleet.toolsTotalTimeouts) timed out"))
-        let numbersLine = joinedBySeparator(numbers)
-            .font(V4.font(V4.muteSize))
-            .foregroundColor(Tok.mute)
-            .lineSpacing(Tok.secondaryLineSpacing)
+        let numbers = ToolsNumbers(
+            machine: machine, errors: fleet.toolsTotalErrors, timeouts: fleet.toolsTotalTimeouts)
         return VStack(alignment: .leading, spacing: Tok.tightSpacing) {
             HStack(alignment: .firstTextBaseline) {
                 Text("\(running) running, \(nearTimeout) near timeout")
@@ -3076,35 +3056,15 @@ struct FleetView: View {
                     .font(V4.font(V4.muteSize))
                     .foregroundColor(fleet.accountsNearLimitCount > 0 ? Tok.near : Tok.mute)
             }
-            // ``toolsNumbersReservedLines`` lines RESERVED, whatever the line
-            // holds, so the heat clause appearing, vanishing or changing width
-            // never moves the cards below (Gil 2026-10-14: no layout shifts).
-            // The reserve is a hidden Text of that many lines in the same font
-            // and spacing rather than a height in points:
-            // `SettingsPanes.waitingLine` measured wrapped lines half a point
-            // off a computed reserve.
-            //
-            // The reserve is `fixedSize` vertically like the line itself. Without
-            // it a hidden Text is compressible: the ZStack's height became a range
-            // from the visible line's height up to the reserve, and when the line
-            // filled fewer lines than the reserve the stack below laid out
-            // differently, cutting the first slowest command to one line and
-            // packing the running rows tighter (scene 17 against 17d, 2026-10-18).
-            ZStack(alignment: .topLeading) {
-                Text(Array(repeating: "0", count: Self.toolsNumbersReservedLines).joined(separator: "\n"))
-                    .font(V4.font(V4.muteSize))
-                    .lineSpacing(Tok.secondaryLineSpacing)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .hidden()
-                    .accessibilityHidden(true)
-                numbersLine
-                    .lineLimit(Self.toolsNumbersReservedLines)
-                    .fixedSize(horizontal: false, vertical: true)
-                    // A link's colour is the tint, not the run's own: the
-                    // clause stays the line's grey, never an accent blue.
-                    .tint(Tok.mute)
+            // ``ToolsNumbers/rowCount`` rows, each one line, whatever they
+            // hold, so the heat phrases appearing, vanishing or changing width
+            // never move the cards below (Gil 2026-10-14: no layout shifts).
+            VStack(alignment: .leading, spacing: Tok.secondaryLineSpacing) {
+                ForEach(Array(numbers.rows.enumerated()), id: \.offset) { _, row in
+                    toolsNumbersRow(row)
+                }
             }
-            .help(machine?.heatDetail ?? "")
+            .help(numbers.help)
             .environment(
                 \.openURL,
                 OpenURLAction { url in
@@ -3133,13 +3093,49 @@ struct FleetView: View {
         return Text(link)
     }
 
-    /// How many lines the Tools numbers line keeps, filled or not. THREE, not
-    /// the mockup's two: `docs/design/fan-readout-mockup.html` panel 6 (every
-    /// clause at its widest) was rendered with `--render-states` on
-    /// 2026-10-18 and ran past two lines in the 372 pt panel, cutting
-    /// "128 timed out" to "1…". The mockup's own rule for that outcome is
-    /// that the reserve grows to three for every state.
-    static let toolsNumbersReservedLines = 3
+    /// One row of the Tools numbers block: one line, cut at its tail with "…"
+    /// when it is wider than the panel (the block's `.help` carries it in
+    /// full), and one line tall even when it holds nothing.
+    ///
+    /// The line is RESERVED by a hidden one-line Text in the same font rather
+    /// than a height in points: `SettingsPanes.waitingLine` measured lines half
+    /// a point off a computed reserve. The reserve is `fixedSize` vertically
+    /// like the row itself. Without it a hidden Text is compressible: the
+    /// ZStack's height became a range from the visible text's height up to the
+    /// reserve, and the stack below laid out differently, cutting the first
+    /// slowest command to one line and packing the running rows tighter
+    /// (scene 17 against 17d, 2026-10-18).
+    private func toolsNumbersRow(_ row: [ToolsNumbers.Phrase]) -> some View {
+        let parts: [Text] = row.map { phrase in
+            switch phrase {
+            case .load(let text):
+                // The block's only coloured phrase.
+                return summaryPhrase(text).foregroundColor(machineLoadTint(machine?.loadTint ?? .calm))
+            case .heat(let text):
+                // A LINK inside the row's one Text, so it opens the fan
+                // popover without splitting the row into separate views.
+                return heatLink(text)
+            case .plain(let text):
+                return summaryPhrase(text)
+            }
+        }
+        return ZStack(alignment: .topLeading) {
+            Text("0")
+                .font(V4.font(V4.muteSize))
+                .fixedSize(horizontal: false, vertical: true)
+                .hidden()
+                .accessibilityHidden(true)
+            joinedBySeparator(parts)
+                .font(V4.font(V4.muteSize))
+                .foregroundColor(Tok.mute)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .fixedSize(horizontal: false, vertical: true)
+                // A link's colour is the tint, not the run's own: the phrase
+                // stays the row's grey, never an accent blue.
+                .tint(Tok.mute)
+        }
+    }
 
     /// `[Text]` joined by a dimmed " · ", the one place both summary numbers
     /// lines build their trailing clause list — so a future third summary line
