@@ -292,6 +292,58 @@ pub fn effective_fable_threshold(config_override: Option<f64>, today: f64) -> f6
     config_override.unwrap_or(today)
 }
 
+/// One pass of the pool pick, in the order the selector tries them for unpinned work:
+/// [`Manager::select_with_group`]'s three, then [`Manager::select_revalidation`]'s
+/// fallback once the proxy finds all three empty. Each pass is one candidate filter,
+/// [`Manager::pool_candidate`]; the pass's own pick ranks what that filter admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PoolPass {
+    /// [`Manager::pick_eligible`]: every gate, pacing and the request's group included.
+    Paced,
+    /// [`Manager::pick_least_loaded`]: the soft fallback, pacing and the group dropped.
+    LeastLoaded,
+    /// [`Manager::pick_fable_last_resort`]: a Fable request's predicted Fable-weekly gate
+    /// relaxed to upstream's own rejection.
+    FableLastResort,
+    /// [`Manager::select_revalidation`]'s fallback: the soft threshold and pacing relaxed,
+    /// every hard gate kept.
+    Revalidation,
+}
+
+/// The request facts every pool pass's filter reads, gathered once per selection.
+pub(super) struct PoolAsk<'a> {
+    /// Slots this request may not be served from: failed attempts, unsupported exits, and
+    /// for an inference pool pick the control account.
+    pub(super) tried: &'a HashSet<usize>,
+    pub(super) now: OffsetDateTime,
+    pub(super) now_ms: i64,
+    pub(super) is_fable: bool,
+    pub(super) provider: crate::provider::Provider,
+    /// The request's `--group`, which only [`PoolPass::Paced`] narrows on; every widening
+    /// pass drops it.
+    pub(super) group: Option<&'a str>,
+    /// The one version of the group settings this selection reads.
+    pub(super) groups: &'a GroupPolicy,
+    /// The session's warm window, which [`PoolPass::Revalidation`]'s hard gate reads.
+    pub(super) warm: WarmWindow,
+}
+
+/// `tried` plus the control account an inference pool pick may not select
+/// ([`Manager::control_excluded`]), borrowed when that adds nothing.
+fn exclude_control(
+    tried: &HashSet<usize>,
+    control_excluded: Option<usize>,
+) -> std::borrow::Cow<'_, HashSet<usize>> {
+    match control_excluded {
+        Some(control_idx) if !tried.contains(&control_idx) => {
+            let mut t = tried.clone();
+            t.insert(control_idx);
+            std::borrow::Cow::Owned(t)
+        }
+        _ => std::borrow::Cow::Borrowed(tried),
+    }
+}
+
 impl Manager {
     /// Pick the best eligible account not in `tried`, spreading load across the
     /// fleet, or `None` if all are exhausted/held/disabled.
@@ -1380,37 +1432,24 @@ impl Manager {
             // This is a deliberate trade, not a tightening: see
             // `Config::control_pooled` for why the reserve is a floor over
             // LAGGING headers and what it costs when upstream wins the race.
-            let control_excluded: Option<usize> =
-                if request_class == RequestClass::Inference && !self.control_pooled {
-                    self.control().filter(|&idx| {
-                        let opted_in = group.is_some_and(|g| {
-                            groups.control_allowed.contains(g)
-                                && accounts
-                                    .get(idx)
-                                    .is_some_and(|a| a.groups.iter().any(|gr| gr == g))
-                        });
-                        !opted_in
-                    })
-                } else {
-                    None
-                };
-            let pool_tried: std::borrow::Cow<'_, HashSet<usize>> = match control_excluded {
-                Some(control_idx) if !tried.contains(&control_idx) => {
-                    let mut t = tried.clone();
-                    t.insert(control_idx);
-                    std::borrow::Cow::Owned(t)
-                }
-                _ => std::borrow::Cow::Borrowed(tried),
+            let control_excluded = self.control_excluded(request_class, group, &accounts, &groups);
+            let pool_tried = exclude_control(tried, control_excluded);
+            let ask = PoolAsk {
+                tried: &pool_tried,
+                now,
+                now_ms,
+                is_fable,
+                provider,
+                group,
+                groups: &groups,
+                warm,
             };
-            let pool_tried: &HashSet<usize> = &pool_tried;
 
             // First pass: honour pacing (skip accounts at the concurrency cap or
             // inside the min-spacing window) AND, when `--group` was requested,
             // prefer that group. With pacing OFF and no group this is byte-identical
             // to the pre-pacing pick.
-            let mut best = self.pick_eligible(
-                &accounts, pool_tried, now, now_ms, is_fable, provider, true, group,
-            );
+            let mut best = self.pick_eligible(&accounts, &ask);
 
             // An explicit `--group` ask is STRICT BY DEFAULT (2026-09-13), and
             // strictness is checked BEFORE the soft fallback below can widen the
@@ -1483,9 +1522,7 @@ impl Manager {
                         "group: strict — refusing to fall back to the whole pool, returning no account — {}",
                         miss.explain(),
                     );
-                } else if let Some(idx) = self
-                    .pick_least_loaded(&accounts, pool_tried, now, now_ms, is_fable, provider, None)
-                {
+                } else if let Some(idx) = self.pick_least_loaded(&accounts, &ask) {
                     if let Some(account) = accounts.get(idx) {
                         // This fallback fires whenever the first (group- and
                         // pacing-respecting) pass came up empty — which can be pacing
@@ -1545,8 +1582,7 @@ impl Manager {
             if best.is_none()
                 && is_fable
                 && strict_group.is_none()
-                && let Some(idx) =
-                    self.pick_fable_last_resort(&accounts, pool_tried, now, now_ms, provider)
+                && let Some(idx) = self.pick_fable_last_resort(&accounts, &ask)
             {
                 if let Some(account) = accounts.get(idx) {
                     let seven_day_oi = account.quota.seven_day_oi.map_or(0.0, |w| w.effective(now));
@@ -1750,20 +1786,20 @@ impl Manager {
         // revalidates onto a reserved account, never widen it, so a reserved
         // account is never leaked to traffic this path cannot identify.
         let warm = self.warm_window(affinity);
-        let hard_ok = |account: &AccountRuntime| -> bool {
-            account.provider == provider
-                && Self::hard_ok(
-                    account,
-                    self.global_threshold,
-                    self.fable_weekly_threshold,
-                    now,
-                    now_ms,
-                    is_fable,
-                    None,
-                    &groups.reserved,
-                    &groups.parked,
-                    warm,
-                )
+        let ask = PoolAsk {
+            tried,
+            now,
+            now_ms,
+            is_fable,
+            provider,
+            group: None,
+            groups: &groups,
+            warm,
+        };
+        // `tried` gates SERVING and nothing else, so it is part of this predicate: the pin
+        // already failed THIS request upstream when it is in `tried`, so it cannot answer it.
+        let servable = |idx: usize, account: &AccountRuntime| -> bool {
+            self.pool_candidate(PoolPass::Revalidation, idx, account, &ask)
         };
 
         // Mirrors `select()`'s `keep_pin`: set to the OLD pin index when the pin
@@ -1790,11 +1826,9 @@ impl Manager {
                     .accounts
                     .write()
                     .unwrap_or_else(PoisonError::into_inner);
-                // `tried` gates SERVING and nothing else: the pin already failed THIS
-                // request upstream, so it cannot answer it. Whether the PIN MOVES is
-                // decided below, on ACCOUNT-level evidence alone — see the comment
-                // there.
-                if !tried.contains(&idx) && accounts.get(idx).is_some_and(hard_ok) {
+                // Whether the PIN MOVES is decided below, on ACCOUNT-level evidence
+                // alone — see the comment there.
+                if accounts.get(idx).is_some_and(|a| servable(idx, a)) {
                     self.serve_pinned_over_threshold(&mut accounts, idx, now, is_fable);
                     return Some(idx);
                 }
@@ -1867,7 +1901,8 @@ impl Manager {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
 
-            let sticky_usable = sticky_pick.filter(|&s| accounts.get(s).is_some_and(hard_ok));
+            let sticky_usable =
+                sticky_pick.filter(|&s| accounts.get(s).is_some_and(|a| servable(s, a)));
             via_sticky = sticky_usable.is_some();
 
             let idx = if let Some(sticky) = sticky_usable {
@@ -1879,7 +1914,7 @@ impl Manager {
                 // pattern orders correctly for ascending "least utilized first".
                 let mut best_key: Option<(u64, u64)> = None;
                 for (i, account) in accounts.iter().enumerate() {
-                    if tried.contains(&i) || !hard_ok(account) {
+                    if !servable(i, account) {
                         continue;
                     }
                     let util = account.quota.max_utilization(now, is_fable);
@@ -2835,61 +2870,30 @@ impl Manager {
         remaining_ms / self.reset_urgency_tier_ms
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the per-request selection inputs, each read by a different gate"
-    )]
-    fn pick_eligible(
-        &self,
-        accounts: &[AccountRuntime],
-        tried: &HashSet<usize>,
-        now: OffsetDateTime,
-        now_ms: i64,
-        is_fable: bool,
-        provider: crate::provider::Provider,
-        respect_pacing: bool,
-        group: Option<&str>,
-    ) -> Option<usize> {
-        let groups = self.groups();
+    fn pick_eligible(&self, accounts: &[AccountRuntime], ask: &PoolAsk<'_>) -> Option<usize> {
         let mut best: Option<usize> = None;
         let mut best_key: Option<(i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
-            if tried.contains(&idx) {
-                continue;
-            }
-            if !Self::eligible(
-                account,
-                self.global_threshold,
-                self.fable_weekly_threshold,
-                &self.pacing,
-                respect_pacing,
-                now,
-                now_ms,
-                is_fable,
-                provider,
-                group,
-                group, // this pass's own real ask — see `eligible`'s `reserved_group` doc
-                &groups.reserved,
-                &groups.parked,
-            ) {
+            if !self.pool_candidate(PoolPass::Paced, idx, account, ask) {
                 // Distinguish a pacing skip (healthy but capped/spaced) from a real
-                // ineligibility (disabled/error/quota) so the log names only the former.
-                if respect_pacing
-                    && self.pacing.is_active()
+                // ineligibility (disabled/error/quota) so the log names only the former:
+                // eligible once pacing is ignored, and held out by pacing alone.
+                if !ask.tried.contains(&idx)
+                    && Self::paced_out(account, &self.pacing, ask.now_ms)
                     && Self::eligible(
                         account,
                         self.global_threshold,
                         self.fable_weekly_threshold,
                         &self.pacing,
                         false,
-                        now,
-                        now_ms,
-                        is_fable,
-                        provider,
-                        group,
-                        group,
-                        &groups.reserved,
-                        &groups.parked,
+                        ask.now,
+                        ask.now_ms,
+                        ask.is_fable,
+                        ask.provider,
+                        ask.group,
+                        ask.group,
+                        &ask.groups.reserved,
+                        &ask.groups.parked,
                     )
                 {
                     tracing::info!(
@@ -2900,9 +2904,7 @@ impl Manager {
                 }
                 continue;
             }
-            if !self.pool_pick_respects_control_reserve(idx, account, now) {
-                continue;
-            }
+            let now = ask.now;
             // Unknown weekly reset sorts FIRST (probe it) — treat as the minimum.
             let reset = account
                 .quota
@@ -2933,45 +2935,12 @@ impl Manager {
     /// non-pacing eligibility (disabled/error/rate-limit/quota) still applies, so a
     /// genuinely exhausted fleet still yields `None` (a real 429), while a merely
     /// all-paced fleet always yields the coolest account. Read-only.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the per-request selection inputs, each read by a different gate"
-    )]
-    fn pick_least_loaded(
-        &self,
-        accounts: &[AccountRuntime],
-        tried: &HashSet<usize>,
-        now: OffsetDateTime,
-        now_ms: i64,
-        is_fable: bool,
-        provider: crate::provider::Provider,
-        group: Option<&str>,
-    ) -> Option<usize> {
-        let groups = self.groups();
+    fn pick_least_loaded(&self, accounts: &[AccountRuntime], ask: &PoolAsk<'_>) -> Option<usize> {
+        let now = ask.now;
         let mut best: Option<usize> = None;
         let mut best_key: Option<(u32, i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
-            if tried.contains(&idx) {
-                continue;
-            }
-            if !Self::eligible(
-                account,
-                self.global_threshold,
-                self.fable_weekly_threshold,
-                &self.pacing,
-                false,
-                now,
-                now_ms,
-                is_fable,
-                provider,
-                group,
-                group,
-                &groups.reserved,
-                &groups.parked,
-            ) {
-                continue;
-            }
-            if !self.pool_pick_respects_control_reserve(idx, account, now) {
+            if !self.pool_candidate(PoolPass::LeastLoaded, idx, account, ask) {
                 continue;
             }
             let reset = account
@@ -3015,55 +2984,13 @@ impl Manager {
     fn pick_fable_last_resort(
         &self,
         accounts: &[AccountRuntime],
-        tried: &HashSet<usize>,
-        now: OffsetDateTime,
-        now_ms: i64,
-        provider: crate::provider::Provider,
+        ask: &PoolAsk<'_>,
     ) -> Option<usize> {
-        let groups = self.groups();
+        let now = ask.now;
         let mut best: Option<usize> = None;
         let mut best_key: Option<(u64, i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
-            if tried.contains(&idx) {
-                continue;
-            }
-            // `eligible`'s first gate, asked by hand because this pass does not
-            // call it. Not hypothetical: an account of the other provider has no
-            // `7d_oi` window at all, so it reads as the FRESHEST candidate below
-            // and would win this pick outright.
-            if account.provider != provider {
-                continue;
-            }
-            if account.disabled || account.status == AccountStatus::Error {
-                continue;
-            }
-            // Parked is an account-level block like `disabled` above, and this
-            // last-resort pass relaxes only the Fable `7d_oi` prediction — never
-            // an operator's own decision to hold a group out.
-            if Self::parked_blocks(account, &groups.parked) {
-                continue;
-            }
-            if let Some(until) = account.rate_limited_until_ms
-                && now_ms < until
-            {
-                continue;
-            }
-            let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
-            // The shared (non-Fable) gates still apply in full — this pass
-            // relaxes ONLY the Fable-specific `7d_oi` prediction, never the
-            // account's other windows.
-            if account.quota.is_near(threshold, now) {
-                continue;
-            }
-            // The one gate this pass relaxes from a prediction to the
-            // authority: skip only a `7d_oi` upstream has actually rejected.
-            if account.quota.model_weekly_rejected(now) {
-                continue;
-            }
-            if Self::reserved_blocks(account, None, &groups.reserved) {
-                continue;
-            }
-            if !self.pool_pick_respects_control_reserve(idx, account, now) {
+            if !self.pool_candidate(PoolPass::FableLastResort, idx, account, ask) {
                 continue;
             }
             let seven_day_oi = account.quota.seven_day_oi.map_or(0.0, |w| w.effective(now));
@@ -3085,6 +3012,133 @@ impl Manager {
             }
         }
         best
+    }
+
+    /// Whether `account`, at slot `idx`, is a candidate of `pass` for the request `ask`
+    /// describes: the filter half of every pool pass, and the one place each pass's
+    /// filter is written. The gates themselves stay with their owners
+    /// ([`Self::eligible`], [`Self::hard_ok`], [`Self::model_blocked`] through both, and
+    /// [`Self::pool_pick_respects_control_reserve`]); this says only which owners each
+    /// pass asks. Pure; the caller holds whichever accounts lock it needs.
+    pub(super) fn pool_candidate(
+        &self,
+        pass: PoolPass,
+        idx: usize,
+        account: &AccountRuntime,
+        ask: &PoolAsk<'_>,
+    ) -> bool {
+        if ask.tried.contains(&idx) {
+            return false;
+        }
+        let (now, now_ms) = (ask.now, ask.now_ms);
+        match pass {
+            PoolPass::Paced | PoolPass::LeastLoaded => {
+                // Only the first pass narrows on the request's group; the soft fallback
+                // widens to the whole pool.
+                let group = match pass {
+                    PoolPass::Paced => ask.group,
+                    _ => None,
+                };
+                Self::eligible(
+                    account,
+                    self.global_threshold,
+                    self.fable_weekly_threshold,
+                    &self.pacing,
+                    pass == PoolPass::Paced,
+                    now,
+                    now_ms,
+                    ask.is_fable,
+                    ask.provider,
+                    group,
+                    group, // this pass's own real ask — see `eligible`'s `reserved_group` doc
+                    &ask.groups.reserved,
+                    &ask.groups.parked,
+                ) && self.pool_pick_respects_control_reserve(idx, account, now)
+            }
+            PoolPass::FableLastResort => {
+                // `eligible`'s first gate, asked by hand because this pass does not
+                // call it. Not hypothetical: an account of the other provider has no
+                // `7d_oi` window at all, so it reads as the FRESHEST candidate below
+                // and would win this pick outright.
+                if account.provider != ask.provider {
+                    return false;
+                }
+                if account.disabled || account.status == AccountStatus::Error {
+                    return false;
+                }
+                // Parked is an account-level block like `disabled` above, and this
+                // last-resort pass relaxes only the Fable `7d_oi` prediction — never
+                // an operator's own decision to hold a group out.
+                if Self::parked_blocks(account, &ask.groups.parked) {
+                    return false;
+                }
+                if let Some(until) = account.rate_limited_until_ms
+                    && now_ms < until
+                {
+                    return false;
+                }
+                let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
+                // The shared (non-Fable) gates still apply in full — this pass
+                // relaxes ONLY the Fable-specific `7d_oi` prediction, never the
+                // account's other windows.
+                if account.quota.is_near(threshold, now) {
+                    return false;
+                }
+                // The one gate this pass relaxes from a prediction to the
+                // authority: skip only a `7d_oi` upstream has actually rejected.
+                if account.quota.model_weekly_rejected(now) {
+                    return false;
+                }
+                if Self::reserved_blocks(account, None, &ask.groups.reserved) {
+                    return false;
+                }
+                self.pool_pick_respects_control_reserve(idx, account, now)
+            }
+            // The request's provider is asked first, as `eligible` asks it: an account of
+            // the other provider is not an over-threshold candidate, it is no candidate.
+            // `group: None` for the reason `select_revalidation` gives at its call.
+            PoolPass::Revalidation => {
+                account.provider == ask.provider
+                    && Self::hard_ok(
+                        account,
+                        self.global_threshold,
+                        self.fable_weekly_threshold,
+                        now,
+                        now_ms,
+                        ask.is_fable,
+                        None,
+                        &ask.groups.reserved,
+                        &ask.groups.parked,
+                        ask.warm,
+                    )
+            }
+        }
+    }
+
+    /// The control account, when an inference pool pick must not select it: unless
+    /// `controlPooled` is set, or the request's `--group` opted the control account in
+    /// (`allowControlAccount`) and the control account carries that group. Why this
+    /// exclusion exists, and why it is an extra `tried` member: the comment at its use in
+    /// [`Self::select_with_group`].
+    fn control_excluded(
+        &self,
+        request_class: RequestClass,
+        group: Option<&str>,
+        accounts: &[AccountRuntime],
+        groups: &GroupPolicy,
+    ) -> Option<usize> {
+        if request_class != RequestClass::Inference || self.control_pooled {
+            return None;
+        }
+        self.control().filter(|&idx| {
+            let opted_in = group.is_some_and(|g| {
+                groups.control_allowed.contains(g)
+                    && accounts
+                        .get(idx)
+                        .is_some_and(|a| a.groups.iter().any(|gr| gr == g))
+            });
+            !opted_in
+        })
     }
 
     /// Lookup half of [`Manager::conn_affinity`]: the account this connection
