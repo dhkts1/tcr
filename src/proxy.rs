@@ -26301,4 +26301,370 @@ mod forecast_routing_tests {
         let document: Value = serde_json::from_slice(&body).expect("the routing document is JSON");
         assert_eq!(document["schema"], 1, "the document names schema 1");
     }
+
+    use crate::routing::ErrorKind;
+    use crate::test_support::stub_upstream as stub;
+    use time::format_description::well_known::Rfc3339;
+
+    /// A loopback peer, as the listener injects one.
+    fn loopback() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 54_321))
+    }
+
+    /// A keyed manager over `config`, whose own key is replaced by [`KEY`].
+    fn keyed(config: Config) -> Arc<Manager> {
+        Manager::with_live_refresher(
+            Config {
+                proxy: ProxyConfig {
+                    port: 0,
+                    api_key: Some(KEY.to_string()),
+                    request_key: None,
+                    extra: serde_json::Map::new(),
+                },
+                ..config
+            },
+            None,
+        )
+    }
+
+    /// The routing document `manager` serves now, parsed.
+    async fn document(manager: Arc<Manager>) -> Value {
+        let (status, _, body) = get(manager, ROUTING_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        serde_json::from_slice(&body).expect("the routing document is JSON")
+    }
+
+    /// One inference request through the router from a loopback client, drained.
+    async fn post(manager: Arc<Manager>, path: &str, body: &'static str) {
+        use tower::ServiceExt as _;
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(HOST, "127.0.0.1")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("build request");
+        req.extensions_mut().insert(ClientAddr(loopback()));
+        let response = app(manager).oneshot(req).await.expect("router response");
+        to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+    }
+
+    /// A request the proxy served for `model` on account `idx`.
+    fn served(manager: &Manager, idx: usize, model: &str, session: Option<u64>) {
+        manager.record_usage(
+            idx,
+            crate::usage::UsageRecord::from_quota_input(
+                crate::now_ms(),
+                Some(model.to_string()),
+                session,
+                10,
+                0,
+                0,
+                0,
+                5,
+            ),
+        );
+    }
+
+    /// An object's keys, sorted.
+    fn keys(value: &Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .map(|object| object.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// `value` is an RFC 3339 time in UTC, as the schema has every time.
+    fn assert_utc(value: &Value) -> OffsetDateTime {
+        let text = value
+            .as_str()
+            .unwrap_or_else(|| panic!("a time string: {value}"));
+        assert!(text.ends_with('Z'), "UTC: {text}");
+        let at = OffsetDateTime::parse(text, &Rfc3339).unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert_eq!(at.offset(), time::UtcOffset::UTC, "{text}");
+        at
+    }
+
+    /// **Every field of schema 1, and its type**: the top level, the build, both providers in
+    /// order, a last error, a model, a null forecast; served as JSON and never stored.
+    #[tokio::test]
+    async fn every_field_and_its_type() {
+        let manager = manager();
+        served(&manager, 0, "claude-opus-5-5", None);
+        manager.record_upstream_error(Provider::Anthropic, ErrorKind::Quota);
+        let (status, headers, body) = get(manager, ROUTING_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        assert_eq!(header("content-type"), Some("application/json"));
+        assert_eq!(header("cache-control"), Some("no-store"));
+        let document: Value = serde_json::from_slice(&body).expect("JSON");
+
+        assert_eq!(
+            keys(&document),
+            ["build", "forecast", "generatedAt", "providers", "schema"]
+        );
+        assert_eq!(document["schema"], 1);
+        assert_utc(&document["generatedAt"]);
+        assert_eq!(keys(&document["build"]), ["builtAt", "dirty", "sha"]);
+        assert!(document["build"]["sha"].is_string());
+        assert!(document["build"]["builtAt"].is_string());
+        assert!(document["build"]["dirty"].is_boolean() || document["build"]["dirty"].is_null());
+        assert!(
+            document["forecast"].is_null(),
+            "no forecast before the forecast rounds"
+        );
+
+        let providers = document["providers"].as_array().expect("providers array");
+        let names: Vec<_> = providers.iter().map(|p| p["provider"].as_str()).collect();
+        assert_eq!(names, [Some("anthropic"), Some("codex")]);
+        for provider in providers {
+            assert_eq!(keys(provider), ["lastError", "models", "provider", "state"]);
+            assert!(
+                matches!(provider["state"].as_str(), Some("ok" | "degraded" | "out")),
+                "{provider}"
+            );
+            assert!(provider["models"].is_array(), "{provider}");
+        }
+
+        let anthropic = &providers[0];
+        let last_error = &anthropic["lastError"];
+        assert_eq!(keys(last_error), ["at", "count10m", "kind"]);
+        assert_eq!(last_error["kind"], "quota");
+        assert_utc(&last_error["at"]);
+        assert!(
+            last_error["count10m"].as_u64().is_some_and(|n| n >= 1),
+            "{last_error}"
+        );
+        assert_eq!(
+            anthropic["state"], "degraded",
+            "a pool that can serve, with an error in ten minutes"
+        );
+        let models = anthropic["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 1, "{models:?}");
+        let opus = &models[0];
+        assert_eq!(
+            keys(opus),
+            [
+                "accountsRoutable",
+                "freesAt",
+                "ids",
+                "model",
+                "reason",
+                "routable"
+            ]
+        );
+        assert_eq!(opus["model"], "opus");
+        assert_eq!(opus["ids"], serde_json::json!(["claude-opus-5-5"]));
+        assert_eq!(opus["routable"], true);
+        assert!(
+            opus["reason"].as_str().is_some_and(|r| !r.is_empty()),
+            "{opus}"
+        );
+        assert!(
+            opus["freesAt"].is_null(),
+            "a routable model frees at no later time"
+        );
+        assert_eq!(opus["accountsRoutable"], 1);
+
+        let codex = &providers[1];
+        assert!(codex["lastError"].is_null());
+        assert_eq!(codex["models"], serde_json::json!([]));
+        assert_eq!(codex["state"], "out", "no `codex` account can serve");
+    }
+
+    /// **The document names no account, organization, session or credential**, even for a
+    /// fleet whose account carries every one of them and a served request with a session.
+    #[tokio::test]
+    async fn names_no_account_organization_session_or_credential() {
+        const ACCOUNT_UUID: &str = "11111111-1111-4111-8111-111111111111";
+        const ORG_UUID: &str = "22222222-2222-4222-8222-222222222222";
+        const SESSION: u64 = 987_654_321_987;
+        let alice = Account {
+            account_uuid: Some(ACCOUNT_UUID.to_string()),
+            org_uuid: Some(ORG_UUID.to_string()),
+            org_name: Some("Example Org".to_string()),
+            ..Account::fixture("alice@example.com")
+        };
+        let manager = keyed(Config {
+            upstream: "http://127.0.0.1:1".to_string(),
+            codex_upstream: "http://127.0.0.1:1".to_string(),
+            ..Config::fixture(vec![alice])
+        });
+        served(&manager, 0, "claude-opus-5-5", Some(SESSION));
+        manager.mark_refused(0);
+        let (status, _, body) = get(manager, ROUTING_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = String::from_utf8_lossy(&body);
+        for private in [
+            "alice",
+            "example.com",
+            ACCOUNT_UUID,
+            ORG_UUID,
+            "Example Org",
+            "at-alice",
+            "rt-alice",
+            KEY,
+            &SESSION.to_string(),
+        ] {
+            assert!(!body.contains(private), "{private} in {body}");
+        }
+    }
+
+    /// **An unroutable model says no available account can serve it now**, the meaning of
+    /// `capacity`, never measured overload, and names when the account holding it frees.
+    #[tokio::test]
+    async fn an_unroutable_model_says_no_available_account_can_serve_it_now() {
+        let manager = manager();
+        served(&manager, 0, "claude-opus-5-5", None);
+        manager.mark_rate_limited(0, 600);
+        let before = OffsetDateTime::now_utc();
+        let document = document(manager).await;
+        let anthropic = &document["providers"][0];
+        assert_eq!(anthropic["state"], "out");
+        let opus = &anthropic["models"][0];
+        assert_eq!(opus["routable"], false, "{opus}");
+        assert_eq!(opus["accountsRoutable"], 0, "{opus}");
+        let reason = opus["reason"].as_str().expect("a reason");
+        assert!(
+            reason.starts_with("no available account can serve this model now"),
+            "{reason}"
+        );
+        assert!(!reason.to_lowercase().contains("overload"), "{reason}");
+        let frees = assert_utc(&opus["freesAt"]);
+        assert!(
+            frees > before && frees <= before + time::Duration::seconds(601),
+            "the hold's end: {frees}"
+        );
+    }
+
+    /// **The route reads, and only reads**: every other method is a local 405, never
+    /// forwarded.
+    #[tokio::test]
+    async fn only_get_is_served() {
+        use tower::ServiceExt as _;
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            let mut req = Request::builder()
+                .method(method.clone())
+                .uri(ROUTING_PATH)
+                .header("x-api-key", KEY)
+                .body(Body::empty())
+                .expect("build request");
+            req.extensions_mut().insert(ClientAddr(loopback()));
+            let response = app(manager()).oneshot(req).await.expect("router response");
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method}"
+            );
+        }
+    }
+
+    /// **The route passes the local gate**: a caller off this host is refused even with the
+    /// key, and a local caller without it is refused.
+    #[tokio::test]
+    async fn the_gate_refuses_a_remote_or_keyless_caller() {
+        use tower::ServiceExt as _;
+        let ask = |peer: SocketAddr, key: Option<&'static str>| async move {
+            let mut builder = Request::builder().method(Method::GET).uri(ROUTING_PATH);
+            if let Some(key) = key {
+                builder = builder.header("x-api-key", key);
+            }
+            let mut req = builder.body(Body::empty()).expect("build request");
+            req.extensions_mut().insert(ClientAddr(peer));
+            app(manager())
+                .oneshot(req)
+                .await
+                .expect("router response")
+                .status()
+        };
+        let remote = SocketAddr::from(([203, 0, 113, 7], 44_444));
+        assert_eq!(ask(remote, Some(KEY)).await, StatusCode::FORBIDDEN);
+        assert_eq!(ask(loopback(), None).await, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The last error and its count, as the document reports `provider`'s.
+    async fn last_error(manager: Arc<Manager>, provider: usize) -> (Value, u64) {
+        let document = document(manager).await;
+        let error = &document["providers"][provider]["lastError"];
+        (
+            error["kind"].clone(),
+            error["count10m"].as_u64().unwrap_or(0),
+        )
+    }
+
+    /// **A send that reaches no upstream is a transport error.**
+    #[tokio::test]
+    async fn a_send_that_reaches_no_upstream_is_a_transport_error() {
+        let manager = manager();
+        post(
+            Arc::clone(&manager),
+            "/v1/messages",
+            r#"{"model":"claude-opus-5-5","max_tokens":1,"messages":[]}"#,
+        )
+        .await;
+        let (kind, count) = last_error(manager, 0).await;
+        assert_eq!(kind, "transport");
+        assert!(count >= 1);
+    }
+
+    /// **An upstream 503 is overloaded**, read at the status every attempt passes.
+    #[tokio::test]
+    async fn an_upstream_503_is_overloaded() {
+        let upstream = stub::canned(stub::reply(
+            "503 Service Unavailable",
+            "application/json",
+            "{}",
+        ));
+        let manager = keyed(Config {
+            upstream: upstream.url(),
+            codex_upstream: "http://127.0.0.1:1".to_string(),
+            ..Config::fixture(vec![Account::fixture("alice@example.com")])
+        });
+        post(
+            Arc::clone(&manager),
+            "/v1/messages",
+            r#"{"model":"claude-opus-5-5","max_tokens":1,"messages":[]}"#,
+        )
+        .await;
+        let (kind, count) = last_error(manager, 0).await;
+        assert_eq!(kind, "overloaded");
+        assert!(count >= 1);
+    }
+
+    /// **A `codex` account refusing the model for its plan is capacity**, on the `codex`
+    /// provider only.
+    #[tokio::test]
+    async fn a_codex_model_refusal_is_capacity() {
+        let origin = Router::new().fallback(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                [(CONTENT_TYPE, "application/json")],
+                r#"{"detail":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}"#,
+            )
+        });
+        let upstream = stub::http(origin);
+        let bob = Account {
+            provider: Provider::Codex,
+            account_uuid: Some("33333333-3333-4333-8333-333333333333".to_string()),
+            ..Account::fixture("bob@example.com/codex")
+        };
+        let manager = keyed(Config {
+            upstream: "http://127.0.0.1:1".to_string(),
+            codex_upstream: upstream.url(),
+            ..Config::fixture(vec![bob])
+        });
+        post(
+            Arc::clone(&manager),
+            crate::provider::CODEX_RESPONSES_PATH,
+            r#"{"model":"gpt-6.1-sol","input":[]}"#,
+        )
+        .await;
+        let document = document(manager).await;
+        assert_eq!(document["providers"][1]["lastError"]["kind"], "capacity");
+        assert!(document["providers"][0]["lastError"].is_null());
+    }
 }

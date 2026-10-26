@@ -109,7 +109,12 @@ fn fake_status_endpoint(body: String) -> u16 {
     port
 }
 
-fn serve_one(mut stream: TcpStream, body: &str) {
+fn serve_one(stream: TcpStream, body: &str) {
+    serve_status(stream, "200 OK", body);
+}
+
+/// Read one request off `stream` and answer it `status` with the JSON `body`.
+fn serve_status(mut stream: TcpStream, status: &str, body: &str) {
     let peek = stream.try_clone().expect("clone the stream");
     let mut reader = BufReader::new(peek);
     let mut line = String::new();
@@ -120,7 +125,7 @@ fn serve_one(mut stream: TcpStream, body: &str) {
         line.clear();
     }
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _written = stream.write_all(response.as_bytes());
@@ -228,5 +233,186 @@ async fn check_exits_zero_when_every_probe_is_ok() {
     for form in [&["--check"][..], &["--json", "--check"][..]] {
         let (code, out) = run_status(home.path(), &config, port, form);
         assert_eq!(code, Some(0), "{form:?} over a healthy fleet:\n{out}");
+    }
+}
+
+// `tcr routing --json`: its whole contract is stdout and the exit code a launcher reads.
+
+/// The exits `tcr routing --json` answers with, written out as literals on purpose: a
+/// launcher reads them, so changing one must fail here.
+const ROUTING_SERVED_EXIT: i32 = 0;
+const ROUTING_NO_PROXY_EXIT: i32 = 3;
+const ROUTING_UNREADABLE_EXIT: i32 = 4;
+
+/// An obviously fake proxy key for the in-process proxy, and a second one it refuses.
+const ROUTING_KEY: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+const WRONG_KEY: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+
+/// A config with no accounts pointed at `port`, carrying `key` as its proxy api-key.
+fn write_routing_config(home: &Path, port: u16, key: &str) -> std::path::PathBuf {
+    let dir = home.join(".config");
+    std::fs::create_dir_all(&dir).expect("create the config directory");
+    let path = dir.join("tcr.json");
+    std::fs::write(
+        &path,
+        format!(
+            "{{\n  \"accounts\": [],\n  \"proxy\": {{ \"port\": {port}, \"apiKey\": \"{key}\" }}\n}}\n"
+        ),
+    )
+    .expect("write the config");
+    path
+}
+
+/// A real proxy in this process, keyed with [`ROUTING_KEY`], on a kernel-assigned port: one
+/// invented account, upstreams on dead ports, nothing sent anywhere. Returns the port.
+async fn routing_proxy(home: &Path) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a scratch port");
+    let port = listener.local_addr().expect("local addr").port();
+    let path = home.join("proxy.json");
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{ "proxy": {{ "port": {port}, "apiKey": "{ROUTING_KEY}" }}, "upstream": "http://127.0.0.1:0", "codexUpstream": "http://127.0.0.1:0", "accounts": [{{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice", "expiresAt": 4102444800000, "priority": 0 }}] }}"#
+        ),
+    )
+    .expect("write the proxy config");
+    let config = tcr::config::load(&path).expect("load the proxy config");
+    let manager = tcr::manager::Manager::with_live_refresher(config, None);
+    tokio::spawn(async move { tcr::mitm::serve(listener, manager, None).await });
+    port
+}
+
+/// A port that answers every request `status` with `body`.
+fn fake_answer(status: &'static str, body: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        while let Ok((stream, _)) = listener.accept() {
+            serve_status(stream, status, body);
+        }
+    });
+    port
+}
+
+/// A port that accepts every connection and never answers.
+fn silent_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept() {
+            held.push(stream);
+        }
+    });
+    port
+}
+
+/// A port nothing listens on: bound by the kernel, then released.
+fn closed_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind a scratch port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+/// Run `tcr routing --json` against `config`, off the async runtime, because the proxy it
+/// may talk to is served by this same runtime. Returns the exit, stdout and stderr.
+async fn run_routing(home: &Path, config: &Path) -> (Option<i32>, String, String) {
+    let home = home.to_path_buf();
+    let config = config.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let out = crate::tcr_env::tcr(&home)
+            .args(["routing", "--json", "--config"])
+            .arg(&config)
+            .current_dir(&home)
+            .output()
+            .expect("run tcr");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    })
+    .await
+    .expect("join the tcr run")
+}
+
+/// **Served: exit 0, and stdout is the running proxy's own schema-1 document.**
+#[tokio::test]
+async fn routing_prints_the_served_document_and_exits_0() {
+    let home = tempfile::tempdir().expect("temp home");
+    let port = routing_proxy(home.path()).await;
+    let config = write_routing_config(home.path(), port, ROUTING_KEY);
+    let (code, stdout, stderr) = run_routing(home.path(), &config).await;
+    assert_eq!(
+        code,
+        Some(ROUTING_SERVED_EXIT),
+        "{stdout}\n--- stderr ---\n{stderr}"
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout is the JSON document");
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["providers"][0]["provider"], "anthropic");
+    assert_eq!(document["providers"][1]["provider"], "codex");
+    assert!(document["forecast"].is_null());
+}
+
+/// **Nothing listening: exit 3, nothing on stdout, and no document made up offline.**
+#[tokio::test]
+async fn routing_exits_3_when_no_proxy_listens() {
+    let home = tempfile::tempdir().expect("temp home");
+    let config = write_routing_config(home.path(), closed_port(), ROUTING_KEY);
+    let (code, stdout, stderr) = run_routing(home.path(), &config).await;
+    assert_eq!(
+        code,
+        Some(ROUTING_NO_PROXY_EXIT),
+        "{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(stdout.is_empty(), "no offline document: {stdout}");
+    assert!(!stderr.trim().is_empty(), "the reason goes to stderr");
+}
+
+/// **A proxy answered, but not with a readable schema-1 document: exit 4**, whether it
+/// refused the key, answered an HTTP error, never answered in time, or answered something
+/// that is not schema 1.
+#[tokio::test]
+async fn routing_exits_4_on_auth_http_timeout_unreadable_or_unknown_schema() {
+    let home = tempfile::tempdir().expect("temp home");
+    let proxy = routing_proxy(home.path()).await;
+    let cases = [
+        ("a refused key", proxy, WRONG_KEY),
+        (
+            "an HTTP error",
+            fake_answer("500 Internal Server Error", "{}"),
+            ROUTING_KEY,
+        ),
+        ("no answer in time", silent_port(), ROUTING_KEY),
+        (
+            "an unreadable document",
+            fake_answer("200 OK", "not json"),
+            ROUTING_KEY,
+        ),
+        (
+            "an unknown schema",
+            fake_answer("200 OK", r#"{"schema":2}"#),
+            ROUTING_KEY,
+        ),
+    ];
+    for (name, port, key) in cases {
+        let config = write_routing_config(home.path(), port, key);
+        let (code, stdout, stderr) = run_routing(home.path(), &config).await;
+        assert_eq!(
+            code,
+            Some(ROUTING_UNREADABLE_EXIT),
+            "{name}:\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(stdout.is_empty(), "{name}: nothing on stdout: {stdout}");
+        assert!(
+            !stderr.trim().is_empty(),
+            "{name}: the reason goes to stderr"
+        );
     }
 }

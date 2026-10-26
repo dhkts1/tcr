@@ -582,3 +582,101 @@ pub(super) fn stream_error_count(times: &VecDeque<i64>, now_ms: i64) -> usize {
         .filter(|&&t| now_ms - t <= STREAM_ERROR_WINDOW_MS)
         .count()
 }
+
+#[cfg(test)]
+mod routing_observation_tests {
+    //! What the routing document reports per provider is written where a served request,
+    //! a failed stream and a refused credential are already recorded.
+    use super::*;
+    use crate::config::Account;
+    use crate::provider::Provider;
+    use crate::routing::ErrorKind;
+    use std::collections::BTreeSet;
+
+    /// One `anthropic` account (slot 0) and one `codex` account (slot 1).
+    fn manager() -> Arc<Manager> {
+        Manager::new(
+            Config::fixture(vec![
+                Account::fixture("alice@example.com"),
+                Account {
+                    provider: Provider::Codex,
+                    ..Account::fixture("bob@example.com/codex")
+                },
+            ]),
+            Arc::new(crate::oauth::NoRefresh),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(crate::warmer::LiveWarmer::new()),
+            None,
+        )
+    }
+
+    fn last_kind(manager: &Manager, provider: Provider) -> Option<ErrorKind> {
+        manager
+            .routing_observed(provider, crate::now_ms())
+            .0
+            .map(|(kind, _, _)| kind)
+    }
+
+    /// **A served model is seen under the serving account's provider**, and a slot with no
+    /// account records nothing.
+    #[test]
+    fn a_served_model_is_seen_under_its_serving_accounts_provider() {
+        let manager = manager();
+        let record = |model: &str| {
+            crate::usage::UsageRecord::from_quota_input(
+                crate::now_ms(),
+                Some(model.to_string()),
+                None,
+                10,
+                0,
+                0,
+                0,
+                5,
+            )
+        };
+        manager.record_usage(0, record("claude-opus-5-5"));
+        manager.record_usage(1, record("gpt-5.1-codex"));
+        manager.record_usage(9, record("served-by-no-account"));
+        let now = crate::now_ms();
+        assert_eq!(
+            manager.routing_observed(Provider::Anthropic, now).1,
+            BTreeSet::from(["claude-opus-5-5".to_string()])
+        );
+        assert_eq!(
+            manager.routing_observed(Provider::Codex, now).1,
+            BTreeSet::from(["gpt-5.1-codex".to_string()])
+        );
+    }
+
+    /// **A failed stream and a refused credential are the provider's last error**; an
+    /// in-band error that names no kind leaves the last one in place.
+    #[test]
+    fn a_failed_stream_and_a_refused_credential_are_the_last_error() {
+        let manager = manager();
+        assert_eq!(last_kind(&manager, Provider::Anthropic), None);
+        manager.record_stream_error(0, "overloaded_error");
+        assert_eq!(
+            last_kind(&manager, Provider::Anthropic),
+            Some(ErrorKind::Overloaded)
+        );
+        manager.record_stream_error(0, "cyber_policy");
+        assert_eq!(
+            last_kind(&manager, Provider::Anthropic),
+            Some(ErrorKind::Overloaded)
+        );
+        manager.record_stream_error(1, "truncated");
+        assert_eq!(
+            last_kind(&manager, Provider::Codex),
+            Some(ErrorKind::Transport)
+        );
+        manager.mark_refused(0);
+        assert_eq!(
+            last_kind(&manager, Provider::Anthropic),
+            Some(ErrorKind::Auth)
+        );
+        assert_eq!(
+            last_kind(&manager, Provider::Codex),
+            Some(ErrorKind::Transport)
+        );
+    }
+}

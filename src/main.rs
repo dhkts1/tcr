@@ -12259,3 +12259,26 @@ mod tests {
         assert_eq!(env_changes(&cmd).get("NODE_EXTRA_CA_CERTS"), None);
     }
 }
+
+#[cfg(test)]
+mod routing_cli_tests {
+    use super::*;
+
+    /// **`tcr routing` speaks JSON only**: without `--json` it is a usage error rather than
+    /// a text form a launcher could mistake for the document.
+    #[test]
+    fn routing_takes_only_json() {
+        let Err(err) = Cli::try_parse_from(["tcr", "routing"]) else {
+            panic!("`tcr routing` without --json must be refused");
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "{err}"
+        );
+        assert!(matches!(
+            Cli::try_parse_from(["tcr", "routing", "--json"]).map(|cli| cli.command),
+            Ok(Some(Command::Routing(_)))
+        ));
+    }
+}

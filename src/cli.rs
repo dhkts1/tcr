@@ -12648,3 +12648,26 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    /// **`tcr routing --json` exits 3 only when nothing listens**: a refused connection is
+    /// the one way no proxy answered. Silence, and a client that could not be built, are 4,
+    /// with every answer that is not a readable schema-1 document.
+    #[test]
+    fn routing_exits_3_only_when_nothing_listens() {
+        assert_eq!(RoutingReadError::from(Unreached::Refused).exit_code(), 3);
+        for unreached in [
+            Unreached::Silent("the server did not answer within 5s".to_string()),
+            Unreached::Unbuilt("http client: no TLS".to_string()),
+        ] {
+            assert_eq!(RoutingReadError::from(unreached).exit_code(), 4);
+        }
+        assert_eq!(
+            RoutingReadError::Unreadable("HTTP 500".to_string()).exit_code(),
+            4
+        );
+    }
+}
