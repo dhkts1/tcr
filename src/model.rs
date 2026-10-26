@@ -20,6 +20,18 @@ pub fn is_fable_model(model: &str) -> bool {
     model.to_ascii_lowercase().contains("fable")
 }
 
+/// The stable families a launcher names an Anthropic model by, in the order the routing
+/// document lists them ([`crate::routing`]).
+pub const FAMILIES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+
+/// The family of `model`: the first of [`FAMILIES`] it names, matched as a case-insensitive
+/// substring the way [`is_fable_model`] matches, so a dated or suffixed id still counts.
+/// `None` for an id that names none of them: an unknown id invents no family.
+pub fn family(model: &str) -> Option<&'static str> {
+    let model = model.to_ascii_lowercase();
+    FAMILIES.into_iter().find(|family| model.contains(family))
+}
+
 /// Whether the API keeps a `thinking` block of this model only inside the organization that
 /// minted it: Claude Sonnet 5.5 and Claude Haiku 5.5. Matched the way [`is_fable_model`]
 /// matches, as a case-insensitive substring, so a dated or suffixed id still counts.

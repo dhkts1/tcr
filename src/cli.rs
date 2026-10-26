@@ -3547,6 +3547,93 @@ async fn fetch_live_status_body(config: &Config) -> Result<String, LiveStatusErr
         .map_err(|e| LiveStatusError::Unusable(format!("reading the response body: {e}")))
 }
 
+/// Why `tcr routing --json` printed no document.
+#[derive(Debug)]
+pub(crate) enum RoutingReadError {
+    /// The connection was refused: no proxy is listening.
+    NoServer,
+    /// Something may be there, but nothing it gave back is a readable schema-1 document: it
+    /// refused the key, answered an HTTP error, did not answer in time, or sent something else.
+    Unreadable(String),
+}
+
+impl RoutingReadError {
+    /// `tcr routing --json`'s exit: 3 when no proxy is listening, 4 for every other way of not
+    /// reading the document; 0 is the document printed. A launcher branches on these, so they
+    /// are a contract. 1 stays every verb's own error, an unreadable config among them.
+    pub(crate) const fn exit_code(&self) -> i32 {
+        match self {
+            Self::NoServer => 3,
+            Self::Unreadable(_) => 4,
+        }
+    }
+
+    fn why(&self) -> &str {
+        match self {
+            Self::NoServer => "nothing is listening",
+            Self::Unreadable(why) => why,
+        }
+    }
+}
+
+impl From<Unreached> for RoutingReadError {
+    fn from(unreached: Unreached) -> Self {
+        match unreached {
+            Unreached::Refused => Self::NoServer,
+            Unreached::Silent(why) | Unreached::Unbuilt(why) => Self::Unreadable(why),
+        }
+    }
+}
+
+/// The running proxy's [`crate::proxy::ROUTING_PATH`] answer, as the bytes it sent, once
+/// [`crate::routing::parse`] has read them as schema 1.
+async fn fetch_routing_body(config: &Config) -> Result<String, RoutingReadError> {
+    let response = send_loopback(config, crate::proxy::ROUTING_PATH, |client, url| {
+        client.get(url)
+    })
+    .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let hint = if status.as_u16() == 401 {
+            " — the proxy api-key in the config was rejected"
+        } else {
+            ""
+        };
+        return Err(RoutingReadError::Unreadable(format!("HTTP {status}{hint}")));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|e| RoutingReadError::Unreadable(format!("reading the response body: {e}")))?;
+    crate::routing::parse(&body).map_err(RoutingReadError::Unreadable)?;
+    Ok(body)
+}
+
+/// `tcr routing --json`: print the running proxy's routing document ([`crate::routing`]) and
+/// return the exit code ([`RoutingReadError::exit_code`]).
+///
+/// On failure stdout stays empty and the reason goes to stderr. Nothing is built offline:
+/// whether a model is routable is the running selector's answer, and a document made without
+/// that selector would describe one that is not serving.
+pub async fn routing(config_path: &Path) -> anyhow::Result<i32> {
+    // Read-only verb: plain load, no clobber-warning (we never save).
+    let config = load_config(config_path)?;
+    match fetch_routing_body(&config).await {
+        Ok(body) => {
+            println!("{}", body.trim_end());
+            Ok(0)
+        }
+        Err(error) => {
+            eprintln!(
+                "[tcr] could not read the routing document from the proxy on 127.0.0.1:{} ({})",
+                config.proxy.port,
+                error.why()
+            );
+            Ok(error.exit_code())
+        }
+    }
+}
+
 /// One probe of the incumbent on the port, answering BOTH questions the startup
 /// stand-down has to decide on.
 ///

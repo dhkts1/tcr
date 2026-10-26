@@ -116,6 +116,11 @@ enum Command {
     /// one-liners in the docs). Sessions get their own object-shaped verb
     /// rather than a flag that changes `status`'s top-level type.
     Sessions(SessionsArgs),
+    /// Print the running proxy's routing document: which models a new request can be
+    /// routed to now, per provider. Exits 0 printed, 3 no proxy listening, 4 unreadable.
+    ///
+    /// Its own verb for the same reason as `sessions`: `tcr status --json` keeps its shape.
+    Routing(RoutingArgs),
     /// Print every Claude account as claude-swap's `list --json` document, for
     /// CodexBar. JSON only: `tcr status` is the view for a person.
     ///
@@ -1531,6 +1536,17 @@ struct SessionsArgs {
     json: bool,
 }
 
+/// `tcr routing --json`. `--json` is required: there is no text form a launcher could
+/// mistake for the document.
+#[derive(clap::Args)]
+struct RoutingArgs {
+    #[command(flatten)]
+    config: ConfigFile,
+    /// Print the schema-1 routing document as JSON (required).
+    #[arg(long, required = true)]
+    json: bool,
+}
+
 #[derive(clap::Args)]
 struct WrapArgs {
     /// Path to the config file, consulted only for pricing overrides, never
@@ -1828,6 +1844,7 @@ async fn run_main() -> anyhow::Result<()> {
         Some(Command::Peer(args)) => run_peer(args).await,
         Some(Command::Status(args)) => run_status(args).await,
         Some(Command::Sessions(args)) => run_sessions(args).await,
+        Some(Command::Routing(args)) => run_routing(args).await,
         Some(Command::List(args)) => run_list(args).await,
         Some(Command::Wrap(args)) => run_wrap(args),
         Some(Command::Update(args)) => update::run_update(args.force),
@@ -6890,6 +6907,20 @@ async fn run_fan(args: FanArgs) -> anyhow::Result<()> {
 async fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
     let config_path = args.config.path();
     cli::sessions(&config_path, args.json).await
+}
+
+/// `tcr routing --json` — the running proxy's routing document.
+///
+/// The exit code is carried out of [`cli::routing`] and spent here, the same shape as
+/// [`run_status`]: 3 when no proxy is listening, 4 when it could not be read.
+async fn run_routing(args: RoutingArgs) -> anyhow::Result<()> {
+    debug_assert!(args.json, "clap refuses `tcr routing` without --json");
+    let config_path = args.config.path();
+    let code = cli::routing(&config_path).await?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 /// `tcr list --json`: claude-swap's list schema v1, for CodexBar.

@@ -293,11 +293,14 @@ pub fn effective_fable_threshold(config_override: Option<f64>, today: f64) -> f6
 }
 
 /// One pass of the pool pick, in the order the selector tries them for unpinned work:
-/// [`Manager::select_with_group`]'s three, then [`Manager::select_revalidation`]'s
-/// fallback once the proxy finds all three empty. Each pass is one candidate filter,
-/// [`Manager::pool_candidate`]; the pass's own pick ranks what that filter admits.
+/// the provider's hard account lock, [`Manager::select_with_group`]'s three, then
+/// [`Manager::select_revalidation`]'s fallback once the proxy finds all three empty. Each
+/// pass is one candidate filter, [`Manager::pool_candidate`]; the pass's own pick ranks
+/// what that filter admits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PoolPass {
+pub enum PoolPass {
+    /// `lockAccount`: that account and no other, whatever its gates, ahead of every pass.
+    Lock,
     /// [`Manager::pick_eligible`]: every gate, pacing and the request's group included.
     Paced,
     /// [`Manager::pick_least_loaded`]: the soft fallback, pacing and the group dropped.
@@ -324,6 +327,9 @@ pub(super) struct PoolAsk<'a> {
     pub(super) group: Option<&'a str>,
     /// The one version of the group settings this selection reads.
     pub(super) groups: &'a GroupPolicy,
+    /// The provider's live locked slot ([`Manager::locked_account_for`]), read before any
+    /// accounts lock is taken: [`PoolPass::Lock`]'s only candidate.
+    pub(super) locked: Option<usize>,
     /// The session's warm window, which [`PoolPass::Revalidation`]'s hard gate reads.
     pub(super) warm: WarmWindow,
 }
@@ -342,6 +348,17 @@ fn exclude_control(
         }
         _ => std::borrow::Cow::Borrowed(tried),
     }
+}
+
+/// What [`Manager::routing_candidates`] found for one new, unpinned request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingCandidates {
+    /// The first pass, in the selector's order, with any candidate; `None` when none has one.
+    pub pass: Option<PoolPass>,
+    /// Every account that pass could choose now, by slot.
+    pub accounts: Vec<usize>,
+    /// Whether the request is a Fable request, the classification every pass read.
+    pub is_fable: bool,
 }
 
 impl Manager {
@@ -480,15 +497,21 @@ impl Manager {
             .collect()
     }
 
+    /// The slots a request of `provider` may never be served from: strict Codex peer exits
+    /// this build cannot honour. Empty for `anthropic`.
+    fn unsupported_exits(&self, provider: crate::provider::Provider) -> HashSet<usize> {
+        match provider {
+            crate::provider::Provider::Anthropic => HashSet::new(),
+            crate::provider::Provider::Codex => self.codex_accounts_with_unsupported_exit(),
+        }
+    }
+
     fn exclude_unsupported_codex_exits<'a>(
         &self,
         tried: &'a HashSet<usize>,
         provider: crate::provider::Provider,
     ) -> std::borrow::Cow<'a, HashSet<usize>> {
-        let unsupported = match provider {
-            crate::provider::Provider::Anthropic => return std::borrow::Cow::Borrowed(tried),
-            crate::provider::Provider::Codex => self.codex_accounts_with_unsupported_exit(),
-        };
+        let unsupported = self.unsupported_exits(provider);
         if unsupported.is_empty() {
             return std::borrow::Cow::Borrowed(tried);
         }
@@ -499,6 +522,92 @@ impl Manager {
         let mut excluded = tried.clone();
         excluded.extend(unsupported);
         std::borrow::Cow::Owned(excluded)
+    }
+
+    /// Which accounts could serve a NEW, UNPINNED request for `model` on `path` now, asking
+    /// for no group: the first pass, in the selector's own order, with any candidate, and
+    /// every candidate it has. The candidates are [`Self::pool_candidate`]'s, the filter the
+    /// picks themselves run, so routing and the picks cannot disagree about a gate.
+    ///
+    /// The passes, as a selection meets them: the provider's hard account lock, which serves
+    /// alone when set; [`PoolPass::Paced`], [`PoolPass::LeastLoaded`], and
+    /// [`PoolPass::FableLastResort`] for a Fable request; then [`PoolPass::Revalidation`],
+    /// which the proxy reaches when those found nothing and `revalidationServe` is on. Its
+    /// two-second window is an anti-storm valve rather than a gate, so it is not asked.
+    ///
+    /// Read-only, unlike every selection: it stamps no account, pins and unpins no session
+    /// and spends no revalidation window, so reading it never changes what the next
+    /// selection does. The one write it shares with them is the group-settings reload, which
+    /// only follows the config file.
+    pub fn routing_candidates(
+        &self,
+        now: OffsetDateTime,
+        model: Option<&str>,
+        path: &str,
+    ) -> RoutingCandidates {
+        self.reload_groups_if_changed();
+        let groups = self.groups();
+        let provider = crate::provider::Provider::of_path(path);
+        let is_fable =
+            provider.has_fable_bucket() && model.is_some_and(crate::model::is_fable_model);
+        let unsupported = self.unsupported_exits(provider);
+        // Each read under a lock of its own, so before the accounts lock and never nested in
+        // it.
+        let locked = self.locked_account_for(provider);
+        let revalidation = self.revalidation_serve_enabled();
+        let warm = self.warm_window(None);
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
+        let control_excluded =
+            self.control_excluded(classify_request(path), None, &accounts, &groups);
+        let pool_tried = exclude_control(&unsupported, control_excluded);
+        let ask = |tried| PoolAsk {
+            tried,
+            now,
+            now_ms: odt_to_ms(now),
+            is_fable,
+            provider,
+            group: None,
+            groups: &groups,
+            locked,
+            warm,
+        };
+        let pool = ask(&pool_tried);
+        // The lock and revalidation never see the control exclusion: the lock returns before
+        // it, and `select_revalidation` is not asked it.
+        let whole = ask(&unsupported);
+        let passes: Vec<(PoolPass, &PoolAsk<'_>)> = if locked.is_some() {
+            vec![(PoolPass::Lock, &whole)]
+        } else {
+            [
+                Some((PoolPass::Paced, &pool)),
+                Some((PoolPass::LeastLoaded, &pool)),
+                is_fable.then_some((PoolPass::FableLastResort, &pool)),
+                revalidation.then_some((PoolPass::Revalidation, &whole)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect()
+        };
+        for (pass, ask) in passes {
+            let found: Vec<usize> = accounts
+                .iter()
+                .enumerate()
+                .filter(|&(idx, account)| self.pool_candidate(pass, idx, account, ask))
+                .map(|(idx, _)| idx)
+                .collect();
+            if !found.is_empty() {
+                return RoutingCandidates {
+                    pass: Some(pass),
+                    accounts: found,
+                    is_fable,
+                };
+            }
+        }
+        RoutingCandidates {
+            pass: None,
+            accounts: Vec::new(),
+            is_fable,
+        }
     }
 
     /// Whether `group` has opted in to `spillToPool`, a PREFERENCE, whose own
@@ -1442,6 +1551,8 @@ impl Manager {
                 provider,
                 group,
                 groups: &groups,
+                // A lock returned above, before the pool.
+                locked: None,
                 warm,
             };
 
@@ -1794,6 +1905,8 @@ impl Manager {
             provider,
             group: None,
             groups: &groups,
+            // A locked provider never reaches this fallback: the proxy answers it first.
+            locked: None,
             warm,
         };
         // `tried` gates SERVING and nothing else, so it is part of this predicate: the pin
@@ -3032,6 +3145,8 @@ impl Manager {
         }
         let (now, now_ms) = (ask.now, ask.now_ms);
         match pass {
+            // The lock bypasses every gate: `select_with_group` returns it before the pool.
+            PoolPass::Lock => ask.locked == Some(idx),
             PoolPass::Paced | PoolPass::LeastLoaded => {
                 // Only the first pass narrows on the request's group; the soft fallback
                 // widens to the whole pool.
@@ -5989,7 +6104,7 @@ mod routing_candidates_tests {
                 tune: |_| {},
                 setup: |manager, now| {
                     each(manager, &[0, 1], |a| {
-                        a.quota.seven_day_oi = window(0.97, now)
+                        a.quota.seven_day_oi = window(0.97, now);
                     });
                 },
                 expect: [

@@ -202,8 +202,44 @@ impl Manager {
                 None => return,
             }
         };
+        // The model this provider served, for the routing document's catalogue.
+        if let Some(model) = record.model.as_deref() {
+            self.routing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .record_model(record.provider, model);
+        }
         self.usage
             .record(idx, &record, &name, uuid.as_deref(), org.as_deref());
+    }
+
+    /// Note an upstream error of `kind` on `provider` now, for the routing document's
+    /// `lastError` ([`crate::routing`]). Observability only: nothing in selection reads it,
+    /// and no retry, hold or gate follows from it.
+    pub fn record_upstream_error(
+        &self,
+        provider: crate::provider::Provider,
+        kind: crate::routing::ErrorKind,
+    ) {
+        self.routing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record_error(provider, kind, crate::now_ms());
+    }
+
+    /// What the routing document reports for `provider` as of `now_ms`: its last upstream
+    /// error as `(kind, at_ms, count of that kind in the ten minutes up to now_ms)`, and every
+    /// model id it served this boot.
+    pub fn routing_observed(
+        &self,
+        provider: crate::provider::Provider,
+        now_ms: i64,
+    ) -> (
+        Option<(crate::routing::ErrorKind, i64, u32)>,
+        std::collections::BTreeSet<String>,
+    ) {
+        let seen = self.routing.lock().unwrap_or_else(PoisonError::into_inner);
+        (seen.last_error(provider, now_ms), seen.model_ids(provider))
     }
 
     /// Attach `dir` as the usage ledger: replay today's and yesterday's files
@@ -490,11 +526,14 @@ impl Manager {
     /// `rate_limited_until_ms` whatever the status, so the hold binds the same.
     pub fn mark_refused(&self, idx: usize) {
         let until = crate::now_ms() + REFUSED_HOLD_SECONDS * 1000;
-        let mut accounts = self
-            .accounts
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(account) = accounts.get_mut(idx) {
+        let provider = {
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(account) = accounts.get_mut(idx) else {
+                return;
+            };
             account.rate_limited_until_ms = Some(until);
             account.hold_cause = HoldCause::Refused;
             tracing::info!(
@@ -502,7 +541,9 @@ impl Manager {
                 hold_seconds = REFUSED_HOLD_SECONDS,
                 "refused by upstream 403, held out of rotation"
             );
-        }
+            account.provider
+        };
+        self.record_upstream_error(provider, crate::routing::ErrorKind::Auth);
     }
 
     /// Clear a hold after live proof it no longer binds (any non-429): a
@@ -535,14 +576,19 @@ impl Manager {
     /// see [`Self::mark_rate_limited`]'s doc comment), and nothing in
     /// `select.rs`'s `eligible`/`hard_ok`/`account_terminal_gate` reads the
     /// counter this writes — wiring it into routing is a separate, later,
-    /// premortem'd change.
+    /// premortem'd change. The kind it names, if any
+    /// ([`crate::routing::ErrorKind::of_stream`]), becomes the provider's last error in the
+    /// routing document, which is observability too.
     pub fn record_stream_error(&self, idx: usize, kind: &str) {
         let now_ms = crate::now_ms();
-        let mut accounts = self
-            .accounts
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(account) = accounts.get_mut(idx) {
+        let provider = {
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(account) = accounts.get_mut(idx) else {
+                return;
+            };
             tracing::warn!(
                 account = %account.name,
                 index = idx,
@@ -552,6 +598,10 @@ impl Manager {
             account.stream_error_times_ms.push_back(now_ms);
             prune_stream_errors(&mut account.stream_error_times_ms, now_ms);
             account.last_stream_error = Some(kind.to_string());
+            account.provider
+        };
+        if let Some(error) = crate::routing::ErrorKind::of_stream(kind) {
+            self.record_upstream_error(provider, error);
         }
     }
 }
@@ -603,9 +653,9 @@ mod routing_observation_tests {
                     ..Account::fixture("bob@example.com/codex")
                 },
             ]),
-            Arc::new(crate::oauth::NoRefresh),
+            Arc::new(oauth::NoRefresh),
             Arc::new(LiveUsageProber::new()),
-            Arc::new(crate::warmer::LiveWarmer::new()),
+            Arc::new(LiveWarmer::new()),
             None,
         )
     }

@@ -78,7 +78,9 @@ mod write_through;
 // Re-exported so unit F's replay harness (`tests/`) can call the SAME
 // production predicate rather than a reimplementation — see
 // the divert-budget design notes §6. Import path: `tcr::manager::{divert_verdict, DivertVerdict}`.
-pub use select::{DivertVerdict, divert_verdict, effective_fable_threshold};
+pub use select::{
+    DivertVerdict, PoolPass, RoutingCandidates, divert_verdict, effective_fable_threshold,
+};
 
 /// How long the session-affinity flusher waits after a change before it saves, so a burst of
 /// changes is one write. It is also the most of a new or moved pin a SIGKILL can lose: a
@@ -1508,6 +1510,10 @@ pub struct Manager {
     /// divides in the same unit the resets arrive in, with no repeated
     /// hour-conversion at the top of every selection loop.
     reset_urgency_tier_ms: i64,
+    /// The upstream errors and served model ids this boot has seen, per provider, for the
+    /// routing document ([`crate::routing`]). Observability only: no selection reads it.
+    /// A leaf lock, never held while another is taken.
+    routing: Mutex<crate::routing::Observations>,
 }
 
 /// Resets the keep-warm in-flight flag on drop, so a sweep that unwinds early
@@ -1786,6 +1792,7 @@ impl Manager {
             control_identity,
             client_identities: crate::control_identity::ClientIdentityCache::new(),
             reset_urgency_tier_ms,
+            routing: Mutex::new(crate::routing::Observations::default()),
         });
         // Hand the manager its own `Arc` (weakly) now that one exists — see the
         // `me` field. Infallible: this is the only write, on a just-built value.

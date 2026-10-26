@@ -147,7 +147,8 @@ const SSE_TEE_CAPACITY: usize = 256;
 /// classifier can tell "we witnessed an explicit error" (always trustworthy)
 /// apart from "we never saw the terminator" (trustworthy only when we also
 /// know we saw everything there was to see — see the handler's use of this).
-const TRUNCATED_STREAM_ERROR_KIND: &str = "truncated";
+/// `pub(crate)` so [`crate::routing::ErrorKind::of_stream`] reads this spelling, not a copy.
+pub(crate) const TRUNCATED_STREAM_ERROR_KIND: &str = "truncated";
 /// The content-block type Anthropic uses for a tool IT runs — `--advisor` today, `web_search`
 /// next. Its result block travels with an `encrypted_content` that only the minting
 /// organization can decrypt, which is why the id has to be remembered at all: see
@@ -965,6 +966,11 @@ pub const PEER_DIAL_ENDPOINT: &str = "peer-dial";
 /// read from memory. `GET` only, behind the same gate as [`STATUS_PATH`].
 pub const QUOTA_PATH: &str = "/_tcr/quota";
 
+/// Path of the routing document [`routing_handler`] serves ([`crate::routing`], schema 1):
+/// which model families each provider pool can serve a new request for now, for a launcher
+/// that must not parse text. `GET` only, behind the same gate as [`STATUS_PATH`].
+pub const ROUTING_PATH: &str = "/_tcr/routing";
+
 /// Path of the live account-control endpoint [`set_disabled_handler`] serves —
 /// `POST` only, the one route on this process that MUTATES rotation.
 ///
@@ -1665,6 +1671,11 @@ pub fn app(manager: Arc<Manager>) -> Router {
             QUOTA_PATH,
             axum::routing::get(quota_handler).fallback(quota_method_not_allowed),
         )
+        // The routing document: a pure GET like the status route, registered the same way.
+        .route(
+            ROUTING_PATH,
+            axum::routing::get(routing_handler).fallback(routing_method_not_allowed),
+        )
         // The two MUTATING local routes. Same reasoning as above, and the method
         // fallback matters more here: an unregistered method must answer a local
         // 405, never fall through to `handle` and be forwarded upstream.
@@ -1971,6 +1982,49 @@ async fn quota_handler(
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorKind::Api,
             "Could not serialize the quota snapshot.",
+        )
+        .respond_local();
+    };
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
+    response
+}
+
+/// A non-`GET` on [`ROUTING_PATH`]. A local 405, for the reasons
+/// [`status_method_not_allowed`] gives.
+async fn routing_method_not_allowed() -> Response {
+    ClientError::new(
+        StatusCode::METHOD_NOT_ALLOWED,
+        ErrorKind::InvalidRequest,
+        "The tcr routing endpoint is read-only: GET.",
+    )
+    .respond_local()
+}
+
+/// `GET /_tcr/routing`: the routing document, [`crate::routing`]'s schema 1.
+///
+/// Gated exactly as [`status_handler`] is, through [`local_endpoint_gate`]. It answers from
+/// memory: the selector's own candidate evaluation, read without stamping, pinning or
+/// spending anything ([`Manager::routing_candidates`]), and what this boot observed. No
+/// probe, no token refresh, no upstream call. It names no account, organization, session or
+/// credential.
+async fn routing_handler(
+    State(manager): State<Arc<Manager>>,
+    parts: axum::http::request::Parts,
+) -> Response {
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "routing") {
+        return refusal;
+    }
+
+    let Some(body) = crate::routing::document(&manager, OffsetDateTime::now_utc())
+        .and_then(|document| serde_json::to_string(&document).ok())
+    else {
+        return ClientError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorKind::Api,
+            "Could not build the routing document.",
         )
         .respond_local();
     };
@@ -4645,6 +4699,7 @@ async fn handle_request(
                     // attribute it to; `is_connect` / `is_timeout` separate "never
                     // reached the host" from "the host went quiet mid-request".
                     ladder.transport_failed();
+                    manager.record_upstream_error(provider, crate::routing::ErrorKind::Transport);
                     // **Blind peer egress, the one offer per request.**
                     //
                     // Four conjuncts, and the first two are what stop a carry
@@ -4925,6 +4980,11 @@ async fn handle_request(
                     status = status.as_u16(),
                     "upstream response"
                 );
+                // The kind a status alone names, once per attempt, for the routing document.
+                // Observation only: the arms below keep every retry, hold and rotation.
+                if let Some(kind) = crate::routing::ErrorKind::of_status(status.as_u16()) {
+                    manager.record_upstream_error(provider, kind);
+                }
             }
             let up_headers = resp.headers().clone();
             let rejections = quota_rejections(&up_headers);
@@ -5842,6 +5902,7 @@ async fn handle_request(
         let bytes = match read_capped_body(upstream_body, MAX_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(BodyReadError::Transport) => {
+                manager.record_upstream_error(provider, crate::routing::ErrorKind::Transport);
                 return ClientError::new(
                     StatusCode::BAD_GATEWAY,
                     ErrorKind::Proxy,
@@ -5865,6 +5926,8 @@ async fn handle_request(
                     && let Some(detail) = codex_model_refusal_detail(&bytes)
                 {
                     log_upstream_error_body(idx, account_name.as_deref(), status, &bytes);
+                    // Capacity: this account cannot serve the model now, which is not overload.
+                    manager.record_upstream_error(provider, crate::routing::ErrorKind::Capacity);
                     ladder.model_refused(account_name.clone(), detail);
                     ladder.bench(idx);
                     continue;
