@@ -26238,3 +26238,67 @@ mod tests {
         );
     }
 }
+
+/// The routing document a launcher reads from the running proxy: which model
+/// families each provider can serve now, behind the same local gate as the
+/// status route.
+#[cfg(test)]
+mod forecast_routing_tests {
+    use super::*;
+    use crate::config::{Account, Config, ProxyConfig};
+
+    /// An obviously fake proxy key: the gate is exercised, no real key is used.
+    const KEY: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    /// A keyed manager over one fake account whose upstreams are dead ports.
+    fn manager() -> Arc<Manager> {
+        Manager::with_live_refresher(
+            Config {
+                proxy: ProxyConfig {
+                    port: 0,
+                    api_key: Some(KEY.to_string()),
+                    request_key: None,
+                    extra: serde_json::Map::new(),
+                },
+                upstream: "http://127.0.0.1:1".to_string(),
+                codex_upstream: "http://127.0.0.1:1".to_string(),
+                ..Config::fixture(vec![Account::fixture("alice@example.com")])
+            },
+            None,
+        )
+    }
+
+    /// `GET path` from a loopback peer carrying the key, answered by the router
+    /// in-process: the [`ClientAddr`] is the extension the listener injects.
+    async fn get(manager: Arc<Manager>, path: &str) -> (StatusCode, HeaderMap, Bytes) {
+        use tower::ServiceExt as _;
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .header("x-api-key", KEY)
+            .body(Body::empty())
+            .expect("build request");
+        req.extensions_mut()
+            .insert(ClientAddr(SocketAddr::from(([127, 0, 0, 1], 54_321))));
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, headers, body)
+    }
+
+    /// **The running proxy serves the routing document locally, as schema 1.**
+    ///
+    /// The status is asserted before the body is decoded, so a proxy without the
+    /// route fails here on the catch-all's local 404 for anything under `/_tcr`,
+    /// not on a JSON error.
+    #[tokio::test]
+    async fn schema_one() {
+        let (status, _, body) = get(manager(), "/_tcr/routing").await;
+        assert_eq!(status, 200, "routing document must be served locally");
+        let document: Value = serde_json::from_slice(&body).expect("the routing document is JSON");
+        assert_eq!(document["schema"], 1, "the document names schema 1");
+    }
+}
