@@ -602,6 +602,106 @@ impl History {
 }
 
 #[cfg(test)]
+mod restored_forecast_call_tests {
+    use crate::config::{Account, Config};
+    use crate::manager::Manager;
+    use std::io::Write as _;
+
+    #[test]
+    fn restored_demand_and_live_calibration_add_zero_upstream_calls() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let ledger = tempfile::tempdir().unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let now_ms = (now.unix_timestamp_nanos() / 1_000_000) as i64;
+        for back in 1..=48 {
+            let ts = now_ms - back * 3_600_000;
+            let day = crate::usage::date_string(crate::usage::ledger_date(ts));
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(ledger.path().join(format!("{day}.jsonl")))
+                .unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"t":ts,"a":"alice@example.com",
+                "m":"claude-fable-5","i":100,"c5":0,"c1":0,"r":500,"o":25})
+            )
+            .unwrap();
+        }
+        let mut config = Config::fixture(vec![Account::fixture("alice@example.com")]);
+        config.upstream = format!("http://{address}");
+        config.codex_upstream = format!("http://{address}");
+        let manager = Manager::with_live_refresher(config, None);
+        manager.attach_usage_ledger(ledger.path().to_path_buf(), 29);
+        let cold = crate::routing::document(&manager, now).unwrap().forecast;
+        let reset = now_ms + 3_600_000;
+        for step in 0..=24 {
+            let at = now + time::Duration::seconds(step * 2);
+            if step != 0 {
+                let (input, output) = if step % 2 == 0 { (100, 0) } else { (0, 25) };
+                manager.record_usage(
+                    0,
+                    crate::usage::UsageRecord::from_quota_input(
+                        (at.unix_timestamp_nanos() / 1_000_000) as i64 - 1,
+                        Some("claude-fable-5".into()),
+                        None,
+                        input,
+                        0,
+                        0,
+                        0,
+                        output,
+                    ),
+                );
+            }
+            let bucket = Some(crate::probe::UsageBucket {
+                utilization: Some((step as f64 + 10.001) / 100.0),
+                reset_at_ms: Some(reset),
+            });
+            manager.apply_usage_at(
+                0,
+                &crate::probe::Usage {
+                    five_hour: bucket,
+                    seven_day: bucket,
+                    seven_day_oi: bucket,
+                    ..Default::default()
+                },
+                at,
+            );
+        }
+        let warm = crate::routing::document(&manager, now + time::Duration::seconds(50))
+            .unwrap()
+            .forecast;
+        let shutdown = manager.shutdown_usage_ledger(std::time::Duration::from_secs(2));
+        assert_eq!(shutdown, crate::usage::LedgerShutdown::Flushed);
+        let cold = cold.expect("restored observed demand produces estimates");
+        assert_eq!(
+            cold["providers"][0]["calibrated"], false,
+            "boot restores demand only"
+        );
+        assert!(cold["providers"][0]["historyHours"].as_f64().unwrap() >= 24.0);
+        let warm = warm.expect("calibrated demand stays visible");
+        assert_eq!(
+            warm["providers"][0]["calibrated"], true,
+            "public ticks reach every window fit"
+        );
+        assert!(warm["task"].is_null() && warm["bestProvider"].is_null());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "restored estimates and fitting add no upstream request"
+        );
+        let _control = std::net::TcpStream::connect(address).unwrap();
+        assert!(
+            listener.accept().is_ok(),
+            "the same listener detects a connection"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::usage::UsageRecord;
