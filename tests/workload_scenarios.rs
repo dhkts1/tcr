@@ -2210,6 +2210,7 @@ mod quota_replay {
     }
 
     #[test]
+    #[ignore = "ten-case replay takes minutes unoptimized; run: cargo test --test it workload_scenarios::quota_replay::frozen_baseline --locked -- --ignored"]
     fn frozen_baseline() {
         let expected: serde_json::Value =
             serde_json::from_str(include_str!("fixtures/quota-replay-baseline.json")).unwrap();
