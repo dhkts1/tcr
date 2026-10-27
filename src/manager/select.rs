@@ -292,6 +292,79 @@ pub fn effective_fable_threshold(config_override: Option<f64>, today: f64) -> f6
     config_override.unwrap_or(today)
 }
 
+/// One pass of the pool pick, in the order the selector tries them for unpinned work:
+/// the provider's hard account lock, [`Manager::select_with_group`]'s three, then
+/// [`Manager::select_revalidation`]'s fallback once the proxy finds all three empty. Each
+/// pass is one candidate filter, [`Manager::pool_candidate`]; the pass's own pick ranks
+/// what that filter admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolPass {
+    /// `lockAccount`: that account and no other, whatever its gates, ahead of every pass.
+    Lock,
+    /// [`Manager::pick_eligible`]: every gate, pacing and the request's group included.
+    Paced,
+    /// [`Manager::pick_least_loaded`]: the soft fallback, pacing and the group dropped.
+    LeastLoaded,
+    /// [`Manager::pick_fable_last_resort`]: a Fable request's predicted Fable-weekly gate
+    /// relaxed to upstream's own rejection.
+    FableLastResort,
+    /// [`Manager::select_revalidation`]'s fallback: the soft threshold and pacing relaxed,
+    /// every hard gate kept.
+    Revalidation,
+}
+
+/// The request facts every pool pass's filter reads, gathered once per selection.
+pub(super) struct PoolAsk<'a> {
+    /// Slots this request may not be served from: failed attempts, unsupported exits, and
+    /// for an inference pool pick the control account.
+    pub(super) tried: &'a HashSet<usize>,
+    pub(super) now: OffsetDateTime,
+    pub(super) now_ms: i64,
+    pub(super) is_fable: bool,
+    pub(super) provider: crate::provider::Provider,
+    /// The request's `--group`, which only [`PoolPass::Paced`] narrows on; every widening
+    /// pass drops it.
+    pub(super) group: Option<&'a str>,
+    /// The one version of the group settings this selection reads.
+    pub(super) groups: &'a GroupPolicy,
+    /// The provider's live locked slot ([`Manager::locked_account_for`]), read before any
+    /// accounts lock is taken: [`PoolPass::Lock`]'s only candidate.
+    pub(super) locked: Option<usize>,
+    /// The session's warm window, which [`PoolPass::Revalidation`]'s hard gate reads.
+    pub(super) warm: WarmWindow,
+}
+
+/// `tried` plus the control account an inference pool pick may not select
+/// ([`Manager::control_excluded`]), borrowed when that adds nothing.
+fn exclude_control(
+    tried: &HashSet<usize>,
+    control_excluded: Option<usize>,
+) -> std::borrow::Cow<'_, HashSet<usize>> {
+    match control_excluded {
+        Some(control_idx) if !tried.contains(&control_idx) => {
+            let mut t = tried.clone();
+            t.insert(control_idx);
+            std::borrow::Cow::Owned(t)
+        }
+        _ => std::borrow::Cow::Borrowed(tried),
+    }
+}
+
+/// What [`Manager::routing_candidates`] found for one new, unpinned request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingCandidates {
+    /// The first pass, in the selector's order, with any candidate; `None` when none has one.
+    pub pass: Option<PoolPass>,
+    /// Every account that pass could choose now, by slot.
+    pub accounts: Vec<usize>,
+    /// Whether the request is a Fable request, the classification every pass read.
+    pub is_fable: bool,
+    /// Earliest known instant these same passes can serve, when none can now.
+    pub free_at: Option<OffsetDateTime>,
+    /// Gate-owner reasons in this request's scope, without account identities.
+    pub gated: BTreeMap<GateReason, usize>,
+}
+
 impl Manager {
     /// Pick the best eligible account not in `tried`, spreading load across the
     /// fleet, or `None` if all are exhausted/held/disabled.
@@ -428,15 +501,21 @@ impl Manager {
             .collect()
     }
 
+    /// The slots a request of `provider` may never be served from: strict Codex peer exits
+    /// this build cannot honour. Empty for `anthropic`.
+    fn unsupported_exits(&self, provider: crate::provider::Provider) -> HashSet<usize> {
+        match provider {
+            crate::provider::Provider::Anthropic => HashSet::new(),
+            crate::provider::Provider::Codex => self.codex_accounts_with_unsupported_exit(),
+        }
+    }
+
     fn exclude_unsupported_codex_exits<'a>(
         &self,
         tried: &'a HashSet<usize>,
         provider: crate::provider::Provider,
     ) -> std::borrow::Cow<'a, HashSet<usize>> {
-        let unsupported = match provider {
-            crate::provider::Provider::Anthropic => return std::borrow::Cow::Borrowed(tried),
-            crate::provider::Provider::Codex => self.codex_accounts_with_unsupported_exit(),
-        };
+        let unsupported = self.unsupported_exits(provider);
         if unsupported.is_empty() {
             return std::borrow::Cow::Borrowed(tried);
         }
@@ -447,6 +526,164 @@ impl Manager {
         let mut excluded = tried.clone();
         excluded.extend(unsupported);
         std::borrow::Cow::Owned(excluded)
+    }
+
+    /// Which accounts could serve a NEW, UNPINNED request for `model` on `path` now, asking
+    /// for no group: the first pass, in the selector's own order, with any candidate, and
+    /// every candidate it has. The candidates are [`Self::pool_candidate`]'s, the filter the
+    /// picks themselves run, so routing and the picks cannot disagree about a gate.
+    ///
+    /// The passes, as a selection meets them: the provider's hard account lock, which serves
+    /// alone when set; [`PoolPass::Paced`], [`PoolPass::LeastLoaded`], and
+    /// [`PoolPass::FableLastResort`] for a Fable request; then [`PoolPass::Revalidation`],
+    /// which the proxy reaches when those found nothing and `revalidationServe` is on. Its
+    /// two-second valve is read without spending it, just as an unpinned serve requires.
+    ///
+    /// Read-only, unlike every selection: it stamps no account, pins and unpins no session
+    /// and spends no revalidation window, so reading it never changes what the next
+    /// selection does. The one write it shares with them is the group-settings reload, which
+    /// only follows the config file.
+    pub fn routing_candidates(
+        &self,
+        now: OffsetDateTime,
+        model: Option<&str>,
+        path: &str,
+    ) -> RoutingCandidates {
+        self.reload_groups_if_changed();
+        let groups = self.groups();
+        let provider = crate::provider::Provider::of_path(path);
+        let is_fable =
+            provider.has_fable_bucket() && model.is_some_and(crate::model::is_fable_model);
+        let unsupported = self.unsupported_exits(provider);
+        // Each read under a lock of its own, so before the accounts lock and never nested in
+        // it.
+        let locked = self.locked_account_for(provider);
+        let revalidation = self.revalidation_serve_enabled();
+        let warm = self.warm_window(None);
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
+        let control_excluded =
+            self.control_excluded(classify_request(path), None, &accounts, &groups);
+        let pool_tried = exclude_control(&unsupported, control_excluded);
+        // Selection spends the valve under the accounts write lock. Read it under this
+        // read lock so every pass below sees the same provider-local deadline.
+        let revalidation_at_ms = self.revalidation_valve(provider).load(Ordering::Relaxed);
+        let candidates_at = |at| {
+            let ask = |tried| PoolAsk {
+                tried,
+                now: at,
+                now_ms: odt_to_ms(at),
+                is_fable,
+                provider,
+                group: None,
+                groups: &groups,
+                locked,
+                warm,
+            };
+            let pool = ask(&pool_tried);
+            // The lock and revalidation do not see the control exclusion, matching
+            // their actual selection paths.
+            let whole = ask(&unsupported);
+            let passes: Vec<(PoolPass, &PoolAsk<'_>)> = if locked.is_some() {
+                vec![(PoolPass::Lock, &whole)]
+            } else {
+                [
+                    Some((PoolPass::Paced, &pool)),
+                    Some((PoolPass::LeastLoaded, &pool)),
+                    is_fable.then_some((PoolPass::FableLastResort, &pool)),
+                    (revalidation && odt_to_ms(at) >= revalidation_at_ms)
+                        .then_some((PoolPass::Revalidation, &whole)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect()
+            };
+            passes.into_iter().find_map(|(pass, ask)| {
+                let found: Vec<usize> = accounts
+                    .iter()
+                    .enumerate()
+                    .filter(|&(idx, account)| self.pool_candidate(pass, idx, account, ask))
+                    .map(|(idx, _)| idx)
+                    .collect();
+                (!found.is_empty()).then_some((pass, found))
+            })
+        };
+        if let Some((pass, accounts)) = candidates_at(now) {
+            return RoutingCandidates {
+                pass: Some(pass),
+                accounts,
+                is_fable,
+                free_at: None,
+                gated: BTreeMap::new(),
+            };
+        }
+
+        // With no upstream update, these are the only instants at which an unpaced
+        // pass can change. Ask the executable filters at each one, rather than
+        // duplicating their hard/soft gates or timing against a provider-wide hint.
+        // The first successful instant is min(account max(binding clear times));
+        // a manual or unknown gate never yields a promise unless a pass can serve.
+        let mut changes = Vec::new();
+        changes.extend(ms_to_odt(revalidation_at_ms));
+        let mut gated = BTreeMap::new();
+        for (idx, account) in accounts.iter().enumerate() {
+            if account.provider != provider
+                || unsupported.contains(&idx)
+                || (!revalidation && control_excluded == Some(idx))
+            {
+                continue;
+            }
+            changes.extend(account.rate_limited_until_ms.and_then(ms_to_odt));
+            changes.extend(
+                [
+                    account.quota.five_hour,
+                    account.quota.seven_day,
+                    account.quota.seven_day_oi,
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(|window| window.live_reset(now)),
+            );
+            changes.extend(account.quota.standard_reset);
+            let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
+            let (reason, _) = Self::account_gate(
+                account,
+                threshold,
+                self.fable_weekly_threshold,
+                now,
+                odt_to_ms(now),
+                is_fable,
+                None,
+                &groups.reserved,
+                &groups.parked,
+            );
+            if reason != GateReason::Ok {
+                *gated.entry(reason).or_insert(0) += 1;
+            }
+        }
+        changes.sort_unstable();
+        changes.dedup();
+        let free_at = changes
+            .into_iter()
+            .filter(|&at| at > now)
+            .find(|&at| candidates_at(at).is_some());
+        RoutingCandidates {
+            pass: None,
+            accounts: Vec::new(),
+            is_fable,
+            free_at,
+            gated,
+        }
+    }
+
+    /// The provider-local revalidation deadline, shared by its read and spend paths.
+    const fn revalidation_valve(
+        &self,
+        provider: crate::provider::Provider,
+    ) -> &std::sync::atomic::AtomicI64 {
+        match provider {
+            crate::provider::Provider::Anthropic => &self.next_revalidation_at_ms,
+            crate::provider::Provider::Codex => &self.next_codex_revalidation_at_ms,
+        }
     }
 
     /// Whether `group` has opted in to `spillToPool`, a PREFERENCE, whose own
@@ -1380,37 +1617,26 @@ impl Manager {
             // This is a deliberate trade, not a tightening: see
             // `Config::control_pooled` for why the reserve is a floor over
             // LAGGING headers and what it costs when upstream wins the race.
-            let control_excluded: Option<usize> =
-                if request_class == RequestClass::Inference && !self.control_pooled {
-                    self.control().filter(|&idx| {
-                        let opted_in = group.is_some_and(|g| {
-                            groups.control_allowed.contains(g)
-                                && accounts
-                                    .get(idx)
-                                    .is_some_and(|a| a.groups.iter().any(|gr| gr == g))
-                        });
-                        !opted_in
-                    })
-                } else {
-                    None
-                };
-            let pool_tried: std::borrow::Cow<'_, HashSet<usize>> = match control_excluded {
-                Some(control_idx) if !tried.contains(&control_idx) => {
-                    let mut t = tried.clone();
-                    t.insert(control_idx);
-                    std::borrow::Cow::Owned(t)
-                }
-                _ => std::borrow::Cow::Borrowed(tried),
+            let control_excluded = self.control_excluded(request_class, group, &accounts, &groups);
+            let pool_tried = exclude_control(tried, control_excluded);
+            let ask = PoolAsk {
+                tried: &pool_tried,
+                now,
+                now_ms,
+                is_fable,
+                provider,
+                group,
+                groups: &groups,
+                // A lock returned above, before the pool.
+                locked: None,
+                warm,
             };
-            let pool_tried: &HashSet<usize> = &pool_tried;
 
             // First pass: honour pacing (skip accounts at the concurrency cap or
             // inside the min-spacing window) AND, when `--group` was requested,
             // prefer that group. With pacing OFF and no group this is byte-identical
             // to the pre-pacing pick.
-            let mut best = self.pick_eligible(
-                &accounts, pool_tried, now, now_ms, is_fable, provider, true, group,
-            );
+            let mut best = self.pick_eligible(&accounts, &ask);
 
             // An explicit `--group` ask is STRICT BY DEFAULT (2026-09-13), and
             // strictness is checked BEFORE the soft fallback below can widen the
@@ -1483,9 +1709,7 @@ impl Manager {
                         "group: strict — refusing to fall back to the whole pool, returning no account — {}",
                         miss.explain(),
                     );
-                } else if let Some(idx) = self
-                    .pick_least_loaded(&accounts, pool_tried, now, now_ms, is_fable, provider, None)
-                {
+                } else if let Some(idx) = self.pick_least_loaded(&accounts, &ask) {
                     if let Some(account) = accounts.get(idx) {
                         // This fallback fires whenever the first (group- and
                         // pacing-respecting) pass came up empty — which can be pacing
@@ -1545,8 +1769,7 @@ impl Manager {
             if best.is_none()
                 && is_fable
                 && strict_group.is_none()
-                && let Some(idx) =
-                    self.pick_fable_last_resort(&accounts, pool_tried, now, now_ms, provider)
+                && let Some(idx) = self.pick_fable_last_resort(&accounts, &ask)
             {
                 if let Some(account) = accounts.get(idx) {
                     let seven_day_oi = account.quota.seven_day_oi.map_or(0.0, |w| w.effective(now));
@@ -1750,20 +1973,22 @@ impl Manager {
         // revalidates onto a reserved account, never widen it, so a reserved
         // account is never leaked to traffic this path cannot identify.
         let warm = self.warm_window(affinity);
-        let hard_ok = |account: &AccountRuntime| -> bool {
-            account.provider == provider
-                && Self::hard_ok(
-                    account,
-                    self.global_threshold,
-                    self.fable_weekly_threshold,
-                    now,
-                    now_ms,
-                    is_fable,
-                    None,
-                    &groups.reserved,
-                    &groups.parked,
-                    warm,
-                )
+        let ask = PoolAsk {
+            tried,
+            now,
+            now_ms,
+            is_fable,
+            provider,
+            group: None,
+            groups: &groups,
+            // A locked provider never reaches this fallback: the proxy answers it first.
+            locked: None,
+            warm,
+        };
+        // `tried` gates SERVING and nothing else, so it is part of this predicate: the pin
+        // already failed THIS request upstream when it is in `tried`, so it cannot answer it.
+        let servable = |idx: usize, account: &AccountRuntime| -> bool {
+            self.pool_candidate(PoolPass::Revalidation, idx, account, &ask)
         };
 
         // Mirrors `select()`'s `keep_pin`: set to the OLD pin index when the pin
@@ -1790,11 +2015,9 @@ impl Manager {
                     .accounts
                     .write()
                     .unwrap_or_else(PoisonError::into_inner);
-                // `tried` gates SERVING and nothing else: the pin already failed THIS
-                // request upstream, so it cannot answer it. Whether the PIN MOVES is
-                // decided below, on ACCOUNT-level evidence alone — see the comment
-                // there.
-                if !tried.contains(&idx) && accounts.get(idx).is_some_and(hard_ok) {
+                // Whether the PIN MOVES is decided below, on ACCOUNT-level evidence
+                // alone — see the comment there.
+                if accounts.get(idx).is_some_and(|a| servable(idx, a)) {
                     self.serve_pinned_over_threshold(&mut accounts, idx, now, is_fable);
                     return Some(idx);
                 }
@@ -1867,7 +2090,8 @@ impl Manager {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
 
-            let sticky_usable = sticky_pick.filter(|&s| accounts.get(s).is_some_and(hard_ok));
+            let sticky_usable =
+                sticky_pick.filter(|&s| accounts.get(s).is_some_and(|a| servable(s, a)));
             via_sticky = sticky_usable.is_some();
 
             let idx = if let Some(sticky) = sticky_usable {
@@ -1879,7 +2103,7 @@ impl Manager {
                 // pattern orders correctly for ascending "least utilized first".
                 let mut best_key: Option<(u64, u64)> = None;
                 for (i, account) in accounts.iter().enumerate() {
-                    if tried.contains(&i) || !hard_ok(account) {
+                    if !servable(i, account) {
                         continue;
                     }
                     let util = account.quota.max_utilization(now, is_fable);
@@ -1894,10 +2118,7 @@ impl Manager {
 
             // A servable candidate exists — spend the anti-storm window now (after
             // selection, so a fleet with nothing to serve never burns the valve).
-            let valve = match provider {
-                crate::provider::Provider::Anthropic => &self.next_revalidation_at_ms,
-                crate::provider::Provider::Codex => &self.next_codex_revalidation_at_ms,
-            };
+            let valve = self.revalidation_valve(provider);
             let next_at = valve.load(Ordering::Relaxed);
             if now_ms < next_at {
                 return None;
@@ -2835,61 +3056,30 @@ impl Manager {
         remaining_ms / self.reset_urgency_tier_ms
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the per-request selection inputs, each read by a different gate"
-    )]
-    fn pick_eligible(
-        &self,
-        accounts: &[AccountRuntime],
-        tried: &HashSet<usize>,
-        now: OffsetDateTime,
-        now_ms: i64,
-        is_fable: bool,
-        provider: crate::provider::Provider,
-        respect_pacing: bool,
-        group: Option<&str>,
-    ) -> Option<usize> {
-        let groups = self.groups();
+    fn pick_eligible(&self, accounts: &[AccountRuntime], ask: &PoolAsk<'_>) -> Option<usize> {
         let mut best: Option<usize> = None;
         let mut best_key: Option<(i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
-            if tried.contains(&idx) {
-                continue;
-            }
-            if !Self::eligible(
-                account,
-                self.global_threshold,
-                self.fable_weekly_threshold,
-                &self.pacing,
-                respect_pacing,
-                now,
-                now_ms,
-                is_fable,
-                provider,
-                group,
-                group, // this pass's own real ask — see `eligible`'s `reserved_group` doc
-                &groups.reserved,
-                &groups.parked,
-            ) {
+            if !self.pool_candidate(PoolPass::Paced, idx, account, ask) {
                 // Distinguish a pacing skip (healthy but capped/spaced) from a real
-                // ineligibility (disabled/error/quota) so the log names only the former.
-                if respect_pacing
-                    && self.pacing.is_active()
+                // ineligibility (disabled/error/quota) so the log names only the former:
+                // eligible once pacing is ignored, and held out by pacing alone.
+                if !ask.tried.contains(&idx)
+                    && Self::paced_out(account, &self.pacing, ask.now_ms)
                     && Self::eligible(
                         account,
                         self.global_threshold,
                         self.fable_weekly_threshold,
                         &self.pacing,
                         false,
-                        now,
-                        now_ms,
-                        is_fable,
-                        provider,
-                        group,
-                        group,
-                        &groups.reserved,
-                        &groups.parked,
+                        ask.now,
+                        ask.now_ms,
+                        ask.is_fable,
+                        ask.provider,
+                        ask.group,
+                        ask.group,
+                        &ask.groups.reserved,
+                        &ask.groups.parked,
                     )
                 {
                     tracing::info!(
@@ -2900,9 +3090,7 @@ impl Manager {
                 }
                 continue;
             }
-            if !self.pool_pick_respects_control_reserve(idx, account, now) {
-                continue;
-            }
+            let now = ask.now;
             // Unknown weekly reset sorts FIRST (probe it) — treat as the minimum.
             let reset = account
                 .quota
@@ -2933,45 +3121,12 @@ impl Manager {
     /// non-pacing eligibility (disabled/error/rate-limit/quota) still applies, so a
     /// genuinely exhausted fleet still yields `None` (a real 429), while a merely
     /// all-paced fleet always yields the coolest account. Read-only.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the per-request selection inputs, each read by a different gate"
-    )]
-    fn pick_least_loaded(
-        &self,
-        accounts: &[AccountRuntime],
-        tried: &HashSet<usize>,
-        now: OffsetDateTime,
-        now_ms: i64,
-        is_fable: bool,
-        provider: crate::provider::Provider,
-        group: Option<&str>,
-    ) -> Option<usize> {
-        let groups = self.groups();
+    fn pick_least_loaded(&self, accounts: &[AccountRuntime], ask: &PoolAsk<'_>) -> Option<usize> {
+        let now = ask.now;
         let mut best: Option<usize> = None;
         let mut best_key: Option<(u32, i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
-            if tried.contains(&idx) {
-                continue;
-            }
-            if !Self::eligible(
-                account,
-                self.global_threshold,
-                self.fable_weekly_threshold,
-                &self.pacing,
-                false,
-                now,
-                now_ms,
-                is_fable,
-                provider,
-                group,
-                group,
-                &groups.reserved,
-                &groups.parked,
-            ) {
-                continue;
-            }
-            if !self.pool_pick_respects_control_reserve(idx, account, now) {
+            if !self.pool_candidate(PoolPass::LeastLoaded, idx, account, ask) {
                 continue;
             }
             let reset = account
@@ -3015,55 +3170,13 @@ impl Manager {
     fn pick_fable_last_resort(
         &self,
         accounts: &[AccountRuntime],
-        tried: &HashSet<usize>,
-        now: OffsetDateTime,
-        now_ms: i64,
-        provider: crate::provider::Provider,
+        ask: &PoolAsk<'_>,
     ) -> Option<usize> {
-        let groups = self.groups();
+        let now = ask.now;
         let mut best: Option<usize> = None;
         let mut best_key: Option<(u64, i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
-            if tried.contains(&idx) {
-                continue;
-            }
-            // `eligible`'s first gate, asked by hand because this pass does not
-            // call it. Not hypothetical: an account of the other provider has no
-            // `7d_oi` window at all, so it reads as the FRESHEST candidate below
-            // and would win this pick outright.
-            if account.provider != provider {
-                continue;
-            }
-            if account.disabled || account.status == AccountStatus::Error {
-                continue;
-            }
-            // Parked is an account-level block like `disabled` above, and this
-            // last-resort pass relaxes only the Fable `7d_oi` prediction — never
-            // an operator's own decision to hold a group out.
-            if Self::parked_blocks(account, &groups.parked) {
-                continue;
-            }
-            if let Some(until) = account.rate_limited_until_ms
-                && now_ms < until
-            {
-                continue;
-            }
-            let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
-            // The shared (non-Fable) gates still apply in full — this pass
-            // relaxes ONLY the Fable-specific `7d_oi` prediction, never the
-            // account's other windows.
-            if account.quota.is_near(threshold, now) {
-                continue;
-            }
-            // The one gate this pass relaxes from a prediction to the
-            // authority: skip only a `7d_oi` upstream has actually rejected.
-            if account.quota.model_weekly_rejected(now) {
-                continue;
-            }
-            if Self::reserved_blocks(account, None, &groups.reserved) {
-                continue;
-            }
-            if !self.pool_pick_respects_control_reserve(idx, account, now) {
+            if !self.pool_candidate(PoolPass::FableLastResort, idx, account, ask) {
                 continue;
             }
             let seven_day_oi = account.quota.seven_day_oi.map_or(0.0, |w| w.effective(now));
@@ -3085,6 +3198,135 @@ impl Manager {
             }
         }
         best
+    }
+
+    /// Whether `account`, at slot `idx`, is a candidate of `pass` for the request `ask`
+    /// describes: the filter half of every pool pass, and the one place each pass's
+    /// filter is written. The gates themselves stay with their owners
+    /// ([`Self::eligible`], [`Self::hard_ok`], [`Self::model_blocked`] through both, and
+    /// [`Self::pool_pick_respects_control_reserve`]); this says only which owners each
+    /// pass asks. Pure; the caller holds whichever accounts lock it needs.
+    pub(super) fn pool_candidate(
+        &self,
+        pass: PoolPass,
+        idx: usize,
+        account: &AccountRuntime,
+        ask: &PoolAsk<'_>,
+    ) -> bool {
+        if ask.tried.contains(&idx) {
+            return false;
+        }
+        let (now, now_ms) = (ask.now, ask.now_ms);
+        match pass {
+            // The lock bypasses every gate: `select_with_group` returns it before the pool.
+            PoolPass::Lock => ask.locked == Some(idx),
+            PoolPass::Paced | PoolPass::LeastLoaded => {
+                // Only the first pass narrows on the request's group; the soft fallback
+                // widens to the whole pool.
+                let group = match pass {
+                    PoolPass::Paced => ask.group,
+                    _ => None,
+                };
+                Self::eligible(
+                    account,
+                    self.global_threshold,
+                    self.fable_weekly_threshold,
+                    &self.pacing,
+                    pass == PoolPass::Paced,
+                    now,
+                    now_ms,
+                    ask.is_fable,
+                    ask.provider,
+                    group,
+                    group, // this pass's own real ask — see `eligible`'s `reserved_group` doc
+                    &ask.groups.reserved,
+                    &ask.groups.parked,
+                ) && self.pool_pick_respects_control_reserve(idx, account, now)
+            }
+            PoolPass::FableLastResort => {
+                // `eligible`'s first gate, asked by hand because this pass does not
+                // call it. Not hypothetical: an account of the other provider has no
+                // `7d_oi` window at all, so it reads as the FRESHEST candidate below
+                // and would win this pick outright.
+                if account.provider != ask.provider {
+                    return false;
+                }
+                if account.disabled || account.status == AccountStatus::Error {
+                    return false;
+                }
+                // Parked is an account-level block like `disabled` above, and this
+                // last-resort pass relaxes only the Fable `7d_oi` prediction — never
+                // an operator's own decision to hold a group out.
+                if Self::parked_blocks(account, &ask.groups.parked) {
+                    return false;
+                }
+                if let Some(until) = account.rate_limited_until_ms
+                    && now_ms < until
+                {
+                    return false;
+                }
+                let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
+                // The shared (non-Fable) gates still apply in full — this pass
+                // relaxes ONLY the Fable-specific `7d_oi` prediction, never the
+                // account's other windows.
+                if account.quota.is_near(threshold, now) {
+                    return false;
+                }
+                // The one gate this pass relaxes from a prediction to the
+                // authority: skip only a `7d_oi` upstream has actually rejected.
+                if account.quota.model_weekly_rejected(now) {
+                    return false;
+                }
+                if Self::reserved_blocks(account, None, &ask.groups.reserved) {
+                    return false;
+                }
+                self.pool_pick_respects_control_reserve(idx, account, now)
+            }
+            // The request's provider is asked first, as `eligible` asks it: an account of
+            // the other provider is not an over-threshold candidate, it is no candidate.
+            // `group: None` for the reason `select_revalidation` gives at its call.
+            PoolPass::Revalidation => {
+                account.provider == ask.provider
+                    && Self::hard_ok(
+                        account,
+                        self.global_threshold,
+                        self.fable_weekly_threshold,
+                        now,
+                        now_ms,
+                        ask.is_fable,
+                        None,
+                        &ask.groups.reserved,
+                        &ask.groups.parked,
+                        ask.warm,
+                    )
+            }
+        }
+    }
+
+    /// The control account, when an inference pool pick must not select it: unless
+    /// `controlPooled` is set, or the request's `--group` opted the control account in
+    /// (`allowControlAccount`) and the control account carries that group. Why this
+    /// exclusion exists, and why it is an extra `tried` member: the comment at its use in
+    /// [`Self::select_with_group`].
+    fn control_excluded(
+        &self,
+        request_class: RequestClass,
+        group: Option<&str>,
+        accounts: &[AccountRuntime],
+        groups: &GroupPolicy,
+    ) -> Option<usize> {
+        if request_class != RequestClass::Inference || self.control_pooled {
+            return None;
+        }
+        self.control().filter(|&idx| {
+            let opted_in = group.is_some_and(|g| {
+                groups.control_allowed.contains(g)
+                    && accounts
+                        .get(idx)
+                        .is_some_and(|a| a.groups.iter().any(|gr| gr == g))
+            });
+            !opted_in
+        })
     }
 
     /// Lookup half of [`Manager::conn_affinity`]: the account this connection
@@ -5840,5 +6082,313 @@ mod provider_filter_tests {
             Some(0),
             "select_revalidation must not gate a Codex request on the Fable bucket"
         );
+    }
+}
+
+#[cfg(test)]
+mod routing_candidates_tests {
+    //! [`Manager::routing_candidates`] is the selector's own answer for a new, unpinned
+    //! request: the pass that would serve it and every account that pass could choose,
+    //! read without changing anything a selection reads.
+    use super::select_test_support::{account, config_with, live_manager, pin};
+    use super::*;
+    use crate::quota::QuotaWindow;
+    use time::Duration;
+
+    const MESSAGES: &str = "/v1/messages";
+    const MODELS: [Option<&str>; 3] = [None, Some("claude-opus-5-5"), Some("claude-fable-5-1")];
+
+    /// Three healthy Anthropic accounts, `tune` applied to their config.
+    fn fleet(tune: fn(&mut Config)) -> Arc<Manager> {
+        let mut config = config_with(vec![
+            account("a@example.com"),
+            account("b@example.com"),
+            account("c@example.com"),
+        ]);
+        tune(&mut config);
+        live_manager(config)
+    }
+
+    /// Change every listed account's runtime, as upstream answers and holds would.
+    fn each(manager: &Manager, slots: &[usize], change: impl Fn(&mut AccountRuntime)) {
+        let mut accounts = manager
+            .accounts
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        for &slot in slots {
+            change(&mut accounts[slot]);
+        }
+    }
+
+    fn window(utilization: f64, now: OffsetDateTime) -> Option<QuotaWindow> {
+        Some(QuotaWindow {
+            utilization,
+            reset: Some(now + Duration::hours(2)),
+        })
+    }
+
+    /// What a new, unpinned request for `model` is served from, through the calls the proxy
+    /// makes: `select`, then the revalidation serve when it is on, no lock is set and `select`
+    /// found nothing.
+    fn served(manager: &Manager, now: OffsetDateTime, model: Option<&str>) -> Option<usize> {
+        let none = HashSet::new();
+        manager
+            .select(&none, now, model, None, MESSAGES, None)
+            .or_else(|| {
+                (manager.revalidation_serve_enabled()
+                    && manager
+                        .locked_account_for(crate::provider::Provider::Anthropic)
+                        .is_none())
+                .then(|| manager.select_revalidation(&none, now, model, None, MESSAGES))
+                .flatten()
+            })
+    }
+
+    struct Case {
+        name: &'static str,
+        tune: fn(&mut Config),
+        setup: fn(&Manager, OffsetDateTime),
+        /// The pass and its candidates, for no model, an Opus model and a Fable model.
+        expect: [(Option<PoolPass>, &'static [usize]); 3],
+    }
+
+    const ALL: &[usize] = &[0, 1, 2];
+
+    fn cases() -> Vec<Case> {
+        vec![
+            Case {
+                name: "a healthy fleet",
+                tune: |_| {},
+                setup: |_, _| {},
+                expect: [(Some(PoolPass::Paced), ALL); 3],
+            },
+            Case {
+                name: "one held, one disabled",
+                tune: |_| {},
+                setup: |manager, now| {
+                    let until = odt_to_ms(now) + 600_000;
+                    each(manager, &[0], |a| a.rate_limited_until_ms = Some(until));
+                    each(manager, &[1], |a| a.disabled = true);
+                },
+                expect: [(Some(PoolPass::Paced), &[2]); 3],
+            },
+            Case {
+                name: "Fable predicted out on two",
+                tune: |_| {},
+                setup: |manager, now| {
+                    each(manager, &[0, 1], |a| {
+                        a.quota.seven_day_oi = window(0.97, now);
+                    });
+                },
+                expect: [
+                    (Some(PoolPass::Paced), ALL),
+                    (Some(PoolPass::Paced), ALL),
+                    (Some(PoolPass::Paced), &[2]),
+                ],
+            },
+            Case {
+                name: "Fable predicted out everywhere",
+                tune: |_| {},
+                setup: |manager, now| {
+                    each(manager, ALL, |a| a.quota.seven_day_oi = window(0.97, now));
+                },
+                expect: [
+                    (Some(PoolPass::Paced), ALL),
+                    (Some(PoolPass::Paced), ALL),
+                    (Some(PoolPass::FableLastResort), ALL),
+                ],
+            },
+            Case {
+                name: "Fable rejected everywhere",
+                tune: |_| {},
+                setup: |manager, now| {
+                    each(manager, ALL, |a| a.quota.seven_day_oi = window(1.0, now));
+                },
+                expect: [
+                    (Some(PoolPass::Paced), ALL),
+                    (Some(PoolPass::Paced), ALL),
+                    (None, &[]),
+                ],
+            },
+            Case {
+                name: "every account paced",
+                tune: |config| {
+                    config.pacing.max_in_flight_per_account = Some(1);
+                },
+                setup: |manager, _| each(manager, ALL, |a| a.in_flight = 1),
+                expect: [(Some(PoolPass::LeastLoaded), ALL); 3],
+            },
+            Case {
+                name: "every account over the switch threshold",
+                tune: |_| {},
+                setup: |manager, now| {
+                    each(manager, ALL, |a| a.quota.five_hour = window(0.95, now));
+                },
+                expect: [(Some(PoolPass::Revalidation), ALL); 3],
+            },
+            Case {
+                name: "every account over the switch threshold, revalidation off",
+                tune: |config| {
+                    config
+                        .extra
+                        .insert("revalidationServe".to_string(), serde_json::json!(false));
+                },
+                setup: |manager, now| {
+                    each(manager, ALL, |a| a.quota.five_hour = window(0.95, now));
+                },
+                expect: [(None, &[]); 3],
+            },
+            Case {
+                name: "every account held",
+                tune: |_| {},
+                setup: |manager, now| {
+                    let until = odt_to_ms(now) + 600_000;
+                    each(manager, ALL, |a| a.rate_limited_until_ms = Some(until));
+                },
+                expect: [(None, &[]); 3],
+            },
+            Case {
+                name: "the control account is not the pool's",
+                tune: |config| {
+                    config.control_account =
+                        Some(config::ControlAccountRef::Name("a@example.com".to_string()));
+                },
+                setup: |_, _| {},
+                expect: [(Some(PoolPass::Paced), &[1, 2]); 3],
+            },
+            Case {
+                name: "a lock serves its account whatever its gates",
+                tune: |config| config.lock_account = Some("b@example.com".to_string()),
+                setup: |manager, _| each(manager, &[1], |a| a.disabled = true),
+                expect: [(Some(PoolPass::Lock), &[1]); 3],
+            },
+        ]
+    }
+
+    /// **Routing reads what the picks serve.** For each fleet and model, the pass routing
+    /// names is the one that serves, a model is routable exactly when a new request for it
+    /// is served, and the account served is one routing counted.
+    ///
+    /// Each model gets a fresh fleet: a pick stamps its account, and a revalidation serve
+    /// spends the window the next one would need.
+    #[test]
+    fn routing_reads_what_the_picks_serve() {
+        for case in cases() {
+            for (model, (pass, accounts)) in MODELS.into_iter().zip(case.expect) {
+                let manager = fleet(case.tune);
+                let now = OffsetDateTime::now_utc();
+                (case.setup)(&manager, now);
+                let found = manager.routing_candidates(now, model, MESSAGES);
+                let name = case.name;
+                assert_eq!(
+                    (found.pass, found.accounts.as_slice()),
+                    (pass, accounts),
+                    "{name}, {model:?}"
+                );
+                let pick = served(&manager, now, model);
+                assert_eq!(
+                    pick.is_some(),
+                    found.pass.is_some(),
+                    "{name}, {model:?}: routable must be exactly what a new request is served"
+                );
+                if let Some(idx) = pick {
+                    assert!(
+                        found.accounts.contains(&idx),
+                        "{name}, {model:?}: served {idx}, routing counted {:?}",
+                        found.accounts
+                    );
+                }
+            }
+        }
+    }
+
+    /// Everything a selection reads and writes besides the gates themselves.
+    #[derive(Debug, PartialEq)]
+    struct SelectorState {
+        stamps: Vec<u64>,
+        select_seq: u64,
+        pins: Vec<(u64, (usize, i64))>,
+        revalidation_at: (i64, i64),
+        connections: usize,
+        diverts: usize,
+    }
+
+    fn selector_state(manager: &Manager) -> SelectorState {
+        let mut pins: Vec<(u64, (usize, i64))> = manager
+            .affinity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(&key, &pin)| (key, pin))
+            .collect();
+        pins.sort_unstable();
+        SelectorState {
+            stamps: manager
+                .accounts
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .map(|a| a.last_selected_seq)
+                .collect(),
+            select_seq: manager.select_seq.load(Ordering::Relaxed),
+            pins,
+            revalidation_at: (
+                manager.next_revalidation_at_ms.load(Ordering::Relaxed),
+                manager
+                    .next_codex_revalidation_at_ms
+                    .load(Ordering::Relaxed),
+            ),
+            connections: manager
+                .conn_affinity
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len(),
+            diverts: manager
+                .divert_ledger
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len(),
+        }
+    }
+
+    /// **A routing read changes nothing the selector reads**: no stamp, no pin, no
+    /// revalidation window spent. A fleet that was read selects exactly as its unread twin
+    /// does, on a healthy fleet and on one only revalidation can serve.
+    #[test]
+    fn a_routing_read_changes_no_selector_state() {
+        for over_threshold in [false, true] {
+            let now = OffsetDateTime::now_utc();
+            let setup = |manager: &Manager| {
+                pin(manager, 7, 0, odt_to_ms(now));
+                if over_threshold {
+                    each(manager, ALL, |a| a.quota.five_hour = window(0.95, now));
+                }
+            };
+            let read = fleet(|_| {});
+            let twin = fleet(|_| {});
+            setup(&read);
+            setup(&twin);
+            let before = selector_state(&read);
+            for model in MODELS {
+                assert_eq!(
+                    read.routing_candidates(now, model, MESSAGES),
+                    read.routing_candidates(now, model, MESSAGES),
+                    "over_threshold={over_threshold}, {model:?}: a read does not change the next read"
+                );
+            }
+            assert_eq!(
+                selector_state(&read),
+                before,
+                "over_threshold={over_threshold}"
+            );
+            for turn in 0..3 {
+                assert_eq!(
+                    served(&read, now, MODELS[1]),
+                    served(&twin, now, MODELS[1]),
+                    "over_threshold={over_threshold}, turn {turn}: the read fleet selects as its twin"
+                );
+            }
+            assert_eq!(selector_state(&read), selector_state(&twin));
+        }
     }
 }
