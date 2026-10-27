@@ -5715,6 +5715,9 @@ async fn handle_request(
                     );
                     None
                 };
+                if status.is_success() {
+                    manager_side.record_response_model(provider, response_model.as_deref());
+                }
                 if parsed.input_total > 0 || parsed.output > 0 {
                     turn.finish(
                         &manager_side,
@@ -5954,6 +5957,7 @@ async fn handle_request(
             manager.record_bound_tokens(&response.bound_tokens, idx, crate::now_ms());
             let parsed = response.usage;
             let response_model = response.model;
+            manager.record_response_model(provider, response_model.as_deref());
             if parsed.input_total > 0 || parsed.output > 0 {
                 // The `request usage` line carries the timing, so `handle` must not log it a
                 // second time: disarmed. No Codex tool calls are read here: codex streams its
@@ -7166,8 +7170,8 @@ struct JsonParse {
     model: Option<String>,
 }
 
-/// Every reading from one buffered 2xx body. Only Anthropic mints its bound-token
-/// kinds and `tool_use` blocks; Codex reads Responses usage and its response model.
+/// Every reading from one buffered 2xx body, including the response's own model.
+/// Only Anthropic mints its bound-token kinds and `tool_use` blocks.
 #[derive(Debug, Default)]
 struct NonStreamedResponse {
     usage: ParsedUsage,
@@ -7239,18 +7243,22 @@ fn response_bound_tokens_from_json(bytes: &[u8]) -> Vec<MintedToken> {
 /// The token breakdown of a parsed non-streamed messages body. No `usage` key
 /// is ordinary and yields the default.
 fn usage_from_value(value: &Value, provider: Provider) -> JsonParse {
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let Some(usage) = value.get("usage") else {
         // Ordinary, and deliberately silent: plenty of 200 bodies carry no usage.
-        return JsonParse::default();
+        return JsonParse {
+            model,
+            ..JsonParse::default()
+        };
     };
     match provider {
         Provider::Codex => {
             return JsonParse {
                 usage: codex_parsed_usage(usage),
-                model: value
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                model,
             };
         }
         Provider::Anthropic => {}
@@ -7269,7 +7277,7 @@ fn usage_from_value(value: &Value, provider: Provider) -> JsonParse {
             cache_creation_1h,
             reasoning: 0,
         },
-        model: None,
+        model,
     }
 }
 
@@ -7307,6 +7315,14 @@ fn codex_parsed_usage(usage: &Value) -> ParsedUsage {
     }
 }
 
+/// The response object of a completed or incomplete turn, even when usage is absent.
+fn codex_terminal_response(event: &Value) -> Option<&Value> {
+    match event.get("type")?.as_str()? {
+        "response.completed" | "response.incomplete" => event.get("response"),
+        _ => None,
+    }
+}
+
 /// One Codex SSE event's usage, if it is a terminal event that spent tokens. A Codex Responses
 /// turn that runs to its end closes on `response.completed`, or on `response.incomplete` when
 /// the backend cut it short, and both carry `response.usage` ([`codex_parsed_usage`];
@@ -7320,11 +7336,7 @@ fn codex_parsed_usage(usage: &Value) -> ParsedUsage {
 /// is null or absent, so [`parse_sse_usage`] leaves its totals as they were rather than
 /// zeroing them.
 fn codex_terminal_usage(event: &Value) -> Option<CodexSseParse> {
-    let kind = event.get("type")?.as_str()?;
-    if kind != "response.completed" && kind != "response.incomplete" {
-        return None;
-    }
-    let response = event.get("response")?;
+    let response = codex_terminal_response(event)?;
     let usage = response.get("usage").filter(|u| !u.is_null())?;
     Some(CodexSseParse {
         usage: codex_parsed_usage(usage),
@@ -7519,7 +7531,7 @@ where
     futures::pin_mut!(events);
 
     let mut parsed = ParsedUsage::default();
-    // Set only on a Codex stream, from its terminal event; see `SseParse::model`.
+    // The response's own identity, independent of whether it reports usage.
     let mut model: Option<String> = None;
     let mut stream_error: Option<String> = None;
     let mut codex_stream_limit = None;
@@ -7562,6 +7574,11 @@ where
                 if let Some(terminal) = codex_terminal_usage(&value) {
                     parsed = terminal.usage;
                     model = terminal.model;
+                } else if let Some(response) = codex_terminal_response(&value) {
+                    model = response
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
                 }
                 // How it ended. First failure wins, as on the Anthropic arm below.
                 match value.get("type").and_then(Value::as_str) {
@@ -7601,6 +7618,11 @@ where
         match value.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 saw_message_start = true;
+                model = value
+                    .get("message")
+                    .and_then(|m| m.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 // The response's own message id. A later request may name it as
                 // `previous_message_id`, and the server-side thread state behind it lives on
                 // the account that answered — `404 No thread state was found` anywhere else.
@@ -7875,10 +7897,8 @@ const SIGNATURE_CAP: usize = 16 * 1024;
 /// misbinding impossible to write.
 struct SseParse {
     usage: ParsedUsage,
-    /// The model the stream itself named, set only on a Codex stream, from its terminal event
-    /// ([`codex_terminal_usage`]): a Codex request body is usually zstd and then cannot be
-    /// peeked for one. Always `None` on an Anthropic stream, whose ledger model is the
-    /// REQUEST's (see [`usage_record`]).
+    /// The model the response itself named: the message start or the terminal Responses
+    /// object. Catalogue identity is independent of the ledger's request-model preference.
     model: Option<String>,
     /// The FIRST in-band failure's kind (an Anthropic `error` event's `error.type`; a Codex
     /// `response.failed` or `error` event's code, see [`codex_error_kind`]), or the fixed
@@ -26418,6 +26438,8 @@ mod forecast_routing_tests {
 
     /// A request the proxy served for `model` on account `idx`.
     fn served(manager: &Manager, idx: usize, model: &str, session: Option<u64>) {
+        let provider = manager.snapshot(OffsetDateTime::now_utc()).accounts[idx].provider;
+        manager.record_response_model(provider, Some(model));
         manager.record_usage(
             idx,
             crate::usage::UsageRecord::from_quota_input(

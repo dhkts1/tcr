@@ -202,15 +202,23 @@ impl Manager {
                 None => return,
             }
         };
-        // The model this provider served, for the routing document's catalogue.
-        if let Some(model) = record.model.as_deref() {
+        self.usage
+            .record(idx, &record, &name, uuid.as_deref(), org.as_deref());
+    }
+
+    /// Observe the successful response's own model, independently of usage bookkeeping.
+    /// A request-only model and a response that names no model add no catalogue id.
+    pub(crate) fn record_response_model(
+        &self,
+        provider: crate::provider::Provider,
+        model: Option<&str>,
+    ) {
+        if let Some(model) = model {
             self.routing
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .record_model(record.provider, model);
+                .record_model(provider, model);
         }
-        self.usage
-            .record(idx, &record, &name, uuid.as_deref(), org.as_deref());
     }
 
     /// Note an upstream error of `kind` on `provider` now, for the routing document's
@@ -667,8 +675,8 @@ mod routing_observation_tests {
             .map(|(kind, _, _)| kind)
     }
 
-    /// **A served model is seen under the serving account's provider**, and a slot with no
-    /// account records nothing.
+    /// **Response observations are filed under their provider**, independently of usage.
+    /// A usage slot with no account still records nothing.
     #[test]
     fn a_served_model_is_seen_under_its_serving_accounts_provider() {
         let manager = manager();
@@ -684,7 +692,9 @@ mod routing_observation_tests {
                 5,
             )
         };
+        manager.record_response_model(Provider::Anthropic, Some("claude-opus-5-5"));
         manager.record_usage(0, record("claude-opus-5-5"));
+        manager.record_response_model(Provider::Codex, Some("gpt-5.1-codex"));
         manager.record_usage(1, record("gpt-5.1-codex"));
         manager.record_usage(9, record("served-by-no-account"));
         let now = crate::now_ms();
