@@ -693,7 +693,10 @@ mod restored_forecast_call_tests {
             std::io::ErrorKind::WouldBlock,
             "restored estimates and fitting add no upstream request"
         );
-        let _control = std::net::TcpStream::connect(address).unwrap();
+        listener.set_nonblocking(false).unwrap();
+        let _control =
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(2))
+                .unwrap();
         assert!(
             listener.accept().is_ok(),
             "the same listener detects a connection"
@@ -935,7 +938,10 @@ mod public_forecast_tests {
             std::io::ErrorKind::WouldBlock,
             "learning/observing never calls upstream"
         );
-        let _control = std::net::TcpStream::connect(address).unwrap();
+        listener.set_nonblocking(false).unwrap();
+        let _control =
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(2))
+                .unwrap();
         assert!(
             listener.accept().is_ok(),
             "the same listener detects a real connection"
