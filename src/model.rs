@@ -20,6 +20,18 @@ pub fn is_fable_model(model: &str) -> bool {
     model.to_ascii_lowercase().contains("fable")
 }
 
+/// The stable families a launcher names an Anthropic model by, in the order the routing
+/// document lists them ([`crate::routing`]).
+pub const FAMILIES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+
+/// The family of `model`: the first of [`FAMILIES`] it names, matched as a case-insensitive
+/// substring the way [`is_fable_model`] matches, so a dated or suffixed id still counts.
+/// `None` for an id that names none of them: an unknown id invents no family.
+pub fn family(model: &str) -> Option<&'static str> {
+    let model = model.to_ascii_lowercase();
+    FAMILIES.into_iter().find(|family| model.contains(family))
+}
+
 /// Whether the API keeps a `thinking` block of this model only inside the organization that
 /// minted it: Claude Sonnet 5.5 and Claude Haiku 5.5. Matched the way [`is_fable_model`]
 /// matches, as a case-insensitive substring, so a dated or suffixed id still counts.
@@ -109,5 +121,21 @@ mod tests {
     #[test]
     fn parse_request_model_none_on_non_json() {
         assert_eq!(parse_request_model(b"not json at all"), None);
+    }
+
+    /// The family a launcher reads in the routing document: one of four, matched the way
+    /// `is_fable_model` matches, and none invented for an id that names none of them.
+    #[test]
+    fn family_names_the_four_families_and_invents_none() {
+        assert_eq!(FAMILIES, ["fable", "opus", "sonnet", "haiku"]);
+        assert_eq!(family("claude-fable-5-1"), Some("fable"));
+        assert_eq!(family("CLAUDE-OPUS-5-5"), Some("opus"));
+        assert_eq!(family("claude-sonnet-5-5"), Some("sonnet"));
+        assert_eq!(family("claude-haiku-5-5"), Some("haiku"));
+        assert_eq!(family("gpt-5.1-codex"), None);
+        assert_eq!(family(""), None);
+        for id in ["claude-fable-5-1", "CLAUDE-FABLE", "claude-opus-4-6", ""] {
+            assert_eq!(family(id) == Some("fable"), is_fable_model(id), "{id}");
+        }
     }
 }

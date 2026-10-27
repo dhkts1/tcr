@@ -147,7 +147,8 @@ const SSE_TEE_CAPACITY: usize = 256;
 /// classifier can tell "we witnessed an explicit error" (always trustworthy)
 /// apart from "we never saw the terminator" (trustworthy only when we also
 /// know we saw everything there was to see — see the handler's use of this).
-const TRUNCATED_STREAM_ERROR_KIND: &str = "truncated";
+/// `pub(crate)` so [`crate::routing::ErrorKind::of_stream`] reads this spelling, not a copy.
+pub(crate) const TRUNCATED_STREAM_ERROR_KIND: &str = "truncated";
 /// The content-block type Anthropic uses for a tool IT runs — `--advisor` today, `web_search`
 /// next. Its result block travels with an `encrypted_content` that only the minting
 /// organization can decrypt, which is why the id has to be remembered at all: see
@@ -965,6 +966,11 @@ pub const PEER_DIAL_ENDPOINT: &str = "peer-dial";
 /// read from memory. `GET` only, behind the same gate as [`STATUS_PATH`].
 pub const QUOTA_PATH: &str = "/_tcr/quota";
 
+/// Path of the routing document [`routing_handler`] serves ([`crate::routing`], schema 1):
+/// which model families each provider pool can serve a new request for now, for a launcher
+/// that must not parse text. `GET` only, behind the same gate as [`STATUS_PATH`].
+pub const ROUTING_PATH: &str = "/_tcr/routing";
+
 /// Path of the live account-control endpoint [`set_disabled_handler`] serves —
 /// `POST` only, the one route on this process that MUTATES rotation.
 ///
@@ -1665,6 +1671,13 @@ pub fn app(manager: Arc<Manager>) -> Router {
             QUOTA_PATH,
             axum::routing::get(quota_handler).fallback(quota_method_not_allowed),
         )
+        // The routing document: a pure GET like the status route, registered the same way.
+        .route(
+            ROUTING_PATH,
+            axum::routing::get(routing_handler)
+                .head(routing_method_not_allowed)
+                .fallback(routing_method_not_allowed),
+        )
         // The two MUTATING local routes. Same reasoning as above, and the method
         // fallback matters more here: an unregistered method must answer a local
         // 405, never fall through to `handle` and be forwarded upstream.
@@ -1971,6 +1984,49 @@ async fn quota_handler(
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorKind::Api,
             "Could not serialize the quota snapshot.",
+        )
+        .respond_local();
+    };
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
+    response
+}
+
+/// A non-`GET` on [`ROUTING_PATH`]. A local 405, for the reasons
+/// [`status_method_not_allowed`] gives.
+async fn routing_method_not_allowed() -> Response {
+    ClientError::new(
+        StatusCode::METHOD_NOT_ALLOWED,
+        ErrorKind::InvalidRequest,
+        "The tcr routing endpoint is read-only: GET.",
+    )
+    .respond_local()
+}
+
+/// `GET /_tcr/routing`: the routing document, [`crate::routing`]'s schema 1.
+///
+/// Gated exactly as [`status_handler`] is, through [`local_endpoint_gate`]. It answers from
+/// memory: the selector's own candidate evaluation, read without stamping, pinning or
+/// spending anything ([`Manager::routing_candidates`]), and what this boot observed. No
+/// probe, no token refresh, no upstream call. It names no account, organization, session or
+/// credential.
+async fn routing_handler(
+    State(manager): State<Arc<Manager>>,
+    parts: axum::http::request::Parts,
+) -> Response {
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "routing") {
+        return refusal;
+    }
+
+    let Some(body) = crate::routing::document(&manager, OffsetDateTime::now_utc())
+        .and_then(|document| serde_json::to_string(&document).ok())
+    else {
+        return ClientError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorKind::Api,
+            "Could not build the routing document.",
         )
         .respond_local();
     };
@@ -4645,6 +4701,7 @@ async fn handle_request(
                     // attribute it to; `is_connect` / `is_timeout` separate "never
                     // reached the host" from "the host went quiet mid-request".
                     ladder.transport_failed();
+                    manager.record_upstream_error(provider, crate::routing::ErrorKind::Transport);
                     // **Blind peer egress, the one offer per request.**
                     //
                     // Four conjuncts, and the first two are what stop a carry
@@ -4925,6 +4982,11 @@ async fn handle_request(
                     status = status.as_u16(),
                     "upstream response"
                 );
+                // The kind a status alone names, once per attempt, for the routing document.
+                // Observation only: the arms below keep every retry, hold and rotation.
+                if let Some(kind) = crate::routing::ErrorKind::of_status(status.as_u16()) {
+                    manager.record_upstream_error(provider, kind);
+                }
             }
             let up_headers = resp.headers().clone();
             let rejections = quota_rejections(&up_headers);
@@ -5592,7 +5654,8 @@ async fn handle_request(
                 });
                 let SseParse {
                     usage: parsed,
-                    model: response_model,
+                    model: usage_model,
+                    response_model,
                     stream_error,
                     tool_uses: response_tool_uses,
                     bound_tokens,
@@ -5653,14 +5716,11 @@ async fn handle_request(
                     );
                     None
                 };
+                if status.is_success() {
+                    manager_side.record_response_model(provider, response_model.as_deref());
+                }
                 if parsed.input_total > 0 || parsed.output > 0 {
-                    turn.finish(
-                        &manager_side,
-                        status,
-                        &parsed,
-                        response_model,
-                        timing.as_ref(),
-                    );
+                    turn.finish(&manager_side, status, &parsed, usage_model, timing.as_ref());
                 } else if let Some(t) = &timing {
                     // No usage, so no `request usage` line to ride on.
                     t.log_alone();
@@ -5842,6 +5902,7 @@ async fn handle_request(
         let bytes = match read_capped_body(upstream_body, MAX_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(BodyReadError::Transport) => {
+                manager.record_upstream_error(provider, crate::routing::ErrorKind::Transport);
                 return ClientError::new(
                     StatusCode::BAD_GATEWAY,
                     ErrorKind::Proxy,
@@ -5865,6 +5926,8 @@ async fn handle_request(
                     && let Some(detail) = codex_model_refusal_detail(&bytes)
                 {
                     log_upstream_error_body(idx, account_name.as_deref(), status, &bytes);
+                    // Capacity: this account cannot serve the model now, which is not overload.
+                    manager.record_upstream_error(provider, crate::routing::ErrorKind::Capacity);
                     ladder.model_refused(account_name.clone(), detail);
                     ladder.bench(idx);
                     continue;
@@ -5889,6 +5952,7 @@ async fn handle_request(
             manager.record_bound_tokens(&response.bound_tokens, idx, crate::now_ms());
             let parsed = response.usage;
             let response_model = response.model;
+            manager.record_response_model(provider, response_model.as_deref());
             if parsed.input_total > 0 || parsed.output > 0 {
                 // The `request usage` line carries the timing, so `handle` must not log it a
                 // second time: disarmed. No Codex tool calls are read here: codex streams its
@@ -7101,8 +7165,8 @@ struct JsonParse {
     model: Option<String>,
 }
 
-/// Every reading from one buffered 2xx body. Only Anthropic mints its bound-token
-/// kinds and `tool_use` blocks; Codex reads Responses usage and its response model.
+/// Every reading from one buffered 2xx body, including the response's own model.
+/// Only Anthropic mints its bound-token kinds and `tool_use` blocks.
 #[derive(Debug, Default)]
 struct NonStreamedResponse {
     usage: ParsedUsage,
@@ -7174,18 +7238,22 @@ fn response_bound_tokens_from_json(bytes: &[u8]) -> Vec<MintedToken> {
 /// The token breakdown of a parsed non-streamed messages body. No `usage` key
 /// is ordinary and yields the default.
 fn usage_from_value(value: &Value, provider: Provider) -> JsonParse {
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let Some(usage) = value.get("usage") else {
         // Ordinary, and deliberately silent: plenty of 200 bodies carry no usage.
-        return JsonParse::default();
+        return JsonParse {
+            model,
+            ..JsonParse::default()
+        };
     };
     match provider {
         Provider::Codex => {
             return JsonParse {
                 usage: codex_parsed_usage(usage),
-                model: value
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                model,
             };
         }
         Provider::Anthropic => {}
@@ -7204,7 +7272,7 @@ fn usage_from_value(value: &Value, provider: Provider) -> JsonParse {
             cache_creation_1h,
             reasoning: 0,
         },
-        model: None,
+        model,
     }
 }
 
@@ -7242,6 +7310,14 @@ fn codex_parsed_usage(usage: &Value) -> ParsedUsage {
     }
 }
 
+/// The response object of a completed or incomplete turn, even when usage is absent.
+fn codex_terminal_response(event: &Value) -> Option<&Value> {
+    match event.get("type")?.as_str()? {
+        "response.completed" | "response.incomplete" => event.get("response"),
+        _ => None,
+    }
+}
+
 /// One Codex SSE event's usage, if it is a terminal event that spent tokens. A Codex Responses
 /// turn that runs to its end closes on `response.completed`, or on `response.incomplete` when
 /// the backend cut it short, and both carry `response.usage` ([`codex_parsed_usage`];
@@ -7255,11 +7331,7 @@ fn codex_parsed_usage(usage: &Value) -> ParsedUsage {
 /// is null or absent, so [`parse_sse_usage`] leaves its totals as they were rather than
 /// zeroing them.
 fn codex_terminal_usage(event: &Value) -> Option<CodexSseParse> {
-    let kind = event.get("type")?.as_str()?;
-    if kind != "response.completed" && kind != "response.incomplete" {
-        return None;
-    }
-    let response = event.get("response")?;
+    let response = codex_terminal_response(event)?;
     let usage = response.get("usage").filter(|u| !u.is_null())?;
     Some(CodexSseParse {
         usage: codex_parsed_usage(usage),
@@ -7454,8 +7526,9 @@ where
     futures::pin_mut!(events);
 
     let mut parsed = ParsedUsage::default();
-    // Set only on a Codex stream, from its terminal event; see `SseParse::model`.
+    // Keep the model attached to retained usage separate from catalogue observations.
     let mut model: Option<String> = None;
+    let mut response_model: Option<String> = None;
     let mut stream_error: Option<String> = None;
     let mut codex_stream_limit = None;
     let mut saw_any_event = false;
@@ -7498,6 +7571,12 @@ where
                     parsed = terminal.usage;
                     model = terminal.model;
                 }
+                if let Some(response) = codex_terminal_response(&value) {
+                    response_model = response
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
                 // How it ended. First failure wins, as on the Anthropic arm below.
                 match value.get("type").and_then(Value::as_str) {
                     Some("response.completed" | "response.incomplete") => saw_codex_end = true,
@@ -7536,6 +7615,12 @@ where
         match value.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 saw_message_start = true;
+                model = value
+                    .get("message")
+                    .and_then(|m| m.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                response_model = model.clone();
                 // The response's own message id. A later request may name it as
                 // `previous_message_id`, and the server-side thread state behind it lives on
                 // the account that answered — `404 No thread state was found` anywhere else.
@@ -7753,6 +7838,7 @@ where
     SseParse {
         usage: parsed,
         model,
+        response_model,
         stream_error,
         tool_uses,
         bound_tokens,
@@ -7810,11 +7896,11 @@ const SIGNATURE_CAP: usize = 16 * 1024;
 /// misbinding impossible to write.
 struct SseParse {
     usage: ParsedUsage,
-    /// The model the stream itself named, set only on a Codex stream, from its terminal event
-    /// ([`codex_terminal_usage`]): a Codex request body is usually zstd and then cannot be
-    /// peeked for one. Always `None` on an Anthropic stream, whose ledger model is the
-    /// REQUEST's (see [`usage_record`]).
+    /// The model attached to retained usage: a metered terminal for `codex`.
     model: Option<String>,
+    /// The response's own identity, even on an unmetered terminal. Catalogue observations
+    /// never replace the model attached to usage retained from an earlier terminal.
+    response_model: Option<String>,
     /// The FIRST in-band failure's kind (an Anthropic `error` event's `error.type`; a Codex
     /// `response.failed` or `error` event's code, see [`codex_error_kind`]), or the fixed
     /// [`TRUNCATED_STREAM_ERROR_KIND`] when the turn's end (`message_stop`; a Codex terminal
@@ -16102,6 +16188,12 @@ mod tests {
     /// `stable_session_key`), and each signature is echoed back inside an assistant `thinking`
     /// block exactly as Claude Code echoes them.
     fn thinking_turn_body(user_id: &str, signatures: &[&str]) -> String {
+        thinking_turn_body_for("claude-sonnet-5", user_id, signatures)
+    }
+
+    /// [`thinking_turn_body`] for `model`, for a test whose model decides where thinking
+    /// survives ([`crate::model::thinking_is_org_bound`]).
+    fn thinking_turn_body_for(model: &str, user_id: &str, signatures: &[&str]) -> String {
         let mut messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         for signature in signatures {
             messages.push(serde_json::json!({
@@ -16112,7 +16204,7 @@ mod tests {
             }));
         }
         serde_json::json!({
-            "model": "claude-sonnet-5",
+            "model": model,
             "metadata": {"user_id": user_id},
             "messages": messages,
         })
@@ -16337,6 +16429,86 @@ mod tests {
              account it left: {}",
             seen.lock().expect("recorder")[2]
         );
+    }
+
+    /// The same move across organizations, for a model whose thinking survives only inside the
+    /// minting account's organization. The two fixture accounts sit in different organizations,
+    /// so the release is `cross_org` and the 200 on the new account drops the old thinking. The
+    /// signature used to keep naming the account it left, so once that account came back the
+    /// conversation was pulled back there: a cold cache, a 404 for thread state that now lives
+    /// on the new account, and a fresh switch warning when the old account ran out again.
+    #[tokio::test]
+    async fn a_sonnet_conversation_moved_across_organizations_is_not_pulled_back() {
+        let model = "claude-sonnet-5-5";
+        let (upstream, _hits, seen) = spawn_bound_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+        assert!(
+            manager.outside_org_of(0).contains(&1),
+            "precondition: the two accounts sit in different organizations"
+        );
+
+        // Turn 1 is served on account 0 and mints `sig_fake_1` there.
+        let (status, _) = drive_conversation(
+            Arc::clone(&manager),
+            &thinking_turn_body_for(model, "sess-cross-org", &[]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            seen.lock().expect("recorder")[0].contains("at-aaaaaaaaaaaa"),
+            "precondition: account 0 served the conversation first"
+        );
+        let turn = thinking_turn_body_for(model, "sess-cross-org", &["sig_fake_1"]);
+
+        // Account 0 goes out: one switch warning, then the retry moves to account 1.
+        assert_eq!(
+            manager.set_disabled(0, true),
+            DisablePersist::NoConfigFile,
+            "disabled in memory, with no config file behind this manager to write"
+        );
+        let (status, _) = drive_conversation(Arc::clone(&manager), &turn).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "the switch warning");
+        let (status, _) = drive_conversation(Arc::clone(&manager), &turn).await;
+        assert_eq!(status, StatusCode::OK, "the retry moves");
+        assert!(
+            seen.lock().expect("recorder")[1].contains("at-bbbbbbbbbbbb"),
+            "precondition: account 1 served the moved conversation"
+        );
+
+        // Account 0 comes back, and the warning has run its life.
+        assert_eq!(
+            manager.set_disabled(0, false),
+            DisablePersist::NoConfigFile,
+            "re-enabled in memory"
+        );
+        manager.expire_switch_warnings();
+        let (status, _) = drive_conversation(
+            Arc::clone(&manager),
+            &thinking_turn_body_for(model, "sess-fresh-cross-org", &[]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            seen.lock().expect("recorder")[2].contains("at-aaaaaaaaaaaa"),
+            "control: account 0 is back and serving, so only the history keeps a turn off it"
+        );
+
+        for (n, nth) in [(1, 3), (2, 4)] {
+            let (status, body) = drive_conversation(Arc::clone(&manager), &turn).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "turn {n} after the return is served, not warned: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(
+                seen.lock().expect("recorder")[nth].contains("at-bbbbbbbbbbbb"),
+                "turn {n} after the return must stay on the account the conversation moved to, \
+                 not be pulled back to the one it left: {}",
+                seen.lock().expect("recorder")[nth]
+            );
+        }
     }
 
     /// A bound account over the SOFT threshold still holds its conversation
@@ -26149,6 +26321,1031 @@ mod tests {
         assert!(
             (body["error"]["resets_at"].as_i64().unwrap() - earliest).abs() <= 2,
             "{body}"
+        );
+    }
+}
+
+/// The routing document a launcher reads from the running proxy: which model
+/// families each provider can serve now, behind the same local gate as the
+/// status route.
+#[cfg(test)]
+mod forecast_routing_tests {
+    use super::*;
+    use crate::config::{Account, Config, ProxyConfig};
+
+    /// An obviously fake proxy key: the gate is exercised, no real key is used.
+    const KEY: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    /// A keyed manager over one fake account whose upstreams are dead ports.
+    fn manager() -> Arc<Manager> {
+        Manager::with_live_refresher(
+            Config {
+                proxy: ProxyConfig {
+                    port: 0,
+                    api_key: Some(KEY.to_string()),
+                    request_key: None,
+                    extra: serde_json::Map::new(),
+                },
+                upstream: "http://127.0.0.1:1".to_string(),
+                codex_upstream: "http://127.0.0.1:1".to_string(),
+                ..Config::fixture(vec![Account::fixture("alice@example.com")])
+            },
+            None,
+        )
+    }
+
+    /// `GET path` from a loopback peer carrying the key, answered by the router
+    /// in-process: the [`ClientAddr`] is the extension the listener injects.
+    async fn get(manager: Arc<Manager>, path: &str) -> (StatusCode, HeaderMap, Bytes) {
+        use tower::ServiceExt as _;
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .header("x-api-key", KEY)
+            .body(Body::empty())
+            .expect("build request");
+        req.extensions_mut()
+            .insert(ClientAddr(SocketAddr::from(([127, 0, 0, 1], 54_321))));
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, headers, body)
+    }
+
+    /// **The running proxy serves the routing document locally, as schema 1.**
+    ///
+    /// The status is asserted before the body is decoded, so a proxy without the
+    /// route fails here on the catch-all's local 404 for anything under `/_tcr`,
+    /// not on a JSON error.
+    #[tokio::test]
+    async fn schema_one() {
+        let (status, _, body) = get(manager(), "/_tcr/routing").await;
+        assert_eq!(status, 200, "routing document must be served locally");
+        let document: Value = serde_json::from_slice(&body).expect("the routing document is JSON");
+        assert_eq!(document["schema"], 1, "the document names schema 1");
+    }
+
+    use crate::routing::ErrorKind;
+    use crate::test_support::stub_upstream as stub;
+    use time::format_description::well_known::Rfc3339;
+
+    /// A loopback peer, as the listener injects one.
+    fn loopback() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 54_321))
+    }
+
+    /// A keyed manager over `config`, whose own key is replaced by [`KEY`].
+    fn keyed(config: Config) -> Arc<Manager> {
+        Manager::with_live_refresher(
+            Config {
+                proxy: ProxyConfig {
+                    port: 0,
+                    api_key: Some(KEY.to_string()),
+                    request_key: None,
+                    extra: serde_json::Map::new(),
+                },
+                ..config
+            },
+            None,
+        )
+    }
+
+    /// The routing document `manager` serves now, parsed.
+    async fn document(manager: Arc<Manager>) -> Value {
+        let (status, _, body) = get(manager, ROUTING_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        serde_json::from_slice(&body).expect("the routing document is JSON")
+    }
+
+    /// One inference request through the router from a loopback client, drained.
+    async fn post(manager: Arc<Manager>, path: &str, body: &'static str) {
+        use tower::ServiceExt as _;
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(HOST, "127.0.0.1")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("build request");
+        req.extensions_mut().insert(ClientAddr(loopback()));
+        let response = app(manager).oneshot(req).await.expect("router response");
+        to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+    }
+
+    /// A request the proxy served for `model` on account `idx`.
+    fn served(manager: &Manager, idx: usize, model: &str, session: Option<u64>) {
+        let provider = manager.snapshot(OffsetDateTime::now_utc()).accounts[idx].provider;
+        manager.record_response_model(provider, Some(model));
+        manager.record_usage(
+            idx,
+            crate::usage::UsageRecord::from_quota_input(
+                crate::now_ms(),
+                Some(model.to_string()),
+                session,
+                10,
+                0,
+                0,
+                0,
+                5,
+            ),
+        );
+    }
+
+    /// An object's keys, sorted.
+    fn keys(value: &Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .map(|object| object.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// `value` is an RFC 3339 time in UTC, as the schema has every time.
+    fn assert_utc(value: &Value) -> OffsetDateTime {
+        let text = value
+            .as_str()
+            .unwrap_or_else(|| panic!("a time string: {value}"));
+        assert!(text.ends_with('Z'), "UTC: {text}");
+        let at = OffsetDateTime::parse(text, &Rfc3339).unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert_eq!(at.offset(), time::UtcOffset::UTC, "{text}");
+        at
+    }
+
+    /// **Every field of schema 1, and its type**: the top level, the build, both providers in
+    /// order, a last error, a model, a null forecast; served as JSON and never stored.
+    #[tokio::test]
+    async fn every_field_and_its_type() {
+        let manager = manager();
+        served(&manager, 0, "claude-opus-5-5", None);
+        manager.record_upstream_error(Provider::Anthropic, ErrorKind::Quota);
+        let (status, headers, body) = get(manager, ROUTING_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        assert_eq!(header("content-type"), Some("application/json"));
+        assert_eq!(header("cache-control"), Some("no-store"));
+        let document: Value = serde_json::from_slice(&body).expect("JSON");
+
+        assert_eq!(
+            keys(&document),
+            ["build", "forecast", "generatedAt", "providers", "schema"]
+        );
+        assert_eq!(document["schema"], 1);
+        assert_utc(&document["generatedAt"]);
+        assert_eq!(keys(&document["build"]), ["builtAt", "dirty", "sha"]);
+        assert!(document["build"]["sha"].is_string());
+        assert!(document["build"]["builtAt"].is_string());
+        assert!(document["build"]["dirty"].is_boolean() || document["build"]["dirty"].is_null());
+        assert!(
+            document["forecast"].is_null(),
+            "no forecast before the forecast rounds"
+        );
+
+        let providers = document["providers"].as_array().expect("providers array");
+        let names: Vec<_> = providers.iter().map(|p| p["provider"].as_str()).collect();
+        assert_eq!(names, [Some("anthropic"), Some("codex")]);
+        for provider in providers {
+            assert_eq!(keys(provider), ["lastError", "models", "provider", "state"]);
+            assert!(
+                matches!(provider["state"].as_str(), Some("ok" | "degraded" | "out")),
+                "{provider}"
+            );
+            assert!(provider["models"].is_array(), "{provider}");
+        }
+
+        let anthropic = &providers[0];
+        let last_error = &anthropic["lastError"];
+        assert_eq!(keys(last_error), ["at", "count10m", "kind"]);
+        assert_eq!(last_error["kind"], "quota");
+        assert_utc(&last_error["at"]);
+        assert!(
+            last_error["count10m"].as_u64().is_some_and(|n| n >= 1),
+            "{last_error}"
+        );
+        assert_eq!(
+            anthropic["state"], "degraded",
+            "a pool that can serve, with an error in ten minutes"
+        );
+        let models = anthropic["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 1, "{models:?}");
+        let opus = &models[0];
+        assert_eq!(
+            keys(opus),
+            [
+                "accountsRoutable",
+                "freesAt",
+                "ids",
+                "model",
+                "reason",
+                "routable"
+            ]
+        );
+        assert_eq!(opus["model"], "opus");
+        assert_eq!(opus["ids"], serde_json::json!(["claude-opus-5-5"]));
+        assert_eq!(opus["routable"], true);
+        assert!(
+            opus["reason"].as_str().is_some_and(|r| !r.is_empty()),
+            "{opus}"
+        );
+        assert!(
+            opus["freesAt"].is_null(),
+            "a routable model frees at no later time"
+        );
+        assert_eq!(opus["accountsRoutable"], 1);
+
+        let codex = &providers[1];
+        assert!(codex["lastError"].is_null());
+        assert_eq!(codex["models"], serde_json::json!([]));
+        assert_eq!(codex["state"], "out", "no `codex` account can serve");
+    }
+
+    /// **The document names no account, organization, session or credential**, even for a
+    /// fleet whose account carries every one of them and a served request with a session.
+    #[tokio::test]
+    async fn names_no_account_organization_session_or_credential() {
+        const ACCOUNT_UUID: &str = "11111111-1111-4111-8111-111111111111";
+        const ORG_UUID: &str = "22222222-2222-4222-8222-222222222222";
+        const SESSION: u64 = 987_654_321_987;
+        let alice = Account {
+            account_uuid: Some(ACCOUNT_UUID.to_string()),
+            org_uuid: Some(ORG_UUID.to_string()),
+            org_name: Some("Example Org".to_string()),
+            ..Account::fixture("alice@example.com")
+        };
+        let manager = keyed(Config {
+            upstream: "http://127.0.0.1:1".to_string(),
+            codex_upstream: "http://127.0.0.1:1".to_string(),
+            ..Config::fixture(vec![alice])
+        });
+        served(&manager, 0, "claude-opus-5-5", Some(SESSION));
+        manager.mark_refused(0);
+        let (status, _, body) = get(manager, ROUTING_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = String::from_utf8_lossy(&body);
+        for private in [
+            "alice",
+            "example.com",
+            ACCOUNT_UUID,
+            ORG_UUID,
+            "Example Org",
+            "at-alice",
+            "rt-alice",
+            KEY,
+            &SESSION.to_string(),
+        ] {
+            assert!(!body.contains(private), "{private} in {body}");
+        }
+    }
+
+    /// **An unroutable model says no available account can serve it now**, the meaning of
+    /// `capacity`, never measured overload, and names when the account holding it frees.
+    #[tokio::test]
+    async fn an_unroutable_model_says_no_available_account_can_serve_it_now() {
+        let manager = manager();
+        served(&manager, 0, "claude-opus-5-5", None);
+        manager.mark_rate_limited(0, 600);
+        let before = OffsetDateTime::now_utc();
+        let document = document(manager).await;
+        let anthropic = &document["providers"][0];
+        assert_eq!(anthropic["state"], "out");
+        let opus = &anthropic["models"][0];
+        assert_eq!(opus["routable"], false, "{opus}");
+        assert_eq!(opus["accountsRoutable"], 0, "{opus}");
+        let reason = opus["reason"].as_str().expect("a reason");
+        assert!(
+            reason.starts_with("no available account can serve this model now"),
+            "{reason}"
+        );
+        assert!(!reason.to_lowercase().contains("overload"), "{reason}");
+        let frees = assert_utc(&opus["freesAt"]);
+        assert!(
+            frees > before && frees <= before + time::Duration::seconds(601),
+            "the hold's end: {frees}"
+        );
+    }
+
+    /// **The route reads, and only reads**: every other method is a local 405, never
+    /// forwarded.
+    #[tokio::test]
+    async fn only_get_is_served() {
+        use tower::ServiceExt as _;
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            let mut req = Request::builder()
+                .method(method.clone())
+                .uri(ROUTING_PATH)
+                .header("x-api-key", KEY)
+                .body(Body::empty())
+                .expect("build request");
+            req.extensions_mut().insert(ClientAddr(loopback()));
+            let response = app(manager()).oneshot(req).await.expect("router response");
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method}"
+            );
+        }
+    }
+
+    /// **The route passes the local gate**: a caller off this host is refused even with the
+    /// key, and a local caller without it is refused.
+    #[tokio::test]
+    async fn the_gate_refuses_a_remote_or_keyless_caller() {
+        use tower::ServiceExt as _;
+        let ask = |peer: SocketAddr, key: Option<&'static str>| async move {
+            let mut builder = Request::builder().method(Method::GET).uri(ROUTING_PATH);
+            if let Some(key) = key {
+                builder = builder.header("x-api-key", key);
+            }
+            let mut req = builder.body(Body::empty()).expect("build request");
+            req.extensions_mut().insert(ClientAddr(peer));
+            app(manager())
+                .oneshot(req)
+                .await
+                .expect("router response")
+                .status()
+        };
+        let remote = SocketAddr::from(([203, 0, 113, 7], 44_444));
+        assert_eq!(ask(remote, Some(KEY)).await, StatusCode::FORBIDDEN);
+        assert_eq!(ask(loopback(), None).await, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The last error and its count, as the document reports `provider`'s.
+    async fn last_error(manager: Arc<Manager>, provider: usize) -> (Value, u64) {
+        let document = document(manager).await;
+        let error = &document["providers"][provider]["lastError"];
+        (
+            error["kind"].clone(),
+            error["count10m"].as_u64().unwrap_or(0),
+        )
+    }
+
+    /// **A send that reaches no upstream is a transport error.**
+    #[tokio::test]
+    async fn a_send_that_reaches_no_upstream_is_a_transport_error() {
+        let manager = manager();
+        post(
+            Arc::clone(&manager),
+            "/v1/messages",
+            r#"{"model":"claude-opus-5-5","max_tokens":1,"messages":[]}"#,
+        )
+        .await;
+        let (kind, count) = last_error(manager, 0).await;
+        assert_eq!(kind, "transport");
+        assert!(count >= 1);
+    }
+
+    /// **An upstream 503 is overloaded**, read at the status every attempt passes.
+    #[tokio::test]
+    async fn an_upstream_503_is_overloaded() {
+        let upstream = stub::canned(stub::reply(
+            "503 Service Unavailable",
+            "application/json",
+            "{}",
+        ));
+        let manager = keyed(Config {
+            upstream: upstream.url(),
+            codex_upstream: "http://127.0.0.1:1".to_string(),
+            ..Config::fixture(vec![Account::fixture("alice@example.com")])
+        });
+        post(
+            Arc::clone(&manager),
+            "/v1/messages",
+            r#"{"model":"claude-opus-5-5","max_tokens":1,"messages":[]}"#,
+        )
+        .await;
+        let (kind, count) = last_error(manager, 0).await;
+        assert_eq!(kind, "overloaded");
+        assert!(count >= 1);
+    }
+
+    /// **A `codex` account refusing the model for its plan is capacity**, on the `codex`
+    /// provider only.
+    #[tokio::test]
+    async fn a_codex_model_refusal_is_capacity() {
+        let origin = Router::new().fallback(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                [(CONTENT_TYPE, "application/json")],
+                r#"{"detail":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}"#,
+            )
+        });
+        let upstream = stub::http(origin);
+        let bob = Account {
+            provider: Provider::Codex,
+            account_uuid: Some("33333333-3333-4333-8333-333333333333".to_string()),
+            ..Account::fixture("bob@example.com/codex")
+        };
+        let manager = keyed(Config {
+            upstream: "http://127.0.0.1:1".to_string(),
+            codex_upstream: upstream.url(),
+            ..Config::fixture(vec![bob])
+        });
+        post(
+            Arc::clone(&manager),
+            crate::provider::CODEX_RESPONSES_PATH,
+            r#"{"model":"gpt-6.1-sol","input":[]}"#,
+        )
+        .await;
+        let document = document(manager).await;
+        assert_eq!(document["providers"][1]["lastError"]["kind"], "capacity");
+        assert!(document["providers"][0]["lastError"].is_null());
+    }
+    #[tokio::test]
+    async fn reviewer_head_must_be_405() {
+        use tower::ServiceExt as _;
+        let mut req = Request::builder()
+            .method(Method::HEAD)
+            .uri(ROUTING_PATH)
+            .header("x-api-key", KEY)
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ClientAddr(loopback()));
+        let response = app(manager()).oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "every method other than GET must be 405"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_all_boot_model_ids_are_reported() {
+        let manager = manager();
+        for n in 0..65 {
+            served(&manager, 0, &format!("claude-opus-{n}"), None);
+        }
+        served(&manager, 0, "claude-sonnet-5-5", None);
+        let document = document(manager).await;
+        let ids = document["providers"][0]["models"][0]["ids"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            ids.len(),
+            65,
+            "schema ids include every full id seen this boot"
+        );
+        assert!(ids.iter().any(|id| id == "claude-opus-64"));
+        assert_eq!(document["providers"][0]["models"][1]["model"], "sonnet");
+        assert_eq!(
+            document["providers"][0]["models"][1]["ids"][0],
+            "claude-sonnet-5-5"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_spent_revalidation_window_is_not_routable_now() {
+        let manager = manager();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.95"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            HeaderValue::from_str(&(OffsetDateTime::now_utc().unix_timestamp() + 3600).to_string())
+                .unwrap(),
+        );
+        assert!(manager.update_quota(0, &headers, 200));
+        served(&manager, 0, "claude-opus-5-5", None);
+        let now = OffsetDateTime::now_utc();
+        let tried = HashSet::new();
+        assert_eq!(
+            manager.select(
+                &tried,
+                now,
+                Some("claude-opus-5-5"),
+                None,
+                "/v1/messages",
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            manager.select_revalidation(&tried, now, Some("claude-opus-5-5"), None, "/v1/messages"),
+            Some(0)
+        );
+        assert_eq!(
+            manager.select_revalidation(&tried, now, Some("claude-opus-5-5"), None, "/v1/messages"),
+            None,
+            "positive control: the spent window actually refuses this request"
+        );
+        let document = crate::routing::document(&manager, now).unwrap();
+        let document = serde_json::to_value(document).unwrap();
+        assert_eq!(
+            document["providers"][0]["models"][0]["routable"], false,
+            "routing must agree with the request the selector can serve now"
+        );
+        let frees = assert_utc(&document["providers"][0]["models"][0]["freesAt"]);
+        assert!(
+            frees > now && frees <= now + time::Duration::seconds(2),
+            "the spent valve, rather than the soft quota reset, sets freesAt"
+        );
+        assert!(
+            manager
+                .routing_candidates(
+                    frees - time::Duration::milliseconds(1),
+                    Some("claude-opus-5-5"),
+                    "/v1/messages"
+                )
+                .accounts
+                .is_empty()
+        );
+        let ready = manager.routing_candidates(frees, Some("claude-opus-5-5"), "/v1/messages");
+        assert_eq!(ready.accounts, vec![0], "the valve opens at its expiry");
+        assert_eq!(
+            manager.select_revalidation(
+                &tried,
+                frees,
+                Some("claude-opus-5-5"),
+                None,
+                "/v1/messages"
+            ),
+            Some(0),
+            "a routing read must not spend the opened valve"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_frees_at_excludes_nonpooled_control_account() {
+        let mut config = Config::fixture(vec![
+            Account::fixture("alice@example.com"),
+            Account::fixture("bob@example.com"),
+        ]);
+        config.control_account = Some(config::ControlAccountRef::Name(
+            "alice@example.com".to_string(),
+        ));
+        config
+            .extra
+            .insert("revalidationServe".to_string(), serde_json::json!(false));
+        let manager = keyed(config);
+        served(&manager, 1, "claude-opus-5-5", None);
+        manager.mark_rate_limited(0, 60);
+        manager.mark_rate_limited(1, 600);
+        let now = OffsetDateTime::now_utc();
+        let future = now + time::Duration::seconds(61);
+        assert!(
+            manager
+                .routing_candidates(future, Some("claude-opus-5-5"), "/v1/messages")
+                .accounts
+                .is_empty(),
+            "positive control: the freed control account cannot serve new pool work"
+        );
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                future,
+                Some("claude-opus-5-5"),
+                None,
+                "/v1/messages",
+                None
+            ),
+            None,
+            "independent public selection still cannot serve after the control account clears"
+        );
+        let document = document(manager).await;
+        let opus = &document["providers"][0]["models"][0];
+        assert_eq!(opus["routable"], false);
+        let frees = assert_utc(&opus["freesAt"]);
+        assert!(
+            frees > now + time::Duration::seconds(599),
+            "freesAt must describe the pool account's 600 second hold, got {frees}, now {now}"
+        );
+    }
+    #[tokio::test]
+    async fn independent_response_named_model_catalogue() {
+        use tower::ServiceExt as _;
+        let upstream = stub::canned(stub::reply(
+            "200 OK",
+            "application/json",
+            r#"{"id":"fake-message","type":"message","role":"assistant","model":"claude-sonnet-5-5","content":[],"usage":{"input_tokens":10,"output_tokens":2}}"#,
+        ));
+        let manager = keyed(Config {
+            upstream: upstream.url(),
+            codex_upstream: "http://127.0.0.1:1".to_string(),
+            ..Config::fixture(vec![Account::fixture("alice@example.com")])
+        });
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header(HOST, "127.0.0.1")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"claude-opus-request-only","max_tokens":2,"messages":[]}"#,
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ClientAddr(loopback()));
+        let response = app(Arc::clone(&manager)).oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "fixture served successfully"
+        );
+        let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        let served: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            served["model"], "claude-sonnet-5-5",
+            "positive control: response names the served model"
+        );
+        let observed = document(manager).await;
+        let models = observed["providers"][0]["models"].as_array().unwrap();
+        assert!(
+            models.iter().all(|model| model["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|id| id != "claude-opus-request-only")),
+            "routing must not catalogue a request-only id absent from the served response: {models:?}"
+        );
+        assert!(
+            models.iter().any(|model| model["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == "claude-sonnet-5-5")),
+            "routing must catalogue the id the served response actually named: {models:?}"
+        );
+    }
+    /// Response identity is independent of request-preferred usage, including a turn
+    /// with no usage at all. Each case drives inference and the public routing read.
+    async fn response_catalogue_case(
+        provider: Provider,
+        streaming: bool,
+        named: bool,
+        usage: bool,
+    ) {
+        use tower::ServiceExt as _;
+        let request_model = match provider {
+            Provider::Anthropic => "claude-opus-request-only",
+            Provider::Codex => "gpt-request-only",
+        };
+        let response_model = match provider {
+            Provider::Anthropic => "claude-sonnet-5-5",
+            Provider::Codex => "gpt-response-only",
+        };
+        let mut value = serde_json::json!({"id":"fake-response", "type":"message", "role":"assistant", "content":[]});
+        if named {
+            value["model"] = response_model.into();
+        }
+        if usage {
+            value["usage"] = serde_json::json!({"input_tokens":10,"output_tokens":2});
+        }
+        let body = if streaming {
+            match provider {
+                Provider::Anthropic => format!(
+                    "event: message_start\ndata: {}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+                    serde_json::json!({"type":"message_start", "message":value})
+                ),
+                Provider::Codex => format!(
+                    "event: response.completed\ndata: {}\n\n",
+                    serde_json::json!({"type":"response.completed", "response":value})
+                ),
+            }
+        } else {
+            value.to_string()
+        };
+        let upstream = stub::http(Router::new().fallback(move || {
+            let body = body.clone();
+            async move {
+                (
+                    [(
+                        CONTENT_TYPE,
+                        if streaming {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        },
+                    )],
+                    body,
+                )
+            }
+        }));
+        let account = Account {
+            provider,
+            ..Account::fixture("alice@example.com")
+        };
+        let manager = keyed(Config {
+            upstream: upstream.url(),
+            codex_upstream: upstream.url(),
+            ..Config::fixture(vec![account])
+        });
+        let path = match provider {
+            Provider::Anthropic => "/v1/messages",
+            Provider::Codex => crate::provider::CODEX_RESPONSES_PATH,
+        };
+        let mut req = Request::builder().method(Method::POST).uri(path)
+            .header(HOST,"127.0.0.1").header(CONTENT_TYPE,"application/json")
+            .body(Body::from(serde_json::json!({"model":request_model,"max_tokens":2,"messages":[],"input":[],"stream":streaming}).to_string())).unwrap();
+        req.extensions_mut().insert(ClientAddr(loopback()));
+        let response = app(Arc::clone(&manager)).oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "fixture served successfully"
+        );
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        let served: Value = if streaming {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let event: Value =
+                serde_json::from_str(text.lines().find_map(|l| l.strip_prefix("data: ")).unwrap())
+                    .unwrap();
+            match provider {
+                Provider::Anthropic => event["message"].clone(),
+                Provider::Codex => event["response"].clone(),
+            }
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        assert_eq!(
+            served.get("model").and_then(Value::as_str),
+            named.then_some(response_model),
+            "positive control: served response identity"
+        );
+        // The streamed parser is a detached tee. For usage cases, its ledger row is
+        // the completion barrier; no-usage cases wait for the expected observation.
+        let ledger_models = || {
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0]
+                .usage
+                .as_ref()
+                .map(|row| row.today_by_model.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        for _ in 0..200 {
+            let ready = if usage {
+                !ledger_models().is_empty()
+            } else {
+                manager
+                    .routing_observed(provider, crate::now_ms())
+                    .1
+                    .contains(response_model)
+            };
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if usage {
+            assert_eq!(
+                ledger_models(),
+                [request_model],
+                "usage keeps the requested model"
+            );
+        } else {
+            assert!(ledger_models().is_empty(), "no usage creates no ledger row");
+        }
+        let doc = document(manager).await;
+        let slot = match provider {
+            Provider::Anthropic => 0,
+            Provider::Codex => 1,
+        };
+        let ids: Vec<_> = doc["providers"][slot]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["ids"].as_array().unwrap())
+            .map(|id| id.as_str().unwrap())
+            .collect();
+        let expected: Vec<_> = named.then_some(response_model).into_iter().collect();
+        assert_eq!(
+            ids, expected,
+            "catalogue contains only response-named ids, independently of usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_anthropic_buffered_mismatch() {
+        response_catalogue_case(Provider::Anthropic, false, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_anthropic_buffered_missing_model() {
+        response_catalogue_case(Provider::Anthropic, false, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_anthropic_buffered_without_usage() {
+        response_catalogue_case(Provider::Anthropic, false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_anthropic_streamed_mismatch() {
+        response_catalogue_case(Provider::Anthropic, true, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_anthropic_streamed_missing_model() {
+        response_catalogue_case(Provider::Anthropic, true, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_anthropic_streamed_without_usage() {
+        response_catalogue_case(Provider::Anthropic, true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_codex_buffered_mismatch() {
+        response_catalogue_case(Provider::Codex, false, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_codex_buffered_missing_model() {
+        response_catalogue_case(Provider::Codex, false, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_codex_buffered_without_usage() {
+        response_catalogue_case(Provider::Codex, false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_codex_streamed_mismatch() {
+        response_catalogue_case(Provider::Codex, true, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_codex_streamed_missing_model() {
+        response_catalogue_case(Provider::Codex, true, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_codex_streamed_without_usage() {
+        response_catalogue_case(Provider::Codex, true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn reviewer_unmetered_terminal_keeps_metered_ledger_model() {
+        use tower::ServiceExt as _;
+        let body = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fake-response\",\"model\":\"gpt-metered\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fake-response\",\"usage\":null}}\n\n",
+        );
+        let upstream = stub::http(
+            Router::new()
+                .fallback(move || async move { ([(CONTENT_TYPE, "text/event-stream")], body) }),
+        );
+        let account = Account {
+            provider: Provider::Codex,
+            ..Account::fixture("alice@example.com")
+        };
+        let manager = keyed(Config {
+            upstream: "http://127.0.0.1:1".into(),
+            codex_upstream: upstream.url(),
+            ..Config::fixture(vec![account])
+        });
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(crate::provider::CODEX_RESPONSES_PATH)
+            .header(HOST, "127.0.0.1")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"input":[]}"#))
+            .unwrap();
+        req.extensions_mut().insert(ClientAddr(loopback()));
+        let response = app(Arc::clone(&manager)).oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "positive control: served response"
+        );
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            body.as_bytes(),
+            "positive control: complete replayed stream forwarded"
+        );
+        for _ in 0..200 {
+            let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+            if snapshot.accounts[0]
+                .usage
+                .as_ref()
+                .is_some_and(|u| u.today.requests > 0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        let usage = snapshot.accounts[0]
+            .usage
+            .as_ref()
+            .expect("metered turn has usage");
+        assert_eq!(
+            (
+                usage.today.requests,
+                usage.today.input_tokens,
+                usage.today.output_tokens
+            ),
+            (1, 12, 3),
+            "positive control: prior terminal's metered totals survive"
+        );
+        let models: Vec<_> = usage.today_by_model.keys().map(String::as_str).collect();
+        assert_eq!(
+            models,
+            ["gpt-metered"],
+            "an unmetered terminal must not erase the model attached to retained usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_unmetered_terminal_keeps_priced_usage() {
+        use tower::ServiceExt as _;
+        let body = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fake-response\",\"model\":\"gpt-metered\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fake-response\",\"usage\":null}}\n\n",
+        );
+        let upstream = stub::http(
+            Router::new()
+                .fallback(move || async move { ([(CONTENT_TYPE, "text/event-stream")], body) }),
+        );
+        let account = Account {
+            provider: Provider::Codex,
+            ..Account::fixture("alice@example.com")
+        };
+        let manager = keyed(Config {
+            pricing: std::collections::HashMap::from([(
+                "gpt-metered".into(),
+                crate::pricing::PricingOverride {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    cache_read: None,
+                },
+            )]),
+            upstream: "http://127.0.0.1:1".into(),
+            codex_upstream: upstream.url(),
+            ..Config::fixture(vec![account])
+        });
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(crate::provider::CODEX_RESPONSES_PATH)
+            .header(HOST, "127.0.0.1")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"input":[]}"#))
+            .unwrap();
+        req.extensions_mut().insert(ClientAddr(loopback()));
+        let response = app(Arc::clone(&manager)).oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "positive control: served response"
+        );
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            body.as_bytes(),
+            "positive control: complete replayed stream forwarded"
+        );
+        for _ in 0..200 {
+            let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+            if snapshot.accounts[0]
+                .usage
+                .as_ref()
+                .is_some_and(|u| u.today.requests > 0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        let usage = snapshot.accounts[0]
+            .usage
+            .as_ref()
+            .expect("metered turn has usage");
+        assert_eq!(
+            (
+                usage.today.requests,
+                usage.today.input_tokens,
+                usage.today.output_tokens
+            ),
+            (1, 12, 3),
+            "positive control: prior terminal's metered totals survive"
+        );
+        assert_eq!(
+            usage.today.cost_usd,
+            Some(0.000_015),
+            "an unmetered terminal must not turn retained priced usage into an unpriced total"
+        );
+        let models: Vec<_> = usage.today_by_model.keys().map(String::as_str).collect();
+        assert_eq!(
+            models,
+            ["gpt-metered"],
+            "an unmetered terminal must not erase the model attached to retained usage"
         );
     }
 }
