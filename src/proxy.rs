@@ -26893,4 +26893,267 @@ mod forecast_routing_tests {
             "freesAt must describe the pool account's 600 second hold, got {frees}, now {now}"
         );
     }
+    #[tokio::test]
+    async fn independent_response_named_model_catalogue() {
+        use tower::ServiceExt as _;
+        let upstream = stub::canned(stub::reply(
+            "200 OK",
+            "application/json",
+            r#"{"id":"fake-message","type":"message","role":"assistant","model":"claude-sonnet-5-5","content":[],"usage":{"input_tokens":10,"output_tokens":2}}"#,
+        ));
+        let manager = keyed(Config {
+            upstream: upstream.url(),
+            codex_upstream: "http://127.0.0.1:1".to_string(),
+            ..Config::fixture(vec![Account::fixture("alice@example.com")])
+        });
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header(HOST, "127.0.0.1")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"claude-opus-request-only","max_tokens":2,"messages":[]}"#,
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ClientAddr(loopback()));
+        let response = app(Arc::clone(&manager)).oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "fixture served successfully"
+        );
+        let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        let served: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            served["model"], "claude-sonnet-5-5",
+            "positive control: response names the served model"
+        );
+        let observed = document(manager).await;
+        let models = observed["providers"][0]["models"].as_array().unwrap();
+        assert!(
+            models.iter().all(|model| model["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|id| id != "claude-opus-request-only")),
+            "routing must not catalogue a request-only id absent from the served response: {models:?}"
+        );
+        assert!(
+            models.iter().any(|model| model["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == "claude-sonnet-5-5")),
+            "routing must catalogue the id the served response actually named: {models:?}"
+        );
+    }
+    /// Response identity is independent of request-preferred usage, including a turn
+    /// with no usage at all. Each case drives inference and the public routing read.
+    async fn response_catalogue_case(
+        provider: Provider,
+        streaming: bool,
+        named: bool,
+        usage: bool,
+    ) {
+        use tower::ServiceExt as _;
+        let request_model = match provider {
+            Provider::Anthropic => "claude-opus-request-only",
+            Provider::Codex => "gpt-request-only",
+        };
+        let response_model = match provider {
+            Provider::Anthropic => "claude-sonnet-5-5",
+            Provider::Codex => "gpt-response-only",
+        };
+        let mut value = serde_json::json!({"id":"fake-response", "type":"message", "role":"assistant", "content":[]});
+        if named {
+            value["model"] = response_model.into();
+        }
+        if usage {
+            value["usage"] = serde_json::json!({"input_tokens":10,"output_tokens":2});
+        }
+        let body = if streaming {
+            match provider {
+                Provider::Anthropic => format!(
+                    "event: message_start\ndata: {}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+                    serde_json::json!({"type":"message_start", "message":value})
+                ),
+                Provider::Codex => format!(
+                    "event: response.completed\ndata: {}\n\n",
+                    serde_json::json!({"type":"response.completed", "response":value})
+                ),
+            }
+        } else {
+            value.to_string()
+        };
+        let upstream = stub::http(Router::new().fallback(move || {
+            let body = body.clone();
+            async move {
+                (
+                    [(
+                        CONTENT_TYPE,
+                        if streaming {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        },
+                    )],
+                    body,
+                )
+            }
+        }));
+        let account = Account {
+            provider,
+            ..Account::fixture("alice@example.com")
+        };
+        let manager = keyed(Config {
+            upstream: upstream.url(),
+            codex_upstream: upstream.url(),
+            ..Config::fixture(vec![account])
+        });
+        let path = match provider {
+            Provider::Anthropic => "/v1/messages",
+            Provider::Codex => crate::provider::CODEX_RESPONSES_PATH,
+        };
+        let mut req = Request::builder().method(Method::POST).uri(path)
+            .header(HOST,"127.0.0.1").header(CONTENT_TYPE,"application/json")
+            .body(Body::from(serde_json::json!({"model":request_model,"max_tokens":2,"messages":[],"input":[],"stream":streaming}).to_string())).unwrap();
+        req.extensions_mut().insert(ClientAddr(loopback()));
+        let response = app(Arc::clone(&manager)).oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "fixture served successfully"
+        );
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        let served: Value = if streaming {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let event: Value =
+                serde_json::from_str(text.lines().find_map(|l| l.strip_prefix("data: ")).unwrap())
+                    .unwrap();
+            match provider {
+                Provider::Anthropic => event["message"].clone(),
+                Provider::Codex => event["response"].clone(),
+            }
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        assert_eq!(
+            served.get("model").and_then(Value::as_str),
+            named.then_some(response_model),
+            "positive control: served response identity"
+        );
+        // The streamed parser is a detached tee. For usage cases, its ledger row is
+        // the completion barrier; no-usage cases wait for the expected observation.
+        let ledger_models = || {
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0]
+                .usage
+                .as_ref()
+                .map(|row| row.today_by_model.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        for _ in 0..200 {
+            let ready = if usage {
+                !ledger_models().is_empty()
+            } else {
+                manager
+                    .routing_observed(provider, crate::now_ms())
+                    .1
+                    .contains(response_model)
+            };
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if usage {
+            assert_eq!(
+                ledger_models(),
+                [request_model],
+                "usage keeps the requested model"
+            );
+        } else {
+            assert!(ledger_models().is_empty(), "no usage creates no ledger row");
+        }
+        let doc = document(manager).await;
+        let slot = match provider {
+            Provider::Anthropic => 0,
+            Provider::Codex => 1,
+        };
+        let ids: Vec<_> = doc["providers"][slot]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["ids"].as_array().unwrap())
+            .map(|id| id.as_str().unwrap())
+            .collect();
+        let expected: Vec<_> = named.then_some(response_model).into_iter().collect();
+        assert_eq!(
+            ids, expected,
+            "catalogue contains only response-named ids, independently of usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_anthropic_buffered_mismatch() {
+        response_catalogue_case(Provider::Anthropic, false, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_anthropic_buffered_missing_model() {
+        response_catalogue_case(Provider::Anthropic, false, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_anthropic_buffered_without_usage() {
+        response_catalogue_case(Provider::Anthropic, false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_anthropic_streamed_mismatch() {
+        response_catalogue_case(Provider::Anthropic, true, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_anthropic_streamed_missing_model() {
+        response_catalogue_case(Provider::Anthropic, true, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_anthropic_streamed_without_usage() {
+        response_catalogue_case(Provider::Anthropic, true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_codex_buffered_mismatch() {
+        response_catalogue_case(Provider::Codex, false, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_codex_buffered_missing_model() {
+        response_catalogue_case(Provider::Codex, false, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_codex_buffered_without_usage() {
+        response_catalogue_case(Provider::Codex, false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_codex_streamed_mismatch() {
+        response_catalogue_case(Provider::Codex, true, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_codex_streamed_missing_model() {
+        response_catalogue_case(Provider::Codex, true, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn response_catalogue_codex_streamed_without_usage() {
+        response_catalogue_case(Provider::Codex, true, true, false).await;
+    }
 }
