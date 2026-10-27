@@ -153,7 +153,16 @@ impl Quota {
     /// non-Anthropic upstream) read nothing and leaves the stamp alone.
     #[must_use]
     pub fn update_from_headers(&mut self, headers: &impl HeaderView) -> bool {
-        let now = OffsetDateTime::now_utc();
+        self.update_from_headers_at(headers, OffsetDateTime::now_utc())
+    }
+
+    /// Fold this reading at an explicit observation time.
+    #[must_use]
+    pub fn update_from_headers_at(
+        &mut self,
+        headers: &impl HeaderView,
+        now: OffsetDateTime,
+    ) -> bool {
         let mut read_five_hour = false;
         let mut read_any = false;
         if let Some(util) = get_parsed::<f64>(headers, "anthropic-ratelimit-unified-5h-utilization")
@@ -344,7 +353,11 @@ impl Quota {
     /// bounds the gate at one window — the account is never benched forever, and
     /// the shared windows are untouched so Opus and Sonnet stay eligible.
     pub fn reject_model_weekly(&mut self, headers: &impl HeaderView) {
-        let now = OffsetDateTime::now_utc();
+        self.reject_model_weekly_at(headers, OffsetDateTime::now_utc());
+    }
+
+    /// Fold this reading at an explicit observation time.
+    pub fn reject_model_weekly_at(&mut self, headers: &impl HeaderView, now: OffsetDateTime) {
         let reported = get_reset(headers, "anthropic-ratelimit-unified-7d_oi-reset");
         self.seven_day_oi = Some(QuotaWindow {
             utilization: 1.0,
@@ -396,14 +409,19 @@ impl Quota {
     ///    "We could not read this" is not "this is at 0%", and a fabricated `0.0`
     ///    is byte-identical to a genuine one. See [`apply_bucket`].
     pub fn apply_usage(&mut self, usage: &crate::probe::Usage) {
+        self.apply_usage_at(usage, OffsetDateTime::now_utc());
+    }
+
+    /// Fold a successful probe on the caller's clock, including missing resets.
+    pub fn apply_usage_at(&mut self, usage: &crate::probe::Usage, now: OffsetDateTime) {
         // MUST run before the merges below. It compares the probe's fresh
         // utilization against the one still stored, and those merges overwrite
         // exactly that value.
         self.drop_rejection_if_a_window_rolled(usage);
 
-        apply_bucket(&mut self.five_hour, usage.five_hour, FIVE_HOUR);
-        apply_bucket(&mut self.seven_day, usage.seven_day, SEVEN_DAY);
-        apply_bucket(&mut self.seven_day_oi, usage.seven_day_oi, SEVEN_DAY);
+        apply_bucket(&mut self.five_hour, usage.five_hour, FIVE_HOUR, now);
+        apply_bucket(&mut self.seven_day, usage.seven_day, SEVEN_DAY, now);
+        apply_bucket(&mut self.seven_day_oi, usage.seven_day_oi, SEVEN_DAY, now);
         // Same rule as the buckets above: only a reported value overwrites.
         // `None` (unread this time) leaves whatever was last learned in place,
         // rather than erasing it back to "unknown".
@@ -414,7 +432,7 @@ impl Quota {
         // when the endpoint reported no bucket: "we read this account's quota" is
         // about the read, the same rule `Manager::apply_usage` latches
         // `quota_known` on. A failed probe never reaches here.
-        self.updated_at = Some(OffsetDateTime::now_utc());
+        self.updated_at = Some(now);
         // A Codex probe's facts (an Anthropic probe carries none). Its windows are the plan's
         // and outrank the headers' from now on (`CodexQuotaFacts::windows`); its spend control
         // is current; its credits stand until another reading reports them.
@@ -596,11 +614,11 @@ fn apply_bucket(
     window: &mut Option<QuotaWindow>,
     bucket: Option<crate::probe::UsageBucket>,
     win: Duration,
+    now: OffsetDateTime,
 ) {
     let Some(bucket) = bucket else {
         return;
     };
-    let now = OffsetDateTime::now_utc();
     let prior = *window;
     let Some(utilization) = bucket.utilization.or_else(|| prior.map(|w| w.utilization)) else {
         // No reading, and nothing prior to keep. Leave the window absent rather
@@ -981,13 +999,31 @@ impl Quota {
     /// Fold headers and the refusal already parsed by the proxy together. A body-only
     /// refusal is the same rejection as a header refusal; its reset takes precedence.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retain the wall-clock adapter; production folds through the explicit-time delegate"
+        )
+    )]
     pub(crate) fn update_from_codex_refusal(
         &mut self,
         headers: &impl HeaderView,
         http_status: u16,
         refusal: Option<&CodexQuotaRefusal>,
     ) -> bool {
-        let now = OffsetDateTime::now_utc();
+        self.update_from_codex_refusal_at(headers, http_status, refusal, OffsetDateTime::now_utc())
+    }
+
+    /// The response and its already-parsed refusal share one observation time.
+    #[must_use]
+    pub(crate) fn update_from_codex_refusal_at(
+        &mut self,
+        headers: &impl HeaderView,
+        http_status: u16,
+        refusal: Option<&CodexQuotaRefusal>,
+        now: OffsetDateTime,
+    ) -> bool {
         // This response's reading of each bucket, (utilization, reported reset, length in
         // minutes), merged across slots before anything is written: see the doc for why a
         // slot may not simply overwrite.
