@@ -26730,4 +26730,165 @@ mod forecast_routing_tests {
         assert_eq!(document["providers"][1]["lastError"]["kind"], "capacity");
         assert!(document["providers"][0]["lastError"].is_null());
     }
+    #[tokio::test]
+    async fn reviewer_head_must_be_405() {
+        use tower::ServiceExt as _;
+        let mut req = Request::builder()
+            .method(Method::HEAD)
+            .uri(ROUTING_PATH)
+            .header("x-api-key", KEY)
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ClientAddr(loopback()));
+        let response = app(manager()).oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "every method other than GET must be 405"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_all_boot_model_ids_are_reported() {
+        let manager = manager();
+        for n in 0..65 {
+            served(&manager, 0, &format!("claude-opus-{n}"), None);
+        }
+        served(&manager, 0, "claude-sonnet-5-5", None);
+        let document = document(manager).await;
+        let ids = document["providers"][0]["models"][0]["ids"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            ids.len(),
+            65,
+            "schema ids include every full id seen this boot"
+        );
+        assert!(ids.iter().any(|id| id == "claude-opus-64"));
+        assert_eq!(document["providers"][0]["models"][1]["model"], "sonnet");
+        assert_eq!(
+            document["providers"][0]["models"][1]["ids"][0],
+            "claude-sonnet-5-5"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_spent_revalidation_window_is_not_routable_now() {
+        let manager = manager();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.95"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            HeaderValue::from_str(&(OffsetDateTime::now_utc().unix_timestamp() + 3600).to_string())
+                .unwrap(),
+        );
+        assert!(manager.update_quota(0, &headers, 200));
+        served(&manager, 0, "claude-opus-5-5", None);
+        let now = OffsetDateTime::now_utc();
+        let tried = std::collections::HashSet::new();
+        assert_eq!(
+            manager.select(
+                &tried,
+                now,
+                Some("claude-opus-5-5"),
+                None,
+                "/v1/messages",
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            manager.select_revalidation(&tried, now, Some("claude-opus-5-5"), None, "/v1/messages"),
+            Some(0)
+        );
+        assert_eq!(
+            manager.select_revalidation(&tried, now, Some("claude-opus-5-5"), None, "/v1/messages"),
+            None,
+            "positive control: the spent window actually refuses this request"
+        );
+        let document = crate::routing::document(&manager, now).unwrap();
+        let document = serde_json::to_value(document).unwrap();
+        assert_eq!(
+            document["providers"][0]["models"][0]["routable"], false,
+            "routing must agree with the request the selector can serve now"
+        );
+        let frees = assert_utc(&document["providers"][0]["models"][0]["freesAt"]);
+        assert!(
+            frees > now && frees <= now + time::Duration::seconds(2),
+            "the spent valve, rather than the soft quota reset, sets freesAt"
+        );
+        assert!(
+            manager
+                .routing_candidates(
+                    frees - time::Duration::milliseconds(1),
+                    Some("claude-opus-5-5"),
+                    "/v1/messages"
+                )
+                .accounts
+                .is_empty()
+        );
+        let ready = manager.routing_candidates(frees, Some("claude-opus-5-5"), "/v1/messages");
+        assert_eq!(ready.accounts, vec![0], "the valve opens at its expiry");
+        assert_eq!(
+            manager.select_revalidation(
+                &tried,
+                frees,
+                Some("claude-opus-5-5"),
+                None,
+                "/v1/messages"
+            ),
+            Some(0),
+            "a routing read must not spend the opened valve"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_frees_at_excludes_nonpooled_control_account() {
+        let mut config = Config::fixture(vec![
+            Account::fixture("alice@example.com"),
+            Account::fixture("bob@example.com"),
+        ]);
+        config.control_account = Some(crate::config::ControlAccountRef::Name(
+            "alice@example.com".to_string(),
+        ));
+        config
+            .extra
+            .insert("revalidationServe".to_string(), serde_json::json!(false));
+        let manager = keyed(config);
+        served(&manager, 1, "claude-opus-5-5", None);
+        manager.mark_rate_limited(0, 60);
+        manager.mark_rate_limited(1, 600);
+        let now = OffsetDateTime::now_utc();
+        let future = now + time::Duration::seconds(61);
+        assert!(
+            manager
+                .routing_candidates(future, Some("claude-opus-5-5"), "/v1/messages")
+                .accounts
+                .is_empty(),
+            "positive control: the freed control account cannot serve new pool work"
+        );
+        assert_eq!(
+            manager.select(
+                &std::collections::HashSet::new(),
+                future,
+                Some("claude-opus-5-5"),
+                None,
+                "/v1/messages",
+                None
+            ),
+            None,
+            "independent public selection still cannot serve after the control account clears"
+        );
+        let document = document(manager).await;
+        let opus = &document["providers"][0]["models"][0];
+        assert_eq!(opus["routable"], false);
+        let frees = assert_utc(&opus["freesAt"]);
+        assert!(
+            frees > now + time::Duration::seconds(599),
+            "freesAt must describe the pool account's 600 second hold, got {frees}, now {now}"
+        );
+    }
 }

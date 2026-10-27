@@ -524,9 +524,9 @@ mod tests {
         assert_eq!(ErrorKind::of_stream("unknown"), None);
     }
 
-    /// **Model ids are remembered per provider, up to a fixed bound.**
+    /// **Every served model id is remembered per provider, including later families.**
     #[test]
-    fn model_ids_are_kept_per_provider_and_bounded() {
+    fn model_ids_are_kept_per_provider_without_truncation() {
         let mut seen = Observations::default();
         seen.record_model(Provider::Codex, "gpt-a");
         seen.record_model(Provider::Codex, "gpt-a");
@@ -535,7 +535,12 @@ mod tests {
         for n in 0..100 {
             seen.record_model(Provider::Anthropic, &format!("claude-opus-{n}"));
         }
-        assert_eq!(seen.model_ids(Provider::Anthropic).len(), MODEL_IDS_CAP);
+        assert_eq!(seen.model_ids(Provider::Anthropic).len(), 100);
+        seen.record_model(Provider::Anthropic, "claude-sonnet-5-5");
+        assert!(
+            seen.model_ids(Provider::Anthropic)
+                .contains("claude-sonnet-5-5")
+        );
     }
 
     /// **The catalogue groups `anthropic` ids by family, in a fixed order, and invents no

@@ -12757,4 +12757,48 @@ mod routing_tests {
             4
         );
     }
+    #[tokio::test]
+    async fn reviewer_routing_rejects_an_http_redirect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/unrelated-service\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let target_task = tokio::spawn(async move {
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_secs(2), target.accept()).await
+            {
+                let mut request = [0u8; 4096];
+                let n = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..n]).to_string();
+                let body = r#"{"schema":1,"generatedAt":"2026-10-26T00:00:00Z","build":{"sha":"fake","dirty":false,"builtAt":"2026-10-26T00:00:00Z"},"providers":[],"forecast":null}"#;
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                Some(request)
+            } else {
+                None
+            }
+        });
+        let mut config = Config::fixture(vec![]);
+        config.proxy.port = origin_port;
+        config.proxy.api_key = Some("fake-routing-key".to_string());
+        let result = fetch_routing_body(&config).await;
+        origin_task.await.unwrap();
+        let forwarded = target_task.await.unwrap();
+        assert!(
+            result.is_err(),
+            "HTTP 302 must be unreadable, redirected answer was accepted; request at second service: {forwarded:?}"
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.exit_code(), 4);
+        assert!(
+            forwarded.is_none(),
+            "a redirect target must receive no request or API key"
+        );
+    }
 }
