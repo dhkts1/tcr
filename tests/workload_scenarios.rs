@@ -1208,3 +1208,24 @@ fn transient_hold_returns_the_session_home() {
         fleet.report()
     );
 }
+
+#[test]
+fn fixed_epoch_spacing() {
+    let mut fleet = Fleet::new(
+        &[("alpha", 0), ("bravo", 1)],
+        PacingConfig {
+            max_in_flight_per_account: None,
+            min_spacing_ms: Some(1_000),
+        },
+    );
+    drop(fleet.stream_anon(t0()));
+    let pick = fleet.manager.select(
+        &HashSet::new(),
+        t0() + Duration::milliseconds(1_001),
+        None,
+        None,
+        "/v1/messages",
+        None,
+    );
+    assert_eq!(pick, Some(0), "spacing must expire on the replay clock");
+}
