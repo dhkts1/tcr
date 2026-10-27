@@ -2287,6 +2287,12 @@ impl Manager {
         if let Some(slept) = self.wake.observe() {
             self.retire_every_client_after_sleep(slept);
         }
+        self.enter_in_flight_at(idx, OffsetDateTime::now_utc())
+    }
+
+    /// Claim a send slot and stamp it on the caller's clock. Sleep observation
+    /// belongs to the production wrapper; RAII and client recycling are shared.
+    pub fn enter_in_flight_at(self: &Arc<Self>, idx: usize, now: OffsetDateTime) -> InFlightGuard {
         let claimed_recycle = {
             let mut accounts = self
                 .accounts
@@ -2295,7 +2301,7 @@ impl Manager {
             match accounts.get_mut(idx) {
                 Some(account) => {
                     account.in_flight = account.in_flight.saturating_add(1);
-                    account.last_served_ms = crate::now_ms();
+                    account.last_served_ms = odt_to_ms(now);
                     account.serves_since_client_build =
                         account.serves_since_client_build.saturating_add(1);
                     // Claim the recycle under the SAME write lock that observes the

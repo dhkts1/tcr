@@ -1,0 +1,280 @@
+{
+  "assumptions": "Synthetic joint shape; capacities use W=4 and load sensitivities scale demand/capacity. No measured output price. Prefix warmth reported independently at 5m and 1h. Weekly includes scoped only once as a distinct budget.",
+  "cases": {
+    "A-load06": {
+      "score": {
+        "arrivals": 51084,
+        "backlog": 0,
+        "cold_moves_1h": 707,
+        "cold_moves_5m": 911,
+        "input_arrived": 276600000,
+        "input_backlog": 0,
+        "input_served": 276600000,
+        "lockout_minutes": [
+          0.03585,
+          0.0
+        ],
+        "lost_distinct_budget_sum": 1276235461.432096,
+        "lost_five_hour": 470331683.09876305,
+        "lost_scoped": 497434090.66666657,
+        "lost_weekly": 308469687.6666665,
+        "output_arrived": 59160000,
+        "output_backlog": 0,
+        "output_served": 59160000,
+        "reasoning_served": 0,
+        "revalidations": 0,
+        "served": 51084
+      },
+      "score_sha256": "998dbf566004ec266e2246c18c39480cabd0f1ce2302e43540bfe1fce0f6daa3",
+      "trace_sha256": "f5dbac9400654a6edab9079eccd4eb75ae38cf171808cc14f9498d95a1ef4a38"
+    },
+    "A-load11": {
+      "score": {
+        "arrivals": 51084,
+        "backlog": 0,
+        "cold_moves_1h": 819,
+        "cold_moves_5m": 591,
+        "input_arrived": 276600000,
+        "input_backlog": 0,
+        "input_served": 276600000,
+        "lockout_minutes": [
+          2261.1175333334077,
+          0.0
+        ],
+        "lost_distinct_budget_sum": 478745278.9595959,
+        "lost_five_hour": 120234967.73737389,
+        "lost_scoped": 254918317.27272713,
+        "lost_weekly": 103591993.94949487,
+        "output_arrived": 59160000,
+        "output_backlog": 0,
+        "output_served": 59160000,
+        "reasoning_served": 0,
+        "revalidations": 595,
+        "served": 51084
+      },
+      "score_sha256": "adb2f4c91dca95924b82e5f1331d9f11e73d1a138f33898cadd9f949fdf7270e",
+      "trace_sha256": "f5dbac9400654a6edab9079eccd4eb75ae38cf171808cc14f9498d95a1ef4a38"
+    },
+    "A-main": {
+      "score": {
+        "arrivals": 51084,
+        "backlog": 0,
+        "cold_moves_1h": 858,
+        "cold_moves_5m": 766,
+        "input_arrived": 276600000,
+        "input_backlog": 0,
+        "input_served": 276600000,
+        "lockout_minutes": [
+          1585.8915000000397,
+          0.0
+        ],
+        "lost_distinct_budget_sum": 564363547.888889,
+        "lost_five_hour": 144636901.88888898,
+        "lost_scoped": 283492256.0,
+        "lost_weekly": 136234390.0,
+        "output_arrived": 59160000,
+        "output_backlog": 0,
+        "output_served": 59160000,
+        "reasoning_served": 0,
+        "revalidations": 87,
+        "served": 51084
+      },
+      "score_sha256": "6d5b70440ee4d3c3e1c777b180df24d5235c09fd1d3f73dd22172f90b25c970c",
+      "trace_sha256": "f5dbac9400654a6edab9079eccd4eb75ae38cf171808cc14f9498d95a1ef4a38"
+    },
+    "A-weight1": {
+      "score": {
+        "arrivals": 51084,
+        "backlog": 0,
+        "cold_moves_1h": 752,
+        "cold_moves_5m": 969,
+        "input_arrived": 276600000,
+        "input_backlog": 0,
+        "input_served": 276600000,
+        "lockout_minutes": [
+          0.03585,
+          0.0
+        ],
+        "lost_distinct_budget_sum": 740357363.7777779,
+        "lost_five_hour": 260795384.77777797,
+        "lost_scoped": 298459662.0,
+        "lost_weekly": 181102316.99999997,
+        "output_arrived": 59160000,
+        "output_backlog": 0,
+        "output_served": 59160000,
+        "reasoning_served": 0,
+        "revalidations": 0,
+        "served": 51084
+      },
+      "score_sha256": "dbeffc6ee33db7d40650a6d64a652e302fa40962b6043d41c4119cff0a873797",
+      "trace_sha256": "f5dbac9400654a6edab9079eccd4eb75ae38cf171808cc14f9498d95a1ef4a38"
+    },
+    "A-weight8": {
+      "score": {
+        "arrivals": 51084,
+        "backlog": 891,
+        "cold_moves_1h": 673,
+        "cold_moves_5m": 418,
+        "input_arrived": 276600000,
+        "input_backlog": 6468251,
+        "input_served": 270131749,
+        "lockout_minutes": [
+          3784.185699999985,
+          0.0
+        ],
+        "lost_distinct_budget_sum": 468395082.85185194,
+        "lost_five_hour": 135408373.4074075,
+        "lost_scoped": 266357325.0,
+        "lost_weekly": 66629384.44444443,
+        "output_arrived": 59160000,
+        "output_backlog": 1383455,
+        "output_served": 57776545,
+        "reasoning_served": 0,
+        "revalidations": 2205,
+        "served": 50193
+      },
+      "score_sha256": "a41a09404fde0a25e37ff84b0d5d74f003c1052edce9cab701b5b886ad253596",
+      "trace_sha256": "f5dbac9400654a6edab9079eccd4eb75ae38cf171808cc14f9498d95a1ef4a38"
+    },
+    "B-load06": {
+      "score": {
+        "arrivals": 90480,
+        "backlog": 0,
+        "cold_moves_1h": 1251,
+        "cold_moves_5m": 1898,
+        "input_arrived": 382200000,
+        "input_backlog": 0,
+        "input_served": 382200000,
+        "lockout_minutes": [
+          0.7121,
+          0.0038166666666666666
+        ],
+        "lost_distinct_budget_sum": 1329537703.4197521,
+        "lost_five_hour": 619801744.0864186,
+        "lost_scoped": 454281236.51851857,
+        "lost_weekly": 255454722.81481484,
+        "output_arrived": 81600000,
+        "output_backlog": 0,
+        "output_served": 81600000,
+        "reasoning_served": 5588833,
+        "revalidations": 0,
+        "served": 90480
+      },
+      "score_sha256": "691dd474e9ad36a2d6958fb4ef375c48142fa716e2b3fd25f1d344473df5d583",
+      "trace_sha256": "0cb8baa38336d66f5290547d241ff02889d96e265b5b5a29a157ba7a1f5e57b0"
+    },
+    "B-load11": {
+      "score": {
+        "arrivals": 90480,
+        "backlog": 90,
+        "cold_moves_1h": 488,
+        "cold_moves_5m": 546,
+        "input_arrived": 382200000,
+        "input_backlog": 201765,
+        "input_served": 381998235,
+        "lockout_minutes": [
+          3504.361616666603,
+          3671.562083333389
+        ],
+        "lost_distinct_budget_sum": 392765593.95959586,
+        "lost_five_hour": 120434160.39393932,
+        "lost_scoped": 222408911.28282827,
+        "lost_weekly": 49922522.28282826,
+        "output_arrived": 81600000,
+        "output_backlog": 43136,
+        "output_served": 81556864,
+        "reasoning_served": 5588173,
+        "revalidations": 2255,
+        "served": 90390
+      },
+      "score_sha256": "8c4478bcdc6e2dc0ab40f3c28547e4d64052dbb799da43ff390653d7ed3e5bd4",
+      "trace_sha256": "0cb8baa38336d66f5290547d241ff02889d96e265b5b5a29a157ba7a1f5e57b0"
+    },
+    "B-main": {
+      "score": {
+        "arrivals": 90480,
+        "backlog": 62,
+        "cold_moves_1h": 586,
+        "cold_moves_5m": 657,
+        "input_arrived": 382200000,
+        "input_backlog": 158467,
+        "input_served": 382041533,
+        "lockout_minutes": [
+          3172.916216666502,
+          1381.1917333332965
+        ],
+        "lost_distinct_budget_sum": 479386653.7777777,
+        "lost_five_hour": 152290752.55555546,
+        "lost_scoped": 252011493.11111113,
+        "lost_weekly": 75084408.11111112,
+        "output_arrived": 81600000,
+        "output_backlog": 33890,
+        "output_served": 81566110,
+        "reasoning_served": 5588833,
+        "revalidations": 2818,
+        "served": 90418
+      },
+      "score_sha256": "887e8fab0c371df0e45957866bb88a130d5e8c977186365baf16496832aa282b",
+      "trace_sha256": "0cb8baa38336d66f5290547d241ff02889d96e265b5b5a29a157ba7a1f5e57b0"
+    },
+    "B-weight1": {
+      "score": {
+        "arrivals": 90480,
+        "backlog": 0,
+        "cold_moves_1h": 1173,
+        "cold_moves_5m": 1764,
+        "input_arrived": 382200000,
+        "input_backlog": 0,
+        "input_served": 382200000,
+        "lockout_minutes": [
+          110.17988333333344,
+          0.0038166666666666666
+        ],
+        "lost_distinct_budget_sum": 757066360.2962964,
+        "lost_five_hour": 336219879.2962963,
+        "lost_scoped": 272073727.11111116,
+        "lost_weekly": 148772753.8888889,
+        "output_arrived": 81600000,
+        "output_backlog": 0,
+        "output_served": 81600000,
+        "reasoning_served": 5588833,
+        "revalidations": 60,
+        "served": 90480
+      },
+      "score_sha256": "6b1c028f1554f05e3b4350760fa7d198abf8d762dfaa9f20bfc08393b6db318c",
+      "trace_sha256": "0cb8baa38336d66f5290547d241ff02889d96e265b5b5a29a157ba7a1f5e57b0"
+    },
+    "B-weight8": {
+      "score": {
+        "arrivals": 90480,
+        "backlog": 5789,
+        "cold_moves_1h": 188,
+        "cold_moves_5m": 205,
+        "input_arrived": 382200000,
+        "input_backlog": 19356394,
+        "input_served": 362843606,
+        "lockout_minutes": [
+          4617.580966666829,
+          8433.143650000071
+        ],
+        "lost_distinct_budget_sum": 464725396.0,
+        "lost_five_hour": 203672551.11111107,
+        "lost_scoped": 231230844.11111113,
+        "lost_weekly": 29822000.777777776,
+        "output_arrived": 81600000,
+        "output_backlog": 4123401,
+        "output_served": 77476599,
+        "reasoning_served": 4953286,
+        "revalidations": 7059,
+        "served": 84691
+      },
+      "score_sha256": "c575d550f319dfec44b6ef2ae4320164847d4dde990b25da10bda7d2a298f47f",
+      "trace_sha256": "0cb8baa38336d66f5290547d241ff02889d96e265b5b5a29a157ba7a1f5e57b0"
+    }
+  },
+  "epoch_ms": 1767225600000,
+  "schema": 1,
+  "scored_ms": 518400000,
+  "seed": 17,
+  "training_ms": 86400000
+}

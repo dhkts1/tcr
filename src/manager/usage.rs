@@ -43,12 +43,21 @@ impl Manager {
         headers: &reqwest::header::HeaderMap,
         status: u16,
     ) -> bool {
+        self.update_quota_at(idx, headers, status, OffsetDateTime::now_utc())
+    }
+
+    /// Fold a response and parse its refusal on the same explicit clock.
+    pub fn update_quota_at(
+        &self,
+        idx: usize,
+        headers: &reqwest::header::HeaderMap,
+        status: u16,
+        now: OffsetDateTime,
+    ) -> bool {
         let refusal = (status == 429)
-            .then(|| {
-                crate::quota::CodexQuotaRefusal::parse(headers, &[], OffsetDateTime::now_utc())
-            })
+            .then(|| crate::quota::CodexQuotaRefusal::parse(headers, &[], now))
             .flatten();
-        self.update_quota_with_codex_refusal(idx, headers, status, refusal.as_ref())
+        self.update_quota_with_codex_refusal_at(idx, headers, status, refusal.as_ref(), now)
     }
 
     pub(crate) fn update_quota_with_codex_refusal(
@@ -57,6 +66,23 @@ impl Manager {
         headers: &reqwest::header::HeaderMap,
         status: u16,
         refusal: Option<&crate::quota::CodexQuotaRefusal>,
+    ) -> bool {
+        self.update_quota_with_codex_refusal_at(
+            idx,
+            headers,
+            status,
+            refusal,
+            OffsetDateTime::now_utc(),
+        )
+    }
+
+    fn update_quota_with_codex_refusal_at(
+        &self,
+        idx: usize,
+        headers: &reqwest::header::HeaderMap,
+        status: u16,
+        refusal: Option<&crate::quota::CodexQuotaRefusal>,
+        now: OffsetDateTime,
     ) -> bool {
         let (newly_known, read_five_hour) = {
             let mut accounts = self
@@ -67,11 +93,11 @@ impl Manager {
                 Some(account) => {
                     let read_five_hour = match account.provider {
                         crate::provider::Provider::Anthropic => {
-                            account.quota.update_from_headers(headers)
+                            account.quota.update_from_headers_at(headers, now)
                         }
                         crate::provider::Provider::Codex => account
                             .quota
-                            .update_from_codex_refusal(headers, status, refusal),
+                            .update_from_codex_refusal_at(headers, status, refusal, now),
                     };
                     let flipped = read_five_hour && !account.quota_known;
                     account.quota_known |= read_five_hour;
@@ -392,6 +418,11 @@ impl Manager {
     /// flat wall-clock wait, decoupled from probe cadence, so the retry rate is
     /// bounded by policy rather than by how often the fleet happens to probe.
     pub fn apply_usage(&self, idx: usize, usage: &Usage) {
+        self.apply_usage_at(idx, usage, OffsetDateTime::now_utc());
+    }
+
+    /// Fold a probe at an explicit observation time.
+    pub fn apply_usage_at(&self, idx: usize, usage: &Usage, now: OffsetDateTime) {
         let newly_known = {
             let mut accounts = self
                 .accounts
@@ -405,7 +436,7 @@ impl Manager {
                             account.quota.status.as_deref() == Some("rejected")
                         }
                     };
-                    account.quota.apply_usage(usage);
+                    account.quota.apply_usage_at(usage, now);
                     if was_codex_refused
                         && account.quota.status.as_deref() != Some("rejected")
                         && account.hold_cause == HoldCause::RateLimit
@@ -473,12 +504,22 @@ impl Manager {
     /// and the rejection frees at its own reset with no second deadline to
     /// reconcile. See [`crate::quota::Quota::reject_model_weekly`].
     pub fn mark_model_weekly_rejected(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
+        self.mark_model_weekly_rejected_at(idx, headers, OffsetDateTime::now_utc());
+    }
+
+    /// Record a scoped rejection on the caller's clock.
+    pub fn mark_model_weekly_rejected_at(
+        &self,
+        idx: usize,
+        headers: &reqwest::header::HeaderMap,
+        now: OffsetDateTime,
+    ) {
         let mut accounts = self
             .accounts
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
-            account.quota.reject_model_weekly(headers);
+            account.quota.reject_model_weekly_at(headers, now);
             tracing::info!(
                 account = %account.name,
                 "model-scoped weekly quota rejection recorded"
@@ -487,8 +528,13 @@ impl Manager {
     }
 
     pub fn mark_rate_limited(&self, idx: usize, seconds: i64) {
+        self.mark_rate_limited_at(idx, seconds, OffsetDateTime::now_utc());
+    }
+
+    /// Arm the bounded rate-limit hold at an explicit time.
+    pub fn mark_rate_limited_at(&self, idx: usize, seconds: i64, now: OffsetDateTime) {
         let hold = seconds.clamp(0, MAX_RATE_LIMIT_HOLD_SECONDS);
-        let until = crate::now_ms() + hold * 1000;
+        let until = odt_to_ms(now) + hold * 1000;
         let mut accounts = self
             .accounts
             .write()
@@ -505,12 +551,16 @@ impl Manager {
     /// retry delay so a spend cap cannot bench an account until an unrelated reset.
     /// A successful probe also releases the hold when it reads the refusal as over.
     pub fn mark_codex_quota_limited(&self, idx: usize, seconds: i64) {
+        self.mark_codex_quota_limited_at(idx, seconds, OffsetDateTime::now_utc());
+    }
+
+    /// Arm the quota hold using the caller's time and learned reset.
+    pub fn mark_codex_quota_limited_at(&self, idx: usize, seconds: i64, now: OffsetDateTime) {
         let mut accounts = self
             .accounts
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
-            let now = OffsetDateTime::now_utc();
             let hold = account
                 .quota
                 .codex
@@ -522,7 +572,7 @@ impl Manager {
                 );
             account.status = AccountStatus::Throttled;
             account.rate_limited_until_ms =
-                Some(crate::now_ms().saturating_add(hold.saturating_mul(1000)));
+                Some(odt_to_ms(now).saturating_add(hold.saturating_mul(1000)));
             account.hold_cause = HoldCause::RateLimit;
         }
     }
@@ -533,7 +583,12 @@ impl Manager {
     /// `Throttled` would claim a rate limit. Selection skips any live
     /// `rate_limited_until_ms` whatever the status, so the hold binds the same.
     pub fn mark_refused(&self, idx: usize) {
-        let until = crate::now_ms() + REFUSED_HOLD_SECONDS * 1000;
+        self.mark_refused_at(idx, OffsetDateTime::now_utc());
+    }
+
+    /// Arm a credential refusal hold on the caller's clock.
+    pub fn mark_refused_at(&self, idx: usize, now: OffsetDateTime) {
+        let until = odt_to_ms(now) + REFUSED_HOLD_SECONDS * 1000;
         let provider = {
             let mut accounts = self
                 .accounts
@@ -551,7 +606,10 @@ impl Manager {
             );
             account.provider
         };
-        self.record_upstream_error(provider, crate::routing::ErrorKind::Auth);
+        self.routing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record_error(provider, crate::routing::ErrorKind::Auth, odt_to_ms(now));
     }
 
     /// Clear a hold after live proof it no longer binds (any non-429): a

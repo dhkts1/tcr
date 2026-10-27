@@ -37,19 +37,9 @@
 //!
 //! ## Determinism
 //!
-//! Every scenario passes an explicit `now` built from a fixed epoch and advances
-//! it by hand. No sleeps, no randomness. `PacingConfig::min_spacing_ms` is
-//! deliberately left unset everywhere because it is evaluated against
-//! `last_served_ms`, which `enter_in_flight` stamps from the real clock — the one
-//! place simulated time and wall time would meet.
-//!
-//! One scenario is a stated exception: `transient_hold_returns_the_session_home`
-//! reads the wall clock ONCE, for its epoch. Its subject is a rate-limit hold, and
-//! the only public way to arm one (`Manager::mark_rate_limited`) anchors the
-//! deadline to the process clock, so the harness clock has to start from the same
-//! source for "15 seconds of hold remaining" to mean anything. Every offset from
-//! that epoch is still written out explicitly, so its routing decisions are as
-//! reproducible as every other scenario's.
+//! Every scenario advances a fixed epoch by hand. Explicit-time delegates stamp
+//! sends, fold quota and arm holds on that same clock; production callers retain
+//! wall-clock wrappers. The replay below never sleeps or calls an upstream.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -197,7 +187,6 @@ impl Fleet {
     /// default soft switch threshold. `config_path: None` makes every persist a
     /// no-op, so nothing can reach disk.
     fn new(accounts: &[(&str, i64)], pacing: PacingConfig) -> Self {
-        let account_names = accounts.iter().map(|(n, _)| (*n).to_string()).collect();
         // The global egress throttle stays at its inert default: it is an async sleep on the
         // send path and has no bearing on selection.
         let config = Config {
@@ -205,6 +194,11 @@ impl Fleet {
             pacing,
             ..Config::fixture(accounts.iter().map(|(n, p)| account(n, *p)).collect())
         };
+        Self::from_config(config)
+    }
+
+    fn from_config(config: Config) -> Self {
+        let account_names = config.accounts.iter().map(|a| a.name.clone()).collect();
         let manager = Manager::new(
             config,
             Arc::new(NeverRefreshes),
@@ -317,13 +311,13 @@ impl Fleet {
     /// moves the guard into an SSE body.
     fn stream(&mut self, lineage: Lineage, now: OffsetDateTime) -> InFlightGuard {
         let idx = self.serve(lineage, now);
-        self.manager.enter_in_flight(idx)
+        self.manager.enter_in_flight_at(idx, now)
     }
 
     /// As [`Self::stream`], for identity-less traffic.
     fn stream_anon(&mut self, now: OffsetDateTime) -> InFlightGuard {
         let idx = self.serve_anon(now);
-        self.manager.enter_in_flight(idx)
+        self.manager.enter_in_flight_at(idx, now)
     }
 
     /// Drive account `idx` over the soft switch threshold on its shared weekly
@@ -332,7 +326,7 @@ impl Fleet {
     /// `set_over_threshold` (`src/manager/mod.rs`); the reset is supplied
     /// explicitly so the fold is not clock-dependent.
     fn set_over_threshold(&self, idx: usize, util: f64, now: OffsetDateTime) {
-        self.manager.apply_usage(
+        self.manager.apply_usage_at(
             idx,
             &Usage {
                 seven_day: Some(UsageBucket {
@@ -341,6 +335,7 @@ impl Fleet {
                 }),
                 ..Usage::default()
             },
+            now,
         );
     }
 
@@ -350,7 +345,7 @@ impl Fleet {
     /// is the real shape: the account is out of Fable and answers every other
     /// model class perfectly.
     fn set_fable_exhausted(&self, idx: usize, util: f64, now: OffsetDateTime) {
-        self.manager.apply_usage(
+        self.manager.apply_usage_at(
             idx,
             &Usage {
                 seven_day_oi: Some(UsageBucket {
@@ -359,6 +354,7 @@ impl Fleet {
                 }),
                 ..Usage::default()
             },
+            now,
         );
     }
 
@@ -770,7 +766,7 @@ fn quota_crossing_moves_only_the_affected_sessions() {
     now += Duration::seconds(1);
 
     // Phase B — alpha 429s for real, which arms a live hold. THAT is hard.
-    fleet.manager.mark_rate_limited(0, 60);
+    fleet.manager.mark_rate_limited_at(0, 60, now);
 
     for _ in 0..5 {
         for session in [doomed_a, healthy, doomed_b] {
@@ -1144,10 +1140,7 @@ fn transient_hold_returns_the_session_home() {
     /// first is at +1s, so all of them land inside the hold.
     const HELD_TURNS: i64 = 5;
 
-    // See the module header: this is the one scenario whose epoch is the wall
-    // clock, because `mark_rate_limited` anchors its deadline there. Every offset
-    // below is explicit, so the decisions stay reproducible.
-    let start = OffsetDateTime::now_utc();
+    let start = t0();
 
     let mut fleet = Fleet::new(&[("alpha", 0), ("bravo", 0)], pacing(CAP));
     let session = fleet.lineage("held-mid-run");
@@ -1166,7 +1159,7 @@ fn transient_hold_returns_the_session_home() {
     );
 
     // Phase 2 — a burst 429 with no guidance parks the home account for 15s.
-    fleet.manager.mark_rate_limited(home, HOLD_SECS);
+    fleet.manager.mark_rate_limited_at(home, HOLD_SECS, start);
 
     for turn in 0..HELD_TURNS {
         let at = start + Duration::seconds(1 + turn * 2);
@@ -1207,4 +1200,1038 @@ fn transient_hold_returns_the_session_home() {
          {continuity:.3}\n{}",
         fleet.report()
     );
+}
+
+#[test]
+fn fixed_epoch_spacing() {
+    let mut fleet = Fleet::new(
+        &[("alpha", 0), ("bravo", 1)],
+        PacingConfig {
+            max_in_flight_per_account: None,
+            min_spacing_ms: Some(1_000),
+        },
+    );
+    drop(fleet.stream_anon(t0()));
+    let pick = fleet.manager.select(
+        &HashSet::new(),
+        t0() + Duration::milliseconds(1_001),
+        None,
+        None,
+        "/v1/messages",
+        None,
+    );
+    assert_eq!(pick, Some(0), "spacing must expire on the replay clock");
+}
+
+#[test]
+fn old_spacing_adapter_reproduces_red() {
+    let fleet = Fleet::new(
+        &[("alpha", 0), ("bravo", 1)],
+        PacingConfig {
+            max_in_flight_per_account: None,
+            min_spacing_ms: Some(1_000),
+        },
+    );
+    drop(fleet.manager.enter_in_flight(0));
+    assert_eq!(
+        fleet.manager.select(
+            &HashSet::new(),
+            t0() + Duration::milliseconds(1_001),
+            None,
+            None,
+            "/v1/messages",
+            None,
+        ),
+        Some(1),
+        "the old wall-clock adapter must still demonstrate the missing seam"
+    );
+}
+
+#[test]
+fn replay_clock_controls_quota_and_holds() {
+    let now = t0();
+    let mut quota = tcr::quota::Quota::default();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "anthropic-ratelimit-unified-5h-utilization",
+        "0.5".parse().unwrap(),
+    );
+    assert!(quota.update_from_headers_at(&headers, now));
+    assert_eq!(quota.updated_at, Some(now));
+    assert_eq!(
+        quota.five_hour.unwrap().reset,
+        Some(now + Duration::hours(5))
+    );
+    quota.apply_usage_at(
+        &Usage {
+            seven_day: Some(UsageBucket {
+                utilization: Some(0.6),
+                reset_at_ms: None,
+            }),
+            ..Usage::default()
+        },
+        now,
+    );
+    assert_eq!(
+        quota.seven_day.unwrap().reset,
+        Some(now + Duration::days(7))
+    );
+    quota.reject_model_weekly_at(&reqwest::header::HeaderMap::new(), now);
+    assert_eq!(
+        quota.seven_day_oi.unwrap().reset,
+        Some(now + Duration::days(7))
+    );
+
+    let fleet = Fleet::new(&[("alpha", 0), ("bravo", 1)], pacing(CAP));
+    assert!(fleet.manager.update_quota_at(0, &headers, 200, now));
+    fleet.manager.mark_rate_limited_at(0, 5, now);
+    let pick = |at| {
+        fleet
+            .manager
+            .select(&HashSet::new(), at, None, None, "/v1/messages", None)
+    };
+    assert_eq!(pick(now + Duration::seconds(4)), Some(1));
+    assert_eq!(pick(now + Duration::seconds(6)), Some(0));
+    fleet.manager.mark_refused_at(0, now);
+    assert_eq!(pick(now), Some(1));
+    assert_eq!(pick(now + Duration::days(1)), Some(0));
+    fleet
+        .manager
+        .mark_model_weekly_rejected_at(0, &reqwest::header::HeaderMap::new(), now);
+    assert_eq!(
+        fleet.manager.select(
+            &HashSet::new(),
+            now + Duration::days(1),
+            Some(FABLE),
+            None,
+            "/v1/messages",
+            None
+        ),
+        Some(1)
+    );
+}
+
+#[test]
+fn replay_clock_controls_codex_holds() {
+    let mut a = account("alpha", 0);
+    a.provider = tcr::provider::Provider::Codex;
+    let fleet = Fleet::from_config(Config::fixture(vec![a]));
+    let now = t0();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-codex-primary-used-percent", "50".parse().unwrap());
+    headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+    assert!(fleet.manager.update_quota_at(0, &headers, 200, now));
+    assert_eq!(
+        fleet.manager.snapshot(now).accounts[0].quota_updated_at,
+        Some(now)
+    );
+    fleet.manager.mark_codex_quota_limited_at(0, 30, now);
+    let pick = |at| {
+        fleet.manager.select(
+            &HashSet::new(),
+            at,
+            Some("gpt-5.1-codex"),
+            None,
+            "/backend-api/codex/responses",
+            None,
+        )
+    };
+    assert_eq!(pick(now + Duration::seconds(29)), None);
+    assert_eq!(pick(now + Duration::seconds(31)), Some(0));
+}
+
+/// Synthetic quota replay. Only the event scheduler, upstream budget ledger and
+/// measurements live here: every routing decision calls the real Manager. The
+/// ledger is a fake upstream, not an alternative implementation of ranking.
+mod quota_replay {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+    use std::collections::{BTreeMap, VecDeque};
+    use tcr::provider::Provider;
+    use tcr::usage::UsageRecord;
+
+    const HOUR: i64 = 3_600_000;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    const TRAINING: i64 = DAY;
+    const END: i64 = TRAINING + 6 * DAY;
+    const MODELS: [&str; 5] = [
+        OPUS,
+        "claude-haiku-4-5",
+        FABLE,
+        "claude-sonnet-4-6",
+        "gpt-5.1-codex",
+    ];
+    const A_HOURS: [u64; 24] = [
+        18, 26, 17, 27, 25, 21, 15, 21, 58, 63, 74, 64, 57, 84, 46, 50, 59, 66, 34, 41, 51, 33, 30,
+        20,
+    ];
+    const C_HOURS: [u64; 24] = [
+        41, 34, 36, 50, 30, 14, 22, 17, 30, 36, 50, 29, 50, 76, 50, 27, 37, 80, 46, 54, 67, 58, 42,
+        23,
+    ];
+
+    struct SplitMix64(u64);
+    impl SplitMix64 {
+        const fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+        fn shuffle<T>(&mut self, values: &mut [T]) {
+            for i in (1..values.len()).rev() {
+                values.swap(i, self.next() as usize % (i + 1));
+            }
+        }
+    }
+
+    /// Exact integer apportionment. Largest remainder wins; index breaks ties.
+    fn apportioned(total: u64, weights: &[u64]) -> Vec<u64> {
+        let sum: u128 = weights.iter().map(|&w| u128::from(w)).sum();
+        assert!(sum > 0);
+        let mut values: Vec<u64> = weights
+            .iter()
+            .map(|&w| (u128::from(total) * u128::from(w) / sum) as u64)
+            .collect();
+        let mut order: Vec<usize> = (0..weights.len()).collect();
+        order.sort_by_key(|&i| {
+            (
+                std::cmp::Reverse(u128::from(total) * u128::from(weights[i]) % sum),
+                i,
+            )
+        });
+        let missing = total - values.iter().sum::<u64>();
+        for &i in order.iter().take(missing as usize) {
+            values[i] += 1;
+        }
+        values
+    }
+
+    /// Integer quantile knots. The long flat shoulders are a declared synthetic
+    /// joint-shape assumption; only the supplied quantiles are observations.
+    /// The unobserved top tail absorbs the exact total without changing a knot.
+    fn quantiles(n: usize, total: u64, p50: u64, p90: u64, p99: u64) -> Vec<u64> {
+        let knots = [
+            (0, 1),
+            (n / 2, p50),
+            (n * 89 / 100, p50),
+            (n * 90 / 100, p90),
+            (n * 98 / 100, p90),
+            (n * 99 / 100, p99),
+            (n - 1, p99),
+        ];
+        let mut values = vec![0; n];
+        for pair in knots.windows(2) {
+            let [(lo, a), (hi, b)] = pair else {
+                unreachable!()
+            };
+            for (i, value) in values.iter_mut().enumerate().take(hi + 1).skip(*lo) {
+                *value = a + (b - a) * (i - lo) as u64 / (hi - lo).max(1) as u64;
+            }
+        }
+        let used = values.iter().sum::<u64>();
+        assert!(
+            used <= total,
+            "quantiles cannot represent this total: {used} > {total}"
+        );
+        let tail = n * 99 / 100 + 1;
+        let add = apportioned(total - used, &vec![1; n - tail]);
+        for (v, extra) in values[tail..].iter_mut().zip(add) {
+            *v += extra;
+        }
+        values[tail..].sort_unstable();
+        values
+    }
+
+    /// Request counts have only two observed quantiles. A piecewise linear
+    /// shoulder and a uniformly apportioned top decile avoid inventing a
+    /// single giant session to absorb the missing joint-distribution data.
+    fn session_counts(n: usize, total: u64, p50: u64, p90: u64) -> Vec<u64> {
+        let knots = [
+            (0, 1),
+            (n / 2, p50),
+            (n * 7 / 10, p50 + (p90 - p50) / 4),
+            (n * 9 / 10, p90),
+            (n - 1, p90),
+        ];
+        let mut counts = vec![0; n];
+        for pair in knots.windows(2) {
+            let [(lo, a), (hi, b)] = pair else {
+                unreachable!()
+            };
+            for (i, value) in counts.iter_mut().enumerate().take(hi + 1).skip(*lo) {
+                *value = a + (b - a) * (i - lo) as u64 / (hi - lo).max(1) as u64;
+            }
+        }
+        let used = counts.iter().sum::<u64>();
+        assert!(used <= total);
+        let tail = n * 9 / 10 + 1;
+        let extra = apportioned(total - used, &vec![1; n - tail]);
+        for (value, add) in counts[tail..].iter_mut().zip(extra) {
+            *value += add;
+        }
+        counts[tail..].sort_unstable();
+        counts
+    }
+
+    #[derive(Clone, Debug, Serialize)]
+    struct Request {
+        at: i64,
+        session: u64,
+        family: usize,
+        input: u64,
+        output: u64,
+        long_cache: bool,
+    }
+    impl Request {
+        fn provider(&self) -> usize {
+            usize::from(self.family == 4)
+        }
+        const fn path(&self) -> &'static str {
+            if self.family == 4 {
+                "/backend-api/codex/responses"
+            } else {
+                "/v1/messages"
+            }
+        }
+    }
+
+    /// Counts and span ranks are correlated; token sizes are shuffled. Session
+    /// starts are assigned by remaining hourly token demand, with seeded jitter.
+    /// Hour shares are normalized (as are the 1.01 family shares). A session can
+    /// straddle an hour: no measured within-session joint distribution is known.
+    fn trace(mixed: bool) -> Vec<Request> {
+        let mut rng = SplitMix64(17);
+        let mut requests = Vec::new();
+        let mut next_session = 1;
+        for day in 0..7 {
+            for provider in 0..=usize::from(mixed) {
+                let (
+                    count,
+                    sessions,
+                    input,
+                    output,
+                    p50,
+                    p90,
+                    p99,
+                    count50,
+                    count90,
+                    span50,
+                    span90,
+                    hours,
+                ) = if provider == 0 {
+                    (
+                        8_514, 142, 46_100_000, 9_860_000, 1_341, 7_784, 111_866, 3, 114, 1, 48,
+                        &A_HOURS,
+                    )
+                } else {
+                    (
+                        6_566, 150, 17_600_000, 3_740_000, 1_088, 7_145, 16_738, 37, 95, 9, 39,
+                        &C_HOURS,
+                    )
+                };
+                let mut inputs = quantiles(count, input, p50, p90, p99);
+                rng.shuffle(&mut inputs);
+                let outputs = apportioned(output, &inputs);
+                let counts = session_counts(sessions, count as u64, count50, count90);
+                let mut families = Vec::new();
+                for (family, n) in apportioned(
+                    count as u64,
+                    if provider == 0 {
+                        &[37, 32, 31, 1]
+                    } else {
+                        &[1]
+                    },
+                )
+                .into_iter()
+                .enumerate()
+                {
+                    families.extend(std::iter::repeat_n(
+                        if provider == 0 { family } else { 4 },
+                        n as usize,
+                    ));
+                }
+                rng.shuffle(&mut families);
+                let targets = apportioned(input, hours);
+                let mut assigned = [0u64; 24];
+                let mut offset = 0;
+                for (rank, n) in counts.into_iter().enumerate() {
+                    let n = n as usize;
+                    let hour = (0..24)
+                        .max_by_key(|&h| {
+                            (
+                                i128::from(targets[h]) - i128::from(assigned[h]),
+                                std::cmp::Reverse(h),
+                            )
+                        })
+                        .unwrap();
+                    let start =
+                        day * DAY + hour as i64 * HOUR + (rng.next() % (HOUR as u64 / 4)) as i64;
+                    let span = if rank <= sessions / 2 {
+                        60_000 * span50 * rank as i64 / (sessions / 2) as i64
+                    } else {
+                        60_000
+                            * (span50
+                                + (span90 - span50) * (rank - sessions / 2) as i64
+                                    / (sessions * 4 / 10) as i64)
+                    };
+                    for turn in 0..n {
+                        let i = offset + turn;
+                        requests.push(Request {
+                            at: (start + span * turn as i64 / n.saturating_sub(1).max(1) as i64)
+                                .min((day + 1) * DAY - 1),
+                            session: next_session,
+                            family: families[i],
+                            input: inputs[i],
+                            output: outputs[i],
+                            long_cache: next_session % 4 == 0,
+                        });
+                        assigned[hour] += inputs[i];
+                    }
+                    offset += n;
+                    next_session += 1;
+                }
+                assert_eq!(offset, count);
+            }
+        }
+        requests.sort_by_key(|r| r.at);
+        requests
+    }
+
+    #[derive(Clone, Copy)]
+    struct Budget {
+        capacity: f64,
+        used: f64,
+        reset: i64,
+        period: i64,
+    }
+    struct Slot {
+        provider: usize,
+        windows: [Budget; 3],
+    }
+    impl Slot {
+        fn usage(&self) -> Usage {
+            let bucket = |w: Budget| {
+                Some(UsageBucket {
+                    utilization: Some(w.used / w.capacity),
+                    reset_at_ms: Some(to_ms(t0()) + w.reset),
+                })
+            };
+            Usage {
+                five_hour: bucket(self.windows[0]),
+                seven_day: bucket(self.windows[1]),
+                seven_day_oi: if self.provider == 0 {
+                    bucket(self.windows[2])
+                } else {
+                    None
+                },
+                ..Usage::default()
+            }
+        }
+    }
+
+    impl Slot {
+        /// Probe and response describe the same independent budgets. A reset
+        /// cannot accidentally clear the rejection of another exhausted window.
+        fn report(&self, manager: &Manager, idx: usize, now: OffsetDateTime) {
+            manager.apply_usage_at(idx, &self.usage(), now);
+            let exhausted = self.windows[..2].iter().any(|w| w.used >= w.capacity);
+            let mut headers = reqwest::header::HeaderMap::new();
+            if self.provider == 0 {
+                headers.insert(
+                    "anthropic-ratelimit-unified-status",
+                    if exhausted { "rejected" } else { "allowed" }
+                        .parse()
+                        .unwrap(),
+                );
+            } else {
+                for (prefix, w) in ["x-codex-primary", "x-codex-secondary"]
+                    .into_iter()
+                    .zip(self.windows)
+                {
+                    headers.insert(
+                        format!("{prefix}-used-percent")
+                            .parse::<reqwest::header::HeaderName>()
+                            .unwrap(),
+                        (100.0 * w.used / w.capacity).to_string().parse().unwrap(),
+                    );
+                    headers.insert(
+                        format!("{prefix}-window-minutes")
+                            .parse::<reqwest::header::HeaderName>()
+                            .unwrap(),
+                        (w.period / 60_000).to_string().parse().unwrap(),
+                    );
+                    headers.insert(
+                        format!("{prefix}-reset-at")
+                            .parse::<reqwest::header::HeaderName>()
+                            .unwrap(),
+                        ((to_ms(t0()) + w.reset) / 1_000)
+                            .to_string()
+                            .parse()
+                            .unwrap(),
+                    );
+                }
+                if exhausted {
+                    headers.insert("x-codex-rate-limit-reached-type", "quota".parse().unwrap());
+                }
+            }
+            manager.update_quota_at(idx, &headers, if exhausted { 429 } else { 200 }, now);
+            if self.provider == 0 && self.windows[2].used >= self.windows[2].capacity {
+                headers.insert(
+                    "anthropic-ratelimit-unified-7d_oi-reset",
+                    ((to_ms(t0()) + self.windows[2].reset) / 1_000)
+                        .to_string()
+                        .parse()
+                        .unwrap(),
+                );
+                manager.mark_model_weekly_rejected_at(idx, &headers, now);
+            }
+        }
+    }
+
+    #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+    struct Score {
+        lost_five_hour: f64,
+        lost_weekly: f64,
+        lost_scoped: f64,
+        lost_distinct_budget_sum: f64,
+        lockout_minutes: [f64; 2],
+        cold_moves_5m: u64,
+        cold_moves_1h: u64,
+        arrivals: u64,
+        served: u64,
+        backlog: u64,
+        input_arrived: u64,
+        output_arrived: u64,
+        input_served: u64,
+        output_served: u64,
+        input_backlog: u64,
+        output_backlog: u64,
+        reasoning_served: u64,
+        revalidations: u64,
+    }
+
+    enum Event {
+        Reset(usize, usize),
+        Complete(usize, usize, InFlightGuard),
+        Hold(usize),
+        Release,
+        Arrival(usize),
+    }
+
+    /// A discrete-event fake upstream. Completion charges tokens and reports
+    /// live usage, then RAII releases the in-flight slot. A spent budget causes
+    /// a real hold/model-scoped refusal. No unserved request is discarded.
+    fn replay(requests: &[Request], mixed: bool, weight: u64, load: f64) -> Score {
+        let mut accounts = Vec::new();
+        let mut slots = Vec::new();
+        let resets = [
+            2.5, 11.5, 13.5, 18.5, 27.5, 33.5, 49.5, 52.5, 79.5, 97.75, 116.0, 134.25, 152.5,
+        ];
+        for provider in 0..=usize::from(mixed) {
+            let n = if mixed {
+                if provider == 0 { 5 } else { 2 }
+            } else {
+                13
+            };
+            let demand = f64::from(if provider == 0 {
+                46_100_000 + 4 * 9_860_000
+            } else {
+                17_600_000 + 4 * 3_740_000
+            });
+            for (i, reset_hour) in resets.iter().enumerate().take(n) {
+                let mut a = account(&format!("replay-{provider}-{i}"), 0);
+                a.provider = if provider == 0 {
+                    Provider::Anthropic
+                } else {
+                    Provider::Codex
+                };
+                accounts.push(a);
+                let weekly = 7.0 * demand / (0.9 * n as f64 * load);
+                let five = 5.0 * demand / (24.0 * 0.9 * n as f64 * load);
+                let headroom = 0.44 + 0.48 * i as f64 / (n - 1) as f64;
+                let weekly_reset = if mixed {
+                    (i + 1) as i64 * WEEK / n as i64
+                } else {
+                    (reset_hour * HOUR as f64) as i64
+                };
+                slots.push(Slot {
+                    provider,
+                    windows: [
+                        Budget {
+                            capacity: five,
+                            used: five * (1.0 - headroom),
+                            reset: (i + 1) as i64 * 5 * HOUR / n as i64,
+                            period: 5 * HOUR,
+                        },
+                        Budget {
+                            capacity: weekly,
+                            used: weekly * (1.0 - headroom),
+                            reset: weekly_reset,
+                            period: WEEK,
+                        },
+                        Budget {
+                            capacity: weekly,
+                            used: weekly * (1.0 - headroom),
+                            reset: weekly_reset,
+                            period: WEEK,
+                        },
+                    ],
+                });
+            }
+        }
+        let fleet = Fleet::from_config(Config {
+            pacing: PacingConfig {
+                max_in_flight_per_account: Some(CAP),
+                min_spacing_ms: Some(1_000),
+            },
+            ..Config::fixture(accounts)
+        });
+        let mut events = BTreeMap::new();
+        let mut seq = 0u64;
+        let mut schedule = |events: &mut BTreeMap<(i64, u8, u64), Event>, at, kind, event| {
+            seq += 1;
+            events.insert((at, kind, seq), event);
+        };
+        for (i, slot) in slots.iter().enumerate() {
+            slot.report(&fleet.manager, i, t0());
+            for w in 0..if slot.provider == 0 { 3 } else { 2 } {
+                schedule(&mut events, slot.windows[w].reset, 0, Event::Reset(i, w));
+            }
+            for day in 0..7 {
+                schedule(
+                    &mut events,
+                    day * DAY + 9 * HOUR + i as i64 * 1_000,
+                    2,
+                    Event::Hold(i),
+                );
+            }
+        }
+        for (i, request) in requests.iter().enumerate() {
+            schedule(&mut events, request.at, 3, Event::Arrival(i));
+        }
+        schedule(&mut events, TRAINING, 0, Event::Release);
+        schedule(&mut events, END, 0, Event::Release);
+        let mut pending: [BTreeMap<u64, VecDeque<usize>>; 5] =
+            std::array::from_fn(|_| BTreeMap::new());
+        let mut prefixes: HashMap<(u64, usize), i64> = HashMap::new();
+        let mut previous: HashMap<u64, usize> = HashMap::new();
+        let mut score = Score::default();
+        let mut last_at = 0;
+        while let Some(((at, _, _), event)) = events.pop_first() {
+            if at > END {
+                events.insert((at, 4, 0), event);
+                break;
+            }
+            let elapsed = (at - last_at.max(TRAINING)).max(0);
+            for provider in 0..2 {
+                if pending
+                    .iter()
+                    .enumerate()
+                    .any(|(f, q)| usize::from(f == 4) == provider && !q.is_empty())
+                {
+                    score.lockout_minutes[provider] += elapsed as f64 / 60_000.0;
+                }
+            }
+            last_at = at;
+            let now = t0() + Duration::milliseconds(at);
+            match event {
+                Event::Reset(i, w) => {
+                    let budget = &mut slots[i].windows[w];
+                    if (TRAINING..END).contains(&at) {
+                        let loss = (budget.capacity - budget.used).max(0.0);
+                        match w {
+                            0 => score.lost_five_hour += loss,
+                            1 => score.lost_weekly += loss,
+                            _ => score.lost_scoped += loss,
+                        }
+                    }
+                    budget.used = 0.0;
+                    budget.reset += budget.period;
+                    schedule(&mut events, budget.reset, 0, Event::Reset(i, w));
+                    slots[i].report(&fleet.manager, i, now);
+                }
+                Event::Complete(i, r, guard) => {
+                    let request = &requests[r];
+                    let scored = request.at >= TRAINING;
+                    if scored {
+                        score.served += 1;
+                        score.input_served += request.input;
+                        score.output_served += request.output;
+                        if request.provider() == 1 {
+                            score.reasoning_served += request.output / 4;
+                        }
+                    }
+                    if let Some(&old) = previous.get(&request.session)
+                        && old != i
+                    {
+                        for (ttl, count) in [
+                            (300_000, &mut score.cold_moves_5m),
+                            (HOUR, &mut score.cold_moves_1h),
+                        ] {
+                            let warm = |idx| {
+                                prefixes
+                                    .get(&(request.session, idx))
+                                    .is_some_and(|&last| at - last < ttl)
+                            };
+                            if scored && warm(old) && !warm(i) {
+                                *count += 1;
+                            }
+                        }
+                    }
+                    previous.insert(request.session, i);
+                    prefixes.insert((request.session, i), at);
+                    let mut record = UsageRecord::from_quota_input(
+                        to_ms(now),
+                        Some(MODELS[request.family].into()),
+                        Some(request.session),
+                        request.input + request.input / 2,
+                        if request.long_cache {
+                            0
+                        } else {
+                            request.input / 2
+                        },
+                        if request.long_cache {
+                            request.input / 2
+                        } else {
+                            0
+                        },
+                        request.input / 2,
+                        request.output,
+                    );
+                    if request.provider() == 1 {
+                        record.reasoning = request.output / 4;
+                    }
+                    let charge = quota_cost(&record, weight);
+                    assert_eq!(charge, request.input + weight * request.output);
+                    for w in 0..if request.family == 2 { 3 } else { 2 } {
+                        slots[i].windows[w].used += charge as f64;
+                    }
+                    fleet.manager.record_usage(i, record);
+                    slots[i].report(&fleet.manager, i, now);
+                    drop(guard);
+                }
+                Event::Hold(i) => {
+                    fleet.manager.mark_rate_limited_at(i, 15, now);
+                    schedule(&mut events, at + 15_000, 2, Event::Release);
+                }
+                Event::Release => {}
+                Event::Arrival(r) => {
+                    pending[requests[r].family]
+                        .entry(requests[r].session)
+                        .or_default()
+                        .push_back(r);
+                    if at >= TRAINING {
+                        score.arrivals += 1;
+                        score.input_arrived += requests[r].input;
+                        score.output_arrived += requests[r].output;
+                    }
+                }
+            }
+            // All resets and completions at this instant precede every retry
+            // and arrival, even when earlier work has been waiting for a slot.
+            if events
+                .first_key_value()
+                .is_some_and(|((next, _, _), _)| *next == at)
+            {
+                continue;
+            }
+            for (family, queue) in pending.iter_mut().enumerate() {
+                if queue.is_empty() {
+                    continue;
+                }
+                // The selector's own read reports terminal rejection, shared by
+                // pooled and pinned work. Once every account is rejected, one
+                // failed real pick proves the remaining sessions cannot serve.
+                // Do not infer this from a soft threshold or an empty pool.
+                let first = *queue.values().next().unwrap().front().unwrap();
+                let request = &requests[first];
+                let routed =
+                    fleet
+                        .manager
+                        .routing_candidates(now, Some(MODELS[family]), request.path());
+                let provider_accounts = slots
+                    .iter()
+                    .filter(|slot| slot.provider == request.provider())
+                    .count();
+                let all_rejected = routed.pass.is_none()
+                    && routed.gated.get(&tcr::stats::GateReason::Rejected)
+                        == Some(&provider_accounts);
+                if all_rejected {
+                    assert_eq!(
+                        fleet.manager.select(
+                            &HashSet::new(),
+                            now,
+                            Some(MODELS[family]),
+                            Some(request.session),
+                            request.path(),
+                            None
+                        ),
+                        None
+                    );
+                    assert_eq!(
+                        fleet.manager.select_revalidation(
+                            &HashSet::new(),
+                            now,
+                            Some(MODELS[family]),
+                            Some(request.session),
+                            request.path()
+                        ),
+                        None
+                    );
+                    continue;
+                }
+                // Keep exactly the FIFO order of request indices, but visit a
+                // failed session only once per event. The rest of that session's
+                // queue cannot become executable without another state change.
+                let mut heads: BTreeMap<usize, u64> = queue
+                    .iter()
+                    .map(|(&session, rs)| (*rs.front().unwrap(), session))
+                    .collect();
+                while let Some((r, session)) = heads.pop_first() {
+                    let request = &requests[r];
+                    let tried = HashSet::new();
+                    let picked = fleet
+                        .manager
+                        .select(
+                            &tried,
+                            now,
+                            Some(MODELS[request.family]),
+                            Some(request.session),
+                            request.path(),
+                            None,
+                        )
+                        .or_else(|| {
+                            let pick = fleet.manager.select_revalidation(
+                                &tried,
+                                now,
+                                Some(MODELS[request.family]),
+                                Some(request.session),
+                                request.path(),
+                            );
+                            if at >= TRAINING && pick.is_some() {
+                                score.revalidations += 1;
+                            }
+                            pick
+                        });
+                    let Some(i) = picked else {
+                        continue;
+                    };
+                    let session_queue = queue.get_mut(&session).unwrap();
+                    assert_eq!(session_queue.pop_front(), Some(r));
+                    if let Some(&next) = session_queue.front() {
+                        heads.insert(next, session);
+                    } else {
+                        queue.remove(&session);
+                    }
+                    assert_eq!(slots[i].provider, request.provider());
+                    let guard = fleet.manager.enter_in_flight_at(i, now);
+                    schedule(
+                        &mut events,
+                        at + 1_000 + (request.input + request.output) as i64 / 100,
+                        1,
+                        Event::Complete(i, r, guard),
+                    );
+                }
+            }
+        }
+        let in_flight = events.values().filter_map(|event| match event {
+            Event::Complete(_, r, _) => Some(*r),
+            _ => None,
+        });
+        for r in pending
+            .iter()
+            .flat_map(|sessions| sessions.values())
+            .flatten()
+            .copied()
+            .chain(in_flight)
+            .filter(|&r| requests[r].at >= TRAINING)
+        {
+            score.backlog += 1;
+            score.input_backlog += requests[r].input;
+            score.output_backlog += requests[r].output;
+        }
+        assert_eq!(score.arrivals, score.served + score.backlog);
+        assert_eq!(
+            score.input_arrived,
+            score.input_served + score.input_backlog
+        );
+        assert_eq!(
+            score.output_arrived,
+            score.output_served + score.output_backlog
+        );
+        score.lost_distinct_budget_sum =
+            score.lost_five_hour + score.lost_weekly + score.lost_scoped;
+        score
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn baseline() -> serde_json::Value {
+        let mut cases = serde_json::Map::new();
+        for mixed in [false, true] {
+            let requests = trace(mixed);
+            let trace_digest = digest(&serde_json::to_vec(&requests).unwrap());
+            for (name, weight, load) in [
+                ("main", 4, 1.0),
+                ("weight1", 1, 1.0),
+                ("weight8", 8, 1.0),
+                ("load06", 4, 0.6),
+                ("load11", 4, 1.1),
+            ] {
+                let score = replay(&requests, mixed, weight, load);
+                let score_digest = digest(&serde_json::to_vec(&score).unwrap());
+                cases.insert(format!("{}-{name}", if mixed { "B" } else { "A" }), serde_json::json!({ "trace_sha256": trace_digest, "score_sha256": score_digest, "score": score }));
+            }
+        }
+        let document = serde_json::json!({"schema":1, "seed":17, "epoch_ms":to_ms(t0()), "training_ms":TRAINING, "scored_ms":6*DAY, "assumptions":"Synthetic joint shape; capacities use W=4 and load sensitivities scale demand/capacity. No measured output price. Prefix warmth reported independently at 5m and 1h. Weekly includes scoped only once as a distinct budget.", "cases":cases});
+        // Compare the same JSON representation read from the fixture. Without
+        // serde_json's float_roundtrip feature, parsing may move a display float
+        // by one ULP. The score digest above still guards its original bytes.
+        serde_json::from_slice(&serde_json::to_vec(&document).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn seeded_trace_preserves_aggregates() {
+        let requests = trace(true);
+        assert_eq!(
+            digest(&serde_json::to_vec(&requests).unwrap()),
+            digest(&serde_json::to_vec(&trace(true)).unwrap())
+        );
+        for day in 0..7 {
+            for provider in 0..2 {
+                let day_requests: Vec<_> = requests
+                    .iter()
+                    .filter(|r| r.at / DAY == day && r.provider() == provider)
+                    .collect();
+                let (n, input, output, sessions, qs) = if provider == 0 {
+                    (8_514, 46_100_000, 9_860_000, 142, [1_341, 7_784, 111_866])
+                } else {
+                    (6_566, 17_600_000, 3_740_000, 150, [1_088, 7_145, 16_738])
+                };
+                assert_eq!(day_requests.len(), n);
+                assert_eq!(day_requests.iter().map(|r| r.input).sum::<u64>(), input);
+                assert_eq!(day_requests.iter().map(|r| r.output).sum::<u64>(), output);
+                assert_eq!(
+                    day_requests
+                        .iter()
+                        .map(|r| r.session)
+                        .collect::<HashSet<_>>()
+                        .len(),
+                    sessions
+                );
+                let mut tokens: Vec<_> = day_requests.iter().map(|r| r.input).collect();
+                tokens.sort_unstable();
+                for (percent, expected) in [50, 90, 99].into_iter().zip(qs) {
+                    assert!(tokens[n * percent / 100].abs_diff(expected) <= expected / 20);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn session_shapes_match_the_supplied_quantiles() {
+        let requests = trace(true);
+        for provider in 0..2 {
+            let mut sessions: BTreeMap<u64, Vec<&Request>> = BTreeMap::new();
+            for request in requests
+                .iter()
+                .filter(|r| r.at < DAY && r.provider() == provider)
+            {
+                sessions.entry(request.session).or_default().push(request);
+            }
+            let mut counts: Vec<_> = sessions.values().map(Vec::len).collect();
+            let mut spans: Vec<_> = sessions
+                .values()
+                .map(|rs| rs.last().unwrap().at - rs.first().unwrap().at)
+                .collect();
+            counts.sort_unstable();
+            spans.sort_unstable();
+            let (count50, count90, span50, span90) = if provider == 0 {
+                (3, 114, 60_000, 48 * 60_000)
+            } else {
+                (37, 95, 9 * 60_000, 39 * 60_000)
+            };
+            for (percent, count, span) in [(50, count50, span50), (90, count90, span90)] {
+                let at = counts.len() * percent / 100;
+                assert!(counts[at].abs_diff(count) <= count / 20);
+                assert!((spans[at] - span).abs() <= span / 20);
+            }
+        }
+    }
+
+    const fn quota_cost(record: &UsageRecord, weight: u64) -> u64 {
+        record.input + record.cache_5m + record.cache_1h + weight * record.output
+    }
+
+    #[test]
+    fn quota_accounting_reads_are_free_and_reasoning_is_not_added_twice() {
+        let mut record =
+            UsageRecord::from_quota_input(to_ms(t0()), None, None, 1_005, 2, 3, 999, 5);
+        record.reasoning = 2;
+        assert_eq!(quota_cost(&record, 4), 26);
+        assert_eq!(quota_cost(&record, 1), 11);
+        assert_eq!(quota_cost(&record, 8), 46);
+    }
+
+    #[test]
+    fn empty_replay_has_no_lockout_or_cold_moves() {
+        let score = replay(&[], false, 4, 1.0);
+        assert_eq!(score.arrivals, 0);
+        assert_eq!(score.served, 0);
+        assert_eq!(score.backlog, 0);
+        assert_eq!(
+            score.lockout_minutes, [0.0; 2],
+            "idle exhaustion is never lockout"
+        );
+        assert_eq!((score.cold_moves_5m, score.cold_moves_1h), (0, 0));
+        let demand = f64::from(46_100_000 + 4 * 9_860_000);
+        let weekly = 7.0 * demand / (0.9 * 13.0);
+        let expected = (4..13)
+            .map(|i| weekly * (0.44 + 0.48 * f64::from(i) / 12.0))
+            .sum::<f64>();
+        assert!(
+            (score.lost_weekly - expected).abs() < 0.001,
+            "only nine weekly budgets expire after training"
+        );
+        assert_eq!(
+            score.lost_weekly, score.lost_scoped,
+            "the two distinct empty weekly budgets are counted separately"
+        );
+        assert!(score.lost_five_hour > score.lost_weekly);
+    }
+
+    #[test]
+    #[ignore = "ten-case replay takes minutes unoptimized; run: cargo test --test it workload_scenarios::quota_replay::frozen_baseline --locked -- --ignored"]
+    fn frozen_baseline() {
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/quota-replay-baseline.json")).unwrap();
+        assert_eq!(
+            baseline(),
+            expected,
+            "the trace and old ranking baseline are frozen"
+        );
+    }
+
+    #[test]
+    #[ignore = "one-time baseline capture; prints scores for the fixture"]
+    fn capture_baseline() {
+        let start = std::time::Instant::now();
+        println!(
+            "REPLAY_BASELINE={}",
+            serde_json::to_string(&baseline()).unwrap()
+        );
+        println!(
+            "REPLAY_RUNTIME_SECONDS={:.6}",
+            start.elapsed().as_secs_f64()
+        );
+    }
 }
