@@ -352,7 +352,8 @@ impl Manager {
     }
 
     /// Re-bind the known tokens of a history that account `served_idx` just answered with a 2xx
-    /// to that account, stamped `now_ms`: how many entries moved.
+    /// to that account, stamped `now_ms`, and drop the thinking it could not read: how many
+    /// entries changed.
     ///
     /// A released conversation keeps running on the account it moved to, often without minting
     /// a token its history echoes back, so its newest known tokens still name the account it
@@ -444,8 +445,7 @@ impl Manager {
                 account_index = served_idx,
                 moved,
                 dropped,
-                "re-bound a served history's tokens to the account that served it, and dropped \
-                 the thinking it did not read"
+                "re-bound a served history to the account that served it"
             );
         }
         moved + dropped
@@ -1360,6 +1360,65 @@ mod tests {
             Some((2, BoundTokenKind::MessageId))
         );
         assert!(manager.take_bound_tokens_dirty(), "a drop is saved");
+    }
+
+    /// A redacted thinking block is thinking too: served across organizations by an org-bound
+    /// model, it is dropped like a signature, not moved.
+    #[test]
+    fn an_org_bound_redacted_thinking_block_served_across_organizations_is_dropped() {
+        let manager = two_orgs();
+        let now = crate::now_ms();
+        manager.record_bound_tokens(
+            &[(BoundTokenKind::RedactedThinking, "redacted_fake_1".into())],
+            0,
+            now - 60_000,
+        );
+        assert_eq!(
+            manager.rebind_served_history(
+                &tokens(&["redacted_fake_1"]),
+                2,
+                Some("claude-haiku-5-5"),
+                now
+            ),
+            1,
+            "dropped"
+        );
+        assert_eq!(
+            manager.bound_token_account(&tokens(&["redacted_fake_1"])),
+            None
+        );
+    }
+
+    /// An account whose organization is unknown cannot be shown to share one, on either side
+    /// of the move, so org-bound thinking is dropped. Keeping it on the minting account would
+    /// pull the moved conversation back there, and binding it to the serving account would
+    /// claim that account reads thinking it may have dropped.
+    #[test]
+    fn org_bound_thinking_moved_to_or_from_an_unknown_organization_is_dropped() {
+        let mut unknown = account("u@example.com", "uuid-u");
+        unknown.org_uuid = None;
+        unknown.org_name = None;
+        let manager = manager_over(&[account("a@example.com", "uuid-a"), unknown]);
+        let now = crate::now_ms();
+        manager.record_bound_tokens(&sig("sig_fake_to_unknown"), 0, now - 60_000);
+        manager.record_bound_tokens(&sig("sig_fake_from_unknown"), 1, now - 60_000);
+        for (token, served_idx) in [("sig_fake_to_unknown", 1), ("sig_fake_from_unknown", 0)] {
+            assert_eq!(
+                manager.rebind_served_history(
+                    &tokens(&[token]),
+                    served_idx,
+                    Some("claude-sonnet-5-5"),
+                    now
+                ),
+                1,
+                "{token} dropped"
+            );
+            assert_eq!(
+                manager.bound_token_account(&tokens(&[token])),
+                None,
+                "{token} names no account"
+            );
+        }
     }
 
     /// A thinking mint that landed on the minting account after the served request read the
