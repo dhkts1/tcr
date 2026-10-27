@@ -27338,7 +27338,7 @@ mod forecast_routing_tests {
         );
         assert_eq!(
             usage.today.cost_usd,
-            Some(0.000015),
+            Some(0.000_015),
             "an unmetered terminal must not turn retained priced usage into an unpriced total"
         );
         let models: Vec<_> = usage.today_by_model.keys().map(String::as_str).collect();
