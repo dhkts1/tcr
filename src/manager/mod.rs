@@ -1311,6 +1311,8 @@ pub struct Manager {
     /// READ lock across its `usage_row` calls, which is safe precisely because
     /// no path ever runs the other way round.
     usage: crate::usage::UsageTracker,
+    /// Runtime-only, cold quota fits indexed by the same stable slots as accounts.
+    forecast: Mutex<Vec<crate::forecast::Calibration>>,
     /// Resolved hard-lock target (index of the account named by `config.lockAccount`),
     /// or `None` when unlocked / the name did not match. For its own provider,
     /// [`Self::select`] returns `i` (bypassing rotation/affinity/migration) with
@@ -1733,6 +1735,11 @@ impl Manager {
 
         let manager = Arc::new(Self {
             me: std::sync::OnceLock::new(),
+            forecast: Mutex::new(
+                (0..accounts.len())
+                    .map(|_| crate::forecast::Calibration::default())
+                    .collect(),
+            ),
             accounts: RwLock::new(accounts),
             usage,
             refresher,

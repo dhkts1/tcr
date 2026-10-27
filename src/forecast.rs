@@ -1,3 +1,606 @@
+//! Demand estimates and cold, runtime-only quota calibration. Nothing here selects an
+//! account or fetches a reading. The ledger owns demand, and the Manager supplies exact
+//! completed usage vectors and quiescent readings while holding its account lock.
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use serde::Serialize;
+
+use crate::{provider::Provider, usage::UsageRecord};
+
+const HOUR_MS: i64 = 3_600_000;
+const HISTORY_HOURS: i64 = 672;
+const MAX_SAMPLES: usize = 2048;
+type Tokens = BTreeMap<String, [u64; 2]>;
+
+fn family(provider: Provider, model: Option<&str>) -> Option<String> {
+    let model = model.filter(|model| !model.is_empty())?;
+    match provider {
+        Provider::Anthropic => crate::model::family(model).map(str::to_owned),
+        Provider::Codex => Some(model.to_owned()),
+    }
+}
+
+fn vector(record: &UsageRecord) -> Option<[u64; 2]> {
+    let input = record
+        .input
+        .checked_add(record.cache_5m)?
+        .checked_add(record.cache_1h)?;
+    (input.checked_add(record.cache_read)? == record.quota_input
+        && record.reasoning <= record.output)
+        .then_some([input, record.output])
+}
+
+fn add(target: &mut [u64; 2], value: [u64; 2]) -> Option<()> {
+    let next = [
+        target[0].checked_add(value[0])?,
+        target[1].checked_add(value[1])?,
+    ];
+    *target = next;
+    Some(())
+}
+
+/// Input-equivalent tokens for one whole percent, and output's relative cost.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Scale {
+    pub tokens_per_percent: f64,
+    pub output_weight: f64,
+}
+
+#[derive(Debug, Clone)]
+struct Anchor {
+    at: i64,
+    reset: i64,
+    percent: f64,
+    tokens: Tokens,
+}
+
+#[derive(Debug, Default)]
+struct WindowFit {
+    anchor: Option<Anchor>,
+    samples: VecDeque<(Tokens, f64)>,
+    scales: BTreeMap<String, Scale>,
+}
+
+impl WindowFit {
+    fn invalidate(&mut self) {
+        self.anchor = None;
+        self.samples.clear();
+        self.scales.clear();
+    }
+
+    fn observe(&mut self, bucket: Option<crate::probe::UsageBucket>, now: i64, tokens: Tokens) {
+        let reading = bucket
+            .and_then(|b| Some((b.utilization?, b.reset_at_ms?)))
+            .filter(|(u, reset)| u.is_finite() && *u >= 0.0 && *reset > now);
+        let Some((u, reset)) = reading else {
+            self.invalidate();
+            return;
+        };
+        let current = Anchor {
+            at: now,
+            reset,
+            // Whole-percent decimal readings such as 0.29 can multiply to the
+            // preceding float. Compensate only for multiplication roundoff.
+            percent: (100.0 * u + 8.0 * f64::EPSILON * (100.0 * u).abs()).floor(),
+            tokens,
+        };
+        let Some(prior) = self.anchor.take() else {
+            self.anchor = Some(current);
+            return;
+        };
+        if now <= prior.at
+            || now >= prior.reset
+            || reset.abs_diff(prior.reset) > 120_000
+            || current.percent < prior.percent
+        {
+            self.anchor = Some(current);
+            return;
+        }
+        if current.percent == prior.percent {
+            // Several completed requests can fit inside one quantized tick. Keep the
+            // original watermark until a rising tick brackets all of them.
+            self.anchor = Some(prior);
+            return;
+        }
+        let mut delta = Tokens::new();
+        for (family, values) in &current.tokens {
+            let before = prior.tokens.get(family).copied().unwrap_or_default();
+            let Some(x) = values[0].checked_sub(before[0]) else {
+                self.invalidate();
+                return;
+            };
+            let Some(o) = values[1].checked_sub(before[1]) else {
+                self.invalidate();
+                return;
+            };
+            if x != 0 || o != 0 {
+                delta.insert(family.clone(), [x, o]);
+            }
+        }
+        if delta.is_empty() {
+            // A rising percent without exact classified tokens is unexplained.
+            self.invalidate();
+        } else {
+            self.samples
+                .push_back((delta, current.percent - prior.percent));
+            if self.samples.len() > MAX_SAMPLES {
+                self.samples.pop_front();
+            }
+            self.scales = fit(&self.samples).unwrap_or_default();
+        }
+        self.anchor = Some(current);
+    }
+}
+
+/// One stable account slot. No identity, anchors or fit is persisted at restart.
+#[derive(Debug, Default)]
+pub(crate) struct Calibration {
+    tokens: Tokens,
+    windows: [WindowFit; 3],
+    last_reading: Option<i64>,
+}
+
+impl Calibration {
+    pub(crate) fn record(&mut self, record: &UsageRecord) {
+        let known = family(record.provider, record.model.as_deref()).zip(vector(record));
+        let Some((family, value)) = known else {
+            self.invalidate();
+            return;
+        };
+        if self.last_reading.is_some_and(|at| record.ts_ms <= at)
+            || add(self.tokens.entry(family).or_default(), value).is_none()
+        {
+            self.invalidate();
+        }
+    }
+
+    fn invalidate(&mut self) {
+        for window in &mut self.windows {
+            window.invalidate();
+        }
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        buckets: [Option<crate::probe::UsageBucket>; 3],
+        now: i64,
+        unfinished: bool,
+    ) {
+        if unfinished || self.last_reading.is_some_and(|prior| now < prior) {
+            self.invalidate();
+            self.last_reading = Some(now);
+            return;
+        }
+        self.last_reading = Some(now);
+        for (idx, (window, bucket)) in self.windows.iter_mut().zip(buckets).enumerate() {
+            let tokens = self
+                .tokens
+                .iter()
+                .filter(|(family, _)| idx != 2 || *family == "fable")
+                .map(|(family, tokens)| (family.clone(), *tokens))
+                .collect();
+            window.observe(bucket, now, tokens);
+        }
+    }
+
+    pub(crate) fn scale(&self, window: usize, family: &str) -> Option<Scale> {
+        self.windows.get(window)?.scales.get(family).copied()
+    }
+
+    pub(crate) fn ready(&self, families: &BTreeSet<String>, scoped: bool) -> bool {
+        !families.is_empty()
+            && families.iter().all(|family| {
+                (0..if scoped && family == "fable" { 3 } else { 2 }).all(|w| {
+                    self.scale(w, family).is_some_and(|scale| {
+                        scale.tokens_per_percent > 0.0 && scale.output_weight > 0.0
+                    })
+                })
+            })
+    }
+}
+
+/// Column-scaled nonnegative least squares. Full rank is checked independently of the
+/// nonnegative solve; positive finite coefficients and whole-percent RMS gate readiness.
+fn fit(samples: &VecDeque<(Tokens, f64)>) -> Option<BTreeMap<String, Scale>> {
+    let families: Vec<_> = samples
+        .iter()
+        .flat_map(|(x, _)| x.keys().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let n = 2 * families.len();
+    if n == 0 || samples.len() < 10 * n {
+        return None;
+    }
+    let xs: Vec<Vec<f64>> = samples
+        .iter()
+        .map(|(row, _)| {
+            families
+                .iter()
+                .flat_map(|family| {
+                    row.get(family)
+                        .copied()
+                        .unwrap_or_default()
+                        .map(|v| v as f64)
+                })
+                .collect()
+        })
+        .collect();
+    let norms: Vec<f64> = (0..n)
+        .map(|col| xs.iter().map(|x| x[col] * x[col]).sum::<f64>().sqrt())
+        .collect();
+    if norms.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return None;
+    }
+    let xs: Vec<Vec<f64>> = xs
+        .into_iter()
+        .map(|row| row.iter().zip(&norms).map(|(x, s)| x / s).collect())
+        .collect();
+    let mut ata = vec![vec![0.0; n]; n];
+    let mut aty = vec![0.0; n];
+    for (row, (_, y)) in xs.iter().zip(samples) {
+        for a in 0..n {
+            aty[a] += row[a] * y;
+            for b in 0..n {
+                ata[a][b] += row[a] * row[b];
+            }
+        }
+    }
+    let mut rank = ata.clone();
+    for col in 0..n {
+        let pivot = (col..n).max_by(|&a, &b| rank[a][col].abs().total_cmp(&rank[b][col].abs()))?;
+        if rank[pivot][col].abs() < 1e-10 {
+            return None;
+        }
+        rank.swap(pivot, col);
+        let p = rank[col][col];
+        for value in &mut rank[col][col..] {
+            *value /= p;
+        }
+        let (above, below) = rank.split_at_mut(col + 1);
+        let pivot_row = &above[col];
+        for row in below {
+            let f = row[col];
+            for (value, pivot) in row[col..].iter_mut().zip(&pivot_row[col..]) {
+                *value -= f * pivot;
+            }
+        }
+    }
+    let mut weights = vec![0.0_f64; n];
+    let mut converged = false;
+    for _ in 0..10_000 {
+        let mut change = 0.0_f64;
+        for col in 0..n {
+            let rest: f64 = (0..n)
+                .filter(|&j| j != col)
+                .map(|j| ata[col][j] * weights[j])
+                .sum();
+            let next = ((aty[col] - rest) / ata[col][col]).max(0.0);
+            change = change.max((next - weights[col]).abs());
+            weights[col] = next;
+        }
+        if change < 1e-10 {
+            converged = true;
+            break;
+        }
+    }
+    if !converged {
+        return None;
+    }
+    let rms = (xs
+        .iter()
+        .zip(samples)
+        .map(|(row, (_, y))| {
+            (row.iter().zip(&weights).map(|(x, w)| x * w).sum::<f64>() - y).powi(2)
+        })
+        .sum::<f64>()
+        / samples.len() as f64)
+        .sqrt();
+    if !rms.is_finite() || rms > 1.0 {
+        return None;
+    }
+    let weights: Vec<f64> = weights.iter().zip(norms).map(|(w, s)| w / s).collect();
+    let mut result = BTreeMap::new();
+    for (idx, family) in families.into_iter().enumerate() {
+        let (a, b) = (weights[2 * idx], weights[2 * idx + 1]);
+        let scale = Scale {
+            tokens_per_percent: 1.0 / a,
+            output_weight: b / a,
+        };
+        if a <= 0.0
+            || b <= 0.0
+            || !scale.tokens_per_percent.is_finite()
+            || !scale.output_weight.is_finite()
+        {
+            return None;
+        }
+        result.insert(family, scale);
+    }
+    Some(result)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub(crate) struct Level {
+    pub input: f64,
+    pub output: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct Band {
+    pub lower: Level,
+    pub upper: Level,
+}
+
+/// Only aggregates reach the routing document. Account/session identity stays in its owner.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderEstimate {
+    pub provider: Provider,
+    pub history_hours: f64,
+    pub profile: Vec<f64>,
+    pub level: BTreeMap<String, Level>,
+    pub band: BTreeMap<String, Band>,
+    pub calibrated: bool,
+    #[serde(skip)]
+    pub partial: bool,
+}
+
+#[derive(Debug, Default)]
+struct ProviderHistory {
+    hours: BTreeMap<i64, Tokens>,
+    minutes: BTreeMap<i64, Tokens>,
+    covered: BTreeSet<i64>,
+    first: Option<i64>,
+}
+
+/// 28 days of demand, separate from ordinary usage totals and calibration. Missing files
+/// contribute no coverage. Malformed, unknown or lost evidence marks the whole snapshot partial.
+#[derive(Debug)]
+pub(crate) struct History {
+    providers: [ProviderHistory; 2],
+    live_since: i64,
+    newest: i64,
+    pub(crate) partial: bool,
+}
+
+const fn slot(provider: Provider) -> usize {
+    match provider {
+        Provider::Anthropic => 0,
+        Provider::Codex => 1,
+    }
+}
+
+const fn week_hour(hour: i64) -> usize {
+    // Unix epoch was Thursday. Monday is the first profile slot.
+    (hour + 3 * 24).rem_euclid(168) as usize
+}
+
+impl History {
+    pub(crate) fn new(now: i64) -> Self {
+        Self {
+            providers: Default::default(),
+            live_since: now,
+            newest: now,
+            partial: false,
+        }
+    }
+
+    pub(crate) fn record(&mut self, record: &UsageRecord) {
+        let Some((family, value)) =
+            family(record.provider, record.model.as_deref()).zip(vector(record))
+        else {
+            self.partial = true;
+            return;
+        };
+        self.newest = self.newest.max(record.ts_ms);
+        let hour = record.ts_ms.div_euclid(HOUR_MS);
+        let oldest = self.newest.div_euclid(HOUR_MS) - HISTORY_HOURS;
+        if hour < oldest {
+            return;
+        }
+        let history = &mut self.providers[slot(record.provider)];
+        history.first = Some(
+            history
+                .first
+                .map_or(record.ts_ms, |first| first.min(record.ts_ms)),
+        );
+        if add(
+            history
+                .hours
+                .entry(hour)
+                .or_default()
+                .entry(family.clone())
+                .or_default(),
+            value,
+        )
+        .is_none()
+            || add(
+                history
+                    .minutes
+                    .entry(record.ts_ms.div_euclid(60_000))
+                    .or_default()
+                    .entry(family)
+                    .or_default(),
+                value,
+            )
+            .is_none()
+        {
+            self.partial = true;
+        }
+        for provider in &mut self.providers {
+            provider.hours.retain(|h, _| *h >= oldest);
+            provider.covered.retain(|h| *h >= oldest);
+            provider
+                .minutes
+                .retain(|m, _| *m >= self.newest.div_euclid(60_000) - 60);
+        }
+    }
+
+    pub(crate) fn cover_day(&mut self, start: i64, end: i64) {
+        for provider in &mut self.providers {
+            if let Some(first) = provider.first {
+                let from = start.max(first).div_euclid(HOUR_MS);
+                for hour in from..end.div_euclid(HOUR_MS) {
+                    if hour * HOUR_MS >= first {
+                        provider.covered.insert(hour);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn estimates(&self, now: i64) -> Vec<ProviderEstimate> {
+        let current = now.div_euclid(HOUR_MS);
+        Provider::ALL
+            .into_iter()
+            .filter_map(|provider| {
+                let history = &self.providers[slot(provider)];
+                history.first?;
+                let live = self.live_since;
+                let live_start =
+                    live.div_euclid(HOUR_MS) + i64::from(live.rem_euclid(HOUR_MS) != 0);
+                let covered: BTreeSet<i64> = history
+                    .covered
+                    .iter()
+                    .copied()
+                    .chain(live_start..current)
+                    .filter(|h| *h >= current - HISTORY_HOURS && *h < current)
+                    .collect();
+                if covered.is_empty() {
+                    return None;
+                }
+                let hours = covered.len() as f64;
+                let mut sums = [0.0; 168];
+                let mut counts = [0.0; 168];
+                let mut families = BTreeSet::new();
+                for &hour in &covered {
+                    let idx = week_hour(hour);
+                    counts[idx] += 1.0;
+                    if let Some(tokens) = history.hours.get(&hour) {
+                        sums[idx] += tokens
+                            .values()
+                            .map(|v| v[0] as f64 + v[1] as f64)
+                            .sum::<f64>();
+                        families.extend(tokens.keys().cloned());
+                    }
+                }
+                if families.is_empty() {
+                    return None;
+                }
+                let mean = sums.iter().sum::<f64>() / hours;
+                let shrink = (hours / 168.0).min(1.0);
+                let mut profile: Vec<f64> = sums
+                    .iter()
+                    .zip(counts)
+                    .map(|(sum, count)| {
+                        let rate = if count > 0.0 { sum / count } else { mean };
+                        if mean > 0.0 {
+                            1.0 - shrink + shrink * rate / mean
+                        } else {
+                            1.0
+                        }
+                    })
+                    .collect();
+                let norm = profile.iter().sum::<f64>() / 168.0;
+                for p in &mut profile {
+                    *p /= norm;
+                }
+                let mut level = BTreeMap::new();
+                let mut band = BTreeMap::new();
+                for family in families {
+                    let mut l = [0.0; 2];
+                    let mut residual = [0.0; 2];
+                    for (index, &hour) in covered.iter().enumerate() {
+                        let value = history
+                            .hours
+                            .get(&hour)
+                            .and_then(|v| v.get(&family))
+                            .copied()
+                            .unwrap_or_default();
+                        let p = profile[week_hour(hour)];
+                        if p <= 0.0 {
+                            continue;
+                        }
+                        for dim in 0..2 {
+                            let rate = value[dim] as f64 / p;
+                            if index == 0 {
+                                l[dim] = rate;
+                            } else {
+                                residual[dim] =
+                                    0.75 * residual[dim] + 0.25 * (rate - l[dim]).powi(2);
+                                l[dim] = 0.75 * l[dim] + 0.25 * rate;
+                            }
+                        }
+                    }
+                    // The existing minute granularity supplies the most recent complete hour.
+                    // Use it only when all 60 minutes are covered by this process or retained days.
+                    let minute = now.div_euclid(60_000);
+                    let recent_known = (minute - 60..minute)
+                        .all(|m| covered.contains(&m.div_euclid(60)) || m * 60_000 >= live);
+                    if recent_known {
+                        let mut recent = [0.0; 2];
+                        for (m, tokens) in history.minutes.range(minute - 60..minute) {
+                            if let Some(value) = tokens.get(&family) {
+                                let p = profile[week_hour(m.div_euclid(60))];
+                                if p > 0.0 {
+                                    for dim in 0..2 {
+                                        recent[dim] += value[dim] as f64 / p;
+                                    }
+                                }
+                            }
+                        }
+                        // At an hour boundary that same hour already entered the EWMA.
+                        if now.rem_euclid(HOUR_MS) >= 60_000 {
+                            for dim in 0..2 {
+                                l[dim] = 0.75 * l[dim] + 0.25 * recent[dim];
+                            }
+                        }
+                    }
+                    let mut lower = [0.0; 2];
+                    let mut upper = [0.0; 2];
+                    for dim in 0..2 {
+                        let s = residual[dim]
+                            .sqrt()
+                            .max(l[dim] / hours.max(1.0).sqrt())
+                            .max(if hours < 168.0 { l[dim] } else { 0.0 });
+                        lower[dim] = (l[dim] - 2.0 * s).max(0.0);
+                        upper[dim] = l[dim] + 2.0 * s;
+                    }
+                    level.insert(
+                        family.clone(),
+                        Level {
+                            input: l[0],
+                            output: l[1],
+                        },
+                    );
+                    band.insert(
+                        family,
+                        Band {
+                            lower: Level {
+                                input: lower[0],
+                                output: lower[1],
+                            },
+                            upper: Level {
+                                input: upper[0],
+                                output: upper[1],
+                            },
+                        },
+                    );
+                }
+                Some(ProviderEstimate {
+                    provider,
+                    history_hours: hours,
+                    profile,
+                    level,
+                    band,
+                    calibrated: false,
+                    partial: self.partial,
+                })
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
