@@ -607,6 +607,231 @@ impl History {
 }
 
 #[cfg(test)]
+mod response_header_tests {
+    use crate::config::{Account, Config};
+    use crate::manager::Manager;
+    use crate::provider::Provider;
+
+    fn headers(provider: Provider, percent: u64, start: i64) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let fields: Vec<(String, String)> = match provider {
+            Provider::Anthropic => ["5h", "7d", "7d_oi"]
+                .into_iter()
+                .flat_map(|window| {
+                    let reset = start + if window == "5h" { 18_000 } else { 604_800 };
+                    [
+                        (
+                            format!("anthropic-ratelimit-unified-{window}-utilization"),
+                            format!("{}", percent as f64 / 100.0),
+                        ),
+                        (
+                            format!("anthropic-ratelimit-unified-{window}-reset"),
+                            reset.to_string(),
+                        ),
+                    ]
+                })
+                .collect(),
+            Provider::Codex => [("primary", 10080, 604_800), ("secondary", 300, 18_000)]
+                .into_iter()
+                .flat_map(|(slot, minutes, seconds)| {
+                    [
+                        (format!("x-codex-{slot}-used-percent"), percent.to_string()),
+                        (
+                            format!("x-codex-{slot}-window-minutes"),
+                            minutes.to_string(),
+                        ),
+                        (
+                            format!("x-codex-{slot}-reset-at"),
+                            (start + seconds).to_string(),
+                        ),
+                    ]
+                })
+                .collect(),
+        };
+        for (name, value) in fields {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn forecast_response_headers_calibrate_both_providers_and_reject_unfinished_or_missing_reset() {
+        let mut second = Account::fixture("bob@example.com");
+        second.provider = Provider::Codex;
+        let mut config = Config::fixture(vec![Account::fixture("alice@example.com"), second]);
+        config.upstream = "http://127.0.0.1:1".into();
+        config.codex_upstream = "http://127.0.0.1:1".into();
+        let manager = Manager::with_live_refresher(config, None);
+        let start = time::OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap();
+        let models = ["claude-fable-5", "gpt-example"];
+        for (idx, model) in models.iter().enumerate() {
+            manager.record_usage(
+                idx,
+                crate::usage::UsageRecord::from_quota_input(
+                    start.unix_timestamp() * 1000,
+                    Some((*model).into()),
+                    None,
+                    100,
+                    0,
+                    0,
+                    0,
+                    25,
+                ),
+            );
+        }
+        let now = start + time::Duration::hours(2);
+        for (idx, provider) in Provider::ALL.into_iter().enumerate() {
+            manager.update_quota_at(
+                idx,
+                &headers(provider, 10, start.unix_timestamp()),
+                200,
+                now,
+            );
+            for step in 1..=24 {
+                let at = now + time::Duration::seconds(step * 2);
+                let (input, output) = if step % 2 == 0 { (100, 0) } else { (0, 25) };
+                manager.record_usage(
+                    idx,
+                    crate::usage::UsageRecord::from_quota_input(
+                        (at.unix_timestamp_nanos() / 1_000_000) as i64 - 1,
+                        Some(models[idx].into()),
+                        None,
+                        input,
+                        0,
+                        0,
+                        0,
+                        output,
+                    ),
+                );
+                manager.update_quota_at(
+                    idx,
+                    &headers(provider, 10 + step as u64, start.unix_timestamp()),
+                    200,
+                    at,
+                );
+            }
+        }
+        let at = now + time::Duration::seconds(50);
+        let forecast = crate::routing::document(&manager, at)
+            .unwrap()
+            .forecast
+            .unwrap();
+        assert!(
+            forecast["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["calibrated"] == true),
+            "response-header ticks must calibrate every reported window"
+        );
+        let flight = manager.enter_in_flight_at(0, at);
+        manager.update_quota_at(
+            0,
+            &headers(Provider::Anthropic, 34, start.unix_timestamp()),
+            200,
+            at,
+        );
+        let forecast = crate::routing::document(&manager, at)
+            .unwrap()
+            .forecast
+            .unwrap();
+        assert_eq!(
+            forecast["providers"][0]["calibrated"], false,
+            "unfinished requests cannot bracket exact vectors"
+        );
+        drop(flight);
+        let mut incomplete = headers(Provider::Codex, 34, start.unix_timestamp());
+        incomplete.remove("x-codex-primary-reset-at");
+        manager.update_quota_at(1, &incomplete, 200, at);
+        let forecast = crate::routing::document(&manager, at)
+            .unwrap()
+            .forecast
+            .unwrap();
+        assert_eq!(
+            forecast["providers"][1]["calibrated"], false,
+            "a synthesized reset is not calibration evidence"
+        );
+    }
+    #[test]
+    fn forecast_quiescent_probes_keep_history_across_unfinished_header_readings() {
+        let mut config = Config::fixture(vec![Account::fixture("alice@example.com")]);
+        config.upstream = "http://127.0.0.1:1".into();
+        let manager = Manager::with_live_refresher(config, None);
+        let start = time::OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap();
+        manager.record_usage(
+            0,
+            crate::usage::UsageRecord::from_quota_input(
+                start.unix_timestamp() * 1000,
+                Some("claude-fable-5".into()),
+                None,
+                100,
+                0,
+                0,
+                0,
+                25,
+            ),
+        );
+        let now = start + time::Duration::hours(2);
+        let tick = |percent: u64| {
+            let bucket = |seconds| {
+                Some(crate::probe::UsageBucket {
+                    utilization: Some(percent as f64 / 100.0),
+                    reset_at_ms: Some((start.unix_timestamp() + seconds) * 1000),
+                })
+            };
+            crate::probe::Usage {
+                five_hour: bucket(18_000),
+                seven_day: bucket(604_800),
+                seven_day_oi: bucket(604_800),
+                ..Default::default()
+            }
+        };
+        manager.apply_usage_at(0, &tick(10), now);
+        for step in 1..=24 {
+            let at = now + time::Duration::seconds(step * 2);
+            let flight = manager.enter_in_flight_at(0, at - time::Duration::seconds(1));
+            manager.update_quota_at(
+                0,
+                &headers(
+                    Provider::Anthropic,
+                    10 + step as u64,
+                    start.unix_timestamp(),
+                ),
+                200,
+                at - time::Duration::milliseconds(2),
+            );
+            let (input, output) = if step % 2 == 0 { (100, 0) } else { (0, 25) };
+            manager.record_usage(
+                0,
+                crate::usage::UsageRecord::from_quota_input(
+                    (at.unix_timestamp_nanos() / 1_000_000) as i64 - 1,
+                    Some("claude-fable-5".into()),
+                    None,
+                    input,
+                    0,
+                    0,
+                    0,
+                    output,
+                ),
+            );
+            drop(flight);
+            manager.apply_usage_at(0, &tick(10 + step as u64), at);
+        }
+        let forecast = crate::routing::document(&manager, now + time::Duration::seconds(50))
+            .unwrap()
+            .forecast
+            .unwrap();
+        assert_eq!(
+            forecast["providers"][0]["calibrated"], true,
+            "unfinished header readings must not discard quiescent probe evidence"
+        );
+    }
+}
+
+#[cfg(test)]
 mod record_clock_tests {
     #[test]
     fn forecast_live_history_uses_the_explicit_record_clock() {
