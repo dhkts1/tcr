@@ -1901,7 +1901,20 @@ async fn send_loopback(
     path: &str,
     build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, Unreached> {
+    send_loopback_with_redirect_policy(config, path, reqwest::redirect::Policy::default(), build)
+        .await
+}
+
+/// The loopback transport with an explicit redirect policy for reads that must stay
+/// on the configured endpoint. Other callers retain the client's default policy.
+async fn send_loopback_with_redirect_policy(
+    config: &Config,
+    path: &str,
+    redirects: reqwest::redirect::Policy,
+    build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, Unreached> {
     let client = crate::http_client::builder()
+        .redirect(redirects)
         .no_proxy()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
@@ -3545,6 +3558,96 @@ async fn fetch_live_status_body(config: &Config) -> Result<String, LiveStatusErr
         .text()
         .await
         .map_err(|e| LiveStatusError::Unusable(format!("reading the response body: {e}")))
+}
+
+/// Why `tcr routing --json` printed no document.
+#[derive(Debug)]
+pub(crate) enum RoutingReadError {
+    /// The connection was refused: no proxy is listening.
+    NoServer,
+    /// Something may be there, but nothing it gave back is a readable schema-1 document: it
+    /// refused the key, answered an HTTP error, did not answer in time, or sent something else.
+    Unreadable(String),
+}
+
+impl RoutingReadError {
+    /// `tcr routing --json`'s exit: 3 when no proxy is listening, 4 for every other way of not
+    /// reading the document; 0 is the document printed. A launcher branches on these, so they
+    /// are a contract. 1 stays every verb's own error, an unreadable config among them.
+    pub(crate) const fn exit_code(&self) -> i32 {
+        match self {
+            Self::NoServer => 3,
+            Self::Unreadable(_) => 4,
+        }
+    }
+
+    fn why(&self) -> &str {
+        match self {
+            Self::NoServer => "nothing is listening",
+            Self::Unreadable(why) => why,
+        }
+    }
+}
+
+impl From<Unreached> for RoutingReadError {
+    fn from(unreached: Unreached) -> Self {
+        match unreached {
+            Unreached::Refused => Self::NoServer,
+            Unreached::Silent(why) | Unreached::Unbuilt(why) => Self::Unreadable(why),
+        }
+    }
+}
+
+/// The running proxy's [`crate::proxy::ROUTING_PATH`] answer, as the bytes it sent, once
+/// [`crate::routing::parse`] has read them as schema 1.
+async fn fetch_routing_body(config: &Config) -> Result<String, RoutingReadError> {
+    let response = send_loopback_with_redirect_policy(
+        config,
+        crate::proxy::ROUTING_PATH,
+        reqwest::redirect::Policy::none(),
+        |client, url| client.get(url),
+    )
+    .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let hint = if status.as_u16() == 401 {
+            " — the proxy api-key in the config was rejected"
+        } else {
+            ""
+        };
+        return Err(RoutingReadError::Unreadable(format!("HTTP {status}{hint}")));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|e| RoutingReadError::Unreadable(format!("reading the response body: {e}")))?;
+    crate::routing::parse(&body).map_err(RoutingReadError::Unreadable)?;
+    Ok(body)
+}
+
+/// `tcr routing --json`: print the running proxy's routing document ([`crate::routing`]) and
+/// return the exit code ([`RoutingReadError::exit_code`]).
+///
+/// On failure stdout stays empty and the reason goes to stderr. Nothing is built offline:
+/// whether a model is routable is the running selector's answer, and a document made without
+/// that selector would describe one that is not serving.
+pub async fn routing(config_path: &Path) -> anyhow::Result<i32> {
+    // Read-only verb: plain load, no clobber-warning (we never save).
+    let config = load_config(config_path)?;
+    match fetch_routing_body(&config).await {
+        Ok(body) => {
+            println!("{}", body.trim_end());
+            Ok(0)
+        }
+        Err(error) => {
+            eprintln!(
+                "[tcr] could not read the routing document from the proxy on 127.0.0.1:{} ({})",
+                config.proxy.port,
+                error.why()
+            );
+            Ok(error.exit_code())
+        }
+    }
 }
 
 /// One probe of the incumbent on the port, answering BOTH questions the startup
@@ -12645,6 +12748,73 @@ mod tests {
                  imports that one with guarded token updates shared through auth.json"
                     .to_string(),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    /// **`tcr routing --json` exits 3 only when nothing listens**: a refused connection is
+    /// the one way no proxy answered. Silence, and a client that could not be built, are 4,
+    /// with every answer that is not a readable schema-1 document.
+    #[test]
+    fn routing_exits_3_only_when_nothing_listens() {
+        assert_eq!(RoutingReadError::from(Unreached::Refused).exit_code(), 3);
+        for unreached in [
+            Unreached::Silent("the server did not answer within 5s".to_string()),
+            Unreached::Unbuilt("http client: no TLS".to_string()),
+        ] {
+            assert_eq!(RoutingReadError::from(unreached).exit_code(), 4);
+        }
+        assert_eq!(
+            RoutingReadError::Unreadable("HTTP 500".to_string()).exit_code(),
+            4
+        );
+    }
+    #[tokio::test]
+    async fn reviewer_routing_rejects_an_http_redirect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/unrelated-service\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let target_task = tokio::spawn(async move {
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_secs(2), target.accept()).await
+            {
+                let mut request = [0u8; 4096];
+                let n = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..n]).to_string();
+                let body = r#"{"schema":1,"generatedAt":"2026-10-26T00:00:00Z","build":{"sha":"fake","dirty":false,"builtAt":"2026-10-26T00:00:00Z"},"providers":[],"forecast":null}"#;
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                Some(request)
+            } else {
+                None
+            }
+        });
+        let mut config = Config::fixture(vec![]);
+        config.proxy.port = origin_port;
+        config.proxy.api_key = Some("fake-routing-key".to_string());
+        let result = fetch_routing_body(&config).await;
+        origin_task.await.unwrap();
+        let forwarded = target_task.await.unwrap();
+        assert!(
+            result.is_err(),
+            "HTTP 302 must be unreadable, redirected answer was accepted; request at second service: {forwarded:?}"
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.exit_code(), 4);
+        assert!(
+            forwarded.is_none(),
+            "a redirect target must receive no request or API key"
         );
     }
 }

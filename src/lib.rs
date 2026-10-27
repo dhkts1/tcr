@@ -55,6 +55,7 @@ pub mod quota;
 pub mod request_body;
 pub mod request_key;
 pub mod restart;
+pub mod routing;
 pub mod save_gate;
 pub mod schedule;
 pub mod server;
