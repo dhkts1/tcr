@@ -355,11 +355,11 @@ struct ProviderHistory {
 
 /// 28 days of demand, separate from ordinary usage totals and calibration. Missing files
 /// contribute no coverage. Malformed, unknown or lost evidence marks the whole snapshot partial.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct History {
     providers: [ProviderHistory; 2],
-    live_since: i64,
-    newest: i64,
+    live_since: Option<i64>,
+    newest: Option<i64>,
     pub(crate) partial: bool,
 }
 
@@ -379,8 +379,8 @@ impl History {
     pub(crate) fn new(now: i64) -> Self {
         Self {
             providers: Default::default(),
-            live_since: now,
-            newest: now,
+            live_since: Some(now),
+            newest: Some(now),
             partial: false,
         }
     }
@@ -392,9 +392,14 @@ impl History {
             self.partial = true;
             return;
         };
-        self.newest = self.newest.max(record.ts_ms);
+        // An empty tracker has no observed clock yet. Seed it from the first
+        // exact record, so explicit-time callers never inherit wall time.
+        self.live_since.get_or_insert(record.ts_ms);
+        let newest = self.newest.get_or_insert(record.ts_ms);
+        *newest = (*newest).max(record.ts_ms);
+        let newest = *newest;
         let hour = record.ts_ms.div_euclid(HOUR_MS);
-        let oldest = self.newest.div_euclid(HOUR_MS) - HISTORY_HOURS;
+        let oldest = newest.div_euclid(HOUR_MS) - HISTORY_HOURS;
         if hour < oldest {
             return;
         }
@@ -432,7 +437,7 @@ impl History {
             provider.covered.retain(|h| *h >= oldest);
             provider
                 .minutes
-                .retain(|m, _| *m >= self.newest.div_euclid(60_000) - 60);
+                .retain(|m, _| *m >= newest.div_euclid(60_000) - 60);
         }
     }
 
@@ -456,7 +461,7 @@ impl History {
             .filter_map(|provider| {
                 let history = &self.providers[slot(provider)];
                 history.first?;
-                let live = self.live_since;
+                let live = self.live_since?;
                 let live_start =
                     live.div_euclid(HOUR_MS) + i64::from(live.rem_euclid(HOUR_MS) != 0);
                 let covered: BTreeSet<i64> = history

@@ -1375,7 +1375,7 @@ impl UsageTracker {
             dropped: Arc::new(AtomicU64::new(0)),
             dir: Mutex::new(None),
             rebuild_gate: RwLock::new(()),
-            forecast_history: Mutex::new(crate::forecast::History::new(crate::now_ms())),
+            forecast_history: Mutex::new(crate::forecast::History::default()),
         }
     }
 
