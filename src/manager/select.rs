@@ -676,7 +676,7 @@ impl Manager {
     }
 
     /// The provider-local revalidation deadline, shared by its read and spend paths.
-    fn revalidation_valve(
+    const fn revalidation_valve(
         &self,
         provider: crate::provider::Provider,
     ) -> &std::sync::atomic::AtomicI64 {
