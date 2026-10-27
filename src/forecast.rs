@@ -39,6 +39,111 @@ fn add(target: &mut [u64; 2], value: [u64; 2]) -> Option<()> {
     Some(())
 }
 
+/// First-hand header evidence only, projected from the quota parser's result. A cached
+/// utilization or synthesized reset can still govern quota, but cannot train a fit.
+pub(crate) fn header_ticks(
+    provider: Provider,
+    headers: &reqwest::header::HeaderMap,
+    quota: &crate::quota::Quota,
+) -> Option<[Option<crate::probe::UsageBucket>; 3]> {
+    let text = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+    };
+    let reported_util = |name: &str| {
+        text(name)
+            .and_then(|s| s.parse::<f64>().ok())
+            .is_some_and(|u| u.is_finite() && u >= 0.0)
+    };
+    let epoch_reset = |name: &str| {
+        text(name)
+            .and_then(|s| s.parse::<i64>().ok())
+            .and_then(|s| time::OffsetDateTime::from_unix_timestamp(s).ok())
+    };
+    let bucket = |window: Option<crate::quota::QuotaWindow>| {
+        window.map(|window| crate::probe::UsageBucket {
+            utilization: Some(window.utilization),
+            reset_at_ms: window
+                .reset
+                .map(|reset| (reset.unix_timestamp_nanos() / 1_000_000) as i64),
+        })
+    };
+    match provider {
+        Provider::Anthropic => {
+            let windows = [
+                ("5h", quota.five_hour),
+                ("7d", quota.seven_day),
+                ("7d_oi", quota.seven_day_oi),
+            ];
+            if !windows.iter().any(|(name, _)| {
+                headers.contains_key(
+                    format!("anthropic-ratelimit-unified-{name}-utilization").as_str(),
+                )
+            }) {
+                return None;
+            }
+            Some(windows.map(|(name, window)| {
+                let utilization = format!("anthropic-ratelimit-unified-{name}-utilization");
+                let reset = format!("anthropic-ratelimit-unified-{name}-reset");
+                let reset = epoch_reset(&reset).or_else(|| {
+                    text(&reset).and_then(|s| {
+                        time::OffsetDateTime::parse(
+                            s,
+                            &time::format_description::well_known::Rfc3339,
+                        )
+                        .ok()
+                    })
+                });
+                bucket(
+                    window.filter(|w| {
+                        reported_util(&utilization) && reset.is_some() && w.reset == reset
+                    }),
+                )
+            }))
+        }
+        Provider::Codex => {
+            // The parser owns primary/secondary length mapping and same-window merging.
+            // All supplied slots need explicit resets before that merged reading is exact.
+            let mut supplied = 0;
+            for slot in ["primary", "secondary"] {
+                let utilization = format!("x-codex-{slot}-used-percent");
+                if headers.contains_key(utilization.as_str()) {
+                    supplied += 1;
+                    if !reported_util(&utilization)
+                        || epoch_reset(&format!("x-codex-{slot}-reset-at")).is_none()
+                    {
+                        return Some([None; 3]);
+                    }
+                }
+            }
+            if supplied == 0 {
+                return None;
+            }
+            let Some(reported) = quota.codex.header_windows.as_ref() else {
+                return Some([None; 3]);
+            };
+            let distinct = usize::from(reported.five_hour.is_some())
+                + usize::from(reported.seven_day.is_some());
+            if distinct != supplied {
+                return Some([None; 3]);
+            }
+            Some([
+                reported
+                    .five_hour
+                    .as_ref()
+                    .and_then(|_| bucket(quota.five_hour)),
+                reported
+                    .seven_day
+                    .as_ref()
+                    .and_then(|_| bucket(quota.seven_day)),
+                None,
+            ])
+        }
+    }
+}
+
 /// Input-equivalent tokens for one whole percent, and output's relative cost.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Scale {
@@ -166,7 +271,16 @@ impl Calibration {
         now: i64,
         unfinished: bool,
     ) {
-        if unfinished || self.last_reading.is_some_and(|prior| now < prior) {
+        if unfinished {
+            // This reading cannot bracket completed vectors. Keep the valid
+            // quiescent anchor and samples, so intervening response headers do
+            // not erase evidence between two valid probe readings.
+            for window in &mut self.windows {
+                window.scales.clear();
+            }
+            return;
+        }
+        if self.last_reading.is_some_and(|prior| now < prior) {
             self.invalidate();
             self.last_reading = Some(now);
             return;

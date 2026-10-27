@@ -99,6 +99,13 @@ impl Manager {
                             .quota
                             .update_from_codex_refusal_at(headers, status, refusal, now),
                     };
+                    if let Some(ticks) =
+                        crate::forecast::header_ticks(account.provider, headers, &account.quota)
+                    {
+                        self.with_forecast_slot(idx, |fit| {
+                            fit.observe(ticks, odt_to_ms(now), account.in_flight != 0);
+                        });
+                    }
                     let flipped = read_five_hour && !account.quota_known;
                     account.quota_known |= read_five_hour;
                     // Any response that DOES carry the 5h window is proof this
@@ -198,11 +205,7 @@ impl Manager {
                     // The same account lock serializes both this completed vector and
                     // probe watermarks. No bucket replay or cumulative quota counter is
                     // used to guess which token dimensions a percent paid for.
-                    let mut fits = self.forecast.lock().unwrap_or_else(PoisonError::into_inner);
-                    if fits.len() <= idx {
-                        fits.resize_with(idx + 1, crate::forecast::Calibration::default);
-                    }
-                    fits[idx].record(&record);
+                    self.with_forecast_slot(idx, |fit| fit.record(&record));
                     account.input_tokens += record.input_total();
                     account.output_tokens += record.output;
                     account.cache_read_tokens += record.cache_read;
@@ -445,15 +448,13 @@ impl Manager {
                         }
                     };
                     account.quota.apply_usage_at(usage, now);
-                    let mut fits = self.forecast.lock().unwrap_or_else(PoisonError::into_inner);
-                    if fits.len() <= idx {
-                        fits.resize_with(idx + 1, crate::forecast::Calibration::default);
-                    }
-                    fits[idx].observe(
-                        [usage.five_hour, usage.seven_day, usage.seven_day_oi],
-                        odt_to_ms(now),
-                        account.in_flight != 0,
-                    );
+                    self.with_forecast_slot(idx, |fit| {
+                        fit.observe(
+                            [usage.five_hour, usage.seven_day, usage.seven_day_oi],
+                            odt_to_ms(now),
+                            account.in_flight != 0,
+                        );
+                    });
                     if was_codex_refused
                         && account.quota.status.as_deref() != Some("rejected")
                         && account.hold_cause == HoldCause::RateLimit
@@ -686,6 +687,20 @@ impl Manager {
         if let Some(error) = crate::routing::ErrorKind::of_stream(kind) {
             self.record_upstream_error(provider, error);
         }
+    }
+
+    /// The single writer interface for stable calibration slots. Callers hold
+    /// the account lock, which serializes completed vectors and reading watermarks.
+    fn with_forecast_slot(
+        &self,
+        idx: usize,
+        update: impl FnOnce(&mut crate::forecast::Calibration),
+    ) {
+        let mut fits = self.forecast.lock().unwrap_or_else(PoisonError::into_inner);
+        if fits.len() <= idx {
+            fits.resize_with(idx + 1, crate::forecast::Calibration::default);
+        }
+        update(&mut fits[idx]);
     }
 
     /// Privacy-safe demand aggregates. Reading never changes selection or quota.
