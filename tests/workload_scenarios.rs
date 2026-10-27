@@ -1311,6 +1311,35 @@ fn replay_clock_controls_quota_and_holds() {
     );
 }
 
+#[test]
+fn replay_clock_controls_codex_holds() {
+    let mut a = account("alpha", 0);
+    a.provider = tcr::provider::Provider::Codex;
+    let fleet = Fleet::from_config(Config::fixture(vec![a]));
+    let now = t0();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-codex-primary-used-percent", "50".parse().unwrap());
+    headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+    assert!(fleet.manager.update_quota_at(0, &headers, 200, now));
+    assert_eq!(
+        fleet.manager.snapshot(now).accounts[0].quota_updated_at,
+        Some(now)
+    );
+    fleet.manager.mark_codex_quota_limited_at(0, 30, now);
+    let pick = |at| {
+        fleet.manager.select(
+            &HashSet::new(),
+            at,
+            Some("gpt-5.1-codex"),
+            None,
+            "/backend-api/codex/responses",
+            None,
+        )
+    };
+    assert_eq!(pick(now + Duration::seconds(29)), None);
+    assert_eq!(pick(now + Duration::seconds(31)), Some(0));
+}
+
 /// Synthetic quota replay. Only the event scheduler, upstream budget ledger and
 /// measurements live here: every routing decision calls the real Manager. The
 /// ledger is a fake upstream, not an alternative implementation of ranking.
@@ -1345,7 +1374,7 @@ mod quota_replay {
 
     struct SplitMix64(u64);
     impl SplitMix64 {
-        fn next(&mut self) -> u64 {
+        const fn next(&mut self) -> u64 {
             self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
             let mut z = self.0;
             z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -1417,6 +1446,37 @@ mod quota_replay {
         values
     }
 
+    /// Request counts have only two observed quantiles. A piecewise linear
+    /// shoulder and a uniformly apportioned top decile avoid inventing a
+    /// single giant session to absorb the missing joint-distribution data.
+    fn session_counts(n: usize, total: u64, p50: u64, p90: u64) -> Vec<u64> {
+        let knots = [
+            (0, 1),
+            (n / 2, p50),
+            (n * 7 / 10, p50 + (p90 - p50) / 4),
+            (n * 9 / 10, p90),
+            (n - 1, p90),
+        ];
+        let mut counts = vec![0; n];
+        for pair in knots.windows(2) {
+            let [(lo, a), (hi, b)] = pair else {
+                unreachable!()
+            };
+            for (i, value) in counts.iter_mut().enumerate().take(hi + 1).skip(*lo) {
+                *value = a + (b - a) * (i - lo) as u64 / (hi - lo).max(1) as u64;
+            }
+        }
+        let used = counts.iter().sum::<u64>();
+        assert!(used <= total);
+        let tail = n * 9 / 10 + 1;
+        let extra = apportioned(total - used, &vec![1; n - tail]);
+        for (value, add) in counts[tail..].iter_mut().zip(extra) {
+            *value += add;
+        }
+        counts[tail..].sort_unstable();
+        counts
+    }
+
     #[derive(Clone, Debug, Serialize)]
     struct Request {
         at: i64,
@@ -1476,7 +1536,7 @@ mod quota_replay {
                 let mut inputs = quantiles(count, input, p50, p90, p99);
                 rng.shuffle(&mut inputs);
                 let outputs = apportioned(output, &inputs);
-                let counts = quantiles(sessions, count as u64, count50, count90, count90);
+                let counts = session_counts(sessions, count as u64, count50, count90);
                 let mut families = Vec::new();
                 for (family, n) in apportioned(
                     count as u64,
@@ -1677,12 +1737,12 @@ mod quota_replay {
             } else {
                 13
             };
-            let demand = if provider == 0 {
+            let demand = f64::from(if provider == 0 {
                 46_100_000 + 4 * 9_860_000
             } else {
                 17_600_000 + 4 * 3_740_000
-            } as f64;
-            for i in 0..n {
+            });
+            for (i, reset_hour) in resets.iter().enumerate().take(n) {
                 let mut a = account(&format!("replay-{provider}-{i}"), 0);
                 a.provider = if provider == 0 {
                     Provider::Anthropic
@@ -1696,7 +1756,7 @@ mod quota_replay {
                 let weekly_reset = if mixed {
                     (i + 1) as i64 * WEEK / n as i64
                 } else {
-                    (resets[i] * HOUR as f64) as i64
+                    (reset_hour * HOUR as f64) as i64
                 };
                 slots.push(Slot {
                     provider,
@@ -1804,29 +1864,25 @@ mod quota_replay {
                             score.reasoning_served += request.output / 4;
                         }
                     }
-                    if let Some(&old) = previous.get(&request.session) {
-                        if old != i {
-                            for (ttl, count) in [
-                                (300_000, &mut score.cold_moves_5m),
-                                (HOUR, &mut score.cold_moves_1h),
-                            ] {
-                                let warm = |idx| {
-                                    prefixes
-                                        .get(&(request.session, idx))
-                                        .is_some_and(|&last| at - last < ttl)
-                                };
-                                if scored && warm(old) && !warm(i) {
-                                    *count += 1;
-                                }
+                    if let Some(&old) = previous.get(&request.session)
+                        && old != i
+                    {
+                        for (ttl, count) in [
+                            (300_000, &mut score.cold_moves_5m),
+                            (HOUR, &mut score.cold_moves_1h),
+                        ] {
+                            let warm = |idx| {
+                                prefixes
+                                    .get(&(request.session, idx))
+                                    .is_some_and(|&last| at - last < ttl)
+                            };
+                            if scored && warm(old) && !warm(i) {
+                                *count += 1;
                             }
                         }
                     }
                     previous.insert(request.session, i);
                     prefixes.insert((request.session, i), at);
-                    let charge = (request.input + weight * request.output) as f64;
-                    for w in 0..if request.family == 2 { 3 } else { 2 } {
-                        slots[i].windows[w].used += charge;
-                    }
                     let mut record = UsageRecord::from_quota_input(
                         to_ms(now),
                         Some(MODELS[request.family].into()),
@@ -1848,6 +1904,11 @@ mod quota_replay {
                     if request.provider() == 1 {
                         record.reasoning = request.output / 4;
                     }
+                    let charge = quota_cost(&record, weight);
+                    assert_eq!(charge, request.input + weight * request.output);
+                    for w in 0..if request.family == 2 { 3 } else { 2 } {
+                        slots[i].windows[w].used += charge as f64;
+                    }
                     fleet.manager.record_usage(i, record);
                     slots[i].report(&fleet.manager, i, now);
                     drop(guard);
@@ -1866,9 +1927,23 @@ mod quota_replay {
                     }
                 }
             }
+            // All resets and completions at this instant precede every retry
+            // and arrival, even when earlier work has been waiting for a slot.
+            if events
+                .first_key_value()
+                .is_some_and(|((next, _, _), _)| *next == at)
+            {
+                continue;
+            }
             for queue in &mut pending {
-                while let Some(&r) = queue.front() {
+                let mut failed_sessions = HashSet::new();
+                for _ in 0..queue.len() {
+                    let r = queue.pop_front().unwrap();
                     let request = &requests[r];
+                    if failed_sessions.contains(&request.session) {
+                        queue.push_back(r);
+                        continue;
+                    }
                     let tried = HashSet::new();
                     let picked = fleet
                         .manager
@@ -1894,10 +1969,11 @@ mod quota_replay {
                             pick
                         });
                     let Some(i) = picked else {
-                        break;
+                        failed_sessions.insert(request.session);
+                        queue.push_back(r);
+                        continue;
                     };
                     assert_eq!(slots[i].provider, request.provider());
-                    queue.pop_front();
                     let guard = fleet.manager.enter_in_flight_at(i, now);
                     schedule(
                         &mut events,
@@ -1938,7 +2014,10 @@ mod quota_replay {
     }
 
     fn digest(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     fn baseline() -> serde_json::Value {
@@ -1997,6 +2076,78 @@ mod quota_replay {
                 }
             }
         }
+    }
+
+    #[test]
+    fn session_shapes_match_the_supplied_quantiles() {
+        let requests = trace(true);
+        for provider in 0..2 {
+            let mut sessions: BTreeMap<u64, Vec<&Request>> = BTreeMap::new();
+            for request in requests
+                .iter()
+                .filter(|r| r.at < DAY && r.provider() == provider)
+            {
+                sessions.entry(request.session).or_default().push(request);
+            }
+            let mut counts: Vec<_> = sessions.values().map(Vec::len).collect();
+            let mut spans: Vec<_> = sessions
+                .values()
+                .map(|rs| rs.last().unwrap().at - rs.first().unwrap().at)
+                .collect();
+            counts.sort_unstable();
+            spans.sort_unstable();
+            let (count50, count90, span50, span90) = if provider == 0 {
+                (3, 114, 60_000, 48 * 60_000)
+            } else {
+                (37, 95, 9 * 60_000, 39 * 60_000)
+            };
+            for (percent, count, span) in [(50, count50, span50), (90, count90, span90)] {
+                let at = counts.len() * percent / 100;
+                assert!(counts[at].abs_diff(count) <= count / 20);
+                assert!((spans[at] - span).abs() <= span / 20);
+            }
+        }
+    }
+
+    const fn quota_cost(record: &UsageRecord, weight: u64) -> u64 {
+        record.input + record.cache_5m + record.cache_1h + weight * record.output
+    }
+
+    #[test]
+    fn quota_accounting_reads_are_free_and_reasoning_is_not_added_twice() {
+        let mut record =
+            UsageRecord::from_quota_input(to_ms(t0()), None, None, 1_005, 2, 3, 999, 5);
+        record.reasoning = 2;
+        assert_eq!(quota_cost(&record, 4), 26);
+        assert_eq!(quota_cost(&record, 1), 11);
+        assert_eq!(quota_cost(&record, 8), 46);
+    }
+
+    #[test]
+    fn empty_replay_has_no_lockout_or_cold_moves() {
+        let score = replay(&[], false, 4, 1.0);
+        assert_eq!(score.arrivals, 0);
+        assert_eq!(score.served, 0);
+        assert_eq!(score.backlog, 0);
+        assert_eq!(
+            score.lockout_minutes, [0.0; 2],
+            "idle exhaustion is never lockout"
+        );
+        assert_eq!((score.cold_moves_5m, score.cold_moves_1h), (0, 0));
+        let demand = f64::from(46_100_000 + 4 * 9_860_000);
+        let weekly = 7.0 * demand / (0.9 * 13.0);
+        let expected = (4..13)
+            .map(|i| weekly * (0.44 + 0.48 * f64::from(i) / 12.0))
+            .sum::<f64>();
+        assert!(
+            (score.lost_weekly - expected).abs() < 0.001,
+            "only nine weekly budgets expire after training"
+        );
+        assert_eq!(
+            score.lost_weekly, score.lost_scoped,
+            "the two distinct empty weekly budgets are counted separately"
+        );
+        assert!(score.lost_five_hour > score.lost_weekly);
     }
 
     #[test]
