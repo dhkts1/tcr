@@ -26788,7 +26788,7 @@ mod forecast_routing_tests {
         assert!(manager.update_quota(0, &headers, 200));
         served(&manager, 0, "claude-opus-5-5", None);
         let now = OffsetDateTime::now_utc();
-        let tried = std::collections::HashSet::new();
+        let tried = HashSet::new();
         assert_eq!(
             manager.select(
                 &tried,
@@ -26851,7 +26851,7 @@ mod forecast_routing_tests {
             Account::fixture("alice@example.com"),
             Account::fixture("bob@example.com"),
         ]);
-        config.control_account = Some(crate::config::ControlAccountRef::Name(
+        config.control_account = Some(config::ControlAccountRef::Name(
             "alice@example.com".to_string(),
         ));
         config
@@ -26872,7 +26872,7 @@ mod forecast_routing_tests {
         );
         assert_eq!(
             manager.select(
-                &std::collections::HashSet::new(),
+                &HashSet::new(),
                 future,
                 Some("claude-opus-5-5"),
                 None,
