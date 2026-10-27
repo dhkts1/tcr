@@ -1901,7 +1901,20 @@ async fn send_loopback(
     path: &str,
     build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, Unreached> {
+    send_loopback_with_redirect_policy(config, path, reqwest::redirect::Policy::default(), build)
+        .await
+}
+
+/// The loopback transport with an explicit redirect policy for reads that must stay
+/// on the configured endpoint. Other callers retain the client's default policy.
+async fn send_loopback_with_redirect_policy(
+    config: &Config,
+    path: &str,
+    redirects: reqwest::redirect::Policy,
+    build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, Unreached> {
     let client = crate::http_client::builder()
+        .redirect(redirects)
         .no_proxy()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
@@ -3588,9 +3601,12 @@ impl From<Unreached> for RoutingReadError {
 /// The running proxy's [`crate::proxy::ROUTING_PATH`] answer, as the bytes it sent, once
 /// [`crate::routing::parse`] has read them as schema 1.
 async fn fetch_routing_body(config: &Config) -> Result<String, RoutingReadError> {
-    let response = send_loopback(config, crate::proxy::ROUTING_PATH, |client, url| {
-        client.get(url)
-    })
+    let response = send_loopback_with_redirect_policy(
+        config,
+        crate::proxy::ROUTING_PATH,
+        reqwest::redirect::Policy::none(),
+        |client, url| client.get(url),
+    )
     .await?;
     let status = response.status();
     if !status.is_success() {

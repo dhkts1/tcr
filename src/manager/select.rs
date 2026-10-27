@@ -359,6 +359,10 @@ pub struct RoutingCandidates {
     pub accounts: Vec<usize>,
     /// Whether the request is a Fable request, the classification every pass read.
     pub is_fable: bool,
+    /// Earliest known instant these same passes can serve, when none can now.
+    pub free_at: Option<OffsetDateTime>,
+    /// Gate-owner reasons in this request's scope, without account identities.
+    pub gated: BTreeMap<GateReason, usize>,
 }
 
 impl Manager {
@@ -533,7 +537,7 @@ impl Manager {
     /// alone when set; [`PoolPass::Paced`], [`PoolPass::LeastLoaded`], and
     /// [`PoolPass::FableLastResort`] for a Fable request; then [`PoolPass::Revalidation`],
     /// which the proxy reaches when those found nothing and `revalidationServe` is on. Its
-    /// two-second window is an anti-storm valve rather than a gate, so it is not asked.
+    /// two-second valve is read without spending it, just as an unpinned serve requires.
     ///
     /// Read-only, unlike every selection: it stamps no account, pins and unpins no session
     /// and spends no revalidation window, so reading it never changes what the next
@@ -560,53 +564,125 @@ impl Manager {
         let control_excluded =
             self.control_excluded(classify_request(path), None, &accounts, &groups);
         let pool_tried = exclude_control(&unsupported, control_excluded);
-        let ask = |tried| PoolAsk {
-            tried,
-            now,
-            now_ms: odt_to_ms(now),
-            is_fable,
-            provider,
-            group: None,
-            groups: &groups,
-            locked,
-            warm,
+        // Selection spends the valve under the accounts write lock. Read it under this
+        // read lock so every pass below sees the same provider-local deadline.
+        let revalidation_at_ms = self.revalidation_valve(provider).load(Ordering::Relaxed);
+        let candidates_at = |at| {
+            let ask = |tried| PoolAsk {
+                tried,
+                now: at,
+                now_ms: odt_to_ms(at),
+                is_fable,
+                provider,
+                group: None,
+                groups: &groups,
+                locked,
+                warm,
+            };
+            let pool = ask(&pool_tried);
+            // The lock and revalidation do not see the control exclusion, matching
+            // their actual selection paths.
+            let whole = ask(&unsupported);
+            let passes: Vec<(PoolPass, &PoolAsk<'_>)> = if locked.is_some() {
+                vec![(PoolPass::Lock, &whole)]
+            } else {
+                [
+                    Some((PoolPass::Paced, &pool)),
+                    Some((PoolPass::LeastLoaded, &pool)),
+                    is_fable.then_some((PoolPass::FableLastResort, &pool)),
+                    (revalidation && odt_to_ms(at) >= revalidation_at_ms)
+                        .then_some((PoolPass::Revalidation, &whole)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect()
+            };
+            passes.into_iter().find_map(|(pass, ask)| {
+                let found: Vec<usize> = accounts
+                    .iter()
+                    .enumerate()
+                    .filter(|&(idx, account)| self.pool_candidate(pass, idx, account, ask))
+                    .map(|(idx, _)| idx)
+                    .collect();
+                (!found.is_empty()).then_some((pass, found))
+            })
         };
-        let pool = ask(&pool_tried);
-        // The lock and revalidation never see the control exclusion: the lock returns before
-        // it, and `select_revalidation` is not asked it.
-        let whole = ask(&unsupported);
-        let passes: Vec<(PoolPass, &PoolAsk<'_>)> = if locked.is_some() {
-            vec![(PoolPass::Lock, &whole)]
-        } else {
-            [
-                Some((PoolPass::Paced, &pool)),
-                Some((PoolPass::LeastLoaded, &pool)),
-                is_fable.then_some((PoolPass::FableLastResort, &pool)),
-                revalidation.then_some((PoolPass::Revalidation, &whole)),
-            ]
-            .into_iter()
-            .flatten()
-            .collect()
-        };
-        for (pass, ask) in passes {
-            let found: Vec<usize> = accounts
-                .iter()
-                .enumerate()
-                .filter(|&(idx, account)| self.pool_candidate(pass, idx, account, ask))
-                .map(|(idx, _)| idx)
-                .collect();
-            if !found.is_empty() {
-                return RoutingCandidates {
-                    pass: Some(pass),
-                    accounts: found,
-                    is_fable,
-                };
+        if let Some((pass, accounts)) = candidates_at(now) {
+            return RoutingCandidates {
+                pass: Some(pass),
+                accounts,
+                is_fable,
+                free_at: None,
+                gated: BTreeMap::new(),
+            };
+        }
+
+        // With no upstream update, these are the only instants at which an unpaced
+        // pass can change. Ask the executable filters at each one, rather than
+        // duplicating their hard/soft gates or timing against a provider-wide hint.
+        // The first successful instant is min(account max(binding clear times));
+        // a manual or unknown gate never yields a promise unless a pass can serve.
+        let mut changes = Vec::new();
+        changes.extend(ms_to_odt(revalidation_at_ms));
+        let mut gated = BTreeMap::new();
+        for (idx, account) in accounts.iter().enumerate() {
+            if account.provider != provider
+                || unsupported.contains(&idx)
+                || (!revalidation && control_excluded == Some(idx))
+            {
+                continue;
+            }
+            changes.extend(account.rate_limited_until_ms.and_then(ms_to_odt));
+            changes.extend(
+                [
+                    account.quota.five_hour,
+                    account.quota.seven_day,
+                    account.quota.seven_day_oi,
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(|window| window.live_reset(now)),
+            );
+            changes.extend(account.quota.standard_reset);
+            let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
+            let (reason, _) = Self::account_gate(
+                account,
+                threshold,
+                self.fable_weekly_threshold,
+                now,
+                odt_to_ms(now),
+                is_fable,
+                None,
+                &groups.reserved,
+                &groups.parked,
+            );
+            if reason != GateReason::Ok {
+                *gated.entry(reason).or_insert(0) += 1;
             }
         }
+        changes.sort_unstable();
+        changes.dedup();
+        let free_at = changes
+            .into_iter()
+            .filter(|&at| at > now)
+            .find(|&at| candidates_at(at).is_some());
         RoutingCandidates {
             pass: None,
             accounts: Vec::new(),
             is_fable,
+            free_at,
+            gated,
+        }
+    }
+
+    /// The provider-local revalidation deadline, shared by its read and spend paths.
+    fn revalidation_valve(
+        &self,
+        provider: crate::provider::Provider,
+    ) -> &std::sync::atomic::AtomicI64 {
+        match provider {
+            crate::provider::Provider::Anthropic => &self.next_revalidation_at_ms,
+            crate::provider::Provider::Codex => &self.next_codex_revalidation_at_ms,
         }
     }
 
@@ -2042,10 +2118,7 @@ impl Manager {
 
             // A servable candidate exists — spend the anti-storm window now (after
             // selection, so a fleet with nothing to serve never burns the valve).
-            let valve = match provider {
-                crate::provider::Provider::Anthropic => &self.next_revalidation_at_ms,
-                crate::provider::Provider::Codex => &self.next_codex_revalidation_at_ms,
-            };
+            let valve = self.revalidation_valve(provider);
             let next_at = valve.load(Ordering::Relaxed);
             if now_ms < next_at {
                 return None;

@@ -9,7 +9,7 @@
 //! Whether a model is routable is the selector's own answer,
 //! [`Manager::routing_candidates`], the candidate evaluation its picks run, never a second
 //! copy of their gates. When none can serve, why and when one frees come from
-//! [`Manager::exhaustion_hint`], the view the synthetic 429 reports.
+//! that same evaluation at the stored hold, reset and revalidation deadlines.
 //!
 //! It names no account: no name, email, organization or account id, no session, no
 //! credential and no upstream error text. `forecast` is `null` until the forecast rounds fill
@@ -34,10 +34,6 @@ pub const NONE_CAN_SERVE: &str = "no available account can serve this model now"
 
 /// `lastError.count10m`'s window, in seconds: ten minutes.
 const ERROR_WINDOW_SECS: i64 = 600;
-
-/// Most full model ids remembered per provider. They come from served responses, so a real
-/// fleet sees a handful; the cap only bounds memory against an upstream that echoes anything.
-const MODEL_IDS_CAP: usize = 64;
 
 /// The document. Its field names are the wire contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -233,10 +229,7 @@ impl Observations {
 
     /// Note that `provider` served model `id`.
     pub fn record_model(&mut self, provider: Provider, id: &str) {
-        let ids = &mut self.models[slot(provider)];
-        if !ids.contains(id) && ids.len() < MODEL_IDS_CAP {
-            ids.insert(id.to_owned());
-        }
+        self.models[slot(provider)].insert(id.to_owned());
     }
 
     /// The last error on `provider` as `(kind, at_ms, count of that kind in the ten minutes
@@ -376,12 +369,11 @@ fn model_routing(
             accounts_routable: found.accounts.len() as u32,
         });
     }
-    let hint = manager.exhaustion_hint(now, found.is_fable, provider, None);
     let gates = match provider {
-        Provider::Anthropic => crate::proxy::describe_gates(&hint.gated),
-        Provider::Codex => crate::proxy::describe_codex_gates(&hint.gated),
+        Provider::Anthropic => crate::proxy::describe_gates(&found.gated),
+        Provider::Codex => crate::proxy::describe_codex_gates(&found.gated),
     };
-    let frees_at = match hint.free_at {
+    let frees_at = match found.free_at {
         Some(at) => Some(utc(at)?),
         None => None,
     };

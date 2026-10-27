@@ -1674,7 +1674,9 @@ pub fn app(manager: Arc<Manager>) -> Router {
         // The routing document: a pure GET like the status route, registered the same way.
         .route(
             ROUTING_PATH,
-            axum::routing::get(routing_handler).fallback(routing_method_not_allowed),
+            axum::routing::get(routing_handler)
+                .head(routing_method_not_allowed)
+                .fallback(routing_method_not_allowed),
         )
         // The two MUTATING local routes. Same reasoning as above, and the method
         // fallback matters more here: an unregistered method must answer a local
