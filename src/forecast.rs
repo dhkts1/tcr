@@ -602,6 +602,43 @@ impl History {
 }
 
 #[cfg(test)]
+mod record_clock_tests {
+    #[test]
+    fn forecast_live_history_uses_the_explicit_record_clock() {
+        let tracker = crate::usage::UsageTracker::new(1, crate::pricing::PricingTable::default());
+        let at = 1_767_225_600_000_i64;
+        assert!(tracker.forecast_estimates(at).is_empty());
+        tracker.record(
+            0,
+            &crate::usage::UsageRecord::from_quota_input(
+                at,
+                Some("claude-fable-5".into()),
+                None,
+                100,
+                0,
+                0,
+                0,
+                25,
+            ),
+            "alice@example.com",
+            None,
+            None,
+        );
+        assert!(
+            tracker.forecast_estimates(at + 3_600_000 - 1).is_empty(),
+            "no full observed hour yet"
+        );
+        let estimates = tracker.forecast_estimates(at + 3_600_000);
+        assert!(
+            !estimates.is_empty(),
+            "explicit record clock must yield demand estimates"
+        );
+        assert_eq!(estimates[0].history_hours, 1.0);
+        assert!(estimates[0].level["fable"].input > 0.0);
+    }
+}
+
+#[cfg(test)]
 mod restored_forecast_call_tests {
     use crate::config::{Account, Config};
     use crate::manager::Manager;
