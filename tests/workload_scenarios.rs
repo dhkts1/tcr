@@ -1815,7 +1815,8 @@ mod quota_replay {
         }
         schedule(&mut events, TRAINING, 0, Event::Release);
         schedule(&mut events, END, 0, Event::Release);
-        let mut pending: [VecDeque<usize>; 5] = std::array::from_fn(|_| VecDeque::new());
+        let mut pending: [BTreeMap<u64, VecDeque<usize>>; 5] =
+            std::array::from_fn(|_| BTreeMap::new());
         let mut prefixes: HashMap<(u64, usize), i64> = HashMap::new();
         let mut previous: HashMap<u64, usize> = HashMap::new();
         let mut score = Score::default();
@@ -1919,7 +1920,10 @@ mod quota_replay {
                 }
                 Event::Release => {}
                 Event::Arrival(r) => {
-                    pending[requests[r].family].push_back(r);
+                    pending[requests[r].family]
+                        .entry(requests[r].session)
+                        .or_default()
+                        .push_back(r);
                     if at >= TRAINING {
                         score.arrivals += 1;
                         score.input_arrived += requests[r].input;
@@ -1935,15 +1939,60 @@ mod quota_replay {
             {
                 continue;
             }
-            for queue in &mut pending {
-                let mut failed_sessions = HashSet::new();
-                for _ in 0..queue.len() {
-                    let r = queue.pop_front().unwrap();
+            for (family, queue) in pending.iter_mut().enumerate() {
+                if queue.is_empty() {
+                    continue;
+                }
+                // The selector's own read reports terminal rejection, shared by
+                // pooled and pinned work. Once every account is rejected, one
+                // failed real pick proves the remaining sessions cannot serve.
+                // Do not infer this from a soft threshold or an empty pool.
+                let first = *queue.values().next().unwrap().front().unwrap();
+                let request = &requests[first];
+                let routed =
+                    fleet
+                        .manager
+                        .routing_candidates(now, Some(MODELS[family]), request.path());
+                let provider_accounts = slots
+                    .iter()
+                    .filter(|slot| slot.provider == request.provider())
+                    .count();
+                let all_rejected = routed.pass.is_none()
+                    && routed.gated.get(&tcr::stats::GateReason::Rejected)
+                        == Some(&provider_accounts);
+                if all_rejected {
+                    assert_eq!(
+                        fleet.manager.select(
+                            &HashSet::new(),
+                            now,
+                            Some(MODELS[family]),
+                            Some(request.session),
+                            request.path(),
+                            None
+                        ),
+                        None
+                    );
+                    assert_eq!(
+                        fleet.manager.select_revalidation(
+                            &HashSet::new(),
+                            now,
+                            Some(MODELS[family]),
+                            Some(request.session),
+                            request.path()
+                        ),
+                        None
+                    );
+                    continue;
+                }
+                // Keep exactly the FIFO order of request indices, but visit a
+                // failed session only once per event. The rest of that session's
+                // queue cannot become executable without another state change.
+                let mut heads: BTreeMap<usize, u64> = queue
+                    .iter()
+                    .map(|(&session, rs)| (*rs.front().unwrap(), session))
+                    .collect();
+                while let Some((r, session)) = heads.pop_first() {
                     let request = &requests[r];
-                    if failed_sessions.contains(&request.session) {
-                        queue.push_back(r);
-                        continue;
-                    }
                     let tried = HashSet::new();
                     let picked = fleet
                         .manager
@@ -1969,10 +2018,15 @@ mod quota_replay {
                             pick
                         });
                     let Some(i) = picked else {
-                        failed_sessions.insert(request.session);
-                        queue.push_back(r);
                         continue;
                     };
+                    let session_queue = queue.get_mut(&session).unwrap();
+                    assert_eq!(session_queue.pop_front(), Some(r));
+                    if let Some(&next) = session_queue.front() {
+                        heads.insert(next, session);
+                    } else {
+                        queue.remove(&session);
+                    }
                     assert_eq!(slots[i].provider, request.provider());
                     let guard = fleet.manager.enter_in_flight_at(i, now);
                     schedule(
@@ -1990,6 +2044,7 @@ mod quota_replay {
         });
         for r in pending
             .iter()
+            .flat_map(|sessions| sessions.values())
             .flatten()
             .copied()
             .chain(in_flight)
@@ -2037,7 +2092,11 @@ mod quota_replay {
                 cases.insert(format!("{}-{name}", if mixed { "B" } else { "A" }), serde_json::json!({ "trace_sha256": trace_digest, "score_sha256": score_digest, "score": score }));
             }
         }
-        serde_json::json!({"schema":1, "seed":17, "epoch_ms":to_ms(t0()), "training_ms":TRAINING, "scored_ms":6*DAY, "assumptions":"Synthetic joint shape; capacities use W=4 and load sensitivities scale demand/capacity. No measured output price. Prefix warmth reported independently at 5m and 1h. Weekly includes scoped only once as a distinct budget.", "cases":cases})
+        let document = serde_json::json!({"schema":1, "seed":17, "epoch_ms":to_ms(t0()), "training_ms":TRAINING, "scored_ms":6*DAY, "assumptions":"Synthetic joint shape; capacities use W=4 and load sensitivities scale demand/capacity. No measured output price. Prefix warmth reported independently at 5m and 1h. Weekly includes scoped only once as a distinct budget.", "cases":cases});
+        // Compare the same JSON representation read from the fixture. Without
+        // serde_json's float_roundtrip feature, parsing may move a display float
+        // by one ULP. The score digest above still guards its original bytes.
+        serde_json::from_slice(&serde_json::to_vec(&document).unwrap()).unwrap()
     }
 
     #[test]
