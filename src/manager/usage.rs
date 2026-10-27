@@ -206,6 +206,50 @@ impl Manager {
             .record(idx, &record, &name, uuid.as_deref(), org.as_deref());
     }
 
+    /// Observe the successful response's own model, independently of usage bookkeeping.
+    /// A request-only model and a response that names no model add no catalogue id.
+    pub(crate) fn record_response_model(
+        &self,
+        provider: crate::provider::Provider,
+        model: Option<&str>,
+    ) {
+        if let Some(model) = model {
+            self.routing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .record_model(provider, model);
+        }
+    }
+
+    /// Note an upstream error of `kind` on `provider` now, for the routing document's
+    /// `lastError` ([`crate::routing`]). Observability only: nothing in selection reads it,
+    /// and no retry, hold or gate follows from it.
+    pub fn record_upstream_error(
+        &self,
+        provider: crate::provider::Provider,
+        kind: crate::routing::ErrorKind,
+    ) {
+        self.routing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record_error(provider, kind, crate::now_ms());
+    }
+
+    /// What the routing document reports for `provider` as of `now_ms`: its last upstream
+    /// error as `(kind, at_ms, count of that kind in the ten minutes up to now_ms)`, and every
+    /// model id it served this boot.
+    pub fn routing_observed(
+        &self,
+        provider: crate::provider::Provider,
+        now_ms: i64,
+    ) -> (
+        Option<(crate::routing::ErrorKind, i64, u32)>,
+        std::collections::BTreeSet<String>,
+    ) {
+        let seen = self.routing.lock().unwrap_or_else(PoisonError::into_inner);
+        (seen.last_error(provider, now_ms), seen.model_ids(provider))
+    }
+
     /// Attach `dir` as the usage ledger: replay today's and yesterday's files
     /// back through the recording path so a restart does not lose the day (and
     /// the week before them too when the fleet holds a Codex account, so its
@@ -490,11 +534,14 @@ impl Manager {
     /// `rate_limited_until_ms` whatever the status, so the hold binds the same.
     pub fn mark_refused(&self, idx: usize) {
         let until = crate::now_ms() + REFUSED_HOLD_SECONDS * 1000;
-        let mut accounts = self
-            .accounts
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(account) = accounts.get_mut(idx) {
+        let provider = {
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(account) = accounts.get_mut(idx) else {
+                return;
+            };
             account.rate_limited_until_ms = Some(until);
             account.hold_cause = HoldCause::Refused;
             tracing::info!(
@@ -502,7 +549,9 @@ impl Manager {
                 hold_seconds = REFUSED_HOLD_SECONDS,
                 "refused by upstream 403, held out of rotation"
             );
-        }
+            account.provider
+        };
+        self.record_upstream_error(provider, crate::routing::ErrorKind::Auth);
     }
 
     /// Clear a hold after live proof it no longer binds (any non-429): a
@@ -535,14 +584,19 @@ impl Manager {
     /// see [`Self::mark_rate_limited`]'s doc comment), and nothing in
     /// `select.rs`'s `eligible`/`hard_ok`/`account_terminal_gate` reads the
     /// counter this writes — wiring it into routing is a separate, later,
-    /// premortem'd change.
+    /// premortem'd change. The kind it names, if any
+    /// ([`crate::routing::ErrorKind::of_stream`]), becomes the provider's last error in the
+    /// routing document, which is observability too.
     pub fn record_stream_error(&self, idx: usize, kind: &str) {
         let now_ms = crate::now_ms();
-        let mut accounts = self
-            .accounts
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(account) = accounts.get_mut(idx) {
+        let provider = {
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(account) = accounts.get_mut(idx) else {
+                return;
+            };
             tracing::warn!(
                 account = %account.name,
                 index = idx,
@@ -552,6 +606,10 @@ impl Manager {
             account.stream_error_times_ms.push_back(now_ms);
             prune_stream_errors(&mut account.stream_error_times_ms, now_ms);
             account.last_stream_error = Some(kind.to_string());
+            account.provider
+        };
+        if let Some(error) = crate::routing::ErrorKind::of_stream(kind) {
+            self.record_upstream_error(provider, error);
         }
     }
 }
@@ -581,4 +639,104 @@ pub(super) fn stream_error_count(times: &VecDeque<i64>, now_ms: i64) -> usize {
         .iter()
         .filter(|&&t| now_ms - t <= STREAM_ERROR_WINDOW_MS)
         .count()
+}
+
+#[cfg(test)]
+mod routing_observation_tests {
+    //! What the routing document reports per provider is written where a served request,
+    //! a failed stream and a refused credential are already recorded.
+    use super::*;
+    use crate::config::Account;
+    use crate::provider::Provider;
+    use crate::routing::ErrorKind;
+    use std::collections::BTreeSet;
+
+    /// One `anthropic` account (slot 0) and one `codex` account (slot 1).
+    fn manager() -> Arc<Manager> {
+        Manager::new(
+            Config::fixture(vec![
+                Account::fixture("alice@example.com"),
+                Account {
+                    provider: Provider::Codex,
+                    ..Account::fixture("bob@example.com/codex")
+                },
+            ]),
+            Arc::new(oauth::NoRefresh),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(LiveWarmer::new()),
+            None,
+        )
+    }
+
+    fn last_kind(manager: &Manager, provider: Provider) -> Option<ErrorKind> {
+        manager
+            .routing_observed(provider, crate::now_ms())
+            .0
+            .map(|(kind, _, _)| kind)
+    }
+
+    /// **Response observations are filed under their provider**, independently of usage.
+    /// A usage slot with no account still records nothing.
+    #[test]
+    fn a_served_model_is_seen_under_its_serving_accounts_provider() {
+        let manager = manager();
+        let record = |model: &str| {
+            crate::usage::UsageRecord::from_quota_input(
+                crate::now_ms(),
+                Some(model.to_string()),
+                None,
+                10,
+                0,
+                0,
+                0,
+                5,
+            )
+        };
+        manager.record_response_model(Provider::Anthropic, Some("claude-opus-5-5"));
+        manager.record_usage(0, record("claude-opus-5-5"));
+        manager.record_response_model(Provider::Codex, Some("gpt-5.1-codex"));
+        manager.record_usage(1, record("gpt-5.1-codex"));
+        manager.record_usage(9, record("served-by-no-account"));
+        let now = crate::now_ms();
+        assert_eq!(
+            manager.routing_observed(Provider::Anthropic, now).1,
+            BTreeSet::from(["claude-opus-5-5".to_string()])
+        );
+        assert_eq!(
+            manager.routing_observed(Provider::Codex, now).1,
+            BTreeSet::from(["gpt-5.1-codex".to_string()])
+        );
+    }
+
+    /// **A failed stream and a refused credential are the provider's last error**; an
+    /// in-band error that names no kind leaves the last one in place.
+    #[test]
+    fn a_failed_stream_and_a_refused_credential_are_the_last_error() {
+        let manager = manager();
+        assert_eq!(last_kind(&manager, Provider::Anthropic), None);
+        manager.record_stream_error(0, "overloaded_error");
+        assert_eq!(
+            last_kind(&manager, Provider::Anthropic),
+            Some(ErrorKind::Overloaded)
+        );
+        manager.record_stream_error(0, "cyber_policy");
+        assert_eq!(
+            last_kind(&manager, Provider::Anthropic),
+            Some(ErrorKind::Overloaded)
+        );
+        manager.record_stream_error(1, "truncated");
+        assert_eq!(
+            last_kind(&manager, Provider::Codex),
+            Some(ErrorKind::Transport)
+        );
+        manager.mark_refused(0);
+        assert_eq!(
+            last_kind(&manager, Provider::Anthropic),
+            Some(ErrorKind::Auth)
+        );
+        assert_eq!(
+            last_kind(&manager, Provider::Codex),
+            Some(ErrorKind::Transport)
+        );
+    }
 }

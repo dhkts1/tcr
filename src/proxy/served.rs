@@ -115,20 +115,24 @@ impl ServedTurn {
     /// `upstream response` lines carry, so this one line is a served request's whole INFO
     /// record; `scripts/` parse it.
     ///
-    /// The model is the REQUEST's whenever its body named one. `response_model` is set only
-    /// for Codex, whose body is usually zstd and does not parse, so its turn is filed under
-    /// the model its own response named instead of under "unknown".
+    /// The model is the REQUEST's whenever its body named one. Only Codex falls back to
+    /// `usage_model`: its body is usually zstd and does not parse. This model belongs to
+    /// the retained usage; catalogue observations carry response identity separately.
     pub(super) fn finish(
         &self,
         manager: &Manager,
         status: StatusCode,
         parsed: &ParsedUsage,
-        response_model: Option<String>,
+        usage_model: Option<String>,
         timing: Option<&TimingFields>,
     ) {
         let record = usage_record(
             parsed,
-            self.request_model.clone().or(response_model),
+            self.request_model.clone().or_else(|| {
+                (self.provider == Provider::Codex)
+                    .then_some(usage_model)
+                    .flatten()
+            }),
             self.session_key,
             || self.extended_ttl,
         );
