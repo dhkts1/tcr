@@ -116,21 +116,21 @@ impl ServedTurn {
     /// record; `scripts/` parse it.
     ///
     /// The model is the REQUEST's whenever its body named one. Only Codex falls back to
-    /// `response_model`: its body is usually zstd and does not parse. Catalogue observations
-    /// use response identity separately and do not change this ledger convention.
+    /// `usage_model`: its body is usually zstd and does not parse. This model belongs to
+    /// the retained usage; catalogue observations carry response identity separately.
     pub(super) fn finish(
         &self,
         manager: &Manager,
         status: StatusCode,
         parsed: &ParsedUsage,
-        response_model: Option<String>,
+        usage_model: Option<String>,
         timing: Option<&TimingFields>,
     ) {
         let record = usage_record(
             parsed,
             self.request_model.clone().or_else(|| {
                 (self.provider == Provider::Codex)
-                    .then_some(response_model)
+                    .then_some(usage_model)
                     .flatten()
             }),
             self.session_key,

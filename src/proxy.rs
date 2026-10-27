@@ -5654,7 +5654,8 @@ async fn handle_request(
                 });
                 let SseParse {
                     usage: parsed,
-                    model: response_model,
+                    model: usage_model,
+                    response_model,
                     stream_error,
                     tool_uses: response_tool_uses,
                     bound_tokens,
@@ -5719,13 +5720,7 @@ async fn handle_request(
                     manager_side.record_response_model(provider, response_model.as_deref());
                 }
                 if parsed.input_total > 0 || parsed.output > 0 {
-                    turn.finish(
-                        &manager_side,
-                        status,
-                        &parsed,
-                        response_model,
-                        timing.as_ref(),
-                    );
+                    turn.finish(&manager_side, status, &parsed, usage_model, timing.as_ref());
                 } else if let Some(t) = &timing {
                     // No usage, so no `request usage` line to ride on.
                     t.log_alone();
@@ -7531,8 +7526,9 @@ where
     futures::pin_mut!(events);
 
     let mut parsed = ParsedUsage::default();
-    // The response's own identity, independent of whether it reports usage.
+    // Keep the model attached to retained usage separate from catalogue observations.
     let mut model: Option<String> = None;
+    let mut response_model: Option<String> = None;
     let mut stream_error: Option<String> = None;
     let mut codex_stream_limit = None;
     let mut saw_any_event = false;
@@ -7574,8 +7570,9 @@ where
                 if let Some(terminal) = codex_terminal_usage(&value) {
                     parsed = terminal.usage;
                     model = terminal.model;
-                } else if let Some(response) = codex_terminal_response(&value) {
-                    model = response
+                }
+                if let Some(response) = codex_terminal_response(&value) {
+                    response_model = response
                         .get("model")
                         .and_then(Value::as_str)
                         .map(str::to_string);
@@ -7623,6 +7620,7 @@ where
                     .and_then(|m| m.get("model"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                response_model = model.clone();
                 // The response's own message id. A later request may name it as
                 // `previous_message_id`, and the server-side thread state behind it lives on
                 // the account that answered — `404 No thread state was found` anywhere else.
@@ -7840,6 +7838,7 @@ where
     SseParse {
         usage: parsed,
         model,
+        response_model,
         stream_error,
         tool_uses,
         bound_tokens,
@@ -7897,9 +7896,11 @@ const SIGNATURE_CAP: usize = 16 * 1024;
 /// misbinding impossible to write.
 struct SseParse {
     usage: ParsedUsage,
-    /// The model the response itself named: the message start or the terminal Responses
-    /// object. Catalogue identity is independent of the ledger's request-model preference.
+    /// The model attached to retained usage: a metered terminal for `codex`.
     model: Option<String>,
+    /// The response's own identity, even on an unmetered terminal. Catalogue observations
+    /// never replace the model attached to usage retained from an earlier terminal.
+    response_model: Option<String>,
     /// The FIRST in-band failure's kind (an Anthropic `error` event's `error.type`; a Codex
     /// `response.failed` or `error` event's code, see [`codex_error_kind`]), or the fixed
     /// [`TRUNCATED_STREAM_ERROR_KIND`] when the turn's end (`message_stop`; a Codex terminal
