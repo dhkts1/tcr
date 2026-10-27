@@ -27178,4 +27178,173 @@ mod forecast_routing_tests {
     async fn response_catalogue_codex_streamed_without_usage() {
         response_catalogue_case(Provider::Codex, true, true, false).await;
     }
+
+    #[tokio::test]
+    async fn reviewer_unmetered_terminal_keeps_metered_ledger_model() {
+        use tower::ServiceExt as _;
+        let body = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fake-response\",\"model\":\"gpt-metered\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fake-response\",\"usage\":null}}\n\n",
+        );
+        let upstream = stub::http(
+            Router::new()
+                .fallback(move || async move { ([(CONTENT_TYPE, "text/event-stream")], body) }),
+        );
+        let account = Account {
+            provider: Provider::Codex,
+            ..Account::fixture("alice@example.com")
+        };
+        let manager = keyed(Config {
+            upstream: "http://127.0.0.1:1".into(),
+            codex_upstream: upstream.url(),
+            ..Config::fixture(vec![account])
+        });
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(crate::provider::CODEX_RESPONSES_PATH)
+            .header(HOST, "127.0.0.1")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"input":[]}"#))
+            .unwrap();
+        req.extensions_mut().insert(ClientAddr(loopback()));
+        let response = app(Arc::clone(&manager)).oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "positive control: served response"
+        );
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            body.as_bytes(),
+            "positive control: complete replayed stream forwarded"
+        );
+        for _ in 0..200 {
+            let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+            if snapshot.accounts[0]
+                .usage
+                .as_ref()
+                .is_some_and(|u| u.today.requests > 0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        let usage = snapshot.accounts[0]
+            .usage
+            .as_ref()
+            .expect("metered turn has usage");
+        assert_eq!(
+            (
+                usage.today.requests,
+                usage.today.input_tokens,
+                usage.today.output_tokens
+            ),
+            (1, 12, 3),
+            "positive control: prior terminal's metered totals survive"
+        );
+        let models: Vec<_> = usage.today_by_model.keys().map(String::as_str).collect();
+        assert_eq!(
+            models,
+            ["gpt-metered"],
+            "an unmetered terminal must not erase the model attached to retained usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_unmetered_terminal_keeps_priced_usage() {
+        use tower::ServiceExt as _;
+        let body = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fake-response\",\"model\":\"gpt-metered\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fake-response\",\"usage\":null}}\n\n",
+        );
+        let upstream = stub::http(
+            Router::new()
+                .fallback(move || async move { ([(CONTENT_TYPE, "text/event-stream")], body) }),
+        );
+        let account = Account {
+            provider: Provider::Codex,
+            ..Account::fixture("alice@example.com")
+        };
+        let manager = keyed(Config {
+            pricing: std::collections::HashMap::from([(
+                "gpt-metered".into(),
+                crate::pricing::PricingOverride {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    cache_read: None,
+                },
+            )]),
+            upstream: "http://127.0.0.1:1".into(),
+            codex_upstream: upstream.url(),
+            ..Config::fixture(vec![account])
+        });
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(crate::provider::CODEX_RESPONSES_PATH)
+            .header(HOST, "127.0.0.1")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"input":[]}"#))
+            .unwrap();
+        req.extensions_mut().insert(ClientAddr(loopback()));
+        let response = app(Arc::clone(&manager)).oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "positive control: served response"
+        );
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            body.as_bytes(),
+            "positive control: complete replayed stream forwarded"
+        );
+        for _ in 0..200 {
+            let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+            if snapshot.accounts[0]
+                .usage
+                .as_ref()
+                .is_some_and(|u| u.today.requests > 0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        let usage = snapshot.accounts[0]
+            .usage
+            .as_ref()
+            .expect("metered turn has usage");
+        assert_eq!(
+            (
+                usage.today.requests,
+                usage.today.input_tokens,
+                usage.today.output_tokens
+            ),
+            (1, 12, 3),
+            "positive control: prior terminal's metered totals survive"
+        );
+        assert_eq!(
+            usage.today.cost_usd,
+            Some(0.000015),
+            "an unmetered terminal must not turn retained priced usage into an unpriced total"
+        );
+        let models: Vec<_> = usage.today_by_model.keys().map(String::as_str).collect();
+        assert_eq!(
+            models,
+            ["gpt-metered"],
+            "an unmetered terminal must not erase the model attached to retained usage"
+        );
+    }
 }
