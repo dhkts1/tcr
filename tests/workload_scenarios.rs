@@ -1224,30 +1224,6 @@ fn fixed_epoch_spacing() {
 }
 
 #[test]
-fn old_spacing_adapter_reproduces_red() {
-    let fleet = Fleet::new(
-        &[("alpha", 0), ("bravo", 1)],
-        PacingConfig {
-            max_in_flight_per_account: None,
-            min_spacing_ms: Some(1_000),
-        },
-    );
-    drop(fleet.manager.enter_in_flight(0));
-    assert_eq!(
-        fleet.manager.select(
-            &HashSet::new(),
-            t0() + Duration::milliseconds(1_001),
-            None,
-            None,
-            "/v1/messages",
-            None,
-        ),
-        Some(1),
-        "the old wall-clock adapter must still demonstrate the missing seam"
-    );
-}
-
-#[test]
 fn replay_clock_controls_quota_and_holds() {
     let now = t0();
     let mut quota = tcr::quota::Quota::default();

@@ -4197,6 +4197,26 @@ mod tests {
     /// silently turn a re-key test into a divert test.
     const LONG_HOLD_SECS: i64 = CACHE_WARM_HOLD_SECS + 60;
 
+    #[test]
+    fn enter_in_flight_stamps_the_wall_clock() {
+        let manager = Manager::new(
+            Config::fixture(vec![Account::fixture("alpha")]),
+            Arc::new(oauth::NoRefresh),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(LiveWarmer::new()),
+            None,
+        );
+        let before = crate::now_ms();
+        manager.accounts.write().unwrap()[0].last_served_ms = before + 86_400_000;
+        drop(manager.enter_in_flight(0));
+        let after = crate::now_ms();
+        let stamp = manager.accounts.read().unwrap()[0].last_served_ms;
+        assert!(
+            (before..=after).contains(&stamp),
+            "enter_in_flight must stamp the wall clock directly: {before} <= {stamp} <= {after}"
+        );
+    }
+
     /// `build_serving_client` must not panic on either branch of `http1_only` —
     /// h1 support is part of the reqwest/rustls TLS backend this crate already
     /// pulls in, but a builder method rejecting a combination it doesn't support
