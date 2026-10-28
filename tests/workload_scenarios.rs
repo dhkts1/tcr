@@ -1640,7 +1640,7 @@ mod quota_replay {
     impl Report {
         fn schedule(self, events: &mut BTreeMap<(i64, u8, u64), Event>) {
             if let Some(at) = self.hold_until {
-                events.entry((at, 2, 0)).or_insert(Event::Release);
+                schedule_wake(events, at);
             }
         }
     }
@@ -1786,6 +1786,13 @@ mod quota_replay {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum WaitReason {
+        Capacity,
+        RevalidationSpacing,
+    }
+
     #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
     struct Score {
         lost_five_hour: f64,
@@ -1794,6 +1801,7 @@ mod quota_replay {
         lost_distinct_budget_sum: f64,
         lockout_minutes: [f64; 2],
         pacing_wait_minutes: [f64; 2],
+        waits: BTreeMap<WaitReason, u64>,
         cold_moves_5m: u64,
         cold_moves_1h: u64,
         arrivals: u64,
@@ -1815,6 +1823,54 @@ mod quota_replay {
         Hold(usize),
         Release,
         Arrival(usize),
+    }
+
+    fn schedule_wake(events: &mut BTreeMap<(i64, u8, u64), Event>, at: i64) {
+        // Sequence zero is reserved for wake-ups: one event per deadline.
+        events.entry((at, 2, 0)).or_insert(Event::Release);
+    }
+
+    fn wait_reason(manager: &Manager, request: &Request, at: i64) -> (WaitReason, Option<i64>) {
+        use tcr::manager::PoolPass;
+        use tcr::stats::GateReason;
+        let now = t0() + Duration::milliseconds(at);
+        let model = Some(MODELS[request.family]);
+        let routed = manager.routing_candidates(now, model, request.path());
+        if routed.pass.is_none() {
+            let wake = routed.free_at.map(|at| to_ms(at) - to_ms(t0()));
+            // Ask the production predicates at their own deadline. A soft
+            // threshold plus the revalidation valve is pacing, not exhaustion.
+            let revalidation = routed.free_at.is_some_and(|free| {
+                let future = manager.routing_candidates(free, model, request.path());
+                future.pass == Some(PoolPass::Revalidation)
+                    && future.accounts.iter().any(|&i| {
+                        manager
+                            .exhaustion_hint_for_account(now, routed.is_fable, i)
+                            .gated
+                            .keys()
+                            .all(|gate| {
+                                matches!(
+                                    gate,
+                                    GateReason::FiveHour
+                                        | GateReason::SevenDay
+                                        | GateReason::FableWeekly
+                                )
+                            })
+                    })
+            });
+            return (
+                if revalidation {
+                    WaitReason::RevalidationSpacing
+                } else {
+                    WaitReason::Capacity
+                },
+                wake,
+            );
+        }
+        panic!(
+            "failed real selection has executable routing candidates: {:?}",
+            routed.pass
+        );
     }
 
     /// A discrete-event fake upstream. Completion charges tokens and reports
@@ -1926,6 +1982,7 @@ mod quota_replay {
         let mut previous: HashMap<u64, usize> = HashMap::new();
         let mut score = Score::default();
         let mut last_at = 0;
+        let mut waiting = [None; 5];
         while let Some(((at, _, _), event)) = events.pop_first() {
             if at > END {
                 events.insert((at, 4, 0), event);
@@ -1933,12 +1990,29 @@ mod quota_replay {
             }
             let elapsed = (at - last_at.max(TRAINING)).max(0);
             for provider in 0..2 {
-                if pending
-                    .iter()
-                    .enumerate()
-                    .any(|(f, q)| usize::from(f == 4) == provider && !q.is_empty())
-                {
+                // Coincident events have not attempted selection yet. Their
+                // zero-length interval needs no wait classification.
+                if elapsed == 0 {
+                    continue;
+                }
+                let mut capacity = false;
+                let mut paced = false;
+                for (family, queue) in pending.iter().enumerate() {
+                    if usize::from(family == 4) != provider || queue.is_empty() {
+                        continue;
+                    }
+                    match waiting[family].expect("every pending family records its wait reason") {
+                        WaitReason::Capacity => capacity = true,
+                        _ => paced = true,
+                    }
+                }
+                // A provider is locked out only when none of its waiting work
+                // has capacity. Pacing has its own integral, without overlap.
+                if capacity && !paced {
                     score.lockout_minutes[provider] += elapsed as f64 / 60_000.0;
+                }
+                if paced {
+                    score.pacing_wait_minutes[provider] += elapsed as f64 / 60_000.0;
                 }
             }
             last_at = at;
@@ -2049,6 +2123,7 @@ mod quota_replay {
                 continue;
             }
             for (family, queue) in pending.iter_mut().enumerate() {
+                waiting[family] = None;
                 if queue.is_empty() {
                     continue;
                 }
@@ -2091,6 +2166,10 @@ mod quota_replay {
                         ),
                         None
                     );
+                    waiting[family] = Some(WaitReason::Capacity);
+                    if (TRAINING..END).contains(&at) {
+                        *score.waits.entry(WaitReason::Capacity).or_default() += 1;
+                    }
                     continue;
                 }
                 // Keep exactly the FIFO order of request indices, but visit a
@@ -2144,6 +2223,17 @@ mod quota_replay {
                         1,
                         Event::Complete(i, r, guard),
                     );
+                }
+                if let Some(r) = queue.values().next().and_then(|rs| rs.front()) {
+                    let (reason, wake) = wait_reason(&fleet.manager, &requests[*r], at);
+                    waiting[family] = Some(reason);
+                    if (TRAINING..END).contains(&at) {
+                        *score.waits.entry(reason).or_default() += 1;
+                    }
+                    if let Some(wake) = wake {
+                        assert!(wake > at, "a time gate must wake strictly in the future");
+                        schedule_wake(&mut events, wake);
+                    }
                 }
             }
         }
