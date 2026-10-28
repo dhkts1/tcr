@@ -196,6 +196,19 @@ impl Manager {
     /// force-refresh and retry exactly once. Success folds the usage into the
     /// account's windows; any failure is recorded as visible probe health.
     pub async fn probe_account(&self, idx: usize) {
+        let Some(gate) = self.usage_gate(idx) else {
+            return;
+        };
+        let _guard = gate.lock().await;
+        self.probe_account_unlocked(idx).await;
+    }
+
+    /// The one probe implementation, called only while owning the row's usage gate.
+    /// True means this call applied usage, not merely that a previous probe succeeded.
+    pub(super) async fn probe_account_unlocked(&self, idx: usize) -> bool {
+        let Some(identity) = codex_reset::BoundAccount::at(self, idx) else {
+            return false;
+        };
         // An `Error` row only reaches here once its recovery backoff elapsed (see
         // `probeable_indices`). `Error` means "the refresh token was rejected", so the
         // only meaningful recovery test is to attempt a refresh: success runs
@@ -206,21 +219,30 @@ impl Manager {
         if self.account_status(idx) == Some(AccountStatus::Error)
             && !self.ensure_fresh_force(idx).await
         {
-            return;
+            return false;
         }
         self.ensure_fresh(idx).await;
         let Some(token) = self.access_token(idx) else {
-            return;
+            return false;
         };
         let Some(credential) = self.probe_credential(idx, token) else {
-            return;
+            return false;
         };
 
+        if !identity.is_current(self, idx) {
+            return false;
+        }
         let result = self.prober.probe(credential).await;
         let result = match result {
             Err(err) if err.status == Some(401) => {
                 // Token rejected: force a refresh and retry once with the new one.
+                if !identity.is_current(self, idx) {
+                    return false;
+                }
                 self.ensure_fresh_force(idx).await;
+                if !identity.is_current(self, idx) {
+                    return false;
+                }
                 match self
                     .access_token(idx)
                     .and_then(|fresh| self.probe_credential(idx, fresh))
@@ -234,6 +256,9 @@ impl Manager {
 
         self.backfill_plan_if_unknown(idx).await;
 
+        if !identity.is_current(self, idx) {
+            return false;
+        }
         match result {
             Ok(usage) => {
                 self.apply_usage(idx, &usage);
@@ -246,6 +271,7 @@ impl Manager {
                 // resets it below.
                 self.note_5xx_probe(idx, false);
                 self.record_probe(idx, ProbeStatus::Ok, None, None);
+                true
             }
             Err(err) => {
                 let msg = err.message.to_lowercase();
@@ -285,6 +311,7 @@ impl Manager {
                     None => ProbeStatus::Error,
                 };
                 self.record_probe(idx, status, Some(err.message), err.retry_after_secs);
+                false
             }
         }
     }
