@@ -1692,6 +1692,72 @@ mod quota_replay {
         }
     }
 
+    #[test]
+    fn exhausted_replay_budget_arms_production_hold() {
+        for provider in [0, 1] {
+            let mut a = account("replay-held", 0);
+            a.provider = if provider == 0 {
+                Provider::Anthropic
+            } else {
+                Provider::Codex
+            };
+            let fleet = Fleet::from_config(Config::fixture(vec![a]));
+            let mut slot = Slot {
+                provider,
+                windows: [Budget {
+                    capacity: 100.0,
+                    used: 100.0,
+                    reset: 120_000,
+                    period: 5 * HOUR,
+                }; 3],
+            };
+            slot.report(&fleet.manager, 0, t0());
+            let until = t0() + Duration::seconds(if provider == 0 { 60 } else { 120 });
+            assert_eq!(
+                fleet
+                    .manager
+                    .snapshot(t0() + Duration::seconds(59))
+                    .accounts[0]
+                    .rate_limited_until,
+                Some(until),
+                "a replay 429 must arm the production hold"
+            );
+            let path = if provider == 0 {
+                "/v1/messages"
+            } else {
+                "/backend-api/codex/responses"
+            };
+            assert_eq!(
+                fleet.manager.select(
+                    &HashSet::new(),
+                    t0() + Duration::seconds(59),
+                    None,
+                    None,
+                    path,
+                    None
+                ),
+                None,
+                "a replay 429 must arm the production hold"
+            );
+            for window in &mut slot.windows {
+                window.used = 0.0;
+                window.reset += window.period;
+            }
+            slot.report(&fleet.manager, 0, t0() + Duration::seconds(121));
+            assert_eq!(
+                fleet.manager.select(
+                    &HashSet::new(),
+                    t0() + Duration::seconds(121),
+                    None,
+                    None,
+                    path,
+                    None
+                ),
+                Some(0)
+            );
+        }
+    }
+
     #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
     struct Score {
         lost_five_hour: f64,
