@@ -1,6 +1,7 @@
 //! Separate shell-tool routing from the model client's proxy. Private launchers
 //! restore nested agents; their scripts contain no proxy values or request keys.
-//! A launch owns its temporary directory and removes it when the client exits.
+//! Each launch directory records the pid the client runs as; a later launch
+//! removes the directories whose client has exited.
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -8,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
+use tcr::log_err::LogErr as _;
 
 const PROXIES: [&str; 6] = [
     "HTTPS_PROXY",
@@ -76,6 +78,29 @@ pub(crate) fn executable(name: &Path) -> Option<PathBuf> {
     tcr::codex_local::is_executable_file(&path)
         .then(|| std::path::absolute(path).ok())
         .flatten()
+}
+
+/// The file in a launch directory that names the pid owning it.
+const OWNER_PID: &str = "pid";
+
+/// Remove launch directories whose owner has exited. A directory without a
+/// readable pid is still being created, or belongs to an older tcr, so it stays.
+fn sweep_exited(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("launch-") {
+            continue;
+        }
+        let owner = std::fs::read_to_string(entry.path().join(OWNER_PID))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        if owner.is_some_and(|pid| !tcr::singleton::is_alive(pid)) {
+            std::fs::remove_dir_all(entry.path())
+                .log_debug("removing an exited launch's helper directory");
+        }
+    }
 }
 
 fn publish(path: &Path, contents: &str) -> anyhow::Result<()> {
@@ -155,8 +180,8 @@ pub(crate) fn apply_codex_shell_policy(cmd: &mut Command, host: &Host<'_>) -> Ve
     vec!["[tcr] shell tools use the caller's proxy and CA settings; nested codex on PATH uses the current pool checks".into()]
 }
 
-/// Apply after model routing, before explicit CLI arguments. The returned owner
-/// must live until the foreground agent exits, including error paths.
+/// Apply after model routing, before explicit CLI arguments. Keep the returned
+/// owner alive up to `exec`: dropping it removes the directory, for a failed launch.
 pub(crate) fn apply(
     cmd: &mut Command,
     claude: &Path,
@@ -224,11 +249,14 @@ pub(crate) fn apply(
         meta.is_dir() && meta.uid() == uid && meta.mode() & 0o777 == 0o700,
         "tool helper directory must be owned by this user with mode 0700 and must not be a symlink"
     );
+    sweep_exited(&parent);
     let directory = tempfile::Builder::new()
         .prefix("launch-")
         .tempdir_in(&parent)?;
     let root = directory.path();
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    // `exec` keeps this pid, so it is the client's.
+    std::fs::write(root.join(OWNER_PID), std::process::id().to_string())?;
     let caller = caller_env(model_port(cmd, &host), &host);
     let mut cleanup = String::new();
     for key in PROXIES.iter().chain(CAS.iter()) {
@@ -337,4 +365,37 @@ pub(crate) fn apply(
             Vec::new()
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweep_removes_only_launches_whose_owner_exited() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut exited = Command::new("true").spawn().unwrap();
+        let exited_pid = exited.id();
+        exited.wait().unwrap();
+        for (name, owner) in [
+            ("launch-exited", Some(exited_pid)),
+            ("launch-live", Some(std::process::id())),
+            ("launch-creating", None),
+        ] {
+            let dir = parent.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            if let Some(pid) = owner {
+                std::fs::write(dir.join(OWNER_PID), pid.to_string()).unwrap();
+            }
+        }
+
+        sweep_exited(parent.path());
+
+        let mut left: Vec<String> = std::fs::read_dir(parent.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["launch-creating", "launch-live"]);
+    }
 }

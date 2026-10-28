@@ -626,7 +626,7 @@ pub fn live_proxy_server(port: u16) -> Option<Incumbent> {
 /// signalled. [`process_command`] is the odd one out: it refreshes the same way
 /// but additionally requests `.with_cmd(UpdateKind::Always)`, since it is the
 /// only one of the three that needs the command line.
-fn is_alive(pid: u32) -> bool {
+pub fn is_alive(pid: u32) -> bool {
     let mut sys = System::new();
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),

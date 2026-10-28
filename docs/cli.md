@@ -178,7 +178,8 @@ stderr saying it is deliberately withholding it.
 
 A value **you** exported is inherited untouched: an explicit choice wins, and it is the
 escape hatch for a `claude` with no claude.ai login of its own, which does need some
-credential to start. The process exits with `claude`'s own exit code.
+credential to start. `tcr run` replaces itself with `claude` (`exec`), so the terminal sees
+`claude` as its foreground program and the shell gets `claude`'s own exit status.
 
 **A proxy that holds no Claude account.** With the proxy up, `tcr run` reads its status once
 before it launches `claude` (the same read decides [the request key](#the-request-key-on-a-launch)).
@@ -251,8 +252,9 @@ or client configuration can bypass the launchers. Claude's `CLAUDE_ENV_FILE` and
 `CLAUDE_CODE_SHELL_PREFIX` still run; a prefix containing flags is refused with a message to use
 an executable wrapper script. Codex's unrelated policy settings and filters are preserved.
 
-Each foreground launch owns an absolute, private helper directory, removed when the client
-exits. Background shells needing these launchers must finish before that exit. No shell startup
+Each foreground launch owns an absolute, private helper directory that records the client's
+pid. The next `tcr run` removes every helper directory whose client has exited, so background
+shells needing these launchers must finish before the client exits. No shell startup
 file or client config is edited.
 
 This is verified with Claude Code 2.1.294 and Codex 0.163.0. Claude's Bash tool and shell-form
@@ -275,7 +277,7 @@ Every child also gets `TCR_RUN_ACTIVE=1`, on every path, the proxy-down passthro
 `tcr run` finds `claude` on `PATH`, so on a machine where something else also wraps
 `claude` that lookup can land on a launcher which wraps in `tcr run` again — the routing
 environment applied twice is identical and nothing breaks, but every startup line prints
-twice and a second `tcr` sits in the process tree for the session. A launcher that checks
+twice. A launcher that checks
 this variable hands off to the real `claude` instead. The name avoids the `CMUX_` prefix
 on purpose: cmux's own claude wrapper clears every `CMUX_*` variable before exec, so a
 marker named after it would be erased in transit.

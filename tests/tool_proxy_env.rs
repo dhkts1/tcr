@@ -255,9 +255,48 @@ if [ "${NESTED:-}" = yes ]; then
 fi
 exec "$CLAUDE_CODE_SHELL_PREFIX" 'NESTED=yes ANTHROPIC_BASE_URL=http://127.0.0.1:4000 HTTPS_PROXY=http://proxy.example:3999 NODE_EXTRA_CA_CERTS=/caller/ca.pem claude'
 "#);
-    // Cleanup is observable after the foreground client exits.
+}
+
+/// The client runs as tcr's own pid, and the next launch removes its helpers.
+#[test]
+fn the_client_replaces_tcr_and_the_next_launch_removes_its_helpers() {
+    let fixture = AgentFixture::new();
     let parent = fixture.home.path().join(".cache/tcr/tool-env");
-    assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
+    let launches = || -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(&parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    };
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"printf '%s %s\n' "$$" "$(cat "$(dirname "$CLAUDE_ENV_FILE")/pid")""#,
+    );
+    let child = fixture
+        .command()
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let tcr_pid = child.id();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{tcr_pid} {tcr_pid}\n"),
+        "the client must run as tcr's pid, and its helper directory must record it"
+    );
+    let first = launches();
+    assert_eq!(
+        first.len(),
+        1,
+        "the exited client's directory waits for the next launch"
+    );
+
+    let output = fixture.command().output().unwrap();
+    assert!(output.status.success());
+    let second = launches();
+    assert_eq!(second.len(), 1, "only the new launch's directory remains");
+    assert_ne!(second, first);
 }
 
 /// tcr starts without the `CLAUDE_CODE_SHELL` that Claude reads from `settings.json`,
@@ -378,7 +417,7 @@ case "$CLAUDE_CODE_SHELL_PREFIX" in /*) ;; *) exit 74;; esac
         String::from_utf8_lossy(&output.stderr)
     );
     let root = fixture.home.path().join("relative-cache/tcr/tool-env");
-    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
     let output = fixture
         .command()

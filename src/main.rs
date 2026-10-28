@@ -7149,7 +7149,7 @@ fn codex_command() -> anyhow::Result<(std::process::Command, PathBuf)> {
     Ok((std::process::Command::new(&codex.path), codex.path))
 }
 
-/// `tcr run [--codex] [-- args…]` — launch Claude Code, or `codex` with
+/// `tcr run [--codex] [-- args…]` — `exec` Claude Code, or `codex` with
 /// `--codex`, already pointed at this proxy.
 ///
 /// If the proxy is not listening we launch `claude` untouched, so a stopped proxy never breaks the
@@ -7208,11 +7208,8 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         };
         // Generated shell-tool defaults precede explicit caller overrides.
         cmd.args(&args.args);
-        let status = cmd
-            .status()
-            .with_context(|| format!("failed to launch `{}`", codex.display()))?;
-        drop(helpers);
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(exec_agent(&mut cmd, helpers))
+            .with_context(|| format!("failed to launch `{}`", codex.display()));
     }
 
     // `--group`: validate the name and the claude version BEFORE spawning
@@ -7303,11 +7300,19 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         eprintln!("[tcr] proxy not listening on :{port} — launching claude directly");
     }
 
-    let status = cmd
-        .status()
-        .context("failed to launch `claude` — is it on PATH?")?;
+    Err(exec_agent(&mut cmd, helpers)).context("failed to launch `claude` — is it on PATH?")
+}
+
+/// Replace this process with the agent, so the terminal's foreground program is
+/// the agent and not `tcr`. Returns only when the launch fails.
+fn exec_agent(
+    cmd: &mut std::process::Command,
+    helpers: Option<tempfile::TempDir>,
+) -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+    let error = cmd.exec();
     drop(helpers);
-    std::process::exit(status.code().unwrap_or(1));
+    error
 }
 
 /// `--group` is a Claude Code mechanism (`ANTHROPIC_CUSTOM_HEADERS`); Codex has no custom-header
