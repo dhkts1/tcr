@@ -26510,7 +26510,23 @@ mod forecast_routing_tests {
         let names: Vec<_> = providers.iter().map(|p| p["provider"].as_str()).collect();
         assert_eq!(names, [Some("anthropic"), Some("codex")]);
         for provider in providers {
-            assert_eq!(keys(provider), ["lastError", "models", "provider", "state"]);
+            if provider["provider"] == "codex" {
+                assert_eq!(
+                    keys(provider),
+                    [
+                        "lastError",
+                        "models",
+                        "provider",
+                        "resetCreditsAvailable",
+                        "state"
+                    ],
+                    "the `codex` provider must carry resetCreditsAvailable"
+                );
+                assert!(provider["resetCreditsAvailable"].as_u64().is_some());
+                assert_eq!(provider["resetCreditsAvailable"], 0);
+            } else {
+                assert_eq!(keys(provider), ["lastError", "models", "provider", "state"]);
+            }
             assert!(
                 matches!(provider["state"].as_str(), Some("ok" | "degraded" | "out")),
                 "{provider}"
