@@ -434,6 +434,10 @@
     "probeError": null,
     "probeStatus": "ok",
     "provider": "codex",
+    "resetCredits": {
+      "availableCount": 3,
+      "earliestExpiryMs": 1800000000000
+    },
     "quota": 0.1,
     "quotaState": "ok",
     "quotaUpdatedAtMs": null,
