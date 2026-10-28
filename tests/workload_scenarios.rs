@@ -98,8 +98,8 @@ fn account(name: &str, priority: i64) -> Account {
     }
 }
 
-/// Per-account pacing with the production cap and no min-spacing (see the module
-/// header for why min-spacing stays off).
+/// Scenario pacing with the chosen cap and no min-spacing. The quota replay
+/// below separately enables CAP and a 1,000 ms minimum spacing.
 const fn pacing(cap: u32) -> PacingConfig {
     PacingConfig {
         max_in_flight_per_account: Some(cap),
