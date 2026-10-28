@@ -1633,10 +1633,22 @@ mod quota_replay {
         }
     }
 
+    struct Report {
+        hold_until: Option<i64>,
+    }
+
+    impl Report {
+        fn schedule(self, events: &mut BTreeMap<(i64, u8, u64), Event>) {
+            if let Some(at) = self.hold_until {
+                events.entry((at, 2, 0)).or_insert(Event::Release);
+            }
+        }
+    }
+
     impl Slot {
         /// Probe and response describe the same independent budgets. A reset
         /// cannot accidentally clear the rejection of another exhausted window.
-        fn report(&self, manager: &Manager, idx: usize, now: OffsetDateTime) {
+        fn report(&self, manager: &Manager, idx: usize, now: OffsetDateTime) -> Report {
             manager.apply_usage_at(idx, &self.usage(), now);
             let exhausted = self.windows[..2].iter().any(|w| w.used >= w.capacity);
             let mut headers = reqwest::header::HeaderMap::new();
@@ -1679,6 +1691,21 @@ mod quota_replay {
                 }
             }
             manager.update_quota_at(idx, &headers, if exhausted { 429 } else { 200 }, now);
+            // No retry-after: production uses 60 seconds for a shared rejection.
+            // A quota refusal with a measured reset holds until that reset.
+            let hold_until = exhausted.then(|| {
+                let seconds = if self.provider == 0 {
+                    manager.mark_rate_limited_at(idx, 60, now);
+                    60
+                } else {
+                    let seconds = tcr::quota::CodexQuotaRefusal::parse(&headers, &[], now)
+                        .and_then(|refusal| refusal.reset)
+                        .map_or(60, |reset| reset.unix_timestamp() - now.unix_timestamp());
+                    manager.mark_codex_quota_limited_at(idx, seconds, now);
+                    seconds
+                };
+                to_ms(now) - to_ms(t0()) + seconds * 1_000
+            });
             if self.provider == 0 && self.windows[2].used >= self.windows[2].capacity {
                 headers.insert(
                     "anthropic-ratelimit-unified-7d_oi-reset",
@@ -1689,6 +1716,7 @@ mod quota_replay {
                 );
                 manager.mark_model_weekly_rejected_at(idx, &headers, now);
             }
+            Report { hold_until }
         }
     }
 
@@ -1863,7 +1891,7 @@ mod quota_replay {
             events.insert((at, kind, seq), event);
         };
         for (i, slot) in slots.iter().enumerate() {
-            slot.report(&fleet.manager, i, t0());
+            slot.report(&fleet.manager, i, t0()).schedule(&mut events);
             for w in 0..if slot.provider == 0 { 3 } else { 2 } {
                 schedule(&mut events, slot.windows[w].reset, 0, Event::Reset(i, w));
             }
@@ -1918,7 +1946,9 @@ mod quota_replay {
                     budget.used = 0.0;
                     budget.reset += budget.period;
                     schedule(&mut events, budget.reset, 0, Event::Reset(i, w));
-                    slots[i].report(&fleet.manager, i, now);
+                    slots[i]
+                        .report(&fleet.manager, i, now)
+                        .schedule(&mut events);
                 }
                 Event::Complete(i, r, guard) => {
                     let request = &requests[r];
@@ -1977,7 +2007,9 @@ mod quota_replay {
                         slots[i].windows[w].used += charge as f64;
                     }
                     fleet.manager.record_usage(i, record);
-                    slots[i].report(&fleet.manager, i, now);
+                    slots[i]
+                        .report(&fleet.manager, i, now)
+                        .schedule(&mut events);
                     drop(guard);
                 }
                 Event::Hold(i) => {
