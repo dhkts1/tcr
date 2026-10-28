@@ -4,7 +4,7 @@
 //!
 //! 1. **Shell** (`tcr setup shell`). A marked block in the shell's startup
 //!    file defines a `claude` function that runs `tcr run -- "$@"`, or the real
-//!    `claude` when a `tcr run` is already above it (`TCR_RUN_ACTIVE`, set by
+//!    `claude` when a `tcr run` already launched it (`TCR_RUN_ACTIVE`, set by
 //!    `mark_run_active` in `src/main.rs`). `tcr run` already launches plain
 //!    `claude` when the proxy is down, so a stopped proxy never breaks the
 //!    command. It covers terminals and nothing else: an IDE extension or an app

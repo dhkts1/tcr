@@ -257,20 +257,22 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" 'NESTED=yes ANTHROPIC_BASE_URL=http://127.0.0.1
 "#);
 }
 
-/// The client runs as tcr's own pid, and the next launch removes its helpers.
+/// The client runs as tcr's own pid, and launches with the same setup share one helper directory.
 #[test]
-fn the_client_replaces_tcr_and_the_next_launch_removes_its_helpers() {
+fn the_client_replaces_tcr_and_one_setup_shares_one_helper_directory() {
     let fixture = AgentFixture::new();
     let parent = fixture.home.path().join(".cache/tcr/tool-env");
     let launches = || -> Vec<std::path::PathBuf> {
-        std::fs::read_dir(&parent)
+        let mut dirs: Vec<_> = std::fs::read_dir(&parent)
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .collect()
+            .collect();
+        dirs.sort();
+        dirs
     };
     script(
         &fixture.home.path().join("real-claude"),
-        r#"printf '%s %s\n' "$$" "$(cat "$(dirname "$CLAUDE_ENV_FILE")/pid")""#,
+        r#"printf '%s\n' "$$""#,
     );
     let child = fixture
         .command()
@@ -282,21 +284,45 @@ fn the_client_replaces_tcr_and_the_next_launch_removes_its_helpers() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        format!("{tcr_pid} {tcr_pid}\n"),
-        "the client must run as tcr's pid, and its helper directory must record it"
+        format!("{tcr_pid}\n"),
+        "the client must run as tcr's own pid"
     );
     let first = launches();
-    assert_eq!(
-        first.len(),
-        1,
-        "the exited client's directory waits for the next launch"
-    );
+    assert_eq!(first.len(), 1);
 
-    let output = fixture.command().output().unwrap();
+    assert!(fixture.command().output().unwrap().status.success());
+    assert_eq!(launches(), first, "the same setup reuses its directory");
+
+    let env_file = fixture.home.path().join("caller env");
+    std::fs::write(&env_file, "").unwrap();
+    let output = fixture
+        .command()
+        .env("CLAUDE_ENV_FILE", &env_file)
+        .output()
+        .unwrap();
     assert!(output.status.success());
-    let second = launches();
-    assert_eq!(second.len(), 1, "only the new launch's directory remains");
-    assert_ne!(second, first);
+    assert_eq!(
+        launches().len(),
+        2,
+        "a different setup gets its own directory"
+    );
+}
+
+#[test]
+fn a_setup_directory_others_can_open_is_refused() {
+    let fixture = AgentFixture::new();
+    fixture.run("true");
+    let parent = fixture.home.path().join(".cache/tcr/tool-env");
+    let setup = std::fs::read_dir(&parent)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = fixture.command().output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mode 0700"));
 }
 
 /// tcr starts without the `CLAUDE_CODE_SHELL` that Claude reads from `settings.json`,
