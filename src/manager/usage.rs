@@ -255,10 +255,20 @@ impl Manager {
         provider: crate::provider::Provider,
         kind: crate::routing::ErrorKind,
     ) {
+        self.record_upstream_error_at(provider, kind, OffsetDateTime::now_utc());
+    }
+
+    /// Record an upstream error on the caller's observation clock.
+    pub fn record_upstream_error_at(
+        &self,
+        provider: crate::provider::Provider,
+        kind: crate::routing::ErrorKind,
+        now: OffsetDateTime,
+    ) {
         self.routing
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .record_error(provider, kind, crate::now_ms());
+            .record_error(provider, kind, odt_to_ms(now));
     }
 
     /// What the routing document reports for `provider` as of `now_ms`: its last upstream
@@ -606,10 +616,7 @@ impl Manager {
             );
             account.provider
         };
-        self.routing
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .record_error(provider, crate::routing::ErrorKind::Auth, odt_to_ms(now));
+        self.record_upstream_error_at(provider, crate::routing::ErrorKind::Auth, now);
     }
 
     /// Clear a hold after live proof it no longer binds (any non-429): a
@@ -646,7 +653,12 @@ impl Manager {
     /// ([`crate::routing::ErrorKind::of_stream`]), becomes the provider's last error in the
     /// routing document, which is observability too.
     pub fn record_stream_error(&self, idx: usize, kind: &str) {
-        let now_ms = crate::now_ms();
+        self.record_stream_error_at(idx, kind, OffsetDateTime::now_utc());
+    }
+
+    /// Record both stream observations on the same explicit clock.
+    pub fn record_stream_error_at(&self, idx: usize, kind: &str, now: OffsetDateTime) {
+        let now_ms = odt_to_ms(now);
         let provider = {
             let mut accounts = self
                 .accounts
@@ -667,7 +679,7 @@ impl Manager {
             account.provider
         };
         if let Some(error) = crate::routing::ErrorKind::of_stream(kind) {
-            self.record_upstream_error(provider, error);
+            self.record_upstream_error_at(provider, error, now);
         }
     }
 }
@@ -763,6 +775,48 @@ mod routing_observation_tests {
         assert_eq!(
             manager.routing_observed(Provider::Codex, now).1,
             BTreeSet::from(["gpt-5.1-codex".to_string()])
+        );
+    }
+
+    #[test]
+    fn explicit_errors_share_the_replay_clock() {
+        let manager = manager();
+        let now = OffsetDateTime::from_unix_timestamp(1_767_225_600).expect("fixed epoch");
+        manager.record_upstream_error_at(Provider::Anthropic, ErrorKind::Quota, now);
+        assert_eq!(
+            manager
+                .routing_observed(Provider::Anthropic, odt_to_ms(now))
+                .0,
+            Some((ErrorKind::Quota, odt_to_ms(now), 1))
+        );
+        let stream_at = now + time::Duration::seconds(1);
+        manager.record_stream_error_at(0, "overloaded_error", stream_at);
+        assert_eq!(
+            manager
+                .routing_observed(Provider::Anthropic, odt_to_ms(stream_at))
+                .0,
+            Some((ErrorKind::Overloaded, odt_to_ms(stream_at), 1))
+        );
+        assert_eq!(
+            manager.accounts.read().expect("accounts lock")[0]
+                .stream_error_times_ms
+                .back(),
+            Some(&odt_to_ms(stream_at))
+        );
+        let refused_at = now + time::Duration::seconds(2);
+        manager.mark_refused_at(0, refused_at);
+        assert_eq!(
+            manager
+                .routing_observed(Provider::Anthropic, odt_to_ms(refused_at))
+                .0,
+            Some((ErrorKind::Auth, odt_to_ms(refused_at), 1))
+        );
+        manager.record_stream_error_at(usize::MAX, "truncated", refused_at);
+        assert_eq!(
+            manager
+                .routing_observed(Provider::Anthropic, odt_to_ms(refused_at))
+                .0,
+            Some((ErrorKind::Auth, odt_to_ms(refused_at), 1))
         );
     }
 
