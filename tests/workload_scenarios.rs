@@ -1348,6 +1348,53 @@ mod quota_replay {
         23,
     ];
 
+    #[derive(Clone, Copy)]
+    struct Profile {
+        count: usize,
+        sessions: usize,
+        input: u64,
+        output: u64,
+        p50: u64,
+        p90: u64,
+        p99: u64,
+        count50: u64,
+        count90: u64,
+        span50: i64,
+        span90: i64,
+        hours: &'static [u64; 24],
+    }
+
+    const PROFILES: [Profile; 2] = [
+        Profile {
+            count: 8_514,
+            sessions: 142,
+            input: 46_100_000,
+            output: 9_860_000,
+            p50: 1_341,
+            p90: 7_784,
+            p99: 111_866,
+            count50: 3,
+            count90: 114,
+            span50: 1,
+            span90: 48,
+            hours: &A_HOURS,
+        },
+        Profile {
+            count: 6_566,
+            sessions: 150,
+            input: 17_600_000,
+            output: 3_740_000,
+            p50: 1_088,
+            p90: 7_145,
+            p99: 16_738,
+            count50: 37,
+            count90: 95,
+            span50: 9,
+            span90: 39,
+            hours: &C_HOURS,
+        },
+    ];
+
     struct SplitMix64(u64);
     impl SplitMix64 {
         const fn next(&mut self) -> u64 {
@@ -1484,8 +1531,8 @@ mod quota_replay {
         let mut requests = Vec::new();
         let mut next_session = 1;
         for day in 0..7 {
-            for provider in 0..=usize::from(mixed) {
-                let (
+            for (provider, profile) in PROFILES.iter().enumerate().take(usize::from(mixed) + 1) {
+                let Profile {
                     count,
                     sessions,
                     input,
@@ -1498,17 +1545,7 @@ mod quota_replay {
                     span50,
                     span90,
                     hours,
-                ) = if provider == 0 {
-                    (
-                        8_514, 142, 46_100_000, 9_860_000, 1_341, 7_784, 111_866, 3, 114, 1, 48,
-                        &A_HOURS,
-                    )
-                } else {
-                    (
-                        6_566, 150, 17_600_000, 3_740_000, 1_088, 7_145, 16_738, 37, 95, 9, 39,
-                        &C_HOURS,
-                    )
-                };
+                } = *profile;
                 let mut inputs = quantiles(count, input, p50, p90, p99);
                 rng.shuffle(&mut inputs);
                 let outputs = apportioned(output, &inputs);
@@ -1858,17 +1895,13 @@ mod quota_replay {
         let resets = [
             2.5, 11.5, 13.5, 18.5, 27.5, 33.5, 49.5, 52.5, 79.5, 97.75, 116.0, 134.25, 152.5,
         ];
-        for provider in 0..=usize::from(mixed) {
+        for (provider, profile) in PROFILES.iter().enumerate().take(usize::from(mixed) + 1) {
             let n = if mixed {
                 if provider == 0 { 5 } else { 2 }
             } else {
                 13
             };
-            let demand = f64::from(if provider == 0 {
-                46_100_000 + 4 * 9_860_000
-            } else {
-                17_600_000 + 4 * 3_740_000
-            });
+            let demand = (profile.input + 4 * profile.output) as f64;
             for (i, reset_hour) in resets.iter().enumerate().take(n) {
                 let mut a = account(&format!("replay-{provider}-{i}"), 0);
                 a.provider = if provider == 0 {
@@ -2282,16 +2315,18 @@ mod quota_replay {
             digest(&serde_json::to_vec(&trace(true)).unwrap())
         );
         for day in 0..7 {
-            for provider in 0..2 {
+            for (provider, profile) in PROFILES.iter().enumerate() {
                 let day_requests: Vec<_> = requests
                     .iter()
                     .filter(|r| r.at / DAY == day && r.provider() == provider)
                     .collect();
-                let (n, input, output, sessions, qs) = if provider == 0 {
-                    (8_514, 46_100_000, 9_860_000, 142, [1_341, 7_784, 111_866])
-                } else {
-                    (6_566, 17_600_000, 3_740_000, 150, [1_088, 7_145, 16_738])
-                };
+                let (n, input, output, sessions, qs) = (
+                    profile.count,
+                    profile.input,
+                    profile.output,
+                    profile.sessions,
+                    [profile.p50, profile.p90, profile.p99],
+                );
                 assert_eq!(day_requests.len(), n);
                 assert_eq!(day_requests.iter().map(|r| r.input).sum::<u64>(), input);
                 assert_eq!(day_requests.iter().map(|r| r.output).sum::<u64>(), output);
@@ -2315,7 +2350,7 @@ mod quota_replay {
     #[test]
     fn session_shapes_match_the_supplied_quantiles() {
         let requests = trace(true);
-        for provider in 0..2 {
+        for (provider, profile) in PROFILES.iter().enumerate() {
             let mut sessions: BTreeMap<u64, Vec<&Request>> = BTreeMap::new();
             for request in requests
                 .iter()
@@ -2330,11 +2365,12 @@ mod quota_replay {
                 .collect();
             counts.sort_unstable();
             spans.sort_unstable();
-            let (count50, count90, span50, span90) = if provider == 0 {
-                (3, 114, 60_000, 48 * 60_000)
-            } else {
-                (37, 95, 9 * 60_000, 39 * 60_000)
-            };
+            let (count50, count90, span50, span90) = (
+                profile.count50 as usize,
+                profile.count90 as usize,
+                profile.span50 * 60_000,
+                profile.span90 * 60_000,
+            );
             for (percent, count, span) in [(50, count50, span50), (90, count90, span90)] {
                 let at = counts.len() * percent / 100;
                 assert!(counts[at].abs_diff(count) <= count / 20);
@@ -2422,7 +2458,7 @@ mod quota_replay {
             "idle exhaustion is never lockout"
         );
         assert_eq!((score.cold_moves_5m, score.cold_moves_1h), (0, 0));
-        let demand = f64::from(46_100_000 + 4 * 9_860_000);
+        let demand = (PROFILES[0].input + 4 * PROFILES[0].output) as f64;
         let weekly = 7.0 * demand / (0.9 * 13.0);
         let expected = (4..13)
             .map(|i| weekly * (0.44 + 0.48 * f64::from(i) / 12.0))
