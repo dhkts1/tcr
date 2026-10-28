@@ -266,6 +266,11 @@ impl Calibration {
         {
             self.invalidate();
         }
+        if self.pending.len() > MAX_SAMPLES {
+            // Dropped vectors cannot remain bracketed by an existing anchor.
+            self.pending.clear();
+            self.invalidate();
+        }
     }
 
     fn invalidate(&mut self) {
