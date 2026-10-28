@@ -2201,7 +2201,7 @@ impl Manager {
     /// Why rule 2: past the reset the window has rolled as far as the clock knows, but tcr has
     /// not read the new window, and the refusal stands until a usage probe reads it, or until a
     /// served response from the account answers 2xx with a window
-    /// (`Quota::update_from_codex_refusal`) or refuses again. The row keeps naming that window,
+    /// (`Quota::update_from_codex_refusal_at`) or refuses again. The row keeps naming that window,
     /// with no time, so it does not read as a refusal no window explains. The hold the refusal
     /// armed has lapsed by then, so the account is back in the pool and may be sent a request in
     /// those minutes.
@@ -5997,7 +5997,7 @@ mod tests {
     /// that carried no quota header leaves the time where it was. Walked to the
     /// `tcr.status.v1` payload, the hop `tcr status --json` reads.
     ///
-    /// Watched red: without the stamp in `Quota::update_from_codex_refusal`, the
+    /// Watched red: without the stamp in `Quota::update_from_codex_refusal_at`, the
     /// header reading leaves the Codex row absent.
     #[tokio::test]
     async fn a_codex_rows_quota_updated_at_comes_from_its_own_readings() {
