@@ -2292,6 +2292,8 @@ impl Manager {
 
     /// Claim a send slot and stamp it on the caller's clock. Sleep observation
     /// belongs to the production wrapper; RAII and client recycling are shared.
+    /// Replay-only entry; production sends use [`Self::enter_in_flight`] to observe sleep.
+    #[doc(hidden)]
     pub fn enter_in_flight_at(self: &Arc<Self>, idx: usize, now: OffsetDateTime) -> InFlightGuard {
         let claimed_recycle = {
             let mut accounts = self
