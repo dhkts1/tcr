@@ -1793,6 +1793,7 @@ mod quota_replay {
         lost_scoped: f64,
         lost_distinct_budget_sum: f64,
         lockout_minutes: [f64; 2],
+        pacing_wait_minutes: [f64; 2],
         cold_moves_5m: u64,
         cold_moves_1h: u64,
         arrivals: u64,
@@ -1884,6 +1885,16 @@ mod quota_replay {
             },
             ..Config::fixture(accounts)
         });
+        replay_slots(requests, weight, fleet, slots, true)
+    }
+
+    fn replay_slots(
+        requests: &[Request],
+        weight: u64,
+        fleet: Fleet,
+        mut slots: Vec<Slot>,
+        fixed_holds: bool,
+    ) -> Score {
         let mut events = BTreeMap::new();
         let mut seq = 0u64;
         let mut schedule = |events: &mut BTreeMap<(i64, u8, u64), Event>, at, kind, event| {
@@ -1895,7 +1906,7 @@ mod quota_replay {
             for w in 0..if slot.provider == 0 { 3 } else { 2 } {
                 schedule(&mut events, slot.windows[w].reset, 0, Event::Reset(i, w));
             }
-            for day in 0..7 {
+            for day in 0..if fixed_holds { 7 } else { 0 } {
                 schedule(
                     &mut events,
                     day * DAY + 9 * HOUR + i as i64 * 1_000,
@@ -2281,15 +2292,57 @@ mod quota_replay {
     }
 
     #[test]
-    fn pacing_only_wait_is_not_lockout() {
-        // The frozen low-load fleet has spare capacity throughout; its brief
-        // gaps are pacing waits under CAP=3 and min_spacing_ms=1000.
-        let score = replay(&trace(false), false, 4, 0.6);
-        assert_eq!(score.backlog, 0, "the low-load fleet must drain its work");
+    fn revalidation_spacing_is_not_lockout() {
+        // Both requests fit the real budget. Only the new-session revalidation
+        // valve keeps the second one waiting; there is no upstream hold.
+        let requests: Vec<_> = (0..2)
+            .map(|i| Request {
+                at: TRAINING + 1_000 + i,
+                session: 10 + i as u64,
+                family: 0,
+                input: 1,
+                output: 1,
+                long_cache: false,
+            })
+            .collect();
+        let slot = Slot {
+            provider: 0,
+            windows: std::array::from_fn(|_| Budget {
+                capacity: 1_000_000.0,
+                used: 960_000.0,
+                reset: END + DAY,
+                period: WEEK,
+            }),
+        };
+        let fleet = Fleet::new(
+            &[("alpha", 0)],
+            PacingConfig {
+                max_in_flight_per_account: Some(CAP),
+                min_spacing_ms: Some(1_000),
+            },
+        );
+        let score = replay_slots(&requests, 4, fleet, vec![slot], false);
         assert_eq!(
             score.lockout_minutes, [0.0; 2],
-            "pacing-only waits must not count as capacity lockout"
+            "a revalidation cooldown with unspent capacity is pacing, not lockout"
         );
+        assert!(
+            score.pacing_wait_minutes[0] > 0.0,
+            "the second new session must record a positive pacing wait"
+        );
+        assert_eq!(score.served, 2);
+        assert_eq!(score.backlog, 0);
+    }
+
+    #[test]
+    fn all_account_hold_still_counts_as_lockout() {
+        let score = replay(&trace(false), false, 4, 0.6);
+        assert_eq!(score.backlog, 0);
+        assert!(
+            (score.lockout_minutes[0] - 0.03585).abs() < 1e-10,
+            "the A-load06 all-account hold gap remains real lockout"
+        );
+        assert_eq!(score.lockout_minutes[1], 0.0);
     }
 
     #[test]
