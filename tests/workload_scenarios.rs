@@ -2437,6 +2437,81 @@ mod quota_replay {
     }
 
     #[test]
+    fn wait_classification_keeps_model_exhaustion_as_capacity() {
+        let requests = [Request {
+            at: TRAINING + 1_000,
+            session: 20,
+            family: 2,
+            input: 1,
+            output: 1,
+            long_cache: false,
+        }];
+        let mut slot = Slot {
+            provider: 0,
+            windows: [Budget {
+                capacity: 1_000_000.0,
+                used: 960_000.0,
+                reset: END + DAY,
+                period: WEEK,
+            }; 3],
+        };
+        slot.windows[2].used = slot.windows[2].capacity;
+        slot.windows[2].reset = TRAINING + 10_000;
+        let fleet = Fleet::new(
+            &[("alpha", 0)],
+            PacingConfig {
+                max_in_flight_per_account: Some(CAP),
+                min_spacing_ms: Some(1_000),
+            },
+        );
+        let score = replay_slots(&requests, 4, fleet, vec![slot], false);
+        assert!(
+            (score.lockout_minutes[0] - 0.15).abs() < 1e-10,
+            "a spent model-scoped budget is capacity lockout: {:?}",
+            score
+        );
+        assert_eq!(score.pacing_wait_minutes, [0.0; 2]);
+        assert_eq!((score.served, score.backlog), (1, 0));
+    }
+
+    #[test]
+    fn wait_classification_handles_a_reset_before_the_valve() {
+        let requests: Vec<_> = (0..2)
+            .map(|i| Request {
+                at: TRAINING + 1_000 + i,
+                session: 30 + i as u64,
+                family: 0,
+                input: 1,
+                output: 1,
+                long_cache: false,
+            })
+            .collect();
+        let slot = Slot {
+            provider: 0,
+            windows: [Budget {
+                capacity: 1_000_000.0,
+                used: 960_000.0,
+                reset: TRAINING + 1_500,
+                period: WEEK,
+            }; 3],
+        };
+        let fleet = Fleet::new(
+            &[("alpha", 0)],
+            PacingConfig {
+                max_in_flight_per_account: Some(CAP),
+                min_spacing_ms: Some(1_000),
+            },
+        );
+        let score = replay_slots(&requests, 4, fleet, vec![slot], false);
+        assert_eq!(
+            score.lockout_minutes, [0.0; 2],
+            "unspent capacity stays pacing when a reset beats the valve"
+        );
+        assert!(score.pacing_wait_minutes[0] > 0.0);
+        assert_eq!((score.served, score.backlog), (2, 0));
+    }
+
+    #[test]
     fn all_account_hold_still_counts_as_lockout() {
         let score = replay(&trace(false), false, 4, 0.6);
         assert_eq!(score.backlog, 0);
