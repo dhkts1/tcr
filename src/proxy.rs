@@ -14890,6 +14890,31 @@ mod tests {
         app(manager).oneshot(req).await.expect("router response")
     }
 
+    #[tokio::test]
+    async fn reset_route_is_local_and_applies() {
+        let origin = stub::http(Router::new().fallback(|| async {
+            axum::Json(serde_json::json!({"code":"reset","windows_reset":1}))
+        }));
+        let manager = Manager::with_live_refresher(codex_fleet(&origin.url(), &origin.url()), None);
+        let response = drive_full(
+            manager,
+            Method::POST,
+            "/_tcr/codex/reset",
+            Some(loopback_peer()),
+            &[("content-type", "application/json")],
+            r#"{"query":"bob@example.com/codex","idempotencyKey":"synthetic-attempt"}"#,
+        )
+        .await;
+        assert_eq!(
+            response
+                .headers()
+                .get(ENDPOINT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("codex-reset"),
+            "reset must be answered by its local route"
+        );
+    }
+
     /// [`drive_full`] reduced to the status and body most tests assert on.
     async fn drive(
         manager: Arc<Manager>,
