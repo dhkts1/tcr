@@ -2456,8 +2456,7 @@ mod quota_replay {
         let score = replay_slots(&requests, 4, fleet, vec![slot], false);
         assert!(
             (score.lockout_minutes[0] - 0.15).abs() < 1e-10,
-            "a spent model-scoped budget is capacity lockout: {:?}",
-            score
+            "a spent model-scoped budget is capacity lockout: {score:?}"
         );
         assert_eq!(score.pacing_wait_minutes, [0.0; 2]);
         assert_eq!((score.served, score.backlog), (1, 0));
