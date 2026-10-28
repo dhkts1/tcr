@@ -2281,6 +2281,18 @@ mod quota_replay {
     }
 
     #[test]
+    fn pacing_only_wait_is_not_lockout() {
+        // The frozen low-load fleet has spare capacity throughout; its brief
+        // gaps are pacing waits under CAP=3 and min_spacing_ms=1000.
+        let score = replay(&trace(false), false, 4, 0.6);
+        assert_eq!(score.backlog, 0, "the low-load fleet must drain its work");
+        assert_eq!(
+            score.lockout_minutes, [0.0; 2],
+            "pacing-only waits must not count as capacity lockout"
+        );
+    }
+
+    #[test]
     fn empty_replay_has_no_lockout_or_cold_moves() {
         let score = replay(&[], false, 4, 1.0);
         assert_eq!(score.arrivals, 0);
