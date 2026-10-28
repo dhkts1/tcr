@@ -141,6 +141,15 @@ pub struct HeldWindowRow {
     pub minutes_until_reset: i64,
 }
 
+/// Banked rate-limit resets from the last successful usage read. No credit identity is kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetCredits {
+    pub available_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earliest_expiry_ms: Option<i64>,
+}
+
 /// A Codex account's credits, as ChatGPT reported them on a response or a usage probe.
 ///
 /// Optional on the row ([`AccountStatusRow::credits`]) because a Codex row carries it only
@@ -759,6 +768,9 @@ pub struct AccountStatusRow {
     /// The account's credits, once reported. Absent when never reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits: Option<CodexCredits>,
+    /// Banked resets. Absent means unknown; zero is a reported count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits: Option<ResetCredits>,
     /// Why this account's login is known dead: `refresh_token_reused`,
     /// `refresh_token_expired`, `refresh_token_invalidated`, `invalid_grant`, `http_401`,
     /// or another raw code. Absent when the login is not known dead.

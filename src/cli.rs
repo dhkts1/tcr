@@ -2824,6 +2824,12 @@ fn codex_tail(a: &AccountSnapshot) -> String {
         Provider::Codex => {}
     }
     let mut tail = String::new();
+    if let Some(resets) = &a.codex.reset_credits {
+        tail.push_str(&format!(" resets={}", resets.available_count));
+        if let Some(expiry) = resets.earliest_expiry_ms {
+            tail.push_str(&format!(" reset_expires_at_ms={expiry}"));
+        }
+    }
     if a.codex.token_sync_pending {
         tail.push_str(" token_sync=pending");
     }
@@ -3327,6 +3333,7 @@ fn account_status_rows_at(
                 limit_reached_type: facts.limit_reached_type,
                 spend_control_reached: facts.spend_control_reached,
                 credits: facts.credits,
+                reset_credits: facts.reset_credits,
                 login_error: facts.login_error,
                 codex_home: facts.codex_home,
                 token_sync_pending: facts.token_sync_pending,
@@ -10249,6 +10256,10 @@ mod tests {
         // The sample's one non-Anthropic row, so it pins both shapes of the
         // `provider` key: absent on the four rows above, `"codex"` here.
         accounts[4].provider = Provider::Codex;
+        accounts[4].codex.reset_credits = Some(tcr_status_wire::ResetCredits {
+            available_count: 3,
+            earliest_expiry_ms: Some(1_800_000_000_000),
+        });
 
         let thresholds = vec![0.9; accounts.len()];
         (
@@ -10851,7 +10862,7 @@ mod tests {
     const WEEK_MS: i64 = 7 * DAY_MS;
 
     /// The keys a Codex row may carry and an Anthropic row never does.
-    const CODEX_ROW_KEYS: [&str; 11] = [
+    const CODEX_ROW_KEYS: [&str; 12] = [
         "quotaWindows",
         "fiveHourWindowMinutes",
         "sevenDayWindowMinutes",
@@ -10861,9 +10872,43 @@ mod tests {
         "loginError",
         "codexHome",
         "tokenSyncPending",
+        "resetCredits",
         "codexRoute",
         "codexTraffic",
     ];
+
+    #[test]
+    fn reset_credits_reach_text_and_json_without_identities() {
+        let (mut snapshot, thresholds) = status_contract_snapshot();
+        let text = status_text_of(&snapshot, None, &pooled_route());
+        assert!(text.contains(" resets=3 reset_expires_at_ms=1800000000000"));
+        let wire: serde_json::Value =
+            serde_json::from_str(&status_json(&snapshot, &thresholds, StatusSource::Live)).unwrap();
+        assert_eq!(
+            wire[4]["resetCredits"],
+            serde_json::json!({
+                "availableCount": 3, "earliestExpiryMs": 1_800_000_000_000i64
+            })
+        );
+        assert!(wire[0].get("resetCredits").is_none());
+        snapshot.accounts[4].codex.reset_credits = Some(tcr_status_wire::ResetCredits {
+            available_count: 0,
+            earliest_expiry_ms: None,
+        });
+        assert!(codex_tail(&snapshot.accounts[4]).contains(" resets=0"));
+        assert!(!codex_tail(&snapshot.accounts[4]).contains("reset_expires_at_ms"));
+        snapshot.accounts[4].codex.reset_credits = None;
+        assert!(!codex_tail(&snapshot.accounts[4]).contains("resets="));
+        snapshot.accounts[0].codex.reset_credits = Some(tcr_status_wire::ResetCredits {
+            available_count: 9,
+            earliest_expiry_ms: None,
+        });
+        assert!(!codex_tail(&snapshot.accounts[0]).contains("resets="));
+        let wire: serde_json::Value =
+            serde_json::from_str(&status_json(&snapshot, &thresholds, StatusSource::Live)).unwrap();
+        assert!(wire[0].get("resetCredits").is_none());
+        assert!(wire[4].get("resetCredits").is_none());
+    }
 
     #[test]
     fn codex_pending_token_sync_has_a_text_status_hint() {
@@ -11830,6 +11875,10 @@ mod tests {
                 login_error: Some("refresh_token_reused".to_string()),
                 codex_home: Some("/Users/example/.codex".to_string()),
                 token_sync_pending: true,
+                reset_credits: Some(tcr_status_wire::ResetCredits {
+                    available_count: 3,
+                    earliest_expiry_ms: Some(1_800_000_000_000),
+                }),
             };
         }
         check("with every Codex fact set", render(&snapshot));

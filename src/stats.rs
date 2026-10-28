@@ -324,8 +324,7 @@ pub struct AccountSnapshot {
 /// was imported from.
 ///
 /// Grouped in one struct so an Anthropic row is the one line
-/// `codex: CodexFacts::default()`, instead of eight fields every Anthropic
-/// literal must spell out.
+/// `codex: CodexFacts::default()`, so each Anthropic literal needs no individual facts.
 ///
 /// `None` and `false` mean "not reported", never "reported absent". The one
 /// value that is a fact rather than a gap is `quota_windows: Some(vec![])`: a
@@ -347,6 +346,8 @@ pub struct CodexFacts {
     pub spend_control_reached: bool,
     /// The account's credits, once reported.
     pub credits: Option<tcr_status_wire::CodexCredits>,
+    /// Banked resets from the last successful usage read; absent means unknown.
+    pub reset_credits: Option<tcr_status_wire::ResetCredits>,
     /// Why the account's login is known dead (`refresh_token_reused`, …).
     pub login_error: Option<String>,
     /// The absolute path of the folder the account's login was imported from.

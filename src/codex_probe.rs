@@ -1,4 +1,4 @@
-//! The Codex quota probe: one `GET /backend-api/wham/usage` per account, no inference.
+//! The `codex` quota probe: usage and, for positive banked resets, expiry details; no inference.
 //!
 //! The Codex TUI reads its own limits from this endpoint
 //! (`openai/codex` `backend-client/src/client/rate_limit_resets.rs:69-80,124-128`), with the
@@ -24,7 +24,8 @@
 //! balance, `spend_control` `{ reached, … }`, `rate_limit_reached_type` `{ type, details }`). It
 //! also records which windows the payload carried and how long each is, so a plan that reports
 //! only its weekly window, or none, is told apart from one whose windows are not known yet. The
-//! other keys are still ignored.
+//! reset summary is read separately from paid credits. Positive counts add a bounded details
+//! read for a qualified expiry; identities are discarded before facts leave this module.
 //!
 //! It reads two flags of `rate_limit` too, `allowed` and `limit_reached`: the backend's own
 //! verdict on the account. A probe that reads the account allowed, not at its limit, with its
@@ -60,6 +61,8 @@ pub struct CodexProbeFacts {
     pub spend_control_reached: bool,
     /// The `credits` object, when it carries a boolean `has_credits`.
     pub credits: Option<tcr_status_wire::CodexCredits>,
+    /// Banked resets from the last successful usage read; absent means unknown.
+    pub reset_credits: Option<tcr_status_wire::ResetCredits>,
     /// `rate_limit.allowed`: the backend's own verdict that the account may be served. Only a
     /// JSON boolean counts; anything else, and a payload with no `rate_limit`, is `None`.
     pub allowed: Option<bool>,
@@ -133,7 +136,133 @@ pub async fn fetch_usage(
         message: format!("codex usage probe was not JSON: {e}"),
         retry_after_secs: None,
     })?;
-    Ok(usage_from_payload(&payload))
+    let mut usage = usage_from_payload(&payload);
+    if let Some(resets) = usage
+        .codex
+        .as_mut()
+        .and_then(|facts| facts.reset_credits.as_mut())
+        .filter(|resets| resets.available_count > 0)
+    {
+        resets.earliest_expiry_ms = fetch_reset_expiry(
+            client,
+            base,
+            access_token,
+            account_id,
+            resets.available_count,
+        )
+        .await;
+    }
+    Ok(usage)
+}
+
+/// Summary is independent of the usage windows and paid credits. The source contract uses
+/// an i64; negative, fractional, string and out-of-range counts are unknown.
+fn reset_credits_from_payload(value: Option<&Value>) -> Option<tcr_status_wire::ResetCredits> {
+    Some(tcr_status_wire::ResetCredits {
+        available_count: u64::try_from(value?.get("available_count")?.as_i64()?).ok()?,
+        earliest_expiry_ms: None,
+    })
+}
+
+/// Optional details never turn a successful usage read into a failed one. Bound the full
+/// call and its body; partial/capped details cannot establish complete available coverage.
+async fn fetch_reset_expiry(
+    client: &reqwest::Client,
+    base: &str,
+    access_token: &str,
+    account_id: Option<&str>,
+    count: u64,
+) -> Option<i64> {
+    let timeout = std::time::Duration::from_secs(5);
+    tokio::time::timeout(timeout, async {
+        let mut request = client
+            .get(format!(
+                "{}/backend-api/wham/rate-limit-reset-credits",
+                base.trim_end_matches('/')
+            ))
+            .bearer_auth(access_token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(
+                reqwest::header::USER_AGENT,
+                concat!("tcr/", env!("CARGO_PKG_VERSION")),
+            )
+            .timeout(timeout);
+        if let Some(id) = account_id {
+            request = request.header(crate::provider::CODEX_ACCOUNT_HEADER, id);
+        }
+        let mut response = request.send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        const BODY_LIMIT: usize = 1_048_576;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if chunk.len() > BODY_LIMIT - body.len() {
+                return None;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let payload = serde_json::from_slice(&body).ok()?;
+        reset_expiry_from_details(&payload, count, crate::now_ms())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Trust expiry only when all rows are well formed and unique, both counts agree, and the
+/// available rows cover that count. Unknown kinds/statuses invalidate the details. IDs exist
+/// only in this local validation set, never in a stored fact, error, trace or public value.
+fn reset_expiry_from_details(value: &Value, count: u64, now_ms: i64) -> Option<i64> {
+    use time::format_description::well_known::Rfc3339;
+    let timestamp = |value: &Value| {
+        let parsed = time::OffsetDateTime::parse(value.as_str()?, &Rfc3339).ok()?;
+        i64::try_from(parsed.unix_timestamp_nanos() / 1_000_000).ok()
+    };
+    let reported = u64::try_from(value.get("available_count")?.as_i64()?).ok()?;
+    if reported != count {
+        return None;
+    }
+    let rows = value.get("credits")?.as_array()?;
+    let mut ids = std::collections::HashSet::new();
+    let mut available = 0u64;
+    let mut earliest = None;
+    for row in rows {
+        let id = row.get("id")?.as_str()?;
+        if id.trim().is_empty() || !ids.insert(id) {
+            return None;
+        }
+        if row.get("reset_type")?.as_str()? != "codex_rate_limits" {
+            return None;
+        }
+        let status = row.get("status")?.as_str()?;
+        if !matches!(status, "available" | "redeeming" | "redeemed") {
+            return None;
+        }
+        let granted = timestamp(row.get("granted_at")?)?;
+        let expiry = match row.get("expires_at") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(timestamp(value)?),
+        };
+        for key in ["title", "description"] {
+            if row.get(key).is_some_and(|v| !v.is_null() && !v.is_string()) {
+                return None;
+            }
+        }
+        if expiry.is_some_and(|expiry| expiry < granted) {
+            return None;
+        }
+        if status == "available" {
+            if granted > now_ms || expiry.is_some_and(|expiry| expiry <= now_ms) {
+                return None;
+            }
+            available = available.checked_add(1)?;
+            if let Some(expiry) = expiry {
+                earliest = Some(earliest.map_or(expiry, |prior: i64| prior.min(expiry)));
+            }
+        }
+    }
+    (available == count).then_some(earliest).flatten()
 }
 
 /// Map the payload onto tcr's buckets. `used_percent` is 0–100; `reset_at` is epoch seconds and
@@ -172,6 +301,7 @@ pub fn usage_from_payload(v: &Value) -> Usage {
             .and_then(Value::as_bool)
             == Some(true),
         credits: credits_from_payload(v.get("credits")),
+        reset_credits: reset_credits_from_payload(v.get("rate_limit_reset_credits")),
         windows: crate::quota::CodexWindows::default(),
         allowed: None,
         limit_reached: None,
@@ -300,6 +430,252 @@ fn credits_from_payload(value: Option<&Value>) -> Option<tcr_status_wire::CodexC
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn reset_summary_is_independent_and_invalid_success_clears_prior() {
+        let mut quota = crate::quota::Quota::default();
+        for count in [0, 3, i64::MAX] {
+            let usage = usage_from_payload(&serde_json::json!({
+                "rate_limit": null, "rate_limit_reset_credits": {"available_count": count}
+            }));
+            quota.apply_usage(&usage);
+            let resets = quota.codex.reset_credits.as_ref().unwrap();
+            assert_eq!(resets.available_count, count as u64);
+            assert_eq!(resets.earliest_expiry_ms, None);
+            assert!(quota.five_hour.is_none());
+        }
+        for block in [
+            Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"available_count": -1}),
+            serde_json::json!({"available_count": 1.5}),
+            serde_json::json!({"available_count": "3"}),
+            serde_json::json!({"available_count": true}),
+            serde_json::json!({"available_count": u64::MAX}),
+        ] {
+            quota.apply_usage(&usage_from_payload(&serde_json::json!({
+                "rate_limit_reset_credits": {"available_count": 3}
+            })));
+            assert!(quota.codex.reset_credits.is_some());
+            quota.apply_usage(&usage_from_payload(
+                &serde_json::json!({"rate_limit_reset_credits": block}),
+            ));
+            assert_eq!(quota.codex.reset_credits, None);
+        }
+        quota.apply_usage(&usage_from_payload(&serde_json::json!({})));
+        assert_eq!(quota.codex.reset_credits, None);
+    }
+
+    fn reset_details() -> Value {
+        serde_json::json!({"available_count": 2, "credits": [
+            {"id":"fake-first", "reset_type":"codex_rate_limits", "status":"available",
+             "granted_at":"2026-01-01T00:00:00Z", "expires_at":"2030-01-02T00:00:00Z"},
+            {"id":"fake-second", "reset_type":"codex_rate_limits", "status":"available",
+             "granted_at":"2026-01-01T00:00:00Z", "expires_at":"2030-01-01T01:00:00+01:00"},
+            {"id":"fake-used", "reset_type":"codex_rate_limits", "status":"redeemed",
+             "granted_at":"2026-01-01T00:00:00Z", "expires_at":"2026-01-02T00:00:00Z"}
+        ]})
+    }
+
+    #[test]
+    fn reset_details_require_complete_valid_coverage() {
+        let now = 1_800_000_000_000;
+        let details = reset_details();
+        assert_eq!(
+            reset_expiry_from_details(&details, 2, now),
+            Some(1_893_456_000_000)
+        );
+        assert_eq!(reset_expiry_from_details(&details, 3, now), None);
+        let mut null_expiry = details.clone();
+        null_expiry["credits"][1]["expires_at"] = Value::Null;
+        assert_eq!(
+            reset_expiry_from_details(&null_expiry, 2, now),
+            Some(1_893_542_400_000)
+        );
+        null_expiry["credits"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("expires_at");
+        assert_eq!(reset_expiry_from_details(&null_expiry, 2, now), None);
+        for (key, value) in [
+            ("id", serde_json::json!("fake-first")),
+            ("id", serde_json::json!("")),
+            ("reset_type", serde_json::json!("future-kind")),
+            ("status", serde_json::json!("unknown")),
+            ("granted_at", serde_json::json!("bad")),
+            ("granted_at", serde_json::json!("2040-01-01T00:00:00Z")),
+            ("expires_at", serde_json::json!("bad")),
+            ("expires_at", serde_json::json!(i64::MAX)),
+            ("expires_at", serde_json::json!("2026-01-02T00:00:00Z")),
+            ("title", serde_json::json!(123)),
+            ("description", serde_json::json!({})),
+        ] {
+            let mut bad = details.clone();
+            bad["credits"][1][key] = value;
+            assert_eq!(
+                reset_expiry_from_details(&bad, 2, now),
+                None,
+                "invalid {key}"
+            );
+        }
+        let mut capped = details;
+        capped["credits"].as_array_mut().unwrap().remove(1);
+        assert_eq!(reset_expiry_from_details(&capped, 2, now), None);
+    }
+
+    #[tokio::test]
+    async fn reset_details_get_is_optional_bounded_and_uses_the_same_login() {
+        use axum::{Router, response::IntoResponse, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let app = Router::new()
+            .route(
+                "/backend-api/wham/usage",
+                get(|headers: axum::http::HeaderMap| async move {
+                    if headers["authorization"] == "Bearer fake-usage-error" {
+                        return (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            "fake-secret-sentinel",
+                        )
+                            .into_response();
+                    }
+                    let count = if headers["authorization"] == "Bearer fake-zero" {
+                        0
+                    } else {
+                        2
+                    };
+                    axum::Json(serde_json::json!({"rate_limit": null,
+                    "rate_limit_reset_credits": {"available_count":count}}))
+                    .into_response()
+                }),
+            )
+            .route(
+                "/backend-api/wham/rate-limit-reset-credits",
+                get(move |headers: axum::http::HeaderMap| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert_eq!(headers["chatgpt-account-id"], "fake-workspace");
+                        assert_eq!(
+                            headers["user-agent"],
+                            concat!("tcr/", env!("CARGO_PKG_VERSION"))
+                        );
+                        match headers["authorization"].to_str().unwrap() {
+                            "Bearer fake-fail" => (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                "fake-secret-sentinel".to_string(),
+                            )
+                                .into_response(),
+                            "Bearer fake-malformed" => "not JSON".into_response(),
+                            "Bearer fake-capped" => " ".repeat(1_048_577).into_response(),
+                            "Bearer fake-timeout" => {
+                                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                                axum::Json(reset_details()).into_response()
+                            }
+                            "Bearer fake-positive" => axum::Json(reset_details()).into_response(),
+                            _ => panic!("unexpected synthetic login"),
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    stopped.await.expect("test requests server shutdown");
+                })
+                .await
+                .unwrap();
+        });
+        let client = crate::http_client::builder().no_proxy().build().unwrap();
+        let zero = fetch_usage(&client, &base, "fake-zero", Some("fake-workspace"))
+            .await
+            .unwrap();
+        assert_eq!(
+            zero.codex.unwrap().reset_credits.unwrap().available_count,
+            0
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "zero must not fetch details"
+        );
+        let positive = fetch_usage(&client, &base, "fake-positive", Some("fake-workspace"))
+            .await
+            .unwrap();
+        assert_eq!(
+            positive
+                .codex
+                .unwrap()
+                .reset_credits
+                .unwrap()
+                .earliest_expiry_ms,
+            Some(1_893_456_000_000)
+        );
+        for token in ["fake-fail", "fake-malformed", "fake-capped", "fake-timeout"] {
+            let usage = fetch_usage(&client, &base, token, Some("fake-workspace"))
+                .await
+                .unwrap();
+            let resets = usage.codex.unwrap().reset_credits.unwrap();
+            assert_eq!(resets.available_count, 2);
+            assert_eq!(resets.earliest_expiry_ms, None);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        let config = serde_json::from_value(serde_json::json!({"accounts":[{
+            "name":"alice@example.com", "provider":"codex", "accessToken":"fake-usage-error",
+            "accountUuid":"fake-workspace", "organizationType":"pro", "expiresAt":4_102_444_800_000i64
+        }]}))
+        .unwrap();
+        let manager = crate::manager::Manager::new(
+            config,
+            Arc::new(crate::oauth::NoRefresh),
+            Arc::new(crate::probe::LiveUsageProber::new().with_codex_base(base)),
+            Arc::new(crate::warmer::LiveWarmer::new()),
+            None,
+        );
+        let mut initial = usage_from_payload(
+            &serde_json::json!({"rate_limit_reset_credits":{"available_count":2}}),
+        );
+        initial
+            .codex
+            .as_mut()
+            .unwrap()
+            .reset_credits
+            .as_mut()
+            .unwrap()
+            .earliest_expiry_ms = Some(1_893_456_000_000);
+        manager.apply_usage(0, &initial);
+        manager.probe_account(0).await;
+        let snapshot = manager.snapshot(time::OffsetDateTime::now_utc());
+        assert_eq!(
+            snapshot.accounts[0].codex.reset_credits,
+            initial.codex.unwrap().reset_credits
+        );
+        assert_eq!(
+            snapshot.accounts[0].probe_status,
+            crate::probe::ProbeStatus::RateLimited
+        );
+        let wire = serde_json::to_string(&crate::status::StatusPayload::from_snapshot(
+            &snapshot,
+            &[],
+            false,
+            None,
+            Default::default(),
+        ))
+        .unwrap();
+        assert!(!wire.contains("fake-secret-sentinel"));
+        assert!(!wire.contains("fake-workspace"));
+        assert!(!wire.contains("fake-usage-error"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "failed usage must not read details"
+        );
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
 
     const PAYLOAD: &str = r#"{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,
         "primary_window":{"used_percent":25,"limit_window_seconds":18000,"reset_after_seconds":3600,"reset_at":1800003600},

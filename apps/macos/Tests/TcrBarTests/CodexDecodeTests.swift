@@ -7,6 +7,14 @@ import XCTest
 /// server's rows, and this decoder reading an older server's.
 final class CodexDecodeTests: XCTestCase {
 
+    func testCanonicalRowsKeepResetCreditsUnknown() throws {
+        for account in try canonicalFleet().accounts {
+            XCTAssertNil(account.resetCredits)
+        }
+        let zero = try JSONDecoder().decode(ResetCredits.self, from: Data("{\"availableCount\":0}".utf8))
+        XCTAssertEqual(zero, ResetCredits(availableCount: 0))
+    }
+
     /// Ten rows, alice the one Claude row among them, and not one of them unreadable.
     func testEveryCanonicalRowDecodes() throws {
         let fleet = try canonicalFleet()
