@@ -2463,6 +2463,38 @@ mod quota_replay {
     }
 
     #[test]
+    fn default_suite_guards_frozen_baseline() {
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/quota-replay-baseline.json")).unwrap();
+        assert_eq!(expected["cases"].as_object().unwrap().len(), 10);
+        for mixed in [false, true] {
+            let requests = trace(mixed);
+            let prefix = if mixed { "B-" } else { "A-" };
+            let trace_digest = digest(&serde_json::to_vec(&requests).unwrap());
+            let cases: Vec<_> = expected["cases"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .collect();
+            assert_eq!(cases.len(), 5, "every stored trace must be checked");
+            for (name, case) in cases {
+                assert_eq!(trace_digest, case["trace_sha256"], "trace changed: {name}");
+            }
+            // One low-load case is the smallest nonempty selection witness.
+            // It exercises real selection and holds while draining its backlog.
+            if !mixed {
+                let score = replay(&requests, false, 4, 0.6);
+                assert_eq!(
+                    digest(&serde_json::to_vec(&score).unwrap()),
+                    expected["cases"]["A-load06"]["score_sha256"],
+                    "the default suite must guard the frozen selection score"
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "ten-case replay takes minutes unoptimized; run: cargo test --test it workload_scenarios::quota_replay::frozen_baseline --locked -- --ignored"]
     fn frozen_baseline() {
         let expected: serde_json::Value =
