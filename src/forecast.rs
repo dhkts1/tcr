@@ -241,6 +241,7 @@ impl WindowFit {
 #[derive(Debug, Default)]
 pub(crate) struct Calibration {
     tokens: Tokens,
+    pending: BTreeMap<i64, Tokens>,
     windows: [WindowFit; 3],
     last_reading: Option<i64>,
 }
@@ -253,7 +254,15 @@ impl Calibration {
             return;
         };
         if self.last_reading.is_some_and(|at| record.ts_ms <= at)
-            || add(self.tokens.entry(family).or_default(), value).is_none()
+            || add(
+                self.pending
+                    .entry(record.ts_ms)
+                    .or_default()
+                    .entry(family)
+                    .or_default(),
+                value,
+            )
+            .is_none()
         {
             self.invalidate();
         }
@@ -286,6 +295,20 @@ impl Calibration {
             return;
         }
         self.last_reading = Some(now);
+        // A queued reading can precede an already recorded completion. Only fold
+        // records through this upper watermark; later records wait for a later
+        // reading. Anchor differences retain the exclusive lower watermark.
+        while let Some(entry) = self.pending.first_entry() {
+            if *entry.key() > now {
+                break;
+            }
+            for (family, value) in entry.remove() {
+                if add(self.tokens.entry(family).or_default(), value).is_none() {
+                    self.invalidate();
+                    return;
+                }
+            }
+        }
         for (idx, (window, bucket)) in self.windows.iter_mut().zip(buckets).enumerate() {
             let tokens = self
                 .tokens
