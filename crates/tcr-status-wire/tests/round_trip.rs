@@ -494,3 +494,30 @@ fn model_unavailability_is_a_known_codex_refusal() {
         "model_unavailable"
     );
 }
+
+#[test]
+fn reset_credits_round_trip_and_older_rows_remain_absent() {
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(fixture_path()).unwrap()).unwrap();
+    let mut row = rows
+        .into_iter()
+        .find(|row| row["provider"] == "codex")
+        .unwrap();
+    let decoded = AccountStatusRow::from_value(row.clone()).unwrap();
+    assert_eq!(decoded.reset_credits.as_ref().unwrap().available_count, 3);
+    assert_eq!(
+        decoded.reset_credits.as_ref().unwrap().earliest_expiry_ms,
+        Some(1_800_000_000_000)
+    );
+    assert_eq!(serde_json::to_value(decoded).unwrap(), row);
+    row.as_object_mut().unwrap().remove("resetCredits");
+    let decoded = AccountStatusRow::from_value(row.clone()).unwrap();
+    assert_eq!(decoded.reset_credits, None);
+    assert_eq!(serde_json::to_value(decoded).unwrap(), row);
+    for row in canonical_rows() {
+        assert_eq!(
+            AccountStatusRow::from_value(row).unwrap().reset_credits,
+            None
+        );
+    }
+}

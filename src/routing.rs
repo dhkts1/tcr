@@ -61,6 +61,9 @@ pub struct ProviderRouting {
     pub last_error: Option<LastError>,
     /// Every model family seen this boot.
     pub models: Vec<ModelRouting>,
+    /// Checked total across all listed `codex` rows, parked included. Any unknown stays absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits_available: Option<u64>,
 }
 
 /// A pool's state for new work.
@@ -308,7 +311,20 @@ fn provider_routing(
         state,
         last_error,
         models,
+        reset_credits_available: match provider {
+            Provider::Anthropic => None,
+            Provider::Codex => reset_credits_total(&manager.snapshot(now).accounts),
+        },
     })
+}
+
+fn reset_credits_total(accounts: &[crate::stats::AccountSnapshot]) -> Option<u64> {
+    accounts
+        .iter()
+        .filter(|account| account.provider == Provider::Codex)
+        .try_fold(0u64, |total, account| {
+            total.checked_add(account.codex.reset_credits.as_ref()?.available_count)
+        })
 }
 
 /// The pool's state: out when nothing can serve its new work; degraded when something can
@@ -431,6 +447,80 @@ mod tests {
 
     /// A fixed instant on a whole second, in ms.
     const AT: i64 = 1_800_000_000_000;
+
+    #[test]
+    fn reset_total_includes_parked_omits_unknown_and_checks_overflow() {
+        let manager_of = |rows: &[(&str, Option<u64>)]| {
+            let accounts: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .map(|(index, (provider, _))| {
+                    serde_json::json!({"name":format!("test-{index}"), "provider":provider,
+                    "accessToken":"fake-key", "disabled":true})
+                })
+                .collect();
+            let config = serde_json::from_value(serde_json::json!({"accounts":accounts})).unwrap();
+            let manager = Manager::with_live_refresher(config, None);
+            for (index, (_, count)) in rows.iter().enumerate() {
+                if let Some(count) = count {
+                    manager.apply_usage(
+                        index,
+                        &crate::codex_probe::usage_from_payload(&serde_json::json!({
+                            "rate_limit_reset_credits":{"available_count":count}
+                        })),
+                    );
+                }
+            }
+            manager
+        };
+        let now = OffsetDateTime::now_utc();
+        let manager = manager_of(&[("codex", Some(2)), ("codex", Some(3)), ("anthropic", None)]);
+        let doc = document(&manager, now).unwrap();
+        assert_eq!(doc.schema, 1);
+        assert_eq!(doc.providers[1].reset_credits_available, Some(5));
+        let wire = serde_json::to_value(doc).unwrap();
+        assert!(wire["providers"][0].get("resetCreditsAvailable").is_none());
+        assert_eq!(wire["providers"][1]["resetCreditsAvailable"], 5);
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("fleet.json");
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({"accounts":[
+            {"name":"removed", "provider":"codex", "accessToken":"fake-key"},
+            {"name":"retained", "provider":"codex", "accessToken":"fake-key", "disabled":true}
+        ]}))
+        .unwrap();
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+        manager.apply_usage(
+            1,
+            &crate::codex_probe::usage_from_payload(&serde_json::json!({
+                "rate_limit_reset_credits":{"available_count":0}
+            })),
+        );
+        std::fs::write(&path, r#"{"accounts":[{"name":"retained","provider":"codex","accessToken":"fake-key","disabled":true}]}"#).unwrap();
+        assert_eq!(
+            document(&manager, now).unwrap().providers[1].reset_credits_available,
+            Some(0)
+        );
+        for rows in [
+            vec![("codex", None)],
+            vec![
+                ("codex", Some(i64::MAX as u64)),
+                ("codex", Some(i64::MAX as u64)),
+                ("codex", Some(2)),
+            ],
+        ] {
+            let manager = manager_of(&rows);
+            assert_eq!(
+                document(&manager, now).unwrap().providers[1].reset_credits_available,
+                None
+            );
+        }
+        let manager = Manager::from_runtimes(vec![]);
+        assert_eq!(
+            document(&manager, now).unwrap().providers[1].reset_credits_available,
+            Some(0)
+        );
+    }
 
     /// **`count10m` counts the last error's kind in the ten minutes up to now, per
     /// provider, and only those.**

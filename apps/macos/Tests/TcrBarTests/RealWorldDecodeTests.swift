@@ -435,10 +435,21 @@ final class RealWorldDecodeTests: XCTestCase {
         XCTAssertEqual(fleet.serverSha, "abc1234")
     }
 
-    /// The contract's Codex row names its provider and carries none of the Codex facts, so
-    /// this is what a row with no Codex data decodes to: each fact absent, which reads as
-    /// unknown, never as a value. The canonical Codex fixture is the proof of the present
-    /// half (`CodexDecodeTests`).
+    func testCommittedContractResetCreditsAndOlderRow() throws {
+        let data = try contractFixtureData()
+        let fleet = try Fleet.decode(data)
+        let resets = try XCTUnwrap(fleet.accounts.last?.resetCredits)
+        XCTAssertEqual(resets, ResetCredits(availableCount: 3, earliestExpiryMs: 1_800_000_000_000))
+        var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+        rows[rows.count - 1].removeValue(forKey: "resetCredits")
+        let old = try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
+        XCTAssertNil(old.accounts.last?.resetCredits)
+        XCTAssertNil(fleet.accounts.first?.resetCredits)
+    }
+
+    /// The contract row carries reset credits, while its earlier Codex facts remain absent.
+    /// Those absent facts decode as unknown. The unchanged canonical fixture exercises their
+    /// present forms (`CodexDecodeTests`).
     func testCommittedContractFixtureHasNoCodexKeys() throws {
         let fleet = try Fleet.decode(contractFixtureData())
 

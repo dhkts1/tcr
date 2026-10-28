@@ -421,6 +421,9 @@ impl Quota {
         if let Some(facts) = &usage.codex {
             self.codex.probed_windows = Some(facts.windows);
             self.codex.spend_control_reached = facts.spend_control_reached;
+            // A successful read replaces this fact, including missing or malformed summaries.
+            // Failed reads never reach apply_usage and retain the prior reading.
+            self.codex.reset_credits.clone_from(&facts.reset_credits);
             if let Some(credits) = &facts.credits {
                 self.codex.credits = Some(credits.clone());
             }
@@ -758,6 +761,8 @@ pub struct CodexQuotaFacts {
     pub spend_control_reached: bool,
     /// The account's credits, from the last reading that reported them.
     pub credits: Option<tcr_status_wire::CodexCredits>,
+    /// Banked resets from the last successful usage read; absent means unknown.
+    pub reset_credits: Option<tcr_status_wire::ResetCredits>,
 }
 
 impl CodexQuotaFacts {

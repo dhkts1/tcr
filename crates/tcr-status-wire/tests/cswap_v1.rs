@@ -199,6 +199,7 @@ fn base(name: &str) -> AccountStatusRow {
         limit_reached_type: None,
         spend_control_reached: false,
         credits: None,
+        reset_credits: None,
         login_error: None,
         codex_home: None,
         token_sync_pending: false,

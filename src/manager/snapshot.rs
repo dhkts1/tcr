@@ -444,6 +444,7 @@ fn codex_snapshot_facts(a: &AccountRuntime) -> crate::stats::CodexFacts {
         limit_reached_type: a.quota.codex_limit_reached_type().map(str::to_string),
         spend_control_reached: a.quota.codex.spend_control_reached,
         credits: a.quota.codex.credits.clone(),
+        reset_credits: a.quota.codex.reset_credits.clone(),
         login_error: a.login_error.clone(),
         codex_home: a.codex_home.clone(),
         token_sync_pending: a.pending_codex_writeback.is_some(),

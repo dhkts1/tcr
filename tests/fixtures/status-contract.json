@@ -434,10 +434,6 @@
     "probeError": null,
     "probeStatus": "ok",
     "provider": "codex",
-    "resetCredits": {
-      "availableCount": 3,
-      "earliestExpiryMs": 1800000000000
-    },
     "quota": 0.1,
     "quotaState": "ok",
     "quotaUpdatedAtMs": null,
@@ -445,6 +441,10 @@
     "rateLimitedUntilMs": null,
     "requests": 0,
     "reservedGroups": [],
+    "resetCredits": {
+      "availableCount": 3,
+      "earliestExpiryMs": 1800000000000
+    },
     "seatTier": null,
     "secondsUntilFree": null,
     "serverDirty": false,
