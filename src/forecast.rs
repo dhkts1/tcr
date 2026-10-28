@@ -1439,3 +1439,41 @@ mod reviewer_upper_watermark {
         );
     }
 }
+
+#[cfg(test)]
+mod reviewer_pending_bound {
+    use super::*;
+    use crate::usage::UsageRecord;
+
+    fn tick(percent: f64) -> [Option<crate::probe::UsageBucket>; 3] {
+        [Some(crate::probe::UsageBucket {
+            utilization: Some((percent + 0.001) / 100.0),
+            reset_at_ms: Some(10_000_000_000),
+        }); 3]
+    }
+
+    #[test]
+    fn reviewer_pending_records_stay_bounded_without_a_finished_reading() {
+        let mut c = Calibration::default();
+        c.observe(tick(10.0), 1_000, false);
+        for n in 1..=4_096_i64 {
+            c.record(&UsageRecord::from_quota_input(
+                1_000 + n,
+                Some("claude-fable-5".into()),
+                None,
+                100,
+                0,
+                0,
+                0,
+                25,
+            ));
+            // The account stays busy: every reading arrives with a request in flight.
+            c.observe(tick(10.0), 1_000 + n, true);
+        }
+        let len = c.pending.len();
+        assert!(
+            c.pending.len() <= MAX_SAMPLES,
+            "pending retained {len} completed records without a finished reading"
+        );
+    }
+}
