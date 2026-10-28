@@ -2330,6 +2330,31 @@ impl Manager {
         }
     }
 
+    /// Replay-only read of the selector's hard serve gates, without spending its valve.
+    #[doc(hidden)]
+    pub fn replay_can_revalidate(&self, idx: usize, now: OffsetDateTime, is_fable: bool) -> bool {
+        if !self.revalidation_serve_enabled() {
+            return false;
+        }
+        let groups = self.groups();
+        let warm = self.warm_window(None);
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
+        accounts.get(idx).is_some_and(|account| {
+            Self::hard_ok(
+                account,
+                self.global_threshold,
+                self.fable_weekly_threshold,
+                now,
+                odt_to_ms(now),
+                is_fable,
+                None,
+                &groups.reserved,
+                &groups.parked,
+                warm,
+            )
+        })
+    }
+
     /// Give EVERY account a fresh HTTP client after the machine slept for
     /// `slept`, not just the one about to send: the sleep outlasted every
     /// pooled connection's idle life on the server side, and none of the pools

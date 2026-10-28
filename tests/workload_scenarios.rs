@@ -1843,9 +1843,12 @@ mod quota_replay {
         events.entry((at, 2, 0)).or_insert(Event::Release);
     }
 
-    fn wait_reason(manager: &Manager, request: &Request, at: i64) -> (WaitReason, Option<i64>) {
-        use tcr::manager::PoolPass;
-        use tcr::stats::GateReason;
+    fn wait_reason(
+        manager: &Manager,
+        request: &Request,
+        at: i64,
+        slots: &[Slot],
+    ) -> (WaitReason, Option<i64>) {
         let now = t0() + Duration::milliseconds(at);
         let model = Some(MODELS[request.family]);
         let routed = manager.routing_candidates(now, model, request.path());
@@ -1853,23 +1856,9 @@ mod quota_replay {
             let wake = routed.free_at.map(|at| to_ms(at) - to_ms(t0()));
             // Ask the production predicates at their own deadline. A soft
             // threshold plus the revalidation valve is pacing, not exhaustion.
-            let revalidation = routed.free_at.is_some_and(|free| {
-                let future = manager.routing_candidates(free, model, request.path());
-                future.pass == Some(PoolPass::Revalidation)
-                    && future.accounts.iter().any(|&i| {
-                        manager
-                            .exhaustion_hint_for_account(now, routed.is_fable, i)
-                            .gated
-                            .keys()
-                            .all(|gate| {
-                                matches!(
-                                    gate,
-                                    GateReason::FiveHour
-                                        | GateReason::SevenDay
-                                        | GateReason::FableWeekly
-                                )
-                            })
-                    })
+            let revalidation = slots.iter().enumerate().any(|(i, slot)| {
+                slot.provider == request.provider()
+                    && manager.replay_can_revalidate(i, now, routed.is_fable)
             });
             return (
                 if revalidation {
@@ -2234,7 +2223,7 @@ mod quota_replay {
                     );
                 }
                 if let Some(r) = queue.values().next().and_then(|rs| rs.front()) {
-                    let (reason, wake) = wait_reason(&fleet.manager, &requests[*r], at);
+                    let (reason, wake) = wait_reason(&fleet.manager, &requests[*r], at, &slots);
                     waiting[family] = Some(reason);
                     if (TRAINING..END).contains(&at) {
                         *score.waits.entry(reason).or_default() += 1;
