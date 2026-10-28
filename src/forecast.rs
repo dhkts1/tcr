@@ -1482,3 +1482,90 @@ mod reviewer_pending_bound {
         );
     }
 }
+
+#[cfg(test)]
+mod reviewer_lower_watermark {
+    use crate::{
+        config::{Account, Config},
+        manager::Manager,
+        usage::UsageRecord,
+    };
+    fn readiness(offset_ms: i64) -> bool {
+        let mut config = Config::fixture(vec![Account::fixture("alice@example.com")]);
+        config.upstream = "http://127.0.0.1:1".into();
+        config.codex_upstream = "http://127.0.0.1:1".into();
+        let manager = Manager::with_live_refresher(config, None);
+        let start = time::OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap();
+        manager.record_usage(
+            0,
+            UsageRecord::from_quota_input(
+                start.unix_timestamp() * 1000,
+                Some("claude-fable-5".into()),
+                None,
+                100,
+                0,
+                0,
+                0,
+                25,
+            ),
+        );
+        let now = start + time::Duration::hours(2);
+        let ticks = |percent: u64| {
+            let b = Some(crate::probe::UsageBucket {
+                utilization: Some((percent as f64 + 0.001) / 100.0),
+                reset_at_ms: Some((start.unix_timestamp() + 18_000) * 1000),
+            });
+            crate::probe::Usage {
+                five_hour: b,
+                seven_day: b,
+                seven_day_oi: b,
+                ..Default::default()
+            }
+        };
+        manager.apply_usage_at(0, &ticks(10), now);
+        let mut percent = 10;
+        for n in 1..=24 {
+            let reading = now + time::Duration::seconds(2 * n);
+            let delta = if n % 4 == 0 { 7 } else { 1 };
+            let (input, output) = if n % 2 == 0 {
+                (100 * delta, 0)
+            } else {
+                (0, 25 * delta)
+            };
+            // A queued observation can acquire the account lock after a
+            // completion whose timestamp is beyond that observation's upper bound.
+            manager.record_usage(
+                0,
+                UsageRecord::from_quota_input(
+                    reading.unix_timestamp() * 1000 + offset_ms,
+                    Some("claude-fable-5".into()),
+                    None,
+                    input,
+                    0,
+                    0,
+                    0,
+                    output,
+                ),
+            );
+            percent += delta;
+            manager.apply_usage_at(0, &ticks(percent), reading);
+        }
+        let forecast = crate::routing::document(&manager, now + time::Duration::seconds(50))
+            .unwrap()
+            .forecast
+            .expect("complete seeded demand is visible");
+        assert!(forecast["providers"][0]["historyHours"].as_f64().unwrap() >= 2.0);
+        forecast["providers"][0]["calibrated"].as_bool().unwrap()
+    }
+    #[test]
+    fn reviewer_a_record_at_the_lower_watermark_cannot_enter_its_interval() {
+        assert!(
+            readiness(-1),
+            "the same full-rank vectors inside each watermark do calibrate"
+        );
+        assert!(
+            !readiness(-2000),
+            "a record stamped at the lower reading cannot enter its interval"
+        );
+    }
+}
