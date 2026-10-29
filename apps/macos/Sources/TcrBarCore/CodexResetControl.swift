@@ -6,7 +6,8 @@ public enum CodexResetCommand {
     public typealias Runner = @Sendable ([String], String) throws -> TcrTool.Output
 
     /// Both streams are kept even when the command exits zero. Only the command writes
-    /// outcome and warning words; the panel displays them without interpreting them.
+    /// outcome and warning words, except "Reset failed." when no command could start;
+    /// the panel displays them without interpreting them.
     public struct Outcome: Equatable, Sendable {
         public let exitCode: Int32
         public let stdout: String
@@ -91,8 +92,10 @@ public final class CodexResetController: ObservableObject {
                     exitCode: output.exitCode, stdout: String(decoding: output.stdout, as: UTF8.self),
                     stderr: output.stderr)
             } catch {
-                return CodexResetCommand.Outcome(
-                    exitCode: -1, stdout: "", stderr: error.localizedDescription)
+                // Every runner throw precedes a started child: `TcrTool.resolve()` found no
+                // `tcr`, or `Process.run()` refused it. Nothing was sent, so this shows the
+                // approved words and never the thrown text; the attempt stays for Retry.
+                return CodexResetCommand.Outcome(exitCode: -1, stdout: "", stderr: "Reset failed.")
             }
         }.value
         outcomes[account.id] = outcome
