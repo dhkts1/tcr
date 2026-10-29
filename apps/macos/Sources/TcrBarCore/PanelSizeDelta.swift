@@ -36,15 +36,15 @@ import Foundation
 ///
 /// The maths lives here and the I/O lives in `MenuBarShell`, which is the split
 /// ``PanelHeight``, ``PanelSize`` and ``UncaughtExceptionReport`` already have:
-/// a log line that only exists inside an `NSLog` call is a log line no test can
+/// a log line that only exists inside a logging call is a log line no test can
 /// read, and this one is the deliverable.
 public struct PanelSizeDelta: Equatable, Sendable {
     /// The fixed prefix every line carries, so one
     /// `log show --predicate 'eventMessage CONTAINS "TCRBAR-PANELSIZE"'` finds
-    /// all of them and nothing else. A marker rather than a subsystem because
-    /// the app logs through `NSLog` throughout (`TcrBarApp.swift:72`, `:136`,
-    /// `:186`) and a second logging mechanism for one phase would be a second
-    /// thing to explain to the person collecting the lines.
+    /// all of them and nothing else. A marker as well as the subsystem: every
+    /// TcrBar line goes through ``TcrBarLog`` under one subsystem, and the
+    /// `panel` category also carries the Tools tab's kill lines, so the marker
+    /// is what tells this line apart.
     public static let marker = "TCRBAR-PANELSIZE"
 
     /// The field set, versioned. Phase 4 changes what is worth logging — the
