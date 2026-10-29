@@ -211,6 +211,9 @@ impl Manager {
                     self.check_reset_owner(idx, &identity)?;
                     continue;
                 }
+                if response.status().is_server_error() {
+                    return Err(CodexResetError::Unknown);
+                }
                 if !response.status().is_success() {
                     return Err(CodexResetError::Failed);
                 }
