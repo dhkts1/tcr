@@ -1956,15 +1956,22 @@ const CODEX_RESET_ROUTE: ControlRoute = ControlRoute {
 
 /// Confirm once, then keep one private key for every explicit retry of this attempt.
 /// Reads only the configured local proxy; no offline redemption or config write.
+///
+/// The questions go to stderr and only outcome words to stdout, so a caller that
+/// shows stdout shows the result and never a question. `assume_yes` is for a
+/// caller that already asked (TcrBar's own dialog): it asks nothing, reads no
+/// input, and an unknown outcome ends the run instead of offering a retry.
 pub async fn codex_reset(
     config_path: &Path,
     account: &str,
     key: Option<&str>,
+    assume_yes: bool,
 ) -> anyhow::Result<i32> {
     codex_reset_with_io(
         config_path,
         account,
         key,
+        assume_yes,
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
@@ -1976,17 +1983,23 @@ async fn codex_reset_with_io(
     config_path: &Path,
     account: &str,
     key: Option<&str>,
+    assume_yes: bool,
     input: &mut impl std::io::BufRead,
     output: &mut impl std::io::Write,
     errors: &mut impl std::io::Write,
 ) -> anyhow::Result<i32> {
-    let Ok(confirmed) = reset_consent(
-        input,
-        output,
-        &format!("Redeem one reset for {account}? [y/N]"),
-    ) else {
-        writeln!(errors, "Reset failed. Could not read confirmation.")?;
-        return Ok(4);
+    let confirmed = if assume_yes {
+        true
+    } else {
+        let Ok(confirmed) = reset_consent(
+            input,
+            errors,
+            &format!("Redeem one reset for {account}? [y/N]"),
+        ) else {
+            writeln!(errors, "Reset failed. Could not read confirmation.")?;
+            return Ok(4);
+        };
+        confirmed
     };
     if !confirmed {
         writeln!(output, "Cancelled.")?;
@@ -2054,7 +2067,12 @@ async fn codex_reset_with_io(
                     );
                 if unknown {
                     writeln!(errors, "Reset outcome unknown.")?;
-                    let Ok(retry) = reset_consent(input, output, "Retry this reset attempt? [y/N]")
+                    // A caller that passed --yes asks its own question: TcrBar shows
+                    // Retry and reruns with the same key.
+                    if assume_yes {
+                        return Ok(4);
+                    }
+                    let Ok(retry) = reset_consent(input, errors, "Retry this reset attempt? [y/N]")
                     else {
                         writeln!(errors, "Reset failed. Could not read confirmation.")?;
                         return Ok(4);
@@ -2071,13 +2089,14 @@ async fn codex_reset_with_io(
     }
 }
 
+/// Asks on `prompt_to`, which is stderr: stdout carries only outcome words.
 fn reset_consent(
     input: &mut impl std::io::BufRead,
-    output: &mut impl std::io::Write,
+    prompt_to: &mut impl std::io::Write,
     prompt: &str,
 ) -> std::io::Result<bool> {
-    writeln!(output, "{prompt}")?;
-    output.flush()?;
+    writeln!(prompt_to, "{prompt}")?;
+    prompt_to.flush()?;
     let mut answer = String::new();
     input.read_line(&mut answer)?;
     Ok(answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes"))

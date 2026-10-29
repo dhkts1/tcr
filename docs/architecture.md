@@ -454,8 +454,11 @@ resetCredits is optional: availableCount is a nonnegative integer;
 earliestExpiryMs is optional and comes only from complete valid details.
 resetCreditsAvailable is the optional provider total; unknown is absent.
 `tcr codex reset <account>` uses the running proxy and asks for confirmation.
+The questions go to stderr; stdout carries only the outcome words below.
 Redeem one reset for {account}? [y/N]
 Retry this reset attempt? [y/N]
+--yes asks nothing and reads no input; an unknown outcome then ends the run.
+TcrBar runs it with --yes after its own dialog, and offers Retry itself.
 Applied.                         exit 0
 Nothing to reset.                exit 0
 No reset credit available.       exit 6

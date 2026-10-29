@@ -84,10 +84,12 @@ public final class CodexResetController: ObservableObject {
         let runner = self.runner
         let outcome = await Task.detached(priority: .userInitiated) {
             do {
-                // EOF after consent leaves any CLI retry prompt unanswered. A retry
-                // requires another operator click and reuses this private attempt.
+                // The panel's own dialog already asked, so `--yes`: the CLI asks
+                // nothing, reads nothing, and an unknown outcome ends the run. The
+                // result dialog then shows outcome words and never a "[y/N]" question.
+                // A retry requires another operator click and reuses this attempt.
                 let output = try runner(
-                    ["codex", "reset", account.name, "--idempotency-key", key], "y\n")
+                    ["codex", "reset", account.name, "--idempotency-key", key, "--yes"], "")
                 return CodexResetCommand.Outcome(
                     exitCode: output.exitCode, stdout: String(decoding: output.stdout, as: UTF8.self),
                     stderr: output.stderr)

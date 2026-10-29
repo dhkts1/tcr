@@ -89,6 +89,19 @@ final class CodexResetControlTests: XCTestCase {
         }
     }
 
+    /// The result dialog shows `outcome.text`. The fake answers as the real CLI does: it
+    /// asks its "[y/N]" question unless it was run with `--yes`, so a controller that
+    /// runs the interactive form puts a question in the dialog nobody can answer there.
+    @MainActor
+    func testResultTextIsTheOutcomeAndNeverTheCommandsQuestion() async {
+        let calls = ResetCalls()
+        let controller = CodexResetController(runner: calls.run)
+        _ = await controller.redeem(account: alice, confirmed: true)
+        let text = controller.outcome(for: alice)?.text
+        XCTAssertEqual(text, "Applied.")
+        XCTAssertFalse(text?.contains("[y/N]") ?? true, "the result dialog must not ask a question")
+    }
+
     @MainActor
     func testRunnerFailureClearsPendingAndKeepsRetry() async {
         let controller = CodexResetController(runner: { _, _ in throw FakeResetFailure() })
@@ -125,13 +138,18 @@ private final class ResetCalls: @unchecked Sendable {
         self.release = release
     }
 
+    /// Answers as `tcr codex reset` does: without `--yes` it asks "Redeem one reset for
+    /// <account>? [y/N]" before its outcome, and that question reaches the caller's output.
     func run(_ arguments: [String], _ stdin: String) throws -> TcrTool.Output {
         lock.lock()
         commands.append((arguments, stdin, Thread.isMainThread))
         lock.unlock()
         started?.fulfill()
         if let release { _ = release.wait(timeout: .now() + 10) }
-        return output
+        guard !arguments.contains("--yes"), arguments.count > 2 else { return output }
+        let question = "Redeem one reset for \(arguments[2])? [y/N]\n"
+        return .init(
+            exitCode: output.exitCode, stdout: output.stdout, stderr: question + output.stderr)
     }
 
     var count: Int {
@@ -150,7 +168,7 @@ private final class ResetCalls: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard commands.indices.contains(a), commands.indices.contains(b),
-            commands[a].0.count == 5, commands[b].0.count == 5
+            commands[a].0.count == 6, commands[b].0.count == 6
         else { return false }
         return commands[a].0[4] == commands[b].0[4]
     }
@@ -161,8 +179,8 @@ private final class ResetCalls: @unchecked Sendable {
         guard commands.count == names.count else { return false }
         return zip(commands, names).allSatisfy { command, name in
             let (args, stdin, _) = command
-            return args.count == 5 && Array(args.prefix(4)) == ["codex", "reset", name, "--idempotency-key"]
-                && UUID(uuidString: args[4]) != nil && stdin == "y\n"
+            return args.count == 6 && Array(args.prefix(4)) == ["codex", "reset", name, "--idempotency-key"]
+                && UUID(uuidString: args[4]) != nil && args[5] == "--yes" && stdin.isEmpty
         }
     }
 }

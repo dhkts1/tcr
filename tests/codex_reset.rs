@@ -210,10 +210,20 @@ impl ResetProxy {
     }
 
     async fn run(&self, input: &'static [u8], explicit_key: bool) -> std::process::Output {
+        self.run_with(input, explicit_key, &[]).await
+    }
+
+    async fn run_with(
+        &self,
+        input: &'static [u8],
+        explicit_key: bool,
+        extra: &[&str],
+    ) -> std::process::Output {
         let mut command = reset_command(self.home.path(), &self.config);
         if explicit_key {
             command.args(["--idempotency-key", "fake-attempt-private-sentinel"]);
         }
+        command.args(extra);
         tokio::task::spawn_blocking(move || {
             let mut child = command
                 .stdin(Stdio::piped())
@@ -289,15 +299,53 @@ async fn reset_cli_all_outcomes_have_the_approved_text_and_exit() {
         }
         assert_eq!(output.status.code(), Some(exit));
         let (out, err) = reset_output(&output);
-        assert_eq!(
-            out,
-            format!("Redeem one reset for alice@example.com? [y/N]\n{text}\n")
-        );
-        assert!(err.is_empty());
+        assert_eq!(out, format!("{text}\n"));
+        assert_eq!(err, ASK);
         assert_eq!(proxy.consumes.load(Ordering::SeqCst), 1);
         assert_eq!(proxy.reads.load(Ordering::SeqCst), 1);
         proxy.finish().await;
     }
+}
+
+/// The question a terminal user answers. It goes to stderr: TcrBar shows the
+/// command's stdout in its result dialog, which must hold the outcome and no
+/// question nobody can answer there.
+const ASK: &str = "Redeem one reset for alice@example.com? [y/N]\n";
+const RETRY: &str = "Retry this reset attempt? [y/N]\n";
+
+/// `--yes` is how TcrBar runs the command after its own dialog: no question on
+/// either stream, no input read, stdout holds the outcome words alone.
+#[tokio::test]
+async fn reset_cli_yes_asks_nothing_and_prints_only_the_outcome() {
+    for (code, text, exit) in [
+        ("reset", "Applied.", 0),
+        ("nothing_to_reset", "Nothing to reset.", 0),
+        ("no_credit", "No reset credit available.", 6),
+    ] {
+        let proxy = ResetProxy::new(code, true).await;
+        let output = proxy.run_with(b"", true, &["--yes"]).await;
+        assert_eq!(output.status.code(), Some(exit));
+        let (out, err) = reset_output(&output);
+        assert_eq!(out, format!("{text}\n"));
+        assert!(err.is_empty(), "--yes must ask nothing, got {err:?}");
+        assert_eq!(proxy.consumes.load(Ordering::SeqCst), 1);
+        proxy.finish().await;
+    }
+}
+
+/// Under `--yes` an unknown outcome ends the run: the caller owns the Retry
+/// question and reruns with the same key, so the command sends one consume and
+/// never waits on input nobody will give.
+#[tokio::test]
+async fn reset_cli_yes_unknown_outcome_ends_without_a_retry_question() {
+    let proxy = ResetProxy::new("lost", true).await;
+    let output = proxy.run_with(b"y\ny\n", true, &["--yes"]).await;
+    assert_eq!(output.status.code(), Some(4));
+    let (out, err) = reset_output(&output);
+    assert!(out.is_empty(), "no outcome is known, got {out:?}");
+    assert_eq!(err, "Reset outcome unknown.\n");
+    assert_eq!(proxy.consumes.load(Ordering::SeqCst), 1);
+    proxy.finish().await;
 }
 
 #[tokio::test]
@@ -307,11 +355,8 @@ async fn reset_cli_cancel_default_and_eof_send_nothing() {
         let output = proxy.run(input, false).await;
         assert_eq!(output.status.code(), Some(0));
         let (out, err) = reset_output(&output);
-        assert_eq!(
-            out,
-            "Redeem one reset for alice@example.com? [y/N]\nCancelled.\n"
-        );
-        assert!(err.is_empty());
+        assert_eq!(out, "Cancelled.\n");
+        assert_eq!(err, ASK);
     }
     assert_eq!(proxy.consumes.load(Ordering::SeqCst), 0);
     assert_eq!(proxy.reads.load(Ordering::SeqCst), 0);
@@ -324,11 +369,8 @@ async fn reset_cli_retry_retains_key_and_new_confirmation_mints_a_new_attempt() 
     let output = proxy.run(b"y\ny\n", false).await;
     assert_eq!(output.status.code(), Some(0));
     let (out, err) = reset_output(&output);
-    assert_eq!(
-        out,
-        "Redeem one reset for alice@example.com? [y/N]\nRetry this reset attempt? [y/N]\nAlready redeemed.\n"
-    );
-    assert_eq!(err, "Reset outcome unknown.\n");
+    assert_eq!(out, "Already redeemed.\n");
+    assert_eq!(err, format!("{ASK}Reset outcome unknown.\n{RETRY}"));
     {
         let keys = proxy.keys.lock().unwrap();
         assert!(
@@ -355,11 +397,8 @@ async fn reset_cli_known_outcome_with_failed_usage_exits_five_and_keeps_outcome(
     let output = proxy.run(b"y\n", true).await;
     assert_eq!(output.status.code(), Some(5));
     let (out, err) = reset_output(&output);
-    assert_eq!(
-        out,
-        "Redeem one reset for alice@example.com? [y/N]\nApplied.\n"
-    );
-    assert_eq!(err, "Usage refresh failed.\n");
+    assert_eq!(out, "Applied.\n");
+    assert_eq!(err, format!("{ASK}Usage refresh failed.\n"));
     proxy.finish().await;
 }
 
@@ -369,11 +408,8 @@ async fn reset_cli_unknown_outcome_without_retry_exits_four() {
     let output = proxy.run(b"y\nn\n", true).await;
     assert_eq!(output.status.code(), Some(4));
     let (out, err) = reset_output(&output);
-    assert_eq!(
-        out,
-        "Redeem one reset for alice@example.com? [y/N]\nRetry this reset attempt? [y/N]\n"
-    );
-    assert_eq!(err, "Reset outcome unknown.\n");
+    assert!(out.is_empty());
+    assert_eq!(err, format!("{ASK}Reset outcome unknown.\n{RETRY}"));
     assert_eq!(proxy.consumes.load(Ordering::SeqCst), 1);
     proxy.finish().await;
 }
@@ -398,7 +434,7 @@ async fn reset_cli_missing_proxy_has_no_offline_fallback() {
     .unwrap();
     assert_eq!(output.status.code(), Some(3));
     let (_, err) = reset_output(&output);
-    assert_eq!(err, "No running proxy.\n");
+    assert_eq!(err, format!("{ASK}No running proxy.\n"));
 }
 
 #[tokio::test]
@@ -463,9 +499,12 @@ async fn reset_cli_requires_stamp_refuses_old_proxy_and_never_redirects() {
             "the CLI must neither follow redirects nor retry automatically"
         );
         if delay > 0 {
-            assert!(out.ends_with("Applied.\n"));
-            assert!(err.is_empty());
+            assert_eq!(out, "Applied.\n");
+            assert_eq!(err, ASK);
         } else {
+            let err = err
+                .strip_prefix(ASK)
+                .expect("the question comes first, on stderr");
             assert!(err.starts_with("Reset failed.") || err.starts_with("Reset outcome unknown."));
         }
     }
@@ -477,14 +516,17 @@ async fn reset_cli_bad_config_and_confirmation_fail_safely_without_request() {
     let output = proxy.run(b"\xff", true).await;
     assert_eq!(output.status.code(), Some(4));
     let (_, err) = reset_output(&output);
-    assert_eq!(err, "Reset failed. Could not read confirmation.\n");
+    assert_eq!(
+        err,
+        format!("{ASK}Reset failed. Could not read confirmation.\n")
+    );
     std::fs::write(&proxy.config, "fake-raw-private-sentinel").unwrap();
     let output = proxy.run(b"y\n", true).await;
     assert_eq!(output.status.code(), Some(4));
     let (_, err) = reset_output(&output);
     assert_eq!(
         err,
-        "Reset failed. Could not read the proxy configuration.\n"
+        format!("{ASK}Reset failed. Could not read the proxy configuration.\n")
     );
     assert_eq!(proxy.consumes.load(Ordering::SeqCst), 0);
     proxy.finish().await;
@@ -511,7 +553,7 @@ async fn reset_backend_error_after_debit_remains_unknown_and_retryable() {
         "the synthetic backend must actually debit before its 503"
     );
     assert!(
-        err.starts_with("Reset outcome unknown."),
+        err.starts_with(&format!("{ASK}Reset outcome unknown.")),
         "a backend 503 after debit must remain unknown, not refused"
     );
     assert_eq!(output.status.code(), Some(0));

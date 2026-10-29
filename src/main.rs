@@ -1555,6 +1555,10 @@ enum CodexCommand {
         /// Reuse one attempt across retries; never printed.
         #[arg(long)]
         idempotency_key: Option<String>,
+        /// Skip the questions, for a caller that already asked: redeem without
+        /// reading input, and end on an unknown outcome instead of offering a retry.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1872,9 +1876,10 @@ async fn run_main() -> anyhow::Result<()> {
                 account,
                 config,
                 idempotency_key,
+                yes,
             } = args.command;
             let code =
-                cli::codex_reset(&config.path(), &account, idempotency_key.as_deref()).await?;
+                cli::codex_reset(&config.path(), &account, idempotency_key.as_deref(), yes).await?;
             if code != 0 {
                 std::process::exit(code);
             }
