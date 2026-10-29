@@ -2207,7 +2207,7 @@ impl Manager {
     /// Why rule 2: past the reset the window has rolled as far as the clock knows, but tcr has
     /// not read the new window, and the refusal stands until a usage probe reads it, or until a
     /// served response from the account answers 2xx with a window
-    /// (`Quota::update_from_codex_refusal`) or refuses again. The row keeps naming that window,
+    /// (`Quota::update_from_codex_refusal_at`) or refuses again. The row keeps naming that window,
     /// with no time, so it does not read as a refusal no window explains. The hold the refusal
     /// armed has lapsed by then, so the account is back in the pool and may be sent a request in
     /// those minutes.
@@ -2293,6 +2293,14 @@ impl Manager {
         if let Some(slept) = self.wake.observe() {
             self.retire_every_client_after_sleep(slept);
         }
+        self.enter_in_flight_at(idx, OffsetDateTime::now_utc())
+    }
+
+    /// Claim a send slot and stamp it on the caller's clock. Sleep observation
+    /// belongs to the production wrapper; RAII and client recycling are shared.
+    /// Replay-only entry; production sends use [`Self::enter_in_flight`] to observe sleep.
+    #[doc(hidden)]
+    pub fn enter_in_flight_at(self: &Arc<Self>, idx: usize, now: OffsetDateTime) -> InFlightGuard {
         let claimed_recycle = {
             let mut accounts = self
                 .accounts
@@ -2301,7 +2309,7 @@ impl Manager {
             match accounts.get_mut(idx) {
                 Some(account) => {
                     account.in_flight = account.in_flight.saturating_add(1);
-                    account.last_served_ms = crate::now_ms();
+                    account.last_served_ms = odt_to_ms(now);
                     account.serves_since_client_build =
                         account.serves_since_client_build.saturating_add(1);
                     // Claim the recycle under the SAME write lock that observes the
@@ -2326,6 +2334,31 @@ impl Manager {
             manager: Arc::clone(self),
             idx,
         }
+    }
+
+    /// Replay-only read of the selector's hard serve gates, without spending its valve.
+    #[doc(hidden)]
+    pub fn replay_can_revalidate(&self, idx: usize, now: OffsetDateTime, is_fable: bool) -> bool {
+        if !self.revalidation_serve_enabled() {
+            return false;
+        }
+        let groups = self.groups();
+        let warm = self.warm_window(None);
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
+        accounts.get(idx).is_some_and(|account| {
+            Self::hard_ok(
+                account,
+                self.global_threshold,
+                self.fable_weekly_threshold,
+                now,
+                odt_to_ms(now),
+                is_fable,
+                None,
+                &groups.reserved,
+                &groups.parked,
+                warm,
+            )
+        })
     }
 
     /// Give EVERY account a fresh HTTP client after the machine slept for
@@ -4197,6 +4230,26 @@ mod tests {
     /// silently turn a re-key test into a divert test.
     const LONG_HOLD_SECS: i64 = CACHE_WARM_HOLD_SECS + 60;
 
+    #[test]
+    fn enter_in_flight_stamps_the_wall_clock() {
+        let manager = Manager::new(
+            Config::fixture(vec![Account::fixture("alpha")]),
+            Arc::new(oauth::NoRefresh),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(LiveWarmer::new()),
+            None,
+        );
+        let before = crate::now_ms();
+        manager.accounts.write().unwrap()[0].last_served_ms = before + 86_400_000;
+        drop(manager.enter_in_flight(0));
+        let after = crate::now_ms();
+        let stamp = manager.accounts.read().unwrap()[0].last_served_ms;
+        assert!(
+            (before..=after).contains(&stamp),
+            "enter_in_flight must stamp the wall clock directly: {before} <= {stamp} <= {after}"
+        );
+    }
+
     /// `build_serving_client` must not panic on either branch of `http1_only` —
     /// h1 support is part of the reqwest/rustls TLS backend this crate already
     /// pulls in, but a builder method rejecting a combination it doesn't support
@@ -5977,7 +6030,7 @@ mod tests {
     /// that carried no quota header leaves the time where it was. Walked to the
     /// `tcr.status.v1` payload, the hop `tcr status --json` reads.
     ///
-    /// Watched red: without the stamp in `Quota::update_from_codex_refusal`, the
+    /// Watched red: without the stamp in `Quota::update_from_codex_refusal_at`, the
     /// header reading leaves the Codex row absent.
     #[tokio::test]
     async fn a_codex_rows_quota_updated_at_comes_from_its_own_readings() {

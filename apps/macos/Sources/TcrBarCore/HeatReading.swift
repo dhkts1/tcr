@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// One fan, as the proxy read it (`FanRow` in `crates/tcr-status-wire`).
 public struct FanReading: Equatable, Sendable, Decodable {
@@ -80,7 +81,8 @@ public struct HeatReading: Equatable, Sendable, Decodable {
 }
 
 /// Where ``Fleet/decodeHeat(_:log:)`` reports a heat object it could not
-/// read: `NSLog`, as the rest of the app logs, once per distinct message.
+/// read: ``TcrBarLog/machine``, public, once per distinct message. A line
+/// names the reading and the decoder's words, never an account.
 public final class HeatDecodeLog: @unchecked Sendable {
     public static let shared = HeatDecodeLog()
 
@@ -88,12 +90,12 @@ public final class HeatDecodeLog: @unchecked Sendable {
     private let lock = NSLock()
     private var logged: Set<String> = []
 
-    /// `NSLog("%@", …)`, never the message as the format: a decoder's words
-    /// can hold a `%`.
+    /// The line as one public value: `Logger` takes no format string, so a
+    /// `%` in a decoder's words prints as itself.
     public func once(_ line: String) {
         lock.lock()
         let fresh = logged.insert(line).inserted
         lock.unlock()
-        if fresh { NSLog("%@", line) }
+        if fresh { TcrBarLog.machine.log("\(line, privacy: .public)") }
     }
 }

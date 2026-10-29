@@ -1,5 +1,6 @@
 import SwiftUI
 import TcrBarCore
+import os
 
 /// The dropdown panel.
 ///
@@ -2625,21 +2626,25 @@ struct FleetView: View {
         switch ProcessKill.target(matched: matched, sessionPid: request.sessionPid) {
         case .success(let group):
             let sent = ProcessKill.signal(processGroup: group)
-            // `NSLog("%@", …)`, never the string as the format itself — a
-            // command head containing a `%` is a format specifier otherwise,
-            // the same reason `MenuBarShell` states for its own logging.
-            NSLog(
-                "%@",
-                sent
-                    ? "TcrBar: killed process group \(group) — \(request.subject)"
-                        + " in \(request.sessionName)"
-                    : "TcrBar: SIGTERM to process group \(group) failed — \(request.subject)"
-                        + " in \(request.sessionName)")
+            // The command head stays `.private`: it is the first 120
+            // characters of a Bash command, and a command line can carry a
+            // token or a key. The group, the session's name and the refusal
+            // are public, so the line still says what happened.
+            let subject = request.subject
+            let session = request.sessionName
+            if sent {
+                TcrBarLog.panel.log(
+                    "TcrBar: killed process group \(group, privacy: .public) — \(subject, privacy: .private) in \(session, privacy: .public)"
+                )
+            } else {
+                TcrBarLog.panel.log(
+                    "TcrBar: SIGTERM to process group \(group, privacy: .public) failed — \(subject, privacy: .private) in \(session, privacy: .public)"
+                )
+            }
         case .failure(let refusal):
-            NSLog(
-                "%@",
-                "TcrBar: kill refused (\(refusal)) — \(request.subject)"
-                    + " in \(request.sessionName)")
+            TcrBarLog.panel.log(
+                "TcrBar: kill refused (\(String(describing: refusal), privacy: .public)) — \(request.subject, privacy: .private) in \(request.sessionName, privacy: .public)"
+            )
         }
         // The row's stats are now a reading of a process that is ending. One
         // extra table walk here is cheaper than a row that keeps drawing a

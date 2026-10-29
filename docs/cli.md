@@ -178,7 +178,8 @@ stderr saying it is deliberately withholding it.
 
 A value **you** exported is inherited untouched: an explicit choice wins, and it is the
 escape hatch for a `claude` with no claude.ai login of its own, which does need some
-credential to start. The process exits with `claude`'s own exit code.
+credential to start. `tcr run` replaces itself with `claude` (`exec`), so the terminal sees
+`claude` as its foreground program and the shell gets `claude`'s own exit status.
 
 **A proxy that holds no Claude account.** With the proxy up, `tcr run` reads its status once
 before it launches `claude` (the same read decides [the request key](#the-request-key-on-a-launch)).
@@ -246,14 +247,18 @@ proxy marker and own CA only when the caller supplied no value; an explicit
 `CLAUDE_ENV_FILE` exported is for shell tools, not an override, so nested Claude still uses the
 pool; set one on the `claude` command itself to override it. Nested Codex uses `tcr run --codex`,
 respecting caller binary overrides. tcr's own client lookups skip these launchers, so an explicit
-nested `tcr run --config other.json` uses that config. Explicit executable paths, a replaced PATH
+nested `tcr run --config other.json` uses that config. A launcher also skips a cmux CLI shim
+(`…/cmux-cli-shims/<pane>/claude` or `codex`) on PATH: cmux's wrapper runs the next one on PATH,
+which is the launcher, so the agent `tcr run` starts still goes through cmux and the launcher
+runs the real binary after it. Explicit executable paths, a replaced PATH
 or client configuration can bypass the launchers. Claude's `CLAUDE_ENV_FILE` and bare executable
 `CLAUDE_CODE_SHELL_PREFIX` still run; a prefix containing flags is refused with a message to use
 an executable wrapper script. Codex's unrelated policy settings and filters are preserved.
 
-Each foreground launch owns an absolute, private helper directory, removed when the client
-exits. Background shells needing these launchers must finish before that exit. No shell startup
-file or client config is edited.
+The launchers live in an absolute, private helper directory named by a hash of everything they
+are generated from (the build, the shell and prefix settings, the client and config paths), so
+launches with the same setup share one directory and nothing is removed when a client exits.
+No shell startup file or client config is edited.
 
 This is verified with Claude Code 2.1.294 and Codex 0.163.0. Claude's Bash tool and shell-form
 hooks/MCP launchers use its shell prefix; exec-form hooks, PowerShell and Codex MCP processes
@@ -270,12 +275,12 @@ python3 scripts/test-agent-proxy-isolation.py codex baseline --policy legacy \
   --tcr /path/to/built/tcr --claude-bin /path/to/claude --codex-bin /path/to/codex
 ```
 
-Every child also gets `TCR_RUN_ACTIVE=1`, on every path, the proxy-down passthrough and
-`--codex` included. It means one thing: **a `tcr run` is already above you in this chain.**
+Every agent also gets `TCR_RUN_ACTIVE=1`, on every path, the proxy-down passthrough and
+`--codex` included. It means one thing: **a `tcr run` already launched you.**
 `tcr run` finds `claude` on `PATH`, so on a machine where something else also wraps
 `claude` that lookup can land on a launcher which wraps in `tcr run` again — the routing
 environment applied twice is identical and nothing breaks, but every startup line prints
-twice and a second `tcr` sits in the process tree for the session. A launcher that checks
+twice. A launcher that checks
 this variable hands off to the real `claude` instead. The name avoids the `CMUX_` prefix
 on purpose: cmux's own claude wrapper clears every `CMUX_*` variable before exec, so a
 marker named after it would be erased in transit.
@@ -525,7 +530,7 @@ claude() {
 ```
 
 `tcr run` already launches plain `claude` when the proxy is down, and `TCR_RUN_ACTIVE` marks that a
-`tcr run` is already above you, so neither a stopped proxy nor a nested shell breaks the command.
+`tcr run` already launched you, so neither a stopped proxy nor a nested shell breaks the command.
 When no `tcr` is on `PATH` (TcrBar runs the copy inside its bundle), the block names that binary's
 full path instead.
 

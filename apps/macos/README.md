@@ -234,6 +234,26 @@ through, **including live `tcr run` sessions**: aim it at a missing, unsigned or
 quarantined binary and every `tcr` command on the machine breaks at once. The
 build script deliberately does not touch it.
 
+TcrBar now does this itself at every launch, and an update always relaunches it,
+because an old CLI on `PATH` breaks the shell's `claude`: it hands Claude Code a
+CA file the updated server does not sign with. It acts only when every one of
+these holds (`Sources/TcrBarCore/PathCliRepair.swift`):
+
+- the first `tcr` a shell would find is a **regular file**, not a symlink;
+- the app runs from an installed bundle (`…/Applications/<name>.app`), never a
+  build folder or a translocated copy;
+- the bundled `tcr --version` exits 0, and the `PATH` copy's `--version` reads
+  as **strictly older** by major.minor.patch;
+- the folder holding the `PATH` copy is writable by you.
+
+It then makes a symlink to the bundled `tcr` at a temporary name in that folder
+and renames it over the old file, the same atomic swap `scripts/install-cli.sh`
+uses, so a running `tcr run` keeps its own bytes. In every other case (an equal or
+newer copy such as a dev build, a symlink someone made, an unreadable version, a
+read-only folder) it changes nothing. Each launch writes one `TcrBar: PATH tcr:`
+line to the system log saying what it did and why; for a read-only folder that
+line names the `ln -sf` command to run by hand.
+
 ## Finding the `tcr` binary
 
 An app launched from Finder inherits a minimal `PATH`, so TcrBar probes, in
