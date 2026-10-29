@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import TcrBarCore
+import os
 
 /// The signals a native crash (an uncaught `NSException` converts to
 /// `SIGABRT` via `abort()`, the runaway-layout crash this pairs with among
@@ -69,7 +70,10 @@ enum TcrBarEntry {
                 reason: exception.reason,
                 callStack: exception.callStackSymbols)
             {
-                NSLog("%@", line)
+                // Public, reason included: the reason is the whole point of
+                // this report, and an AppKit or Swift-runtime reason names
+                // views and selectors, not account data.
+                TcrBarLog.app.log("\(line, privacy: .public)")
             }
         }
         // First, and the only one of the four that needs no AppKit at all: it
@@ -160,7 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         didSet {
             guard checkIsPending, let shell else { return }
             checkIsPending = false
-            NSLog("TcrBar: running the update check that arrived before launch finished")
+            TcrBarLog.update.log("TcrBar: running the update check that arrived before launch finished")
             shell.updater.checkForUpdates()
         }
     }
@@ -224,7 +228,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // The operator chose the update; the proxy it replaces is by
             // definition the pre-update one.
             if LaunchVersionMarker().noteLaunch(current: AppBuild.shortVersion) {
-                NSLog("TcrBar: first launch of \(AppBuild.shortVersion ?? "?") — taking the port")
+                TcrBarLog.app.log(
+                    "TcrBar: first launch of \(AppBuild.shortVersion ?? "?", privacy: .public) — taking the port"
+                )
                 shell.server.startTakingOverPort()
             } else {
                 shell.server.start()
@@ -251,7 +257,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let outcome = PathCliRepair.run(
                 pathTcr: TcrTool.pathExecutable(),
                 bundledTcr: TcrTool.bundledDirectory()?.appendingPathComponent("tcr"))
-            NSLog("%@", outcome.logLine)
+            // Public: the line names the `tcr` on PATH, the bundled one and
+            // their versions, which is what an operator reads it for.
+            TcrBarLog.app.log("\(outcome.logLine, privacy: .public)")
         }
     }
 
@@ -294,7 +302,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// rather than unpacking it.
     ///
     /// What reaches the log is ``PeerJoinLink/redacted(_:)``: the path, and
-    /// which kinds of key rode along. Never the URL, never a key. Silence is
+    /// which kinds of key rode along, logged public. Never the URL, never a
+    /// key. The outcome after it can be `tcr`'s own stderr, which can name a
+    /// file under the operator's config, so it is logged `.private`. Silence is
     /// not an option here, a link that did nothing quietly is
     /// indistinguishable from a broken handler, and neither is the link
     /// itself, because the system log is readable by other processes too.
@@ -307,24 +317,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// actually set something asks first, via ``PeerJoinConfirmation``.
     private func handleJoinLink(_ url: URL) {
         let shape = PeerJoinLink.redacted(url)
-        NSLog("TcrBar: %@ received", shape)
+        TcrBarLog.peer.log("TcrBar: \(shape, privacy: .public) received")
         guard case .success = PeerJoinLink.invocation(for: url) else {
             let outcome = PeerController.join(link: url)
-            NSLog("TcrBar: %@: %@", shape, outcome)
+            TcrBarLog.peer.log("TcrBar: \(shape, privacy: .public): \(outcome, privacy: .private)")
             return
         }
         Task.detached(priority: .userInitiated) {
             let hasExistingKey = Self.networkKeyIsCurrentlySet()
             let confirmed = await PeerJoinConfirmation.confirm(url: url, hasExistingKey: hasExistingKey)
             guard confirmed else {
-                NSLog("TcrBar: %@: cancelled at the confirmation sheet", shape)
+                TcrBarLog.peer.log("TcrBar: \(shape, privacy: .public): cancelled at the confirmation sheet")
                 return
             }
             // The sheet already told the operator a key would be replaced
             // (`hasExistingKey`); Join means it, so the command carries the
             // flag `tcr peer join` requires to act on that.
             let outcome = PeerController.join(link: url, replace: hasExistingKey)
-            NSLog("TcrBar: %@: %@", shape, outcome)
+            TcrBarLog.peer.log("TcrBar: \(shape, privacy: .public): \(outcome, privacy: .private)")
         }
     }
 
@@ -347,19 +357,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// trains an operator to stop reading alerts.
     ///
     /// What reaches the log is ``PeerMovedLink/redacted(_:)``: the path, and
-    /// whether anything sealed rode along. Never the record. Anyone holding
+    /// whether anything sealed rode along, logged public, as is a shape
+    /// refusal's fixed sentence. The outcome of a run is `tcr`'s words or a
+    /// launch error and is logged `.private`. Never the record. Anyone holding
     /// the string can replay it while it is still good, and the system log is
     /// readable by other processes on this Mac.
     private func handleMovedLink(_ url: URL) {
         let shape = PeerMovedLink.redacted(url)
-        NSLog("TcrBar: %@ received", shape)
+        TcrBarLog.peer.log("TcrBar: \(shape, privacy: .public) received")
         if case .failure(let refusal) = PeerMovedLink.invocation(for: url) {
-            NSLog("TcrBar: %@: %@", shape, PeerMovedLink.sentence(for: refusal))
+            TcrBarLog.peer.log(
+                "TcrBar: \(shape, privacy: .public): \(PeerMovedLink.sentence(for: refusal), privacy: .public)"
+            )
             return
         }
         Task.detached(priority: .userInitiated) {
             let outcome = await PeerMovedConfirmation.readAskKeep(url: url)
-            NSLog("TcrBar: %@: %@", shape, outcome)
+            TcrBarLog.peer.log("TcrBar: \(shape, privacy: .public): \(outcome, privacy: .private)")
         }
     }
 
@@ -395,20 +409,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         guard url.scheme == "tcrbar" else {
-            NSLog("TcrBar: ignoring URL with unexpected scheme: %@", url.absoluteString)
+            TcrBarLog.update.log(
+                "TcrBar: ignoring URL with unexpected scheme: \(url.absoluteString, privacy: .private)")
             return
         }
         switch url.host {
         case "check-for-updates":
-            NSLog("TcrBar: tcrbar://check-for-updates received")
+            TcrBarLog.update.log("TcrBar: tcrbar://check-for-updates received")
             guard let shell else {
-                NSLog("TcrBar: no updater yet — the check is queued until launch completes")
+                TcrBarLog.update.log("TcrBar: no updater yet — the check is queued until launch completes")
                 checkIsPending = true
                 return
             }
             shell.updater.checkForUpdates()
         default:
-            NSLog("TcrBar: unhandled tcrbar URL: %@", url.absoluteString)
+            TcrBarLog.update.log("TcrBar: unhandled tcrbar URL: \(url.absoluteString, privacy: .private)")
         }
     }
 }

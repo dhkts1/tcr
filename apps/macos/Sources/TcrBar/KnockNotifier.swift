@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import TcrBarCore
 import UserNotifications
+import os
 
 /// Posts one banner when a Mac asks to connect, and opens the Peers tab when
 /// somebody clicks it.
@@ -96,7 +97,9 @@ final class KnockNotifier: NSObject {
             // Surfaced, never swallowed: a refusal is not an error and arrives
             // as `granted == false`, so anything landing here is the ask
             // itself failing and an operator reading the log should see it.
-            NSLog("TcrBar: notification permission could not be asked: %@", "\(error)")
+            TcrBarLog.knock.log(
+                "TcrBar: notification permission could not be asked: \(String(describing: error), privacy: .public)"
+            )
         }
     }
 
@@ -126,7 +129,9 @@ final class KnockNotifier: NSObject {
             trigger: nil)
         centre.add(request) { error in
             guard let error else { return }
-            NSLog("TcrBar: a knock notification was not delivered: %@", "\(error)")
+            TcrBarLog.knock.log(
+                "TcrBar: a knock notification was not delivered: \(String(describing: error), privacy: .public)"
+            )
         }
     }
 }
@@ -158,7 +163,8 @@ extension KnockNotifier: UNUserNotificationCenterDelegate {
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
-        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) ->
+        withCompletionHandler completionHandler:
+            @escaping (UNNotificationPresentationOptions) ->
             Void
     ) {
         completionHandler([.banner, .list])
