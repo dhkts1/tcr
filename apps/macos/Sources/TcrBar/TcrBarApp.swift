@@ -240,6 +240,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // anything. `AwakeController.restoreFromPreference` is a no-op unless the
         // stored intent is ON.
         shell.awake.restoreFromPreference()
+        // An update relaunches the app but never touches the `tcr` a shell finds
+        // on `PATH`, and the shell's `claude` runs that one. An older copy hands
+        // Claude Code a CA this app's server does not sign with, so every request
+        // fails. `PathCliRepair` repoints it at the bundled `tcr` only when it is
+        // a regular file strictly older than ours; every other case is logged
+        // and left alone. Off the main thread: it runs `--version` twice. Never
+        // reached by the render or probe harnesses, which exit in `main()`.
+        DispatchQueue.global(qos: .utility).async {
+            let outcome = PathCliRepair.run(
+                pathTcr: TcrTool.pathExecutable(),
+                bundledTcr: TcrTool.bundledDirectory()?.appendingPathComponent("tcr"))
+            NSLog("%@", outcome.logLine)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
