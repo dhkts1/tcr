@@ -650,7 +650,7 @@ mod tests {
             (
                 "reset",
                 StatusCode::SERVICE_UNAVAILABLE,
-                CodexResetError::Failed,
+                CodexResetError::Unknown,
             ),
             (
                 "reset",

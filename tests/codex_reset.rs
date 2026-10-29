@@ -128,6 +128,7 @@ struct ResetProxy {
     config: PathBuf,
     consumes: Arc<AtomicUsize>,
     reads: Arc<AtomicUsize>,
+    debits: Arc<AtomicUsize>,
     keys: Arc<Mutex<Vec<String>>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
@@ -137,11 +138,12 @@ impl ResetProxy {
     async fn new(code: &'static str, usage_ok: bool) -> Self {
         let consumes = Arc::new(AtomicUsize::new(0));
         let reads = Arc::new(AtomicUsize::new(0));
+        let debits = Arc::new(AtomicUsize::new(0));
         let keys = Arc::new(Mutex::new(Vec::<String>::new()));
         let origin=stub::http(axum::Router::new().fallback({
-            let consumes=Arc::clone(&consumes);let reads=Arc::clone(&reads);let keys=Arc::clone(&keys);
+            let consumes=Arc::clone(&consumes);let reads=Arc::clone(&reads);let debits=Arc::clone(&debits);let keys=Arc::clone(&keys);
             move |req: Request| {
-                let consumes=Arc::clone(&consumes);let reads=Arc::clone(&reads);let keys=Arc::clone(&keys);
+                let consumes=Arc::clone(&consumes);let reads=Arc::clone(&reads);let debits=Arc::clone(&debits);let keys=Arc::clone(&keys);
                 async move {
                     if req.uri().path()=="/backend-api/wham/rate-limit-reset-credits/consume" {
                         assert!(req.headers().get("authorization").is_some_and(|v|v=="Bearer fake-token-private-sentinel"));
@@ -151,8 +153,10 @@ impl ResetProxy {
                         let key=body["redeem_request_id"].as_str().unwrap().to_owned();
                         let duplicate={let mut keys=keys.lock().unwrap();let duplicate=keys.contains(&key);keys.push(key);duplicate};
                         let n=consumes.fetch_add(1,Ordering::SeqCst);
+                        if !duplicate && matches!(code,"reset"|"lost"|"lost_503") {debits.fetch_add(1,Ordering::SeqCst);}
+                        if code=="lost_503"&&n==0 {return (StatusCode::SERVICE_UNAVAILABLE,"fake-raw-private-sentinel").into_response();}
                         if code=="lost"&&n==0 {return (StatusCode::OK,"fake-raw-private-sentinel").into_response();}
-                        let outcome=if duplicate {"already_redeemed"} else if code=="lost" {"reset"} else {code};
+                        let outcome=if duplicate {"already_redeemed"} else if code=="lost" || code=="lost_503" {"reset"} else {code};
                         return axum::Json(serde_json::json!({"code":outcome,"windows_reset":1,"ignored":"fake-credit-private-sentinel"})).into_response();
                     }
                     assert_eq!(req.uri().path(),"/backend-api/wham/usage");
@@ -198,6 +202,7 @@ impl ResetProxy {
             config,
             consumes,
             reads,
+            debits,
             keys,
             shutdown: Some(shutdown),
             task: Some(task),
@@ -488,5 +493,34 @@ async fn reset_cli_bad_config_and_confirmation_fail_safely_without_request() {
     assert_eq!(output.status.code(), Some(4));
     reset_output(&output);
     assert_eq!(proxy.consumes.load(Ordering::SeqCst), 1);
+    proxy.finish().await;
+}
+
+#[tokio::test]
+async fn reset_backend_error_after_debit_remains_unknown_and_retryable() {
+    let proxy = ResetProxy::new("lost_503", true).await;
+    let output = proxy.run(b"y\ny\n", false).await;
+    let (_out, err) = reset_output(&output);
+    // The fake upstream recorded this attempt in its redeemed-key set before
+    // emitting 503, exactly as the lost-response fixture records before bad JSON.
+    assert!(proxy.consumes.load(Ordering::SeqCst) >= 1);
+    assert!(!proxy.keys.lock().unwrap().is_empty());
+    assert_eq!(
+        proxy.debits.load(Ordering::SeqCst),
+        1,
+        "the synthetic backend must actually debit before its 503"
+    );
+    assert!(
+        err.starts_with("Reset outcome unknown."),
+        "a backend 503 after debit must remain unknown, not refused"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    {
+        let keys = proxy.keys.lock().unwrap();
+        assert!(
+            keys.len() == 2 && keys[0] == keys[1],
+            "retry after a server error must retain its attempt key"
+        );
+    }
     proxy.finish().await;
 }
