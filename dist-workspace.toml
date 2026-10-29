@@ -36,10 +36,18 @@ build = ["cp", "apps/macos/appcast.xml", "appcast.xml"]
 
 # Runner labels for the release jobs. dist's defaults pin image versions that GitHub
 # retires (macos-14, ubuntu-22.04), so name the moving labels instead. `global` is
-# the plan, global-artifacts, host and announce jobs. x86_64-apple-darwin keeps
-# dist's default Intel image, which builds it natively.
+# the plan, global-artifacts, host and announce jobs.
+#
+# x86_64-apple-darwin is cross-compiled on the Apple Silicon `macos-latest` image
+# rather than built natively on dist's Intel one. The Intel image was the whole
+# critical path of a release: on v1.2.20 its build took 9.5 minutes while every
+# other target finished in about 4, and on v1.2.21 that wait outlasted
+# release-tcrbar.sh's stage 9. The macOS SDK on an arm64 runner links x86_64
+# natively; a local `cargo build --release --target x86_64-apple-darwin` on an
+# Apple Silicon Mac produced a binary that runs under Rosetta.
 [dist.github-custom-runners]
 global = "ubuntu-latest"
 aarch64-apple-darwin = "macos-latest"
+x86_64-apple-darwin = "macos-latest"
 x86_64-unknown-linux-musl = "ubuntu-latest"
 aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
