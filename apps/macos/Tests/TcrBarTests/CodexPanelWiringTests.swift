@@ -98,13 +98,17 @@ final class CodexPanelWiringTests: XCTestCase {
             "Tok.link is no longer the system's link colour")
     }
 
-    func testResetCountReachesCardAndBothLineShapes() throws {
+    /// The reset count lives on the card only. A label on a line row sits beside the
+    /// row's one flexible column, so a count change ("unavailable" to "3", 9 to 10)
+    /// would move the signal and cut long names: nothing on a line row may move when
+    /// a count changes.
+    func testResetCountReachesCardButNeverALineRow() throws {
         let card = try source("apps/macos/Sources/TcrBar/PanelV4/AccountCard.swift")
         let line = try source("apps/macos/Sources/TcrBar/PanelV4/AccountLineRow.swift")
         XCTAssertTrue(card.contains("CodexCardFacts.resetText(account)"))
-        XCTAssertEqual(
-            line.components(separatedBy: "if let resets = CodexCardFacts.resetText(account)").count - 1,
-            2)
+        XCTAssertFalse(
+            line.contains("resetText"),
+            "a line row must not draw the reset count; it moves the signal when the count changes")
     }
 
     func testResetMenuConfirmsThenRunsAndPollsBeforeShowingCommandOutput() throws {
