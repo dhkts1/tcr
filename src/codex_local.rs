@@ -161,12 +161,30 @@ pub fn is_tool_launcher(path: &Path) -> bool {
     head[..n].starts_with(b"#!/bin/sh\n# tcr tool launcher\n")
 }
 
+/// A cmux CLI shim, `…/cmux-cli-shims/<pane>/claude` (cmux's own wrappers match the same way).
+/// It runs the next `claude` or `codex` on `PATH`, so a tool launcher that execs one loops back
+/// into itself.
+pub fn is_cmux_shim(path: &Path) -> bool {
+    path.parent()
+        .is_some_and(|dir| dir.components().any(|c| c.as_os_str() == "cmux-cli-shims"))
+}
+
 /// The `codex` this process should run, by the one rule in the module doc, reading this
 /// process's environment.
 pub fn find_codex() -> Result<CodexBin, CodexSearch> {
     find_codex_from(&env_value, &home_dir(), &|path| {
         is_executable_file(path) && !is_tool_launcher(path)
     })
+}
+
+/// [`find_codex`] for a tool launcher to pin: it also passes over [`is_cmux_shim`].
+/// When that finds nothing, a shim is the only `codex` (cmux's custom binary path
+/// setting), so it falls back to [`find_codex`] and pins the shim, which does not loop then.
+pub fn find_codex_for_launcher() -> Result<CodexBin, CodexSearch> {
+    find_codex_from(&env_value, &home_dir(), &|path| {
+        is_executable_file(path) && !is_tool_launcher(path) && !is_cmux_shim(path)
+    })
+    .or_else(|_| find_codex())
 }
 
 /// [`find_codex`] over values already read: `env` answers a variable's value, `home` is the
@@ -604,6 +622,27 @@ mod tests {
     }
 
     const HOME: &str = "/Users/example";
+
+    /// Only a binary inside a `cmux-cli-shims` directory counts as a cmux shim.
+    #[test]
+    fn cmux_shims_are_recognised_by_their_directory() {
+        for shim in [
+            "/tmp/T/cmux-cli-shims/11111111-AAAA/claude",
+            "/tmp/T/cmux-cli-shims/11111111-AAAA/codex",
+            "/tmp/T/cmux-cli-shims/claude",
+        ] {
+            assert!(is_cmux_shim(Path::new(shim)), "{shim}");
+        }
+        for real in [
+            "/Users/example/.local/bin/claude",
+            "/opt/homebrew/bin/codex",
+            "/Applications/cmux.app/Contents/Resources/bin/cmux-claude-wrapper",
+            "/tmp/cmux-cli-shims",
+            "claude",
+        ] {
+            assert!(!is_cmux_shim(Path::new(real)), "{real}");
+        }
+    }
 
     /// The order, one place at a time: each case holds a `codex` in that place and in every
     /// later one, so the place that wins is the first in order.

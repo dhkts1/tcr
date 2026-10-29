@@ -924,7 +924,12 @@ main() {
     # race the workflow the other way and can leave TWO releases on one tag —
     # which happened on v0.2.0, and made `releases/latest/download/appcast.xml`
     # resolve to the wrong one and 404 the update feed.
-    release_wait_seconds="${TCRBAR_RELEASE_WAIT:-600}"
+    #
+    # 20 minutes, not 10. The Release workflow's x86_64-apple-darwin build alone
+    # took 9.5 minutes on v1.2.20 and the whole workflow 11; v1.2.21 then timed
+    # out here about a minute before its release appeared, and stage 9 had to be
+    # finished by hand. A longer wait costs nothing when the release is early.
+    release_wait_seconds="${TCRBAR_RELEASE_WAIT:-1200}"
     waited=0
     until gh release view "$tag" --repo "$repo" >/dev/null 2>&1; do
       if [ "$waited" -ge "$release_wait_seconds" ]; then

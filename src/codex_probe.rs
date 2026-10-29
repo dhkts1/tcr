@@ -271,7 +271,7 @@ fn reset_expiry_from_details(value: &Value, count: u64, now_ms: i64) -> Option<i
 /// reset cannot wrap into the past (and a past reset cannot wrap into the future).
 ///
 /// A window is trusted only as far as it carries data, by the same three rules the header parser
-/// applies (`Quota::update_from_codex_refusal`), so the probe and the headers read one account
+/// applies (`Quota::update_from_codex_refusal_at`), so the probe and the headers read one account
 /// alike:
 ///
 /// - a `limit_window_seconds` of zero or less is no length at all, and the slot decides;

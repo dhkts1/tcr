@@ -7184,7 +7184,7 @@ fn codex_command() -> anyhow::Result<(std::process::Command, PathBuf)> {
     Ok((std::process::Command::new(&codex.path), codex.path))
 }
 
-/// `tcr run [--codex] [-- args…]` — launch Claude Code, or `codex` with
+/// `tcr run [--codex] [-- args…]` — `exec` Claude Code, or `codex` with
 /// `--codex`, already pointed at this proxy.
 ///
 /// If the proxy is not listening we launch `claude` untouched, so a stopped proxy never breaks the
@@ -7231,23 +7231,15 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         ) {
             eprintln!("{line}");
         }
-        let helpers = if matches!(launch, CodexLaunch::SeeThrough { .. }) {
-            let (helpers, lines) =
-                tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path, false)?;
-            for line in lines {
+        if matches!(launch, CodexLaunch::SeeThrough { .. }) {
+            for line in tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path, false)? {
                 eprintln!("{line}");
             }
-            Some(helpers)
-        } else {
-            None
-        };
+        }
         // Generated shell-tool defaults precede explicit caller overrides.
         cmd.args(&args.args);
-        let status = cmd
-            .status()
-            .with_context(|| format!("failed to launch `{}`", codex.display()))?;
-        drop(helpers);
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(exec_agent(&mut cmd))
+            .with_context(|| format!("failed to launch `{}`", codex.display()));
     }
 
     // `--group`: validate the name and the claude version BEFORE spawning
@@ -7281,7 +7273,6 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let mut cmd = claude_command();
-    let mut helpers = None;
     cmd.args(&args.args);
     mark_run_active(&mut cmd);
 
@@ -7322,10 +7313,12 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         let mut lines = match see_through_ca() {
             Some(ca) => {
                 let mut lines = apply_see_through_env(&mut cmd, port, &ca, &launch_key);
-                let (owner, notices) =
-                    tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path, true)?;
-                helpers = Some(owner);
-                lines.extend(notices);
+                lines.extend(tool_env::apply(
+                    &mut cmd,
+                    Path::new(&claude_bin()),
+                    &config_path,
+                    true,
+                )?);
                 lines
             }
             None => apply_base_url_env(&mut cmd, port, &launch_key),
@@ -7338,11 +7331,14 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         eprintln!("[tcr] proxy not listening on :{port} — launching claude directly");
     }
 
-    let status = cmd
-        .status()
-        .context("failed to launch `claude` — is it on PATH?")?;
-    drop(helpers);
-    std::process::exit(status.code().unwrap_or(1));
+    Err(exec_agent(&mut cmd)).context("failed to launch `claude` — is it on PATH?")
+}
+
+/// Replace this process with the agent, so the terminal's foreground program is
+/// the agent and not `tcr`. Returns only when the launch fails.
+fn exec_agent(cmd: &mut std::process::Command) -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+    cmd.exec()
 }
 
 /// `--group` is a Claude Code mechanism (`ANTHROPIC_CUSTOM_HEADERS`); Codex has no custom-header
@@ -7825,15 +7821,14 @@ fn compose_custom_header(inherited: Option<&str>, name: &str, value: &str) -> St
     lines.join("\n")
 }
 
-/// The marker `tcr run` leaves on its child: **a `tcr run` is already above you
-/// in this process chain, so do not start another one.**
+/// The marker `tcr run` leaves on the agent it `exec`s: **a `tcr run` already
+/// launched you, so do not start another one.**
 ///
 /// `tcr run` resolves `claude` from `PATH`, and on a machine where something else
 /// also wraps `claude` that lookup can land back on a launcher that wraps in
 /// `tcr run` — which then resolves `claude` from `PATH` again. The chain still
 /// terminates and the routing environment applied twice is identical, so nothing
-/// breaks; what you see is every startup line printed twice and a second `tcr`
-/// process parked in the tree for the life of the session. Measured 2026-08-17
+/// breaks; what you see is every startup line printed twice. Measured 2026-08-17
 /// inside a cmux pane: a hand-typed `tcr run` produced two see-through banners,
 /// and dropping cmux's shim directory from `PATH` produced one.
 ///

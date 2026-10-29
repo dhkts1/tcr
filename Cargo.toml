@@ -155,7 +155,7 @@ allow_attributes_without_reason = "warn"
 
 [package]
 name = "tcr"
-version = "1.2.20"
+version = "1.2.23"
 edition = "2024"
 # The toolchain itself is pinned in rust-toolchain.toml; this is the floor a
 # build with any other toolchain is held to.

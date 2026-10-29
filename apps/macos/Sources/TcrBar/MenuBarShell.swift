@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import SwiftUI
 import TcrBarCore
+import os
 
 /// The menu bar item and the panel that hangs off it, owned by this app rather
 /// than by SwiftUI.
@@ -292,7 +293,7 @@ final class MenuBarShell {
         // panel's height and would print a duplicate of the previous line.
         //
         // Nothing here writes anything. `sizingOptions` is untouched, the
-        // popover still sizes itself, and the only output is one `NSLog`.
+        // popover still sizes itself, and the only output is one log line.
         self.poller.$state
             .sink { [weak self] state in
                 self?.logPanelSize(state: state)
@@ -652,11 +653,10 @@ final class MenuBarShell {
             server: server.state,
             actualContentSize: popover.contentSize,
             isPanelShown: popover.isShown)
-        // `"%@"` and not the string itself: `NSLog` takes a format string, and
-        // a panel line carries `%` in it the moment a cache-hit percentage
-        // reaches the header — `TcrBarApp.swift:72` logs through the same guard
-        // for the same reason.
-        NSLog("%@", delta.logLine)
+        // Public: the line is sizes, counts and yes/no, nothing about an
+        // account. `Logger` takes no format string, so the `%` a cache-hit
+        // percentage can bring into a line prints as itself.
+        TcrBarLog.panel.log("\(delta.logLine, privacy: .public)")
     }
 
     // MARK: - The panel
