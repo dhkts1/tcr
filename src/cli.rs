@@ -1946,6 +1946,143 @@ struct ControlRoute {
     success_needs_stamp: bool,
 }
 
+const CODEX_RESET_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::CODEX_RESET_PATH,
+    endpoint: crate::proxy::CODEX_RESET_ENDPOINT,
+    refusals: &[400, 404, 409, 502, 504],
+    noun: "reset",
+    success_needs_stamp: true,
+};
+
+/// Confirm once, then keep one private key for every explicit retry of this attempt.
+/// Reads only the configured local proxy; no offline redemption or config write.
+pub async fn codex_reset(
+    config_path: &Path,
+    account: &str,
+    key: Option<&str>,
+) -> anyhow::Result<i32> {
+    codex_reset_with_io(
+        config_path,
+        account,
+        key,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
+    .await
+}
+
+async fn codex_reset_with_io(
+    config_path: &Path,
+    account: &str,
+    key: Option<&str>,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+    errors: &mut impl std::io::Write,
+) -> anyhow::Result<i32> {
+    let Ok(confirmed) = reset_consent(
+        input,
+        output,
+        &format!("Redeem one reset for {account}? [y/N]"),
+    ) else {
+        writeln!(errors, "Reset failed. Could not read confirmation.")?;
+        return Ok(4);
+    };
+    if !confirmed {
+        writeln!(output, "Cancelled.")?;
+        return Ok(0);
+    }
+    let key = match key {
+        Some(key) => key.to_owned(),
+        None => {
+            if let Ok(key) = crate::request_key::generate() {
+                key
+            } else {
+                writeln!(errors, "Reset failed. Could not create an attempt.")?;
+                return Ok(4);
+            }
+        }
+    };
+    if !crate::manager::valid_reset_key(&key) {
+        writeln!(errors, "Reset failed. Invalid attempt key.")?;
+        return Ok(4);
+    }
+    let Ok(config) = config::load(config_path) else {
+        writeln!(
+            errors,
+            "Reset failed. Could not read the proxy configuration."
+        )?;
+        return Ok(4);
+    };
+    loop {
+        let answer: RouteAnswer<crate::manager::CodexResetResponse> = call_route_with_policy(
+            &config,
+            &CODEX_RESET_ROUTE,
+            reqwest::redirect::Policy::none(),
+            |client, url| {
+                client
+                    .post(url)
+                    .timeout(Duration::from_secs(95))
+                    .json(&serde_json::json!({"query":account,"idempotencyKey":key}))
+            },
+        )
+        .await;
+        match answer.result {
+            Ok(response) => {
+                writeln!(output, "{}", response.outcome.message())?;
+                if !response.usage_refreshed {
+                    writeln!(errors, "Usage refresh failed.")?;
+                    return Ok(5);
+                }
+                return Ok(
+                    if response.outcome == crate::manager::CodexResetOutcome::NoCredit {
+                        6
+                    } else {
+                        0
+                    },
+                );
+            }
+            Err(LiveControlError::NoServer) => {
+                writeln!(errors, "No running proxy.")?;
+                return Ok(3);
+            }
+            Err(error) => {
+                let unknown = answer.status == Some(504)
+                    || matches!(
+                        error,
+                        LiveControlError::NoAnswer(_) | LiveControlError::Unusable(_)
+                    );
+                if unknown {
+                    writeln!(errors, "Reset outcome unknown.")?;
+                    let Ok(retry) = reset_consent(input, output, "Retry this reset attempt? [y/N]")
+                    else {
+                        writeln!(errors, "Reset failed. Could not read confirmation.")?;
+                        return Ok(4);
+                    };
+                    if retry {
+                        continue;
+                    }
+                } else {
+                    writeln!(errors, "Reset failed. The proxy refused the reset request.")?;
+                }
+                return Ok(4);
+            }
+        }
+    }
+}
+
+fn reset_consent(
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+    prompt: &str,
+) -> std::io::Result<bool> {
+    writeln!(output, "{prompt}")?;
+    output.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes"))
+}
+
 const DISABLED_ROUTE: ControlRoute = ControlRoute {
     path: crate::proxy::DISABLED_PATH,
     endpoint: crate::proxy::DISABLED_ENDPOINT,
@@ -1996,6 +2133,7 @@ const CONFIG_ROUTE: ControlRoute = ControlRoute {
 struct RouteAnswer<T> {
     result: Result<T, LiveControlError>,
     stamped: Option<reqwest::header::HeaderMap>,
+    status: Option<u16>,
 }
 
 /// Send one request to `route` and sort the answer.
@@ -2012,15 +2150,27 @@ async fn call_route<T: serde::de::DeserializeOwned>(
     route: &ControlRoute,
     build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
 ) -> RouteAnswer<T> {
-    let response = match send_loopback(config, route.path, build).await {
-        Ok(response) => response,
-        Err(unreached) => {
-            return RouteAnswer {
-                result: Err(unreached.into()),
-                stamped: None,
-            };
-        }
-    };
+    call_route_with_policy(config, route, reqwest::redirect::Policy::default(), build).await
+}
+
+/// One response classifier; callers choose redirect policy without duplicating transport.
+async fn call_route_with_policy<T: serde::de::DeserializeOwned>(
+    config: &Config,
+    route: &ControlRoute,
+    redirects: reqwest::redirect::Policy,
+    build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> RouteAnswer<T> {
+    let response =
+        match send_loopback_with_redirect_policy(config, route.path, redirects, build).await {
+            Ok(response) => response,
+            Err(unreached) => {
+                return RouteAnswer {
+                    result: Err(unreached.into()),
+                    stamped: None,
+                    status: None,
+                };
+            }
+        };
     let status = response.status();
     let from_route = response
         .headers()
@@ -2057,7 +2207,11 @@ async fn call_route<T: serde::de::DeserializeOwned>(
             message().map(|m| format!(": {m}")).unwrap_or_default()
         )))
     };
-    RouteAnswer { result, stamped }
+    RouteAnswer {
+        result,
+        stamped,
+        status: Some(status.as_u16()),
+    }
 }
 
 /// Ask the running proxy to park/unpark an account.
