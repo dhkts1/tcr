@@ -139,6 +139,32 @@ final class CodexPanelWiringTests: XCTestCase {
         XCTAssertLessThan(poll.lowerBound, notice.lowerBound)
     }
 
+    func testResetConfirmationDefaultsToCancel() throws {
+        let confirm = try slice(
+            try source("apps/macos/Sources/TcrBar/FleetView.swift"),
+            from: "private func confirmRedeemReset() {",
+            to: "private func performReset(retrying: Bool)")
+        XCTAssertTrue(
+            confirm.contains("alert.addButton(withTitle: \"Cancel\")")
+                && confirm.contains("alert.window.defaultButtonCell = nil")
+                && confirm.contains("alert.buttons.last?.keyEquivalent = \"\\r\"")
+                && confirm.contains("redeem.keyEquivalent = \"\""),
+            "the reset confirmation must default to Cancel")
+    }
+
+    func testResetRetryDefaultsToCancel() throws {
+        let retry = try slice(
+            try source("apps/macos/Sources/TcrBar/FleetView.swift"),
+            from: "private func performReset(retrying: Bool)",
+            to: "private func confirmDeleteAccount()")
+        XCTAssertTrue(
+            retry.contains("alert.addButton(withTitle: \"Cancel\")")
+                && retry.contains("alert.window.defaultButtonCell = nil")
+                && retry.contains("alert.buttons.last?.keyEquivalent = \"\\r\"")
+                && retry.contains("alert.addButton(withTitle: \"Retry\").keyEquivalent = \"\""),
+            "the reset Retry dialog must default to Cancel")
+    }
+
     // MARK: - Source helpers
 
     private func repoRoot() -> URL {

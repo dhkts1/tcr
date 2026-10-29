@@ -95,7 +95,8 @@ final class CodexResetControlTests: XCTestCase {
         _ = await controller.redeem(account: alice, confirmed: true)
         XCTAssertFalse(controller.isPending(alice))
         let outcome = controller.outcome(for: alice)
-        XCTAssertEqual(outcome?.stderr, "fake command unavailable")
+        XCTAssertEqual(outcome?.stderr, "Reset failed.")
+        XCTAssertFalse(outcome?.text.contains("fake command unavailable") ?? true)
         XCTAssertEqual(outcome?.exitCode, -1)
         guard case .finished = await controller.retry(account: alice) else {
             return XCTFail("an explicit retry must retain a failed attempt")
