@@ -1458,6 +1458,81 @@ mod reviewer_pending_bound {
     }
 
     #[test]
+    fn reviewer_overflow_invalidates_calibration_before_fresh_anchors() {
+        let mut c = Calibration::default();
+        c.observe(tick(10.0), 1_000, false);
+        for n in 1..=24 {
+            let (input, output) = if n % 2 == 0 { (100, 0) } else { (0, 25) };
+            c.record(&UsageRecord::from_quota_input(
+                1_000 + n * 2 - 1,
+                Some("claude-fable-5".into()),
+                None,
+                input,
+                0,
+                0,
+                0,
+                output,
+            ));
+            c.observe(tick(10.0 + n as f64), 1_000 + n * 2, false);
+        }
+        assert!(c.windows.iter().all(|window| {
+            window.anchor.is_some()
+                && !window.samples.is_empty()
+                && window.scales.contains_key("fable")
+        }));
+
+        for n in 1..=MAX_SAMPLES as i64 + 1 {
+            c.record(&UsageRecord::from_quota_input(
+                2_000 + n,
+                Some("claude-fable-5".into()),
+                None,
+                100,
+                0,
+                0,
+                0,
+                25,
+            ));
+        }
+        assert!(
+            c.pending.is_empty()
+                && c.windows.iter().all(|window| {
+                    window.anchor.is_none() && window.samples.is_empty() && window.scales.is_empty()
+                }),
+            "an overflow drop must invalidate so no dropped interval is sampled"
+        );
+
+        let reading = 2_000 + MAX_SAMPLES as i64 + 3;
+        c.record(&UsageRecord::from_quota_input(
+            reading - 1,
+            Some("claude-fable-5".into()),
+            None,
+            100,
+            0,
+            0,
+            0,
+            25,
+        ));
+        c.observe(tick(40.0), reading, false);
+        assert!(c.pending.is_empty());
+        for window in &c.windows {
+            let anchor = window
+                .anchor
+                .as_ref()
+                .expect("a fresh anchor is established");
+            assert_eq!(anchor.at, reading);
+            assert_eq!(anchor.percent, 40.0);
+            assert_eq!(
+                anchor.tokens,
+                Tokens::from([("fable".into(), [1_300, 325])])
+            );
+            assert!(
+                window.samples.is_empty() && window.scales.is_empty(),
+                "an overflow drop must invalidate so no dropped interval is sampled"
+            );
+        }
+    }
+
+    #[test]
     fn reviewer_pending_records_stay_bounded_without_a_finished_reading() {
         let mut c = Calibration::default();
         c.observe(tick(10.0), 1_000, false);
