@@ -178,10 +178,13 @@ pub fn find_codex() -> Result<CodexBin, CodexSearch> {
 }
 
 /// [`find_codex`] for a tool launcher to pin: it also passes over [`is_cmux_shim`].
+/// When that finds nothing, a shim is the only `codex` (cmux's custom binary path
+/// setting), so it falls back to [`find_codex`] and pins the shim, which does not loop then.
 pub fn find_codex_for_launcher() -> Result<CodexBin, CodexSearch> {
     find_codex_from(&env_value, &home_dir(), &|path| {
         is_executable_file(path) && !is_tool_launcher(path) && !is_cmux_shim(path)
     })
+    .or_else(|_| find_codex())
 }
 
 /// [`find_codex`] over values already read: `env` answers a variable's value, `home` is the

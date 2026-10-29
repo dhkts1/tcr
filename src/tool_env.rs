@@ -71,8 +71,11 @@ pub(crate) fn executable(name: &Path) -> Option<PathBuf> {
 
 /// [`executable`] for a tool launcher to exec: a `PATH` search also passes over
 /// cmux's CLI shims, which would run the launcher again. An explicit path is kept.
+/// When a shim is the only `name` on `PATH` (cmux's custom binary path setting, where
+/// the shim runs a binary `PATH` does not hold), pin the shim, as before: the shim does
+/// not loop then, and without a launcher a nested agent would leave the pool.
 fn launcher_target(name: &Path) -> Option<PathBuf> {
-    resolve(name, true)
+    resolve(name, true).or_else(|| executable(name))
 }
 
 fn resolve(name: &Path, past_cmux_shims: bool) -> Option<PathBuf> {
