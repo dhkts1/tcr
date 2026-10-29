@@ -66,6 +66,7 @@ struct AccountLineRow<MenuItems: View>: View {
         .accessibilityLabel(
             account.cardSummaryLabel(
                 now: now, isControl: isControl, namesProvider: namesProvider)
+                + (CodexCardFacts.resetText(account).map { ", \($0)" } ?? "")
         )
         .modifier(LineValue(value: CodexCardFacts.lineValue(account, now: now)))
         .accessibilityHint("Opens this account's actions.")
@@ -116,6 +117,12 @@ struct AccountLineRow<MenuItems: View>: View {
                 // which ``AccountLineFit`` keeps at least as wide as the
                 // widest signal the panel draws.
                 .frame(maxWidth: .infinity, alignment: .trailing)
+            if let resets = CodexCardFacts.resetText(account) {
+                Text(resets)
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(Tok.mute)
+                    .fixedSize()
+            }
         }
         .frame(minHeight: V4.lineRowHeight)
         .contentShape(Rectangle())
@@ -197,6 +204,7 @@ struct WaitingLineRow<MenuItems: View>: View {
         .accessibilityLabel(
             account.cardSummaryLabel(
                 now: now, isControl: isControl, namesProvider: namesProvider)
+                + (CodexCardFacts.resetText(account).map { ", \($0)" } ?? "")
         )
         .modifier(LineValue(value: CodexCardFacts.lineValue(account, now: now)))
         .accessibilityHint("Opens this account's actions.")
@@ -225,6 +233,12 @@ struct WaitingLineRow<MenuItems: View>: View {
                     .font(V4.font(V4.lineSignalSize))
                     .foregroundStyle(LineColor.tone(signal.tone))
                     .lineLimit(1)
+                    .fixedSize()
+            }
+            if let resets = CodexCardFacts.resetText(account) {
+                Text(resets)
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(Tok.mute)
                     .fixedSize()
             }
         }

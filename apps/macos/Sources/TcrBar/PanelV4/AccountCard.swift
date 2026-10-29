@@ -178,6 +178,11 @@ struct AccountCard<Actions: View>: View {
                 minHeight: CGFloat(CodexCardFacts.reservedQuotaRows(account))
                     * (V4.lineHeight(V4.dimSize) + V4.quotaMarginTop),
                 alignment: .topLeading)
+            if let resets = CodexCardFacts.resetText(account) {
+                Text(resets)
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(Tok.mute)
+            }
             // A Codex request always leaves from this Mac, so a Codex card draws
             // no lease line, and in place of the exit picker one statement of
             // where its requests leave from (``AccountExit/statement(for:exit:)``).

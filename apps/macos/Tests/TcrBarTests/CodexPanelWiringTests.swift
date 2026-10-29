@@ -98,6 +98,73 @@ final class CodexPanelWiringTests: XCTestCase {
             "Tok.link is no longer the system's link colour")
     }
 
+    func testResetCountReachesCardAndBothLineShapes() throws {
+        let card = try source("apps/macos/Sources/TcrBar/PanelV4/AccountCard.swift")
+        let line = try source("apps/macos/Sources/TcrBar/PanelV4/AccountLineRow.swift")
+        XCTAssertTrue(card.contains("CodexCardFacts.resetText(account)"))
+        XCTAssertEqual(
+            line.components(separatedBy: "if let resets = CodexCardFacts.resetText(account)").count - 1,
+            2)
+    }
+
+    func testResetMenuConfirmsThenRunsAndPollsBeforeShowingCommandOutput() throws {
+        let fleet = try source("apps/macos/Sources/TcrBar/FleetView.swift")
+        let menu = try slice(
+            fleet, from: "private var contextMenuItems: some View {",
+            to: "private var groupMenuItems: some View {")
+        XCTAssertTrue(menu.contains("CodexCardFacts.canRedeemReset(account)"))
+        XCTAssertTrue(menu.contains("confirmRedeemReset()"))
+        XCTAssertTrue(menu.contains(".disabled(resets.isPending(account.ref))"))
+        let confirm = try slice(
+            fleet, from: "private func confirmRedeemReset() {",
+            to: "private func performReset(retrying: Bool)")
+        XCTAssertTrue(confirm.contains("This spends one banked reset."))
+        XCTAssertTrue(confirm.contains("withTitle: \"Cancel\""))
+        let consent = try XCTUnwrap(
+            confirm.range(of: "guard alert.runModal() == .alertFirstButtonReturn else { return }"))
+        let run = try XCTUnwrap(confirm.range(of: "performReset(retrying: false)"))
+        XCTAssertLessThan(consent.lowerBound, run.lowerBound)
+        let perform = try slice(
+            fleet, from: "private func performReset(retrying: Bool)",
+            to: "private func confirmDeleteAccount()")
+        for call in [
+            "resets.retry(account: account.ref)",
+            "resets.redeem(account: account.ref, confirmed: true)", "outcome.text",
+            "withTitle: \"Retry\"", "performReset(retrying: true)",
+        ] {
+            XCTAssertTrue(perform.contains(call), "missing reset wiring: \(call)")
+        }
+        let poll = try XCTUnwrap(perform.range(of: "_ = await onChanged()"))
+        let notice = try XCTUnwrap(perform.range(of: "alert.informativeText = outcome.text"))
+        XCTAssertLessThan(poll.lowerBound, notice.lowerBound)
+    }
+
+    func testResetConfirmationDefaultsToCancel() throws {
+        let confirm = try slice(
+            try source("apps/macos/Sources/TcrBar/FleetView.swift"),
+            from: "private func confirmRedeemReset() {",
+            to: "private func performReset(retrying: Bool)")
+        XCTAssertTrue(
+            confirm.contains("alert.addButton(withTitle: \"Cancel\")")
+                && confirm.contains("alert.window.defaultButtonCell = nil")
+                && confirm.contains("alert.buttons.last?.keyEquivalent = \"\\r\"")
+                && confirm.contains("redeem.keyEquivalent = \"\""),
+            "the reset confirmation must default to Cancel")
+    }
+
+    func testResetRetryDefaultsToCancel() throws {
+        let retry = try slice(
+            try source("apps/macos/Sources/TcrBar/FleetView.swift"),
+            from: "private func performReset(retrying: Bool)",
+            to: "private func confirmDeleteAccount()")
+        XCTAssertTrue(
+            retry.contains("alert.addButton(withTitle: \"Cancel\")")
+                && retry.contains("alert.window.defaultButtonCell = nil")
+                && retry.contains("alert.buttons.last?.keyEquivalent = \"\\r\"")
+                && retry.contains("alert.addButton(withTitle: \"Retry\").keyEquivalent = \"\""),
+            "the reset Retry dialog must default to Cancel")
+    }
+
     // MARK: - Source helpers
 
     private func repoRoot() -> URL {
