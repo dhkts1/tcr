@@ -82,7 +82,7 @@ pub struct Quota {
     pub seven_day_oi: Option<QuotaWindow>,
     /// Last reported unified status: `allowed` | `allowed_warning` | `rejected`.
     /// A Codex account has no such header: its value comes from the response's HTTP
-    /// status instead (see [`Quota::update_from_codex_refusal`]).
+    /// status instead (see [`Quota::update_from_codex_refusal_at`]).
     pub status: Option<String>,
     // Standard API-key rate limits (present on non-OAuth accounts).
     pub tokens_limit: Option<i64>,
@@ -99,7 +99,7 @@ pub struct Quota {
     pub extra_usage_usd: Option<f64>,
     /// When a quota reading was last taken, from EITHER source: a successful
     /// usage probe ([`Self::apply_usage`]) or a response that carried rate-limit
-    /// headers ([`Self::update_from_headers`], or [`Self::update_from_codex_refusal`]
+    /// headers ([`Self::update_from_headers`], or [`Self::update_from_codex_refusal_at`]
     /// for a Codex account). `None` means nothing has been read since this process
     /// started.
     ///
@@ -113,7 +113,7 @@ pub struct Quota {
     /// What a Codex account's readings said beyond its windows' utilization: which windows
     /// its plan has and how long they are, the refusal's kind, its spend control and its
     /// credits. See [`CodexQuotaFacts`]. Only the Codex readers write it
-    /// ([`Self::update_from_codex_refusal`], and [`Self::apply_usage`] with a Codex probe's
+    /// ([`Self::update_from_codex_refusal_at`], and [`Self::apply_usage`] with a Codex probe's
     /// reading), so on an Anthropic account it stays the default.
     pub codex: CodexQuotaFacts,
 }
@@ -488,7 +488,7 @@ impl Quota {
     ///
     /// Without this, a rejection outlives its cause and benches the account until
     /// the process restarts. [`Quota::update_from_headers`] is the only writer of
-    /// `status` (with, for a Codex account, [`Quota::update_from_codex_refusal`]), and
+    /// `status` (with, for a Codex account, [`Quota::update_from_codex_refusal_at`]), and
     /// it reads a SERVED response's `anthropic-ratelimit-unified-status` (the Codex one,
     /// the response's HTTP status). But
     /// [`crate::manager::Manager::account_terminal_gate`] skips an account carrying
@@ -499,7 +499,7 @@ impl Quota {
     /// ended a rejection. A refused Codex account is not kept from traffic that way: once
     /// the hold its refusal armed lapses, the pool pick, which never reads `status`, may send
     /// it a request, and upstream is the oracle, since a 2xx that carries a window reads it
-    /// allowed and another refusal marks it again ([`Quota::update_from_codex_refusal`]). A
+    /// allowed and another refusal marks it again ([`Quota::update_from_codex_refusal_at`]). A
     /// probe that reads the account allowed ends the refusal too, the backend's own word
     /// ([`Self::lift_a_codex_refusal_the_probe_reads_allowed`], which runs after this).
     ///
@@ -521,7 +521,7 @@ impl Quota {
     ///
     /// Clearing wrongly is cheap and self-correcting. EVERY upstream response
     /// including a 429 is folded through [`Quota::update_from_headers`], or a Codex
-    /// account's through [`Quota::update_from_codex_refusal`]
+    /// account's through [`Quota::update_from_codex_refusal_at`]
     /// (`proxy.rs`, immediately after the "upstream response" log line), so an
     /// account that really is still rejected is marked again on its very next
     /// attempt, at a cost of one request. Clearing too late is the old behaviour: a
@@ -824,7 +824,7 @@ pub const CODEX_FIVE_HOUR_CUTOFF_MINUTES: i64 = 600;
 /// `rate-limit-reached-type`, and the three credits headers: whether the account has credits,
 /// whether they are unlimited, and their balance), then the one the Codex client reads and tcr
 /// does not, a promotional message (`codex-api/src/rate_limits.rs`). The credits are read
-/// BEFORE the strip, in [`Quota::update_from_codex_refusal`], which the proxy calls with the
+/// BEFORE the strip, in [`Quota::update_from_codex_refusal_at`], which the proxy calls with the
 /// upstream headers ahead of building the pooled answer. All eleven describe the SERVING
 /// account, so `proxy::build_response` strips exactly these from a pooled Codex response
 /// (`proxy::is_account_scoped`), as it strips `anthropic-ratelimit-*`: a pooled client would
@@ -976,7 +976,7 @@ impl Quota {
     /// equivalent of. A 2xx that carried a window, from either slot, means this account is
     /// being served (`allowed`). A 429 carrying `x-codex-rate-limit-reached-type`
     /// means it is not (`rejected`). The proxy parses body-only refusals once through
-    /// [`CodexQuotaRefusal::parse`] and folds them with [`Self::update_from_codex_refusal`].
+    /// [`CodexQuotaRefusal::parse`] and folds them with [`Self::update_from_codex_refusal_at`].
     /// The Codex usage probe
     /// ([`crate::codex_probe`]) is what clears it, as the Anthropic probe clears an Anthropic
     /// rejection: its reading is folded through [`Self::apply_usage`], where
@@ -1155,7 +1155,7 @@ fn codex_credits_from_headers(headers: &impl HeaderView) -> Option<tcr_status_wi
 /// length in minutes): the length of the window whose utilization the bucket keeps, which is the
 /// fuller one, and the longer of the two on equal utilization.
 ///
-/// One rule for both readers, the headers ([`Quota::update_from_codex_refusal`]) and the probe
+/// One rule for both readers, the headers ([`Quota::update_from_codex_refusal_at`]) and the probe
 /// ([`crate::codex_probe::usage_from_payload`]), so they report one account's lengths alike. A
 /// utilization the reading did not carry is passed as `f64::NEG_INFINITY`, so the window that
 /// did carry one is the one kept, as the bucket keeps its utilization.
@@ -2025,7 +2025,7 @@ mod tests {
     /// response with no Codex header, a 0% placeholder slot with no length or
     /// reset, and a 429 that is not the quota read nothing.
     ///
-    /// Watched red: without the stamp in `update_from_codex_refusal`, the
+    /// Watched red: without the stamp in `update_from_codex_refusal_at`, the
     /// weekly-only reading leaves `updated_at` at `None`.
     #[test]
     fn a_codex_reading_stamps_updated_at_and_silence_does_not() {
