@@ -255,9 +255,74 @@ if [ "${NESTED:-}" = yes ]; then
 fi
 exec "$CLAUDE_CODE_SHELL_PREFIX" 'NESTED=yes ANTHROPIC_BASE_URL=http://127.0.0.1:4000 HTTPS_PROXY=http://proxy.example:3999 NODE_EXTRA_CA_CERTS=/caller/ca.pem claude'
 "#);
-    // Cleanup is observable after the foreground client exits.
+}
+
+/// The client runs as tcr's own pid, and launches with the same setup share one helper directory.
+#[test]
+fn the_client_replaces_tcr_and_one_setup_shares_one_helper_directory() {
+    let fixture = AgentFixture::new();
     let parent = fixture.home.path().join(".cache/tcr/tool-env");
-    assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
+    let launches = || -> Vec<std::path::PathBuf> {
+        let mut dirs: Vec<_> = std::fs::read_dir(&parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        dirs.sort();
+        dirs
+    };
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"printf '%s\n' "$$""#,
+    );
+    let child = fixture
+        .command()
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let tcr_pid = child.id();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{tcr_pid}\n"),
+        "the client must run as tcr's own pid"
+    );
+    let first = launches();
+    assert_eq!(first.len(), 1);
+
+    assert!(fixture.command().output().unwrap().status.success());
+    assert_eq!(launches(), first, "the same setup reuses its directory");
+
+    let env_file = fixture.home.path().join("caller env");
+    std::fs::write(&env_file, "").unwrap();
+    let output = fixture
+        .command()
+        .env("CLAUDE_ENV_FILE", &env_file)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        launches().len(),
+        2,
+        "a different setup gets its own directory"
+    );
+}
+
+#[test]
+fn a_setup_directory_others_can_open_is_refused() {
+    let fixture = AgentFixture::new();
+    fixture.run("true");
+    let parent = fixture.home.path().join(".cache/tcr/tool-env");
+    let setup = std::fs::read_dir(&parent)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = fixture.command().output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mode 0700"));
 }
 
 /// tcr starts without the `CLAUDE_CODE_SHELL` that Claude reads from `settings.json`,
@@ -378,7 +443,7 @@ case "$CLAUDE_CODE_SHELL_PREFIX" in /*) ;; *) exit 74;; esac
         String::from_utf8_lossy(&output.stderr)
     );
     let root = fixture.home.path().join("relative-cache/tcr/tool-env");
-    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
     let output = fixture
         .command()

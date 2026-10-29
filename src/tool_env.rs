@@ -1,6 +1,7 @@
 //! Separate shell-tool routing from the model client's proxy. Private launchers
 //! restore nested agents; their scripts contain no proxy values or request keys.
-//! A launch owns its temporary directory and removes it when the client exits.
+//! The helper directory is named by a hash of everything its scripts depend on,
+//! so launches with the same setup share one and nothing needs removing.
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -8,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
+use sha2::{Digest as _, Sha256};
 
 const PROXIES: [&str; 6] = [
     "HTTPS_PROXY",
@@ -155,14 +157,13 @@ pub(crate) fn apply_codex_shell_policy(cmd: &mut Command, host: &Host<'_>) -> Ve
     vec!["[tcr] shell tools use the caller's proxy and CA settings; nested codex on PATH uses the current pool checks".into()]
 }
 
-/// Apply after model routing, before explicit CLI arguments. The returned owner
-/// must live until the foreground agent exits, including error paths.
+/// Apply after model routing, before explicit CLI arguments.
 pub(crate) fn apply(
     cmd: &mut Command,
     claude: &Path,
     config: &Path,
     claude_shell: bool,
-) -> anyhow::Result<(tempfile::TempDir, Vec<String>)> {
+) -> anyhow::Result<Vec<String>> {
     let claude = executable(claude);
     let tcr = std::env::current_exe()?.canonicalize()?;
     let config = std::path::absolute(config)?;
@@ -213,23 +214,22 @@ pub(crate) fn apply(
             )
         })
         .unwrap_or_else(|| "/bin/bash".into());
-    let parent = std::path::absolute(tcr::paths::cache_dir().root().join("tool-env"))?;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&parent)?;
-    let meta = std::fs::symlink_metadata(&parent)?;
-    let uid = tcr_fdpass::effective_uid();
-    anyhow::ensure!(
-        meta.is_dir() && meta.uid() == uid && meta.mode() & 0o777 == 0o700,
-        "tool helper directory must be owned by this user with mode 0700 and must not be a symlink"
-    );
-    let directory = tempfile::Builder::new()
-        .prefix("launch-")
-        .tempdir_in(&parent)?;
-    let root = directory.path();
-    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
     let caller = caller_env(model_port(cmd, &host), &host);
+    let parent = std::path::absolute(tcr::paths::cache_dir().root().join("tool-env"))?;
+    private_dir(&parent)?;
+    let setup = SetupKey {
+        prefix: prefix.as_deref(),
+        env_file: env_file.as_deref(),
+        shell: &shell,
+        claude: claude.as_deref(),
+        codex: codex_bin.as_deref(),
+        tcr: &tcr,
+        config: &config,
+        caller_keys: caller.keys().map(String::as_str).collect(),
+    };
+    let directory = parent.join(format!("setup-{}", setup.digest()));
+    private_dir(&directory)?;
+    let root = directory.as_path();
     let mut cleanup = String::new();
     for key in PROXIES.iter().chain(CAS.iter()) {
         let saved = format!("TCR_TOOL_CALLER_{key}");
@@ -329,12 +329,103 @@ pub(crate) fn apply(
     );
     cmd.env("CLAUDE_CODE_SHELL_PREFIX", root.join("shell-prefix"));
     cmd.env("CLAUDE_ENV_FILE", root.join("shell-env"));
-    Ok((
-        directory,
-        if claude_shell {
-            vec!["[tcr] shell tools use the caller's proxy and CA settings; nested claude/codex on PATH use the pool unless explicitly overridden".into()]
-        } else {
-            Vec::new()
-        },
-    ))
+    Ok(if claude_shell {
+        vec!["[tcr] shell tools use the caller's proxy and CA settings; nested claude/codex on PATH use the pool unless explicitly overridden".into()]
+    } else {
+        Vec::new()
+    })
+}
+
+/// Create `dir` if missing, and refuse one that is not ours alone.
+fn private_dir(dir: &Path) -> anyhow::Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = std::fs::symlink_metadata(dir)?;
+    anyhow::ensure!(
+        meta.is_dir() && meta.uid() == tcr_fdpass::effective_uid() && meta.mode() & 0o777 == 0o700,
+        "tool helper directory must be owned by this user with mode 0700 and must not be a symlink"
+    );
+    Ok(())
+}
+
+/// Everything the helper scripts are generated from. Caller values are read at
+/// run time, so only which keys are set matters here.
+struct SetupKey<'a> {
+    prefix: Option<&'a str>,
+    env_file: Option<&'a str>,
+    shell: &'a str,
+    claude: Option<&'a Path>,
+    codex: Option<&'a Path>,
+    tcr: &'a Path,
+    config: &'a Path,
+    caller_keys: Vec<&'a str>,
+}
+
+impl SetupKey<'_> {
+    fn digest(&self) -> String {
+        let mut hash = Sha256::new();
+        // The build is part of the key: a newer template must not overwrite the
+        // scripts a running session of an older tcr uses.
+        let fields = [
+            Some(env!("CARGO_PKG_VERSION").as_bytes()),
+            Some(tcr::build_info::SHA.as_bytes()),
+            self.prefix.map(str::as_bytes),
+            self.env_file.map(str::as_bytes),
+            Some(self.shell.as_bytes()),
+            self.claude.map(|p| p.as_os_str().as_encoded_bytes()),
+            self.codex.map(|p| p.as_os_str().as_encoded_bytes()),
+            Some(self.tcr.as_os_str().as_encoded_bytes()),
+            Some(self.config.as_os_str().as_encoded_bytes()),
+        ];
+        for field in fields {
+            match field {
+                Some(bytes) => {
+                    hash.update([1]);
+                    hash.update((bytes.len() as u64).to_le_bytes());
+                    hash.update(bytes);
+                }
+                None => hash.update([0]),
+            }
+        }
+        for key in &self.caller_keys {
+            hash.update((key.len() as u64).to_le_bytes());
+            hash.update(key.as_bytes());
+        }
+        hash.finalize()[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key<'a>(shell: &'a str, caller_keys: Vec<&'a str>) -> SetupKey<'a> {
+        SetupKey {
+            prefix: None,
+            env_file: None,
+            shell,
+            claude: Some(Path::new("/bin/claude")),
+            codex: None,
+            tcr: Path::new("/bin/tcr"),
+            config: Path::new("/cfg.json"),
+            caller_keys,
+        }
+    }
+
+    #[test]
+    fn the_setup_digest_is_stable_and_changes_with_any_input() {
+        let base = key("/bin/bash", vec!["HTTPS_PROXY"]).digest();
+        assert_eq!(base, key("/bin/bash", vec!["HTTPS_PROXY"]).digest());
+        assert_eq!(base.len(), 16);
+        assert_ne!(base, key("/bin/zsh", vec!["HTTPS_PROXY"]).digest());
+        assert_ne!(base, key("/bin/bash", vec![]).digest());
+        let mut no_claude = key("/bin/bash", vec!["HTTPS_PROXY"]);
+        no_claude.claude = None;
+        assert_ne!(base, no_claude.digest());
+    }
 }
