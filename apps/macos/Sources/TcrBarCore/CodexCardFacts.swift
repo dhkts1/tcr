@@ -37,6 +37,17 @@ public enum CodexCardFacts {
         account.provider == .codex ? 2 : 0
     }
 
+    /// The measured reset count, distinct from paid credits. An absent fact is unavailable.
+    public static func resetText(_ account: Account) -> String? {
+        guard account.provider == .codex else { return nil }
+        guard let resets = account.resetCredits else { return "Resets: unavailable" }
+        return "Resets: \(resets.availableCount)"
+    }
+
+    public static func canRedeemReset(_ account: Account) -> Bool {
+        account.provider == .codex && (account.resetCredits?.availableCount ?? 0) > 0
+    }
+
     // MARK: - The state pill's help
 
     /// The sentence behind a Codex row's state pill, or `nil` wherever the row keeps
