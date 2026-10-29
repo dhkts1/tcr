@@ -766,3 +766,152 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" '. "$CLAUDE_ENV_FILE"; INNER=yes HTTPS_PROXY=ht
         "a proxy set on the nested claude command was not kept as an override",
     );
 }
+
+/// cmux's per-pane shim and wrapper in one: run the next `name` on `PATH` past its own
+/// directory, as cmux's wrapper does. It counts its runs, so a loop fails fast.
+fn cmux_shim_dir(fixture: &AgentFixture, name: &str) -> std::path::PathBuf {
+    let dir = fixture.home.path().join("T/cmux-cli-shims/11111111-AAAA");
+    std::fs::create_dir_all(&dir).unwrap();
+    script(
+        &dir.join(name),
+        &format!(
+            r#"
+hops=$(( ${{SHIM_HOPS:-0}} + 1 )); export SHIM_HOPS=$hops
+if [ "$hops" -gt 3 ]; then printf 'the cmux shim looped\n' >&2; exit 79; fi
+self=$(dirname "$0"); IFS=:
+for d in $PATH; do
+    if [ "$d" != "$self" ] && [ -x "$d/{name}" ]; then exec "$d/{name}" "$@"; fi
+done
+exit 127
+"#
+        ),
+    );
+    dir
+}
+
+/// A real `name` in `<home>/bin` that prints how many cmux shim runs preceded it, and a
+/// `PATH` with the cmux shim directory ahead of it.
+fn behind_a_cmux_shim(fixture: &AgentFixture, name: &str) -> String {
+    let shims = cmux_shim_dir(fixture, name);
+    let bin = fixture.home.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    script(
+        &bin.join(name),
+        &format!("printf 'real-{name} hops=%s\\n' \"${{SHIM_HOPS:-0}}\""),
+    );
+    format!("{}:{}:/usr/bin:/bin", shims.display(), bin.display())
+}
+
+/// The agent still starts through a cmux shim first on `PATH`, but the launcher that shim's
+/// wrapper finds next execs the real `claude`, not the shim again.
+#[test]
+fn a_cmux_shim_on_path_runs_once_before_the_real_claude() {
+    let fixture = AgentFixture::new();
+    let path = behind_a_cmux_shim(&fixture, "claude");
+    let output = fixture
+        .command()
+        .env_remove("TCR_CLAUDE_BIN")
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert_ran(&output, "tcr run behind a cmux claude shim");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("real-claude hops=1"), "stdout={stdout}");
+}
+
+/// [`a_cmux_shim_on_path_runs_once_before_the_real_claude`] for `tcr run --codex`, whose
+/// `codex` launcher pins `TCR_CODEX_BIN` for the `tcr run --codex` it starts.
+#[test]
+fn a_cmux_shim_on_path_runs_once_before_the_real_codex() {
+    let fixture = AgentFixture::new();
+    let path = behind_a_cmux_shim(&fixture, "codex");
+    let output = fixture
+        .command()
+        .arg("--codex")
+        .env_remove("TCR_CODEX_BIN")
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert_ran(&output, "tcr run --codex behind a cmux codex shim");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("real-codex hops=1"), "stdout={stdout}");
+}
+
+/// cmux's custom binary path setting: the shim is the only `name` on `PATH`, and it
+/// runs the binary that `$CMUX_CUSTOM_BIN` names. Returns that `PATH`.
+fn only_a_cmux_shim(fixture: &AgentFixture, name: &str) -> String {
+    let dir = fixture.home.path().join("T/cmux-cli-shims/22222222-BBBB");
+    std::fs::create_dir_all(&dir).unwrap();
+    script(
+        &dir.join(name),
+        r#"
+hops=$(( ${SHIM_HOPS:-0} + 1 )); export SHIM_HOPS=$hops
+if [ "$hops" -gt 3 ]; then printf 'the cmux shim looped\n' >&2; exit 79; fi
+exec "$CMUX_CUSTOM_BIN" "$@"
+"#,
+    );
+    format!("{}:/usr/bin:/bin", dir.display())
+}
+
+/// When the cmux shim is the only `claude` on `PATH`, the launcher pins the shim, so a
+/// nested `claude` still reaches the pool rather than going direct.
+#[test]
+fn a_nested_claude_behind_the_only_cmux_shim_stays_on_the_pool() {
+    let fixture = AgentFixture::new();
+    let real = fixture.home.path().join("custom-claude");
+    script(
+        &real,
+        r#"
+if [ "${INNER:-}" = yes ]; then
+    test "${HTTPS_PROXY:-}" = "$EXPECTED_MODEL" || { printf 'nested HTTPS_PROXY=%s\n' "${HTTPS_PROXY:-}" >&2; exit 81; }
+    printf 'nested-pooled\n'; exit
+fi
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'INNER=yes claude'
+"#,
+    );
+    let output = fixture
+        .command()
+        .env_remove("TCR_CLAUDE_BIN")
+        .env("PATH", only_a_cmux_shim(&fixture, "claude"))
+        .env("CMUX_CUSTOM_BIN", &real)
+        .env("EXPECTED_MODEL", pooled_model_url(&fixture))
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "a nested claude behind the only cmux shim left the pool",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("nested-pooled"), "stdout={stdout}");
+}
+
+/// [`a_nested_claude_behind_the_only_cmux_shim_stays_on_the_pool`] for a nested `codex`.
+#[test]
+fn a_nested_codex_behind_the_only_cmux_shim_stays_on_the_pool() {
+    let fixture = AgentFixture::new();
+    let real = fixture.home.path().join("custom-codex");
+    script(
+        &real,
+        r#"
+case "${HTTPS_PROXY:-}" in *tcr-codex*) ;; *) printf 'nested codex HTTPS_PROXY=%s\n' "${HTTPS_PROXY:-}" >&2; exit 84;; esac
+printf 'nested-codex-pooled\n'
+"#,
+    );
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"exec "$CLAUDE_CODE_SHELL_PREFIX" 'codex'"#,
+    );
+    let output = fixture
+        .command()
+        .env_remove("TCR_CODEX_BIN")
+        .env("PATH", only_a_cmux_shim(&fixture, "codex"))
+        .env("CMUX_CUSTOM_BIN", &real)
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "a nested codex behind the only cmux shim left the pool",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("nested-codex-pooled"), "stdout={stdout}");
+}

@@ -66,13 +66,28 @@ fn inherited(cmd: &Command, name: &str, host: &Host<'_>) -> Option<String> {
 /// Resolve PATH without re-entering an outer session's tcr launchers. Retain
 /// npm symlinks: their parent directory is meaningful to the executable.
 pub(crate) fn executable(name: &Path) -> Option<PathBuf> {
+    resolve(name, false)
+}
+
+/// [`executable`] for a tool launcher to exec: a `PATH` search also passes over
+/// cmux's CLI shims, which would run the launcher again. An explicit path is kept.
+/// When a shim is the only `name` on `PATH` (cmux's custom binary path setting, where
+/// the shim runs a binary `PATH` does not hold), pin the shim, as before: the shim does
+/// not loop then, and without a launcher a nested agent would leave the pool.
+fn launcher_target(name: &Path) -> Option<PathBuf> {
+    resolve(name, true).or_else(|| executable(name))
+}
+
+fn resolve(name: &Path, past_cmux_shims: bool) -> Option<PathBuf> {
     let path = if name.components().count() > 1 || name.is_absolute() {
         name.to_path_buf()
     } else {
         std::env::split_paths(&std::env::var_os("PATH")?)
             .map(|dir| dir.join(name))
             .find(|p| {
-                tcr::codex_local::is_executable_file(p) && !tcr::codex_local::is_tool_launcher(p)
+                tcr::codex_local::is_executable_file(p)
+                    && !tcr::codex_local::is_tool_launcher(p)
+                    && !(past_cmux_shims && tcr::codex_local::is_cmux_shim(p))
             })?
     };
     tcr::codex_local::is_executable_file(&path)
@@ -164,10 +179,10 @@ pub(crate) fn apply(
     config: &Path,
     claude_shell: bool,
 ) -> anyhow::Result<Vec<String>> {
-    let claude = executable(claude);
+    let claude = launcher_target(claude);
     let tcr = std::env::current_exe()?.canonicalize()?;
     let config = std::path::absolute(config)?;
-    let codex_bin = tcr::codex_local::find_codex()
+    let codex_bin = tcr::codex_local::find_codex_for_launcher()
         .ok()
         .and_then(|found| executable(&found.path));
     let host = Host::current();

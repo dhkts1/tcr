@@ -247,7 +247,10 @@ proxy marker and own CA only when the caller supplied no value; an explicit
 `CLAUDE_ENV_FILE` exported is for shell tools, not an override, so nested Claude still uses the
 pool; set one on the `claude` command itself to override it. Nested Codex uses `tcr run --codex`,
 respecting caller binary overrides. tcr's own client lookups skip these launchers, so an explicit
-nested `tcr run --config other.json` uses that config. Explicit executable paths, a replaced PATH
+nested `tcr run --config other.json` uses that config. A launcher also skips a cmux CLI shim
+(`…/cmux-cli-shims/<pane>/claude` or `codex`) on PATH: cmux's wrapper runs the next one on PATH,
+which is the launcher, so the agent `tcr run` starts still goes through cmux and the launcher
+runs the real binary after it. Explicit executable paths, a replaced PATH
 or client configuration can bypass the launchers. Claude's `CLAUDE_ENV_FILE` and bare executable
 `CLAUDE_CODE_SHELL_PREFIX` still run; a prefix containing flags is refused with a message to use
 an executable wrapper script. Codex's unrelated policy settings and filters are preserved.
