@@ -591,6 +591,35 @@ struct DecodedDay {
     complete: bool,
 }
 
+/// Fold one decoded UTC day into the forecast's demand history: every line through the
+/// checked decoder, independently of account resolution, and the day's hours marked
+/// covered only when the file was present, complete and clean.
+fn history_day(history: &mut crate::forecast::History, day: &DecodedDay, date: Date, now_ms: i64) {
+    history.partial |= !day.complete || day.malformed != 0;
+    for line in &day.lines {
+        if line
+            .p
+            .as_deref()
+            .is_some_and(|p| Provider::from_name(p).is_none())
+        {
+            history.partial = true;
+            continue;
+        }
+        if let Some(record) = ledger_record(line, line_provider(line)) {
+            history.record(&record);
+        } else {
+            history.partial = true;
+        }
+    }
+    if day.present && day.complete && day.malformed == 0 {
+        let start = time::PrimitiveDateTime::new(date, time::Time::MIDNIGHT)
+            .assume_utc()
+            .unix_timestamp()
+            * 1000;
+        history.cover_day(start, (start + 86_400_000).min(now_ms));
+    }
+}
+
 fn parse_ledger_day_checked(dir: &Path, date: Date) -> DecodedDay {
     let day = read_ledger_day_checked(dir, date);
     let mut lines = Vec::new();
@@ -1700,6 +1729,8 @@ impl UsageTracker {
             .forecast_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Sticky until the next boot: a dropped line or a failed write is missing from
+        // the history for good, and a handoff rebuild no longer replaces the history.
         history.partial |= self.dropped_lines() != 0
             || (self.is_attached() && !self.healthy.load(Ordering::Relaxed));
         history.estimates(now_ms)
@@ -1732,7 +1763,14 @@ impl UsageTracker {
         // can be in and never prunes one of them. A Claude-only fleet replays
         // yesterday and today and prunes as it always has.
         let holds_codex = holds_codex(accounts);
-        self.replay_window(&dir, accounts, now_ms, &mut report);
+        // The one time the 29-day forecast history is read. A handoff rebuild never
+        // re-reads it: `record` has fed the history ever since.
+        let mut history = crate::forecast::History::new(now_ms);
+        self.replay_window(&dir, accounts, now_ms, &mut report, Some(&mut history));
+        *self
+            .forecast_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = history;
         *self
             .dir
             .lock()
@@ -1850,7 +1888,7 @@ impl UsageTracker {
         trusted(self)?;
         let fresh = Self::new(accounts.len(), self.pricing.clone());
         let mut report = ReplayReport::default();
-        fresh.replay_window(&dir, accounts, now_ms, &mut report);
+        fresh.replay_window(&dir, accounts, now_ms, &mut report, None);
         let mut rebuilt = fresh
             .accounts
             .into_inner()
@@ -1863,63 +1901,41 @@ impl UsageTracker {
             rebuilt.resize_with(live.len(), Mutex::default);
         }
         *live = rebuilt;
-        *self
-            .forecast_history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh
-            .forecast_history
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The forecast history is left as it is. It was read once at boot and fed by
+        // `record` since, so re-reading 29 days here would hold every request behind
+        // the gate for the length of that read. The cost: lines the predecessor wrote
+        // after this process's boot replay are in the totals above but not in it.
         Ok(report)
     }
 
     /// Replay the files a boot replays into this tracker's buckets: today's and
     /// yesterday's UTC files, and when the fleet holds a Codex account, whose
     /// weekly window reaches back seven days, the six before them, oldest first.
+    ///
+    /// With `history`, the same pass also builds the forecast's demand history from
+    /// the 29 UTC files it covers, reading each file once. Only the boot replay
+    /// passes one: a handoff rebuild leaves the history `record` has kept since boot.
     fn replay_window(
         &self,
         dir: &Path,
         accounts: &[LedgerAccount],
         now_ms: i64,
         report: &mut ReplayReport,
+        mut history: Option<&mut crate::forecast::History>,
     ) {
         let days_back: i64 = if holds_codex(accounts) { 7 } else { 1 };
-        let mut history = crate::forecast::History::new(now_ms);
-        for back in (0..=28).rev() {
+        let oldest_back = if history.is_some() { 28 } else { days_back };
+        for back in (0..=oldest_back).rev() {
             let date = ledger_date(now_ms - back * 86_400_000);
             let day = parse_ledger_day_checked(dir, date);
-            history.partial |= !day.complete || day.malformed != 0;
-            for line in &day.lines {
-                if line
-                    .p
-                    .as_deref()
-                    .is_some_and(|p| Provider::from_name(p).is_none())
-                {
-                    history.partial = true;
-                    continue;
-                }
-                if let Some(record) = ledger_record(line, line_provider(line)) {
-                    history.record(&record);
-                } else {
-                    history.partial = true;
-                }
-            }
-            if day.present && day.complete && day.malformed == 0 {
-                let start = time::PrimitiveDateTime::new(date, time::Time::MIDNIGHT)
-                    .assume_utc()
-                    .unix_timestamp()
-                    * 1000;
-                history.cover_day(start, (start + 86_400_000).min(now_ms));
+            if let Some(history) = history.as_deref_mut() {
+                history_day(history, &day, date, now_ms);
             }
             if back <= days_back {
                 report.malformed += day.malformed;
                 self.replay_day(day.lines, accounts, report);
             }
         }
-        *self
-            .forecast_history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = history;
     }
 
     fn replay_day(
@@ -4326,6 +4342,62 @@ mod tests {
         assert!(
             t.forecast_estimates(now)[0].partial,
             "unknown provider is not filed as known demand"
+        );
+        assert_eq!(
+            t.shutdown_ledger(std::time::Duration::from_secs(2)),
+            LedgerShutdown::Flushed
+        );
+    }
+
+    /// A handoff rebuild re-reads the quota window's files, never the forecast's 29 days,
+    /// and keeps the history built at boot and fed live since. The day five back is outside
+    /// a Claude-only fleet's two-day quota window; deleting its file after boot shows
+    /// whether the rebuild read it again.
+    #[test]
+    fn forecast_rebuild_keeps_the_boot_history_and_never_rereads_it() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let now = crate::now_ms();
+        let day = ledger_date(now - 5 * 86_400_000);
+        let start = day.with_hms(0, 0, 0).unwrap().assume_utc().unix_timestamp() * 1000;
+        let mut data = Vec::new();
+        for hour in 0..24 {
+            writeln!(
+                &mut data,
+                "{}",
+                serde_json::json!({"t":start+hour*3_600_000+1,
+                "a":"alice@example.com","m":"claude-opus-5","i":100,"c5":0,"c1":0,"r":0,"o":25})
+            )
+            .unwrap();
+        }
+        std::fs::write(plain_day_path(dir.path(), day), &data).unwrap();
+        let accounts = [named("alice@example.com")];
+        let t = tracker();
+        t.attach_ledger(dir.path().to_path_buf(), 29, &accounts, now);
+        t.record(
+            0,
+            &record(now, "claude-opus-5", 100),
+            "alice@example.com",
+            None,
+            None,
+        );
+        let before = t.forecast_estimates(now + 1);
+        assert_eq!(before.len(), 1);
+        assert!(
+            before[0].history_hours >= 23.0,
+            "the boot replay read the day five back"
+        );
+        std::fs::remove_file(plain_day_path(dir.path(), day)).unwrap();
+        t.rebuild_from_ledger(&accounts, now + 1).unwrap();
+        assert_eq!(
+            t.row(0, now + 1, None).today.requests,
+            1,
+            "the rebuild replayed the quota window, including the live line"
+        );
+        assert_eq!(
+            t.forecast_estimates(now + 1),
+            before,
+            "a rebuild neither resets the history nor reads the 29 days again"
         );
         assert_eq!(
             t.shutdown_ledger(std::time::Duration::from_secs(2)),
