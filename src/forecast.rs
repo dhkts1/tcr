@@ -39,6 +39,45 @@ fn add(target: &mut [u64; 2], value: [u64; 2]) -> Option<()> {
     Some(())
 }
 
+/// Anthropic's unified windows, in calibration-window order: utilization and reset header.
+const ANTHROPIC_TICK_HEADERS: [(&str, &str); 3] = [
+    (
+        "anthropic-ratelimit-unified-5h-utilization",
+        "anthropic-ratelimit-unified-5h-reset",
+    ),
+    (
+        "anthropic-ratelimit-unified-7d-utilization",
+        "anthropic-ratelimit-unified-7d-reset",
+    ),
+    (
+        "anthropic-ratelimit-unified-7d_oi-utilization",
+        "anthropic-ratelimit-unified-7d_oi-reset",
+    ),
+];
+
+/// Codex's two slots: used-percent and reset-at header.
+const CODEX_TICK_HEADERS: [(&str, &str); 2] = [
+    ("x-codex-primary-used-percent", "x-codex-primary-reset-at"),
+    (
+        "x-codex-secondary-used-percent",
+        "x-codex-secondary-reset-at",
+    ),
+];
+
+/// Whether [`header_ticks`] returns `Some` for these headers: a response that names any
+/// window's utilization. Header lookups only, so a caller that will not use the ticks
+/// can ask this instead of building them.
+pub(crate) fn carries_ticks(provider: Provider, headers: &reqwest::header::HeaderMap) -> bool {
+    match provider {
+        Provider::Anthropic => ANTHROPIC_TICK_HEADERS
+            .iter()
+            .any(|(utilization, _)| headers.contains_key(*utilization)),
+        Provider::Codex => CODEX_TICK_HEADERS
+            .iter()
+            .any(|(utilization, _)| headers.contains_key(*utilization)),
+    }
+}
+
 /// First-hand header evidence only, projected from the quota parser's result. A cached
 /// utilization or synthesized reset can still govern quota, but cannot train a fit.
 pub(crate) fn header_ticks(
@@ -70,25 +109,17 @@ pub(crate) fn header_ticks(
                 .map(|reset| (reset.unix_timestamp_nanos() / 1_000_000) as i64),
         })
     };
+    if !carries_ticks(provider, headers) {
+        return None;
+    }
     match provider {
         Provider::Anthropic => {
-            let windows = [
-                ("5h", quota.five_hour),
-                ("7d", quota.seven_day),
-                ("7d_oi", quota.seven_day_oi),
-            ];
-            if !windows.iter().any(|(name, _)| {
-                headers.contains_key(
-                    format!("anthropic-ratelimit-unified-{name}-utilization").as_str(),
-                )
-            }) {
-                return None;
-            }
-            Some(windows.map(|(name, window)| {
-                let utilization = format!("anthropic-ratelimit-unified-{name}-utilization");
-                let reset = format!("anthropic-ratelimit-unified-{name}-reset");
-                let reset = epoch_reset(&reset).or_else(|| {
-                    text(&reset).and_then(|s| {
+            let windows = [quota.five_hour, quota.seven_day, quota.seven_day_oi];
+            Some(std::array::from_fn(|idx| {
+                let (utilization, reset) = ANTHROPIC_TICK_HEADERS[idx];
+                let window = windows[idx];
+                let reset = epoch_reset(reset).or_else(|| {
+                    text(reset).and_then(|s| {
                         time::OffsetDateTime::parse(
                             s,
                             &time::format_description::well_known::Rfc3339,
@@ -98,7 +129,7 @@ pub(crate) fn header_ticks(
                 });
                 bucket(
                     window.filter(|w| {
-                        reported_util(&utilization) && reset.is_some() && w.reset == reset
+                        reported_util(utilization) && reset.is_some() && w.reset == reset
                     }),
                 )
             }))
@@ -107,19 +138,13 @@ pub(crate) fn header_ticks(
             // The parser owns primary/secondary length mapping and same-window merging.
             // All supplied slots need explicit resets before that merged reading is exact.
             let mut supplied = 0;
-            for slot in ["primary", "secondary"] {
-                let utilization = format!("x-codex-{slot}-used-percent");
-                if headers.contains_key(utilization.as_str()) {
+            for (utilization, reset) in CODEX_TICK_HEADERS {
+                if headers.contains_key(utilization) {
                     supplied += 1;
-                    if !reported_util(&utilization)
-                        || epoch_reset(&format!("x-codex-{slot}-reset-at")).is_none()
-                    {
+                    if !reported_util(utilization) || epoch_reset(reset).is_none() {
                         return Some([None; 3]);
                     }
                 }
-            }
-            if supplied == 0 {
-                return None;
             }
             let Some(reported) = quota.codex.header_windows.as_ref() else {
                 return Some([None; 3]);
@@ -244,6 +269,9 @@ pub(crate) struct Calibration {
     pending: BTreeMap<i64, Tokens>,
     windows: [WindowFit; 3],
     last_reading: Option<i64>,
+    /// Whether `last_reading` came on the headers of a request still open, with no other
+    /// request on the account open ([`Self::observe_serving`]).
+    last_serving: bool,
 }
 
 impl Calibration {
@@ -253,7 +281,13 @@ impl Calibration {
             self.invalidate();
             return;
         };
-        if self.last_reading.is_some_and(|at| record.ts_ms <= at)
+        // A record at or before the last reading's watermark that arrives after it may be
+        // in that reading's percent without being in its tokens. The one exception is a
+        // serving reading's own request: it completed after the headers it was read from,
+        // so a record in that same millisecond waits for the next reading.
+        if self
+            .last_reading
+            .is_some_and(|at| record.ts_ms < at || (record.ts_ms == at && !self.last_serving))
             || add(
                 self.pending
                     .entry(record.ts_ms)
@@ -279,6 +313,18 @@ impl Calibration {
         }
     }
 
+    /// A finished reading taken from the headers of a request that is still open, when
+    /// no other request on the account is: [`Self::observe`], and that request's own
+    /// record may then share the reading's millisecond and goes to the next interval.
+    pub(crate) fn observe_serving(
+        &mut self,
+        buckets: [Option<crate::probe::UsageBucket>; 3],
+        now: i64,
+    ) {
+        self.observe(buckets, now, false);
+        self.last_serving = true;
+    }
+
     pub(crate) fn observe(
         &mut self,
         buckets: [Option<crate::probe::UsageBucket>; 3],
@@ -294,6 +340,7 @@ impl Calibration {
             }
             return;
         }
+        self.last_serving = false;
         if self.last_reading.is_some_and(|prior| now < prior) {
             self.invalidate();
             self.last_reading = Some(now);
@@ -856,20 +903,25 @@ mod response_header_tests {
             );
         }
         let now = start + time::Duration::hours(2);
+        // The order the proxy runs a request in: take its in-flight guard, read the
+        // response headers while it is held, then record its usage at the body's end
+        // (here in the same millisecond, the tightest case) and release the guard. Each
+        // reading therefore brackets every request before its own.
         for (idx, provider) in Provider::ALL.into_iter().enumerate() {
-            manager.update_quota_at(
-                idx,
-                &headers(provider, 10, start.unix_timestamp()),
-                200,
-                now,
-            );
-            for step in 1..=24 {
+            for step in 0..=24 {
                 let at = now + time::Duration::seconds(step * 2);
+                let flight = manager.enter_in_flight_at(idx, at);
+                manager.update_quota_serving_at(
+                    &flight,
+                    &headers(provider, 10 + step as u64, start.unix_timestamp()),
+                    200,
+                    at,
+                );
                 let (input, output) = if step % 2 == 0 { (100, 0) } else { (0, 25) };
                 manager.record_usage(
                     idx,
                     crate::usage::UsageRecord::from_quota_input(
-                        (at.unix_timestamp_nanos() / 1_000_000) as i64 - 1,
+                        (at.unix_timestamp_nanos() / 1_000_000) as i64,
                         Some(models[idx].into()),
                         None,
                         input,
@@ -879,12 +931,7 @@ mod response_header_tests {
                         output,
                     ),
                 );
-                manager.update_quota_at(
-                    idx,
-                    &headers(provider, 10 + step as u64, start.unix_timestamp()),
-                    200,
-                    at,
-                );
+                drop(flight);
             }
         }
         let at = now + time::Duration::seconds(50);
@@ -900,10 +947,12 @@ mod response_header_tests {
                 .all(|p| p["calibrated"] == true),
             "response-header ticks must calibrate every reported window"
         );
+        // A reading on one request while ANOTHER request on the account is open.
+        let other = manager.enter_in_flight_at(0, at);
         let flight = manager.enter_in_flight_at(0, at);
-        manager.update_quota_at(
-            0,
-            &headers(Provider::Anthropic, 34, start.unix_timestamp()),
+        manager.update_quota_serving_at(
+            &flight,
+            &headers(Provider::Anthropic, 35, start.unix_timestamp()),
             200,
             at,
         );
@@ -916,6 +965,7 @@ mod response_header_tests {
             "unfinished requests cannot bracket exact vectors"
         );
         drop(flight);
+        drop(other);
         let mut incomplete = headers(Provider::Codex, 34, start.unix_timestamp());
         incomplete.remove("x-codex-primary-reset-at");
         manager.update_quota_at(1, &incomplete, 200, at);
@@ -1065,6 +1115,8 @@ mod record_clock_tests {
         // A walk that steps forward by 0.7 to 90 minutes, and every seventh record
         // reaches 10 minutes to 40 days back.
         let mut ts = start;
+        // The largest hours, minutes and covered map each provider reached.
+        let mut most = [[0_usize; 3]; 2];
         for i in 0..4_000_i64 {
             ts += [42_000, 61_000, 3_600_000, 5_400_000][(i % 4) as usize];
             let at = if i % 7 == 0 {
@@ -1097,20 +1149,29 @@ mod record_clock_tests {
             history.record(&record);
             reference.record(&record);
             every_record(&mut reference);
-            for (ours, theirs) in history.providers.iter().zip(&reference.providers) {
+            for (slot, (ours, theirs)) in history
+                .providers
+                .iter()
+                .zip(&reference.providers)
+                .enumerate()
+            {
                 assert_eq!(ours.hours, theirs.hours, "hours after record {i}");
                 assert_eq!(ours.minutes, theirs.minutes, "minutes after record {i}");
                 assert_eq!(ours.covered, theirs.covered, "covered after record {i}");
                 assert_eq!(ours.first, theirs.first, "first after record {i}");
+                let seen = &mut most[slot];
+                *seen = [
+                    seen[0].max(ours.hours.len()),
+                    seen[1].max(ours.minutes.len()),
+                    seen[2].max(ours.covered.len()),
+                ];
             }
             assert_eq!(history.partial, reference.partial);
         }
         assert!(
-            history
-                .providers
-                .iter()
-                .all(|p| !p.minutes.is_empty() && !p.covered.is_empty() && p.hours.len() > 100),
-            "the walk must exercise every map"
+            most.iter()
+                .all(|[hours, minutes, covered]| *hours > 100 && *minutes > 0 && *covered > 24),
+            "the walk must exercise every map of both providers: {most:?}"
         );
     }
 }
