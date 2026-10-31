@@ -216,6 +216,13 @@ final class FleetViewCodexWiringTests: XCTestCase {
             "the running ring's help names the Bash tool's 600 s over a codex call's own timeout")
     }
 
+    func testResetRequiresConfirmation() throws {
+        let source = try source(fleetView)
+        XCTAssertTrue(
+            source.contains("Button(\"Redeem reset\")"),
+            "the account menu must offer reset redemption")
+    }
+
     // MARK: - Source helpers
 
     private func repoRoot() -> URL {

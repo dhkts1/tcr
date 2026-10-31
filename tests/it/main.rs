@@ -44,6 +44,8 @@ mod codex_cli_login;
 mod codex_e2e;
 #[path = "../codex_import.rs"]
 mod codex_import;
+#[path = "../codex_reset.rs"]
+mod codex_reset;
 #[path = "../codex_run.rs"]
 mod codex_run;
 #[path = "../config_show.rs"]

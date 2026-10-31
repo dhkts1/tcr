@@ -31,6 +31,21 @@ final class CodexCardFactsTests: XCTestCase {
         XCTAssertTrue(help.contains("auth.json"))
     }
 
+    func testResetCountIsKnownOrUnavailableAndOnlyForCodex() throws {
+        for count in [0, 1, 3] {
+            let account = try canonical(
+                "bob@example.com/codex", ["resetCredits": ["availableCount": count]])
+            XCTAssertEqual(CodexCardFacts.resetText(account), "Resets: \(count)")
+            XCTAssertEqual(CodexCardFacts.canRedeemReset(account), count > 0)
+        }
+        let unknown = try canonical("bob@example.com/codex")
+        XCTAssertEqual(CodexCardFacts.resetText(unknown), "Resets: unavailable")
+        XCTAssertFalse(CodexCardFacts.canRedeemReset(unknown))
+        let other = try canonical("alice@example.com", ["resetCredits": ["availableCount": 3]])
+        XCTAssertNil(CodexCardFacts.resetText(other))
+        XCTAssertFalse(CodexCardFacts.canRedeemReset(other))
+    }
+
     // MARK: - Which windows draw a row
 
     func testOnlyReportedWindowsAreDrawn() throws {

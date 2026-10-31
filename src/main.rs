@@ -81,6 +81,8 @@ enum Command {
     Mint(MintArgs),
     /// List the configured accounts (offline; `--probe` refreshes live quota).
     Accounts(AccountsArgs),
+    /// Redeem banked resets through the running proxy.
+    Codex(CodexArgs),
     /// Remove an account from the config.
     Remove(RemoveArgs),
     /// Set an account's rotation priority (lower value = preferred).
@@ -1536,6 +1538,30 @@ struct SessionsArgs {
     json: bool,
 }
 
+/// Commands for banked resets on the running proxy.
+#[derive(clap::Args)]
+struct CodexArgs {
+    #[command(subcommand)]
+    command: CodexCommand,
+}
+
+#[derive(Subcommand)]
+enum CodexCommand {
+    /// Redeem one reset for the named account, after confirmation.
+    Reset {
+        account: String,
+        #[command(flatten)]
+        config: ConfigFile,
+        /// Reuse one attempt across retries; never printed.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Skip the questions, for a caller that already asked: redeem without
+        /// reading input, and end on an unknown outcome instead of offering a retry.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 /// `tcr routing --json`. `--json` is required: there is no text form a launcher could
 /// mistake for the document.
 #[derive(clap::Args)]
@@ -1845,6 +1871,20 @@ async fn run_main() -> anyhow::Result<()> {
         Some(Command::Status(args)) => run_status(args).await,
         Some(Command::Sessions(args)) => run_sessions(args).await,
         Some(Command::Routing(args)) => run_routing(args).await,
+        Some(Command::Codex(args)) => {
+            let CodexCommand::Reset {
+                account,
+                config,
+                idempotency_key,
+                yes,
+            } = args.command;
+            let code =
+                cli::codex_reset(&config.path(), &account, idempotency_key.as_deref(), yes).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Some(Command::List(args)) => run_list(args).await,
         Some(Command::Wrap(args)) => run_wrap(args),
         Some(Command::Update(args)) => update::run_update(args.force),

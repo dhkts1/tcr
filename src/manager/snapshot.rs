@@ -444,6 +444,7 @@ fn codex_snapshot_facts(a: &AccountRuntime) -> crate::stats::CodexFacts {
         limit_reached_type: a.quota.codex_limit_reached_type().map(str::to_string),
         spend_control_reached: a.quota.codex.spend_control_reached,
         credits: a.quota.codex.credits.clone(),
+        reset_credits: a.quota.codex.reset_credits.clone(),
         login_error: a.login_error.clone(),
         codex_home: a.codex_home.clone(),
         token_sync_pending: a.pending_codex_writeback.is_some(),
@@ -453,6 +454,35 @@ fn codex_snapshot_facts(a: &AccountRuntime) -> crate::stats::CodexFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_summary_reaches_status() {
+        let mut account = runtime(
+            r#"{"name":"bob@example.com/codex","provider":"codex","accessToken":"fake-key"}"#,
+        );
+        account
+            .quota
+            .apply_usage(&crate::codex_probe::usage_from_payload(
+                &serde_json::json!({
+                    "rate_limit": null,
+                    "rate_limit_reset_credits": {"available_count": 3}
+                }),
+            ));
+        let manager = Manager::from_runtimes(vec![account]);
+        let status = crate::status::StatusPayload::from_snapshot(
+            &manager.snapshot(OffsetDateTime::now_utc()),
+            &[],
+            false,
+            None,
+            Default::default(),
+        );
+        let wire = serde_json::to_value(status).unwrap();
+        assert_eq!(
+            wire["accounts"][0]["resetCredits"]["availableCount"],
+            serde_json::json!(3),
+            "reset count must reach the status wire"
+        );
+    }
 
     fn runtime(account: &str) -> AccountRuntime {
         AccountRuntime::from_config(&serde_json::from_str(account).expect("an account"), false)

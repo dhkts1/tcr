@@ -118,6 +118,7 @@ struct FleetView: View {
     /// controllers would be two reads of one file at two instants, which is
     /// the disagreement `PeersSnapshot`'s own header exists to prevent.
     @StateObject private var peers = PeerController()
+    @StateObject private var resets = CodexResetController()
 
     /// Surfaced in place rather than swallowed: a button that silently does
     /// nothing is worse than one that says why.
@@ -1087,6 +1088,7 @@ struct FleetView: View {
             account: account,
             countersAreStructural: fleet.source.countersAreStructural,
             accounts: accounts,
+            resets: resets,
             control: control,
             onChanged: { await poller.pollOnce() },
             onRelogin: { reloginAccount(account) },
@@ -3776,6 +3778,7 @@ struct FleetView: View {
             account: account,
             countersAreStructural: fleet.source.countersAreStructural,
             accounts: accounts,
+            resets: resets,
             control: control,
             onChanged: { await poller.pollOnce() },
             onRelogin: { reloginAccount(account) },
@@ -4802,6 +4805,7 @@ struct AccountRow: View {
     let account: Account
     let countersAreStructural: Bool
     @ObservedObject var accounts: AccountController
+    @ObservedObject var resets: CodexResetController
     /// The identity-bound control account. See ``ControlAccountController``.
     @ObservedObject var control: ControlAccountController
     /// Called after a successful toggle so the row re-reads reality. It returns
@@ -5591,6 +5595,10 @@ struct AccountRow: View {
                         : "Shows this account's card in the list all the time, on this Mac.")
             Divider()
         }
+        if CodexCardFacts.canRedeemReset(account) {
+            Button("Redeem reset") { confirmRedeemReset() }
+                .disabled(resets.isPending(account.ref))
+        }
         if actions.contains(.toggleEnabled) {
             Button(enabling ? "Enable" : "Disable") {
                 Task { await performToggle(enabling: enabling) }
@@ -5914,6 +5922,47 @@ struct AccountRow: View {
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         Task { await groupController.removeAll(group: group) }
+    }
+
+    private func confirmRedeemReset() {
+        guard !resets.isPending(account.ref) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Redeem reset"
+        alert.informativeText =
+            "Redeem one reset for \(account.name)? This spends one banked reset."
+        let redeem = alert.addButton(withTitle: "Redeem")
+        redeem.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        alert.window.defaultButtonCell = nil
+        alert.buttons.last?.keyEquivalent = "\r"
+        redeem.keyEquivalent = ""
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        performReset(retrying: false)
+    }
+
+    private func performReset(retrying: Bool) {
+        Task {
+            let attempt = retrying
+                ? await resets.retry(account: account.ref)
+                : await resets.redeem(account: account.ref, confirmed: true)
+            guard case .finished(let outcome) = attempt else { return }
+            // Read status even for a qualified or unknown result. Never adjust the
+            // displayed count ourselves: only the poller's measured row supplies it.
+            _ = await onChanged()
+            let alert = NSAlert()
+            alert.messageText = "Redeem reset"
+            alert.informativeText = outcome.text
+            if outcome.exitCode != 0 {
+                alert.addButton(withTitle: "Retry").keyEquivalent = ""
+            }
+            alert.addButton(withTitle: "Cancel")
+            alert.window.defaultButtonCell = nil
+            alert.buttons.last?.keyEquivalent = "\r"
+            let response = alert.runModal()
+            if outcome.exitCode != 0, response == .alertFirstButtonReturn {
+                performReset(retrying: true)
+            }
+        }
     }
 
     /// Confirms before ``RemoveAccountController/remove(account:org:)`` — same

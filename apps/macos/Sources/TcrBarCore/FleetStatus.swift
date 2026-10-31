@@ -366,6 +366,17 @@ public enum QuotaWindowKind: String, Equatable, Sendable {
     }
 }
 
+/// Banked resets, without credit identities. Nil is unknown, zero is a reported count.
+public struct ResetCredits: Equatable, Sendable, Decodable {
+    public let availableCount: UInt64
+    public let earliestExpiryMs: Int64?
+
+    public init(availableCount: UInt64, earliestExpiryMs: Int64? = nil) {
+        self.availableCount = availableCount
+        self.earliestExpiryMs = earliestExpiryMs
+    }
+}
+
 /// A Codex account's ChatGPT credits, as the server last read them.
 public struct CodexCredits: Equatable, Sendable, Decodable {
     public let hasCredits: Bool
@@ -1969,6 +1980,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let spendControlReached: Bool
     /// The account's ChatGPT credits, once they were reported.
     public let credits: CodexCredits?
+    public let resetCredits: ResetCredits?
     /// The refresh error that signed this account out, verbatim. An absent
     /// reason is never drawn.
     public let loginError: String?
@@ -2040,6 +2052,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         limitReachedType: String? = nil,
         spendControlReached: Bool = false,
         credits: CodexCredits? = nil,
+        resetCredits: ResetCredits? = nil,
         loginError: String? = nil,
         codexHome: String? = nil,
         tokenSyncPending: Bool = false,
@@ -2095,6 +2108,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.limitReachedType = limitReachedType
         self.spendControlReached = spendControlReached
         self.credits = credits
+        self.resetCredits = resetCredits
         self.loginError = loginError
         self.codexHome = codexHome
         self.tokenSyncPending = tokenSyncPending
@@ -2112,6 +2126,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         case plan, organizationType, rateLimitTier, seatTier, orgUuid, orgName, gate, freeAtMs
         case provider, quotaWindows, fiveHourWindowMinutes, sevenDayWindowMinutes
         case limitReachedType, spendControlReached, credits, loginError, codexHome, tokenSyncPending
+        case resetCredits
         case codexRoute, codexTraffic
     }
 
@@ -2181,6 +2196,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         spendControlReached =
             try c.decodeIfPresent(Bool.self, forKey: .spendControlReached) ?? false
         credits = try c.decodeIfPresent(CodexCredits.self, forKey: .credits)
+        resetCredits = try c.decodeIfPresent(ResetCredits.self, forKey: .resetCredits)
         loginError = try c.decodeIfPresent(String.self, forKey: .loginError)
         codexHome = try c.decodeIfPresent(String.self, forKey: .codexHome)
         tokenSyncPending = try c.decodeIfPresent(Bool.self, forKey: .tokenSyncPending) ?? false

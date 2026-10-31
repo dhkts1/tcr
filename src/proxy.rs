@@ -1118,6 +1118,11 @@ pub const PRIORITY_ENDPOINT: &str = "accounts-priority";
 /// requirement.
 pub const CONFIG_PATH: &str = "/_tcr/config";
 
+/// Confirmed redemption of one banked reset for a listed account.
+pub const CODEX_RESET_PATH: &str = "/_tcr/codex/reset";
+/// The discriminator shared by the local route and its CLI caller.
+pub const CODEX_RESET_ENDPOINT: &str = "codex-reset";
+
 /// The [`ENDPOINT_HEADER`] value both halves of [`CONFIG_PATH`] stamp.
 pub const CONFIG_ENDPOINT: &str = "config";
 
@@ -1708,6 +1713,11 @@ pub fn app(manager: Arc<Manager>) -> Router {
                 .fallback(|| async { method_not_allowed(&CONFIG_ROUTE) }),
         )
         .route(
+            CODEX_RESET_PATH,
+            axum::routing::post(codex_reset_handler)
+                .fallback(|| async { reset_no_store(method_not_allowed(&CODEX_RESET_ROUTE)) }),
+        )
+        .route(
             FAN_PATH,
             axum::routing::post(fan_handler).fallback(|| async { method_not_allowed(&FAN_ROUTE) }),
         )
@@ -2050,6 +2060,76 @@ struct LocalRoute {
     verbs: &'static str,
     /// Whether every stamped answer also carries [`PROVIDERS_HEADER`].
     advertises_providers: bool,
+}
+
+const CODEX_RESET_ROUTE: LocalRoute = LocalRoute {
+    name: "codex reset",
+    stamp: CODEX_RESET_ENDPOINT,
+    verbs: "POST",
+    advertises_providers: false,
+};
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CodexResetRequest {
+    query: String,
+    idempotency_key: String,
+}
+
+fn reset_no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn codex_reset_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
+    let response = match read_command::<CodexResetRequest>(
+        &CODEX_RESET_ROUTE,
+        &manager,
+        req,
+        "Expected query and a valid idempotencyKey, and no other fields.",
+    )
+    .await
+    {
+        Err(response) => *response,
+        Ok(parsed)
+            if parsed.query.is_empty()
+                || !crate::manager::valid_reset_key(&parsed.idempotency_key) =>
+        {
+            route_error(
+                &CODEX_RESET_ROUTE,
+                StatusCode::BAD_REQUEST,
+                ErrorKind::InvalidRequest,
+                "Expected query and a valid idempotencyKey, and no other fields.",
+            )
+        }
+        Ok(parsed) => match manager
+            .reset_codex(&parsed.query, &parsed.idempotency_key)
+            .await
+        {
+            Ok(result) => json_ok(&CODEX_RESET_ROUTE, &result),
+            Err(error) => {
+                use crate::manager::CodexResetError;
+                let status = match error {
+                    CodexResetError::Missing => StatusCode::NOT_FOUND,
+                    CodexResetError::Ambiguous | CodexResetError::Unavailable => {
+                        StatusCode::CONFLICT
+                    }
+                    CodexResetError::WrongProvider => StatusCode::BAD_REQUEST,
+                    CodexResetError::Failed => StatusCode::BAD_GATEWAY,
+                    CodexResetError::Unknown => StatusCode::GATEWAY_TIMEOUT,
+                };
+                route_error(
+                    &CODEX_RESET_ROUTE,
+                    status,
+                    ErrorKind::InvalidRequest,
+                    error.message(),
+                )
+            }
+        },
+    };
+    reset_no_store(response)
 }
 
 const DISABLED_ROUTE: LocalRoute = LocalRoute {
@@ -14890,6 +14970,249 @@ mod tests {
         app(manager).oneshot(req).await.expect("router response")
     }
 
+    #[tokio::test]
+    async fn reset_route_is_local_and_applies() {
+        let origin = stub::http(Router::new().fallback(|| async {
+            axum::Json(serde_json::json!({"code":"reset","windows_reset":1}))
+        }));
+        let manager = Manager::with_live_refresher(codex_fleet(&origin.url(), &origin.url()), None);
+        let response = drive_full(
+            manager,
+            Method::POST,
+            "/_tcr/codex/reset",
+            Some(loopback_peer()),
+            &[("content-type", "application/json")],
+            r#"{"query":"bob@example.com/codex","idempotencyKey":"synthetic-attempt"}"#,
+        )
+        .await;
+        assert_eq!(
+            response
+                .headers()
+                .get(ENDPOINT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("codex-reset"),
+            "reset must be answered by its local route"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_route_refuses_every_gate_method_and_body_violation() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let origin = stub::http(Router::new().fallback(move || {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                axum::Json(serde_json::json!({"code":"reset","windows_reset":1}))
+            }
+        }));
+        let mut config = codex_fleet(&origin.url(), &origin.url());
+        config.proxy.api_key = Some("fake-local-key".into());
+        let manager = Manager::with_live_refresher(config, None);
+        let good = r#"{"query":"bob@example.com/codex","idempotencyKey":"synthetic-attempt"}"#;
+        let json = [
+            ("content-type", "application/json"),
+            ("x-api-key", "fake-local-key"),
+        ];
+        for (peer, headers, status) in [
+            (None, json.to_vec(), StatusCode::FORBIDDEN),
+            (
+                Some("192.0.2.1:1234".parse().unwrap()),
+                json.to_vec(),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Some(loopback_peer()),
+                vec![("content-type", "application/json")],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some(loopback_peer()),
+                vec![("content-type", "application/json"), ("x-api-key", "wrong")],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some(loopback_peer()),
+                vec![
+                    ("content-type", "application/json"),
+                    ("x-api-key", "fake-local-key"),
+                    ("host", "evil.example"),
+                ],
+                StatusCode::MISDIRECTED_REQUEST,
+            ),
+            (
+                Some(loopback_peer()),
+                vec![
+                    ("content-type", "application/json"),
+                    ("x-api-key", "fake-local-key"),
+                    ("origin", "https://evil.example"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Some(loopback_peer()),
+                vec![
+                    ("content-type", "application/json"),
+                    ("x-api-key", "fake-local-key"),
+                    ("sec-fetch-site", "cross-site"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let response = drive_full(
+                Arc::clone(&manager),
+                Method::POST,
+                CODEX_RESET_PATH,
+                peer,
+                &headers,
+                good,
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                status,
+                "reset must retain every local endpoint gate"
+            );
+        }
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ] {
+            let response = drive_full(
+                Arc::clone(&manager),
+                method,
+                CODEX_RESET_PATH,
+                Some(loopback_peer()),
+                &json,
+                good,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(
+                response.headers().get(ENDPOINT_HEADER).unwrap(),
+                "codex-reset"
+            );
+            assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        }
+        for content_type in [
+            None,
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+        ] {
+            let mut headers = vec![("x-api-key", "fake-local-key")];
+            if let Some(value) = content_type {
+                headers.push(("content-type", value));
+            }
+            let response = drive_full(
+                Arc::clone(&manager),
+                Method::POST,
+                CODEX_RESET_PATH,
+                Some(loopback_peer()),
+                &headers,
+                good,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+        for body in ["null".to_string(),"[]".into(),"{}".into(),"false".into(),"not json".into(),
+            r#"["bob@example.com/codex","synthetic-attempt"]"#.into(),
+            r#"{"query":1,"idempotencyKey":"synthetic-attempt"}"#.into(),
+            r#"{"query":"bob@example.com/codex","idempotencyKey":null}"#.into(),
+            r#"{"query":"bob@example.com/codex","idempotencyKey":"","creditId":"fake-secret-sentinel"}"#.into(),
+            r#"{"query":"bob@example.com/codex","idempotencyKey":"synthetic-attempt","extra":true}"#.into(),
+            serde_json::json!({"query":"bob@example.com/codex","idempotencyKey":"a".repeat(129)}).to_string(),
+            serde_json::json!({"query":"bob@example.com/codex","idempotencyKey":"bad key"}).to_string(),
+            serde_json::json!({"query":"bob@example.com/codex","idempotencyKey":"ñ"}).to_string(),
+            serde_json::json!({"query":"bob@example.com/codex","idempotencyKey":"a".repeat(9000)}).to_string(),
+        ] {
+            let response=drive_full(Arc::clone(&manager),Method::POST,CODEX_RESET_PATH,Some(loopback_peer()),&json,&body).await;
+            assert_eq!(response.status(),StatusCode::BAD_REQUEST);
+            let body=to_bytes(response.into_body(),MAX_BODY_BYTES).await.unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains("fake-secret-sentinel"));
+        }
+        for invalid in [
+            Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(12),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(""),
+        ] {
+            for field in ["query", "idempotencyKey"] {
+                let mut body: Value = serde_json::from_str(good).unwrap();
+                body[field] = invalid.clone();
+                assert_eq!(
+                    drive_full(
+                        Arc::clone(&manager),
+                        Method::POST,
+                        CODEX_RESET_PATH,
+                        Some(loopback_peer()),
+                        &json,
+                        &body.to_string()
+                    )
+                    .await
+                    .status(),
+                    StatusCode::BAD_REQUEST
+                );
+            }
+        }
+        for (query, status) in [
+            ("bob", StatusCode::NOT_FOUND),
+            ("alice@example.com", StatusCode::BAD_REQUEST),
+        ] {
+            let body =
+                serde_json::json!({"query":query,"idempotencyKey":"synthetic-attempt"}).to_string();
+            assert_eq!(
+                drive_full(
+                    Arc::clone(&manager),
+                    Method::POST,
+                    CODEX_RESET_PATH,
+                    Some(loopback_peer()),
+                    &json,
+                    &body
+                )
+                .await
+                .status(),
+                status
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "refusals must not reach any backend"
+        );
+        let response = drive_full(
+            manager,
+            Method::POST,
+            CODEX_RESET_PATH,
+            Some(loopback_peer()),
+            &json,
+            good,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(ENDPOINT_HEADER).unwrap(),
+            "codex-reset"
+        );
+        let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            serde_json::json!({"outcome":"applied","usageRefreshed":true})
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "positive control: consume then usage"
+        );
+    }
+
     /// [`drive_full`] reduced to the status and body most tests assert on.
     async fn drive(
         manager: Arc<Manager>,
@@ -26510,7 +26833,23 @@ mod forecast_routing_tests {
         let names: Vec<_> = providers.iter().map(|p| p["provider"].as_str()).collect();
         assert_eq!(names, [Some("anthropic"), Some("codex")]);
         for provider in providers {
-            assert_eq!(keys(provider), ["lastError", "models", "provider", "state"]);
+            if provider["provider"] == "codex" {
+                assert_eq!(
+                    keys(provider),
+                    [
+                        "lastError",
+                        "models",
+                        "provider",
+                        "resetCreditsAvailable",
+                        "state"
+                    ],
+                    "the `codex` provider must carry resetCreditsAvailable"
+                );
+                assert!(provider["resetCreditsAvailable"].as_u64().is_some());
+                assert_eq!(provider["resetCreditsAvailable"], 0);
+            } else {
+                assert_eq!(keys(provider), ["lastError", "models", "provider", "state"]);
+            }
             assert!(
                 matches!(provider["state"].as_str(), Some("ok" | "degraded" | "out")),
                 "{provider}"

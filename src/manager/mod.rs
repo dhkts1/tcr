@@ -63,8 +63,10 @@ mod peer_lend;
 // private, so this re-export is the whole of its surface beyond the methods on
 // `Manager`.
 pub use peer_lend::HandedCredential;
+mod codex_reset;
 mod pins;
 mod probing;
+pub use codex_reset::{CodexResetError, CodexResetOutcome, CodexResetResponse, valid_reset_key};
 mod refresh;
 mod select;
 mod snapshot;
@@ -1143,6 +1145,9 @@ pub struct Manager {
     /// way": the refresh then runs inline, exactly as it did before.
     me: std::sync::OnceLock<std::sync::Weak<Self>>,
     accounts: RwLock<Vec<AccountRuntime>>,
+    /// Lazily allocated gates for append-only account slots. The registry lock
+    /// is released before awaiting a gate; unrelated accounts never queue together.
+    usage_gates: Mutex<HashMap<usize, Arc<AsyncMutex<()>>>>,
     refresher: Arc<dyn TokenRefresher>,
     /// Reads each account's quota from the zero-spend usage endpoint on a timer.
     prober: Arc<dyn UsageProber>,
@@ -1745,6 +1750,7 @@ impl Manager {
             config_write: Arc::new(Mutex::new(())),
             config_path,
             mutation_released: AtomicBool::new(false),
+            usage_gates: Mutex::new(HashMap::new()),
             wake: crate::wake::WakeDetector::new(),
             upstream,
             codex_upstream,

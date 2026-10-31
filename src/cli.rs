@@ -1946,6 +1946,162 @@ struct ControlRoute {
     success_needs_stamp: bool,
 }
 
+const CODEX_RESET_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::CODEX_RESET_PATH,
+    endpoint: crate::proxy::CODEX_RESET_ENDPOINT,
+    refusals: &[400, 404, 409, 502, 504],
+    noun: "reset",
+    success_needs_stamp: true,
+};
+
+/// Confirm once, then keep one private key for every explicit retry of this attempt.
+/// Reads only the configured local proxy; no offline redemption or config write.
+///
+/// The questions go to stderr and only outcome words to stdout, so a caller that
+/// shows stdout shows the result and never a question. `assume_yes` is for a
+/// caller that already asked (TcrBar's own dialog): it asks nothing, reads no
+/// input, and an unknown outcome ends the run instead of offering a retry.
+pub async fn codex_reset(
+    config_path: &Path,
+    account: &str,
+    key: Option<&str>,
+    assume_yes: bool,
+) -> anyhow::Result<i32> {
+    codex_reset_with_io(
+        config_path,
+        account,
+        key,
+        assume_yes,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
+    .await
+}
+
+async fn codex_reset_with_io(
+    config_path: &Path,
+    account: &str,
+    key: Option<&str>,
+    assume_yes: bool,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+    errors: &mut impl std::io::Write,
+) -> anyhow::Result<i32> {
+    let confirmed = if assume_yes {
+        true
+    } else {
+        let Ok(confirmed) = reset_consent(
+            input,
+            errors,
+            &format!("Redeem one reset for {account}? [y/N]"),
+        ) else {
+            writeln!(errors, "Reset failed. Could not read confirmation.")?;
+            return Ok(4);
+        };
+        confirmed
+    };
+    if !confirmed {
+        writeln!(output, "Cancelled.")?;
+        return Ok(0);
+    }
+    let key = match key {
+        Some(key) => key.to_owned(),
+        None => {
+            if let Ok(key) = crate::request_key::generate() {
+                key
+            } else {
+                writeln!(errors, "Reset failed. Could not create an attempt.")?;
+                return Ok(4);
+            }
+        }
+    };
+    if !crate::manager::valid_reset_key(&key) {
+        writeln!(errors, "Reset failed. Invalid attempt key.")?;
+        return Ok(4);
+    }
+    let Ok(config) = config::load(config_path) else {
+        writeln!(
+            errors,
+            "Reset failed. Could not read the proxy configuration."
+        )?;
+        return Ok(4);
+    };
+    loop {
+        let answer: RouteAnswer<crate::manager::CodexResetResponse> = call_route_with_policy(
+            &config,
+            &CODEX_RESET_ROUTE,
+            reqwest::redirect::Policy::none(),
+            |client, url| {
+                client
+                    .post(url)
+                    .timeout(Duration::from_secs(95))
+                    .json(&serde_json::json!({"query":account,"idempotencyKey":key}))
+            },
+        )
+        .await;
+        match answer.result {
+            Ok(response) => {
+                writeln!(output, "{}", response.outcome.message())?;
+                if !response.usage_refreshed {
+                    writeln!(errors, "Usage refresh failed.")?;
+                    return Ok(5);
+                }
+                return Ok(
+                    if response.outcome == crate::manager::CodexResetOutcome::NoCredit {
+                        6
+                    } else {
+                        0
+                    },
+                );
+            }
+            Err(LiveControlError::NoServer) => {
+                writeln!(errors, "No running proxy.")?;
+                return Ok(3);
+            }
+            Err(error) => {
+                let unknown = answer.status == Some(504)
+                    || matches!(
+                        error,
+                        LiveControlError::NoAnswer(_) | LiveControlError::Unusable(_)
+                    );
+                if unknown {
+                    writeln!(errors, "Reset outcome unknown.")?;
+                    // A caller that passed --yes asks its own question: TcrBar shows
+                    // Retry and reruns with the same key.
+                    if assume_yes {
+                        return Ok(4);
+                    }
+                    let Ok(retry) = reset_consent(input, errors, "Retry this reset attempt? [y/N]")
+                    else {
+                        writeln!(errors, "Reset failed. Could not read confirmation.")?;
+                        return Ok(4);
+                    };
+                    if retry {
+                        continue;
+                    }
+                } else {
+                    writeln!(errors, "Reset failed. The proxy refused the reset request.")?;
+                }
+                return Ok(4);
+            }
+        }
+    }
+}
+
+/// Asks on `prompt_to`, which is stderr: stdout carries only outcome words.
+fn reset_consent(
+    input: &mut impl std::io::BufRead,
+    prompt_to: &mut impl std::io::Write,
+    prompt: &str,
+) -> std::io::Result<bool> {
+    writeln!(prompt_to, "{prompt}")?;
+    prompt_to.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes"))
+}
+
 const DISABLED_ROUTE: ControlRoute = ControlRoute {
     path: crate::proxy::DISABLED_PATH,
     endpoint: crate::proxy::DISABLED_ENDPOINT,
@@ -1996,6 +2152,7 @@ const CONFIG_ROUTE: ControlRoute = ControlRoute {
 struct RouteAnswer<T> {
     result: Result<T, LiveControlError>,
     stamped: Option<reqwest::header::HeaderMap>,
+    status: Option<u16>,
 }
 
 /// Send one request to `route` and sort the answer.
@@ -2012,15 +2169,27 @@ async fn call_route<T: serde::de::DeserializeOwned>(
     route: &ControlRoute,
     build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
 ) -> RouteAnswer<T> {
-    let response = match send_loopback(config, route.path, build).await {
-        Ok(response) => response,
-        Err(unreached) => {
-            return RouteAnswer {
-                result: Err(unreached.into()),
-                stamped: None,
-            };
-        }
-    };
+    call_route_with_policy(config, route, reqwest::redirect::Policy::default(), build).await
+}
+
+/// One response classifier; callers choose redirect policy without duplicating transport.
+async fn call_route_with_policy<T: serde::de::DeserializeOwned>(
+    config: &Config,
+    route: &ControlRoute,
+    redirects: reqwest::redirect::Policy,
+    build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> RouteAnswer<T> {
+    let response =
+        match send_loopback_with_redirect_policy(config, route.path, redirects, build).await {
+            Ok(response) => response,
+            Err(unreached) => {
+                return RouteAnswer {
+                    result: Err(unreached.into()),
+                    stamped: None,
+                    status: None,
+                };
+            }
+        };
     let status = response.status();
     let from_route = response
         .headers()
@@ -2057,7 +2226,11 @@ async fn call_route<T: serde::de::DeserializeOwned>(
             message().map(|m| format!(": {m}")).unwrap_or_default()
         )))
     };
-    RouteAnswer { result, stamped }
+    RouteAnswer {
+        result,
+        stamped,
+        status: Some(status.as_u16()),
+    }
 }
 
 /// Ask the running proxy to park/unpark an account.
@@ -2824,6 +2997,12 @@ fn codex_tail(a: &AccountSnapshot) -> String {
         Provider::Codex => {}
     }
     let mut tail = String::new();
+    if let Some(resets) = &a.codex.reset_credits {
+        tail.push_str(&format!(" resets={}", resets.available_count));
+        if let Some(expiry) = resets.earliest_expiry_ms {
+            tail.push_str(&format!(" reset_expires_at_ms={expiry}"));
+        }
+    }
     if a.codex.token_sync_pending {
         tail.push_str(" token_sync=pending");
     }
@@ -3327,6 +3506,7 @@ fn account_status_rows_at(
                 limit_reached_type: facts.limit_reached_type,
                 spend_control_reached: facts.spend_control_reached,
                 credits: facts.credits,
+                reset_credits: facts.reset_credits,
                 login_error: facts.login_error,
                 codex_home: facts.codex_home,
                 token_sync_pending: facts.token_sync_pending,
@@ -10249,6 +10429,10 @@ mod tests {
         // The sample's one non-Anthropic row, so it pins both shapes of the
         // `provider` key: absent on the four rows above, `"codex"` here.
         accounts[4].provider = Provider::Codex;
+        accounts[4].codex.reset_credits = Some(tcr_status_wire::ResetCredits {
+            available_count: 3,
+            earliest_expiry_ms: Some(1_800_000_000_000),
+        });
 
         let thresholds = vec![0.9; accounts.len()];
         (
@@ -10851,7 +11035,7 @@ mod tests {
     const WEEK_MS: i64 = 7 * DAY_MS;
 
     /// The keys a Codex row may carry and an Anthropic row never does.
-    const CODEX_ROW_KEYS: [&str; 11] = [
+    const CODEX_ROW_KEYS: [&str; 12] = [
         "quotaWindows",
         "fiveHourWindowMinutes",
         "sevenDayWindowMinutes",
@@ -10861,9 +11045,43 @@ mod tests {
         "loginError",
         "codexHome",
         "tokenSyncPending",
+        "resetCredits",
         "codexRoute",
         "codexTraffic",
     ];
+
+    #[test]
+    fn reset_credits_reach_text_and_json_without_identities() {
+        let (mut snapshot, thresholds) = status_contract_snapshot();
+        let text = status_text_of(&snapshot, None, &pooled_route());
+        assert!(text.contains(" resets=3 reset_expires_at_ms=1800000000000"));
+        let wire: serde_json::Value =
+            serde_json::from_str(&status_json(&snapshot, &thresholds, StatusSource::Live)).unwrap();
+        assert_eq!(
+            wire[4]["resetCredits"],
+            serde_json::json!({
+                "availableCount": 3, "earliestExpiryMs": 1_800_000_000_000i64
+            })
+        );
+        assert!(wire[0].get("resetCredits").is_none());
+        snapshot.accounts[4].codex.reset_credits = Some(tcr_status_wire::ResetCredits {
+            available_count: 0,
+            earliest_expiry_ms: None,
+        });
+        assert!(codex_tail(&snapshot.accounts[4]).contains(" resets=0"));
+        assert!(!codex_tail(&snapshot.accounts[4]).contains("reset_expires_at_ms"));
+        snapshot.accounts[4].codex.reset_credits = None;
+        assert!(!codex_tail(&snapshot.accounts[4]).contains("resets="));
+        snapshot.accounts[0].codex.reset_credits = Some(tcr_status_wire::ResetCredits {
+            available_count: 9,
+            earliest_expiry_ms: None,
+        });
+        assert!(!codex_tail(&snapshot.accounts[0]).contains("resets="));
+        let wire: serde_json::Value =
+            serde_json::from_str(&status_json(&snapshot, &thresholds, StatusSource::Live)).unwrap();
+        assert!(wire[0].get("resetCredits").is_none());
+        assert!(wire[4].get("resetCredits").is_none());
+    }
 
     #[test]
     fn codex_pending_token_sync_has_a_text_status_hint() {
@@ -11830,6 +12048,10 @@ mod tests {
                 login_error: Some("refresh_token_reused".to_string()),
                 codex_home: Some("/Users/example/.codex".to_string()),
                 token_sync_pending: true,
+                reset_credits: Some(tcr_status_wire::ResetCredits {
+                    available_count: 3,
+                    earliest_expiry_ms: Some(1_800_000_000_000),
+                }),
             };
         }
         check("with every Codex fact set", render(&snapshot));

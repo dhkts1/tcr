@@ -158,6 +158,8 @@ five-hour one.
 `chatgpt-account-id`; it runs no inference. A Codex token is always refreshed against
 `https://auth.openai.com/oauth/token`, whatever `codexUpstream` says. Keep-warm never targets
 a Codex account: a warm is an Anthropic request.
+For `codex`, a positive reset count adds a read of
+`/backend-api/wham/rate-limit-reset-credits` for expiry details.
 
 **Usage and price.** A Codex turn's usage is read from its closing SSE event
 (`response.completed`, or `response.incomplete` when the backend cut it short) into the same
@@ -245,6 +247,8 @@ Between requests, a quota probe keeps the bars fresh: one plain `GET` per accoun
 Anthropic's OAuth usage endpoint, or for a Codex account against `/backend-api/wham/usage`
 (see [Codex requests](#codex-requests)). It issues no `/v1/messages` call, so it creates no
 messages.
+For `codex`, a positive reset count adds a read of reset-credit details
+for expiry (see [Requests for `codex`](#codex-requests)).
 
 **Each account is probed on its own randomly drawn schedule, not a fleet sweep.** Boot does
 one whole-fleet pass so the bars populate immediately, and from then on every account
@@ -443,3 +447,34 @@ application. Known older tokens and different accounts remain rejected. Signing 
 `codex login` in the shared folder revokes that login and can require tcr to sign in again.
 Uninstalling tcr leaves that auth
 file in place with its current login.
+
+```text
+Reset credits are read from the named account's usage summary.
+resetCredits is optional: availableCount is a nonnegative integer;
+earliestExpiryMs is optional and comes only from complete valid details.
+resetCreditsAvailable is the optional provider total; unknown is absent.
+`tcr codex reset <account>` uses the running proxy and asks for confirmation.
+The questions go to stderr; stdout carries only the outcome words below.
+Redeem one reset for {account}? [y/N]
+Retry this reset attempt? [y/N]
+--yes asks nothing and reads no input; an unknown outcome then ends the run.
+TcrBar runs it with --yes after its own dialog, and offers Retry itself.
+Applied.                         exit 0
+Nothing to reset.                exit 0
+No reset credit available.       exit 6
+Already redeemed.                exit 0
+Cancelled.                       exit 0, no request
+No running proxy.                exit 3
+Reset failed.                    exit 4, sanitized reason follows
+Reset outcome unknown.           exit 4, retry retains the attempt key
+Usage refresh failed.            exit 5, known consume outcome also printed
+Redeem reset
+Redeem one reset for {account}? This spends one banked reset.
+Cancel
+Redeem
+Retry
+--idempotency-key reuses one attempt across retries; it is never printed.
+Resets: {count}
+Resets: unavailable
+Only a confirmed operator action redeems; nothing redeems automatically.
+```
