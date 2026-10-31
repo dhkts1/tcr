@@ -267,15 +267,21 @@ fn gateway_that_corrupts(
 /// line is the whole record of a stream nobody may read, and it said only that
 /// the splice failed: not that the frames had stopped decrypting.
 ///
-/// Measured rather than assumed, and the first version of this test was wrong
-/// about it: a pump that dies takes the duplex with it, so the splice ends in
-/// an error too and the line is still "failed mid-stream". What the awaited
-/// `finish()` adds is the `pump_error` field beside it, which is the half no
-/// other reader has. Asserting only on the message would have passed without
-/// the fix.
+/// Measured rather than assumed, and the first two versions of this test were
+/// each wrong about it. Under tokio 1.53 a pump that dies takes the duplex with
+/// it, so the splice ends in an error too and the line is "failed mid-stream"
+/// with the pump's ending in its `pump_error` field. Under tokio 1.54 (its io
+/// changes keep the shutdown bit and flush on a stalled reader; which one
+/// matters here is not measured) the splice ends `Ok` after the local close,
+/// and the pump's ending is the `error` field of "the carry ended inside the
+/// peer stream". Both lines carry what the awaited `finish()` adds, which is
+/// the half no other reader has, so the gate accepts either and pins the
+/// field each line owns. Asserting only on the message would have passed
+/// without the fix.
 ///
 /// Watch it fail by dropping the `finish()` await in
-/// `egress::accept_once_splice`: the line stays, and `pump_error` is empty.
+/// `egress::accept_once_splice`: the line stays, and the pump's field is
+/// empty.
 #[tokio::test]
 async fn a_carry_that_died_inside_the_peer_stream_is_not_logged_as_carried() {
     let (collector, _guard) = capture();
@@ -354,15 +360,23 @@ async fn a_carry_that_died_inside_the_peer_stream_is_not_logged_as_carried() {
         ending.message, "peer egress: carried",
         "a carry whose frames stopped decrypting is not a carry: {ending:?}"
     );
+    // Which field holds the pump's ending depends on how the splice ended
+    // (see the doc-comment): `pump_error` beside a splice error, `error` when
+    // the splice itself was clean and the pump is the only thing that died.
+    let field = if ending.message.contains("the carry failed mid-stream") {
+        "pump_error"
+    } else {
+        "error"
+    };
     let pump = ending
         .fields
-        .get("pump_error")
+        .get(field)
         .map(|value| value.trim_matches('"').to_string())
         .unwrap_or_default();
     assert!(
-        !pump.is_empty(),
-        "the line carries the pump's own ending, which is the only place a frame that \
-         failed to decrypt is visible at all: {ending:?}"
+        pump.contains("did not decrypt"),
+        "the line carries the pump's own ending in `{field}`, which is the only place a \
+         frame that failed to decrypt is visible at all: {ending:?}"
     );
 }
 
