@@ -9,7 +9,16 @@ use crate::{provider::Provider, usage::UsageRecord};
 
 const HOUR_MS: i64 = 3_600_000;
 const HISTORY_HOURS: i64 = 672;
+/// Caps both a window's fit samples and an account's records pending a reading.
+///
+/// Not justified by a measurement, and the one taken argues for less: `fit` over a full
+/// deque of four families cost 0.06 ms at 256 samples, 0.2 ms at 1024 and 3.7-6.7 ms at
+/// 2048 (standalone copy, `rustc -O`, 2026-10-31), and it runs on every rising tick of
+/// each of three windows under the Manager's accounts write lock. A fit needs 20 samples
+/// per family. Lowering it also lowers the pending cap, which needs its own number.
 const MAX_SAMPLES: usize = 2048;
+/// The family whose Fable-only weekly window (`7d_oi`, the third) is calibrated.
+const FABLE: &str = "fable";
 type Tokens = BTreeMap<String, [u64; 2]>;
 
 fn family(provider: Provider, model: Option<&str>) -> Option<String> {
@@ -365,7 +374,7 @@ impl Calibration {
             let tokens = self
                 .tokens
                 .iter()
-                .filter(|(family, _)| idx != 2 || *family == "fable")
+                .filter(|(family, _)| idx != 2 || *family == FABLE)
                 .map(|(family, tokens)| (family.clone(), *tokens))
                 .collect();
             window.observe(bucket, now, tokens);
@@ -379,7 +388,7 @@ impl Calibration {
     pub(crate) fn ready(&self, families: &BTreeSet<String>, scoped: bool) -> bool {
         !families.is_empty()
             && families.iter().all(|family| {
-                (0..if scoped && family == "fable" { 3 } else { 2 }).all(|w| {
+                (0..if scoped && family == FABLE { 3 } else { 2 }).all(|w| {
                     self.scale(w, family).is_some_and(|scale| {
                         scale.tokens_per_percent > 0.0 && scale.output_weight > 0.0
                     })
