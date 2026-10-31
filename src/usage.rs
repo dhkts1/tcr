@@ -123,7 +123,7 @@
 //! file stays plain because it is being appended to, and yesterday's for one
 //! more day so a late line and boot's replay both meet a plain file.
 //!
-//! Every reader goes through [`read_ledger_day`], which reads either form and
+//! Every reader goes through [`read_ledger_day_checked`], which reads either form and
 //! both at once, so nothing that reads the ledger needs to know which days are
 //! compressed: boot's replay, `tcr wrap`, and the scripts that read these files
 //! by hand (`scripts/fit-quota-weights.py`) read both.
@@ -572,7 +572,7 @@ const fn is_zero(n: &u64) -> bool {
 
 /// Parse one day's ledger into its lines, skipping blank lines and counting
 /// (never failing on) malformed ones. The day is read in whichever form it is
-/// on disk ([`read_ledger_day`]).
+/// on disk ([`read_ledger_day_checked`]).
 ///
 /// `pub(crate)` and the ONLY place either [`UsageTracker::replay_day`] or
 /// `tcr wrap` reads a ledger day off disk, so "a malformed line is counted,
@@ -580,19 +580,62 @@ const fn is_zero(n: &u64) -> bool {
 /// A missing day is the ordinary case (no traffic that day) and returns
 /// nothing, the same as replay always has.
 pub(crate) fn parse_ledger_day(dir: &Path, date: Date) -> (Vec<LedgerLine>, usize) {
-    let data = read_ledger_day(dir, date);
-    let mut lines = Vec::new();
-    let mut malformed = 0;
-    for raw in data.lines() {
-        if raw.trim().is_empty() {
+    let day = parse_ledger_day_checked(dir, date);
+    (day.lines, day.malformed)
+}
+
+struct DecodedDay {
+    lines: Vec<LedgerLine>,
+    malformed: usize,
+    present: bool,
+    complete: bool,
+}
+
+/// Fold one decoded UTC day into the forecast's demand history: every line through the
+/// checked decoder, independently of account resolution, and the day's hours marked
+/// covered only when the file was present, complete and clean.
+fn history_day(history: &mut crate::forecast::History, day: &DecodedDay, date: Date, now_ms: i64) {
+    history.partial |= !day.complete || day.malformed != 0;
+    for line in &day.lines {
+        if line
+            .p
+            .as_deref()
+            .is_some_and(|p| Provider::from_name(p).is_none())
+        {
+            history.partial = true;
             continue;
         }
+        if let Some(record) = ledger_record(line, line_provider(line)) {
+            history.record(&record);
+        } else {
+            history.partial = true;
+        }
+    }
+    if day.present && day.complete && day.malformed == 0 {
+        let start = time::PrimitiveDateTime::new(date, time::Time::MIDNIGHT)
+            .assume_utc()
+            .unix_timestamp()
+            * 1000;
+        history.cover_day(start, (start + 86_400_000).min(now_ms));
+    }
+}
+
+fn parse_ledger_day_checked(dir: &Path, date: Date) -> DecodedDay {
+    let day = read_ledger_day_checked(dir, date);
+    let mut lines = Vec::new();
+    let mut malformed = 0;
+    for raw in day.text.lines().filter(|raw| !raw.trim().is_empty()) {
         match serde_json::from_str::<LedgerLine>(raw) {
             Ok(line) => lines.push(line),
             Err(_) => malformed += 1,
         }
     }
-    (lines, malformed)
+    DecodedDay {
+        lines,
+        malformed,
+        present: day.present,
+        complete: day.complete,
+    }
 }
 
 /// The plain file a day's lines are appended to: `<UTC date>.jsonl`.
@@ -614,13 +657,15 @@ fn gz_day_temp_path(dir: &Path, date: Date) -> PathBuf {
 /// Every byte of `path` decompressed, or `None` when it cannot be read. Multi-member, so a
 /// file that is several gzip streams back to back reads as all of them.
 fn read_gz(path: &Path) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let file = std::fs::File::open(path).ok()?;
+    read_gz_checked(path).ok()
+}
+
+fn read_gz_checked(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
     let mut out = Vec::new();
-    flate2::read::MultiGzDecoder::new(std::io::BufReader::new(file))
-        .read_to_end(&mut out)
-        .ok()?;
-    Some(out)
+    flate2::read::MultiGzDecoder::new(std::io::BufReader::new(file)).read_to_end(&mut out)?;
+    Ok(out)
 }
 
 /// One day's ledger text, in whichever form it is on disk.
@@ -636,20 +681,44 @@ fn read_gz(path: &Path) -> Option<Vec<u8>> {
 ///   file then holds only lines the `.gz` does not, and they are read after it.
 ///
 /// An unreadable file reads as absent, as a missing one always has.
-pub(crate) fn read_ledger_day(dir: &Path, date: Date) -> String {
-    let plain = std::fs::read(plain_day_path(dir, date)).ok();
-    let gz = read_gz(&gz_day_path(dir, date));
-    let bytes = match (gz, plain) {
-        (None, None) => return String::new(),
-        (Some(gz), None) => gz,
-        (None, Some(plain)) => plain,
+#[cfg(test)]
+fn read_ledger_day(dir: &Path, date: Date) -> String {
+    read_ledger_day_checked(dir, date).text
+}
+
+struct DayRead {
+    text: String,
+    present: bool,
+    complete: bool,
+}
+
+/// The same decode/merge for totals and forecasts. Ordinary replay retains its historical
+/// best-effort text; forecasts additionally see whether each source was readable UTF-8.
+fn read_ledger_day_checked(dir: &Path, date: Date) -> DayRead {
+    let plain = std::fs::read(plain_day_path(dir, date));
+    let gz = read_gz_checked(&gz_day_path(dir, date));
+    let absent = |result: &std::io::Result<Vec<u8>>| {
+        result
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    };
+    let present = !absent(&plain) || !absent(&gz);
+    let complete = (plain.is_ok() || absent(&plain)) && (gz.is_ok() || absent(&gz));
+    let bytes = match (gz.ok(), plain.ok()) {
+        (None, None) => Vec::new(),
+        (Some(bytes), None) | (None, Some(bytes)) => bytes,
         (Some(gz), Some(plain)) if gz.ends_with(&plain) => gz,
         (Some(mut gz), Some(plain)) => {
             gz.extend_from_slice(&plain);
             gz
         }
     };
-    String::from_utf8_lossy_owned(bytes)
+    let valid_utf8 = std::str::from_utf8(&bytes).is_ok();
+    DayRead {
+        text: String::from_utf8_lossy_owned(bytes),
+        present,
+        complete: complete && valid_utf8,
+    }
 }
 
 /// What one pass of [`compress_closed_days`] did.
@@ -731,7 +800,7 @@ fn parse_day(stem: &str) -> Option<Date> {
 /// temporary name, sync it, read it back and compare it with what it must hold, rename it into
 /// place, and only then remove the plain file. A failure before the rename leaves the day as
 /// it was. A stop after the rename leaves both files, the `.gz` ending with the plain file's
-/// bytes, which [`read_ledger_day`] reads once and the next pass finishes removing.
+/// bytes, which [`read_ledger_day_checked`] reads once and the next pass finishes removing.
 fn compress_day(dir: &Path, date: Date) -> std::io::Result<Option<(u64, u64)>> {
     let plain_path = plain_day_path(dir, date);
     let plain = match std::fs::read(&plain_path) {
@@ -826,6 +895,27 @@ pub(crate) fn line_provider(line: &LedgerLine) -> Provider {
                 Provider::Anthropic
             }
         })
+}
+
+/// Reconstruct the exact dimensions once for ordinary replay and forecast history.
+fn ledger_record(line: &LedgerLine, provider: Provider) -> Option<UsageRecord> {
+    Some(UsageRecord {
+        ts_ms: line.t,
+        model: line.m.clone(),
+        session: line.s,
+        quota_input: line
+            .i
+            .checked_add(line.c5)?
+            .checked_add(line.c1)?
+            .checked_add(line.r)?,
+        input: line.i,
+        cache_5m: line.c5,
+        cache_1h: line.c1,
+        cache_read: line.r,
+        output: line.o,
+        provider,
+        reasoning: line.rt,
+    })
 }
 
 /// Whether `line` carries no provider and its model id files it under Codex: a Codex line
@@ -1296,6 +1386,7 @@ pub struct UsageTracker {
     /// shared, so records never wait on each other here; a rebuild holds it
     /// exclusively, so no record is half done while it flushes and replays.
     rebuild_gate: RwLock<()>,
+    forecast_history: Mutex<crate::forecast::History>,
 }
 
 impl UsageTracker {
@@ -1313,6 +1404,7 @@ impl UsageTracker {
             dropped: Arc::new(AtomicU64::new(0)),
             dir: Mutex::new(None),
             rebuild_gate: RwLock::new(()),
+            forecast_history: Mutex::new(crate::forecast::History::default()),
         }
     }
 
@@ -1626,12 +1718,30 @@ impl UsageTracker {
             }
         }
         self.record_in_memory(idx, record);
+        self.forecast_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(record);
+    }
+
+    pub(crate) fn forecast_estimates(&self, now_ms: i64) -> Vec<crate::forecast::ProviderEstimate> {
+        let mut history = self
+            .forecast_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Sticky until the next boot: a dropped line or a failed write is missing from
+        // the history for good, and a handoff rebuild no longer replaces the history.
+        history.partial |= self.dropped_lines() != 0
+            || (self.is_attached() && !self.healthy.load(Ordering::Relaxed));
+        history.estimates(now_ms)
     }
 
     /// Attach `dir` as this tracker's ledger: replay today's and yesterday's UTC
     /// files back through the recording path, plus the six before them when the
     /// fleet holds a Codex account, whose weekly window reaches back that far;
-    /// then prune files older than `retention_days`, never below what was
+    /// Forecast history additionally reads at most 29 retained UTC files through
+    /// the same checked decoder, independently of account resolution and totals.
+    /// Then prune files older than `retention_days`, never below what was
     /// replayed; then start appending.
     ///
     /// Replay happens BEFORE the writer is armed, so a replayed line is never
@@ -1643,13 +1753,24 @@ impl UsageTracker {
         accounts: &[LedgerAccount],
         now_ms: i64,
     ) -> ReplayReport {
+        let _gate = self
+            .rebuild_gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut report = ReplayReport::default();
         let today = ledger_date(now_ms);
         // A fleet holding a Codex account replays the eight UTC files its lines
         // can be in and never prunes one of them. A Claude-only fleet replays
         // yesterday and today and prunes as it always has.
         let holds_codex = holds_codex(accounts);
-        self.replay_window(&dir, accounts, now_ms, &mut report);
+        // The one time the 29-day forecast history is read. A handoff rebuild never
+        // re-reads it: `record` has fed the history ever since.
+        let mut history = crate::forecast::History::new(now_ms);
+        self.replay_window(&dir, accounts, now_ms, &mut report, Some(&mut history));
+        *self
+            .forecast_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = history;
         *self
             .dir
             .lock()
@@ -1767,7 +1888,7 @@ impl UsageTracker {
         trusted(self)?;
         let fresh = Self::new(accounts.len(), self.pricing.clone());
         let mut report = ReplayReport::default();
-        fresh.replay_window(&dir, accounts, now_ms, &mut report);
+        fresh.replay_window(&dir, accounts, now_ms, &mut report, None);
         let mut rebuilt = fresh
             .accounts
             .into_inner()
@@ -1780,64 +1901,62 @@ impl UsageTracker {
             rebuilt.resize_with(live.len(), Mutex::default);
         }
         *live = rebuilt;
+        // The forecast history is left as it is. It was read once at boot and fed by
+        // `record` since, so re-reading 29 days here would hold every request behind
+        // the gate for the length of that read. The cost: lines the predecessor wrote
+        // after this process's boot replay are in the totals above but not in it.
         Ok(report)
     }
 
     /// Replay the files a boot replays into this tracker's buckets: today's and
     /// yesterday's UTC files, and when the fleet holds a Codex account, whose
     /// weekly window reaches back seven days, the six before them, oldest first.
+    ///
+    /// With `history`, the same pass also builds the forecast's demand history from
+    /// the 29 UTC files it covers, reading each file once. Only the boot replay
+    /// passes one: a handoff rebuild leaves the history `record` has kept since boot.
     fn replay_window(
         &self,
         dir: &Path,
         accounts: &[LedgerAccount],
         now_ms: i64,
         report: &mut ReplayReport,
+        mut history: Option<&mut crate::forecast::History>,
     ) {
         let days_back: i64 = if holds_codex(accounts) { 7 } else { 1 };
-        for back in (0..=days_back).rev() {
+        let oldest_back = if history.is_some() { 28 } else { days_back };
+        for back in (0..=oldest_back).rev() {
             let date = ledger_date(now_ms - back * 86_400_000);
-            self.replay_day(dir, date, accounts, report);
+            let day = parse_ledger_day_checked(dir, date);
+            if let Some(history) = history.as_deref_mut() {
+                history_day(history, &day, date, now_ms);
+            }
+            if back <= days_back {
+                report.malformed += day.malformed;
+                self.replay_day(day.lines, accounts, report);
+            }
         }
     }
 
     fn replay_day(
         &self,
-        dir: &Path,
-        date: Date,
+        lines: Vec<LedgerLine>,
         accounts: &[LedgerAccount],
         report: &mut ReplayReport,
     ) {
-        let (lines, malformed) = parse_ledger_day(dir, date);
-        report.malformed += malformed;
         for line in lines {
             let Some(idx) = resolve_account(accounts, &line) else {
                 report.unresolved += 1;
                 continue;
             };
-            self.record_in_memory(
-                idx,
-                &UsageRecord {
-                    ts_ms: line.t,
-                    model: line.m,
-                    session: line.s,
-                    // Replay feeds the BUCKETS only — it never touches the
-                    // cumulative quota counters — so this reconstructs the
-                    // caller's original total from the dimensions the line
-                    // carries rather than inventing one.
-                    quota_input: line.i + line.c5 + line.c1 + line.r,
-                    input: line.i,
-                    cache_5m: line.c5,
-                    cache_1h: line.c1,
-                    cache_read: line.r,
-                    output: line.o,
-                    // The account the line resolves to is the truth, including for a Codex
-                    // line written before the ledger recorded `p`.
-                    provider: accounts
-                        .get(idx)
-                        .map_or(Provider::Anthropic, |a| a.provider),
-                    reasoning: line.rt,
-                },
-            );
+            let provider = accounts
+                .get(idx)
+                .map_or(Provider::Anthropic, |a| a.provider);
+            let Some(record) = ledger_record(&line, provider) else {
+                report.malformed += 1;
+                continue;
+            };
+            self.record_in_memory(idx, &record);
             report.replayed += 1;
         }
     }
@@ -4162,5 +4281,168 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn forecast_restart_gzip_dedup_removed_accounts_and_partial_days() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_800_000_000_000_i64;
+        let day = ledger_date(now - 2 * 86_400_000);
+        let start = day.with_hms(0, 0, 0).unwrap().assume_utc().unix_timestamp() * 1000;
+        let mut data = Vec::new();
+        for hour in 0..24 {
+            writeln!(
+                &mut data,
+                "{}",
+                serde_json::json!({"t":start+hour*3_600_000+1,
+                "a":"removed@example.com","m":"claude-opus-5","i":100,"c5":0,"c1":0,"r":700,"o":25})
+            )
+            .unwrap();
+        }
+        std::fs::write(plain_day_path(dir.path(), day), &data).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&data).unwrap();
+        std::fs::write(gz_day_path(dir.path(), day), gz.finish().unwrap()).unwrap();
+        let t = tracker();
+        t.attach_ledger(dir.path().to_path_buf(), 29, &[], now);
+        let before = t.forecast_estimates(now);
+        assert_eq!(before.len(), 1);
+        assert!(before[0].history_hours >= 23.0 && before[0].history_hours <= 24.0);
+        assert!(
+            (before[0].level["opus"].input - 100.0).abs() < 1e-8,
+            "plain suffix was not replayed twice"
+        );
+        assert!(!before[0].partial);
+        t.rebuild_from_ledger(&[], now).unwrap();
+        assert_eq!(
+            before,
+            t.forecast_estimates(now),
+            "handoff replaces history, never adds it"
+        );
+        assert_eq!(
+            t.shutdown_ledger(std::time::Duration::from_secs(2)),
+            LedgerShutdown::Flushed
+        );
+        let damaged = ledger_date(now - 86_400_000);
+        std::fs::write(plain_day_path(dir.path(), damaged), b"malformed\n").unwrap();
+        let t = tracker();
+        t.attach_ledger(dir.path().to_path_buf(), 29, &[], now);
+        assert!(
+            t.forecast_estimates(now)[0].partial,
+            "malformed history is never known zero"
+        );
+        assert_eq!(
+            t.shutdown_ledger(std::time::Duration::from_secs(2)),
+            LedgerShutdown::Flushed
+        );
+        std::fs::write(plain_day_path(dir.path(),damaged),serde_json::json!({"t":now-1000,
+            "a":"removed@example.com","p":"future-provider","m":"claude-opus-5","i":1,"c5":0,"c1":0,"r":0,"o":0}).to_string()).unwrap();
+        let t = tracker();
+        t.attach_ledger(dir.path().to_path_buf(), 29, &[], now);
+        assert!(
+            t.forecast_estimates(now)[0].partial,
+            "unknown provider is not filed as known demand"
+        );
+        assert_eq!(
+            t.shutdown_ledger(std::time::Duration::from_secs(2)),
+            LedgerShutdown::Flushed
+        );
+    }
+
+    /// A handoff rebuild re-reads the quota window's files, never the forecast's 29 days,
+    /// and keeps the history built at boot and fed live since. The day five back is outside
+    /// a Claude-only fleet's two-day quota window; deleting its file after boot shows
+    /// whether the rebuild read it again.
+    #[test]
+    fn forecast_rebuild_keeps_the_boot_history_and_never_rereads_it() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let now = crate::now_ms();
+        let day = ledger_date(now - 5 * 86_400_000);
+        let start = day.with_hms(0, 0, 0).unwrap().assume_utc().unix_timestamp() * 1000;
+        let mut data = Vec::new();
+        for hour in 0..24 {
+            writeln!(
+                &mut data,
+                "{}",
+                serde_json::json!({"t":start+hour*3_600_000+1,
+                "a":"alice@example.com","m":"claude-opus-5","i":100,"c5":0,"c1":0,"r":0,"o":25})
+            )
+            .unwrap();
+        }
+        std::fs::write(plain_day_path(dir.path(), day), &data).unwrap();
+        let accounts = [named("alice@example.com")];
+        let t = tracker();
+        t.attach_ledger(dir.path().to_path_buf(), 29, &accounts, now);
+        t.record(
+            0,
+            &record(now, "claude-opus-5", 100),
+            "alice@example.com",
+            None,
+            None,
+        );
+        let before = t.forecast_estimates(now + 1);
+        assert_eq!(before.len(), 1);
+        assert!(
+            before[0].history_hours >= 23.0,
+            "the boot replay read the day five back"
+        );
+        std::fs::remove_file(plain_day_path(dir.path(), day)).unwrap();
+        t.rebuild_from_ledger(&accounts, now + 1).unwrap();
+        assert_eq!(
+            t.row(0, now + 1, None).today.requests,
+            1,
+            "the rebuild replayed the quota window, including the live line"
+        );
+        assert_eq!(
+            t.forecast_estimates(now + 1),
+            before,
+            "a rebuild neither resets the history nor reads the 29 days again"
+        );
+        assert_eq!(
+            t.shutdown_ledger(std::time::Duration::from_secs(2)),
+            LedgerShutdown::Flushed
+        );
+    }
+
+    #[test]
+    fn forecast_unreadable_history_and_concurrent_rebuild_never_claim_complete_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = crate::now_ms();
+        let day = ledger_date(now - 86_400_000);
+        std::fs::create_dir(plain_day_path(dir.path(), day)).unwrap();
+        let t = tracker();
+        t.attach_ledger(
+            dir.path().to_path_buf(),
+            29,
+            &[named("alice@example.com")],
+            now,
+        );
+        assert!(t.forecast_history.lock().unwrap().partial);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for n in 0..100 {
+                    t.record(
+                        0,
+                        &record(now + n, "claude-opus-5", 100),
+                        "alice@example.com",
+                        None,
+                        None,
+                    );
+                }
+            });
+            for _ in 0..3 {
+                t.rebuild_from_ledger(&[named("alice@example.com")], now + 1000)
+                    .unwrap();
+            }
+        });
+        t.rebuild_from_ledger(&[named("alice@example.com")], now + 1000)
+            .unwrap();
+        assert_eq!(t.row(0, now + 1000, None).today.requests, 100);
+        assert!(t.forecast_history.lock().unwrap().partial);
+        assert_eq!(
+            t.shutdown_ledger(std::time::Duration::from_secs(2)),
+            LedgerShutdown::Flushed
+        );
     }
 }

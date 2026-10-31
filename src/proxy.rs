@@ -4624,7 +4624,7 @@ async fn handle_request(
         // fresh one is taken for the new idx next iteration, so the counter tracks
         // true concurrent load and can never leak to strand an account. Inert when
         // pacing is unconfigured (the count is simply never read by `eligible`).
-        let _in_flight = manager.enter_in_flight(idx);
+        let in_flight = manager.enter_in_flight(idx);
 
         // Refresh the token if it is hard-expired (coalesced across concurrent
         // requests). If the refresh proved the credential dead, skip now.
@@ -5073,7 +5073,7 @@ async fn handle_request(
             match provider {
                 Provider::Codex if status == StatusCode::TOO_MANY_REQUESTS => {}
                 Provider::Codex | Provider::Anthropic => {
-                    manager.update_quota(idx, &up_headers, status.as_u16());
+                    manager.update_quota_serving(&in_flight, &up_headers, status.as_u16());
                 }
             }
             // Any non-429 is live proof a rate-limit hold no longer binds.
@@ -5361,8 +5361,8 @@ async fn handle_request(
                                     &refusal_body,
                                     clock,
                                 );
-                                manager.update_quota_with_codex_refusal(
-                                    idx,
+                                manager.update_quota_with_codex_refusal_serving(
+                                    &in_flight,
                                     &up_headers,
                                     429,
                                     refusal.as_ref(),
@@ -5891,7 +5891,7 @@ async fn handle_request(
                 // this iteration — the retry loop above already re-fetches its
                 // own copy from `manager.account_name(idx)` on the next pass.
                 account_name,
-                _in_flight,
+                _in_flight: in_flight,
                 timing: stream_timing,
             };
             let passthrough = futures::stream::unfold(state, |mut state| async move {
@@ -26696,6 +26696,167 @@ mod forecast_routing_tests {
             .await
             .expect("read body");
         (status, headers, body)
+    }
+
+    /// History and live whole-percent ticks reach the launcher's existing local surface.
+    /// All data is synthetic; neither a real ledger nor a quota endpoint is read.
+    #[tokio::test]
+    async fn history_and_ticks() {
+        let manager = manager();
+        let now = OffsetDateTime::now_utc();
+        let now_ms = (now.unix_timestamp_nanos() / 1_000_000) as i64;
+        let ledger = fable_ledger(now_ms);
+        manager.attach_usage_ledger(ledger.path().to_path_buf(), 29);
+        let reset = now_ms + 3_600_000;
+        let tick = |percent: u64| {
+            let bucket = Some(crate::probe::UsageBucket {
+                utilization: Some(percent as f64 / 100.0),
+                reset_at_ms: Some(reset),
+            });
+            crate::probe::Usage {
+                five_hour: bucket,
+                seven_day: bucket,
+                seven_day_oi: bucket,
+                ..Default::default()
+            }
+        };
+        manager.apply_usage_at(0, &tick(10), now - time::Duration::seconds(60));
+        for step in 1..=20 {
+            let at = now - time::Duration::seconds(60 - step * 2);
+            let (input, output) = if step % 2 == 0 { (100, 0) } else { (0, 25) };
+            manager.record_usage(
+                0,
+                crate::usage::UsageRecord::from_quota_input(
+                    (at.unix_timestamp_nanos() / 1_000_000) as i64 - 1,
+                    Some("claude-fable-5".to_string()),
+                    None,
+                    input,
+                    0,
+                    0,
+                    0,
+                    output,
+                ),
+            );
+            manager.apply_usage_at(0, &tick(10 + step as u64), at);
+        }
+        let value = document(Arc::clone(&manager)).await;
+        let estimate = &value["forecast"]["providers"][0];
+        let profile_and_scale_match = estimate["profile"].as_array().is_some_and(|p| {
+            p.len() == 168 && (p.iter().filter_map(Value::as_f64).sum::<f64>() - 168.0).abs() < 1e-6
+        }) && estimate["historyHours"]
+            .as_f64()
+            .is_some_and(|h| h >= 24.0)
+            && estimate["level"]["fable"]["input"]
+                .as_f64()
+                .is_some_and(|x| x > 0.0)
+            && estimate["calibrated"] == true;
+        assert_eq!(
+            manager.shutdown_usage_ledger(Duration::from_secs(2)),
+            crate::usage::LedgerShutdown::Flushed
+        );
+        assert!(
+            profile_and_scale_match,
+            "history and ticks must yield estimates"
+        );
+        assert!(value["forecast"]["task"].is_null());
+        assert!(value["forecast"]["bestProvider"].is_null());
+    }
+
+    /// A ledger of one synthetic Fable request an hour, from 2 to 48 hours before `now_ms`,
+    /// so the forecast has demand history to estimate from.
+    fn fable_ledger(now_ms: i64) -> tempfile::TempDir {
+        use std::io::Write as _;
+        let ledger = tempfile::tempdir().expect("owned ledger");
+        for back in 2..=48 {
+            let ts = now_ms - back * 3_600_000;
+            let date = crate::usage::date_string(crate::usage::ledger_date(ts));
+            let path = ledger.path().join(format!("{date}.jsonl"));
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .unwrap(),
+                "{}",
+                serde_json::json!({"t":ts,"a":"alice@example.com","m":"claude-fable-5",
+                    "i":100,"c5":0,"c1":0,"r":900,"o":25})
+            )
+            .unwrap();
+        }
+        ledger
+    }
+
+    /// **Served responses' own rate-limit headers calibrate the forecast.** Each response
+    /// reports the whole percent spent before its request, and each request spends one
+    /// more, alternating input and output. The proxy reads those headers while the
+    /// request's in-flight guard is held, so a reading that counted the request itself as
+    /// unfinished would never train, and the document would stay uncalibrated.
+    #[tokio::test]
+    async fn served_response_headers_calibrate_under_their_own_request() {
+        let now_ms = crate::now_ms();
+        let reset_secs = now_ms / 1000 + 3_600;
+        let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = Arc::clone(&served);
+        let upstream = stub::http(Router::new().fallback(move || {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                for window in ["5h", "7d", "7d_oi"] {
+                    let utilization = format!("anthropic-ratelimit-unified-{window}-utilization");
+                    let reset = format!("anthropic-ratelimit-unified-{window}-reset");
+                    headers.insert(
+                        HeaderName::from_bytes(utilization.as_bytes()).unwrap(),
+                        HeaderValue::from_str(&format!("{}", (10 + n) as f64 / 100.0)).unwrap(),
+                    );
+                    headers.insert(
+                        HeaderName::from_bytes(reset.as_bytes()).unwrap(),
+                        HeaderValue::from_str(&reset_secs.to_string()).unwrap(),
+                    );
+                }
+                let (input, output) = if n.is_multiple_of(2) {
+                    (100, 0)
+                } else {
+                    (0, 25)
+                };
+                let body = serde_json::json!({"id":"msg_1","type":"message","role":"assistant",
+                    "model":"claude-fable-5","content":[],"stop_reason":"end_turn",
+                    "usage":{"input_tokens":input,"output_tokens":output}});
+                (headers, body.to_string())
+            }
+        }));
+        let manager = keyed(Config {
+            upstream: upstream.url(),
+            codex_upstream: upstream.url(),
+            ..Config::fixture(vec![Account::fixture("alice@example.com")])
+        });
+        let ledger = fable_ledger(now_ms);
+        manager.attach_usage_ledger(ledger.path().to_path_buf(), 29);
+        // One family needs 20 rising ticks; 40 leave room for readings that share a
+        // millisecond, which re-anchor rather than add a sample.
+        for _ in 0..40 {
+            post(
+                Arc::clone(&manager),
+                "/v1/messages",
+                r#"{"model":"claude-fable-5","max_tokens":2,"messages":[],"stream":false}"#,
+            )
+            .await;
+        }
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            40,
+            "every request reached the stub"
+        );
+        let value = document(Arc::clone(&manager)).await;
+        assert_eq!(
+            manager.shutdown_usage_ledger(Duration::from_secs(2)),
+            crate::usage::LedgerShutdown::Flushed
+        );
+        assert_eq!(
+            value["forecast"]["providers"][0]["calibrated"], true,
+            "{}",
+            value["forecast"]
+        );
     }
 
     /// **The running proxy serves the routing document locally, as schema 1.**

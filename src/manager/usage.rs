@@ -57,7 +57,45 @@ impl Manager {
         let refusal = (status == 429)
             .then(|| crate::quota::CodexQuotaRefusal::parse(headers, &[], now))
             .flatten();
-        self.update_quota_with_codex_refusal_at(idx, headers, status, refusal.as_ref(), now)
+        self.update_quota_with_codex_refusal_at(idx, headers, status, refusal.as_ref(), now, 0)
+    }
+
+    /// [`Self::update_quota`] for the headers of the response `serving` was taken for.
+    ///
+    /// The guard is what lets the forecast's calibration learn from them. These headers
+    /// arrive while the request is still open, so the account's `in_flight` counts the
+    /// request itself, and the plain entry treats every such reading as unfinished. This
+    /// request's own usage lands after the headers (`record_usage` runs at the body's end,
+    /// stamped then), so it belongs to the NEXT reading, and the reading is exact when no
+    /// OTHER request on the account is open.
+    pub fn update_quota_serving(
+        &self,
+        serving: &InFlightGuard,
+        headers: &reqwest::header::HeaderMap,
+        status: u16,
+    ) -> bool {
+        self.update_quota_serving_at(serving, headers, status, OffsetDateTime::now_utc())
+    }
+
+    /// [`Self::update_quota_serving`] at an explicit observation time.
+    pub fn update_quota_serving_at(
+        &self,
+        serving: &InFlightGuard,
+        headers: &reqwest::header::HeaderMap,
+        status: u16,
+        now: OffsetDateTime,
+    ) -> bool {
+        let refusal = (status == 429)
+            .then(|| crate::quota::CodexQuotaRefusal::parse(headers, &[], now))
+            .flatten();
+        self.update_quota_with_codex_refusal_at(
+            serving.idx,
+            headers,
+            status,
+            refusal.as_ref(),
+            now,
+            1,
+        )
     }
 
     pub(crate) fn update_quota_with_codex_refusal(
@@ -73,9 +111,32 @@ impl Manager {
             status,
             refusal,
             OffsetDateTime::now_utc(),
+            0,
         )
     }
 
+    /// [`Self::update_quota_with_codex_refusal`] for the response `serving` was taken
+    /// for; see [`Self::update_quota_serving`].
+    pub(crate) fn update_quota_with_codex_refusal_serving(
+        &self,
+        serving: &InFlightGuard,
+        headers: &reqwest::header::HeaderMap,
+        status: u16,
+        refusal: Option<&crate::quota::CodexQuotaRefusal>,
+    ) -> bool {
+        self.update_quota_with_codex_refusal_at(
+            serving.idx,
+            headers,
+            status,
+            refusal,
+            OffsetDateTime::now_utc(),
+            1,
+        )
+    }
+
+    /// `own` is how many of the account's in-flight requests are the caller's: 1 when it
+    /// holds the guard of the request these headers came on, else 0. Any beyond those are
+    /// other requests whose usage has not landed, and the reading cannot bracket them.
     fn update_quota_with_codex_refusal_at(
         &self,
         idx: usize,
@@ -83,6 +144,7 @@ impl Manager {
         status: u16,
         refusal: Option<&crate::quota::CodexQuotaRefusal>,
         now: OffsetDateTime,
+        own: u32,
     ) -> bool {
         let (newly_known, read_five_hour) = {
             let mut accounts = self
@@ -99,6 +161,24 @@ impl Manager {
                             .quota
                             .update_from_codex_refusal_at(headers, status, refusal, now),
                     };
+                    // An unfinished reading only clears the fit's scales, so its ticks
+                    // are not built (they are header parses under this write lock).
+                    let unfinished = account.in_flight > own;
+                    let ticks = if unfinished {
+                        crate::forecast::carries_ticks(account.provider, headers)
+                            .then_some([None; 3])
+                    } else {
+                        crate::forecast::header_ticks(account.provider, headers, &account.quota)
+                    };
+                    if let Some(ticks) = ticks {
+                        self.with_forecast_slot(idx, |fit| {
+                            if !unfinished && own > 0 {
+                                fit.observe_serving(ticks, odt_to_ms(now));
+                            } else {
+                                fit.observe(ticks, odt_to_ms(now), unfinished);
+                            }
+                        });
+                    }
                     let flipped = read_five_hour && !account.quota_known;
                     account.quota_known |= read_five_hour;
                     // Any response that DOES carry the 5h window is proof this
@@ -195,6 +275,10 @@ impl Manager {
                     // puts a Codex record in the weekly window. Read under the lock that
                     // already resolves its identity.
                     record.provider = account.provider;
+                    // The same account lock serializes both this completed vector and
+                    // probe watermarks. No bucket replay or cumulative quota counter is
+                    // used to guess which token dimensions a percent paid for.
+                    self.with_forecast_slot(idx, |fit| fit.record(&record));
                     account.input_tokens += record.input_total();
                     account.output_tokens += record.output;
                     account.cache_read_tokens += record.cache_read;
@@ -447,6 +531,13 @@ impl Manager {
                         }
                     };
                     account.quota.apply_usage_at(usage, now);
+                    self.with_forecast_slot(idx, |fit| {
+                        fit.observe(
+                            [usage.five_hour, usage.seven_day, usage.seven_day_oi],
+                            odt_to_ms(now),
+                            account.in_flight != 0,
+                        );
+                    });
                     if was_codex_refused
                         && account.quota.status.as_deref() != Some("rejected")
                         && account.hold_cause == HoldCause::RateLimit
@@ -681,6 +772,53 @@ impl Manager {
         if let Some(error) = crate::routing::ErrorKind::of_stream(kind) {
             self.record_upstream_error_at(provider, error, now);
         }
+    }
+
+    /// The single writer interface for stable calibration slots. Callers hold
+    /// the account lock, which serializes completed vectors and reading watermarks.
+    fn with_forecast_slot(
+        &self,
+        idx: usize,
+        update: impl FnOnce(&mut crate::forecast::Calibration),
+    ) {
+        let mut fits = self.forecast.lock().unwrap_or_else(PoisonError::into_inner);
+        if fits.len() <= idx {
+            fits.resize_with(idx + 1, crate::forecast::Calibration::default);
+        }
+        update(&mut fits[idx]);
+    }
+
+    /// Privacy-safe demand aggregates. Reading never changes selection or quota.
+    pub(crate) fn forecast_document(&self, now_ms: i64) -> Option<serde_json::Value> {
+        let mut estimates = self.usage.forecast_estimates(now_ms);
+        if estimates.is_empty() {
+            return None;
+        }
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
+        let fits = self.forecast.lock().unwrap_or_else(PoisonError::into_inner);
+        for estimate in &mut estimates {
+            let families = estimate.level.keys().cloned().collect();
+            let slots: Vec<_> = accounts
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.provider == estimate.provider && !a.removed)
+                .map(|(idx, _)| idx)
+                .collect();
+            estimate.calibrated = !estimate.partial
+                && !slots.is_empty()
+                && slots.iter().all(|&idx| {
+                    fits.get(idx)
+                        .is_some_and(|fit| fit.ready(&families, estimate.provider.is_anthropic()))
+                });
+        }
+        let reason = if estimates.iter().any(|estimate| estimate.partial) {
+            "partial demand history; calibration unavailable"
+        } else {
+            "demand estimates available"
+        };
+        Some(
+            serde_json::json!({"providers":estimates,"task":null,"bestProvider":null,"reason":reason}),
+        )
     }
 }
 

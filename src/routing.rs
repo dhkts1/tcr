@@ -12,8 +12,8 @@
 //! that same evaluation at the stored hold, reset and revalidation deadlines.
 //!
 //! It names no account: no name, email, organization or account id, no session, no
-//! credential and no upstream error text. `forecast` is `null` until the forecast rounds fill
-//! it, and a reader of schema 1 takes any JSON value there.
+//! credential and no upstream error text. `forecast` is `null` without observed history;
+//! otherwise it carries demand estimates and cold calibration readiness.
 
 use std::collections::BTreeSet;
 
@@ -47,7 +47,7 @@ pub struct RoutingDocument {
     pub build: BuildInfo,
     /// `anthropic`, then `codex`.
     pub providers: Vec<ProviderRouting>,
-    /// `null` until the forecast rounds fill it.
+    /// Demand estimates and calibration readiness, or `null` without observed history.
     pub forecast: Option<serde_json::Value>,
 }
 
@@ -278,7 +278,7 @@ pub fn document(manager: &Manager, now: OffsetDateTime) -> Option<RoutingDocumen
         generated_at: utc(now)?,
         build: BuildInfo::current(),
         providers,
-        forecast: None,
+        forecast: manager.forecast_document((now.unix_timestamp_nanos() / 1_000_000) as i64),
     })
 }
 

@@ -32,6 +32,7 @@ pub mod fallback;
 pub mod fan;
 pub mod fan_probe;
 pub mod file_log;
+pub(crate) mod forecast;
 #[cfg(unix)]
 pub mod handoff;
 pub mod heat;
