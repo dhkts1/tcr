@@ -26491,7 +26491,11 @@ mod forecast_routing_tests {
                         HeaderValue::from_str(&reset_secs.to_string()).unwrap(),
                     );
                 }
-                let (input, output) = if n % 2 == 0 { (100, 0) } else { (0, 25) };
+                let (input, output) = if n.is_multiple_of(2) {
+                    (100, 0)
+                } else {
+                    (0, 25)
+                };
                 let body = serde_json::json!({"id":"msg_1","type":"message","role":"assistant",
                     "model":"claude-fable-5","content":[],"stop_reason":"end_turn",
                     "usage":{"input_tokens":input,"output_tokens":output}});
