@@ -164,8 +164,25 @@ fn reset_credits_from_payload(value: Option<&Value>) -> Option<tcr_status_wire::
     })
 }
 
+/// `error` and every source under it, joined with ": ". reqwest's own text stops at
+/// "error sending request"; the cause (refused, timed out, TLS) is in the sources.
+/// Pass a reqwest error through `without_url()` first.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
 /// Optional details never turn a successful usage read into a failed one. Bound the full
 /// call and its body; partial/capped details cannot establish complete available coverage.
+///
+/// This runs on every usage probe, so a failed read logs at DEBUG, not INFO: the cause is
+/// kept for whoever turns the level up, and a backend that stays down adds no INFO noise.
 async fn fetch_reset_expiry(
     client: &reqwest::Client,
     base: &str,
@@ -190,24 +207,59 @@ async fn fetch_reset_expiry(
         if let Some(id) = account_id {
             request = request.header(crate::provider::CODEX_ACCOUNT_HEADER, id);
         }
-        let mut response = request.send().await.ok()?;
+        let skipped = |cause: &str| {
+            tracing::debug!(cause, "codex reset details unread; expiry left unknown");
+        };
+        let mut response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                skipped(&error_chain(&error.without_url()));
+                return None;
+            }
+        };
         if !response.status().is_success() {
+            skipped(&format!(
+                "the backend answered {}",
+                response.status().as_u16()
+            ));
             return None;
         }
         const BODY_LIMIT: usize = 1_048_576;
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.ok()? {
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(error) => {
+                    skipped(&error_chain(&error.without_url()));
+                    return None;
+                }
+            };
             if chunk.len() > BODY_LIMIT - body.len() {
+                skipped("the details body is over 1 MiB");
                 return None;
             }
             body.extend_from_slice(&chunk);
         }
-        let payload = serde_json::from_slice(&body).ok()?;
+        // A `Value` parse fails only on syntax, and serde_json's syntax errors name a
+        // line and column, never the body's text, so no credit id reaches the cause.
+        let payload = match serde_json::from_slice(&body) {
+            Ok(payload) => payload,
+            Err(error) => {
+                skipped(&error_chain(&error));
+                return None;
+            }
+        };
         reset_expiry_from_details(&payload, count, crate::now_ms())
     })
     .await
-    .ok()
-    .flatten()
+    .unwrap_or_else(|_| {
+        tracing::debug!(
+            cause = "the 5 s details deadline passed",
+            "codex reset details unread; expiry left unknown"
+        );
+        None
+    })
 }
 
 /// Trust expiry only when all rows are well formed and unique, both counts agree, and the
@@ -614,6 +666,13 @@ mod tests {
                 .earliest_expiry_ms,
             Some(1_893_456_000_000)
         );
+        let logs = crate::test_support::log_capture::SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .finish();
+        let log_guard = tracing::subscriber::set_default(subscriber);
         for token in ["fake-fail", "fake-malformed", "fake-capped", "fake-timeout"] {
             let usage = fetch_usage(&client, &base, token, Some("fake-workspace"))
                 .await
@@ -622,7 +681,30 @@ mod tests {
             assert_eq!(resets.available_count, 2);
             assert_eq!(resets.earliest_expiry_ms, None);
         }
+        drop(log_guard);
         assert_eq!(calls.load(Ordering::SeqCst), 5);
+        // Each skipped read leaves one DEBUG line naming its cause, never an INFO line
+        // and never the body the backend sent.
+        let text = logs.contents();
+        let skipped: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("codex reset details unread"))
+            .collect();
+        assert_eq!(skipped.len(), 4, "one line per skipped read:\n{text}");
+        // The request and the wrapper share the 5 s budget, so either may end the slow read.
+        for (line, causes) in skipped.iter().zip([
+            &["the backend answered 503"][..],
+            &["line 1 column"],
+            &["the details body is over 1 MiB"],
+            &["operation timed out", "the 5 s details deadline passed"],
+        ]) {
+            assert!(line.contains(" DEBUG "), "{line}");
+            assert!(
+                causes.iter().any(|cause| line.contains(cause)),
+                "cause {causes:?} missing: {line}"
+            );
+            assert!(!line.contains("fake-secret-sentinel"), "{line}");
+        }
         let config = serde_json::from_value(serde_json::json!({"accounts":[{
             "name":"alice@example.com", "provider":"codex", "accessToken":"fake-usage-error",
             "accountUuid":"fake-workspace", "organizationType":"pro", "expiresAt":4_102_444_800_000i64

@@ -58,6 +58,49 @@ impl CodexResetError {
     }
 }
 
+/// A failed attempt: the fixed reason the caller is shown, and, for the tcr log only,
+/// what caused it. The cause is a status code, a deadline, or a reqwest error with its
+/// URL removed and its source chain kept. reqwest never puts a header in its error
+/// text, so the bearer token cannot reach it, and the consume body is only ever
+/// parsed into its `code`, so a decode error can echo nothing but that code.
+#[derive(Debug)]
+struct ResetFailure {
+    reason: CodexResetError,
+    cause: Option<String>,
+}
+
+impl From<CodexResetError> for ResetFailure {
+    fn from(reason: CodexResetError) -> Self {
+        Self {
+            reason,
+            cause: None,
+        }
+    }
+}
+
+impl ResetFailure {
+    const fn because(reason: CodexResetError, cause: String) -> Self {
+        Self {
+            reason,
+            cause: Some(cause),
+        }
+    }
+
+    fn deadline(_: tokio::time::error::Elapsed) -> Self {
+        Self::because(
+            CodexResetError::Unknown,
+            "the 90 s reset deadline passed".to_owned(),
+        )
+    }
+
+    fn transport(reason: CodexResetError, error: reqwest::Error) -> Self {
+        Self::because(
+            reason,
+            crate::codex_probe::error_chain(&error.without_url()),
+        )
+    }
+}
+
 /// A snapshot for rechecking identity after awaits; never formatted or logged.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct BoundAccount {
@@ -145,88 +188,140 @@ impl Manager {
     /// The only path that consumes. The caller must have confirmed operator input.
     /// Queueing, refresh and consume share one deadline. A known result survives a
     /// post-read timeout, and the gate stays held until that read finishes or expires.
+    ///
+    /// Every attempt writes one INFO line, whatever its outcome: a redemption spends
+    /// something on a real account and is rare, so it leaves a trace without adding
+    /// per-request noise. The line names the account by its tcr index, never by name,
+    /// id or token, and a failed or unknown attempt carries its transport cause.
     pub async fn reset_codex(
         &self,
         query: &str,
         key: &str,
     ) -> Result<CodexResetResponse, CodexResetError> {
+        let mut index = None;
+        let result = self.redeem_codex_reset(query, key, &mut index).await;
+        let index = index.map_or_else(|| "none".to_owned(), |idx| idx.to_string());
+        match &result {
+            Ok(response) => tracing::info!(
+                index = %index,
+                outcome = ?response.outcome,
+                usage_refreshed = response.usage_refreshed,
+                "codex reset attempt finished"
+            ),
+            Err(failure) => tracing::info!(
+                index = %index,
+                outcome = ?failure.reason,
+                cause = failure.cause.as_deref().unwrap_or("none"),
+                "codex reset attempt finished"
+            ),
+        }
+        result.map_err(|failure| failure.reason)
+    }
+
+    /// [`Self::reset_codex`]'s body. `index` is set once the query names one row.
+    async fn redeem_codex_reset(
+        &self,
+        query: &str,
+        key: &str,
+        index: &mut Option<usize>,
+    ) -> Result<CodexResetResponse, ResetFailure> {
         if !valid_reset_key(key) {
-            return Err(CodexResetError::Failed);
+            return Err(CodexResetError::Failed.into());
         }
         let deadline = Instant::now() + Duration::from_secs(90);
-        let (idx, identity, guard, outcome) = timeout_at(deadline, async {
-            let (idx, identity) = {
-                let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
-                let idx = match match_listed(&accounts, query) {
-                    crate::identity::Match::None => return Err(CodexResetError::Missing),
-                    crate::identity::Match::Ambiguous(_) => return Err(CodexResetError::Ambiguous),
-                    crate::identity::Match::One(idx) => idx,
-                };
-                let row = &accounts[idx];
-                if row.provider != Provider::Codex {
-                    return Err(CodexResetError::WrongProvider);
-                }
-                (idx, BoundAccount::of(row))
-            };
-            let gate = self.usage_gate(idx).ok_or(CodexResetError::Unavailable)?;
-            let guard = gate.lock_owned().await;
-            self.check_reset_owner(idx, &identity)?;
-            self.ensure_fresh(idx).await;
-            self.check_reset_owner(idx, &identity)?;
-            let client = crate::http_client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|_| CodexResetError::Failed)?;
-            let url = format!(
-                "{}{CONSUME_PATH}",
-                self.upstream_for(Provider::Codex).trim_end_matches('/')
-            );
-            let body = serde_json::json!({"redeem_request_id":key});
-            for attempt in 0..2 {
-                self.check_reset_owner(idx, &identity)?;
-                let credential = self
-                    .access_token(idx)
-                    .and_then(|token| self.probe_credential(idx, token))
-                    .ok_or(CodexResetError::Unavailable)?;
-                self.check_reset_owner(idx, &identity)?;
-                let mut request = client
-                    .post(&url)
-                    .bearer_auth(credential.access_token)
-                    .header(
-                        reqwest::header::USER_AGENT,
-                        concat!("tcr/", env!("CARGO_PKG_VERSION")),
-                    )
-                    .json(&body);
-                if let Some(id) = credential.account_id {
-                    request = request.header(crate::provider::CODEX_ACCOUNT_HEADER, id);
-                }
-                let response = request.send().await.map_err(|_| CodexResetError::Unknown)?;
-                if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-                    self.check_reset_owner(idx, &identity)?;
-                    if !self.ensure_fresh_force(idx).await {
-                        return Err(CodexResetError::Failed);
+        let (idx, identity, guard, outcome) =
+            timeout_at(deadline, async {
+                let (idx, identity) = {
+                    let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
+                    let idx = match match_listed(&accounts, query) {
+                        crate::identity::Match::None => {
+                            return Err(ResetFailure::from(CodexResetError::Missing));
+                        }
+                        crate::identity::Match::Ambiguous(_) => {
+                            return Err(ResetFailure::from(CodexResetError::Ambiguous));
+                        }
+                        crate::identity::Match::One(idx) => idx,
+                    };
+                    *index = Some(idx);
+                    let row = &accounts[idx];
+                    if row.provider != Provider::Codex {
+                        return Err(ResetFailure::from(CodexResetError::WrongProvider));
                     }
+                    (idx, BoundAccount::of(row))
+                };
+                let gate = self.usage_gate(idx).ok_or(CodexResetError::Unavailable)?;
+                let guard = gate.lock_owned().await;
+                self.check_reset_owner(idx, &identity)?;
+                self.ensure_fresh(idx).await;
+                self.check_reset_owner(idx, &identity)?;
+                let client = crate::http_client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .map_err(|error| ResetFailure::transport(CodexResetError::Failed, error))?;
+                let url = format!(
+                    "{}{CONSUME_PATH}",
+                    self.upstream_for(Provider::Codex).trim_end_matches('/')
+                );
+                let body = serde_json::json!({"redeem_request_id":key});
+                for attempt in 0..2 {
                     self.check_reset_owner(idx, &identity)?;
-                    continue;
+                    let credential = self
+                        .access_token(idx)
+                        .and_then(|token| self.probe_credential(idx, token))
+                        .ok_or(CodexResetError::Unavailable)?;
+                    self.check_reset_owner(idx, &identity)?;
+                    let mut request = client
+                        .post(&url)
+                        .bearer_auth(credential.access_token)
+                        .header(
+                            reqwest::header::USER_AGENT,
+                            concat!("tcr/", env!("CARGO_PKG_VERSION")),
+                        )
+                        .json(&body);
+                    if let Some(id) = credential.account_id {
+                        request = request.header(crate::provider::CODEX_ACCOUNT_HEADER, id);
+                    }
+                    let response = request.send().await.map_err(|error| {
+                        ResetFailure::transport(CodexResetError::Unknown, error)
+                    })?;
+                    let status = response.status();
+                    if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                        self.check_reset_owner(idx, &identity)?;
+                        if !self.ensure_fresh_force(idx).await {
+                            return Err(ResetFailure::because(
+                                CodexResetError::Failed,
+                                "401, then the token refresh failed".to_owned(),
+                            ));
+                        }
+                        self.check_reset_owner(idx, &identity)?;
+                        continue;
+                    }
+                    if status.is_server_error() {
+                        return Err(ResetFailure::because(
+                            CodexResetError::Unknown,
+                            format!("the backend answered {}", status.as_u16()),
+                        ));
+                    }
+                    if !status.is_success() {
+                        return Err(ResetFailure::because(
+                            CodexResetError::Failed,
+                            format!("the backend answered {}", status.as_u16()),
+                        ));
+                    }
+                    let response: ConsumeResponse = response.json().await.map_err(|error| {
+                        ResetFailure::transport(CodexResetError::Unknown, error)
+                    })?;
+                    return Ok((idx, identity, guard, CodexResetOutcome::from(response.code)));
                 }
-                if response.status().is_server_error() {
-                    return Err(CodexResetError::Unknown);
-                }
-                if !response.status().is_success() {
-                    return Err(CodexResetError::Failed);
-                }
-                let response: ConsumeResponse = response
-                    .json()
-                    .await
-                    .map_err(|_| CodexResetError::Unknown)?;
-                return Ok((idx, identity, guard, CodexResetOutcome::from(response.code)));
-            }
-            Err(CodexResetError::Failed)
-        })
-        .await
-        .map_err(|_| CodexResetError::Unknown)??;
+                Err(ResetFailure::because(
+                    CodexResetError::Failed,
+                    "the consume loop ended without an answer".to_owned(),
+                ))
+            })
+            .await
+            .map_err(ResetFailure::deadline)??;
         let usage_refreshed = if identity.is_current(self, idx) && !self.mutation_is_released() {
             timeout_at(deadline, self.probe_account_unlocked(idx))
                 .await
@@ -486,6 +581,89 @@ mod tests {
                 "reset logs must not disclose private request or response fields"
             );
         }
+    }
+
+    /// Each attempt leaves exactly one INFO line: the account's tcr index (never its
+    /// name), the outcome, and for a failure the transport cause rather than a bare
+    /// "unknown". A query naming no row logs `index=none`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_attempt_logs_one_info_line_with_index_outcome_and_cause() {
+        let logs = crate::test_support::log_capture::SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let backend = Backend::new("reset", StatusCode::OK);
+        let live = manager(&backend);
+        live.reset_codex("alice@example.com", "synthetic-attempt")
+            .await
+            .unwrap();
+
+        // A Codex upstream nobody listens on: the consume call is refused.
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let mut config = Config::fixture(vec![row("alice@example.com")]);
+        config.upstream = dead.clone();
+        config.codex_upstream = dead.clone();
+        let offline = Manager::new(
+            config,
+            Arc::new(oauth::NoRefresh),
+            Arc::new(LiveUsageProber::new().with_codex_base(dead)),
+            Arc::new(LiveWarmer::new()),
+            None,
+        );
+        assert_eq!(
+            offline
+                .reset_codex("alice@example.com", "synthetic-attempt")
+                .await,
+            Err(CodexResetError::Unknown)
+        );
+
+        assert_eq!(
+            live.reset_codex("nobody@example.com", "synthetic-attempt")
+                .await,
+            Err(CodexResetError::Missing)
+        );
+
+        let text = logs.contents();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("codex reset attempt finished"))
+            .collect();
+        assert_eq!(lines.len(), 3, "one line per attempt:\n{text}");
+        for line in &lines {
+            assert!(line.contains(" INFO "), "{line}");
+            for private in [
+                "alice@example.com",
+                "nobody@example.com",
+                "synthetic-attempt",
+            ] {
+                assert!(!line.contains(private), "names an identity or key: {line}");
+            }
+        }
+        assert!(
+            lines[0].contains("index=0") && lines[0].contains("outcome=Applied"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("index=0")
+                && lines[1].contains("outcome=Unknown")
+                && lines[1].contains("error sending request")
+                && lines[1].contains("Connection refused"),
+            "the refused connection's cause must be kept: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("index=none") && lines[2].contains("outcome=Missing"),
+            "{}",
+            lines[2]
+        );
     }
 
     #[tokio::test]
