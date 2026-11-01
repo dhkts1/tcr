@@ -1691,7 +1691,7 @@ to say:
 
 | key | shape | what it is |
 |---|---|---|
-| `quotaWindows` | array of `"fiveHour"` / `"sevenDay"`, in that order | which usage windows the account's plan reports. Absent: not known yet, so a reader draws both. `[]`: the plan reports no usage window at all, which is a fact, not a gap. Once the quota probe has answered, its answer outranks the response headers', which may carry a five-hour slot the plan does not have |
+| `quotaWindows` | array of `"fiveHour"` / `"sevenDay"`, in that order | which usage windows the account's plan reports. Absent: not known yet, so a reader draws both. `[]`: the plan reports no usage window at all, which is a fact, not a gap. Once the quota probe has answered, its answer outranks the response headers', which may carry a five-hour slot the plan does not have. The one key a Claude row can carry too: a Claude plan with no five-hour window (Ultra, whose usage read says `"five_hour": null`) reports `["sevenDay"]` |
 | `fiveHourWindowMinutes` | integer | how long the window in the five-hour bucket is, in minutes, as reported (`300`). Absent when no length was reported |
 | `sevenDayWindowMinutes` | integer | how long the window in the weekly bucket is, in minutes: `10080` is seven days, and a 30-day window reads `43200`. Absent when no length was reported |
 | `limitReachedType` | string | why ChatGPT refused the account, verbatim: `rate_limit_reached`, or a credits or spend-cap kind. Present exactly while that refusal stands |

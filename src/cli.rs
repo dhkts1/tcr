@@ -3167,8 +3167,10 @@ fn account_status_rows(
 /// `codex_route` and `codex_traffic` are fleet-wide facts, repeated on every
 /// Codex row the way `serverSha` and `groupColors` are repeated on every row.
 ///
-/// No Codex key ever reaches an Anthropic row — neither these two nor the
-/// account's own Codex facts — so such a row is the bytes it always was.
+/// No Codex key reaches an Anthropic row, neither these two nor the account's
+/// own Codex facts, so such a row is the bytes it always was. The one
+/// exception is `quotaWindows: ["sevenDay"]` on a row whose plan has no
+/// five-hour window ([`AccountSnapshot::five_hour_absent_on_plan`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "the snapshot plus each piece of server state a status row renders"
@@ -3194,9 +3196,20 @@ fn account_status_rows_at(
             let threshold = thresholds.get(i).copied().unwrap_or(1.0);
             // The Codex keys are written on a Codex row only. An Anthropic row
             // takes the empty facts and no route or traffic whatever it was
-            // given, so every one of its keys is skipped.
+            // given, so every one of its keys is skipped, except `quotaWindows`
+            // on a plan with no five-hour window (Ultra): `["sevenDay"]`, so a
+            // panel drops the 5h meter instead of drawing it as unmeasured.
             let (facts, row_route, row_traffic) = match a.provider {
-                Provider::Anthropic => (CodexFacts::default(), None, None),
+                Provider::Anthropic => (
+                    CodexFacts {
+                        quota_windows: a
+                            .five_hour_absent_on_plan
+                            .then(|| vec!["sevenDay".to_string()]),
+                        ..CodexFacts::default()
+                    },
+                    None,
+                    None,
+                ),
                 Provider::Codex => (
                     a.codex.clone(),
                     codex_route.cloned(),
@@ -3504,7 +3517,8 @@ fn account_status_rows_at(
                 // (`CodexFacts`), copied from the snapshot. No `source` guard:
                 // unlike the serving counters above, a fact nobody reported is
                 // already `None` or `false` and its key is skipped, so it can
-                // never read as a measurement. Empty on every Anthropic row.
+                // never read as a measurement. Empty on an Anthropic row, but
+                // for `quotaWindows: ["sevenDay"]` when its plan has no 5h window.
                 quota_windows: facts.quota_windows,
                 five_hour_window_minutes: facts.five_hour_window_minutes,
                 seven_day_window_minutes: facts.seven_day_window_minutes,
@@ -12823,6 +12837,57 @@ mod tests {
         assert!(
             bob.contains(" plan=Max 20x 5h=n/a "),
             "no display name and no null: today's label and `n/a`: {bob}"
+        );
+    }
+
+    /// `tcr status --json` tells a panel which windows a Claude plan has the way it tells it
+    /// for a Codex plan: an Ultra row (no 5h window) carries `quotaWindows: ["sevenDay"]`,
+    /// so TcrBar drops its 5h meter instead of drawing it as unmeasured. A Claude row
+    /// without the flag carries no `quotaWindows` key at all, the bytes it always was.
+    #[test]
+    fn status_json_lists_only_the_week_for_a_claude_plan_with_no_five_hour_window() {
+        let row = |name: &str| {
+            contract_account(
+                name,
+                0,
+                "active",
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ProbeStatus::Ok,
+                None,
+                QuotaState::Normal,
+                &[],
+                None,
+                (Some("claude_max"), Some("default_claude_max_20x"), None),
+                (None, None),
+            )
+        };
+        let ultra = AccountSnapshot {
+            plan_display_name: Some("Ultra".to_string()),
+            five_hour_absent_on_plan: true,
+            ..row("alice@example.com")
+        };
+        let snapshot = snapshot_of(vec![ultra, row("bob@example.com")]);
+        let json = status_json(&snapshot, &[0.95, 0.95], StatusSource::Live);
+        let alice = status_row(&json, "alice@example.com");
+        assert_eq!(
+            alice["quotaWindows"],
+            serde_json::json!(["sevenDay"]),
+            "a plan with no 5h window lists only the week: {alice}"
+        );
+        assert!(
+            alice.get("provider").is_none(),
+            "still an Anthropic row: {alice}"
+        );
+        let bob = status_row(&json, "bob@example.com");
+        assert!(
+            bob.get("quotaWindows").is_none(),
+            "an unflagged Claude row carries no quotaWindows key: {bob}"
         );
     }
 

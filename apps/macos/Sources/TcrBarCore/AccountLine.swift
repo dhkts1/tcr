@@ -279,7 +279,8 @@ extension Account {
     /// The labels of a live line's two meter slots, 5-hour then weekly: the label
     /// a window's length gives it (``windowLabel(for:)``), or `nil` for a window
     /// the plan does not report, whose slot the line leaves blank so every bar
-    /// after it still starts at one x. `["5h", "7d"]` on every Claude line.
+    /// after it still starts at one x. `["5h", "7d"]` on a Claude line, but
+    /// `[nil, "7d"]` on a plan with no 5-hour window (Ultra).
     public var lineSlotLabels: [String?] {
         let reported = reportedWindows
         return [QuotaWindow.fiveHour, .sevenDay].map {

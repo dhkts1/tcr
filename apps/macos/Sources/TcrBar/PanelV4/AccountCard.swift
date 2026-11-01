@@ -578,24 +578,14 @@ struct AccountCard<Actions: View>: View {
     /// measured 21 pt; the tail column costs nothing extra, because it is
     /// already reserved for the figure above it.
     ///
-    /// A Codex card draws only the windows its plan reports
-    /// (``Account/reportedWindows``), each labelled by its length: a Pro plan's one
-    /// weekly row, and no row at all for a plan that reports none. A window the
-    /// plan does not have is not a reading nobody took, so it gets no empty row.
+    /// A card draws only the windows its plan reports (``Account/reportedWindows``),
+    /// each labelled by its length: a Codex Pro plan's one weekly row, a Claude Ultra
+    /// plan's one `7d` row, and no row at all for a Codex plan that reports none. A
+    /// window the plan does not have is not a reading nobody took, so it gets no empty
+    /// row. A plan that has not said draws both, `5h` and `7d`, as every Claude card
+    /// always did.
     private var quotaWindows: [QuotaWindowSpec] {
-        guard account.provider == .codex else {
-            return [
-                QuotaWindowSpec(
-                    window: .fiveHour, label: "5h", value: account.fiveHour,
-                    tint: account.quotaBarTintSource(for: .fiveHour),
-                    resetAtMs: account.fiveHourResetAtMs),
-                QuotaWindowSpec(
-                    window: .sevenDay, label: "7d", value: account.sevenDay,
-                    tint: account.quotaBarTintSource(for: .sevenDay),
-                    resetAtMs: account.sevenDayResetAtMs),
-            ]
-        }
-        return account.reportedWindows.map { window in
+        account.reportedWindows.map { window in
             QuotaWindowSpec(
                 window: window, label: account.windowLabel(for: window),
                 value: window == .fiveHour ? account.fiveHour : account.sevenDay,

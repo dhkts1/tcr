@@ -271,6 +271,23 @@ final class FleetStripTests: XCTestCase {
         XCTAssertEqual(StripSegmentKind(alice), .off)
     }
 
+    /// A Claude plan with no 5-hour window (Ultra, `quotaWindows: ["sevenDay"]`) fills
+    /// from its week like a Codex Pro plan, not grey: its 5-hour window does not exist,
+    /// so a missing 5-hour reading is not "unmeasured".
+    func testAClaudeSegmentOnAPlanWithNoFiveHourWindowFillsFromTheWeek() throws {
+        let ultra = try canonical(
+            "alice@example.com", ["fiveHour": NSNull(), "quotaWindows": ["sevenDay"]])
+        XCTAssertEqual(ultra.provider, .anthropic)
+        let sevenDay = try XCTUnwrap(ultra.sevenDay)
+        guard case .room(let room, _) = StripSegmentKind(ultra)
+        else { return XCTFail("an Ultra row is a filled live segment, not grey") }
+        XCTAssertEqual(room, 1 - sevenDay, accuracy: 1e-9)
+
+        guard case .room(let aliceRoom, _) = StripSegmentKind(try canonical("alice@example.com"))
+        else { return XCTFail("alice is a filled live segment") }
+        XCTAssertEqual(aliceRoom, 1 - 0.47, accuracy: 1e-9, "no key: the 5-hour rule")
+    }
+
     // MARK: - Two pools
 
     /// In a fleet holding both providers the tab draws Claude's list first, so the strip
