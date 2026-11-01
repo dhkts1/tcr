@@ -815,7 +815,7 @@ pub struct AccountStatusRow {
     /// (`organization.plan_display_name`, "Ultra"). `None` on an org whose profile
     /// has no such key (Team, measured 2026-11-01), or a row not profiled since it
     /// appeared. When present it is the [`Self::plan`] label.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_display_name: Option<String>,
     /// The customer-facing plan label ("Ultra", "Max 20x", "Team Premium", ...) derived
     /// from the four raw fields above by [`plan_label`] — or, on a Codex row,

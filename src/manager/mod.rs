@@ -5440,7 +5440,8 @@ mod tests {
                 { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
                   "refreshToken": "rt-a", "priority": 0,
                   "organizationType": "claude_max",
-                  "rateLimitTier": "default_claude_max_20x" }
+                  "rateLimitTier": "default_claude_max_20x",
+                  "planDisplayName": "Ultra" }
             ] }"#,
         );
         let manager = manager_on_file(&path, Arc::new(NoProber));
