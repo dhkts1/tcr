@@ -285,6 +285,24 @@ final class AccountLineTests: XCTestCase {
         XCTAssertNil(try canonical("alice@example.com").lineNoWindowsText)
     }
 
+    /// A Claude plan with no 5-hour window (Ultra) says so the way a Codex plan does,
+    /// `quotaWindows: ["sevenDay"]`, and its line leaves the 5h slot blank rather than
+    /// drawing a `5h` meter reading `n/a`. Without the key a Claude line is the
+    /// `5h`/`7d` line it always was.
+    func testAClaudePlanWithNoFiveHourWindowLeavesItsSlotBlank() throws {
+        let ultra = try canonical(
+            "alice@example.com", ["fiveHour": NSNull(), "quotaWindows": ["sevenDay"]])
+        XCTAssertEqual(ultra.provider, .anthropic)
+        XCTAssertEqual(ultra.reportedWindows, [.sevenDay])
+        XCTAssertEqual(ultra.lineSlotLabels, [nil, "7d"])
+        XCTAssertNil(ultra.lineNoWindowsText)
+
+        let alice = try canonical("alice@example.com")
+        XCTAssertNil(alice.quotaWindows)
+        XCTAssertEqual(alice.reportedWindows, [.fiveHour, .sevenDay])
+        XCTAssertEqual(alice.lineSlotLabels, ["5h", "7d"])
+    }
+
     func testTheCodexSignalWords() throws {
         let forbiddenHold: [String: Any] = [
             "gate": "refused", "freeAtMs": 1_767_225_690_000,

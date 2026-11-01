@@ -2332,15 +2332,16 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
 
     /// The windows this account's card draws a row for, in order.
     ///
-    /// Both, as always, on a Claude row and on a Codex row whose plan has not said
-    /// which windows it has (``quotaWindows`` is `nil`): an unknown is drawn as the
-    /// two rows the panel has always drawn, empty until measured. Otherwise exactly
-    /// the windows the plan reported, so a ChatGPT Pro plan, which has no 5-hour
-    /// window, draws one weekly row rather than a 5-hour row of nothing, and a plan
-    /// that reports none draws no row at all. A window the plan does not report is not
-    /// a reading nobody took; it does not exist, and the row would claim it does.
+    /// Both on a row whose plan has not said which windows it has (``quotaWindows``
+    /// is `nil`, as on every Claude row but Ultra's): an unknown is drawn as the two
+    /// rows the panel has always drawn, empty until measured. Otherwise exactly the
+    /// windows the plan reported, on either provider, so a ChatGPT Pro plan or a
+    /// Claude Ultra plan, neither of which has a 5-hour window, draws one weekly row
+    /// rather than a 5-hour row of nothing, and a plan that reports none draws no row
+    /// at all. A window the plan does not report is not a reading nobody took; it does
+    /// not exist, and the row would claim it does.
     public var reportedWindows: [QuotaWindow] {
-        guard provider == .codex, let quotaWindows else { return [.fiveHour, .sevenDay] }
+        guard let quotaWindows else { return [.fiveHour, .sevenDay] }
         var windows: [QuotaWindow] = []
         for kind in quotaWindows {
             let window: QuotaWindow = kind == .fiveHour ? .fiveHour : .sevenDay
