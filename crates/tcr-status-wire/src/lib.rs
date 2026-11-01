@@ -811,8 +811,14 @@ pub struct AccountStatusRow {
     /// of a seated org, not of every account.
     #[serde(default)]
     pub seat_tier: Option<String>,
-    /// The customer-facing plan label ("Max 20x", "Team Premium", ...) derived
-    /// from the three raw fields above by [`plan_label`] — or, on a Codex row,
+    /// The plan's own name as the provider shows it, verbatim
+    /// (`organization.plan_display_name`, "Ultra"). `None` on an org whose profile
+    /// has no such key (Team, measured 2026-11-01), or a row not profiled since it
+    /// appeared. When present it is the [`Self::plan`] label.
+    #[serde(default)]
+    pub plan_display_name: Option<String>,
+    /// The customer-facing plan label ("Ultra", "Max 20x", "Team Premium", ...) derived
+    /// from the four raw fields above by [`plan_label`] — or, on a Codex row,
     /// from `organizationType` alone by [`codex_plan_label`] ("ChatGPT Pro") —
     /// the ONE place each mapping exists, so the CLI's plain text, the TUI and
     /// the macOS panel cannot disagree about what a row's plan is called.
@@ -836,20 +842,26 @@ pub struct AccountStatusRow {
     pub org_name: Option<String>,
 }
 
-/// The customer-facing plan label for one account, derived from the three raw
-/// profile fields — `organization.organization_type`,
+/// The customer-facing plan label for one account: the provider's own plan name
+/// (`organization.plan_display_name`) when the profile carries one, else derived
+/// from the three raw profile fields `organization.organization_type`,
 /// `organization.rate_limit_tier` and `organization.seat_tier`.
 ///
 /// The single place this mapping exists. It lives in the wire crate rather than
 /// the binary because both consumers need it: the server fills the `plan` field
 /// from here, and so does the CLI's OFFLINE path, which has no server to ask.
 ///
-/// `organization_type` is the PLAN WORD — Max, Pro, Team, Enterprise. The other
+/// A non-empty `plan_display_name` is the label, verbatim: measured 2026-11-01, a
+/// Max-20x org's profile names its plan "Ultra", while a Team org's profile has
+/// no such key and is labelled as below.
+///
+/// Otherwise `organization_type` is the PLAN WORD — Max, Pro, Team, Enterprise. The other
 /// two supply at most one SUFFIX after it, and the rate-limit multiplier wins
 /// when both could:
 ///
 /// | plan word | suffix from | example |
 /// |---|---|---|
+/// | `plan_display_name` present | nothing: that word, as the provider shows it | `Ultra` |
 /// | any | `rate_limit_tier` ending `_20x` / `_5x` | `Max 20x`, `Team 5x` |
 /// | Team / Enterprise, no multiplier | `seat_tier` | `Team Standard`, `Team Tier 2` |
 /// | Max / Pro, no multiplier | nothing | `Max`, `Pro` |
@@ -878,7 +890,12 @@ pub fn plan_label(
     organization_type: Option<&str>,
     rate_limit_tier: Option<&str>,
     seat_tier: Option<&str>,
+    plan_display_name: Option<&str>,
 ) -> Option<String> {
+    // The provider's own name for the plan outranks every derivation below.
+    if let Some(name) = plan_display_name.map(str::trim).filter(|n| !n.is_empty()) {
+        return Some(name.to_string());
+    }
     /// The rate-limit multiplier a tier names, if it names one.
     fn multiplier(rate_limit_tier: Option<&str>) -> Option<&'static str> {
         let tier = rate_limit_tier?;
@@ -1004,14 +1021,20 @@ mod tests {
     #[test]
     fn plan_label_names_the_three_rows_the_live_fleet_produces() {
         assert_eq!(
-            plan_label(Some("claude_max"), Some("default_claude_max_20x"), None),
+            plan_label(
+                Some("claude_max"),
+                Some("default_claude_max_20x"),
+                None,
+                None
+            ),
             Some("Max 20x".to_string())
         );
         assert_eq!(
             plan_label(
                 Some("claude_team"),
                 Some("default_claude_max_5x"),
-                Some("team_tier_1")
+                Some("team_tier_1"),
+                None
             ),
             Some("Team 5x".to_string()),
             "a premium Team seat carries a 5x multiplier, and the multiplier is \
@@ -1021,7 +1044,8 @@ mod tests {
             plan_label(
                 Some("claude_team"),
                 Some("default_raven"),
-                Some("team_standard")
+                Some("team_standard"),
+                None
             ),
             Some("Team Standard".to_string()),
             "a standard seat's tier names no multiplier, so the seat is what is \
@@ -1032,21 +1056,26 @@ mod tests {
     #[test]
     fn plan_label_falls_back_to_the_seat_only_when_no_multiplier_is_named() {
         assert_eq!(
-            plan_label(Some("claude_team"), None, Some("team_tier_2")),
+            plan_label(Some("claude_team"), None, Some("team_tier_2"), None),
             Some("Team Tier 2".to_string()),
             "a seat tier with no multiplier beside it is spelled out"
         );
         assert_eq!(
-            plan_label(Some("claude_team"), Some("default_raven"), None),
+            plan_label(Some("claude_team"), Some("default_raven"), None, None),
             Some("Team".to_string()),
             "no multiplier and no seat means no suffix — never a guessed Standard"
         );
         assert_eq!(
-            plan_label(Some("claude_enterprise"), None, Some("enterprise_standard")),
+            plan_label(
+                Some("claude_enterprise"),
+                None,
+                Some("enterprise_standard"),
+                None
+            ),
             Some("Enterprise Standard".to_string())
         );
         assert_eq!(
-            plan_label(Some("claude_enterprise"), Some("something_20x"), None),
+            plan_label(Some("claude_enterprise"), Some("something_20x"), None, None),
             Some("Enterprise 20x".to_string())
         );
     }
@@ -1054,20 +1083,25 @@ mod tests {
     #[test]
     fn plan_label_ignores_a_seat_on_an_unseated_plan() {
         assert_eq!(
-            plan_label(Some("claude_max"), None, Some("team_standard")),
+            plan_label(Some("claude_max"), None, Some("team_standard"), None),
             Some("Max".to_string()),
             "Max has no seats, so a stray seat value must not become part of its name"
         );
         assert_eq!(
-            plan_label(Some("claude_pro"), None, Some("team_tier_1")),
+            plan_label(Some("claude_pro"), None, Some("team_tier_1"), None),
             Some("Pro".to_string())
         );
         assert_eq!(
-            plan_label(Some("claude_max"), Some("default_claude_max_5x"), None),
+            plan_label(
+                Some("claude_max"),
+                Some("default_claude_max_5x"),
+                None,
+                None
+            ),
             Some("Max 5x".to_string())
         );
         assert_eq!(
-            plan_label(Some("claude_max"), Some("something_else"), None),
+            plan_label(Some("claude_max"), Some("something_else"), None, None),
             Some("Max".to_string()),
             "a tier naming no multiplier leaves the size off rather than guessing one"
         );
@@ -1079,7 +1113,8 @@ mod tests {
             plan_label(
                 Some("claude_something_new"),
                 Some("default_claude_max_20x"),
-                Some("team_standard")
+                Some("team_standard"),
+                None
             ),
             Some("claude_something_new".to_string()),
             "an unrecognized plan must survive verbatim, never be bucketed into a \
@@ -1091,27 +1126,58 @@ mod tests {
     #[test]
     fn plan_label_returns_an_unknown_seat_tier_verbatim() {
         assert_eq!(
-            plan_label(Some("claude_team"), None, Some("team_trial")),
+            plan_label(Some("claude_team"), None, Some("team_trial"), None),
             Some("Team team_trial".to_string()),
             "an unrecognized seat is a real difference between two rows — it rides \
              along verbatim rather than being dropped or read as standard"
         );
         assert_eq!(
-            plan_label(Some("claude_team"), None, Some("team_tier_x")),
+            plan_label(Some("claude_team"), None, Some("team_tier_x"), None),
             Some("Team team_tier_x".to_string()),
             "a tier suffix that is not a number is not a tier number"
+        );
+    }
+
+    /// The provider's own plan name wins, verbatim, over the tier derivation
+    /// (measured 2026-11-01: a `default_claude_max_20x` org's profile says "Ultra");
+    /// a blank one does not count as a name.
+    #[test]
+    fn plan_label_is_the_providers_display_name_when_present() {
+        assert_eq!(
+            plan_label(
+                Some("claude_max"),
+                Some("default_claude_max_20x"),
+                None,
+                Some("Ultra")
+            ),
+            Some("Ultra".to_string())
+        );
+        assert_eq!(
+            plan_label(
+                Some("claude_max"),
+                Some("default_claude_max_20x"),
+                None,
+                Some("  ")
+            ),
+            Some("Max 20x".to_string()),
+            "a blank display name falls back to the derivation"
         );
     }
 
     #[test]
     fn plan_label_is_none_when_the_plan_is_unknown() {
         assert_eq!(
-            plan_label(None, None, None),
+            plan_label(None, None, None, None),
             None,
             "an unprofiled account has no label — never a fabricated default"
         );
         assert_eq!(
-            plan_label(None, Some("default_claude_max_20x"), Some("team_standard")),
+            plan_label(
+                None,
+                Some("default_claude_max_20x"),
+                Some("team_standard"),
+                None
+            ),
             None,
             "neither refinement ever names a plan on its own: non-Max orgs carry \
              tiers, and a seat without a plan is not a plan"

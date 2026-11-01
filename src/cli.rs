@@ -2976,10 +2976,15 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
 
 /// `{label}=none` for a Codex row whose plan reported its usage windows without `window`
 /// (`"fiveHour"` or `"sevenDay"`), else `None`, leaving the token to [`render_window`]. An
-/// unknown list is not a plan without the window, and a Claude row has no such list at all.
+/// unknown list is not a plan without the window. A Claude row has no such list; its one
+/// such fact is a usage read that said `"five_hour": null`
+/// ([`AccountSnapshot::five_hour_absent_on_plan`]), which makes its 5h token `5h=none`.
 fn unreported_window(a: &AccountSnapshot, label: &str, window: &str) -> Option<String> {
     let reported = match a.provider {
-        Provider::Anthropic => return None,
+        Provider::Anthropic => {
+            return (window == "fiveHour" && a.five_hour_absent_on_plan)
+                .then(|| format!("{label}=none"));
+        }
         Provider::Codex => a.codex.quota_windows.as_ref()?,
     };
     (!reported.iter().any(|w| w == window)).then(|| format!("{label}=none"))
@@ -3528,6 +3533,7 @@ fn account_status_rows_at(
                 organization_type: a.organization_type.clone(),
                 rate_limit_tier: a.rate_limit_tier.clone(),
                 seat_tier: a.seat_tier.clone(),
+                plan_display_name: a.plan_display_name.clone(),
                 // Derived HERE, once, by `AccountSnapshot::plan_label` — the
                 // same method the TUI and the plain-text renderer call, so
                 // three surfaces cannot disagree about what one row's plan is
@@ -7681,7 +7687,7 @@ mod tests {
             let util = self.util;
             Box::pin(async move {
                 Ok(Usage {
-                    five_hour: Some(UsageBucket {
+                    five_hour: crate::probe::WindowReading::Read(UsageBucket {
                         utilization: Some(util),
                         reset_at_ms: Some(crate::now_ms() + 3_600_000),
                     }),
@@ -7720,7 +7726,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 Ok(Usage {
-                    five_hour: Some(UsageBucket {
+                    five_hour: crate::probe::WindowReading::Read(UsageBucket {
                         utilization: Some(0.5),
                         reset_at_ms: Some(crate::now_ms() + 3_600_000),
                     }),
@@ -9392,7 +9398,7 @@ mod tests {
                 Box::pin(async move {
                     match provider {
                         Provider::Anthropic => Ok(Usage {
-                            five_hour: Some(UsageBucket {
+                            five_hour: crate::probe::WindowReading::Read(UsageBucket {
                                 utilization: Some(0.2),
                                 reset_at_ms: None,
                             }),
@@ -9646,7 +9652,7 @@ mod tests {
             Box::pin(async move {
                 if credential.access_token == "at-a" {
                     Ok(Usage {
-                        five_hour: Some(UsageBucket {
+                        five_hour: crate::probe::WindowReading::Read(UsageBucket {
                             utilization: Some(0.95),
                             reset_at_ms: Some(now + 92 * 60 * 1000),
                         }),
@@ -9657,7 +9663,7 @@ mod tests {
                     })
                 } else {
                     Ok(Usage {
-                        five_hour: None,
+                        five_hour: crate::probe::WindowReading::Unread,
                         seven_day: Some(UsageBucket {
                             utilization: Some(0.97),
                             reset_at_ms: Some(now + 3 * 24 * 60 * 60 * 1000),
@@ -9737,7 +9743,7 @@ mod tests {
             Box::pin(async move {
                 if credential.access_token == "at-a" {
                     Ok(Usage {
-                        five_hour: Some(UsageBucket {
+                        five_hour: crate::probe::WindowReading::Read(UsageBucket {
                             utilization: Some(0.3),
                             reset_at_ms: Some(now + 42 * 60 * 1000),
                         }),
@@ -9748,7 +9754,7 @@ mod tests {
                     })
                 } else {
                     Ok(Usage {
-                        five_hour: None,
+                        five_hour: crate::probe::WindowReading::Unread,
                         seven_day: None,
                         seven_day_oi: None,
                         extra_usage_usd: None,
@@ -9957,7 +9963,7 @@ mod tests {
             let now = crate::now_ms();
             Box::pin(async move {
                 Ok(Usage {
-                    five_hour: Some(UsageBucket {
+                    five_hour: crate::probe::WindowReading::Read(UsageBucket {
                         utilization: Some(1.0),
                         reset_at_ms: Some(now + 45 * 60 * 1000),
                     }),
@@ -10046,6 +10052,7 @@ mod tests {
             organization_type: plan.0.map(str::to_string),
             rate_limit_tier: plan.1.map(str::to_string),
             seat_tier: plan.2.map(str::to_string),
+            plan_display_name: None,
             org_uuid: org.0.map(str::to_string),
             org_name: org.1.map(str::to_string),
             priority,
@@ -10053,6 +10060,7 @@ mod tests {
             disabled,
             five_hour,
             five_hour_reset,
+            five_hour_absent_on_plan: false,
             seven_day,
             seven_day_reset,
             seven_day_oi,
@@ -12329,6 +12337,7 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            plan_display_name: None,
             org_uuid: None,
             org_name: None,
             priority: 0,
@@ -12336,6 +12345,7 @@ mod tests {
             disabled: false,
             five_hour: None,
             five_hour_reset: None,
+            five_hour_absent_on_plan: false,
             seven_day: None,
             seven_day_reset: None,
             seven_day_oi: None,
@@ -12756,6 +12766,64 @@ mod tests {
             );
             assert!(line.contains(holds), "{name} must hold {holds:?}: {line}");
         }
+    }
+
+    /// An Ultra row as measured 2026-11-01: a Max-20x org whose profile names its plan
+    /// "Ultra" and whose usage read said `"five_hour": null`. Through the server-to-CLI
+    /// wire (the live `tcr status` path), its line says `plan=Ultra` and `5h=none`, while
+    /// `5h=n/a` stays for a 5h window that is merely unknown.
+    #[test]
+    fn an_ultra_row_reads_plan_ultra_and_five_hour_none_through_the_wire() {
+        let row = |name: &str| {
+            contract_account(
+                name,
+                0,
+                "active",
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ProbeStatus::Ok,
+                None,
+                QuotaState::Normal,
+                &[],
+                None,
+                (Some("claude_max"), Some("default_claude_max_20x"), None),
+                (None, None),
+            )
+        };
+        let ultra = AccountSnapshot {
+            plan_display_name: Some("Ultra".to_string()),
+            five_hour_absent_on_plan: true,
+            ..row("alice@example.com")
+        };
+        let unknown = row("bob@example.com");
+        let snapshot = snapshot_of(vec![ultra, unknown]);
+        let payload =
+            StatusPayload::from_snapshot(&snapshot, &[0.95, 0.95], false, None, Default::default());
+        let wire = serde_json::to_string(&payload).expect("serialize");
+        let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
+        let (rebuilt, _) = back.into_snapshot();
+        let text = render_accounts(&rebuilt, StatusSource::Live);
+        let line_for = |name: &str| {
+            text.lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("{name} line in {text}"))
+                .to_string()
+        };
+        let alice = line_for("alice@example.com");
+        assert!(
+            alice.contains(" plan=Ultra 5h=none wk=n/a "),
+            "the provider's plan name and the plan's missing 5h window: {alice}"
+        );
+        let bob = line_for("bob@example.com");
+        assert!(
+            bob.contains(" plan=Max 20x 5h=n/a "),
+            "no display name and no null: today's label and `n/a`: {bob}"
+        );
     }
 
     /// `tcr accounts` prints `tcr status`'s account line, the Codex tokens included, from its

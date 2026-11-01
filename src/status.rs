@@ -458,6 +458,13 @@ pub struct AccountStatus {
     /// Timestamps cross the wire as Unix milliseconds — the same unit the config's
     /// `expiresAt` and every internal deadline already use.
     pub five_hour_reset_ms: Option<i64>,
+    /// [`AccountSnapshot::five_hour_absent_on_plan`]: the plan has no 5-hour window.
+    /// On this server-to-CLI wire because only the server probed it and the live
+    /// `tcr status` text renders it as `5h=none`. Skipped when `false`, and a
+    /// missing key reads `false`, so both skew directions show `5h=n/a` exactly as
+    /// before; no [`STATUS_KIND`] bump.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub five_hour_absent_on_plan: bool,
     pub seven_day: Option<f64>,
     pub seven_day_reset_ms: Option<i64>,
     pub seven_day_oi: Option<f64>,
@@ -584,6 +591,8 @@ pub struct AccountStatus {
     pub rate_limit_tier: Option<String>,
     #[serde(default)]
     pub seat_tier: Option<String>,
+    #[serde(default)]
+    pub plan_display_name: Option<String>,
     /// The org this account is scoped to — see [`AccountSnapshot::org_uuid`]:
     /// a fact for a client to show, never an address. `#[serde(default)]`
     /// for the same forward-compat reason as the fields above.
@@ -693,6 +702,7 @@ impl StatusPayload {
                 disabled: a.disabled,
                 five_hour: a.five_hour,
                 five_hour_reset_ms: a.five_hour_reset.map(to_ms),
+                five_hour_absent_on_plan: a.five_hour_absent_on_plan,
                 seven_day: a.seven_day,
                 seven_day_reset_ms: a.seven_day_reset.map(to_ms),
                 seven_day_oi: a.seven_day_oi,
@@ -722,6 +732,7 @@ impl StatusPayload {
                 organization_type: a.organization_type.clone(),
                 rate_limit_tier: a.rate_limit_tier.clone(),
                 seat_tier: a.seat_tier.clone(),
+                plan_display_name: a.plan_display_name.clone(),
                 org_uuid: a.org_uuid.clone(),
                 org_name: a.org_name.clone(),
                 usage: a.usage.clone(),
@@ -807,6 +818,7 @@ impl StatusPayload {
                     organization_type: a.organization_type,
                     rate_limit_tier: a.rate_limit_tier,
                     seat_tier: a.seat_tier,
+                    plan_display_name: a.plan_display_name,
                     org_uuid: a.org_uuid,
                     org_name: a.org_name,
                     priority: a.priority,
@@ -814,6 +826,7 @@ impl StatusPayload {
                     disabled: a.disabled,
                     five_hour: a.five_hour,
                     five_hour_reset: a.five_hour_reset_ms.and_then(from_ms),
+                    five_hour_absent_on_plan: a.five_hour_absent_on_plan,
                     seven_day: a.seven_day,
                     seven_day_reset: a.seven_day_reset_ms.and_then(from_ms),
                     seven_day_oi: a.seven_day_oi,
@@ -2163,6 +2176,7 @@ mod tests {
                 organization_type: Some("claude_team".to_string()),
                 rate_limit_tier: Some("default_raven".to_string()),
                 seat_tier: Some("team_standard".to_string()),
+                plan_display_name: None,
                 org_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
                 org_name: Some("Example Org".to_string()),
                 priority: 0,
@@ -2170,6 +2184,7 @@ mod tests {
                 disabled: false,
                 five_hour: Some(0.42),
                 five_hour_reset: from_ms(crate::now_ms() + 3_600_000),
+                five_hour_absent_on_plan: false,
                 seven_day: None,
                 seven_day_reset: None,
                 seven_day_oi: Some(0.11),

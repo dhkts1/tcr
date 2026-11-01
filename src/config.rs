@@ -439,6 +439,14 @@ pub struct Account {
     /// no multiplier, which outranks it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat_tier: Option<String>,
+    /// The plan's own name as the provider shows it, verbatim
+    /// (`organization.plan_display_name`, "Ultra" on a Max-20x org, measured
+    /// 2026-11-01). Optional per org: a Team org's profile has no such key. When
+    /// present it IS the label [`tcr_status_wire::plan_label`] returns; when
+    /// absent the label is derived from the three fields above. Overwritten on a
+    /// fresh profile read and never blanked by a `None`, like them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_display_name: Option<String>,
     /// Which node this account's requests leave from. See [`Egress`]; absent is
     /// [`Egress::Local`], which is what every account did before this key
     /// existed.
@@ -503,6 +511,7 @@ impl Account {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            plan_display_name: None,
             egress: Egress::Local,
             egress_strict: false,
             codex_home: None,
@@ -3618,7 +3627,7 @@ impl std::fmt::Display for PlanWrite {
     }
 }
 
-/// Persist ONLY the plan fields (`organizationType`, `rateLimitTier`,
+/// Persist ONLY the plan fields (`organizationType`, `rateLimitTier`, `planDisplayName`,
 /// `seatTier`) of the one account matching `target`'s identity, leaving every
 /// other key — and every other account — exactly as the user left it.
 ///
@@ -3644,6 +3653,7 @@ pub fn save_plan(
     organization_type: Option<&str>,
     rate_limit_tier: Option<&str>,
     seat_tier: Option<&str>,
+    plan_display_name: Option<&str>,
 ) -> Result<PlanWrite, ConfigError> {
     edit_document(path, |doc| {
         Ok(merge_plan(
@@ -3652,6 +3662,7 @@ pub fn save_plan(
             organization_type,
             rate_limit_tier,
             seat_tier,
+            plan_display_name,
         ))
     })
 }
@@ -3665,6 +3676,7 @@ fn merge_plan(
     organization_type: Option<&str>,
     rate_limit_tier: Option<&str>,
     seat_tier: Option<&str>,
+    plan_display_name: Option<&str>,
 ) -> PlanWrite {
     let entry = match find_account_entry(doc, target) {
         Ok(entry) => entry,
@@ -3675,6 +3687,7 @@ fn merge_plan(
         ("organizationType", organization_type),
         ("rateLimitTier", rate_limit_tier),
         ("seatTier", seat_tier),
+        ("planDisplayName", plan_display_name),
     ] {
         let Some(value) = value else { continue };
         let desired = Value::String(value.to_string());
@@ -4490,6 +4503,12 @@ fn merge_account(
                 }
                 if let Some(seat) = &account.seat_tier {
                     entry.insert("seatTier".to_string(), Value::String(seat.clone()));
+                }
+                if let Some(display) = &account.plan_display_name {
+                    entry.insert(
+                        "planDisplayName".to_string(),
+                        Value::String(display.clone()),
+                    );
                 }
             }
             Ok(AccountWrite::Updated)
@@ -7753,6 +7772,7 @@ mod tests {
                 Some("claude_team"),
                 Some("default_raven"),
                 Some("team_tier_1"),
+                None,
             )
             .unwrap(),
             PlanWrite::Updated
@@ -7790,6 +7810,7 @@ mod tests {
                 Some("claude_max"),
                 Some("default_claude_max_20x"),
                 None,
+                None,
             )
             .unwrap(),
             PlanWrite::Updated
@@ -7824,6 +7845,7 @@ mod tests {
                 Some("claude_team"),
                 None,
                 Some("team_standard"),
+                None,
             )
             .unwrap(),
             PlanWrite::Unchanged
@@ -7856,6 +7878,7 @@ mod tests {
             Some("claude_team"),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -7886,6 +7909,7 @@ mod tests {
                 &path,
                 &by_name("me@example.com"),
                 Some("claude_max"),
+                None,
                 None,
                 None,
             )

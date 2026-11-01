@@ -208,6 +208,7 @@ fn base(name: &str) -> AccountStatusRow {
         organization_type: None,
         rate_limit_tier: None,
         seat_tier: None,
+        plan_display_name: None,
         plan: None,
         org_uuid: None,
         org_name: None,

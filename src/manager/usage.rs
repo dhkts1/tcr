@@ -533,7 +533,11 @@ impl Manager {
                     account.quota.apply_usage_at(usage, now);
                     self.with_forecast_slot(idx, |fit| {
                         fit.observe(
-                            [usage.five_hour, usage.seven_day, usage.seven_day_oi],
+                            [
+                                usage.five_hour.bucket(),
+                                usage.seven_day,
+                                usage.seven_day_oi,
+                            ],
                             odt_to_ms(now),
                             account.in_flight != 0,
                         );
@@ -578,8 +582,8 @@ impl Manager {
         };
         tracing::info!(
             account = %name,
-            five_hour = util(usage.five_hour),
-            five_hour_reset_ms = reset(usage.five_hour),
+            five_hour = util(usage.five_hour.bucket()),
+            five_hour_reset_ms = reset(usage.five_hour.bucket()),
             seven_day = util(usage.seven_day),
             seven_day_reset_ms = reset(usage.seven_day),
             seven_day_oi = util(usage.seven_day_oi),

@@ -1109,6 +1109,9 @@ pub struct Profile {
     /// seated org (`team_standard`, `team_tier_1`). `None` on Max and Pro,
     /// which have no seats.
     pub seat_tier: Option<String>,
+    /// `organization.plan_display_name`, verbatim ("Ultra"): the plan's own name,
+    /// which wins the label when present. Absent on orgs whose profile has no such key.
+    pub plan_display_name: Option<String>,
 }
 
 impl Profile {
@@ -1238,6 +1241,7 @@ pub async fn fetch_profile_at(url: &str, access_token: &str) -> Profile {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            plan_display_name: None,
         })
 }
 
@@ -1274,6 +1278,7 @@ pub async fn try_fetch_profile_at(
         organization_type: Option<String>,
         rate_limit_tier: Option<String>,
         seat_tier: Option<String>,
+        plan_display_name: Option<String>,
     }
 
     async fn inner(url: &str, access_token: &str) -> Result<ProfileResponse, ProfileFetchError> {
@@ -1316,7 +1321,8 @@ pub async fn try_fetch_profile_at(
                     .as_ref()
                     .and_then(|o| o.rate_limit_tier.clone()),
             ),
-            seat_tier: non_empty(organization.and_then(|o| o.seat_tier)),
+            seat_tier: non_empty(organization.as_ref().and_then(|o| o.seat_tier.clone())),
+            plan_display_name: non_empty(organization.and_then(|o| o.plan_display_name)),
         }
     })
 }
@@ -1414,6 +1420,11 @@ pub fn upsert_account(
             }
             if profile.seat_tier.is_some() {
                 account.seat_tier.clone_from(&profile.seat_tier);
+            }
+            if profile.plan_display_name.is_some() {
+                account
+                    .plan_display_name
+                    .clone_from(&profile.plan_display_name);
             }
             Ok(())
         }
@@ -3670,6 +3681,7 @@ fn claude_login_row(name: &str, tokens: &Tokens, profile: &Profile) -> Account {
         organization_type: profile.organization_type.clone(),
         rate_limit_tier: profile.rate_limit_tier.clone(),
         seat_tier: profile.seat_tier.clone(),
+        plan_display_name: profile.plan_display_name.clone(),
         ..Account::new(
             name,
             crate::provider::Provider::Anthropic,
@@ -4442,6 +4454,7 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            plan_display_name: None,
         }
     }
 
@@ -5381,6 +5394,7 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            plan_display_name: None,
         }
     }
 
@@ -5400,6 +5414,7 @@ mod tests {
             organization_type: Some(organization_type.to_string()),
             rate_limit_tier: rate_limit_tier.map(str::to_string),
             seat_tier: seat_tier.map(str::to_string),
+            plan_display_name: None,
         }
     }
 
@@ -5525,6 +5540,7 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            plan_display_name: None,
         };
         let err = finish_login_checked(
             &path,
@@ -5674,6 +5690,7 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            plan_display_name: None,
         }
     }
 
@@ -6508,6 +6525,7 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            plan_display_name: None,
         }
     }
 

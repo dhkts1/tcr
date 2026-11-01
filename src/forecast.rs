@@ -1015,7 +1015,7 @@ mod response_header_tests {
                 })
             };
             crate::probe::Usage {
-                five_hour: bucket(18_000),
+                five_hour: bucket(18_000).into(),
                 seven_day: bucket(604_800),
                 seven_day_oi: bucket(604_800),
                 ..Default::default()
@@ -1247,7 +1247,7 @@ mod restored_forecast_call_tests {
             manager.apply_usage_at(
                 0,
                 &crate::probe::Usage {
-                    five_hour: bucket,
+                    five_hour: bucket.into(),
                     seven_day: bucket,
                     seven_day_oi: bucket,
                     ..Default::default()
@@ -1495,7 +1495,7 @@ mod public_forecast_tests {
             manager.apply_usage_at(
                 0,
                 &crate::probe::Usage {
-                    five_hour: bucket,
+                    five_hour: bucket.into(),
                     seven_day: bucket,
                     seven_day_oi: bucket,
                     ..Default::default()
@@ -1566,7 +1566,7 @@ mod reviewer_upper_watermark {
                 reset_at_ms: Some((start.unix_timestamp() + 18_000) * 1000),
             });
             crate::probe::Usage {
-                five_hour: b,
+                five_hour: b.into(),
                 seven_day: b,
                 seven_day_oi: b,
                 ..Default::default()
@@ -1766,7 +1766,7 @@ mod reviewer_lower_watermark {
                 reset_at_ms: Some((start.unix_timestamp() + 18_000) * 1000),
             });
             crate::probe::Usage {
-                five_hour: b,
+                five_hour: b.into(),
                 seven_day: b,
                 seven_day_oi: b,
                 ..Default::default()

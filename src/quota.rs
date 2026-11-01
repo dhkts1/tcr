@@ -73,6 +73,13 @@ impl QuotaWindow {
 pub struct Quota {
     /// Shared 5-hour session bucket (`unified-5h`).
     pub five_hour: Option<QuotaWindow>,
+    /// The usage endpoint's last word on the 5h window was an explicit `null`: this
+    /// plan has no 5-hour window (an Ultra org, measured 2026-11-01), which is not
+    /// the same fact as "unread". Set only by [`Self::apply_usage_at`] on
+    /// [`crate::probe::WindowReading::PlanHasNone`], which also clears
+    /// [`Self::five_hour`]; cleared by any 5h reading, from a probe or a header. The
+    /// warmer skips an account with it set (`Manager::warm_targets`).
+    pub five_hour_absent_on_plan: bool,
     /// Shared weekly bucket (`unified-7d`).
     pub seven_day: Option<QuotaWindow>,
     /// Model-scoped weekly bucket (`unified-7d_oi`, the Fable weekly on current
@@ -179,6 +186,8 @@ impl Quota {
                 utilization: util,
                 reset,
             });
+            // A 5h header is first-hand evidence the plan has the window.
+            self.five_hour_absent_on_plan = false;
             read_five_hour = true;
             read_any = true;
         }
@@ -408,6 +417,10 @@ impl Quota {
     ///  - it reported `None` and there is NO prior → the window stays **absent**.
     ///    "We could not read this" is not "this is at 0%", and a fabricated `0.0`
     ///    is byte-identical to a genuine one. See [`apply_bucket`].
+    ///
+    /// The 5h window has a fourth case: an explicit `"five_hour": null`
+    /// ([`crate::probe::WindowReading::PlanHasNone`]) is a reading, not a gap, and
+    /// clears the window and sets [`Self::five_hour_absent_on_plan`].
     pub fn apply_usage(&mut self, usage: &crate::probe::Usage) {
         self.apply_usage_at(usage, OffsetDateTime::now_utc());
     }
@@ -419,7 +432,19 @@ impl Quota {
         // exactly that value.
         self.drop_rejection_if_a_window_rolled(usage);
 
-        apply_bucket(&mut self.five_hour, usage.five_hour, FIVE_HOUR, now);
+        match usage.five_hour {
+            crate::probe::WindowReading::Unread => {}
+            // The plan has no 5h window: whatever was tracked before is stale, and
+            // keeping it would gate and warm a window that does not exist.
+            crate::probe::WindowReading::PlanHasNone => {
+                self.five_hour = None;
+                self.five_hour_absent_on_plan = true;
+            }
+            crate::probe::WindowReading::Read(bucket) => {
+                apply_bucket(&mut self.five_hour, Some(bucket), FIVE_HOUR, now);
+                self.five_hour_absent_on_plan = false;
+            }
+        }
         apply_bucket(&mut self.seven_day, usage.seven_day, SEVEN_DAY, now);
         apply_bucket(&mut self.seven_day_oi, usage.seven_day_oi, SEVEN_DAY, now);
         // Same rule as the buckets above: only a reported value overwrites.
@@ -533,7 +558,7 @@ impl Quota {
         if self.status.as_deref() != Some("rejected") {
             return;
         }
-        if window_rolled(self.five_hour, usage.five_hour)
+        if window_rolled(self.five_hour, usage.five_hour.bucket())
             || window_rolled(self.seven_day, usage.seven_day)
         {
             self.status = None;
@@ -1454,7 +1479,7 @@ mod tests {
                 }
             } else {
                 crate::probe::Usage {
-                    five_hour: bucket(0.04),
+                    five_hour: bucket(0.04).into(),
                     ..Default::default()
                 }
             };
@@ -1477,7 +1502,7 @@ mod tests {
         // Utilization climbing within the same window.
         let mut climbing = rejected_with(false, 0.97);
         climbing.apply_usage(&crate::probe::Usage {
-            five_hour: bucket(0.99),
+            five_hour: bucket(0.99).into(),
             ..Default::default()
         });
         assert_eq!(
@@ -1489,7 +1514,7 @@ mod tests {
         // Identical reading: no evidence of anything.
         let mut flat = rejected_with(false, 0.99);
         flat.apply_usage(&crate::probe::Usage {
-            five_hour: bucket(0.99),
+            five_hour: bucket(0.99).into(),
             ..Default::default()
         });
         assert_eq!(
@@ -1513,7 +1538,7 @@ mod tests {
             ..Default::default()
         };
         unknown.apply_usage(&crate::probe::Usage {
-            five_hour: bucket(0.01),
+            five_hour: bucket(0.01).into(),
             ..Default::default()
         });
         assert_eq!(
@@ -1560,7 +1585,7 @@ mod tests {
         };
 
         quota.apply_usage(&crate::probe::Usage {
-            five_hour: bucket(0.01),
+            five_hour: bucket(0.01).into(),
             ..Default::default()
         });
 
@@ -1583,7 +1608,7 @@ mod tests {
     fn probed_zero_bucket_does_not_fabricate_a_window() {
         let mut quota = Quota::default();
         quota.apply_usage(&crate::probe::Usage {
-            five_hour: Some(crate::probe::UsageBucket {
+            five_hour: crate::probe::WindowReading::Read(crate::probe::UsageBucket {
                 utilization: Some(0.0),
                 reset_at_ms: None,
             }),
@@ -1610,7 +1635,7 @@ mod tests {
     fn probed_nonzero_bucket_without_reset_still_gets_a_bounded_window() {
         let mut quota = Quota::default();
         quota.apply_usage(&crate::probe::Usage {
-            five_hour: Some(crate::probe::UsageBucket {
+            five_hour: crate::probe::WindowReading::Read(crate::probe::UsageBucket {
                 utilization: Some(0.95),
                 reset_at_ms: None,
             }),
@@ -1639,7 +1664,7 @@ mod tests {
     fn unreadable_utilization_with_no_prior_stays_absent() {
         let mut quota = Quota::default();
         quota.apply_usage(&crate::probe::Usage {
-            five_hour: Some(crate::probe::UsageBucket {
+            five_hour: crate::probe::WindowReading::Read(crate::probe::UsageBucket {
                 utilization: None,
                 reset_at_ms: Some(crate::now_ms() + 3_600_000),
             }),
@@ -1686,7 +1711,7 @@ mod tests {
             ..Quota::default()
         };
         quota.apply_usage(&crate::probe::Usage {
-            five_hour: Some(crate::probe::UsageBucket {
+            five_hour: crate::probe::WindowReading::Read(crate::probe::UsageBucket {
                 utilization: None,
                 reset_at_ms: Some((reported_reset.unix_timestamp_nanos() / 1_000_000) as i64),
             }),
@@ -1709,7 +1734,7 @@ mod tests {
             ..Quota::default()
         };
         quota.apply_usage(&crate::probe::Usage {
-            five_hour: Some(crate::probe::UsageBucket {
+            five_hour: crate::probe::WindowReading::Read(crate::probe::UsageBucket {
                 utilization: None,
                 reset_at_ms: None,
             }),
@@ -1729,7 +1754,7 @@ mod tests {
     fn a_genuine_zero_utilization_is_a_reading_not_an_absence() {
         let mut quota = Quota::default();
         quota.apply_usage(&crate::probe::Usage {
-            five_hour: Some(crate::probe::UsageBucket {
+            five_hour: crate::probe::WindowReading::Read(crate::probe::UsageBucket {
                 utilization: Some(0.0),
                 reset_at_ms: None,
             }),
@@ -1743,7 +1768,7 @@ mod tests {
         // A later unreadable probe then falls into the prior-preserving arm, so
         // the measured zero survives instead of blanking the bar.
         quota.apply_usage(&crate::probe::Usage {
-            five_hour: Some(crate::probe::UsageBucket {
+            five_hour: crate::probe::WindowReading::Read(crate::probe::UsageBucket {
                 utilization: None,
                 reset_at_ms: None,
             }),
@@ -2773,5 +2798,73 @@ mod tests {
             "the refusal's kind goes with the refusal"
         );
         assert_eq!(rolled.codex_limit_reached_type(), None);
+    }
+
+    /// The stale `fiveHour=0.0` rows of 2026-11-01: a 5h window tracked from before
+    /// the plan lost it, then a probe saying `"five_hour": null`. The null clears the
+    /// window and marks the plan; a later probe with no 5h key changes neither; a
+    /// later 5h header (the plan evidently has the window again) clears the mark.
+    #[test]
+    fn an_explicit_five_hour_null_clears_the_window_and_marks_the_plan() {
+        let now = OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap();
+        let mut quota = Quota {
+            five_hour: Some(QuotaWindow {
+                utilization: 0.4,
+                reset: Some(now + Duration::hours(2)),
+            }),
+            ..Default::default()
+        };
+
+        quota.apply_usage_at(
+            &crate::probe::Usage {
+                five_hour: crate::probe::WindowReading::PlanHasNone,
+                seven_day: bucket(0.1),
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(
+            quota.five_hour.is_none(),
+            "a plan with no 5h window keeps no 5h window: {:?}",
+            quota.five_hour
+        );
+        assert!(quota.five_hour_absent_on_plan);
+        assert!(quota.seven_day.is_some(), "the weekly still folds");
+
+        quota.apply_usage_at(&crate::probe::Usage::default(), now);
+        assert!(
+            quota.five_hour_absent_on_plan && quota.five_hour.is_none(),
+            "an unread 5h is not evidence either way"
+        );
+
+        let headers = TestHeaders::new(&[
+            ("anthropic-ratelimit-unified-5h-utilization", "0.05"),
+            ("anthropic-ratelimit-unified-5h-reset", "1900018000"),
+        ]);
+        assert!(quota.update_from_headers_at(&headers, now));
+        assert!(
+            !quota.five_hour_absent_on_plan,
+            "a 5h header is the plan having the window"
+        );
+        assert_eq!(quota.five_hour.map(|w| w.utilization), Some(0.05));
+    }
+
+    /// A 5h bucket read by the probe clears the mark too, and folds as it always did.
+    #[test]
+    fn a_five_hour_bucket_after_a_null_clears_the_mark() {
+        let now = OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap();
+        let mut quota = Quota {
+            five_hour_absent_on_plan: true,
+            ..Default::default()
+        };
+        quota.apply_usage_at(
+            &crate::probe::Usage {
+                five_hour: bucket(0.3).into(),
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(!quota.five_hour_absent_on_plan);
+        assert_eq!(quota.five_hour.map(|w| w.utilization), Some(0.3));
     }
 }

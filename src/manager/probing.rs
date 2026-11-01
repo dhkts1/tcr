@@ -360,7 +360,11 @@ impl Manager {
     ///    steady state after the first sweep is zero extra HTTP calls forever.
     ///    Without the gate this is an extra request per account per cadence,
     ///    which is exactly the fingerprintable chatter the randomized schedule
-    ///    exists to remove.
+    ///    exists to remove. One exception, bounded to one request per account
+    ///    per process: a row with a plan but no `plan_display_name` is asked
+    ///    once more (`AccountRuntime::plan_display_name_asked`), because that
+    ///    field arrived after the fleet was profiled (2026-11-01) and a Team
+    ///    org's profile never carries it, so "absent" alone cannot stop asking.
     /// 2. **A failure records nothing and fails nothing.** No probe status is
     ///    written on this path at all: a profile fetch that could not reach the
     ///    endpoint says nothing about the account's quota or its credential, and
@@ -388,7 +392,8 @@ impl Manager {
                 return;
             };
             (
-                account.organization_type.is_some(),
+                account.organization_type.is_some()
+                    && (account.plan_display_name.is_some() || account.plan_display_name_asked),
                 account.access_token.clone(),
             )
         };
@@ -421,6 +426,9 @@ impl Manager {
             let Some(account) = accounts.get_mut(idx) else {
                 return;
             };
+            // A profile read answered: whatever it said about the display name stands
+            // for this process.
+            account.plan_display_name_asked = true;
             if plan.organization_type.is_some() {
                 account
                     .organization_type
@@ -432,11 +440,17 @@ impl Manager {
             if plan.seat_tier.is_some() {
                 account.seat_tier.clone_from(&plan.seat_tier);
             }
+            if plan.plan_display_name.is_some() {
+                account
+                    .plan_display_name
+                    .clone_from(&plan.plan_display_name);
+            }
             tracing::info!(
                 account = %account.name,
                 organization_type = ?account.organization_type,
                 rate_limit_tier = ?account.rate_limit_tier,
                 seat_tier = ?account.seat_tier,
+                plan_display_name = ?account.plan_display_name,
                 "learned this account's plan from the profile endpoint"
             );
             // The identity probe `save_plan` locates the on-disk row by. Built
@@ -533,6 +547,7 @@ impl Manager {
                 plan.organization_type.as_deref(),
                 plan.rate_limit_tier.as_deref(),
                 plan.seat_tier.as_deref(),
+                plan.plan_display_name.as_deref(),
             ) {
                 Ok(config::PlanWrite::Updated | config::PlanWrite::Unchanged) => {}
                 Ok(outcome) => tracing::warn!(

@@ -376,6 +376,11 @@ pub struct AccountRuntime {
     pub organization_type: Option<String>,
     pub rate_limit_tier: Option<String>,
     pub seat_tier: Option<String>,
+    /// Mirrors [`config::Account::plan_display_name`]: the provider's own plan name.
+    pub plan_display_name: Option<String>,
+    /// Runtime only: a profile read answered for this row in this process, so a row
+    /// with a plan and no display name is not asked again (`backfill_plan_if_unknown`).
+    pub plan_display_name_asked: bool,
     pub switch_threshold: Option<f64>,
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -817,6 +822,8 @@ impl AccountRuntime {
             organization_type: account.organization_type.clone(),
             rate_limit_tier: account.rate_limit_tier.clone(),
             seat_tier: account.seat_tier.clone(),
+            plan_display_name: account.plan_display_name.clone(),
+            plan_display_name_asked: false,
             switch_threshold: account.switch_threshold,
             access_token: account.access_token.clone(),
             refresh_token: account.refresh_token.clone(),
@@ -3780,6 +3787,9 @@ impl Manager {
                         if account.seat_tier.is_some() {
                             row.seat_tier.clone_from(&account.seat_tier);
                         }
+                        if account.plan_display_name.is_some() {
+                            row.plan_display_name.clone_from(&account.plan_display_name);
+                        }
                         // F5: carry the row's REAL routing state, not
                         // `identity::probe`'s None placeholders — see
                         // `persist_replaced`'s doc-comment for the restart-un-bench
@@ -3841,6 +3851,7 @@ impl Manager {
                             organization_type: row.organization_type.clone(),
                             rate_limit_tier: row.rate_limit_tier.clone(),
                             seat_tier: row.seat_tier.clone(),
+                            plan_display_name: row.plan_display_name.clone(),
                             // Carried from the config row this account already
                             // resolves to, never hardcoded to `Local`/unpinned;
                             // see the `existing_pin` note above. A re-add that
@@ -4561,7 +4572,7 @@ mod tests {
             Box::pin(async move {
                 if ok {
                     Ok(Usage {
-                        five_hour: Some(UsageBucket {
+                        five_hour: crate::probe::WindowReading::Read(UsageBucket {
                             utilization: Some(0.25),
                             reset_at_ms: Some(crate::now_ms() + 3_600_000),
                         }),
@@ -4610,7 +4621,7 @@ mod tests {
             Box::pin(async move {
                 if n == 0 {
                     Ok(Usage {
-                        five_hour: Some(UsageBucket {
+                        five_hour: crate::probe::WindowReading::Read(UsageBucket {
                             utilization: Some(0.25),
                             reset_at_ms: Some(crate::now_ms() + 3_600_000),
                         }),
@@ -4641,7 +4652,7 @@ mod tests {
         fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             Box::pin(async {
                 Ok(Usage {
-                    five_hour: None,
+                    five_hour: crate::probe::WindowReading::Unread,
                     seven_day: Some(UsageBucket {
                         utilization: Some(0.10),
                         reset_at_ms: Some(crate::now_ms() + 86_400_000),
@@ -5075,6 +5086,7 @@ mod tests {
                 organization_type: Some("claude_team".to_string()),
                 rate_limit_tier: Some("default_raven".to_string()),
                 seat_tier: Some("team_standard".to_string()),
+                plan_display_name: None,
             },
         );
 
@@ -5106,6 +5118,50 @@ mod tests {
             1,
             "the backfill must run once per account, not once per probe"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A row profiled before `plan_display_name` existed (2026-11-01) has a plan and no
+    /// display name. It is asked once more in this process, learns "Ultra" on the
+    /// runtime row and on disk, and is not asked again.
+    #[tokio::test]
+    async fn probing_asks_a_profiled_row_once_for_its_display_name() {
+        let path = config_file(
+            "plan-display-name",
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "refreshToken": "rt-a", "priority": 0,
+                  "organizationType": "claude_max", "rateLimitTier": "default_claude_max_20x" }
+            ] }"#,
+        );
+        let manager = manager_on_file(&path, Arc::new(NoProber));
+        let calls = count_plan_fetches(
+            &manager,
+            crate::probe::Plan {
+                organization_type: Some("claude_max".to_string()),
+                rate_limit_tier: Some("default_claude_max_20x".to_string()),
+                seat_tier: None,
+                plan_display_name: Some("Ultra".to_string()),
+            },
+        );
+
+        manager.probe_account(0).await;
+        manager.probe_account(0).await;
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "asked once, not per probe"
+        );
+        assert_eq!(
+            manager.accounts.read().expect("lock")[0]
+                .plan_display_name
+                .as_deref(),
+            Some("Ultra")
+        );
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["accounts"][0]["planDisplayName"], "Ultra");
         std::fs::remove_file(&path).ok();
     }
 
@@ -5274,6 +5330,7 @@ mod tests {
                 organization_type: Some("claude_team".to_string()),
                 rate_limit_tier: None,
                 seat_tier: None,
+                plan_display_name: None,
             },
         );
 
@@ -10128,7 +10185,7 @@ mod tests {
                         })
                     } else {
                         Ok(Usage {
-                            five_hour: Some(UsageBucket {
+                            five_hour: crate::probe::WindowReading::Read(UsageBucket {
                                 utilization: Some(0.1),
                                 reset_at_ms: Some(crate::now_ms() + 3_600_000),
                             }),
@@ -12146,7 +12203,7 @@ mod tests {
         manager.apply_usage(
             0,
             &crate::probe::Usage {
-                five_hour: None,
+                five_hour: crate::probe::WindowReading::Unread,
                 seven_day: None,
                 seven_day_oi: Some(UsageBucket {
                     utilization: Some(0.99),
@@ -15047,6 +15104,29 @@ mod tests {
         );
     }
 
+    /// A plan with no 5h window (the usage endpoint's `"five_hour": null`, an Ultra
+    /// org) has no window for a warm to start, so it is never a warm target, even
+    /// with its quota read and no live 5h reset. Without the gate it would be warmed
+    /// every cadence up to the repeat cap, spending weekly quota for nothing.
+    #[test]
+    fn a_plan_with_no_five_hour_window_is_not_a_warm_target() {
+        let manager = manager_of(vec![account("ultra", 0)]);
+        mark_all_probed(&manager);
+        assert_eq!(manager.warm_targets(), vec![0], "control: a cold row warms");
+
+        manager.apply_usage(
+            0,
+            &crate::probe::Usage {
+                five_hour: crate::probe::WindowReading::PlanHasNone,
+                ..crate::probe::Usage::default()
+            },
+        );
+        assert!(
+            manager.warm_targets().is_empty(),
+            "an account whose plan has no 5h window has nothing to warm"
+        );
+    }
+
     /// A follow-up regression on the bound above: it must not be defeatable by
     /// the background prober. A first cut of the recovery fix reset
     /// `consecutive_warms_without_evidence` on every successful `apply_usage`
@@ -15069,7 +15149,7 @@ mod tests {
         );
 
         let headerless_probe = crate::probe::Usage {
-            five_hour: None,
+            five_hour: crate::probe::WindowReading::Unread,
             seven_day: None,
             seven_day_oi: None,
             extra_usage_usd: None,
