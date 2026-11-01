@@ -66,12 +66,58 @@ pub struct UsageBucket {
     pub reset_at_ms: Option<i64>,
 }
 
+/// What one usage read said about a window a plan may not have at all.
+///
+/// The endpoint says two different things that a bare `Option` collapses into one.
+/// A missing key (or a value that is not an object) means we learned nothing this
+/// time, and the last reading stands. An explicit `"five_hour": null`, key present,
+/// is the endpoint saying the plan has no such window: measured 2026-11-01 on a
+/// Max-20x org whose profile names its plan "Ultra", while a Team org on the same
+/// day still returned a `five_hour` object.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum WindowReading {
+    /// The key was absent or not an object or `null`: nothing learned this time.
+    #[default]
+    Unread,
+    /// The key was present and `null`: the plan has no such window.
+    PlanHasNone,
+    /// A bucket was reported.
+    Read(UsageBucket),
+}
+
+impl WindowReading {
+    /// Parse the raw value under the window's key, `None` when the key is absent.
+    pub fn parse(value: Option<&Value>) -> Self {
+        match value {
+            Some(Value::Null) => Self::PlanHasNone,
+            other => normalize_usage_bucket(other).map_or(Self::Unread, Self::Read),
+        }
+    }
+
+    /// The reported bucket, if this read carried one.
+    pub const fn bucket(self) -> Option<UsageBucket> {
+        match self {
+            Self::Read(bucket) => Some(bucket),
+            Self::Unread | Self::PlanHasNone => None,
+        }
+    }
+}
+
+impl From<Option<UsageBucket>> for WindowReading {
+    /// A source that cannot say "the plan has none" (a Codex probe) maps a bucket
+    /// to `Read` and its absence to `Unread`.
+    fn from(bucket: Option<UsageBucket>) -> Self {
+        bucket.map_or(Self::Unread, Self::Read)
+    }
+}
+
 /// The normalized buckets a single probe yields. `seven_day_oi` is the
 /// model-scoped (Fable) weekly, pulled from the payload's `limits[]` array.
 /// `extra_usage_usd` is not a bucket at all — see its own doc-comment.
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
-    pub five_hour: Option<UsageBucket>,
+    /// The 5-hour window, three-state: see [`WindowReading`].
+    pub five_hour: WindowReading,
     pub seven_day: Option<UsageBucket>,
     pub seven_day_oi: Option<UsageBucket>,
     /// Real, already-billed pay-as-you-go overage in USD, from the payload's
@@ -222,7 +268,7 @@ fn parse_extra_usage_usd(data: &Value) -> Option<f64> {
 pub fn usage_from_payload(data: &Value) -> Usage {
     let fable = find_scoped_weekly_limit(data, "fable");
     Usage {
-        five_hour: normalize_usage_bucket(data.get("five_hour")),
+        five_hour: WindowReading::parse(data.get("five_hour")),
         seven_day: normalize_usage_bucket(data.get("seven_day")),
         seven_day_oi: normalize_usage_bucket(fable.as_ref()),
         extra_usage_usd: parse_extra_usage_usd(data),
@@ -386,8 +432,9 @@ impl UsageProber for LiveUsageProber {
 }
 
 /// What one account's plan reads as, straight off the profile endpoint: the
-/// three raw strings, verbatim, with no interpretation applied — the label is
-/// derived from them exactly once, by [`tcr_status_wire::plan_label`].
+/// three raw strings and the plan's display name, verbatim, with no
+/// interpretation applied. The label is derived from them exactly once, by
+/// [`tcr_status_wire::plan_label`].
 ///
 /// All-`None` is the honest answer for a fetch that failed or returned nothing
 /// usable, and it is what makes a failure cost nothing: the plan backfill
@@ -398,6 +445,7 @@ pub struct Plan {
     pub organization_type: Option<String>,
     pub rate_limit_tier: Option<String>,
     pub seat_tier: Option<String>,
+    pub plan_display_name: Option<String>,
 }
 
 impl Plan {
@@ -408,6 +456,7 @@ impl Plan {
         self.organization_type.is_none()
             && self.rate_limit_tier.is_none()
             && self.seat_tier.is_none()
+            && self.plan_display_name.is_none()
     }
 }
 
@@ -442,6 +491,7 @@ impl PlanProber for LivePlanProber {
                 organization_type: profile.organization_type,
                 rate_limit_tier: profile.rate_limit_tier,
                 seat_tier: profile.seat_tier,
+                plan_display_name: profile.plan_display_name,
             }
         })
     }
@@ -693,5 +743,40 @@ mod tests {
             Some(7.0),
             "an unread probe must not erase a previously learned overage"
         );
+    }
+
+    /// The three 5h readings the usage endpoint can give, shaped as measured on
+    /// 2026-11-01: an explicit `null` (a Max-20x "Ultra" org), no key at all, and
+    /// a bucket object (a Team org).
+    #[test]
+    fn five_hour_null_absent_and_object_parse_to_three_readings() {
+        let plan_has_none = usage_from_payload(&serde_json::json!({
+            "five_hour": null,
+            "seven_day": { "utilization": 0.0, "resets_at": "2026-11-06T12:00:00+00:00" }
+        }));
+        assert!(
+            matches!(plan_has_none.five_hour, WindowReading::PlanHasNone),
+            "an explicit null is the plan having no 5h window: {:?}",
+            plan_has_none.five_hour
+        );
+        assert!(
+            plan_has_none.seven_day.is_some(),
+            "the weekly beside it still reads"
+        );
+
+        let unread = usage_from_payload(&serde_json::json!({ "seven_day": {} }));
+        assert!(
+            matches!(unread.five_hour, WindowReading::Unread),
+            "a missing key is nothing learned: {:?}",
+            unread.five_hour
+        );
+
+        let read = usage_from_payload(&serde_json::json!({
+            "five_hour": { "utilization": 25.0, "resets_at": null }
+        }));
+        let WindowReading::Read(bucket) = read.five_hour else {
+            panic!("an object is a reading: {:?}", read.five_hour);
+        };
+        assert_eq!(bucket.utilization, Some(0.25));
     }
 }

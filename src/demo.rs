@@ -63,6 +63,8 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         organization_type: Some("claude_max".to_string()),
         rate_limit_tier: Some("default_claude_max_20x".to_string()),
         seat_tier: None,
+        plan_display_name: None,
+        plan_display_name_asked: false,
         switch_threshold: None,
         access_token: "demo-access-token".to_string(),
         refresh_token: Some("demo-refresh-token".to_string()),

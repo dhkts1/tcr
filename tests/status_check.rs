@@ -53,7 +53,7 @@ impl UsageProber for HealthyProber {
     fn probe(&self, _credential: ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Ok(Usage {
-                five_hour: Some(UsageBucket {
+                five_hour: tcr::probe::WindowReading::Read(UsageBucket {
                     utilization: Some(0.2),
                     reset_at_ms: None,
                 }),

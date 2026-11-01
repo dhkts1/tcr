@@ -1526,7 +1526,9 @@ account bob@example.com/codex provider=codex priority=0 plan=ChatGPT Pro 5h=none
 - **` provider=codex`** follows the name.
 - **`5h=none` and `wk=none`** say the account's plan reports no such window: measured on ChatGPT
   Pro logins, Codex reports a weekly window only, so a Pro row reads `5h=none`. That is a fact
-  about the plan; `n/a` keeps meaning only that a window has no reading yet.
+  about the plan; `n/a` keeps meaning only that a window has no reading yet. A Claude row reads
+  `5h=none` too once its usage read says `"five_hour": null`, which an Ultra plan does (measured
+  2026-11-01); its JSON `fiveHour` stays `null`.
 - **The tail**, after the group tokens, holds these tokens in this order, each only when it has
   something to say:
 
@@ -1630,14 +1632,15 @@ has: *which* of these is the company seat?
 
 | key | shape | what it is |
 |---|---|---|
-| `plan` | string or `null` | the customer-facing label: `Max 20x`, `Team 5x`, `Team Standard`, `Pro`, … `null` for an account never profiled — never a fabricated default |
+| `plan` | string or `null` | the customer-facing label: `Ultra`, `Max 20x`, `Team 5x`, `Team Standard`, `Pro`, … `null` for an account never profiled — never a fabricated default |
+| `planDisplayName` | string or `null` | the plan's own name as the provider shows it, verbatim (`Ultra`). `null` on an org whose profile has none, Team among them |
 | `organizationType` | string or `null` | the provider's own word, verbatim: `claude_max`, `claude_team`, `claude_pro`, `claude_enterprise` |
 | `rateLimitTier` | string or `null` | verbatim, e.g. `default_claude_max_20x` — the rate-limit multiplier, when it names one |
 | `seatTier` | string or `null` | verbatim, e.g. `team_standard` / `team_tier_1` — which seat this row holds. `null` on Max and Pro, which have no seats |
 | `orgUuid` | string or `null` | the org this account is scoped to |
 | `orgName` | string or `null` | the org's display name. Two orgs can share one, which is why `orgUuid` is the exact fact and this is the readable one |
 
-`plan` is DERIVED from the three raw keys, in one place, so the JSON, the plain text (`plan=`), the
+`plan` is `planDisplayName` when the profile carries one. Otherwise it is DERIVED from the three raw keys, in one place, so the JSON, the plain text (`plan=`), the
 TUI and the macOS panel cannot disagree. The plan word comes from `organizationType`; the suffix
 after it is the `rateLimitTier` multiplier (`_20x` / `_5x`) when there is one, otherwise — on Team
 and Enterprise only — the seat (`team_standard` → `Standard`, `team_tier_2` → `Tier 2`). The

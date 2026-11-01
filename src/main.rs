@@ -11753,6 +11753,7 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            plan_display_name: None,
             egress: config::Egress::Local,
             egress_strict: false,
             codex_home: None,

@@ -123,6 +123,8 @@ impl Manager {
                         || a.consecutive_probe_failures >= PROBE_FAILURES_BEFORE_WARMING_UNPROBED)
                     // A live future 5h reset means the session window is already running.
                     && a.quota.five_hour.and_then(|w| w.live_reset(now)).is_none()
+                    // A plan with no 5h window has nothing to start; a warm would only spend weekly quota.
+                    && !a.quota.five_hour_absent_on_plan
                     // Warming an at/over-threshold account is wasted spend.
                     && !a
                         .quota

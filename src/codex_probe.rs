@@ -369,6 +369,9 @@ pub fn usage_from_payload(v: &Value) -> Usage {
     // The length each bucket keeps, by the header parser's rule (`quota::codex_kept_length`).
     let mut five_hour_minutes: Option<u32> = None;
     let mut seven_day_minutes: Option<u32> = None;
+    // Built as a plain bucket and handed to `Usage` once: a Codex payload cannot say "the plan
+    // has none", so its 5h reading is `Read` or `Unread` (`WindowReading::from`).
+    let mut five_hour: Option<UsageBucket> = None;
     for (key, positional_is_weekly) in [("primary_window", false), ("secondary_window", true)] {
         let Some(w) = rate_limit.get(key).filter(|w| !w.is_null()) else {
             continue;
@@ -403,7 +406,7 @@ pub fn usage_from_payload(v: &Value) -> Usage {
         let (bucket, length) = if weekly {
             (&mut usage.seven_day, &mut seven_day_minutes)
         } else {
-            (&mut usage.five_hour, &mut five_hour_minutes)
+            (&mut five_hour, &mut five_hour_minutes)
         };
         // A length of zero or less is no length, in minutes as in seconds.
         let minutes = seconds
@@ -434,13 +437,14 @@ pub fn usage_from_payload(v: &Value) -> Usage {
         });
     }
     facts.windows = crate::quota::CodexWindows {
-        five_hour: usage.five_hour.map(|_| crate::quota::CodexWindow {
+        five_hour: five_hour.map(|_| crate::quota::CodexWindow {
             minutes: five_hour_minutes,
         }),
         seven_day: usage.seven_day.map(|_| crate::quota::CodexWindow {
             minutes: seven_day_minutes,
         }),
     };
+    usage.five_hour = five_hour.into();
     usage.codex = Some(facts);
     usage
 }
@@ -767,7 +771,7 @@ mod tests {
     #[test]
     fn payload_windows_land_in_five_hour_and_weekly_by_length() {
         let usage = usage_from_payload(&serde_json::from_str(PAYLOAD).unwrap());
-        let fh = usage.five_hour.unwrap();
+        let fh = usage.five_hour.bucket().unwrap();
         assert!((fh.utilization.unwrap() - 0.25).abs() < 1e-9);
         assert_eq!(fh.reset_at_ms, Some(1_800_003_600_000));
         let sd = usage.seven_day.unwrap();
@@ -779,7 +783,7 @@ mod tests {
     #[test]
     fn a_payload_without_rate_limit_is_an_empty_usage_not_a_zero() {
         let usage = usage_from_payload(&serde_json::json!({"plan_type":"free","rate_limit":null}));
-        assert!(usage.five_hour.is_none() && usage.seven_day.is_none());
+        assert!(usage.five_hour.bucket().is_none() && usage.seven_day.is_none());
     }
 
     #[test]
@@ -787,7 +791,7 @@ mod tests {
         let v = serde_json::json!({"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":120}}});
         let before = crate::now_ms();
         let usage = usage_from_payload(&v);
-        let reset = usage.five_hour.unwrap().reset_at_ms.unwrap();
+        let reset = usage.five_hour.bucket().unwrap().reset_at_ms.unwrap();
         assert!(reset >= before + 119_000 && reset <= before + 121_000 + 1000);
     }
 
@@ -804,7 +808,7 @@ mod tests {
                     "rate_limit": { "primary_window": window },
                 }));
                 assert_eq!(
-                    usage.five_hour.unwrap().reset_at_ms,
+                    usage.five_hour.bucket().unwrap().reset_at_ms,
                     Some(expected),
                     "{key} must never wrap a future reset into the past or a past reset into the future"
                 );
@@ -903,7 +907,7 @@ mod tests {
             );
             assert_eq!(weekly.reset_at_ms, Some(1_800_345_600_000));
             assert!(
-                usage.five_hour.is_none(),
+                usage.five_hour.bucket().is_none(),
                 "no five-hour window was sent at {used}%, so none may be invented: {:?}",
                 usage.five_hour
             );
@@ -932,7 +936,7 @@ mod tests {
                 "rate_limit": { "primary_window": primary, "secondary_window": secondary },
             }));
             assert!(
-                usage.five_hour.is_none(),
+                usage.five_hour.bucket().is_none(),
                 "no five-hour bucket is fabricated (primary {primary}): {:?}",
                 usage.five_hour
             );
@@ -967,6 +971,7 @@ mod tests {
         assert_eq!(weekly.reset_at_ms, Some(1_800_345_600_000));
         let five_hour = usage
             .five_hour
+            .bucket()
             .expect("control: the primary window by position");
         assert!((five_hour.utilization.expect("a utilization") - 0.10).abs() < 1e-9);
         assert_eq!(five_hour.reset_at_ms, Some(1_800_003_600_000));
@@ -1001,7 +1006,7 @@ mod tests {
                 "the fuller reading survives: {weekly:?}"
             );
             assert_eq!(weekly.reset_at_ms, Some(late * 1000));
-            assert!(usage.five_hour.is_none());
+            assert!(usage.five_hour.bucket().is_none());
         }
     }
 
@@ -1455,7 +1460,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(usage.five_hour.is_some());
+        assert!(usage.five_hour.bucket().is_some());
         let s = seen.lock().unwrap().clone();
         assert!(s.contains(&("authorization".to_string(), "Bearer at-live".to_string())));
         assert!(s.contains(&(

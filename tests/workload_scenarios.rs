@@ -1634,7 +1634,7 @@ mod quota_replay {
                 })
             };
             Usage {
-                five_hour: bucket(self.windows[0]),
+                five_hour: bucket(self.windows[0]).into(),
                 seven_day: bucket(self.windows[1]),
                 seven_day_oi: if self.provider == 0 {
                     bucket(self.windows[2])

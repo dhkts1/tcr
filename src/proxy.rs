@@ -2920,6 +2920,8 @@ struct AddAccountRequest {
     rate_limit_tier: Option<String>,
     #[serde(default)]
     seat_tier: Option<String>,
+    #[serde(default)]
+    plan_display_name: Option<String>,
     /// The upstream the credential belongs to. Absent is Anthropic: every body
     /// posted before this field existed, and every Anthropic row, which
     /// `config::Account` serializes with no `provider` key. A Codex import
@@ -3127,6 +3129,7 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
         organization_type: parsed.organization_type,
         rate_limit_tier: parsed.rate_limit_tier,
         seat_tier: parsed.seat_tier,
+        plan_display_name: parsed.plan_display_name,
         egress: config::Egress::Local,
         egress_strict: false,
         codex_home: parsed.codex_home,
@@ -14846,6 +14849,7 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            plan_display_name: None,
             egress: config::Egress::Local,
             egress_strict: false,
             codex_home: None,
@@ -26714,7 +26718,7 @@ mod forecast_routing_tests {
                 reset_at_ms: Some(reset),
             });
             crate::probe::Usage {
-                five_hour: bucket,
+                five_hour: bucket.into(),
                 seven_day: bucket,
                 seven_day_oi: bucket,
                 ..Default::default()

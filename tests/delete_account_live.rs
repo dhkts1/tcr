@@ -264,7 +264,7 @@ async fn quota_state_does_not_change_a_delete() {
         fleet.manager.apply_usage(
             idx,
             &tcr::probe::Usage {
-                five_hour: Some(tcr::probe::UsageBucket {
+                five_hour: tcr::probe::WindowReading::Read(tcr::probe::UsageBucket {
                     utilization: Some(used),
                     reset_at_ms: Some(reset),
                 }),

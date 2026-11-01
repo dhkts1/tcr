@@ -186,6 +186,8 @@ pub struct AccountSnapshot {
     pub organization_type: Option<String>,
     pub rate_limit_tier: Option<String>,
     pub seat_tier: Option<String>,
+    /// The provider's own plan name ("Ultra"), verbatim; when present it is the label.
+    pub plan_display_name: Option<String>,
     /// The org this account is scoped to, carried from
     /// [`crate::manager::AccountRuntime`]. A fact a CLIENT can show beside the
     /// row; it is not how the row is addressed — `name` is unique, and every
@@ -199,6 +201,9 @@ pub struct AccountSnapshot {
     /// 5-hour utilization (0.0–1.0), evaluated live — `None` if never learned.
     pub five_hour: Option<f64>,
     pub five_hour_reset: Option<OffsetDateTime>,
+    /// The usage endpoint reported `"five_hour": null`: this plan has no 5-hour window, so
+    /// `five_hour` is `None` as a fact, not a gap. `tcr status` text renders it `5h=none`.
+    pub five_hour_absent_on_plan: bool,
     /// Weekly utilization (0.0–1.0), evaluated live.
     pub seven_day: Option<f64>,
     pub seven_day_reset: Option<OffsetDateTime>,
@@ -370,6 +375,7 @@ impl AccountSnapshot {
                 self.organization_type.as_deref(),
                 self.rate_limit_tier.as_deref(),
                 self.seat_tier.as_deref(),
+                self.plan_display_name.as_deref(),
             ),
             Provider::Codex => tcr_status_wire::codex_plan_label(self.organization_type.as_deref()),
         }
@@ -692,6 +698,7 @@ mod tests {
             organization_type: Some("team".to_string()),
             rate_limit_tier: None,
             seat_tier: None,
+            plan_display_name: None,
             org_uuid: None,
             org_name: None,
             priority: 0,
@@ -699,6 +706,7 @@ mod tests {
             disabled: false,
             five_hour: None,
             five_hour_reset: None,
+            five_hour_absent_on_plan: false,
             seven_day: None,
             seven_day_reset: None,
             seven_day_oi: None,
