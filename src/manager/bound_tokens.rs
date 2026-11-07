@@ -519,6 +519,40 @@ impl Manager {
         })
     }
 
+    /// Whether a conversation bound by `tokens` has gone cold: its newest sign of life is older
+    /// than `warm`, so no account holds a warm prompt cache for it.
+    ///
+    /// Two clocks, and the NEWER one decides, so a conversation is never called cold while
+    /// either says it is alive: the session's pin, stamped on every request the session sends
+    /// (`session_key`), and the newest mint among `tokens`, stamped when the response carrying
+    /// it finished. With neither known there is nothing to measure, and the answer is no: a
+    /// hold this process cannot date is not released on a guess.
+    pub fn bound_history_is_cold(
+        &self,
+        tokens: &[String],
+        session_key: Option<u64>,
+        now_ms: i64,
+        warm: WarmWindow,
+    ) -> bool {
+        let pin_touched = session_key.and_then(|key| {
+            self.affinity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .map(|&(_, touched)| touched)
+        });
+        let newest_mint = tokens
+            .iter()
+            .filter_map(|token| self.bound_tokens.get(&bound_tokens::hash_token(token)))
+            .map(|(_, _, minted)| minted)
+            .max();
+        pin_touched
+            .into_iter()
+            .chain(newest_mint)
+            .max()
+            .is_some_and(|last| now_ms.saturating_sub(last) >= warm.ms())
+    }
+
     /// Serve a held request on the account its history is bound to, over the soft threshold if
     /// need be: `Some(idx)` when that account can answer this request now.
     ///

@@ -11847,8 +11847,26 @@ mod tests {
         );
         assert_eq!(pin_of(&manager, key), Some(failover));
 
+        // The session keeps working on its failover while the hold runs out, so its
+        // cache there stays warm: one more turn a minute before the hold ends. A
+        // session idle past its warm window would take the normal pick instead, and
+        // that is `a_cold_pin_takes_the_reset_order_again`'s rule, not this one's.
+        let last_turn = now + Duration::seconds(LONG_HOLD_SECS - 60);
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                last_turn,
+                None,
+                Some(key),
+                "/v1/messages",
+                None
+            ),
+            Some(failover),
+            "while the hold is live the session is served on its failover"
+        );
+
         // The hold expires. A past hold reads as expired live, no mutation needed.
-        let after = now + Duration::hours(1);
+        let after = now + Duration::seconds(LONG_HOLD_SECS + 40);
         assert_eq!(
             manager.select(
                 &HashSet::new(),
