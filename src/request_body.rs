@@ -843,7 +843,10 @@ fn collect_bound(found: &mut BoundHistory, message: &MessageSpans<'_>) {
     for block in blocks {
         let f = &block.fields;
         let token_field = match f[B_TYPE].and_then(string_of).as_deref() {
-            Some("server_tool_use") => f[B_ID],
+            Some("server_tool_use") => {
+                found.carries_account_only_state = true;
+                f[B_ID]
+            }
             Some("thinking") => f[B_SIGNATURE],
             Some("redacted_thinking") => f[B_DATA],
             _ => continue,

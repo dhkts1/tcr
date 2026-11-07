@@ -217,8 +217,10 @@ Claude request never spills onto a Codex account, nor a Codex request onto a Cla
 ## Account selection
 
 Account selection is not one sort. On the normal path, `tcr` picks the eligible account
-minimising `(priority ascending, least-recently-selected, soonest weekly reset)`, so
-`priority` is a hard tier and rotation breaks ties within it. Eligibility means: not
+minimising `(priority ascending, reset-urgency bucket, least-recently-selected, soonest weekly
+reset)`, so `priority` is a hard tier, and inside it the account whose weekly window resets
+soonest is spent first, in `resetUrgencyTierHours`-wide buckets (24 hours by default) that
+rotation breaks ties within. Eligibility means: not
 disabled, not in an error state, not under a live rate-limit hold, under the switch
 threshold, and not blocked for this request's model class. Four things change that picture:
 `lockAccount` short-circuits every pooled request of its account's provider to that account
@@ -230,6 +232,18 @@ returning an error when the whole fleet reads over the soft threshold.
 Each of those keys (`lockAccount`, `sessionAffinity`, `pacing`, `revalidationServe`, and
 the switch threshold itself) is documented with its default in
 [`configuration.md`](configuration.md).
+
+### A pin holds only while the cache is warm
+
+A session's pin, and the hold that keeps a conversation on the account that signed its
+`thinking` blocks, exist for the prompt cache. Once a session has been idle past its cache
+window (5 minutes, or 55 for a client that asks for the 1-hour cache), neither is honoured:
+the next request takes the normal pick above and is re-pinned where it lands, logged as
+`affinity: re-pin session … (cache cold: idle Ns)`. Without this, a conversation resumed
+after a break went back to the account it started on, over one whose week was about to
+expire unspent. The thinking hold is released this way only for a model whose thinking reads
+on any account (Opus 5.5). An advisor result, server-side thread state, or Sonnet 5.5 and
+Haiku 5.5 thinking stays held, because another account cannot read it.
 
 ### Session-affinity pins survive a restart
 

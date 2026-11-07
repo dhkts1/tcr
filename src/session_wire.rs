@@ -1335,6 +1335,12 @@ pub struct BoundHistory {
     /// were capped away, and true for a bound block whose token field is missing. This is what
     /// holds a conversation to its pin when no token happens to be known to this process.
     pub carries_bound_history: bool,
+    /// Whether the history carries state another account cannot read at all: an advisor
+    /// result (`server_tool_use`) or server-side thread state (`previous_message_id`, folded in
+    /// by `src/proxy.rs`). A history bound only by `thinking` and `redacted_thinking` blocks
+    /// leaves this `false`, and for a model whose thinking survives a move
+    /// (`crate::model::thinking_is_org_bound` false) its hold buys nothing but a warm cache.
+    pub carries_account_only_state: bool,
 }
 
 /// Every account-bound token carried anywhere in a request's `messages`.
@@ -1413,6 +1419,9 @@ pub fn extract_bound_tokens(messages: &RawValue) -> BoundHistory {
             // Reached only for a bound shape, so the history is bound even when the token field
             // itself is absent and even once the cap has been hit.
             found.carries_bound_history = true;
+            if block.kind == "server_tool_use" {
+                found.carries_account_only_state = true;
+            }
             let Some(token) = token else {
                 continue;
             };

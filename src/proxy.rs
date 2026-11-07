@@ -3917,8 +3917,10 @@ async fn handle_request(
         for (path, id) in &wire.previous_message_ids {
             note_previous_message_id_path(path);
             // Thread state is bound exactly as a signature is, and it binds even when
-            // this process never saw the response that created it.
+            // this process never saw the response that created it. Unlike a signature,
+            // no other account can read it, so a cold hold never releases it.
             bound.carries_bound_history = true;
+            bound.carries_account_only_state = true;
             if !bound.tokens.contains(id) {
                 bound.tokens.push(id.clone());
             }
@@ -4174,6 +4176,40 @@ async fn handle_request(
             );
         }
         same_provider
+    });
+    // A COLD conversation whose only bound state is thinking that survives a move is not held.
+    //
+    // For Opus 5.5 a thinking block reads on any account (the list above), so its hold buys one
+    // thing only: the warm prompt cache. Once the conversation has been idle past the cache's
+    // life (`Manager::bound_history_is_cold`) that is gone, and holding it anyway kept it on the
+    // account it started on for up to `BOUND_TOKEN_TTL_MS`, a day, over the weekly-reset order
+    // every other new pick follows. Reported 2026-11-07: two Ultra accounts, the one resetting
+    // in 3d 14h at 95% carrying the day's traffic while the one resetting in 11h sat at 16%.
+    //
+    // Never for advisor results or thread state (`carries_account_only_state`), which no other
+    // account can read, nor for a model whose thinking is dropped across organizations, nor for
+    // a request whose model is unknown: those keep today's hold.
+    let bound_candidate = bound_candidate.filter(|&(bound_idx, via)| {
+        let thinking_travels = request_model
+            .as_deref()
+            .is_some_and(|model| !crate::model::thinking_is_org_bound(model));
+        let release = thinking_travels
+            && !bound.carries_account_only_state
+            && manager.bound_history_is_cold(
+                &bound.tokens,
+                session_key,
+                crate::now_ms(),
+                manager.warm_window(session_key),
+            );
+        if release {
+            tracing::info!(
+                account = manager.account_name(bound_idx).as_deref().unwrap_or("?"),
+                kind = via,
+                model = request_model.as_deref().unwrap_or("?"),
+                "bound history is cold and its thinking travels; not holding it, the pick decides"
+            );
+        }
+        !release
     });
     let mut bound_to: Option<usize> = None;
     // A same-organization sibling a released conversation is sent to first (`same_org_release`),
@@ -16640,6 +16676,69 @@ mod tests {
             "with no token to honour, the session goes back to its own pinned account"
         );
         assert_eq!(hits.load(Ordering::SeqCst), 4);
+    }
+
+    /// Reported 2026-11-07: a conversation resumed hours later went back to the account its
+    /// thinking was signed on, over an account the pick ranks first. For Opus 5.5 that hold
+    /// buys only a warm cache, and two hours idle there is none, so the pick decides. Two
+    /// controls fence it: Sonnet 5.5, whose thinking is dropped across organizations, and a
+    /// signature minted just now, whose cache is warm. Both stay held.
+    ///
+    /// The pick is steered by priority alone (bob 0, alice 5), so a released request lands
+    /// on bob and a held one on alice, who signed every history here.
+    #[tokio::test]
+    async fn a_cold_opus_conversation_is_not_held_by_its_thinking() {
+        let (upstream, _hits, seen) = spawn_bound_upstream().await;
+        let mut config = two_accounts_over(&upstream, &[false, false]);
+        config.accounts[0].priority = Some(5);
+        config.accounts[1].priority = Some(0);
+        let manager = Manager::with_live_refresher(config, None);
+        let two_hours_ago = crate::now_ms() - 2 * 60 * 60 * 1000;
+        let signed = |token: &str| vec![(BoundTokenKind::ThinkingSignature, token.to_string())];
+        manager.record_bound_tokens(&signed("sig_cold_opus"), 0, two_hours_ago);
+        manager.record_bound_tokens(&signed("sig_cold_sonnet"), 0, two_hours_ago);
+        manager.record_bound_tokens(&signed("sig_warm_opus"), 0, crate::now_ms());
+        let served_by = |n: usize| seen.lock().expect("recorder")[n].clone();
+
+        let (status, _) = drive_conversation(
+            Arc::clone(&manager),
+            &thinking_turn_body_for("claude-opus-5-5", "sess-cold-opus", &["sig_cold_opus"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            served_by(0).contains("at-bbbbbbbbbbbb"),
+            "a cold Opus conversation must take the pick, not its signer: got {}",
+            served_by(0)
+        );
+
+        let (status, _) = drive_conversation(
+            Arc::clone(&manager),
+            &thinking_turn_body_for(
+                "claude-sonnet-5-5",
+                "sess-cold-sonnet",
+                &["sig_cold_sonnet"],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            served_by(1).contains("at-aaaaaaaaaaaa"),
+            "Sonnet 5.5 thinking is dropped off its org, so even cold it stays held: got {}",
+            served_by(1)
+        );
+
+        let (status, _) = drive_conversation(
+            Arc::clone(&manager),
+            &thinking_turn_body_for("claude-opus-5-5", "sess-warm-opus", &["sig_warm_opus"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            served_by(2).contains("at-aaaaaaaaaaaa"),
+            "a warm Opus conversation keeps its hold: got {}",
+            served_by(2)
+        );
     }
 
     /// A bound account that is OUT (here `disabled`, the same terminal gate a `rejected` unified

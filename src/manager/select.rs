@@ -409,6 +409,12 @@ impl Manager {
     /// failure arms a long hold or sets `rejected` on the very next attempt, and
     /// those fail `account_hard_ok`.
     ///
+    /// The one exception is a pin with nothing left to protect: a session idle past its warm
+    /// window (`WarmWindow`) has a cold cache on every account, so its pin is not honoured
+    /// and the request takes the normal pick, which then re-pins wherever it lands. A cold
+    /// pin that stood would only override the pick's order (priority, then the weekly-reset
+    /// urgency bucket) for no gain.
+    ///
     /// Everything else is a fact about ONE REQUEST, not about the account. Such a
     /// fact never re-keys, and — the second half of the same argument — mostly does
     /// not even DIVERT, because a divert costs that request the same cold prefix a
@@ -872,6 +878,10 @@ impl Manager {
         // paced/model-class/pin-tried divert): a stable sentinel, not a real
         // deadline, so those diverts still key one shared episode per pin.
         let mut divert_until_ms: i64 = 0;
+        // Set when the session's pin was given up because its cache is cold, to the idle
+        // time that made it so. Carried down to the re-pin line, which otherwise names a
+        // HARD gate as the reason for every move. Purely for the log.
+        let mut cold_pin_idle_ms: Option<i64> = None;
         // Built once here, read by every hold-or-move decision below.
         let warm = self.warm_window(affinity);
 
@@ -1038,7 +1048,21 @@ impl Manager {
                                 &groups.parked,
                             )
                         });
-                        if x_usable {
+                        let pin_idle_ms = now_ms - pin_touched_ms;
+                        if x_usable && pin_idle_ms >= warm.ms() {
+                            // A COLD PIN PROTECTS NOTHING. The pin exists for the prompt
+                            // cache, and a session idle past `warm` has none left on any
+                            // account, so honouring it only overrides the normal pick's
+                            // order (priority, then the weekly-reset urgency bucket) for no
+                            // gain. Fall through to that pick, which may well choose the
+                            // same account, and re-pin wherever it lands. This is the rule
+                            // `affinity::PIN_TTL_MS` already applies to a pin restored at
+                            // boot, now applied to the live map too. Reported 2026-11-07: a
+                            // session resumed after a break went back to the account
+                            // resetting in 3d 14h while the one resetting in 11h idled.
+                            cold_pin_idle_ms = Some(pin_idle_ms);
+                            None
+                        } else if x_usable {
                             // Default: honour the pin. With migration disabled (the
                             // default), or when `count_x < 2` (a LONE session),
                             // `target` stays `idx` and nothing below runs, so this
@@ -1241,7 +1265,7 @@ impl Manager {
                                     .unwrap_or(0);
                                 None
                             } else {
-                                let idle_ms = now_ms - pin_touched_ms;
+                                let idle_ms = pin_idle_ms;
                                 // An eligible alternative must exist before we give up
                                 // this pin — otherwise falling through would turn a soft
                                 // threshold into a hard 429 the account itself never
@@ -1295,6 +1319,7 @@ impl Manager {
                                         name,
                                         util
                                     );
+                                    cold_pin_idle_ms = Some(idle_ms);
                                     None
                                 } else {
                                     self.serve_pinned_over_threshold(
@@ -1835,12 +1860,22 @@ impl Manager {
                 let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                 let old_name = accounts.get(previous).map_or("?", |a| a.name.as_str());
                 let new_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
-                tracing::info!(
-                    "affinity: re-pin session {} off {} -> {} (pin failed an ACCOUNT HARD gate)",
-                    short_session_id(key),
-                    old_name,
-                    new_name
-                );
+                if let Some(idle_ms) = cold_pin_idle_ms {
+                    tracing::info!(
+                        "affinity: re-pin session {} off {} -> {} (cache cold: idle {}s)",
+                        short_session_id(key),
+                        old_name,
+                        new_name,
+                        idle_ms / 1000
+                    );
+                } else {
+                    tracing::info!(
+                        "affinity: re-pin session {} off {} -> {} (pin failed an ACCOUNT HARD gate)",
+                        short_session_id(key),
+                        old_name,
+                        new_name
+                    );
+                }
             }
             // The SOFT counterpart, and until now it emitted nothing at all: the pin
             // survived, a DIFFERENT account served, and no line said so — which is why
@@ -4582,7 +4617,7 @@ mod group_miss_tests {
 /// LRU sorts last.
 #[cfg(test)]
 mod reset_urgency_tests {
-    use super::select_test_support::{account, live_manager};
+    use super::select_test_support::{account, live_manager, pin};
     use super::*;
     use crate::config::Account;
     use crate::quota::QuotaWindow;
@@ -4653,6 +4688,60 @@ mod reset_urgency_tests {
              the one with 100h left, even though it is the most recently \
              selected of the two — its unused headroom is the only headroom \
              about to expire"
+        );
+    }
+
+    /// The shape reported 2026-11-07: a session pinned to `roomy` (reset in 86h)
+    /// comes back after its cache went cold, and `urgent` (reset in 11h) sits
+    /// unused. Both are under the threshold, so before this change the pin was
+    /// honoured and `urgent`'s week expired unspent. A cold pin protects nothing,
+    /// so the request takes the reset order like any new one, and the session is
+    /// re-pinned where it lands.
+    #[test]
+    fn a_cold_pin_takes_the_reset_order_again() {
+        let manager = live_manager(config_with(vec![account("roomy"), account("urgent")], 24));
+        let now = OffsetDateTime::now_utc();
+        set_weekly(&manager, 0, 86, now);
+        set_weekly(&manager, 1, 11, now);
+        let key = 4242;
+        let cold_ms = odt_to_ms(now) - WarmWindow::DEFAULT.ms() - 1_000;
+        pin(&manager, key, 0, cold_ms);
+
+        let served = manager.select(&HashSet::new(), now, None, Some(key), "/v1/messages", None);
+        assert_eq!(
+            served,
+            Some(1),
+            "a session idle past its warm window has no cache left on `roomy`, so it \
+             must take the reset order and land on the account resetting in 11h"
+        );
+        assert_eq!(
+            manager.affinity_pin(key),
+            Some(1),
+            "the session is re-pinned where the pick sent it"
+        );
+    }
+
+    /// The complement, so the rule above cannot widen: inside the warm window the
+    /// cache on `roomy` is real, and the pin still outranks the reset order.
+    #[test]
+    fn a_warm_pin_keeps_its_account_over_the_reset_order() {
+        let manager = live_manager(config_with(vec![account("roomy"), account("urgent")], 24));
+        let now = OffsetDateTime::now_utc();
+        set_weekly(&manager, 0, 86, now);
+        set_weekly(&manager, 1, 11, now);
+        let key = 4243;
+        pin(&manager, key, 0, odt_to_ms(now) - 10_000);
+
+        let served = manager.select(&HashSet::new(), now, None, Some(key), "/v1/messages", None);
+        assert_eq!(
+            served,
+            Some(0),
+            "a warm pin keeps its cache: it is honoured over the reset order"
+        );
+        assert_eq!(
+            manager.affinity_pin(key),
+            Some(0),
+            "the warm pin does not move"
         );
     }
 
@@ -5243,10 +5332,13 @@ mod stale_pin_load_tests {
         assert_eq!(pin_of(&manager, 50), Some(1));
     }
 
-    /// A count filter, not a TTL: a session returning after days still gets
-    /// its own pin back, and no stale pin is removed from the map.
+    /// A count filter, not a TTL: no stale pin is removed from the map. The
+    /// session returning after days is a different question: its cache is cold
+    /// on every account, so its pin is not honoured and it takes the normal pick
+    /// (`a_cold_pin_takes_the_reset_order_again`), here the emptier account 0,
+    /// and is re-pinned there. Every OTHER stale pin is left exactly as it was.
     #[test]
-    fn a_stale_pin_is_still_honoured_and_never_dropped() {
+    fn a_stale_pin_takes_the_pick_and_no_other_pin_is_dropped() {
         let manager = build_manager();
         let now = OffsetDateTime::now_utc();
         let now_ms = odt_to_ms(now);
@@ -5255,16 +5347,18 @@ mod stale_pin_load_tests {
         }
         pin(&manager, 50, 1, now_ms - DAYS_STALE_MS);
 
-        assert_eq!(
-            manager.select(&HashSet::new(), now, None, Some(50), "/v1/messages", None),
-            Some(1),
-            "the returning session is served on its own pinned account"
-        );
+        let served = manager.select(&HashSet::new(), now, None, Some(50), "/v1/messages", None);
+        assert!(served.is_some(), "the returning session is served");
         let pins = manager
             .affinity
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         assert_eq!(pins.len(), 7, "no stale pin was evicted by the filter");
+        assert_eq!(
+            pins.get(&50).map(|&(i, _)| i),
+            served,
+            "the returning session is re-pinned where the pick served it"
+        );
         assert!((1..=6).all(|k| pins.get(&k).map(|&(i, _)| i) == Some(1)));
     }
 }
