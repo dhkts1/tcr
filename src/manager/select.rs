@@ -1860,20 +1860,21 @@ impl Manager {
                 let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                 let old_name = accounts.get(previous).map_or("?", |a| a.name.as_str());
                 let new_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
-                match cold_pin_idle_ms {
-                    Some(idle_ms) => tracing::info!(
+                if let Some(idle_ms) = cold_pin_idle_ms {
+                    tracing::info!(
                         "affinity: re-pin session {} off {} -> {} (cache cold: idle {}s)",
                         short_session_id(key),
                         old_name,
                         new_name,
                         idle_ms / 1000
-                    ),
-                    None => tracing::info!(
+                    );
+                } else {
+                    tracing::info!(
                         "affinity: re-pin session {} off {} -> {} (pin failed an ACCOUNT HARD gate)",
                         short_session_id(key),
                         old_name,
                         new_name
-                    ),
+                    );
                 }
             }
             // The SOFT counterpart, and until now it emitted nothing at all: the pin
