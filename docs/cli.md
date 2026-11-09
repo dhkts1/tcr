@@ -864,6 +864,15 @@ It is never accepted as a `--token=<value>` argument, on purpose: an argv value 
 visible to every other process on the machine via `ps`, and shells routinely persist
 argv into history files. A prompt or a pipe are the only ways in.
 
+The token is the first non-empty line of what you give it. A `tcr mint` clipboard line,
+`<name>`, tab, `<token>`, is accepted as it is: the token is taken and the name dropped, so
+`pbpaste | tcr login --token --name <name>` adds a token `tcr mint` just copied. Whitespace
+inside the token is removed. Two inputs are refused before anything is sent upstream: the
+`code#state` the sign-in page shows, which belongs in the command that printed the sign-in
+URL, and a `tcr mint --group` block holding more than one account. A token pasted at the
+prompt is read up to its first line break, so one that wrapped over two lines arrives cut
+short and upstream refuses it; pipe it in instead.
+
 A `claude setup-token` credential is not shaped like a browser login, and two
 consequences follow directly from that:
 

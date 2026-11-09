@@ -2045,13 +2045,59 @@ fn read_setup_token() -> anyhow::Result<String> {
         eprint!("Paste the token from `claude setup-token`: ");
         std::io::stderr().flush().log_debug("flushing the prompt");
     }
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .context("read setup-token from stdin")?;
-    let token = line.trim().to_string();
+    let mut input = String::new();
+    if std::io::stdin().is_terminal() {
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("read setup-token from stdin")?;
+    } else {
+        // Piped: read it all, so a `tcr mint --group` block of several
+        // accounts is refused by name instead of silently using its first.
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
+            .context("read setup-token from stdin")?;
+    }
+    parse_setup_token(&input)
+}
+
+/// Turn what was pasted or piped into the bare access token.
+///
+/// The token is the first non-empty line. Three shapes of it are handled here,
+/// each one a paste that used to reach upstream as a wrong bearer and come back
+/// as a 401 blaming the token:
+///
+/// - a `tcr mint` clipboard line, `<name>\t<token>` (`assemble_clipboard_block`
+///   in `src/mint.rs`): the token is the part after the last tab;
+/// - whitespace inside the token, left by copying one a terminal had wrapped:
+///   removed, since no token contains any;
+/// - the `code#state` the sign-in page shows: refused before any upstream call,
+///   because a token never contains `#` and the fix is a different step.
+///
+/// More than one `tcr mint` line is refused: `--token` adds one account, and
+/// picking the first would add it under whatever `--name` said.
+fn parse_setup_token(input: &str) -> anyhow::Result<String> {
+    let mut lines = input.lines().filter(|l| !l.trim().is_empty());
+    let Some(first) = lines.next() else {
+        bail!("no token read from stdin — pipe or paste the output of `claude setup-token`");
+    };
+    if first.contains('\t') && lines.any(|l| l.contains('\t')) {
+        bail!(
+            "this is a `tcr mint` block for more than one account, and --token adds one. \
+             Pass one line at a time. Nothing was written."
+        );
+    }
+    let field = first
+        .rsplit_once('\t')
+        .map_or(first, |(_name, token)| token);
+    let token: String = field.chars().filter(|c| !c.is_whitespace()).collect();
     if token.is_empty() {
         bail!("no token read from stdin — pipe or paste the output of `claude setup-token`");
+    }
+    if token.contains('#') {
+        bail!(
+            "this is the sign-in code (code#state), not a token. Paste it into the command \
+             that printed the sign-in URL (`claude setup-token` or `tcr mint`), then give \
+             --token the token that command produces. Nothing was written."
+        );
     }
     Ok(token)
 }
@@ -2200,7 +2246,9 @@ pub async fn login_with_token(
         SetupTokenCheck::Accepted => {}
         SetupTokenCheck::Rejected { status } => bail!(
             "upstream refused this token (HTTP {status}) — it is expired, revoked or mistyped. \
-             Mint a fresh one with `claude setup-token` and try again. Nothing was written."
+             A token pasted at the prompt is read up to its first line break, so one that \
+             wrapped over two lines arrives cut short: pipe it in instead. Otherwise mint a \
+             fresh one with `claude setup-token` and try again. Nothing was written."
         ),
         SetupTokenCheck::Unreachable { message } => {
             eprintln!(
@@ -6579,6 +6627,56 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A `tcr mint` clipboard line is `<name>\t<token>`; `--token` must take
+    /// the token and drop the name, or the name goes upstream inside the bearer.
+    #[test]
+    fn parse_setup_token_takes_the_token_from_a_mint_clipboard_line() {
+        assert_eq!(
+            parse_setup_token("alice@example.com\tfake-token-abc\n").unwrap(),
+            "fake-token-abc"
+        );
+        assert_eq!(
+            parse_setup_token("  fake-token-abc  \n").unwrap(),
+            "fake-token-abc"
+        );
+    }
+
+    /// A token copied out of a terminal that wrapped it carries whitespace
+    /// in the middle; no token contains any, so it is removed.
+    #[test]
+    fn parse_setup_token_removes_whitespace_inside_the_token() {
+        assert_eq!(
+            parse_setup_token("fake-token \tabc def\n").unwrap(),
+            "abcdef"
+        );
+        assert_eq!(
+            parse_setup_token("fake-token abc\n").unwrap(),
+            "fake-tokenabc"
+        );
+    }
+
+    /// The sign-in page's `code#state` is refused by name before any upstream
+    /// call, rather than sent and reported as a bad token.
+    #[test]
+    fn parse_setup_token_refuses_a_sign_in_code() {
+        let err = parse_setup_token("fakecode#fakestate\n").unwrap_err();
+        assert!(err.to_string().contains("sign-in code"), "{err}");
+    }
+
+    /// A `tcr mint --group` block holds several accounts; `--token` adds one,
+    /// so it refuses rather than quietly adding the first.
+    #[test]
+    fn parse_setup_token_refuses_a_mint_block_of_several_accounts() {
+        let err =
+            parse_setup_token("a@example.com\tfake-one\nb@example.com\tfake-two\n").unwrap_err();
+        assert!(err.to_string().contains("more than one account"), "{err}");
+    }
+
+    #[test]
+    fn parse_setup_token_refuses_empty_input() {
+        assert!(parse_setup_token("\n  \n").is_err());
     }
 
     /// `--token` combined with `--account` must refuse and write nothing —
