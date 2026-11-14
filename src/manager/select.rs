@@ -2839,10 +2839,7 @@ impl Manager {
         // account. When `respect_pacing` is false (the fallback pass) or pacing is
         // unconfigured, this is inert — so a default-OFF build is byte-identical here
         // and the fallback pass can always still find a servable account.
-        if respect_pacing && Self::paced_out(account, pacing, now_ms) {
-            return false;
-        }
-        true
+        !(respect_pacing && Self::paced_out(account, pacing, now_ms))
     }
 
     /// Whether the SOFT pacing gate ALONE holds this account out: it is at the

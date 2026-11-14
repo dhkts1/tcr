@@ -56,10 +56,7 @@ const fn is_usable_v4(addr: Ipv4Addr) -> bool {
     // 169.254.0.0/16 link-local: a NIC's self-assigned address before DHCP
     // answers, not a network this Mac has actually joined.
     let octets = addr.octets();
-    if octets[0] == 169 && octets[1] == 254 {
-        return false;
-    }
-    true
+    !(octets[0] == 169 && octets[1] == 254)
 }
 
 const fn is_usable_v6(addr: Ipv6Addr) -> bool {
