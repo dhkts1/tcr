@@ -27,12 +27,6 @@
 //! interception decision regresses or a leaf does not cover the host. Every listener binds
 //! `127.0.0.1:0`.
 
-#![expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
-)]
-
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

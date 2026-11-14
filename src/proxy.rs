@@ -6450,8 +6450,7 @@ fn codex_model_unavailable_response(
         "tcr could not serve {model} from its available pooled Codex accounts. ChatGPT rejected that model for {accounts}. Choose another model or make an account that supports it available. {}",
         refused
             .first()
-            .map(|(_, detail)| detail.as_str())
-            .unwrap_or_default(),
+            .map_or_default(|(_, detail)| detail.as_str()),
     );
     if !credential_refusals.is_empty() {
         message.push(' ');
@@ -7341,8 +7340,7 @@ fn usage_from_json(bytes: &[u8], provider: Provider) -> JsonParse {
 #[cfg(test)]
 fn response_tool_uses_from_json(bytes: &[u8]) -> Vec<crate::session_wire::ToolUseEvent> {
     serde_json::from_slice::<Value>(bytes)
-        .map(|value| response_tool_uses_from_value(&value))
-        .unwrap_or_default()
+        .map_or_default(|value| response_tool_uses_from_value(&value))
 }
 
 /// The bound tokens of a non-streamed body, parsing it on its own and silently:
@@ -7350,8 +7348,7 @@ fn response_tool_uses_from_json(bytes: &[u8]) -> Vec<crate::session_wire::ToolUs
 #[cfg(test)]
 fn response_bound_tokens_from_json(bytes: &[u8]) -> Vec<MintedToken> {
     serde_json::from_slice::<Value>(bytes)
-        .map(|value| response_bound_tokens_from_value(&value))
-        .unwrap_or_default()
+        .map_or_default(|value| response_bound_tokens_from_value(&value))
 }
 
 /// The token breakdown of a parsed non-streamed messages body. No `usage` key
@@ -8606,8 +8603,7 @@ fn switch_warning(
         .map_or("unavailable", gate_phrase);
     let until = hint
         .free_at
-        .map(|at| format!(" until {}", at_utc(at, now)))
-        .unwrap_or_default();
+        .map_or_default(|at| format!(" until {}", at_utc(at, now)));
     tracing::info!(
         account = manager.account_name(bound_idx).as_deref().unwrap_or("?"),
         binding = ?hint.binding,
@@ -10651,8 +10647,7 @@ mod tests {
                 .wire_sessions
                 .into_iter()
                 .find(|row| row.session_id == "sess-tool")
-                .map(|row| row.tools.running)
-                .unwrap_or_default()
+                .map_or_default(|row| row.tools.running)
         };
         let mut polls = 0u32;
         while running().is_empty() && polls < 200 {
@@ -14966,8 +14961,7 @@ mod tests {
                     path: parts
                         .uri
                         .path_and_query()
-                        .map(|pq| pq.as_str().to_string())
-                        .unwrap_or_default(),
+                        .map_or_default(|pq| pq.as_str().to_string()),
                     headers: parts
                         .headers
                         .iter()
@@ -16354,15 +16348,12 @@ mod tests {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
-            seen = manager
-                .fan()
-                .map(|f| {
-                    let row = f.row();
-                    serde_json::json!({
-                        "desired": row.desired, "reason": row.reason, "command": row.command
-                    })
+            seen = manager.fan().map_or_default(|f| {
+                let row = f.row();
+                serde_json::json!({
+                    "desired": row.desired, "reason": row.reason, "command": row.command
                 })
-                .unwrap_or_default();
+            });
         }
         assert_eq!(seen, want);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
@@ -22532,8 +22523,7 @@ mod tests {
                             path: parts
                                 .uri
                                 .path_and_query()
-                                .map(|pq| pq.as_str().to_string())
-                                .unwrap_or_default(),
+                                .map_or_default(|pq| pq.as_str().to_string()),
                             headers: parts
                                 .headers
                                 .iter()
@@ -23455,8 +23445,7 @@ mod tests {
             manager.snapshot(OffsetDateTime::now_utc()).accounts[idx]
                 .usage
                 .as_ref()
-                .map(|row| row.today_by_model.keys().cloned().collect())
-                .unwrap_or_default()
+                .map_or_default(|row| row.today_by_model.keys().cloned().collect())
         };
         let mut polls = 0u32;
         while (models(0).is_empty() || models(1).len() < 2) && polls < 200 {
@@ -23539,8 +23528,7 @@ mod tests {
             manager.snapshot(OffsetDateTime::now_utc()).accounts[idx]
                 .usage
                 .as_ref()
-                .map(|usage| usage.last_hour)
-                .unwrap_or_default()
+                .map_or_default(|usage| usage.last_hour)
         };
         let mut polls = 0u32;
         while (last_hour(1).requests == 0 || last_hour(0).requests == 0) && polls < 200 {
@@ -23603,8 +23591,7 @@ mod tests {
                 manager.snapshot(OffsetDateTime::now_utc()).accounts[1]
                     .usage
                     .as_ref()
-                    .map(|usage| usage.last_hour)
-                    .unwrap_or_default()
+                    .map_or_default(|usage| usage.last_hour)
             };
             let mut polls = 0u32;
             while last_hour().output_tokens == 0 && polls < 200 {
@@ -23709,8 +23696,7 @@ mod tests {
         let models: Vec<String> = snapshot.accounts[1]
             .usage
             .as_ref()
-            .map(|row| row.today_by_model.keys().cloned().collect())
-            .unwrap_or_default();
+            .map_or_default(|row| row.today_by_model.keys().cloned().collect());
         assert_eq!(
             models,
             ["gpt-6-astra"],
@@ -27047,8 +27033,7 @@ mod forecast_routing_tests {
     fn keys(value: &Value) -> Vec<&str> {
         let mut keys: Vec<&str> = value
             .as_object()
-            .map(|object| object.keys().map(String::as_str).collect())
-            .unwrap_or_default();
+            .map_or_default(|object| object.keys().map(String::as_str).collect());
         keys.sort_unstable();
         keys
     }
@@ -27678,8 +27663,7 @@ mod forecast_routing_tests {
             manager.snapshot(OffsetDateTime::now_utc()).accounts[0]
                 .usage
                 .as_ref()
-                .map(|row| row.today_by_model.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default()
+                .map_or_default(|row| row.today_by_model.keys().cloned().collect::<Vec<_>>())
         };
         for _ in 0..200 {
             let ready = if usage {

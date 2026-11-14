@@ -33,8 +33,7 @@ const PUBLIC_B: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 2);
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or_default()
+        .map_or_default(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// One slot, on the pair's derived port, opening `in_ms` from now.

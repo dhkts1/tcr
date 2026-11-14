@@ -60,7 +60,7 @@ To install only the `tcr` CLI, on any platform, use the release's own installer:
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dhkts1/tcr/releases/latest/download/tcr-installer.sh | sh
 ```
 
-Or build from source with Rust 1.99 or newer (`rust-toolchain.toml` pins the exact version, and
+Or build from source with Rust 1.100 or newer (`rust-toolchain.toml` pins the exact version, and
 rustup installs it on the first build). Install the binary with the script and not with `cp`,
 because [macOS kills a running `tcr` that `cp` writes over](CONTRIBUTING.md#installing-it-onto-your-path):
 

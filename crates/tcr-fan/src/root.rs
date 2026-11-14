@@ -356,11 +356,7 @@ impl<K: KeyAccess> Root<K> {
         // What root put in manual for an earlier holder, or for a connection
         // whose window is running, is still root's doing, so the record
         // carries over to whoever holds next.
-        let mut fans = self
-            .holder
-            .as_ref()
-            .map(|h| h.fans.clone())
-            .unwrap_or_default();
+        let mut fans = self.holder.as_ref().map_or_default(|h| h.fans.clone());
         if let Some(window) = &self.window {
             merge(&mut fans, &window.fans);
         }

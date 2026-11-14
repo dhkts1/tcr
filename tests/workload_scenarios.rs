@@ -1957,8 +1957,9 @@ mod quota_replay {
         };
         for (i, slot) in slots.iter().enumerate() {
             slot.report(&fleet.manager, i, t0()).schedule(&mut events);
-            for w in 0..if slot.provider == 0 { 3 } else { 2 } {
-                schedule(&mut events, slot.windows[w].reset, 0, Event::Reset(i, w));
+            let tracked = if slot.provider == 0 { 3 } else { 2 };
+            for (w, window) in slot.windows.iter().enumerate().take(tracked) {
+                schedule(&mut events, window.reset, 0, Event::Reset(i, w));
             }
             for day in 0..if fixed_holds { 7 } else { 0 } {
                 schedule(
@@ -2086,8 +2087,9 @@ mod quota_replay {
                     }
                     let charge = quota_cost(&record, weight);
                     assert_eq!(charge, request.input + weight * request.output);
-                    for w in 0..if request.family == 2 { 3 } else { 2 } {
-                        slots[i].windows[w].used += charge as f64;
+                    let charged = if request.family == 2 { 3 } else { 2 };
+                    for window in slots[i].windows.iter_mut().take(charged) {
+                        window.used += charge as f64;
                     }
                     fleet.manager.record_usage(i, record);
                     slots[i]

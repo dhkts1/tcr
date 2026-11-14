@@ -1,6 +1,5 @@
 //! The Claude launch contract, using executable fixtures and real shells.
 //! Actual installed-client routing is exercised by test-agent-proxy-isolation.py.
-#![expect(clippy::unwrap_used, reason = "test helpers fail with context")]
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;

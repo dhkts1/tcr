@@ -4150,8 +4150,7 @@ mod tests {
     fn percent_decode(value: &str) -> String {
         form_urlencoded::parse(format!("v={value}").as_bytes())
             .next()
-            .map(|(_, v)| v.into_owned())
-            .unwrap_or_default()
+            .map_or_default(|(_, v)| v.into_owned())
     }
 
     /// The email-less profile — the one path that prompts — takes the

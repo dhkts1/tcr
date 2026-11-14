@@ -2,7 +2,7 @@
 name = "tcr-smc"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 license = "PolyForm-Noncommercial-1.0.0"
 publish = false
 description = "Fan speeds and CPU temperature from the Mac's System Management Controller, read through AppleSMC without root"

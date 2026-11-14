@@ -36,7 +36,7 @@ pub const WARM_TIMEOUT: Duration = Duration::from_secs(30);
 /// Why a warm request failed. `status` carries the HTTP code when there was one.
 /// A warm failure is a *soft* signal — the caller logs it and moves on.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("keep-warm request failed{}: {message}", .status.map(|s| format!(" (HTTP {s})")).unwrap_or_default())]
+#[error("keep-warm request failed{}: {message}", .status.map_or_default(|s| format!(" (HTTP {s})")))]
 pub struct WarmError {
     pub status: Option<u16>,
     pub message: String,

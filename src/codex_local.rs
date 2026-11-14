@@ -285,13 +285,12 @@ fn older_tcr_dirs(env: &dyn Fn(&str) -> Option<String>, home: &Path) -> Vec<Path
 
 /// A colon-separated list of directories, empty entries dropped.
 fn split_dirs(list: Option<&str>) -> Vec<PathBuf> {
-    list.map(|list| {
+    list.map_or_default(|list| {
         list.split(':')
             .filter(|dir| !dir.is_empty())
             .map(PathBuf::from)
             .collect()
     })
-    .unwrap_or_default()
 }
 
 /// An executable regular file, after following symlinks (Homebrew's `bin/codex` is one): a

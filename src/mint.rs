@@ -575,7 +575,7 @@ mod tests {
         // Decode the `scope` param rather than substring-matching the raw URL:
         // `:` and the space between scopes are both percent-encoded, so a raw
         // `contains("user:inference")` check would never match.
-        let query = url.split_once('?').map(|(_, q)| q).unwrap_or_default();
+        let query = url.split_once('?').map_or_default(|(_, q)| q);
         let scope = form_urlencoded::parse(query.as_bytes())
             .find(|(k, _)| k == "scope")
             .map(|(_, v)| v.into_owned())

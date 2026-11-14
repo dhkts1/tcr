@@ -1486,9 +1486,8 @@ fn pin_row(
     let label = sanitize_label(label).map_err(|refusal| anyhow!("peer pin: {refusal}"))?;
     let _lock = crate::peer::config::FileLock::acquire(store.path())?;
     let mut file = read_or_default(store.path())?;
-    let endpoints = addr
-        .map(|addr| vec![Endpoint::direct(addr, now_ms(), EndpointSource::Paired)])
-        .unwrap_or_default();
+    let endpoints =
+        addr.map_or_default(|addr| vec![Endpoint::direct(addr, now_ms(), EndpointSource::Paired)]);
     let row = PeerRow {
         node: peer,
         label,
@@ -1624,8 +1623,7 @@ fn random_id() -> Result<u64> {
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or_default()
+        .map_or_default(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// A 32-byte join secret is the same width as a static key, which is why both

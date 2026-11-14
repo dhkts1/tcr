@@ -3813,8 +3813,7 @@ impl Manager {
                                 crate::identity::Resolved::One(position) => config
                                     .accounts
                                     .get(position)
-                                    .map(config::Account::egress_pin)
-                                    .unwrap_or_default(),
+                                    .map_or_default(config::Account::egress_pin),
                                 crate::identity::Resolved::Many
                                 | crate::identity::Resolved::None => config::EgressPin::default(),
                             }

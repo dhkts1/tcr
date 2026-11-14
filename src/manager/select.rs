@@ -1120,12 +1120,9 @@ impl Manager {
                                     }
                                 }
                                 if let Some(y) = best {
-                                    let x_name = accounts
-                                        .get(idx)
-                                        .map(|a| a.name.clone())
-                                        .unwrap_or_default();
-                                    let y_name =
-                                        accounts.get(y).map(|a| a.name.clone()).unwrap_or_default();
+                                    let x_name =
+                                        accounts.get(idx).map_or_default(|a| a.name.clone());
+                                    let y_name = accounts.get(y).map_or_default(|a| a.name.clone());
                                     migrate_names = Some((x_name, y_name));
                                     target = y;
                                 }
@@ -1301,12 +1298,8 @@ impl Manager {
                                     // genuinely dead pin takes).
                                     let util = accounts
                                         .get(idx)
-                                        .map(|a| a.quota.max_utilization(now, is_fable))
-                                        .unwrap_or_default();
-                                    let name = accounts
-                                        .get(idx)
-                                        .map(|a| a.name.clone())
-                                        .unwrap_or_default();
+                                        .map_or_default(|a| a.quota.max_utilization(now, is_fable));
+                                    let name = accounts.get(idx).map_or_default(|a| a.name.clone());
                                     tracing::info!(
                                         idle_s = idle_ms / 1000,
                                         cache_warm_hold_secs = warm.secs(),
@@ -2163,8 +2156,7 @@ impl Manager {
             let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
             let util = accounts
                 .get(idx)
-                .map(|a| a.quota.max_utilization(now, is_fable))
-                .unwrap_or_default();
+                .map_or_default(|a| a.quota.max_utilization(now, is_fable));
             if let Some(account) = accounts.get_mut(idx) {
                 account.last_selected_seq = tick;
                 if via_sticky {
@@ -2247,8 +2239,7 @@ impl Manager {
         let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
         let util = accounts
             .get(idx)
-            .map(|a| a.quota.max_utilization(now, is_fable))
-            .unwrap_or_default();
+            .map_or_default(|a| a.quota.max_utilization(now, is_fable));
         if let Some(account) = accounts.get_mut(idx) {
             account.last_selected_seq = tick;
             tracing::info!(
@@ -2839,10 +2830,7 @@ impl Manager {
         // account. When `respect_pacing` is false (the fallback pass) or pacing is
         // unconfigured, this is inert — so a default-OFF build is byte-identical here
         // and the fallback pass can always still find a servable account.
-        if respect_pacing && Self::paced_out(account, pacing, now_ms) {
-            return false;
-        }
-        true
+        !(respect_pacing && Self::paced_out(account, pacing, now_ms))
     }
 
     /// Whether the SOFT pacing gate ALONE holds this account out: it is at the

@@ -1247,12 +1247,10 @@ mod tests {
             Ok(peek) => {
                 let (tool_uses, tool_results) = peek
                     .messages
-                    .map(crate::session_wire::extract_tool_events)
-                    .unwrap_or_default();
+                    .map_or_default(crate::session_wire::extract_tool_events);
                 let bound = peek
                     .messages
-                    .map(crate::session_wire::extract_bound_tokens)
-                    .unwrap_or_default();
+                    .map_or_default(crate::session_wire::extract_bound_tokens);
                 let mut previous_message_ids = Vec::new();
                 if let Some(id) = peek.previous_message_id {
                     previous_message_ids.push(("previous_message_id", id));
@@ -1402,7 +1400,7 @@ mod tests {
             assert_eq!(answers.wire.tool_uses.len(), 1);
             assert_eq!(answers.wire.tool_results.len(), 1);
             assert!(answers.wire.session_id.is_some());
-            let (system, _) = answers.affinity_prefix.clone().expect("a prefix");
+            let (system, _) = answers.affinity_prefix.expect("a prefix");
             assert!(
                 system.expect("system").contains(r#""ttl":"1h""#),
                 "the prefix hash reads the rewritten system"
