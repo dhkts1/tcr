@@ -189,13 +189,7 @@ branch="chore/appcast-$version-bump-$next"
 title="chore: appcast entry for $version and bump to $next"
 say "step 5/7  PR: $title"
 git -C "$root" switch -q -c "$branch" || die "could not create $branch"
-V="$version" N="$next" perl -0pi -e 's/^version = "\Q$ENV{V}\E"/version = "$ENV{N}"/m' "$root/Cargo.toml"
-V="$version" N="$next" perl -0pi -e 's/(name = "tcr"\nversion = ")\Q$ENV{V}\E"/$1$ENV{N}"/' "$root/Cargo.lock"
-[ "$(cargo_version)" = "$next" ] || die "Cargo.toml was not moved to $next"
-grep -A1 '^name = "tcr"$' "$root/Cargo.lock" | grep -q "^version = \"$next\"$" \
-  || die "Cargo.lock was not moved to $next"
-cargo metadata --manifest-path "$root/Cargo.toml" --format-version 1 --locked --no-deps >/dev/null \
-  || die "Cargo.lock does not match Cargo.toml after the bump"
+"$script_dir/bump-version.sh" "$root" "$version" "$next" || die "the bump to $next failed"
 git -C "$root" add apps/macos/appcast.xml Cargo.toml Cargo.lock
 git -C "$root" commit -q -m "$title" \
   -m "release: the feed entry the release wrote, and the next unreleased version in Cargo.toml and Cargo.lock." \
