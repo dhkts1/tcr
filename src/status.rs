@@ -751,8 +751,8 @@ impl StatusPayload {
         Self {
             kind: STATUS_KIND.to_string(),
             accounts,
-            // Compile-time constants of the SERVING binary — not passed in,
-            // because the only honest answer is the one baked into this process.
+            // The SERVING binary's stamp, installed at its startup — not passed
+            // in, because the only honest answer is the one this process holds.
             build: BuildInfo::current(),
             http1_only,
             control,
@@ -2510,6 +2510,7 @@ mod tests {
     /// The server's build stamp rides along and survives the wire.
     #[test]
     fn payload_carries_the_servers_build() {
+        let stamp = crate::build_info::install_test_stamp();
         let wire = serde_json::to_string(&StatusPayload::from_snapshot(
             &snapshot_with_counters(),
             &[0.85],
@@ -2520,9 +2521,12 @@ mod tests {
         .expect("serialize");
         let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
         assert_eq!(
-            back.build,
-            BuildInfo::current(),
+            back.build, stamp,
             "the payload reports the SERVING binary's build"
+        );
+        assert!(
+            wire.contains(crate::build_info::TEST_STAMP_SHA),
+            "the installed sha is on the wire: {wire}"
         );
         assert!(
             wire.contains("\"builtAt\""),

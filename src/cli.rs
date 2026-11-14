@@ -8222,6 +8222,9 @@ mod tests {
     /// overrides the config's 3456, so this never touches a real running proxy.
     #[tokio::test]
     async fn live_status_reads_the_running_servers_counters() {
+        // A real stamp, so the build check below compares a sha that only the
+        // serving process could have sent, not `unknown` with `unknown`.
+        let stamp = build_info::install_test_stamp();
         let (listener, port) = crate::test_support::loopback::listener().await;
         let mut config = load_from(TWO_ACCOUNTS);
         config.proxy.port = port;
@@ -8273,14 +8276,14 @@ mod tests {
         // END-TO-END on the build stamp too: the sha crossed a real socket from
         // the serving process, and reaches every rendered row.
         assert_eq!(
-            build,
-            BuildInfo::current(),
+            build, stamp,
             "the served payload names the build that served it"
         );
+        assert_eq!(build.sha, build_info::TEST_STAMP_SHA);
         for row in &rows {
             assert_eq!(
                 row["serverSha"],
-                serde_json::json!(BuildInfo::current().sha)
+                serde_json::json!(build_info::TEST_STAMP_SHA)
             );
         }
     }

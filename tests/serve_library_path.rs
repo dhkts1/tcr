@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tcr::log_err::LogErr as _;
 
+use tcr::build_info::BuildInfo;
 use tcr::config::Config;
 use tcr::proxy::STATUS_PATH;
 use tcr::server::{CacheFlush, IncumbentPolicy, ServeOptions, TlsSetup, serve};
@@ -35,6 +36,21 @@ use tcr::usage::LedgerShutdown;
 /// The port `tcr` uses by default. Named here so the assertion below says what
 /// it is protecting rather than showing a bare number.
 const LIVE_PROXY_PORT: u16 = 3456;
+
+/// The build this test process says it runs. Nothing here is the `tcr` binary,
+/// so nothing installs a stamp unless a test does; without one, every build
+/// field reads `unknown` on both sides of an assertion and proves nothing.
+/// Every caller installs the same stamp, so a second call is a no-op.
+fn install_test_stamp() -> BuildInfo {
+    let stamp = BuildInfo::from_stamp("7e57ab1", "false", "2026-11-14T00:00:00Z");
+    if let Err(err) = tcr::build_info::install(stamp.clone()) {
+        assert_eq!(
+            err.installed, stamp,
+            "a different stamp is already installed"
+        );
+    }
+    stamp
+}
 
 /// A config that binds an ephemeral port and enables exactly the two background
 /// loops this file counts: the session-affinity flusher and the quota prober.
@@ -363,6 +379,7 @@ fn the_convenience_constructor_touches_nothing_outside_the_process() {
 /// identity there is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serving_writes_the_port_claim_after_binding_and_withdraws_it_on_shutdown() {
+    let stamp = install_test_stamp();
     let owner_dir = scratch_owner_dir("claim");
 
     let mut handle = serve(ServeOptions {
@@ -406,7 +423,7 @@ async fn serving_writes_the_port_claim_after_binding_and_withdraws_it_on_shutdow
         ProxyOwner {
             pid: std::process::id(),
             port: addr.port(),
-            sha: tcr::build_info::BuildInfo::current().sha,
+            sha: stamp.sha,
             host: ProxyHost::Embedded,
         },
         "the claim must name THIS process, the port actually bound, this build and \

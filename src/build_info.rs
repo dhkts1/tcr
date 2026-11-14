@@ -70,6 +70,29 @@ pub fn install(build: BuildInfo) -> Result<(), AlreadyInstalled> {
     install_into(&INSTALLED, build)
 }
 
+/// The stamp the library's own tests install, so a test that checks a build
+/// crossing the wire compares a real sha and not `unknown` against `unknown`.
+#[cfg(test)]
+pub(crate) const TEST_STAMP_SHA: &str = "7e57ab1";
+
+/// Install [`TEST_STAMP_SHA`] in this test process and return the build it
+/// names. Every caller installs the same value, so a second call is a no-op;
+/// a different stamp already installed is a bug in a test and panics.
+#[cfg(test)]
+pub(crate) fn install_test_stamp() -> BuildInfo {
+    let stamp = BuildInfo::from_stamp(TEST_STAMP_SHA, "false", "2026-11-14T00:00:00Z");
+    match install(stamp.clone()) {
+        Ok(()) => stamp,
+        Err(err) => {
+            assert_eq!(
+                err.installed, stamp,
+                "another test installed a different stamp"
+            );
+            stamp
+        }
+    }
+}
+
 fn install_into(cell: &OnceLock<BuildInfo>, build: BuildInfo) -> Result<(), AlreadyInstalled> {
     cell.set(build).map_err(|refused| AlreadyInstalled {
         refused,
@@ -122,11 +145,13 @@ impl Default for BuildInfo {
 impl BuildInfo {
     /// The running binary's own stamp, as [`install`]ed.
     ///
-    /// A process that installed none (the library's own tests, an integration
-    /// test serving in-process) has no binary build to name, so it reads as
+    /// A process that installed none (a library test, an integration test
+    /// serving in-process) has no binary build to name, so it reads as
     /// [`BuildInfo::default`], every field [`UNKNOWN`]: the same "cannot tell" a
-    /// build without git reports. `tests/codex_run.rs` runs the real binary and
-    /// holds that it reports the stamp it was built with.
+    /// build without git reports. A test that checks a build crossing the wire
+    /// installs a fixed stamp first, so it compares a real sha.
+    /// `tests/codex_run.rs` runs the real binary and holds that it reports the
+    /// stamp it was built with.
     pub fn current() -> Self {
         INSTALLED.get().cloned().unwrap_or_default()
     }
