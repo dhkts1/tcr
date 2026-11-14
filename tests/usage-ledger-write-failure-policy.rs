@@ -21,11 +21,6 @@
 //! after it is set. This file has exactly one test, so "global for the whole
 //! binary" and "global for this test" are the same thing.
 
-#![expect(
-    clippy::expect_used,
-    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
-)]
-
 /// The tracing capture layer the `peer_*` files share.
 #[path = "support/peer.rs"]
 mod peer_support;

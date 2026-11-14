@@ -17,11 +17,6 @@
 //! on the configured default. Nothing here signals, restarts or probes a live
 //! proxy.
 
-#![expect(
-    clippy::expect_used,
-    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
-)]
-
 use std::sync::Arc;
 use std::time::Duration;
 use tcr::log_err::LogErr as _;
