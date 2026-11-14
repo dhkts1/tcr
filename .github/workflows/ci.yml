@@ -33,11 +33,27 @@ jobs:
   # never merge; gating per job with `if:` still reports each job. And a rule in a
   # script can be run and tested, which is why the step below executes its own
   # fixture (14 cases, both directions) before it is allowed to answer.
+  #
+  # The second reason to sit out is a push to main whose exact tree already
+  # passed this workflow as a pull request: the squash merge of an up-to-date
+  # branch. That was 39 of the last 40 pushes on 2026-11-14, each re-running
+  # the same build. .github/scripts/same-tree-pr-run.sh finds the passing run
+  # from the API's own records and says why in this job's log; any error in
+  # the lookup runs everything. `skip` is the one output the jobs below read.
   changes:
     name: changes
     runs-on: ubuntu-latest
+    # Job-level permissions replace the workflow's, so contents:read is
+    # restated. actions:read lists the pull request's runs and
+    # pull-requests:read finds the pull request a push merged.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
     outputs:
       inert: ${{ steps.classify.outputs.inert }}
+      reuse: ${{ steps.reuse.outputs.reuse }}
+      skip: ${{ steps.decide.outputs.skip }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -53,9 +69,12 @@ jobs:
           # A gate that cannot fail is not a gate: prove the classifier still
           # says `code` for source before trusting it to say `inert` for prose.
           .github/scripts/changed-is-inert.sh --self-check
+          # The same for the same-tree lookup below, on every event, so a pull
+          # request that breaks it goes red before it can reach main.
+          .github/scripts/test-same-tree-pr-run.sh
 
           if [ -z "${BASE_SHA}" ]; then
-            echo "not a pull request (push to main) — running everything."
+            echo "not a pull request (push to main): the inert rule does not apply."
             echo "inert=false" >>"${GITHUB_OUTPUT}"
             exit 0
           fi
@@ -73,14 +92,61 @@ jobs:
             echo "inert=false" >>"${GITHUB_OUTPUT}"
           fi
 
+      - name: Find a pull request run that passed on this tree
+        id: reuse
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+          WORKFLOW_PATH: .github/workflows/ci.yml
+        run: |
+          set -uo pipefail
+          # A first push or a force push has no old tip in this clone, so there
+          # is no diff to judge the cache rule by.
+          if ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "old tip ${BEFORE} is not in this clone; running everything."
+            echo "reuse=" >>"${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          # To a file first: the lookup can stop reading early, and a pipe
+          # would then fail the writer with SIGPIPE.
+          git diff --unified=0 "${BEFORE}" "${SHA}" >"${RUNNER_TEMP}/push.diff"
+          if out="$(.github/scripts/same-tree-pr-run.sh <"${RUNNER_TEMP}/push.diff")"; then
+            echo "${out}" >>"${GITHUB_OUTPUT}"
+            run="${out#reuse=}"
+            if [ -n "${run}" ]; then
+              echo "Reusing https://github.com/${REPO}/actions/runs/${run}, which passed on this tree." >>"${GITHUB_STEP_SUMMARY}"
+            fi
+          else
+            echo "::warning::same-tree lookup failed (exit $?); running everything."
+            echo "reuse=" >>"${GITHUB_OUTPUT}"
+          fi
+
+      - name: Decide
+        id: decide
+        env:
+          INERT: ${{ steps.classify.outputs.inert }}
+          REUSE: ${{ steps.reuse.outputs.reuse }}
+        run: |
+          set -euo pipefail
+          if [ "${INERT}" = "true" ] || [ -n "${REUSE}" ]; then
+            echo "skip=true" >>"${GITHUB_OUTPUT}"
+          else
+            echo "skip=false" >>"${GITHUB_OUTPUT}"
+          fi
+
   # Unlike macos, tsan and miri, this job carries no job-level `if:`. A
   # docs-only change still runs it, and every step after the secret scan
-  # carries the inert condition on its own instead. The reason is the scan: a
+  # carries the `skip` condition on its own instead. The reason is the scan: a
   # token pasted into a README is the likeliest leak this repository has, and
   # a README edit is exactly the change the inert rule skips. A skipped job
   # reports as passing to branch protection, so a scan inside a skipped `ci`
   # would let that README merge with every required check green. On an inert
-  # change this job costs a checkout and one scan, a few seconds.
+  # change this job costs a checkout and one scan, a few seconds. A push that
+  # reuses a pull request run keeps the scan too, because it scans the pushed
+  # commit itself, which is not one the pull request ran on.
   ci:
     name: ci
     needs: changes
@@ -152,31 +218,31 @@ jobs:
 
       # The version here and rust-toolchain.toml's channel move together.
       - name: Install Rust toolchain
-        if: needs.changes.outputs.inert != 'true'
+        if: needs.changes.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
 
       - name: Toolchain version
-        if: needs.changes.outputs.inert != 'true'
+        if: needs.changes.outputs.skip != 'true'
         run: rustc -V && cargo -V && cargo clippy -V
 
       # Caches ~/.cargo/{registry,git} + target/. Auto-keys on Cargo.lock +
       # rustc version + job name, so this cache stays isolated from the tsan/
       # miri jobs' sanitizer builds. Typically 50-80% faster warm builds.
       - name: Cache cargo
-        if: needs.changes.outputs.inert != 'true'
+        if: needs.changes.outputs.skip != 'true'
         uses: Swatinem/rust-cache@v2
 
       - name: Format
-        if: needs.changes.outputs.inert != 'true'
+        if: needs.changes.outputs.skip != 'true'
         run: cargo fmt --all --check
 
       # An `--org` flag on an account verb narrows nothing now that account
       # names are unique, so one would be a lie in `--help`. It came back once
       # already, one verb at a time — see the script's own header.
       - name: No --org flag
-        if: needs.changes.outputs.inert != 'true'
+        if: needs.changes.outputs.skip != 'true'
         run: scripts/check-no-org-flag.sh
 
       # SwiftUI's `.secondary`/`.tertiary` resolve against the system window
@@ -184,7 +250,7 @@ jobs:
       # `tcrbar-palette.py` measures and gates never applied to them. Thirteen
       # text runs had drifted onto them, the worst at 1.86:1 — see the script.
       - name: No hierarchical styles used as panel ink
-        if: needs.changes.outputs.inert != 'true'
+        if: needs.changes.outputs.skip != 'true'
         run: scripts/check-panel-ink.sh
 
       # `PanelV4/` is a transcription of the approved mockup's stylesheet, one
@@ -192,7 +258,7 @@ jobs:
       # drifted through hand-written sizes — a 16 here, an 8 there — so a view
       # that writes one, or reaches for a pre-v4 geometry token, is refused.
       - name: PanelV4 writes no sizes of its own
-        if: needs.changes.outputs.inert != 'true'
+        if: needs.changes.outputs.skip != 'true'
         run: scripts/check-panel-v4.sh
 
       # This repository is public and takes pull requests from forks, which
@@ -202,7 +268,7 @@ jobs:
       # .githooks/lib/disclosure-scan.sh). This is the same check the hook
       # runs on a staged diff, run here over the whole tracked tree instead.
       - name: No internal-scaffolding citations in the tree
-        if: needs.changes.outputs.inert != 'true'
+        if: needs.changes.outputs.skip != 'true'
         run: scripts/check-public-disclosure.sh
 
       # The same check, over the PR's own title and body: a description that
@@ -210,7 +276,7 @@ jobs:
       # does. Skipped on a plain push to `main`, where there is no PR text to
       # check.
       - name: No internal-scaffolding citations in the PR title/body
-        if: github.event_name == 'pull_request' && needs.changes.outputs.inert != 'true'
+        if: github.event_name == 'pull_request' && needs.changes.outputs.skip != 'true'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -224,7 +290,7 @@ jobs:
       # email — in a diff AND in a commit message. A gate nobody has watched
       # fail is a gate that reports safety.
       - name: Disclosure scan fixtures
-        if: needs.changes.outputs.inert != 'true'
+        if: needs.changes.outputs.skip != 'true'
         run: .githooks/test-disclosure-scan.sh
 
       # --locked: fail if CI would silently rewrite Cargo.lock. Pins the exact
@@ -234,15 +300,15 @@ jobs:
       # every `#[cfg(target_os = "macos")]` block is compiled out here; the
       # `macos` job runs the same command to lint it.
       - name: Clippy
-        if: needs.changes.outputs.inert != 'true'
+        if: needs.changes.outputs.skip != 'true'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
-        if: needs.changes.outputs.inert != 'true'
+        if: needs.changes.outputs.skip != 'true'
         run: cargo test --all --locked
 
       - name: Build (release)
-        if: needs.changes.outputs.inert != 'true'
+        if: needs.changes.outputs.skip != 'true'
         run: cargo build --release --locked
 
       # Tokens.swift says a failing design token is a build error. Until this
@@ -264,7 +330,7 @@ jobs:
       # stylesheet publishing the old hex under the generator's authority. The
       # generator writes nothing when it fails, so the diff cannot mask it.
       - name: Design tokens (contrast + freshness)
-        if: needs.changes.outputs.inert != 'true'
+        if: needs.changes.outputs.skip != 'true'
         run: |
           python3 scripts/tcrbar-palette.py \
             --emit-css "$RUNNER_TEMP/tokens.css" \
@@ -285,7 +351,7 @@ jobs:
   macos:
     name: macos
     needs: changes
-    if: needs.changes.outputs.inert != 'true'
+    if: needs.changes.outputs.skip != 'true'
     runs-on: macos-latest
     # macOS runners are slower than ubuntu-latest and this job compiles both
     # toolchains; 20 (the `ci` budget) is too tight for a cold cache.
@@ -440,7 +506,7 @@ jobs:
   tsan:
     name: tsan
     needs: changes
-    if: needs.changes.outputs.inert != 'true'
+    if: needs.changes.outputs.skip != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -463,7 +529,7 @@ jobs:
   miri:
     name: miri
     needs: changes
-    if: needs.changes.outputs.inert != 'true'
+    if: needs.changes.outputs.skip != 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 20
