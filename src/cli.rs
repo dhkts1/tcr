@@ -1529,15 +1529,13 @@ fn render_groups_text(config: &Config) -> String {
             row.accounts,
             row.members.join(","),
             row.codex_members
-                .map(|n| format!(" codex_members={n}"))
-                .unwrap_or_default(),
+                .map_or_default(|n| format!(" codex_members={n}")),
             yes_no(row.reserved),
             yes_no(row.parked),
             yes_no(row.allows_control),
             yes_no(row.routes),
             row.route_block
-                .map(|block| format!(" route_block={block}"))
-                .unwrap_or_default(),
+                .map_or_default(|block| format!(" route_block={block}")),
             row.color,
             row.color_source,
         )
@@ -1794,17 +1792,13 @@ impl LiveSite<'_> {
                 words.too_old_to,
                 words.route_path,
                 words.file_written,
-                keeps
-                    .map(|k| format!(" It will KEEP {k} until it restarts."))
-                    .unwrap_or_default(),
+                keeps.map_or_default(|k| format!(" It will KEEP {k} until it restarts.")),
             ),
             Stale::Failed(why) => format!(
                 "[tcr] WARNING: could not {} the proxy running on :{port} ({why}), so {}.{}",
                 words.could_not,
                 words.file_written,
-                keeps
-                    .map(|k| format!(" It may KEEP {k} until it restarts."))
-                    .unwrap_or_default(),
+                keeps.map_or_default(|k| format!(" It may KEEP {k} until it restarts.")),
             ),
         }
     }
@@ -2223,7 +2217,7 @@ async fn call_route_with_policy<T: serde::de::DeserializeOwned>(
     } else {
         Err(LiveControlError::Unusable(format!(
             "HTTP {status}{}",
-            message().map(|m| format!(": {m}")).unwrap_or_default()
+            message().map_or_default(|m| format!(": {m}"))
         )))
     };
     RouteAnswer {
@@ -2294,8 +2288,7 @@ pub(crate) async fn post_add_account_with_providers(
         .as_ref()
         .and_then(|headers| headers.get(crate::proxy::PROVIDERS_HEADER))
         .and_then(|v| v.to_str().ok())
-        .map(crate::proxy::providers_in_header)
-        .unwrap_or_default();
+        .map_or_default(crate::proxy::providers_in_header);
     (answer.result, providers)
 }
 
@@ -4165,9 +4158,8 @@ pub async fn fan(
     }
     let reason = row
         .reason
-        .map(|r| format!(" ({})", fan_word(&r)))
-        .unwrap_or_default();
-    let detail = row.detail.map(|d| format!(": {d}")).unwrap_or_default();
+        .map_or_default(|r| format!(" ({})", fan_word(&r)));
+    let detail = row.detail.map_or_default(|d| format!(": {d}"));
     eprintln!(
         "tcr: the fans are {}{reason}{detail}, not {}",
         fan_word(&row.state),
@@ -4230,8 +4222,7 @@ fn render_fan_text(
             .targets
             .iter()
             .find(|t| t.fan == fan.index)
-            .map(|t| format!(" written={:.0}", t.rpm))
-            .unwrap_or_default();
+            .map_or_default(|t| format!(" written={:.0}", t.rpm));
         out.push_str(&format!(
             "fan={} actual={:.0} min={:.0} max={:.0} mode={} target={}{written}\n",
             fan.index,
@@ -4268,8 +4259,7 @@ fn render_sessions_text(supported: bool, sessions: &[tcr_status_wire::SessionRow
             row.account.as_deref().unwrap_or("-"),
             row.provider
                 .as_deref()
-                .map(|p| format!(" provider={p}"))
-                .unwrap_or_default(),
+                .map_or_default(|p| format!(" provider={p}")),
             row.model.as_deref().unwrap_or("-"),
             row.requests,
             row.input_tokens,
@@ -4825,10 +4815,7 @@ fn relogin_hint_lines(snapshot: &StatsSnapshot, home: Option<&Path>) -> Vec<Stri
         .filter(|a| a.provider == Provider::Codex && a.gate == crate::stats::GateReason::Login)
         .map(|a| {
             let name = &a.name;
-            let why = a
-                .relogin_why(home)
-                .map(|why| format!(": {why}"))
-                .unwrap_or_default();
+            let why = a.relogin_why(home).map_or_default(|why| format!(": {why}"));
             format!("[tcr] {name} needs re-login{why} — tcr login --codex --account {name}")
         })
         .collect()

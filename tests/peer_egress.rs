@@ -371,8 +371,7 @@ async fn a_carry_that_died_inside_the_peer_stream_is_not_logged_as_carried() {
     let pump = ending
         .fields
         .get(field)
-        .map(|value| value.trim_matches('"').to_string())
-        .unwrap_or_default();
+        .map_or_default(|value| value.trim_matches('"').to_string());
     assert!(
         pump.contains("did not decrypt"),
         "the line carries the pump's own ending in `{field}`, which is the only place a \

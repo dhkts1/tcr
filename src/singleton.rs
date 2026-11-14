@@ -422,14 +422,12 @@ fn process_command(pid: u32) -> Vec<String> {
         false,
         ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
     );
-    sys.process(Pid::from_u32(pid))
-        .map(|p| {
-            p.cmd()
-                .iter()
-                .map(|s| s.to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
+    sys.process(Pid::from_u32(pid)).map_or_default(|p| {
+        p.cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    })
 }
 
 /// PIDs listening on `:port` on any address (via [`listeners`], no subprocess),
@@ -1393,8 +1391,7 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
+                .map_or_default(|d| d.as_nanos())
         ));
         std::fs::create_dir_all(&dir).expect("a scratch dir under the temp dir is creatable");
         dir

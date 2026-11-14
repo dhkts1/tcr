@@ -166,8 +166,7 @@ pub fn beacon_txt(
 fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or_default()
+        .map_or_default(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// The one shared sanitizer, plus the two beacon-specific refusals it has no

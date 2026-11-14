@@ -375,14 +375,8 @@ impl Manager {
         // as it keeps that row's name.
         let sessions = {
             let map = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-            let name_of = |idx: usize| {
-                accounts
-                    .get(idx)
-                    .map(|a| a.name.clone())
-                    .unwrap_or_default()
-            };
-            let provider_of =
-                |idx: usize| accounts.get(idx).map(|a| a.provider).unwrap_or_default();
+            let name_of = |idx: usize| accounts.get(idx).map_or_default(|a| a.name.clone());
+            let provider_of = |idx: usize| accounts.get(idx).map_or_default(|a| a.provider);
             let mut v: Vec<SessionSnapshot> = map
                 .iter()
                 .map(|(k, s)| {

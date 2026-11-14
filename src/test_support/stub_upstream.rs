@@ -239,8 +239,7 @@ async fn dispatch_http(mut req: Request) -> Response {
     let target = req
         .uri()
         .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_default();
+        .map_or_default(|pq| pq.as_str().to_string());
     let Some((id, tail)) = split_route(&target) else {
         return (StatusCode::NOT_FOUND, format!("no stub route in {target}")).into_response();
     };

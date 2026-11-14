@@ -830,8 +830,7 @@ fn parse_soap_fault(text: &str) -> Option<(u16, String)> {
     root.find_all("errorDescription", &mut descriptions);
     let description = descriptions
         .first()
-        .map(|node| node.text.trim().to_string())
-        .unwrap_or_default();
+        .map_or_default(|node| node.text.trim().to_string());
     Some((code, description))
 }
 

@@ -64,8 +64,7 @@ fn scratch_affinity_path(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default()
+            .map_or_default(|d| d.as_nanos())
     );
     std::env::temp_dir().join(unique).join("affinity.json")
 }
@@ -76,8 +75,7 @@ fn scratch_wire_sessions_path(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default()
+            .map_or_default(|d| d.as_nanos())
     );
     std::env::temp_dir().join(unique).join("session-wire.json")
 }

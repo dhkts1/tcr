@@ -602,7 +602,7 @@ pub async fn accept_once_splice(
                 gateway = %label,
                 host = %host_for_log,
                 error = %err,
-                pump_error = ended.err().map(|err| err.to_string()).unwrap_or_default(),
+                pump_error = ended.err().map_or_default(|err| err.to_string()),
                 "peer egress: the carry failed mid-stream"
             ),
         }

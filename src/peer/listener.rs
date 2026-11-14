@@ -3998,9 +3998,7 @@ impl NodeFacts {
     /// itself, is still a different mechanism and is not here.
     pub fn listening(node: PeerId, listen: Option<SocketAddr>) -> Self {
         let mut facts = Self::minimal(node);
-        facts.addrs = listen
-            .map(|addr| vec![addr.to_string()])
-            .unwrap_or_default();
+        facts.addrs = listen.map_or_default(|addr| vec![addr.to_string()]);
         // tcr's own tailnet node, when this process runs one: its address at
         // the peer port. After the configured socket for the same reason the
         // mapping is, and before the mapping, because it needs no router.
@@ -4080,8 +4078,7 @@ pub fn outstanding_secrets(file: &PeerFile) -> Vec<[u8; KEY_BYTES]> {
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or_default()
+        .map_or_default(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Why a stream was refused. **Every arm closes the connection and logs.**
