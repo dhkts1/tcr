@@ -410,7 +410,7 @@ mod tests {
     /// crate builds such a path today, and this keeps it that way.
     #[test]
     fn dot_dir_paths_are_built_only_in_paths() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = Path::new(repo_root!());
         let paths_rs = root.join("src").join("paths.rs");
         let mut files = Vec::new();
         rust_files(&root.join("src"), &mut files);

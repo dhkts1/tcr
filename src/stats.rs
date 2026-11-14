@@ -648,7 +648,7 @@ mod tests {
     /// the token list comes from the type, not from this file.
     #[test]
     fn troubleshooting_doc_has_a_row_for_every_gate_token() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/troubleshooting.md");
+        let path = concat!(repo_root!(), "/docs/troubleshooting.md");
         let doc =
             std::fs::read_to_string(path).unwrap_or_else(|err| panic!("cannot read {path}: {err}"));
         let missing: Vec<&str> = gate_tokens()

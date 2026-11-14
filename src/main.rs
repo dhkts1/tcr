@@ -17,6 +17,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
+mod build_stamp;
 mod tool_env;
 
 use tcr::cli::{self, PriorityArg, validate_group_label_chars};
@@ -1839,6 +1840,9 @@ fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
 /// The runtime is built here rather than by `#[tokio::main]`, whose default is one worker
 /// thread per core: see `tcr::server::worker_threads` for the count and why.
 fn main() -> anyhow::Result<()> {
+    // First, so every line that names this build (the boot marker, `tcr status`,
+    // the port claim) reads the stamp rather than `unknown`.
+    build_info::install(build_stamp::build_info())?;
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let workers =
         server::worker_threads(std::env::var("TOKIO_WORKER_THREADS").ok().as_deref(), cores);

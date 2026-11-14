@@ -1348,7 +1348,7 @@ mod tests {
     /// real string lives).
     #[test]
     fn the_bundle_id_constant_matches_the_shipped_build_script() {
-        let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let script_path = Path::new(repo_root!())
             .join("apps")
             .join("macos")
             .join("scripts")
@@ -1544,7 +1544,7 @@ mod tests {
     /// checked against the tree rather than trusted to stay true.
     #[test]
     fn the_recommended_app_installer_script_exists() {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let script = Path::new(repo_root!())
             .join("apps")
             .join("macos")
             .join("scripts")

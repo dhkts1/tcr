@@ -406,7 +406,7 @@ async fn serving_writes_the_port_claim_after_binding_and_withdraws_it_on_shutdow
         ProxyOwner {
             pid: std::process::id(),
             port: addr.port(),
-            sha: tcr::build_info::SHA.to_string(),
+            sha: tcr::build_info::BuildInfo::current().sha,
             host: ProxyHost::Embedded,
         },
         "the claim must name THIS process, the port actually bound, this build and \

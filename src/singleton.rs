@@ -151,7 +151,7 @@ pub struct ProxyOwner {
     pub pid: u32,
     /// The port that pid bound.
     pub port: u16,
-    /// The build the proxy is executing (`build_info::SHA`).
+    /// The build the proxy is executing (`build_info::BuildInfo::current().sha`).
     pub sha: String,
     /// What is hosting the proxy.
     pub host: ProxyHost,

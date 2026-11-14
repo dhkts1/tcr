@@ -3962,8 +3962,7 @@ mod tests {
     #[test]
     fn codex_login_events_match_the_fixture() {
         let fixture = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("apps/macos/Tests/Fixtures/codex-login-events.jsonl"),
+            Path::new(repo_root!()).join("apps/macos/Tests/Fixtures/codex-login-events.jsonl"),
         )
         .expect("the committed fixture");
         let want: Vec<serde_json::Value> = fixture

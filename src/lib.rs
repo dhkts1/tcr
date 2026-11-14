@@ -6,6 +6,17 @@
 
 #![forbid(unsafe_code)]
 
+/// The repository root (where `src/`, `tests/`, `docs/` and `apps/` sit) as a string literal,
+/// for tests that read a fixture or walk the sources. `CARGO_MANIFEST_DIR` is not it: the
+/// library's manifest is `crates/tcr-lib/Cargo.toml`, two levels down, while its sources stay in
+/// `src/` (see that manifest for why). Defined before the modules so every one of them sees it.
+#[cfg(test)]
+macro_rules! repo_root {
+    () => {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../..")
+    };
+}
+
 pub mod account_uuid;
 pub mod affinity;
 pub mod bound_tokens;

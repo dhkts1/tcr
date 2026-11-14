@@ -447,7 +447,7 @@ mod tests {
     /// is still read somewhere.
     #[test]
     fn the_read_from_extra_keys_match_the_code() {
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let src = Path::new(repo_root!()).join("src");
         let mut files = Vec::new();
         rust_sources(&src, &mut files);
         let mut read = BTreeSet::new();

@@ -1273,8 +1273,7 @@ mod tests {
         let mut produced = serde_json::to_value(&row).expect("a session row serializes");
         let fixture: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("apps/macos/Tests/Fixtures/codex-sessions.json"),
+                Path::new(repo_root!()).join("apps/macos/Tests/Fixtures/codex-sessions.json"),
             )
             .expect("the canonical sessions fixture"),
         )

@@ -255,6 +255,33 @@ fn an_older_proxy_keeps_the_configured_codex_status_verdict() {
     );
 }
 
+/// The binary hands its build stamp to the library before anything runs: `tcr
+/// status` names the client by the sha `build.rs` stamped, never `unknown`. The
+/// library has no stamp of its own (`tcr::build_info::install`), so this is the
+/// line that breaks if `main` stops installing it.
+#[test]
+fn the_binary_reports_the_build_it_was_stamped_with() {
+    let stamped = env!("TCR_BUILD_SHA");
+    assert_ne!(
+        stamped, "unknown",
+        "the tests are built from a git checkout, so build.rs stamped a sha"
+    );
+    let fixture = Fixture::new(false);
+    let output = fixture
+        .command()
+        .args(["status", "--config"])
+        .arg(&fixture.config)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{}", details(&output));
+    assert!(
+        text.contains(&format!("client_sha={stamped}")),
+        "{}",
+        details(&output)
+    );
+}
+
 #[test]
 fn an_older_proxy_keeps_the_configured_codex_doctor_verdict() {
     let fixture = Fixture::new(false);

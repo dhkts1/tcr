@@ -5193,8 +5193,7 @@ mod tests {
             text.push_str(&format!("== {label}\n{:?}\n", terminal.backend().buffer()));
         }
 
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/tui-claude-only.golden");
+        let path = std::path::Path::new(repo_root!()).join("tests/fixtures/tui-claude-only.golden");
         if std::env::var_os(UPDATE_TUI_GOLDEN).is_some() {
             std::fs::write(&path, &text)
                 .unwrap_or_else(|err| panic!("cannot write {}: {err}", path.display()));

@@ -15,10 +15,20 @@
 //! build ever made. Proving which code a live server executed meant comparing
 //! inodes with `lsof -p <pid>` by hand.
 //!
-//! This module makes the binary self-reporting. `build.rs` stamps [`SHA`],
-//! [`DIRTY`] and [`BUILT_AT`] at compile time; the boot marker logs them, the
-//! status endpoint ships them, and [`compare`] turns "server sha vs checkout
-//! HEAD" into a single line `tcr status` can print.
+//! This module makes the binary self-reporting. `build.rs` stamps the sha, the
+//! dirty flag and the build time into the BINARY at compile time
+//! (`src/build_stamp.rs`), which hands them to this library with [`install`]
+//! before anything else runs; the boot marker logs them, the status endpoint
+//! ships them, and [`compare`] turns "server sha vs checkout HEAD" into a single
+//! line `tcr status` can print.
+//!
+//! # Why the library does not read the stamp itself
+//!
+//! The stamp changes on every commit and carries the wall clock. A library that
+//! compiled it in (`env!`) was recompiled whole on every HEAD move, and two
+//! checkouts of one commit could never share a cached build. So the library
+//! lives in a package with no build script (`crates/tcr-lib`) and takes the
+//! stamp as a value; `scripts/check-lib-build-stamp-free.sh` holds that line.
 //!
 //! # What is proven, and what is not
 //!
@@ -34,6 +44,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -47,17 +58,37 @@ pub const UNKNOWN: &str = "unknown";
 /// below that a prefix match stops meaning anything.
 const MIN_SHA_LEN: usize = 7;
 
-/// Short commit sha this binary was compiled from, or [`UNKNOWN`].
-pub const SHA: &str = env!("TCR_BUILD_SHA");
+/// The running binary's build, set once by [`install`].
+static INSTALLED: OnceLock<BuildInfo> = OnceLock::new();
 
-/// Whether TRACKED files carried uncommitted changes when `build.rs` last ran:
-/// `"true"`, `"false"` or [`UNKNOWN`]. Stale by design in one direction — see
-/// the limitation section in `build.rs`, and prefer [`read_checkout_state`] for
-/// the live answer.
-pub const DIRTY: &str = env!("TCR_BUILD_DIRTY");
+/// Hand the library the build stamp of the binary it runs in. The `tcr` binary
+/// calls this first thing in `main`, before any code that reports a build.
+///
+/// A second call is refused rather than ignored: one process has one build, and
+/// a caller that tries to change it has a bug worth seeing.
+pub fn install(build: BuildInfo) -> Result<(), AlreadyInstalled> {
+    install_into(&INSTALLED, build)
+}
 
-/// When `build.rs` last stamped this binary (UTC), or [`UNKNOWN`].
-pub const BUILT_AT: &str = env!("TCR_BUILD_TIME");
+fn install_into(cell: &OnceLock<BuildInfo>, build: BuildInfo) -> Result<(), AlreadyInstalled> {
+    cell.set(build).map_err(|refused| AlreadyInstalled {
+        refused,
+        // `set` refused, so the cell holds a value.
+        installed: cell.get().cloned().unwrap_or_default(),
+    })
+}
+
+/// [`install`] was called twice.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the build stamp is already installed (sha {}), refusing sha {}",
+    installed.sha,
+    refused.sha
+)]
+pub struct AlreadyInstalled {
+    pub installed: BuildInfo,
+    pub refused: BuildInfo,
+}
 
 /// A binary's build provenance, as it crosses the wire in
 /// [`crate::status::StatusPayload`].
@@ -89,12 +120,25 @@ impl Default for BuildInfo {
 }
 
 impl BuildInfo {
-    /// This binary's own stamp.
+    /// The running binary's own stamp, as [`install`]ed.
+    ///
+    /// A process that installed none (the library's own tests, an integration
+    /// test serving in-process) has no binary build to name, so it reads as
+    /// [`BuildInfo::default`], every field [`UNKNOWN`]: the same "cannot tell" a
+    /// build without git reports. `tests/codex_run.rs` runs the real binary and
+    /// holds that it reports the stamp it was built with.
     pub fn current() -> Self {
+        INSTALLED.get().cloned().unwrap_or_default()
+    }
+
+    /// A build from the three raw values `build.rs` writes: a short sha, the
+    /// dirty token (`"true"`, `"false"`, anything else is unknown) and the UTC
+    /// build time.
+    pub fn from_stamp(sha: &str, dirty: &str, built_at: &str) -> Self {
         Self {
-            sha: SHA.to_string(),
-            dirty: parse_tri_bool(DIRTY),
-            built_at: BUILT_AT.to_string(),
+            sha: sha.to_string(),
+            dirty: parse_tri_bool(dirty),
+            built_at: built_at.to_string(),
         }
     }
 
@@ -436,9 +480,14 @@ pub fn find_tcr_checkout(start: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Does this `Cargo.toml` declare `name = "<this package>"`? A line scan rather
-/// than a TOML parse — the crate takes no toml dependency, and the question is
-/// narrow enough that "some line assigns this exact name" answers it.
+/// The package name in the root `Cargo.toml` of a tcr checkout: the binary's
+/// package. Not this crate's `CARGO_PKG_NAME`, which is `tcr-lib` and lives in
+/// `crates/tcr-lib/Cargo.toml`, a file [`find_tcr_checkout`] never reads.
+pub const CHECKOUT_PACKAGE: &str = "tcr";
+
+/// Does this `Cargo.toml` declare `name = "<the tcr package>"`? A line scan
+/// rather than a TOML parse — the crate takes no toml dependency, and the
+/// question is narrow enough that "some line assigns this exact name" answers it.
 fn manifest_names_this_package(manifest: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(manifest) else {
         return false;
@@ -450,7 +499,7 @@ fn manifest_names_this_package(manifest: &Path) -> bool {
         let Some(value) = rest.trim_start().strip_prefix('=') else {
             return false;
         };
-        value.trim().trim_matches('"') == env!("CARGO_PKG_NAME")
+        value.trim().trim_matches('"') == CHECKOUT_PACKAGE
     })
 }
 
@@ -579,22 +628,37 @@ mod tests {
         }
     }
 
-    /// `build.rs` must emit all three variables unconditionally — `env!` would
-    /// have failed the compile otherwise, so this asserts the values are also
-    /// non-empty and, for the tri-state, one of the three legal tokens.
+    /// The three raw values `build.rs` writes parse into a [`BuildInfo`], and a
+    /// dirty token that is neither `true` nor `false` stays unknown rather than
+    /// reading as clean.
     #[test]
-    fn the_build_stamped_every_field() {
-        assert!(!SHA.is_empty(), "TCR_BUILD_SHA is stamped");
-        assert!(!BUILT_AT.is_empty(), "TCR_BUILD_TIME is stamped");
-        std::assert_matches!(
-            DIRTY,
-            "true" | "false" | "unknown",
-            "TCR_BUILD_DIRTY is a tri-state token"
+    fn from_stamp_parses_the_raw_values() {
+        let clean = BuildInfo::from_stamp("cd146ce", "false", "2026-07-26T00:00:00Z");
+        assert_eq!(clean, build("cd146ce", Some(false)));
+        assert_eq!(
+            BuildInfo::from_stamp("cd146ce", "true", "t").dirty,
+            Some(true)
         );
-        // Whatever git said, the current stamp round-trips into a BuildInfo.
-        let current = BuildInfo::current();
-        assert_eq!(current.sha, SHA);
-        assert_eq!(current.dirty_str(), DIRTY);
+        for murky in [UNKNOWN, "", "yes"] {
+            let info = BuildInfo::from_stamp(UNKNOWN, murky, UNKNOWN);
+            assert_eq!(info.dirty, None, "{murky:?} is not a dirty answer");
+            assert_eq!(info.dirty_str(), UNKNOWN);
+        }
+    }
+
+    /// One process, one build: the first stamp sticks and a second is refused
+    /// with both named. Driven on a private cell, because the process-wide one
+    /// is read by tests running beside this one.
+    #[test]
+    fn a_second_install_is_refused() {
+        let cell = OnceLock::new();
+        let first = build("cd146ce", Some(false));
+        install_into(&cell, first.clone()).expect("the first install takes");
+        let err = install_into(&cell, build("9f3a1b2", None)).expect_err("a second is refused");
+        assert_eq!(err.installed, first);
+        assert_eq!(err.refused.sha, "9f3a1b2");
+        assert_eq!(cell.get(), Some(&first), "the first stamp is kept");
+        assert!(err.to_string().contains("cd146ce"), "{err}");
     }
 
     /// Same sha, clean both ends → the status output says NOTHING. A line on
@@ -934,20 +998,21 @@ mod tests {
     /// unit testing covers. Everything above drives [`compare`] with hand-built
     /// structs; this drives the actual `git -C` shell-outs.
     ///
-    /// Not skippable-by-accident: a known [`SHA`] means git answered at build
-    /// time in this very manifest directory, so it must answer now too. The
-    /// early return fires only for a genuine no-git build (a source tarball),
-    /// where there is nothing to test rather than something being hidden.
+    /// The running sha is this checkout's own HEAD, which is what a binary
+    /// built here and never rebuilt would carry. The early return fires only
+    /// when there is no `.git` at the repository root (a source tarball), where
+    /// there is nothing to test rather than something being hidden.
     #[test]
     fn read_checkout_state_reads_this_very_repository() {
-        if SHA == UNKNOWN {
-            return; // built without git; the fallbacks are covered above
+        let repo = Path::new(repo_root!());
+        if !repo.join(".git").exists() {
+            return; // a source tarball; the fallbacks are covered above
         }
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let root = find_tcr_checkout(manifest)
-            .expect("git stamped a sha from this directory, so it is our checkout");
+        let sha = git_in(repo, &["rev-parse", "--short", "HEAD"])
+            .expect("the repository root has a .git, so git names its HEAD");
+        let root = find_tcr_checkout(repo).expect("the repository root holds tcr's own Cargo.toml");
 
-        let state = read_checkout_state(&root, SHA);
+        let state = read_checkout_state(&root, &sha);
         assert!(
             is_comparable_sha(&state.head),
             "a real checkout has a real HEAD, got {:?}",
@@ -963,7 +1028,7 @@ mod tests {
         // And the end-to-end verdict is a real one — never "cannot tell".
         assert!(
             !matches!(
-                compare(&BuildInfo::current(), &state),
+                compare(&build(&sha, Some(false)), &state),
                 Skew::Indeterminate { .. }
             ),
             "both shas are real, so the comparison is decidable"
@@ -996,7 +1061,7 @@ mod tests {
         // The same directory, renamed to this package, IS ours.
         std::fs::write(
             root.join("Cargo.toml"),
-            format!("[package]\nname = \"{}\"\n", env!("CARGO_PKG_NAME")),
+            format!("[package]\nname = \"{CHECKOUT_PACKAGE}\"\n"),
         )
         .unwrap();
         assert_eq!(find_tcr_checkout(&root).as_deref(), Some(root.as_path()));

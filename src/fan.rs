@@ -1049,8 +1049,7 @@ mod tests {
     }
 
     fn fixture() -> serde_json::Map<String, serde_json::Value> {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fan-control-contract.json");
+        let path = Path::new(repo_root!()).join("tests/fixtures/fan-control-contract.json");
         match serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap() {
             serde_json::Value::Object(samples) => samples,
             other => panic!("{other}"),

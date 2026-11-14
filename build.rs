@@ -18,7 +18,7 @@
 //! # Contract
 //!
 //! Emits three `rustc-env` variables, ALWAYS — never conditionally, so
-//! [`env!`] in `src/build_info.rs` compiles everywhere:
+//! [`env!`] in `src/build_stamp.rs` compiles everywhere:
 //!
 //! * `TCR_BUILD_SHA`   — short commit sha, or `unknown`
 //! * `TCR_BUILD_DIRTY` — `true` / `false` / `unknown` (tracked files only)
@@ -27,6 +27,15 @@
 //! Missing git, a `.git`-less source tarball, or an unborn HEAD degrade to
 //! `unknown` rather than failing the build: a source release must still compile.
 //! No build-dependencies — everything here shells out.
+//!
+//! # Only the binary's package runs this
+//!
+//! Cargo recompiles every target of the package that owns a build script each
+//! time the script re-runs, whether or not a target reads its output. So this
+//! package holds the binary, its stamp module and the integration tests, and
+//! the library is the separate `crates/tcr-lib` package, which takes the stamp
+//! as a value (`tcr::build_info::install`). A re-run here recompiles the binary,
+//! not the 200k-line library; `scripts/check-lib-build-stamp-free.sh` holds that.
 //!
 //! # Known limitation: `TCR_BUILD_DIRTY` and `TCR_BUILD_TIME` are as fresh as
 //! the last re-run

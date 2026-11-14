@@ -385,7 +385,7 @@ impl SetupKey<'_> {
         // scripts a running session of an older tcr uses.
         let fields = [
             Some(env!("CARGO_PKG_VERSION").as_bytes()),
-            Some(tcr::build_info::SHA.as_bytes()),
+            Some(crate::build_stamp::SHA.as_bytes()),
             self.prefix.map(str::as_bytes),
             self.env_file.map(str::as_bytes),
             Some(self.shell.as_bytes()),

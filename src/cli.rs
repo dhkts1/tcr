@@ -8278,7 +8278,10 @@ mod tests {
             "the served payload names the build that served it"
         );
         for row in &rows {
-            assert_eq!(row["serverSha"], serde_json::json!(build_info::SHA));
+            assert_eq!(
+                row["serverSha"],
+                serde_json::json!(BuildInfo::current().sha)
+            );
         }
     }
 
@@ -8390,7 +8393,7 @@ mod tests {
             "{live}"
         );
         assert!(
-            live.contains(&format!("client_sha={}", build_info::SHA)),
+            live.contains(&format!("client_sha={}", BuildInfo::current().sha)),
             "{live}"
         );
 
@@ -8400,7 +8403,7 @@ mod tests {
             "no server, no server fields: {offline}"
         );
         assert!(
-            offline.contains(&format!("client_sha={}", build_info::SHA)),
+            offline.contains(&format!("client_sha={}", BuildInfo::current().sha)),
             "{offline}"
         );
 
@@ -8665,8 +8668,7 @@ mod tests {
     /// committed contract sample spells it: the object TcrBar's popover decodes.
     #[test]
     fn fan_status_crosses_sessions_json_as_the_contract_says() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fan-control-contract.json");
+        let path = Path::new(repo_root!()).join("tests/fixtures/fan-control-contract.json");
         let samples: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         let sample = samples["holdingFixed5000"].clone();
@@ -10020,7 +10022,7 @@ mod tests {
     /// `apps/macos/Tests/TcrBarTests/RealWorldDecodeTests.swift` reaches the same
     /// path from `#filePath`.
     fn status_contract_fixture_path() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/status-contract.json")
+        Path::new(repo_root!()).join("tests/fixtures/status-contract.json")
     }
 
     /// One fully-specified account row for the fixture.
@@ -11036,7 +11038,7 @@ mod tests {
     /// with two proofs, the panel's decode and this renderer's output, is what keeps the
     /// producer and the consumer from drifting apart.
     fn canonical_fixture(name: &str) -> serde_json::Value {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = Path::new(repo_root!())
             .join("apps/macos/Tests/Fixtures")
             .join(name);
         let text = fs::read_to_string(&path).unwrap_or_else(|e| {

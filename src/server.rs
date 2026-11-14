@@ -2331,16 +2331,17 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         // since the last commit (build.rs re-runs only when a git ref moves), so
         // comparing two stamps would print "build in sync" for a proxy that
         // predates the edit — see `build_info::stand_down_build_report`.
+        let ours = build_info::BuildInfo::current();
         let checkout = std::env::current_dir()
             .ok()
             .and_then(|cwd| build_info::find_tcr_checkout(&cwd))
-            .map(|root| build_info::read_checkout_state(&root, build_info::SHA));
+            .map(|root| build_info::read_checkout_state(&root, &ours.sha));
         // Standing down is cheap and correct, but silent success here would mean
         // `cargo build && tcr` exits 0 with the OLD build still serving — the
         // caller is handed which build actually holds the port so it can say so.
         let report = build_info::stand_down_build_report(
             port,
-            &build_info::BuildInfo::current(),
+            &ours,
             probe.build.as_ref(),
             checkout.as_ref(),
         );
@@ -2791,11 +2792,12 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let control_account = manager.control_name();
     let control_pooled = manager.control_pooled();
     let control_identity = manager.control_identity().as_str();
+    let build = build_info::BuildInfo::current();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        sha = build_info::SHA,
-        dirty = build_info::DIRTY,
-        built_at = build_info::BUILT_AT,
+        sha = build.sha.as_str(),
+        dirty = build.dirty_str(),
+        built_at = build.built_at.as_str(),
         pid = std::process::id(),
         port = bound.port(),
         http1_only,
@@ -2842,7 +2844,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         let owner = singleton::ProxyOwner {
             pid: std::process::id(),
             port: bound.port(),
-            sha: build_info::SHA.to_string(),
+            sha: build_info::BuildInfo::current().sha,
             host,
         };
         match singleton::write_owner_file(&path, &owner) {
