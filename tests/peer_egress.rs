@@ -27,11 +27,6 @@
 //! at the scratch copy before any request runs. Nothing here touches the proxy on
 //! `127.0.0.1:3456`.
 
-#![expect(
-    clippy::expect_used,
-    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
-)]
-
 /// The environment every launch of the built `tcr` starts from.
 #[path = "support/tcr_env.rs"]
 mod tcr_env;
@@ -371,8 +366,7 @@ async fn a_carry_that_died_inside_the_peer_stream_is_not_logged_as_carried() {
     let pump = ending
         .fields
         .get(field)
-        .map(|value| value.trim_matches('"').to_string())
-        .unwrap_or_default();
+        .map_or_default(|value| value.trim_matches('"').to_string());
     assert!(
         pump.contains("did not decrypt"),
         "the line carries the pump's own ending in `{field}`, which is the only place a \

@@ -138,7 +138,7 @@ pub struct Usage {
 /// Why a probe failed. `status` carries the HTTP code when there was one — the
 /// probe loop force-refreshes the token and retries exactly once on a `401`.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("usage probe failed{}: {message}", .status.map(|s| format!(" (HTTP {s})")).unwrap_or_default())]
+#[error("usage probe failed{}: {message}", .status.map_or_default(|s| format!(" (HTTP {s})")))]
 pub struct ProbeError {
     pub status: Option<u16>,
     pub message: String,

@@ -17,11 +17,6 @@
 //! on the configured default. Nothing here signals, restarts or probes a live
 //! proxy.
 
-#![expect(
-    clippy::expect_used,
-    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
-)]
-
 use std::sync::Arc;
 use std::time::Duration;
 use tcr::log_err::LogErr as _;
@@ -64,8 +59,7 @@ fn scratch_affinity_path(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default()
+            .map_or_default(|d| d.as_nanos())
     );
     std::env::temp_dir().join(unique).join("affinity.json")
 }
@@ -76,8 +70,7 @@ fn scratch_wire_sessions_path(tag: &str) -> std::path::PathBuf {
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default()
+            .map_or_default(|d| d.as_nanos())
     );
     std::env::temp_dir().join(unique).join("session-wire.json")
 }

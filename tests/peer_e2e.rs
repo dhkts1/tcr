@@ -421,13 +421,12 @@ impl Mac {
         let listening = self.wait_for_log("listening on http://");
         self.proxy = listening
             .rsplit_once("http://")
-            .map(|(_, rest)| {
+            .map_or_default(|(_, rest)| {
                 rest.split_whitespace()
                     .next()
                     .unwrap_or_default()
                     .to_string()
-            })
-            .unwrap_or_default();
+            });
         assert!(
             self.proxy.starts_with("127.0.0.1:"),
             "{}: could not read a loopback proxy address out of {listening:?}",
@@ -569,11 +568,7 @@ impl Mac {
         // the one on disk. A side config carrying it is written here rather
         // than rewriting the Mac's own, which the running server also owns.
         let asking = self.home.path().join("asking-config.json");
-        let port = self
-            .proxy
-            .rsplit_once(':')
-            .map(|(_, port)| port)
-            .unwrap_or_default();
+        let port = self.proxy.rsplit_once(':').map_or_default(|(_, port)| port);
         std::fs::write(
             &asking,
             format!("{{\n  \"proxy\": {{ \"port\": {port} }},\n  \"accounts\": []\n}}\n"),
@@ -1075,8 +1070,7 @@ fn pair_two_macs(initiator: &Mac, responder: &Mac) {
     let instance = asked
         .rsplit_once("as instance ")
         .and_then(|(_, rest)| rest.split_whitespace().next())
-        .map(str::to_string)
-        .unwrap_or_default();
+        .map_or_default(str::to_string);
     assert_eq!(
         instance.len(),
         16,

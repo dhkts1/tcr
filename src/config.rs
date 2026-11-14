@@ -3840,12 +3840,11 @@ fn merge_group_membership(
     let mut groups: Vec<String> = entry
         .get("groups")
         .and_then(Value::as_array)
-        .map(|arr| {
+        .map_or_default(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let already = groups.iter().any(|g| g == group);
     if member == already {
         return GroupWrite::Unchanged;

@@ -4105,8 +4105,7 @@ async fn run_peer_graph(args: peer_cli::PeerGraphArgs) -> anyhow::Result<()> {
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_millis() as i64)
-        .unwrap_or_default()
+        .map_or_default(|since| since.as_millis() as i64)
 }
 
 /// `tcr peer graph --serve`: the inline HTML page from `GRAPH_PAGE_HTML`, and
@@ -4361,17 +4360,14 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
         .into_iter()
         .map(|(interface, addr)| peer::pair::HostAddress { interface, addr })
         .collect();
-    let ranked = file
-        .listen
-        .map(|listen| {
-            peer::pair::dial_addresses(
-                listen,
-                &host,
-                external,
-                peer::tailnet_node::recorded_node_address(&peer_state_path(peers_path), now_ms),
-            )
-        })
-        .unwrap_or_default();
+    let ranked = file.listen.map_or_default(|listen| {
+        peer::pair::dial_addresses(
+            listen,
+            &host,
+            external,
+            peer::tailnet_node::recorded_node_address(&peer_state_path(peers_path), now_ms),
+        )
+    });
 
     let mut carried: Vec<std::net::SocketAddr> = Vec::new();
     let mut carry = |addr: std::net::SocketAddr| {
@@ -5030,8 +5026,7 @@ const PORT_SECRET_NOT_PERSISTED: &str = "the pair's handshake secret is not stor
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or_default()
+        .map_or_default(|since| since.as_secs())
 }
 
 /// The runtime-state file that goes with a peers file.
@@ -9515,8 +9510,7 @@ mod tests {
             .expect("proxied");
         let auth = intercept
             .basic_auth()
-            .map(|value| value.to_str().expect("ascii").to_string())
-            .unwrap_or_default();
+            .map_or_default(|value| value.to_str().expect("ascii").to_string());
         tcr::request_key::ProxyCredential::from_connect_head(
             &format!("CONNECT chatgpt.com:443 HTTP/1.1\r\nProxy-Authorization: {auth}\r\n\r\n"),
             Some(KEY),
@@ -9984,10 +9978,8 @@ mod tests {
                 if arg.get_long() == Some("config") {
                     out.push((
                         path.to_string(),
-                        arg.get_help().map(ToString::to_string).unwrap_or_default(),
-                        arg.get_long_help()
-                            .map(ToString::to_string)
-                            .unwrap_or_default(),
+                        arg.get_help().map_or_default(ToString::to_string),
+                        arg.get_long_help().map_or_default(ToString::to_string),
                     ));
                 }
             }
@@ -10989,8 +10981,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("no {id} argument"));
             arg.get_long_help()
                 .or_else(|| arg.get_help())
-                .map(ToString::to_string)
-                .unwrap_or_default()
+                .map_or_default(ToString::to_string)
         };
         let login = help(&["login"], "non_interactive");
         for fact in [r#""opened":true"#, "`--codex` has no timeout", "SIGTERM"] {
@@ -11292,8 +11283,7 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
+                .map_or_default(|d| d.as_nanos())
         ))
     }
 
@@ -12106,9 +12096,8 @@ mod tests {
     fn help_names_both_providers() {
         use clap::CommandFactory as _;
         let cli = Cli::command();
-        let text = |styled: Option<&clap::builder::StyledStr>| {
-            styled.map(ToString::to_string).unwrap_or_default()
-        };
+        let text =
+            |styled: Option<&clap::builder::StyledStr>| styled.map_or_default(ToString::to_string);
         let sub = |path: &[&str]| -> clap::Command {
             let mut command = cli.clone();
             for name in path {

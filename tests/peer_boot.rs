@@ -19,11 +19,6 @@
 //! configured, so nothing can reach
 //! Anthropic.
 
-#![expect(
-    clippy::expect_used,
-    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
-)]
-
 /// The harness pieces the `peer_*` test files share.
 #[path = "support/peer.rs"]
 mod peer_support;

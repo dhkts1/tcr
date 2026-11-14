@@ -1457,7 +1457,7 @@ where
             tracing::warn!(
                 peer = %session.peer.display(),
                 promised = request.body_bytes,
-                sent = outcome.as_ref().map(Vec::len).unwrap_or_default(),
+                sent = outcome.as_ref().map_or_default(Vec::len),
                 "peer serve: the borrower's body is not the body its frame promised, so \
                  nothing was sent upstream"
             );
@@ -1477,9 +1477,7 @@ where
     // makes the request on its own account. Read OUTSIDE the ledger lock: the
     // reader reaches the manager's accounts, and holding both locks across it
     // is how a later edit introduces a deadlock between the two.
-    let before = window
-        .map(|window| utilization.read(window))
-        .unwrap_or_default();
+    let before = window.map_or_default(|window| utilization.read(window));
 
     let started = Instant::now();
     // The request key of THIS process, which is the proxy the relay goes into:
@@ -1497,9 +1495,7 @@ where
     // The same windows, after. `utilization_rise` is what turns the pair into
     // one figure, and an index unmeasured on either side contributes nothing.
     // See its doc for why that is the honest direction to round in.
-    let after = window
-        .map(|window| utilization.read(window))
-        .unwrap_or_default();
+    let after = window.map_or_default(|window| utilization.read(window));
     let rise = utilization_rise(&before, &after);
 
     // The slot is released on every path out of the serve, including the error

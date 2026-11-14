@@ -6,11 +6,6 @@
 //! is the whole reason [`tcr::peer::reach::NatPmp::at`] takes an
 //! address instead of always finding its own.
 
-#![expect(
-    clippy::expect_used,
-    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
-)]
-
 /// The environment every launch of the built `tcr` starts from.
 #[path = "support/tcr_env.rs"]
 mod tcr_env;

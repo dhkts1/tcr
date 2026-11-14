@@ -1441,9 +1441,7 @@ pub fn install_tcr_run(dir: &Path) -> Result<FileChange, SetupError> {
             let what = if meta.file_type().is_symlink() {
                 format!(
                     "a symlink to {}",
-                    std::fs::read_link(&link)
-                        .map(|target| target.display().to_string())
-                        .unwrap_or_default()
+                    std::fs::read_link(&link).map_or_default(|target| target.display().to_string())
                 )
             } else {
                 "a file tcr did not make".to_string()

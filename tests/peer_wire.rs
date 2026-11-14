@@ -862,8 +862,7 @@ fn every_wire_type_serializes_only_allowlisted_keys() {
     fn keys(value: &serde_json::Value) -> BTreeSet<String> {
         value
             .as_object()
-            .map(|map| map.keys().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|map| map.keys().cloned().collect())
     }
 
     /// Every key anywhere inside a sample, at any depth. The top-level

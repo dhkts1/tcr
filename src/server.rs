@@ -3293,8 +3293,7 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
+                .map_or_default(|d| d.as_nanos())
         ));
         std::fs::write(&blocker, b"not a directory").expect("the scratch blocker file is writable");
         blocker.join("affinity.json")

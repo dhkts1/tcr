@@ -26,11 +26,6 @@
 //! DEFAULT, and nothing in between would stop it. These tests are what stands
 //! where the existing code does not reach.
 
-#![expect(
-    clippy::expect_used,
-    reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
-)]
-
 /// What the real API refuses a request without, shared by every fake upstream
 /// in this tree. See that module's docs for why a fake upstream is strict.
 #[path = "tools/api_contract.rs"]

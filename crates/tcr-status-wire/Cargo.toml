@@ -2,7 +2,7 @@
 name = "tcr-status-wire"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 license = "PolyForm-Noncommercial-1.0.0"
 publish = false
 description = "Serde types for the `tcr status --json` wire contract, shared between the CLI and the macOS app"
