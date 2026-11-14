@@ -159,7 +159,7 @@ version = "1.2.27"
 edition = "2024"
 # The toolchain itself is pinned in rust-toolchain.toml; this is the floor a
 # build with any other toolchain is held to.
-rust-version = "1.99"
+rust-version = "1.100"
 license = "PolyForm-Noncommercial-1.0.0"
 # Noncommercial license, so this crate must never reach crates.io, whose terms
 # require a license permitting redistribution and commercial use.
