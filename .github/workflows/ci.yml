@@ -383,6 +383,20 @@ jobs:
       - name: Test (release upload)
         run: apps/macos/scripts/release-upload-race-fixture-test.sh
 
+      # ship-release.sh's "bump to <next>" edit on a copy of the tree, then a
+      # `cargo metadata --locked` resolve: the workspace version moves two
+      # packages, and a lock that moved only one fails every `--locked` job.
+      - name: Test (release version bump)
+        run: apps/macos/scripts/bump-version-fixture-test.sh
+
+      # The `tcr` library takes the build stamp as a value and must not compile
+      # it in, or every HEAD move recompiles the whole library. The script flips
+      # HEAD at one commit, so build.rs restamps, and requires the library to
+      # come back fresh. Here, not in `ci`, for the 40-minute budget: it runs
+      # one `cargo check` of the binary that no other step shares.
+      - name: Library is free of the build stamp
+        run: scripts/check-lib-build-stamp-free.sh
+
   audit:
     name: audit
     runs-on: ubuntu-latest
