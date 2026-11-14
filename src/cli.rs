@@ -8388,7 +8388,10 @@ mod tests {
             dirty: Some(false),
             built_at: "2026-07-26T00:00:00Z".to_string(),
         };
-        let live = build_fields(Some(&server), &BuildInfo::current());
+        // Read the client stamp once: another test can install the process-wide stamp between two
+        // reads, and the assert must compare against the value build_fields was given.
+        let client = BuildInfo::current();
+        let live = build_fields(Some(&server), &client);
         assert!(live.contains("server_sha=cd146ce"), "{live}");
         assert!(live.contains("server_dirty=false"), "{live}");
         assert!(
@@ -8396,22 +8399,22 @@ mod tests {
             "{live}"
         );
         assert!(
-            live.contains(&format!("client_sha={}", BuildInfo::current().sha)),
+            live.contains(&format!("client_sha={}", client.sha)),
             "{live}"
         );
 
-        let offline = build_fields(None, &BuildInfo::current());
+        let offline = build_fields(None, &client);
         assert!(
             !offline.contains("server_sha="),
             "no server, no server fields: {offline}"
         );
         assert!(
-            offline.contains(&format!("client_sha={}", BuildInfo::current().sha)),
+            offline.contains(&format!("client_sha={}", client.sha)),
             "{offline}"
         );
 
         // An unknown dirty flag reads as `unknown`, never as `false`.
-        let murky = build_fields(Some(&BuildInfo::default()), &BuildInfo::current());
+        let murky = build_fields(Some(&BuildInfo::default()), &client);
         assert!(murky.contains("server_dirty=unknown"), "{murky}");
     }
 
