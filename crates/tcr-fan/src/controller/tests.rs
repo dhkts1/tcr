@@ -1574,7 +1574,7 @@ fn a_block_after_the_first_set_manual_hands_back_first() {
 
         // Between two set-targets.
         let mut rig = rig_from(None, Some(machine()));
-        let during = block.clone();
+        let during = block;
         rig.hook(Box::new(move |request, machine, _inject, _clock| {
             if *request == set_target(0, 3000.0) {
                 machine.macs = during.clone();

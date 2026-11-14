@@ -3816,7 +3816,6 @@ fn a_concurrent_revoke_and_enrolment_never_resurrect_or_drop_a_row() {
             })
         };
         let enrol_handle = {
-            let peers_path = peers_path.clone();
             let secret = token.secret;
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {

@@ -1400,7 +1400,7 @@ mod tests {
             assert_eq!(answers.wire.tool_uses.len(), 1);
             assert_eq!(answers.wire.tool_results.len(), 1);
             assert!(answers.wire.session_id.is_some());
-            let (system, _) = answers.affinity_prefix.clone().expect("a prefix");
+            let (system, _) = answers.affinity_prefix.expect("a prefix");
             assert!(
                 system.expect("system").contains(r#""ttl":"1h""#),
                 "the prefix hash reads the rewritten system"
