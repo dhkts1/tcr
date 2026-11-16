@@ -43,7 +43,9 @@ public enum CodexResetCommand {
 public final class CodexResetController: ObservableObject {
     @Published public private(set) var pending: Set<String> = []
     @Published public private(set) var outcomes: [String: CodexResetCommand.Outcome] = [:]
-    private var attempts: [String: String] = [:]
+    /// Each account's last confirmed attempt: its key, and the Claude kind it spends
+    /// (`nil` for a Codex reset), so Retry repeats exactly that attempt.
+    private var attempts: [String: (key: String, kind: ResetKind?)] = [:]
     private let runner: CodexResetCommand.Runner
 
     public init(
@@ -63,21 +65,37 @@ public final class CodexResetController: ObservableObject {
         case finished(CodexResetCommand.Outcome)
     }
 
+    /// Spends one reset. `kind` names a Claude account's reset (`tcr reset --kind`); `nil`
+    /// is a Codex account's, which runs `tcr codex reset` exactly as it always did.
     @discardableResult
-    public func redeem(account: AccountRef, confirmed: Bool) async -> Attempt {
+    public func redeem(account: AccountRef, kind: ResetKind? = nil, confirmed: Bool) async
+        -> Attempt
+    {
         guard confirmed, !isPending(account) else { return .skipped }
         let key = UUID().uuidString
-        attempts[account.id] = key
-        return await perform(account: account, key: key)
+        attempts[account.id] = (key, kind)
+        return await perform(account: account, key: key, kind: kind)
     }
 
     @discardableResult
     public func retry(account: AccountRef) async -> Attempt {
-        guard !isPending(account), let key = attempts[account.id] else { return .skipped }
-        return await perform(account: account, key: key)
+        guard !isPending(account), let attempt = attempts[account.id] else { return .skipped }
+        return await perform(account: account, key: attempt.key, kind: attempt.kind)
     }
 
-    private func perform(account: AccountRef, key: String) async -> Attempt {
+    /// The command one attempt runs, with `--yes` because the panel's own dialog asked.
+    public nonisolated static func arguments(account: AccountRef, key: String, kind: ResetKind?)
+        -> [String]
+    {
+        guard let kind else {
+            return ["codex", "reset", account.name, "--idempotency-key", key, "--yes"]
+        }
+        return [
+            "reset", account.name, "--kind", kind.rawValue, "--idempotency-key", key, "--yes",
+        ]
+    }
+
+    private func perform(account: AccountRef, key: String, kind: ResetKind?) async -> Attempt {
         pending.insert(account.id)
         outcomes[account.id] = nil
         defer { pending.remove(account.id) }
@@ -89,7 +107,7 @@ public final class CodexResetController: ObservableObject {
                 // result dialog then shows outcome words and never a "[y/N]" question.
                 // A retry requires another operator click and reuses this attempt.
                 let output = try runner(
-                    ["codex", "reset", account.name, "--idempotency-key", key, "--yes"], "")
+                    CodexResetController.arguments(account: account, key: key, kind: kind), "")
                 return CodexResetCommand.Outcome(
                     exitCode: output.exitCode, stdout: String(decoding: output.stdout, as: UTF8.self),
                     stderr: output.stderr)

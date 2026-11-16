@@ -13,6 +13,7 @@ pub mod build_info;
 pub(crate) mod cache_file;
 pub mod cache_ttl;
 pub mod claude_code_login;
+pub mod claude_resets;
 pub mod cli;
 pub mod codex_cli_login;
 pub mod codex_local;

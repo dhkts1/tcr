@@ -63,9 +63,11 @@ mod peer_lend;
 // private, so this re-export is the whole of its surface beyond the methods on
 // `Manager`.
 pub use peer_lend::HandedCredential;
+mod claude_reset;
 mod codex_reset;
 mod pins;
 mod probing;
+pub use claude_reset::{ClaudeResetError, ClaudeResetOutcome, ClaudeResetResponse};
 pub use codex_reset::{CodexResetError, CodexResetOutcome, CodexResetResponse, valid_reset_key};
 mod refresh;
 mod select;
@@ -4579,6 +4581,7 @@ mod tests {
                         seven_day_oi: None,
                         extra_usage_usd: None,
                         codex: None,
+                        claude_resets: None,
                     })
                 } else {
                     Err(ProbeError {
@@ -4628,6 +4631,7 @@ mod tests {
                         seven_day_oi: None,
                         extra_usage_usd: None,
                         codex: None,
+                        claude_resets: None,
                     })
                 } else {
                     Err(ProbeError {
@@ -4659,6 +4663,7 @@ mod tests {
                     seven_day_oi: None,
                     extra_usage_usd: None,
                     codex: None,
+                    claude_resets: None,
                 })
             })
         }
@@ -10193,6 +10198,7 @@ mod tests {
                             seven_day_oi: None,
                             extra_usage_usd: None,
                             codex: None,
+                            claude_resets: None,
                         })
                     }
                 })
@@ -12229,6 +12235,7 @@ mod tests {
                 }),
                 extra_usage_usd: None,
                 codex: None,
+                claude_resets: None,
             },
         );
         // A FABLE request (`is_fable = true`) is the only one gated by the 7d_oi
@@ -15172,6 +15179,7 @@ mod tests {
             seven_day_oi: None,
             extra_usage_usd: None,
             codex: None,
+            claude_resets: None,
         };
         for cycle in 0..5 {
             manager.apply_usage(0, &headerless_probe);

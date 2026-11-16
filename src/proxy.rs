@@ -1123,6 +1123,14 @@ pub const CODEX_RESET_PATH: &str = "/_tcr/codex/reset";
 /// The discriminator shared by the local route and its CLI caller.
 pub const CODEX_RESET_ENDPOINT: &str = "codex-reset";
 
+/// Confirmed claim of one banked reset for a listed Claude account
+/// ([`crate::manager::Manager::reset_claude`]). Its own route rather than a wider
+/// [`CODEX_RESET_PATH`], so an older proxy answers a newer CLI with a plain 404 and a
+/// Codex reset keeps the route it always had.
+pub const CLAUDE_RESET_PATH: &str = "/_tcr/claude/reset";
+/// The discriminator shared by the Claude reset route and its CLI caller.
+pub const CLAUDE_RESET_ENDPOINT: &str = "claude-reset";
+
 /// The [`ENDPOINT_HEADER`] value both halves of [`CONFIG_PATH`] stamp.
 pub const CONFIG_ENDPOINT: &str = "config";
 
@@ -1718,6 +1726,11 @@ pub fn app(manager: Arc<Manager>) -> Router {
                 .fallback(|| async { reset_no_store(method_not_allowed(&CODEX_RESET_ROUTE)) }),
         )
         .route(
+            CLAUDE_RESET_PATH,
+            axum::routing::post(claude_reset_handler)
+                .fallback(|| async { reset_no_store(method_not_allowed(&CLAUDE_RESET_ROUTE)) }),
+        )
+        .route(
             FAN_PATH,
             axum::routing::post(fan_handler).fallback(|| async { method_not_allowed(&FAN_ROUTE) }),
         )
@@ -2129,6 +2142,90 @@ async fn codex_reset_handler(State(manager): State<Arc<Manager>>, req: Request) 
             }
         },
     };
+    reset_no_store(response)
+}
+
+const CLAUDE_RESET_ROUTE: LocalRoute = LocalRoute {
+    name: "claude reset",
+    stamp: CLAUDE_RESET_ENDPOINT,
+    verbs: "POST",
+    advertises_providers: false,
+};
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClaudeResetRequest {
+    query: String,
+    idempotency_key: String,
+    /// `weekly`, `full`, `session` or `fable`; absent when the account holds one kind.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+async fn claude_reset_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
+    const INVALID: &str =
+        "Expected query, a valid idempotencyKey and an optional kind, and no other fields.";
+    let response =
+        match read_command::<ClaudeResetRequest>(&CLAUDE_RESET_ROUTE, &manager, req, INVALID).await
+        {
+            Err(response) => *response,
+            Ok(parsed) => {
+                let kind = parsed
+                    .kind
+                    .as_deref()
+                    .map(|token| tcr_status_wire::ResetKind::parse(token).ok_or(()));
+                match kind {
+                    Some(Err(())) => route_error(
+                        &CLAUDE_RESET_ROUTE,
+                        StatusCode::BAD_REQUEST,
+                        ErrorKind::InvalidRequest,
+                        INVALID,
+                    ),
+                    _ if parsed.query.is_empty()
+                        || !crate::claude_resets::valid_request_id(&parsed.idempotency_key) =>
+                    {
+                        route_error(
+                            &CLAUDE_RESET_ROUTE,
+                            StatusCode::BAD_REQUEST,
+                            ErrorKind::InvalidRequest,
+                            INVALID,
+                        )
+                    }
+                    kind => match manager
+                        .reset_claude(
+                            &parsed.query,
+                            kind.and_then(Result::ok),
+                            &parsed.idempotency_key,
+                        )
+                        .await
+                    {
+                        Ok(result) => json_ok(&CLAUDE_RESET_ROUTE, &result),
+                        Err(error) => {
+                            use crate::manager::ClaudeResetError;
+                            let status = match error {
+                                ClaudeResetError::Missing => StatusCode::NOT_FOUND,
+                                ClaudeResetError::Ambiguous | ClaudeResetError::Unavailable => {
+                                    StatusCode::CONFLICT
+                                }
+                                ClaudeResetError::WrongProvider
+                                | ClaudeResetError::NotRead
+                                | ClaudeResetError::NoneHeld
+                                | ClaudeResetError::KindNeeded => StatusCode::BAD_REQUEST,
+                                ClaudeResetError::Auth => StatusCode::FORBIDDEN,
+                                ClaudeResetError::Failed => StatusCode::BAD_GATEWAY,
+                                ClaudeResetError::Unknown => StatusCode::GATEWAY_TIMEOUT,
+                            };
+                            route_error(
+                                &CLAUDE_RESET_ROUTE,
+                                status,
+                                ErrorKind::InvalidRequest,
+                                error.message(),
+                            )
+                        }
+                    },
+                }
+            }
+        };
     reset_no_store(response)
 }
 

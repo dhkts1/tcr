@@ -488,7 +488,28 @@ Cancel
 Redeem
 Retry
 --idempotency-key reuses one attempt across retries; it is never printed.
-Resets: {count}
-Resets: unavailable
+{count} weekly · first expires {Mon D}  [Reset]   (card; no line when none or unknown)
+↻{count}                                           (collapsed line, after its status)
 Only a confirmed operator action redeems; nothing redeems automatically.
+```
+
+A Claude account's banked limit resets (Claude Code's `/limit-reset`) ride the usage
+probe it already makes: `?cedar_ember=1`, sent with Claude Code's user agent, because
+without it Anthropic answers `eligible: false` with reason `surface` on every account.
+Not `skip_spend=1`: it nulls `extra_usage`. An ineligible answer is unknown, never zero.
+
+```text
+bankedResets is optional: {eligible, reason?, grants[{kind, resetsLeft, usableNow,
+paused, requiresLimit, endsAtMs?, unavailableReason?}]}; grant ids never leave the server.
+kind: weekly (7-day window) | full (5-hour and 7-day) | session (5-hour) | fable
+tcr status: resets=weekly:1,fable:2(Dec 10) | resets=unknown | resets=0
+`tcr reset <account> [--kind weekly|full|fable|session] [--yes]`; `tcr codex reset` is
+the same command. A Claude account spends the chosen kind's earliest use-by grant through
+POST /_tcr/claude/reset; every other name keeps the Codex route above.
+Use a {kind} reset on {account}? [y/N]
+Reset used. | Already used. | Nothing to reset. | Not usable yet.   exit 0
+No reset left.                                                      exit 6
+Reset failed. {fixed reason}                                        exit 4
+Couldn't confirm the reset went through; check again in a minute.  exit 4
+Card: 1 weekly · 2 Fable · first expires {Mon D}  [Reset]; several kinds ask which.
 ```

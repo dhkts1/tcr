@@ -83,6 +83,9 @@ enum Command {
     Accounts(AccountsArgs),
     /// Redeem banked resets through the running proxy.
     Codex(CodexArgs),
+    /// Use one banked limit reset on a Claude or Codex account, after confirmation, through
+    /// the running proxy. `tcr codex reset` is the same command.
+    Reset(ResetArgs),
     /// Remove an account from the config.
     Remove(RemoveArgs),
     /// Set an account's rotation priority (lower value = preferred).
@@ -1562,6 +1565,30 @@ enum CodexCommand {
     },
 }
 
+/// `tcr reset <account> [--kind weekly|full|fable|session] [--yes]`.
+#[derive(clap::Args)]
+struct ResetArgs {
+    account: String,
+    #[command(flatten)]
+    config: ConfigFile,
+    /// Which kind of reset to use on a Claude account: `weekly`, `full`, `fable` or
+    /// `session`. Needed only when the account holds more than one kind.
+    #[arg(long, value_parser = parse_reset_kind)]
+    kind: Option<tcr_status_wire::ResetKind>,
+    /// Reuse one attempt across retries; never printed.
+    #[arg(long)]
+    idempotency_key: Option<String>,
+    /// Skip the questions, for a caller that already asked: use the reset without
+    /// reading input, and end on an unknown outcome instead of offering a retry.
+    #[arg(long)]
+    yes: bool,
+}
+
+fn parse_reset_kind(token: &str) -> Result<tcr_status_wire::ResetKind, String> {
+    tcr_status_wire::ResetKind::parse(token)
+        .ok_or_else(|| format!("expected weekly, full, fable or session, not {token:?}"))
+}
+
 /// `tcr routing --json`. `--json` is required: there is no text form a launcher could
 /// mistake for the document.
 #[derive(clap::Args)]
@@ -1878,8 +1905,28 @@ async fn run_main() -> anyhow::Result<()> {
                 idempotency_key,
                 yes,
             } = args.command;
-            let code =
-                cli::codex_reset(&config.path(), &account, idempotency_key.as_deref(), yes).await?;
+            let code = cli::reset(
+                &config.path(),
+                &account,
+                None,
+                idempotency_key.as_deref(),
+                yes,
+            )
+            .await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Some(Command::Reset(args)) => {
+            let code = cli::reset(
+                &args.config.path(),
+                &args.account,
+                args.kind,
+                args.idempotency_key.as_deref(),
+                args.yes,
+            )
+            .await?;
             if code != 0 {
                 std::process::exit(code);
             }

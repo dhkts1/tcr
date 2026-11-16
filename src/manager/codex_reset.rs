@@ -337,7 +337,7 @@ impl Manager {
         })
     }
 
-    fn check_reset_owner(
+    pub(super) fn check_reset_owner(
         &self,
         idx: usize,
         identity: &BoundAccount,
