@@ -99,6 +99,10 @@ struct QuotaRow: View {
     /// (``Account/fableBarTintSource``) so a near-empty Fable window is still
     /// amber or red at a glance, the way its caption used to read.
     var trailingTint: Color? = nil
+    /// The bar's hover, when the card has something to say about this window that the
+    /// row does not draw: `banked resets unknown` on a Claude card's 7d bar
+    /// (`ResetRowFacts.unknownNote(_:)`). `nil` draws no hover, as before.
+    var barHelp: String? = nil
 
     private var fraction: Double {
         switch QuotaFormat.barFill(value) {
@@ -158,6 +162,7 @@ struct QuotaRow: View {
                 }
             }
             .frame(height: V4.barHeight)
+            .help(barHelp ?? "")
             Text(QuotaFormat.percent(value))
                 .font(V4.font(V4.dimSize))
                 .foregroundStyle(Tok.dim)

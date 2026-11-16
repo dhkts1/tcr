@@ -429,7 +429,16 @@ impl Manager {
 /// An Anthropic row keeps the defaults, whatever its quota holds, so its wire row gains no key.
 fn codex_snapshot_facts(a: &AccountRuntime) -> crate::stats::CodexFacts {
     match a.provider {
-        crate::provider::Provider::Anthropic => return crate::stats::CodexFacts::default(),
+        crate::provider::Provider::Anthropic => {
+            return crate::stats::CodexFacts {
+                banked_resets: a
+                    .quota
+                    .claude_resets
+                    .as_ref()
+                    .map(crate::claude_resets::ClaudeResetBank::wire),
+                ..crate::stats::CodexFacts::default()
+            };
+        }
         crate::provider::Provider::Codex => {}
     }
     let windows = a.quota.codex.windows();
@@ -441,6 +450,7 @@ fn codex_snapshot_facts(a: &AccountRuntime) -> crate::stats::CodexFacts {
         spend_control_reached: a.quota.codex.spend_control_reached,
         credits: a.quota.codex.credits.clone(),
         reset_credits: a.quota.codex.reset_credits.clone(),
+        banked_resets: None,
         login_error: a.login_error.clone(),
         codex_home: a.codex_home.clone(),
         token_sync_pending: a.pending_codex_writeback.is_some(),

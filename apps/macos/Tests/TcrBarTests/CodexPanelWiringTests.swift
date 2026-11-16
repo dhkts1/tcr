@@ -105,7 +105,14 @@ final class CodexPanelWiringTests: XCTestCase {
     func testResetRowReachesTheCardAndTheBadgeIsReservedOnLines() throws {
         let card = try source("apps/macos/Sources/TcrBar/PanelV4/AccountCard.swift")
         XCTAssertTrue(card.contains("ResetRowFacts.row(account)"))
-        XCTAssertTrue(card.contains("action?.redeem()"))
+        let row = try slice(card, from: "if let date = row.date {", to: ".help(row.help)")
+        XCTAssertTrue(
+            row.contains(".fixedSize()") && row.contains(".layoutPriority(1)"),
+            "the reset row's date can be cut again; the kinds must give way instead")
+        XCTAssertTrue(card.contains("action?.redeem(kind)"))
+        XCTAssertTrue(
+            card.contains("Section(\"Which reset do you want to use?\")"),
+            "several kinds held no longer ask which one")
         XCTAssertTrue(card.contains(".disabled(!enabled)"), "a pending reset leaves the button live")
         let line = try source("apps/macos/Sources/TcrBar/PanelV4/AccountLineRow.swift")
         XCTAssertTrue(line.contains("ResetBadge.text(account)"))
@@ -127,7 +134,10 @@ final class CodexPanelWiringTests: XCTestCase {
             to: "private func v4AccountRow(")
         XCTAssertTrue(helper.contains("CodexCardFacts.canRedeemReset(account)"))
         XCTAssertTrue(helper.contains("pending: resets.isPending(account.ref)"))
-        XCTAssertTrue(helper.contains("v4AccountRow(account, in: fleet).confirmRedeemReset()"))
+        XCTAssertTrue(helper.contains("let row = v4AccountRow(account, in: fleet)"))
+        XCTAssertTrue(helper.contains("row.confirmRedeemReset()"))
+        XCTAssertTrue(helper.contains("row.confirmClaudeReset(kind)"))
+        XCTAssertTrue(helper.contains("ResetRowFacts.canRedeem(account)"))
         XCTAssertEqual(
             try occurrences(
                 of: "reset: { account in cardReset(account, in: fleet) }",
@@ -153,7 +163,7 @@ final class CodexPanelWiringTests: XCTestCase {
         XCTAssertTrue(menu.contains(".disabled(resets.isPending(account.ref))"))
         let confirm = try slice(
             fleet, from: "func confirmRedeemReset() {",
-            to: "private func performReset(retrying: Bool)")
+            to: "private func performReset(retrying: Bool, kind: ResetKind? = nil)")
         XCTAssertTrue(confirm.contains("This spends one banked reset."))
         XCTAssertTrue(confirm.contains("withTitle: \"Cancel\""))
         let consent = try XCTUnwrap(
@@ -161,11 +171,11 @@ final class CodexPanelWiringTests: XCTestCase {
         let run = try XCTUnwrap(confirm.range(of: "performReset(retrying: false)"))
         XCTAssertLessThan(consent.lowerBound, run.lowerBound)
         let perform = try slice(
-            fleet, from: "private func performReset(retrying: Bool)",
+            fleet, from: "private func performReset(retrying: Bool, kind: ResetKind? = nil)",
             to: "private func confirmDeleteAccount()")
         for call in [
             "resets.retry(account: account.ref)",
-            "resets.redeem(account: account.ref, confirmed: true)", "outcome.text",
+            "resets.redeem(account: account.ref, kind: kind, confirmed: true)", "outcome.text",
             "withTitle: \"Retry\"", "performReset(retrying: true)",
         ] {
             XCTAssertTrue(perform.contains(call), "missing reset wiring: \(call)")
@@ -179,7 +189,7 @@ final class CodexPanelWiringTests: XCTestCase {
         let confirm = try slice(
             try source("apps/macos/Sources/TcrBar/FleetView.swift"),
             from: "func confirmRedeemReset() {",
-            to: "private func performReset(retrying: Bool)")
+            to: "private func performReset(retrying: Bool, kind: ResetKind? = nil)")
         XCTAssertTrue(
             confirm.contains("alert.addButton(withTitle: \"Cancel\")")
                 && confirm.contains("alert.window.defaultButtonCell = nil")
@@ -191,7 +201,7 @@ final class CodexPanelWiringTests: XCTestCase {
     func testResetRetryDefaultsToCancel() throws {
         let retry = try slice(
             try source("apps/macos/Sources/TcrBar/FleetView.swift"),
-            from: "private func performReset(retrying: Bool)",
+            from: "private func performReset(retrying: Bool, kind: ResetKind? = nil)",
             to: "private func confirmDeleteAccount()")
         XCTAssertTrue(
             retry.contains("alert.addButton(withTitle: \"Cancel\")")

@@ -377,6 +377,115 @@ public struct ResetCredits: Equatable, Sendable, Decodable {
     }
 }
 
+/// What a banked reset refills, in Claude Code's words (the wire's `kind`).
+public enum ResetKind: String, Equatable, Hashable, Sendable, CaseIterable, Comparable {
+    case session
+    case weekly
+    case full
+    case fable
+
+    /// `5-hour reset`, `weekly reset`, `full reset`, `Fable reset`.
+    public var noun: String {
+        switch self {
+        case .session: return "5-hour reset"
+        case .weekly: return "weekly reset"
+        case .full: return "full reset"
+        case .fable: return "Fable reset"
+        }
+    }
+
+    /// The word a card's line counts it by: `2 weekly`, `1 Fable`, `1 5-hour`.
+    public var short: String {
+        switch self {
+        case .session: return "5-hour"
+        case .weekly: return "weekly"
+        case .full: return "full"
+        case .fable: return "Fable"
+        }
+    }
+
+    /// The wire's order, which the line follows: session, weekly, full, Fable.
+    public static func < (lhs: ResetKind, rhs: ResetKind) -> Bool { lhs.rank < rhs.rank }
+
+    private var rank: Int {
+        switch self {
+        case .session: return 0
+        case .weekly: return 1
+        case .full: return 2
+        case .fable: return 3
+        }
+    }
+}
+
+/// A Claude account's banked limit resets, as `bankedResets` carries them: no grant ids.
+/// `eligible == false` is Anthropic not saying what the account holds (e.g. reason
+/// `surface`): unknown, never zero. A grant of a kind this build cannot name is dropped, so
+/// a newer server never costs the row.
+public struct BankedResets: Equatable, Sendable, Decodable {
+    public let eligible: Bool
+    public let reason: String?
+    public let grants: [BankedReset]
+
+    public init(eligible: Bool, reason: String? = nil, grants: [BankedReset] = []) {
+        self.eligible = eligible
+        self.reason = reason
+        self.grants = grants
+    }
+
+    private enum CodingKeys: String, CodingKey { case eligible, reason, grants }
+
+    private struct AnyGrant: Decodable {
+        let grant: BankedReset?
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: BankedReset.CodingKeys.self)
+            guard let kind = ResetKind(rawValue: try c.decode(String.self, forKey: .kind)) else {
+                grant = nil
+                return
+            }
+            grant = BankedReset(
+                kind: kind, resetsLeft: try c.decode(UInt32.self, forKey: .resetsLeft),
+                usableNow: try c.decodeIfPresent(Bool.self, forKey: .usableNow) ?? false,
+                paused: try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false,
+                requiresLimit: try c.decodeIfPresent(Bool.self, forKey: .requiresLimit) ?? false,
+                endsAtMs: try c.decodeIfPresent(Int64.self, forKey: .endsAtMs))
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        eligible = try c.decode(Bool.self, forKey: .eligible)
+        reason = try c.decodeIfPresent(String.self, forKey: .reason)
+        grants = (try c.decodeIfPresent([AnyGrant].self, forKey: .grants) ?? []).compactMap(\.grant)
+    }
+}
+
+/// One grant of banked resets.
+public struct BankedReset: Equatable, Sendable {
+    public let kind: ResetKind
+    public let resetsLeft: UInt32
+    public let usableNow: Bool
+    public let paused: Bool
+    /// Usable only once the window it refills is at its limit.
+    public let requiresLimit: Bool
+    public let endsAtMs: Int64?
+
+    fileprivate enum CodingKeys: String, CodingKey {
+        case kind, resetsLeft, usableNow, paused, requiresLimit, endsAtMs
+    }
+
+    public init(
+        kind: ResetKind, resetsLeft: UInt32, usableNow: Bool = true, paused: Bool = false,
+        requiresLimit: Bool = false, endsAtMs: Int64? = nil
+    ) {
+        self.kind = kind
+        self.resetsLeft = resetsLeft
+        self.usableNow = usableNow
+        self.paused = paused
+        self.requiresLimit = requiresLimit
+        self.endsAtMs = endsAtMs
+    }
+}
+
 /// A Codex account's ChatGPT credits, as the server last read them.
 public struct CodexCredits: Equatable, Sendable, Decodable {
     public let hasCredits: Bool
@@ -1981,6 +2090,8 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// The account's ChatGPT credits, once they were reported.
     public let credits: CodexCredits?
     public let resetCredits: ResetCredits?
+    /// A Claude account's banked limit resets; `nil` when never read.
+    public let bankedResets: BankedResets?
     /// The refresh error that signed this account out, verbatim. An absent
     /// reason is never drawn.
     public let loginError: String?
@@ -2053,6 +2164,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         spendControlReached: Bool = false,
         credits: CodexCredits? = nil,
         resetCredits: ResetCredits? = nil,
+        bankedResets: BankedResets? = nil,
         loginError: String? = nil,
         codexHome: String? = nil,
         tokenSyncPending: Bool = false,
@@ -2109,6 +2221,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.spendControlReached = spendControlReached
         self.credits = credits
         self.resetCredits = resetCredits
+        self.bankedResets = bankedResets
         self.loginError = loginError
         self.codexHome = codexHome
         self.tokenSyncPending = tokenSyncPending
@@ -2126,7 +2239,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         case plan, organizationType, rateLimitTier, seatTier, orgUuid, orgName, gate, freeAtMs
         case provider, quotaWindows, fiveHourWindowMinutes, sevenDayWindowMinutes
         case limitReachedType, spendControlReached, credits, loginError, codexHome, tokenSyncPending
-        case resetCredits
+        case resetCredits, bankedResets
         case codexRoute, codexTraffic
     }
 
@@ -2197,6 +2310,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
             try c.decodeIfPresent(Bool.self, forKey: .spendControlReached) ?? false
         credits = try c.decodeIfPresent(CodexCredits.self, forKey: .credits)
         resetCredits = try c.decodeIfPresent(ResetCredits.self, forKey: .resetCredits)
+        bankedResets = try c.decodeIfPresent(BankedResets.self, forKey: .bankedResets)
         loginError = try c.decodeIfPresent(String.self, forKey: .loginError)
         codexHome = try c.decodeIfPresent(String.self, forKey: .codexHome)
         tokenSyncPending = try c.decodeIfPresent(Bool.self, forKey: .tokenSyncPending) ?? false

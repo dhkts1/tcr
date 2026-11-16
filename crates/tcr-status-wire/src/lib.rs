@@ -150,6 +150,119 @@ pub struct ResetCredits {
     pub earliest_expiry_ms: Option<i64>,
 }
 
+/// A Claude account's banked limit resets: one-time refills Anthropic grants an account,
+/// each with a use-by date (Claude Code's `/limit-reset`, internally `cedar_ember`).
+/// Spending one empties one or more usage windows now and does not move the account's
+/// regular weekly reset day, which is the 7d window and never a banked reset.
+///
+/// Absent on a row: never read. `eligible: false`: Anthropic answered that this login
+/// cannot see or use resets (`reason` says why, e.g. `surface` without a Claude Code
+/// user agent), with no grants. Either way the count is unknown, never zero. Grant ids
+/// never cross this wire; the server keeps them to spend one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BankedResets {
+    pub eligible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub grants: Vec<BankedReset>,
+}
+
+/// One grant of banked resets, without its id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BankedReset {
+    pub kind: ResetKind,
+    /// How many resets of this grant are left to use.
+    pub resets_left: u32,
+    /// Usable now, by Anthropic's own verdict.
+    #[serde(default)]
+    pub usable_now: bool,
+    /// Paused by Anthropic: held, not usable until it is unpaused.
+    #[serde(default)]
+    pub paused: bool,
+    /// Usable only once the window it refills is at its limit.
+    #[serde(default)]
+    pub requires_limit: bool,
+    /// The use-by instant, in Unix ms, when Anthropic sent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ends_at_ms: Option<i64>,
+    /// Anthropic's reason the grant is not usable now, verbatim, when it gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// What a banked reset refills, named the way Claude Code names it, so tcr and
+/// `/limit-reset` use the same words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResetKind {
+    /// Refills the 5-hour window only.
+    Session,
+    /// Refills the 7-day window.
+    Weekly,
+    /// Refills the 5-hour and 7-day windows.
+    Full,
+    /// Gives back what Fable used from the weekly budget.
+    Fable,
+}
+
+impl ResetKind {
+    /// The token `tcr reset --kind` takes and the wire carries.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Weekly => "weekly",
+            Self::Full => "full",
+            Self::Fable => "fable",
+        }
+    }
+
+    /// `weekly reset`, `5-hour reset`, `full reset`, `Fable reset`.
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Session => "5-hour reset",
+            Self::Weekly => "weekly reset",
+            Self::Full => "full reset",
+            Self::Fable => "Fable reset",
+        }
+    }
+
+    /// Parses a token, `None` for one this build cannot name.
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "session" => Some(Self::Session),
+            "weekly" => Some(Self::Weekly),
+            "full" => Some(Self::Full),
+            "fable" => Some(Self::Fable),
+            _ => None,
+        }
+    }
+}
+
+impl BankedResets {
+    /// Every kind held with at least one reset left, in kind order, with its count and its
+    /// earliest use-by. Empty for an ineligible answer: unknown, not zero.
+    pub fn held(&self) -> Vec<(ResetKind, u32, Option<i64>)> {
+        let mut held: Vec<(ResetKind, u32, Option<i64>)> = Vec::new();
+        for grant in self.grants.iter().filter(|g| g.resets_left > 0) {
+            match held.iter_mut().find(|(kind, _, _)| *kind == grant.kind) {
+                Some((_, count, ends)) => {
+                    *count += grant.resets_left;
+                    *ends = match (*ends, grant.ends_at_ms) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                }
+                None => held.push((grant.kind, grant.resets_left, grant.ends_at_ms)),
+            }
+        }
+        held.sort_by_key(|(kind, _, _)| *kind);
+        held
+    }
+}
+
 /// A Codex account's credits, as ChatGPT reported them on a response or a usage probe.
 ///
 /// Optional on the row ([`AccountStatusRow::credits`]) because a Codex row carries it only
@@ -771,6 +884,9 @@ pub struct AccountStatusRow {
     /// Banked resets. Absent means unknown; zero is a reported count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_credits: Option<ResetCredits>,
+    /// A Claude row's banked limit resets ([`BankedResets`]). Absent: never read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banked_resets: Option<BankedResets>,
     /// Why this account's login is known dead: `refresh_token_reused`,
     /// `refresh_token_expired`, `refresh_token_invalidated`, `invalid_grant`, `http_401`,
     /// or another raw code. Absent when the login is not known dead.

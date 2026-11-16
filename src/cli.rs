@@ -2083,6 +2083,172 @@ async fn codex_reset_with_io(
     }
 }
 
+const CLAUDE_RESET_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::CLAUDE_RESET_PATH,
+    endpoint: crate::proxy::CLAUDE_RESET_ENDPOINT,
+    refusals: &[400, 403, 404, 409, 502, 504],
+    noun: "reset",
+    success_needs_stamp: true,
+};
+
+/// `tcr reset` and its alias `tcr codex reset`: one banked reset, by the account's provider.
+/// A Claude account (named exactly as the config names it) goes to the Claude route with its
+/// `kind`; every other query keeps the Codex path it always had, where the proxy matches the
+/// name. A kind other than `weekly` on a Codex account is refused here: a Codex reset is a
+/// weekly reset.
+pub async fn reset(
+    config_path: &Path,
+    account: &str,
+    kind: Option<tcr_status_wire::ResetKind>,
+    key: Option<&str>,
+    assume_yes: bool,
+) -> anyhow::Result<i32> {
+    let claude = config::load(config_path).is_ok_and(|config| {
+        config
+            .accounts
+            .iter()
+            .any(|a| a.name == account && a.provider == Provider::Anthropic)
+    });
+    if !claude {
+        if kind.is_some_and(|kind| kind != tcr_status_wire::ResetKind::Weekly) {
+            eprintln!("Reset failed. A Codex reset is a weekly reset.");
+            return Ok(4);
+        }
+        return codex_reset(config_path, account, key, assume_yes).await;
+    }
+    claude_reset_with_io(
+        config_path,
+        account,
+        kind,
+        key,
+        assume_yes,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
+    .await
+}
+
+/// [`codex_reset_with_io`]'s Claude twin: the same consent, attempt key, exit codes and
+/// retry rule, against [`crate::proxy::CLAUDE_RESET_PATH`]. Every word it prints is fixed
+/// (the server's own fixed reasons included); nothing from Anthropic's body reaches it.
+#[expect(clippy::too_many_arguments, reason = "the io seams are for tests")]
+async fn claude_reset_with_io(
+    config_path: &Path,
+    account: &str,
+    kind: Option<tcr_status_wire::ResetKind>,
+    key: Option<&str>,
+    assume_yes: bool,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+    errors: &mut impl std::io::Write,
+) -> anyhow::Result<i32> {
+    let noun = kind.map_or("banked reset", tcr_status_wire::ResetKind::noun);
+    if !assume_yes {
+        let Ok(confirmed) =
+            reset_consent(input, errors, &format!("Use a {noun} on {account}? [y/N]"))
+        else {
+            writeln!(errors, "Reset failed. Could not read confirmation.")?;
+            return Ok(4);
+        };
+        if !confirmed {
+            writeln!(output, "Cancelled.")?;
+            return Ok(0);
+        }
+    }
+    let key = match key {
+        Some(key) => key.to_owned(),
+        None => {
+            if let Ok(key) = crate::request_key::generate() {
+                key
+            } else {
+                writeln!(errors, "Reset failed. Could not create an attempt.")?;
+                return Ok(4);
+            }
+        }
+    };
+    if !crate::claude_resets::valid_request_id(&key) {
+        writeln!(errors, "Reset failed. Invalid attempt key.")?;
+        return Ok(4);
+    }
+    let Ok(config) = config::load(config_path) else {
+        writeln!(
+            errors,
+            "Reset failed. Could not read the proxy configuration."
+        )?;
+        return Ok(4);
+    };
+    loop {
+        let mut body = serde_json::json!({"query": account, "idempotencyKey": key});
+        if let Some(kind) = kind {
+            body["kind"] = serde_json::Value::from(kind.token());
+        }
+        let answer: RouteAnswer<crate::manager::ClaudeResetResponse> = call_route_with_policy(
+            &config,
+            &CLAUDE_RESET_ROUTE,
+            reqwest::redirect::Policy::none(),
+            |client, url| {
+                client
+                    .post(url)
+                    .timeout(Duration::from_secs(95))
+                    .json(&body)
+            },
+        )
+        .await;
+        match answer.result {
+            Ok(response) => {
+                writeln!(output, "{}", response.outcome.message())?;
+                if !response.usage_refreshed {
+                    writeln!(errors, "Usage refresh failed.")?;
+                    return Ok(5);
+                }
+                return Ok(
+                    if response.outcome == crate::manager::ClaudeResetOutcome::NoResetLeft {
+                        6
+                    } else {
+                        0
+                    },
+                );
+            }
+            Err(LiveControlError::NoServer) => {
+                writeln!(errors, "No running proxy.")?;
+                return Ok(3);
+            }
+            Err(LiveControlError::Rejected(message)) if answer.status != Some(504) => {
+                writeln!(errors, "Reset failed. {message}")?;
+                return Ok(4);
+            }
+            Err(error) => {
+                let unknown = answer.status == Some(504)
+                    || matches!(
+                        error,
+                        LiveControlError::NoAnswer(_) | LiveControlError::Unusable(_)
+                    );
+                if !unknown {
+                    writeln!(errors, "Reset failed. The proxy refused the reset request.")?;
+                    return Ok(4);
+                }
+                writeln!(
+                    errors,
+                    "{}",
+                    crate::manager::ClaudeResetError::Unknown.message()
+                )?;
+                if assume_yes {
+                    return Ok(4);
+                }
+                let Ok(retry) = reset_consent(input, errors, "Retry this reset attempt? [y/N]")
+                else {
+                    writeln!(errors, "Reset failed. Could not read confirmation.")?;
+                    return Ok(4);
+                };
+                if !retry {
+                    return Ok(4);
+                }
+            }
+        }
+    }
+}
+
 /// Asks on `prompt_to`, which is stderr: stdout carries only outcome words.
 fn reset_consent(
     input: &mut impl std::io::BufRead,
@@ -2983,6 +3149,44 @@ fn unreported_window(a: &AccountSnapshot, label: &str, window: &str) -> Option<S
     (!reported.iter().any(|w| w == window)).then(|| format!("{label}=none"))
 }
 
+/// A Claude row's banked resets on its `tcr status` line: ` resets=weekly:1,fable:2(Dec 10)`,
+/// each kind held with its count, then the earliest use-by among them (UTC day). Read but
+/// ineligible is ` resets=unknown`, never `0`: Anthropic did not say what the account holds.
+/// Eligible with none held is ` resets=0`. Nothing when never read.
+fn claude_resets_token(resets: Option<&tcr_status_wire::BankedResets>) -> String {
+    let Some(resets) = resets else {
+        return String::new();
+    };
+    if !resets.eligible {
+        return " resets=unknown".to_owned();
+    }
+    let held = resets.held();
+    if held.is_empty() {
+        return " resets=0".to_owned();
+    }
+    let kinds: Vec<String> = held
+        .iter()
+        .map(|(kind, count, _)| format!("{}:{count}", kind.token()))
+        .collect();
+    let mut token = format!(" resets={}", kinds.join(","));
+    if let Some(day) = held
+        .iter()
+        .filter_map(|(_, _, ends)| *ends)
+        .min()
+        .and_then(utc_day)
+    {
+        token.push_str(&format!("({day})"));
+    }
+    token
+}
+
+/// `Dec 10`: the UTC day of a Unix-ms instant.
+fn utc_day(ms: i64) -> Option<String> {
+    let at = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()?;
+    let format = time::macros::format_description!("[month repr:short] [day padding:none]");
+    at.format(&format).ok()
+}
+
 /// The tokens that end a Codex row's line, in this order, each only when it has something to
 /// say: ` login_error=` (the raw error the login died with), ` limit_reached=` (the raw limit
 /// ChatGPT says it reached), ` spend_control=reached`, ` credits=` (`unlimited`, else the
@@ -2991,7 +3195,7 @@ fn unreported_window(a: &AccountSnapshot, label: &str, window: &str) -> Option<S
 /// row, whatever its Codex facts hold.
 fn codex_tail(a: &AccountSnapshot) -> String {
     match a.provider {
-        Provider::Anthropic => return String::new(),
+        Provider::Anthropic => return claude_resets_token(a.codex.banked_resets.as_ref()),
         Provider::Codex => {}
     }
     let mut tail = String::new();
@@ -3198,6 +3402,7 @@ fn account_status_rows_at(
                         quota_windows: a
                             .five_hour_absent_on_plan
                             .then(|| vec!["sevenDay".to_string()]),
+                        banked_resets: a.codex.banked_resets.clone(),
                         ..CodexFacts::default()
                     },
                     None,
@@ -3519,6 +3724,7 @@ fn account_status_rows_at(
                 spend_control_reached: facts.spend_control_reached,
                 credits: facts.credits,
                 reset_credits: facts.reset_credits,
+                banked_resets: facts.banked_resets,
                 login_error: facts.login_error,
                 codex_home: facts.codex_home,
                 token_sync_pending: facts.token_sync_pending,
@@ -7696,6 +7902,7 @@ mod tests {
                     seven_day_oi: None,
                     extra_usage_usd: None,
                     codex: None,
+                    claude_resets: None,
                 })
             })
         }
@@ -7735,6 +7942,7 @@ mod tests {
                     seven_day_oi: None,
                     extra_usage_usd: None,
                     codex: None,
+                    claude_resets: None,
                 })
             })
         }
@@ -9407,6 +9615,7 @@ mod tests {
                             seven_day_oi: None,
                             extra_usage_usd: None,
                             codex: None,
+                            claude_resets: None,
                         }),
                         Provider::Codex => Err(crate::probe::ProbeError {
                             status: Some(401),
@@ -9661,6 +9870,7 @@ mod tests {
                         seven_day_oi: None,
                         extra_usage_usd: None,
                         codex: None,
+                        claude_resets: None,
                     })
                 } else {
                     Ok(Usage {
@@ -9672,6 +9882,7 @@ mod tests {
                         seven_day_oi: None,
                         extra_usage_usd: None,
                         codex: None,
+                        claude_resets: None,
                     })
                 }
             })
@@ -9752,6 +9963,7 @@ mod tests {
                         seven_day_oi: None,
                         extra_usage_usd: None,
                         codex: None,
+                        claude_resets: None,
                     })
                 } else {
                     Ok(Usage {
@@ -9760,6 +9972,7 @@ mod tests {
                         seven_day_oi: None,
                         extra_usage_usd: None,
                         codex: None,
+                        claude_resets: None,
                     })
                 }
             })
@@ -9972,6 +10185,7 @@ mod tests {
                     seven_day_oi: None,
                     extra_usage_usd: None,
                     codex: None,
+                    claude_resets: None,
                 })
             })
         }
@@ -11059,6 +11273,60 @@ mod tests {
         "codexTraffic",
     ];
 
+    /// A Claude row's banked resets on `tcr status`: per kind with the earliest use-by,
+    /// `unknown` for an ineligible answer (never `0`), `0` for eligible with none held, and
+    /// nothing when never read. The JSON carries the grants and never a grant id.
+    #[test]
+    fn claude_banked_resets_reach_text_and_json() {
+        use tcr_status_wire::{BankedReset, BankedResets, ResetKind};
+        let grant = |kind, left, ends| BankedReset {
+            kind,
+            resets_left: left,
+            usable_now: true,
+            paused: false,
+            requires_limit: false,
+            ends_at_ms: ends,
+            unavailable_reason: None,
+        };
+        let held = BankedResets {
+            eligible: true,
+            reason: None,
+            grants: vec![
+                grant(ResetKind::Fable, 2, Some(1_891_036_800_000)),
+                grant(ResetKind::Weekly, 1, Some(1_891_123_200_000)),
+                grant(ResetKind::Weekly, 0, Some(1_800_000_000_000)),
+            ],
+        };
+        assert_eq!(
+            claude_resets_token(Some(&held)),
+            " resets=weekly:1,fable:2(Dec 4)"
+        );
+        let surface = BankedResets {
+            eligible: false,
+            reason: Some("surface".to_owned()),
+            grants: Vec::new(),
+        };
+        assert_eq!(claude_resets_token(Some(&surface)), " resets=unknown");
+        let none = BankedResets {
+            eligible: true,
+            ..surface
+        };
+        assert_eq!(claude_resets_token(Some(&none)), " resets=0");
+        assert_eq!(claude_resets_token(None), "");
+
+        let (mut snapshot, thresholds) = status_contract_snapshot();
+        assert_eq!(snapshot.accounts[0].provider, Provider::Anthropic);
+        snapshot.accounts[0].codex.banked_resets = Some(held);
+        let text = status_text_of(&snapshot, None, &pooled_route());
+        assert!(text.contains(" resets=weekly:1,fable:2(Dec 4)"), "{text}");
+        let wire: serde_json::Value =
+            serde_json::from_str(&status_json(&snapshot, &thresholds, StatusSource::Live)).unwrap();
+        assert_eq!(wire[0]["bankedResets"]["eligible"], true);
+        assert_eq!(wire[0]["bankedResets"]["grants"][0]["kind"], "fable");
+        assert_eq!(wire[0]["bankedResets"]["grants"][0]["resetsLeft"], 2);
+        assert!(wire[4].get("bankedResets").is_none());
+    }
+
     #[test]
     fn reset_credits_reach_text_and_json_without_identities() {
         let (mut snapshot, thresholds) = status_contract_snapshot();
@@ -12057,6 +12325,7 @@ mod tests {
                 login_error: Some("refresh_token_reused".to_string()),
                 codex_home: Some("/Users/example/.codex".to_string()),
                 token_sync_pending: true,
+                banked_resets: None,
                 reset_credits: Some(tcr_status_wire::ResetCredits {
                     available_count: 3,
                     earliest_expiry_ms: Some(1_800_000_000_000),

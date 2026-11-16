@@ -322,6 +322,9 @@ enum RenderStates {
             ("25i-codex-reset-row", .loaded(fleet(codexResetJSON)), false, nil),
             // The same accounts as lines: bob's and dana's end in the ↻ badge.
             ("25j-codex-reset-lines", .loaded(fleet(codexResetJSON)), false, nil),
+            // A Claude account holding one weekly and two Fable resets, its card kept open:
+            // the per-kind line. See ``claudeResetJSON``.
+            ("25k-claude-reset-row", .loaded(fleet(claudeResetJSON)), false, nil),
             // Both providers at compact density: ORCHARD is drawn once under each head, each
             // box holding its own provider's members. See ``mixedFleetCompactJSON``.
             ("24b-mixed-fleet-compact", .loaded(fleet(mixedFleetCompactJSON)), false, nil),
@@ -797,6 +800,8 @@ enum RenderStates {
             return KeptOpenCards(["lee@example.com/codex"])
         case "25i-codex-reset-row":
             return KeptOpenCards([CanonicalCodexRow.bob, .dana, .carol].map(\.rawValue))
+        case "25k-claude-reset-row":
+            return KeptOpenCards([CanonicalCodexRow.alice.rawValue])
         default: return KeptOpenCards()
         }
     }
@@ -5393,6 +5398,44 @@ extension RenderStates {
             .carol, now: now,
             extra: ["codexTraffic": quietCodexTraffic, "resetCredits": ["availableCount": 0]])
         return "[\([bob, dana, carol].joined(separator: ","))]"
+    }
+
+    /// Scene `25k-claude-reset-row`: canonical alice, the one Claude row, holding one weekly
+    /// reset that expires in 9 days and two Fable resets that expire in 4.
+    private static var claudeResetJSON: String {
+        let now = Date()
+        func atMs(days: Double) -> Int64 {
+            Int64((now.timeIntervalSince1970 + days * 86_400) * 1000)
+        }
+        let alice = codexRow(
+            .alice, now: now,
+            extra: [
+                "bankedResets": [
+                    "eligible": true,
+                    "grants": [
+                        [
+                            "kind": "weekly", "resetsLeft": 1, "usableNow": true,
+                            "endsAtMs": atMs(days: 9),
+                        ],
+                        [
+                            "kind": "fable", "resetsLeft": 2, "usableNow": true,
+                            "endsAtMs": atMs(days: 4),
+                        ],
+                    ],
+                ]
+            ])
+        // Two more Claude accounts, as lines, so the kept-open card sits in a list as it
+        // does on a real Mac rather than alone in an empty panel.
+        let nina = account(
+            "nina@example.com", quota: "0.91", state: "near", fiveHour: "0.91",
+            fiveHourState: "near", sevenDay: "0.25", sevenDayState: "ok",
+            fiveHourResetInMinutes: 72, sevenDayResetInMinutes: 7200, plan: "Max 5x",
+            orgUuid: "44444444-4444-4444-8444-444444444444")
+        let henry = account(
+            "henry@example.com", quota: "0.30", state: "ok", fiveHour: "0.30", sevenDay: "0.15",
+            fiveHourResetInMinutes: 100, sevenDayResetInMinutes: 5760, plan: "Team 5x",
+            orgUuid: "66666666-6666-4666-8666-666666666666")
+        return "[\(alice),\(nina),\(henry)]"
     }
 
     /// Scene `25e-codex-unmeasured`: one Codex account before its first probe, with no

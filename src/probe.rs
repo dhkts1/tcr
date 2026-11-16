@@ -26,6 +26,15 @@ use crate::log_err::LogErr;
 
 /// Anthropic OAuth usage endpoint (zero message-quota spend).
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// The query every usage read carries: Claude's banked resets ride the same request
+/// ([`crate::claude_resets`] says why this and not `skip_spend=1` beside it).
+pub const USAGE_QUERY: &str = "?cedar_ember=1";
+/// The user agent a usage read and a reset claim send. Anthropic answers the banked-reset
+/// block only to Claude Code: without it every account reads `eligible: false` with reason
+/// `surface` (measured 2026-11-16). The version is the Claude Code release the reset API
+/// was read from (2.1.325). tcr presents no other Claude Code identity on its own calls; the
+/// proxy forwards the client's own user agent untouched.
+pub const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.325 (external, cli)";
 /// `anthropic-beta` header value required by the usage endpoint.
 pub const OAUTH_USAGE_BETA: &str = "oauth-2025-04-20";
 /// Per-probe wall-clock ceiling; a probe that outlives it reads as a timeout.
@@ -133,6 +142,9 @@ pub struct Usage {
     /// ([`crate::codex_probe::CodexProbeFacts`]). Anthropic's probe leaves it `None`, so an
     /// Anthropic reading folds into the quota exactly as it did before the field existed.
     pub codex: Option<crate::codex_probe::CodexProbeFacts>,
+    /// Anthropic's banked resets (the payload's `cedar_ember` block), `None` when the block
+    /// was absent or unreadable. A Codex probe leaves it `None` and is never read for it.
+    pub claude_resets: Option<crate::claude_resets::ClaudeResetBank>,
 }
 
 /// Why a probe failed. `status` carries the HTTP code when there was one — the
@@ -273,6 +285,7 @@ pub fn usage_from_payload(data: &Value) -> Usage {
         seven_day_oi: normalize_usage_bucket(fable.as_ref()),
         extra_usage_usd: parse_extra_usage_usd(data),
         codex: None,
+        claude_resets: crate::claude_resets::parse(data.get("cedar_ember")),
     }
 }
 
@@ -281,7 +294,7 @@ pub async fn fetch_usage(
     client: &reqwest::Client,
     access_token: &str,
 ) -> Result<Usage, ProbeError> {
-    fetch_usage_at(client, access_token, USAGE_URL).await
+    fetch_usage_at(client, access_token, &format!("{USAGE_URL}{USAGE_QUERY}")).await
 }
 
 async fn fetch_usage_at(
@@ -294,6 +307,7 @@ async fn fetch_usage_at(
         .header("Authorization", format!("Bearer {access_token}"))
         .header("anthropic-beta", OAUTH_USAGE_BETA)
         .header("Accept", "application/json")
+        .header(reqwest::header::USER_AGENT, CLAUDE_CODE_USER_AGENT)
         .timeout(PROBE_TIMEOUT)
         .send()
         .await
@@ -364,6 +378,8 @@ pub struct LiveUsageProber {
     /// initialise); every probe then reports that as a [`ProbeError`].
     client: Option<reqwest::Client>,
     codex_base: String,
+    /// The full Anthropic usage URL, query included: production's, or a test's stub.
+    anthropic_usage_url: String,
 }
 
 impl LiveUsageProber {
@@ -377,7 +393,18 @@ impl LiveUsageProber {
                 .build()
                 .log_warn("building the usage probe HTTP client"),
             codex_base: crate::provider::CODEX_UPSTREAM.to_string(),
+            anthropic_usage_url: format!("{USAGE_URL}{USAGE_QUERY}"),
         }
+    }
+
+    /// Probe Anthropic accounts under `base` instead of `api.anthropic.com`, for a test's stub.
+    #[cfg(test)]
+    pub fn with_anthropic_base(mut self, base: &str) -> Self {
+        self.anthropic_usage_url = format!(
+            "{}/api/oauth/usage{USAGE_QUERY}",
+            base.trim_end_matches('/')
+        );
+        self
     }
 
     /// Probe Codex accounts under `base` instead of [`crate::provider::CODEX_UPSTREAM`]: the
@@ -408,7 +435,10 @@ impl UsageProber for LiveUsageProber {
         };
         match credential.provider {
             crate::provider::Provider::Anthropic => {
-                Box::pin(async move { fetch_usage(&client, &credential.access_token).await })
+                let url = self.anthropic_usage_url.clone();
+                Box::pin(
+                    async move { fetch_usage_at(&client, &credential.access_token, &url).await },
+                )
             }
             crate::provider::Provider::Codex => {
                 let base = self.codex_base.clone();

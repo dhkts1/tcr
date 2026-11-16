@@ -61,6 +61,7 @@ impl UsageProber for HealthyProber {
                 seven_day_oi: None,
                 extra_usage_usd: None,
                 codex: None,
+                claude_resets: None,
             })
         })
     }

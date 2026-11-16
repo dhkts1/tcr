@@ -353,6 +353,12 @@ pub struct CodexFacts {
     pub credits: Option<tcr_status_wire::CodexCredits>,
     /// Banked resets from the last successful usage read; absent means unknown.
     pub reset_credits: Option<tcr_status_wire::ResetCredits>,
+    /// A CLAUDE row's banked limit resets, without grant ids
+    /// ([`crate::claude_resets`]). The one field here that is not Codex's: this struct is
+    /// the provider facts a row reports beyond the shared ones, named for its first
+    /// provider, and every row literal already carries it, so a Claude fact rides here
+    /// rather than through forty-one `AccountSnapshot` literals. `None` on a Codex row.
+    pub banked_resets: Option<tcr_status_wire::BankedResets>,
     /// Why the account's login is known dead (`refresh_token_reused`, …).
     pub login_error: Option<String>,
     /// The absolute path of the folder the account's login was imported from.

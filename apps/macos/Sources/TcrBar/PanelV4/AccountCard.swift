@@ -162,7 +162,9 @@ struct AccountCard<Actions: View>: View {
                         trailing: trailingText(index, window),
                         trailingReserved: trailingReserved,
                         trailingHelp: trailingHelp(index, window),
-                        trailingTint: trailingTint(index))
+                        trailingTint: trailingTint(index),
+                        barHelp: window.window == .sevenDay
+                            ? ResetRowFacts.unknownNote(account) : nil)
                 }
                 // A Codex plan that reports no usage window draws no row, and this
                 // one line in its place says so, with its credits. `nil` on every
@@ -182,11 +184,11 @@ struct AccountCard<Actions: View>: View {
                 minHeight: CGFloat(CodexCardFacts.reservedQuotaRows(account))
                     * (V4.lineHeight(V4.dimSize) + V4.quotaMarginTop),
                 alignment: .topLeading)
-            // Option B's one line (Gil, 2026-11-16): the banked resets, when the
-            // first expires, and a small Reset button. Drawn only for an account
+            // Option B's one line (Gil, 2026-11-16): the banked resets, the first
+            // use-by, and a small Reset button. Drawn only for an account
             // holding at least one, so every other card keeps its height.
             if let resets = ResetRowFacts.row(account) {
-                CardResetRow(text: resets.text, help: resets.help, action: reset)
+                CardResetRow(row: resets, action: reset, snapshotMode: snapshotMode)
             }
             // A Codex request always leaves from this Mac, so a Codex card draws
             // no lease line, and in place of the exit picker one statement of
@@ -601,78 +603,136 @@ struct AccountCard<Actions: View>: View {
     }
 }
 
-/// The reset row's button, wired by the card's host: the SAME confirm alert and the
-/// same ``CodexResetController`` the account's "Redeem reset" menu item uses
-/// (`AccountRow.confirmRedeemReset()`), so the button and the menu cannot become
-/// two ways to spend a reset.
+/// The reset row's button, wired by the card's host: the same confirm alert and the
+/// same `CodexResetController` the account's menu items use
+/// (`AccountRow.confirmRedeemReset()` for a Codex account, `confirmClaudeReset(_:)` for a
+/// Claude one), so the button and the menu cannot become two ways to spend a reset.
 struct CardResetAction {
-    /// A reset is in flight on this account: the button is disabled until it ends.
+    /// A reset is in flight on this account: the button reads "Resetting…" and is disabled.
     let pending: Bool
-    /// Opens the confirm alert. Nothing is spent unless the operator confirms.
-    let redeem: () -> Void
+    /// The kinds a click can spend. One opens the confirm alert at once; several open a
+    /// menu asking which.
+    let choices: [ResetKind]
+    /// Why no reset can be used right now although some are held (paused, waiting for
+    /// the limit, not usable yet), shown as the disabled button's hover.
+    let disabledReason: String?
+    /// Opens the confirm alert for one kind. Nothing is spent unless the operator confirms.
+    let redeem: (ResetKind) -> Void
 }
 
-/// Option B's row (`docs/design/banked-resets.md`): one mute line,
-/// `3 weekly · first expires Nov 30`, and a small Reset button at its end.
+/// Option B's row (`docs/design/codex-weekly-reset-mockup.html`, `docs/design/banked-resets.md`):
+/// a hairline across the whole card, then one mute line, `1 weekly · 2 Fable · Dec 10`, and a
+/// compact Reset button sized to its label at the line's right end. The hairline makes the
+/// row the card's footer, so the bars' tail divider ends above it.
 ///
-/// The button reads "Resetting…" while a reset runs and keeps the width of that label
-/// in every state, so nothing moves; it is disabled, and dimmed, while one is pending
-/// or when no host wired it.
+/// The date is never cut (Gil, 2026-11-16: "doesnt look that good" of a cut one): on a
+/// narrow card the kinds give way, and the hover holds every kind in full. The button reads
+/// "Resetting…" while a reset runs; it is disabled, and dimmed, while one is pending, when
+/// no reset is usable now (its hover says why), or when no host wired it. With several kinds
+/// held it is a menu: "Which reset do you want to use?", one item each.
 private struct CardResetRow: View {
-    let text: String
-    let help: String
+    let row: ResetRowFacts.Row
     let action: CardResetAction?
+    let snapshotMode: Bool
 
-    /// The button's side padding and its dimmed alpha. Small, because the row is one
-    /// mute line and a full ``V4Button`` (28 pt) would make it two.
+    /// The button's padding and its dimmed alpha: the mockup's `.btn.sm`, about 20 pt tall.
     private static let insetH: CGFloat = 8
+    private static let insetV: CGFloat = 2
     private static let disabledAlpha: Double = 0.45
-
     private static let runningLabel = "Resetting…"
+    /// The gap between the hairline and the line under it.
+    private static let ruleGap: CGFloat = 5
 
     private var pending: Bool { action?.pending ?? false }
-    private var enabled: Bool { action != nil && !pending }
+    private var enabled: Bool {
+        guard let action else { return false }
+        return !action.pending && action.disabledReason == nil
+    }
+    private var buttonHelp: String {
+        if let reason = action?.disabledReason { return reason }
+        return "Spends one banked reset on this account, after you confirm."
+    }
 
     var body: some View {
-        HStack(spacing: V4.pillGap) {
-            Text(text)
+        VStack(alignment: .leading, spacing: Self.ruleGap) {
+            Rectangle()
+                .fill(Tok.cardLine)
+                .frame(height: V4.panelBorderWidth)
+                .padding(.horizontal, -V4.cardPaddingH)
+            HStack(spacing: V4.pillGap) {
+                HStack(spacing: 0) {
+                    Text(row.kinds)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if let date = row.date {
+                        Text(" · \(date)")
+                            .lineLimit(1)
+                            .fixedSize()
+                            .layoutPriority(1)
+                    }
+                }
                 .font(V4.font(V4.muteSize))
                 .foregroundStyle(Tok.mute)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .help(help)
-            Spacer(minLength: 0)
-            Button {
-                action?.redeem()
-            } label: {
-                // Both labels laid in one place, the idle one hidden while a reset
-                // runs, so the button is always as wide as "Resetting…" and the
-                // label changing moves nothing.
-                ZStack {
-                    Text(Self.runningLabel).hidden()
-                    Text(pending ? Self.runningLabel : "Reset")
-                }
-                .font(V4.font(V4.muteSize, .medium))
-                .foregroundStyle(Tok.ink)
-                .lineLimit(1)
-                .fixedSize()
-                .padding(.horizontal, Self.insetH)
-                .frame(minHeight: V4.lineHeight(V4.muteSize))
-                .background(
-                    RoundedRectangle(cornerRadius: V4.buttonRadius)
-                        .fill(Tok.ink.opacity(V4.buttonFillAlpha))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: V4.buttonRadius)
-                        .strokeBorder(Tok.cardLine, lineWidth: V4.panelBorderWidth)
-                )
+                .help(row.help)
+                Spacer(minLength: V4.pillGap)
+                control
+                    .disabled(!enabled)
+                    .opacity(enabled ? 1 : Self.disabledAlpha)
+                    .help(buttonHelp)
+                    .accessibilityLabel("Redeem a reset")
             }
-            .buttonStyle(V4PressStyle(cornerRadius: V4.buttonRadius))
-            .disabled(!enabled)
-            .opacity(enabled ? 1 : Self.disabledAlpha)
-            .help("Spends one banked reset on this account, after you confirm.")
-            .accessibilityLabel("Redeem a reset")
         }
         .padding(.top, V4.quotaMarginTop)
+    }
+
+    @ViewBuilder
+    private var control: some View {
+        let choices = action?.choices ?? []
+        if choices.count > 1 && !snapshotMode {
+            Menu {
+                Section("Which reset do you want to use?") {
+                    ForEach(choices, id: \.self) { kind in
+                        Button(kind.noun.prefix(1).uppercased() + kind.noun.dropFirst()) {
+                            action?.redeem(kind)
+                        }
+                    }
+                }
+            } label: {
+                label
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+        } else {
+            Button {
+                if let kind = choices.first { action?.redeem(kind) }
+            } label: {
+                label
+            }
+            .buttonStyle(V4PressStyle(cornerRadius: V4.buttonRadius))
+        }
+    }
+
+    private var label: some View {
+        // Its own width in each state. Reserving "Resetting…" for both cut the
+        // line beside it on a card inside a group (`25k-claude-reset-row`); the
+        // line is leading-aligned and the button trailing, so the label changing
+        // moves nothing but where that line would cut.
+        Text(pending ? Self.runningLabel : "Reset")
+            .font(V4.font(V4.muteSize, .medium))
+            .foregroundStyle(Tok.ink)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, Self.insetH)
+            .padding(.vertical, Self.insetV)
+            .background(
+                RoundedRectangle(cornerRadius: V4.buttonRadius)
+                    .fill(Tok.ink.opacity(V4.buttonFillAlpha))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: V4.buttonRadius)
+                    .strokeBorder(Tok.cardLine, lineWidth: V4.panelBorderWidth)
+            )
     }
 }

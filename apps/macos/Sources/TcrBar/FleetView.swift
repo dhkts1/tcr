@@ -1087,10 +1087,19 @@ struct FleetView: View {
     /// the menu are one way to spend a reset. Disabled while one is in flight. `nil`
     /// on an account that offers none, whose card draws no reset row.
     private func cardReset(_ account: Account, in fleet: Fleet) -> CardResetAction? {
-        guard CodexCardFacts.canRedeemReset(account) else { return nil }
+        guard ResetRowFacts.canRedeem(account) else { return nil }
         return CardResetAction(
             pending: resets.isPending(account.ref),
-            redeem: { v4AccountRow(account, in: fleet).confirmRedeemReset() })
+            choices: ResetRowFacts.choices(account),
+            disabledReason: ResetRowFacts.disabledReason(account),
+            redeem: { kind in
+                let row = v4AccountRow(account, in: fleet)
+                if CodexCardFacts.canRedeemReset(account) {
+                    row.confirmRedeemReset()
+                } else {
+                    row.confirmClaudeReset(kind)
+                }
+            })
     }
 
     /// One `AccountRow`, built exactly as the legacy panel builds it, rendering
@@ -5614,6 +5623,14 @@ struct AccountRow: View {
         if CodexCardFacts.canRedeemReset(account) {
             Button("Redeem reset") { confirmRedeemReset() }
                 .disabled(resets.isPending(account.ref))
+        } else if account.provider == .anthropic {
+            // A Claude account's banked resets, one item per kind it holds.
+            ForEach(ResetRowFacts.choices(account), id: \.self) { kind in
+                Button("Use \(kind.noun)…") { confirmClaudeReset(kind) }
+                    .disabled(
+                        resets.isPending(account.ref)
+                            || ResetRowFacts.disabledReason(account) != nil)
+            }
         }
         if actions.contains(.toggleEnabled) {
             Button(enabling ? "Enable" : "Disable") {
@@ -5959,11 +5976,30 @@ struct AccountRow: View {
         performReset(retrying: false)
     }
 
-    private func performReset(retrying: Bool) {
+    /// Asks before spending one `kind` reset of a Claude account, in the words
+    /// `ResetRowFacts.confirmation(_:kind:timeZone:)` holds, then spends it. Cancel is the
+    /// default, as on the Codex alert above.
+    func confirmClaudeReset(_ kind: ResetKind) {
+        guard !resets.isPending(account.ref) else { return }
+        let words = ResetRowFacts.confirmation(account, kind: kind)
+        let alert = NSAlert()
+        alert.messageText = words.message
+        alert.informativeText = words.informative
+        let use = alert.addButton(withTitle: "Use reset")
+        use.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        alert.window.defaultButtonCell = nil
+        alert.buttons.last?.keyEquivalent = "\r"
+        use.keyEquivalent = ""
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        performReset(retrying: false, kind: kind)
+    }
+
+    private func performReset(retrying: Bool, kind: ResetKind? = nil) {
         Task {
             let attempt = retrying
                 ? await resets.retry(account: account.ref)
-                : await resets.redeem(account: account.ref, confirmed: true)
+                : await resets.redeem(account: account.ref, kind: kind, confirmed: true)
             guard case .finished(let outcome) = attempt else { return }
             // Read status even for a qualified or unknown result. Never adjust the
             // displayed count ourselves: only the poller's measured row supplies it.

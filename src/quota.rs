@@ -123,6 +123,10 @@ pub struct Quota {
     /// ([`Self::update_from_codex_refusal_at`], and [`Self::apply_usage`] with a Codex probe's
     /// reading), so on an Anthropic account it stays the default.
     pub codex: CodexQuotaFacts,
+    /// Anthropic's banked resets from the last successful Anthropic usage read, grant ids
+    /// included (the claim names one). `None`: never read, or the last read carried no
+    /// block. An ineligible answer is kept as one: unknown, not zero.
+    pub claude_resets: Option<crate::claude_resets::ClaudeResetBank>,
 }
 
 /// A generic view over "case-insensitive header name → value" so the same
@@ -458,6 +462,11 @@ impl Quota {
         // about the read, the same rule `Manager::apply_usage` latches
         // `quota_known` on. A failed probe never reaches here.
         self.updated_at = Some(now);
+        // Anthropic's banked resets: a successful Anthropic read replaces them, a block it did
+        // not carry included. A Codex read carries `codex` facts and says nothing about them.
+        if usage.codex.is_none() {
+            self.claude_resets.clone_from(&usage.claude_resets);
+        }
         // A Codex probe's facts (an Anthropic probe carries none). Its windows are the plan's
         // and outrank the headers' from now on (`CodexQuotaFacts::windows`); its spend control
         // is current; its credits stand until another reading reports them.
