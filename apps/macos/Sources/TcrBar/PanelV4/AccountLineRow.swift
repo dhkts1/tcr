@@ -107,9 +107,13 @@ struct AccountLineRow<MenuItems: View>: View {
                 slot(1, slots[1], account.sevenDay, account.quotaBarTintSource(for: .sevenDay))
             }
             let signal = account.liveSignal(now: now)
-            Text(signal.text)
+            // The reset badge rides the signal (`ready · ↻3`): no button, which
+            // needs the card. It reserves no room (``AccountLineFit/signalColumn(_:)``
+            // says why), so it moves no name and no bar, and the tail truncation
+            // below cuts it before any word of the status.
+            (Text(signal.text).foregroundColor(LineColor.tone(signal.tone))
+                + ResetBadge.text(account))
                 .font(V4.font(V4.lineSignalSize))
-                .foregroundStyle(LineColor.tone(signal.tone))
                 .lineLimit(1)
                 .truncationMode(.tail)
                 // Whatever the row has left after the name and the meters,
@@ -221,9 +225,15 @@ struct WaitingLineRow<MenuItems: View>: View {
             }
             Spacer(minLength: 0)
             if let signal = account.waitingLineSignal(in: band, now: now) {
-                Text(signal.text)
+                (Text(signal.text).foregroundColor(LineColor.tone(signal.tone))
+                    + ResetBadge.text(account))
                     .font(V4.font(V4.lineSignalSize))
-                    .foregroundStyle(LineColor.tone(signal.tone))
+                    .lineLimit(1)
+                    .fixedSize()
+            } else if let badge = ResetRowFacts.badge(account) {
+                Text(badge)
+                    .font(V4.font(V4.lineSignalSize))
+                    .foregroundStyle(Tok.mute)
                     .lineLimit(1)
                     .fixedSize()
             }
@@ -425,5 +435,14 @@ private enum LineColor {
         case .unmeasured: return Tok.unmeasured
         case .unknown, .disabled: return Tok.mute
         }
+    }
+}
+
+/// A collapsed account's reset badge, after its line's signal: ` · ↻3` in the mute
+/// ink, or nothing when the account holds no reset (``ResetRowFacts/badge(_:)``).
+private enum ResetBadge {
+    static func text(_ account: Account) -> Text {
+        guard let badge = ResetRowFacts.badge(account) else { return Text(verbatim: "") }
+        return Text(verbatim: ResetRowFacts.badgeSeparator + badge).foregroundColor(Tok.mute)
     }
 }

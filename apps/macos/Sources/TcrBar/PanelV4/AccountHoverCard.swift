@@ -154,6 +154,8 @@ struct AccountHoverCardContent<Actions: View, Menu: View>: View {
     /// The fleet also holds Codex accounts, so a kept-open Claude card's spoken
     /// label says which provider it serves (``AccountCard/namesProvider``).
     var namesProvider: Bool = false
+    /// The reset row's button (``AccountCard/reset``).
+    var reset: CardResetAction? = nil
     @ViewBuilder var actions: () -> Actions
     @ViewBuilder var menu: () -> Menu
 
@@ -161,7 +163,7 @@ struct AccountHoverCardContent<Actions: View, Menu: View>: View {
         AccountCard(
             account: row.account, shape: shape, now: now, isControl: row.isControl,
             namesProvider: namesProvider,
-            snapshotMode: snapshotMode, lit: lit
+            snapshotMode: snapshotMode, lit: lit, reset: reset
         ) {
             actions()
         }

@@ -76,6 +76,10 @@ struct AccountCard<Actions: View>: View {
     var onToggleExitMust: (Bool) -> Void = { _ in }
     /// Lit from the strip (``V4Card/lit``): only a kept-open card is.
     var lit: Bool = false
+    /// What the reset row's button does, or `nil` where nothing wires it (a
+    /// render's bare card), which draws the button disabled so the row keeps its
+    /// shape. See ``CardResetAction``.
+    var reset: CardResetAction? = nil
     /// The card's visible per-account controls — the actions menu, and the
     /// re-login button on a broken account. A closure so ``AccountCard`` stays
     /// free of the controllers those controls are wired to: they are built from
@@ -178,10 +182,11 @@ struct AccountCard<Actions: View>: View {
                 minHeight: CGFloat(CodexCardFacts.reservedQuotaRows(account))
                     * (V4.lineHeight(V4.dimSize) + V4.quotaMarginTop),
                 alignment: .topLeading)
-            if let resets = CodexCardFacts.resetText(account) {
-                Text(resets)
-                    .font(V4.font(V4.muteSize))
-                    .foregroundStyle(Tok.mute)
+            // Option B's one line (Gil, 2026-11-16): the banked resets, when the
+            // first expires, and a small Reset button. Drawn only for an account
+            // holding at least one, so every other card keeps its height.
+            if let resets = ResetRowFacts.row(account) {
+                CardResetRow(text: resets.text, help: resets.help, action: reset)
             }
             // A Codex request always leaves from this Mac, so a Codex card draws
             // no lease line, and in place of the exit picker one statement of
@@ -593,5 +598,81 @@ struct AccountCard<Actions: View>: View {
                 resetAtMs: window == .fiveHour
                     ? account.fiveHourResetAtMs : account.sevenDayResetAtMs)
         }
+    }
+}
+
+/// The reset row's button, wired by the card's host: the SAME confirm alert and the
+/// same ``CodexResetController`` the account's "Redeem reset" menu item uses
+/// (`AccountRow.confirmRedeemReset()`), so the button and the menu cannot become
+/// two ways to spend a reset.
+struct CardResetAction {
+    /// A reset is in flight on this account: the button is disabled until it ends.
+    let pending: Bool
+    /// Opens the confirm alert. Nothing is spent unless the operator confirms.
+    let redeem: () -> Void
+}
+
+/// Option B's row (`docs/design/banked-resets.md`): one mute line,
+/// `3 weekly · first expires Nov 30`, and a small Reset button at its end.
+///
+/// The button reads "Resetting…" while a reset runs and keeps the width of that label
+/// in every state, so nothing moves; it is disabled, and dimmed, while one is pending
+/// or when no host wired it.
+private struct CardResetRow: View {
+    let text: String
+    let help: String
+    let action: CardResetAction?
+
+    /// The button's side padding and its dimmed alpha. Small, because the row is one
+    /// mute line and a full ``V4Button`` (28 pt) would make it two.
+    private static let insetH: CGFloat = 8
+    private static let disabledAlpha: Double = 0.45
+
+    private static let runningLabel = "Resetting…"
+
+    private var pending: Bool { action?.pending ?? false }
+    private var enabled: Bool { action != nil && !pending }
+
+    var body: some View {
+        HStack(spacing: V4.pillGap) {
+            Text(text)
+                .font(V4.font(V4.muteSize))
+                .foregroundStyle(Tok.mute)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .help(help)
+            Spacer(minLength: 0)
+            Button {
+                action?.redeem()
+            } label: {
+                // Both labels laid in one place, the idle one hidden while a reset
+                // runs, so the button is always as wide as "Resetting…" and the
+                // label changing moves nothing.
+                ZStack {
+                    Text(Self.runningLabel).hidden()
+                    Text(pending ? Self.runningLabel : "Reset")
+                }
+                .font(V4.font(V4.muteSize, .medium))
+                .foregroundStyle(Tok.ink)
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.horizontal, Self.insetH)
+                .frame(minHeight: V4.lineHeight(V4.muteSize))
+                .background(
+                    RoundedRectangle(cornerRadius: V4.buttonRadius)
+                        .fill(Tok.ink.opacity(V4.buttonFillAlpha))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: V4.buttonRadius)
+                        .strokeBorder(Tok.cardLine, lineWidth: V4.panelBorderWidth)
+                )
+            }
+            .buttonStyle(V4PressStyle(cornerRadius: V4.buttonRadius))
+            .disabled(!enabled)
+            .opacity(enabled ? 1 : Self.disabledAlpha)
+            .help("Spends one banked reset on this account, after you confirm.")
+            .accessibilityLabel("Redeem a reset")
+        }
+        .padding(.top, V4.quotaMarginTop)
     }
 }

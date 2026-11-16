@@ -317,6 +317,11 @@ enum RenderStates {
                 "25h-codex-hover-card", .loaded(fleet(codexScene(CanonicalCodexRow.allCases))),
                 false, nil
             ),
+            // Option B's reset row (Gil, 2026-11-16): bob holds three weekly resets, dana
+            // one, carol none, so carol's card draws no row. See ``codexResetJSON``.
+            ("25i-codex-reset-row", .loaded(fleet(codexResetJSON)), false, nil),
+            // The same accounts as lines: bob's and dana's end in the ↻ badge.
+            ("25j-codex-reset-lines", .loaded(fleet(codexResetJSON)), false, nil),
             // Both providers at compact density: ORCHARD is drawn once under each head, each
             // box holding its own provider's members. See ``mixedFleetCompactJSON``.
             ("24b-mixed-fleet-compact", .loaded(fleet(mixedFleetCompactJSON)), false, nil),
@@ -790,6 +795,8 @@ enum RenderStates {
             return KeptOpenCards(CanonicalCodexRow.allCases.map(\.rawValue))
         case "25e-codex-unmeasured":
             return KeptOpenCards(["lee@example.com/codex"])
+        case "25i-codex-reset-row":
+            return KeptOpenCards([CanonicalCodexRow.bob, .dana, .carol].map(\.rawValue))
         default: return KeptOpenCards()
         }
     }
@@ -5360,6 +5367,32 @@ extension RenderStates {
                 : codexRow(row, now: now, extra: ["codexTraffic": quietCodexTraffic])
         }
         return "[\(built.joined(separator: ","))]"
+    }
+
+    /// Scenes `25i-codex-reset-row` and `25j-codex-reset-lines`: bob with three banked
+    /// weekly resets, the first expiring in 14 days, dana with one expiring in 3 days, and
+    /// carol with none. Quiet traffic, so no refusal banner draws.
+    private static var codexResetJSON: String {
+        let now = Date()
+        func atMs(days: Double) -> Int64 {
+            Int64((now.timeIntervalSince1970 + days * 86_400) * 1000)
+        }
+        let bob = codexRow(
+            .bob, now: now,
+            extra: [
+                "codexTraffic": quietCodexTraffic,
+                "resetCredits": ["availableCount": 3, "earliestExpiryMs": atMs(days: 14)],
+            ])
+        let dana = codexRow(
+            .dana, now: now,
+            extra: [
+                "codexTraffic": quietCodexTraffic,
+                "resetCredits": ["availableCount": 1, "earliestExpiryMs": atMs(days: 3)],
+            ])
+        let carol = codexRow(
+            .carol, now: now,
+            extra: ["codexTraffic": quietCodexTraffic, "resetCredits": ["availableCount": 0]])
+        return "[\([bob, dana, carol].joined(separator: ","))]"
     }
 
     /// Scene `25e-codex-unmeasured`: one Codex account before its first probe, with no
