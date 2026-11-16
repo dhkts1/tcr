@@ -72,6 +72,10 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// What became of the last action on each account, drawn under its line
     /// or card (``RowNotices``). Empty for every account by default.
     var notices: (Account) -> [AccountRowNotice] = { _ in [] }
+    /// What each card's reset row button does (``CardResetAction``), or `nil` for
+    /// none. Every card host passes the same closure, so the tall card, the kept-open
+    /// card and the floating one spend a reset the same way.
+    var reset: (Account) -> CardResetAction? = { _ in nil }
     /// The row's own actions, as a context menu — the SECOND route to them,
     /// from the one definition in ``AccountRow``.
     @ViewBuilder var menu: (Account) -> Menu
@@ -253,7 +257,8 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                 row: row, shape: grouped ? .compact : .full, now: now,
                 snapshotMode: snapshotMode,
                 lit: litAccount == row.account.id,
-                namesProvider: fleet.holdsCodex
+                namesProvider: fleet.holdsCodex,
+                reset: reset(row.account)
             ) {
                 actions(row.account)
             } menu: {
@@ -417,7 +422,8 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                         forAccountLabel: row.account.name, in: exits)
                 else { return }
                 onSetExit(row.account.name, current.route, must)
-            }
+            },
+            reset: reset(row.account)
         ) {
             actions(row.account)
         }

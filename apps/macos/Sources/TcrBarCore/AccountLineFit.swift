@@ -178,6 +178,12 @@ public enum AccountLineFit {
     /// (``Account/liveSignalWorstCases``), decided once and never from what the
     /// lines say right now. Digits are tabular here, so the `0`s in a countdown
     /// template measure as any digit would.
+    ///
+    /// A reset badge (``ResetRowFacts/badge(_:)``) gets no room here. Reserving
+    /// ` · ↻00` on top of the widest status took 28 pt the line does not have: the bars
+    /// or the names went to a sliver (measured on scene `25j-codex-reset-lines`). The
+    /// badge rides after the status in this column instead, and the column's tail
+    /// truncation cuts the badge before it cuts a word of the status.
     public static func signalColumn(_ m: Metrics) -> CGFloat {
         let widest = Account.liveSignalWorstCases
             .map { textWidth($0, size: m.signalSize, weight: .regular) }.max()

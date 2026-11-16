@@ -98,17 +98,49 @@ final class CodexPanelWiringTests: XCTestCase {
             "Tok.link is no longer the system's link colour")
     }
 
-    /// The reset count lives on the card only. A label on a line row sits beside the
-    /// row's one flexible column, so a count change ("unavailable" to "3", 9 to 10)
-    /// would move the signal and cut long names: nothing on a line row may move when
-    /// a count changes.
-    func testResetCountReachesCardButNeverALineRow() throws {
+    /// Option B (Gil, 2026-11-16): the card draws the reset row, and a line draws the
+    /// ↻N badge after its signal, in the line's one flexible column, with no room
+    /// reserved: a count going 0 to 1, or 9 to 10, moves no name and no bar. The badge
+    /// comes after the status, so the column's tail truncation cuts the badge first.
+    func testResetRowReachesTheCardAndTheBadgeIsReservedOnLines() throws {
         let card = try source("apps/macos/Sources/TcrBar/PanelV4/AccountCard.swift")
+        XCTAssertTrue(card.contains("ResetRowFacts.row(account)"))
+        XCTAssertTrue(card.contains("action?.redeem()"))
+        XCTAssertTrue(card.contains(".disabled(!enabled)"), "a pending reset leaves the button live")
         let line = try source("apps/macos/Sources/TcrBar/PanelV4/AccountLineRow.swift")
-        XCTAssertTrue(card.contains("CodexCardFacts.resetText(account)"))
-        XCTAssertFalse(
-            line.contains("resetText"),
-            "a line row must not draw the reset count; it moves the signal when the count changes")
+        XCTAssertTrue(line.contains("ResetBadge.text(account)"))
+        let rows = try slice(line, from: "struct AccountLineRow<", to: "struct BandHeading:")
+        XCTAssertFalse(rows.contains("Button"), "a line draws a reset button; it needs the card")
+        XCTAssertTrue(
+            line.contains(
+                "(Text(signal.text).foregroundColor(LineColor.tone(signal.tone))\n"
+                    + "                + ResetBadge.text(account))"),
+            "the badge no longer follows the status, so truncation would cut the status")
+    }
+
+    /// Every card host wires the Reset button to the row's own confirm alert, the one
+    /// the menu's "Redeem reset" opens, so the two are one way to spend a reset.
+    func testTheResetButtonOpensTheMenusConfirmOnEveryCardHost() throws {
+        let fleet = try source("apps/macos/Sources/TcrBar/FleetView.swift")
+        let helper = try slice(
+            fleet, from: "private func cardReset(_ account: Account, in fleet: Fleet)",
+            to: "private func v4AccountRow(")
+        XCTAssertTrue(helper.contains("CodexCardFacts.canRedeemReset(account)"))
+        XCTAssertTrue(helper.contains("pending: resets.isPending(account.ref)"))
+        XCTAssertTrue(helper.contains("v4AccountRow(account, in: fleet).confirmRedeemReset()"))
+        XCTAssertEqual(
+            try occurrences(
+                of: "reset: { account in cardReset(account, in: fleet) }",
+                in: "apps/macos/Sources/TcrBar/FleetView.swift"), 1, "the tab's cards")
+        XCTAssertEqual(
+            try occurrences(
+                of: "reset: cardReset(row.account, in: fleet)",
+                in: "apps/macos/Sources/TcrBar/FleetView.swift"), 1, "the floating card")
+        XCTAssertEqual(
+            try occurrences(
+                of: "reset: reset(row.account)",
+                in: "apps/macos/Sources/TcrBar/PanelV4/AccountsTabV4.swift"),
+            2, "the tall card and the kept-open card")
     }
 
     func testResetMenuConfirmsThenRunsAndPollsBeforeShowingCommandOutput() throws {
@@ -120,7 +152,7 @@ final class CodexPanelWiringTests: XCTestCase {
         XCTAssertTrue(menu.contains("confirmRedeemReset()"))
         XCTAssertTrue(menu.contains(".disabled(resets.isPending(account.ref))"))
         let confirm = try slice(
-            fleet, from: "private func confirmRedeemReset() {",
+            fleet, from: "func confirmRedeemReset() {",
             to: "private func performReset(retrying: Bool)")
         XCTAssertTrue(confirm.contains("This spends one banked reset."))
         XCTAssertTrue(confirm.contains("withTitle: \"Cancel\""))
@@ -146,7 +178,7 @@ final class CodexPanelWiringTests: XCTestCase {
     func testResetConfirmationDefaultsToCancel() throws {
         let confirm = try slice(
             try source("apps/macos/Sources/TcrBar/FleetView.swift"),
-            from: "private func confirmRedeemReset() {",
+            from: "func confirmRedeemReset() {",
             to: "private func performReset(retrying: Bool)")
         XCTAssertTrue(
             confirm.contains("alert.addButton(withTitle: \"Cancel\")")

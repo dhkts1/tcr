@@ -37,15 +37,11 @@ public enum CodexCardFacts {
         account.provider == .codex ? 2 : 0
     }
 
-    /// The measured reset count, distinct from paid credits. An absent fact is unavailable.
-    public static func resetText(_ account: Account) -> String? {
-        guard account.provider == .codex else { return nil }
-        guard let resets = account.resetCredits else { return "Resets: unavailable" }
-        return "Resets: \(resets.availableCount)"
-    }
-
+    /// Whether this Codex row offers a reset: the menu's "Redeem reset" and the card's
+    /// Reset button (``ResetRowFacts/row(_:timeZone:)``), both of which run
+    /// `tcr codex reset`. The count and its words are ``ResetRowFacts``'s.
     public static func canRedeemReset(_ account: Account) -> Bool {
-        account.provider == .codex && (account.resetCredits?.availableCount ?? 0) > 0
+        account.provider == .codex && ResetRowFacts.canRedeem(account)
     }
 
     // MARK: - The state pill's help

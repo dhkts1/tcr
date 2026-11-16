@@ -624,7 +624,8 @@ struct FleetView: View {
         if case .loaded(let fleet) = poller.state {
             AccountHoverCardContent(
                 row: row, now: Date(), snapshotMode: snapshotMode,
-                namesProvider: fleet.holdsCodex
+                namesProvider: fleet.holdsCodex,
+                reset: cardReset(row.account, in: fleet)
             ) {
                 v4AccountRow(row.account, in: fleet, actionsOnly: true)
             } menu: {
@@ -1060,6 +1061,9 @@ struct FleetView: View {
                         ).map(AccountRowNotice.init(codexNote:))
                         : nil)
             },
+            // The card's Reset button opens the same alert the menu's "Redeem
+            // reset" does, from the same row (``cardReset(_:in:)``).
+            reset: { account in cardReset(account, in: fleet) },
             menu: { account in
                 // The row's own actions, from the ONE definition of them —
                 // `AccountRow`'s menu, rendered with no row around it. A second
@@ -1075,6 +1079,18 @@ struct FleetView: View {
                 v4AccountRow(account, in: fleet, actionsOnly: true)
             }
         )
+    }
+
+    /// The Reset button on an account's card: the confirm alert, the controller and
+    /// the poll that follow the account's own "Redeem reset" menu item, called on the
+    /// same `AccountRow` (``AccountRow/confirmRedeemReset()``), so the button and
+    /// the menu are one way to spend a reset. Disabled while one is in flight. `nil`
+    /// on an account that offers none, whose card draws no reset row.
+    private func cardReset(_ account: Account, in fleet: Fleet) -> CardResetAction? {
+        guard CodexCardFacts.canRedeemReset(account) else { return nil }
+        return CardResetAction(
+            pending: resets.isPending(account.ref),
+            redeem: { v4AccountRow(account, in: fleet).confirmRedeemReset() })
     }
 
     /// One `AccountRow`, built exactly as the legacy panel builds it, rendering
@@ -5924,7 +5940,10 @@ struct AccountRow: View {
         Task { await groupController.removeAll(group: group) }
     }
 
-    private func confirmRedeemReset() {
+    /// Asks before spending a reset, then spends it. The menu's "Redeem reset" and the
+    /// card's Reset button (`FleetView.cardReset(_:in:)`) both call this, so it is
+    /// not private.
+    func confirmRedeemReset() {
         guard !resets.isPending(account.ref) else { return }
         let alert = NSAlert()
         alert.messageText = "Redeem reset"
