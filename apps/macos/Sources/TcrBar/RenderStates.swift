@@ -5424,7 +5424,18 @@ extension RenderStates {
                     ],
                 ]
             ])
-        return "[\(alice)]"
+        // Two more Claude accounts, as lines, so the kept-open card sits in a list as it
+        // does on a real Mac rather than alone in an empty panel.
+        let nina = account(
+            "nina@example.com", quota: "0.91", state: "near", fiveHour: "0.91",
+            fiveHourState: "near", sevenDay: "0.25", sevenDayState: "ok",
+            fiveHourResetInMinutes: 72, sevenDayResetInMinutes: 7200, plan: "Max 5x",
+            orgUuid: "44444444-4444-4444-8444-444444444444")
+        let henry = account(
+            "henry@example.com", quota: "0.30", state: "ok", fiveHour: "0.30", sevenDay: "0.15",
+            fiveHourResetInMinutes: 100, sevenDayResetInMinutes: 5760, plan: "Team 5x",
+            orgUuid: "66666666-6666-4666-8666-666666666666")
+        return "[\(alice),\(nina),\(henry)]"
     }
 
     /// Scene `25e-codex-unmeasured`: one Codex account before its first probe, with no

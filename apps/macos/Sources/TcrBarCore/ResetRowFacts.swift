@@ -76,19 +76,27 @@ public enum ResetRowFacts {
         (held(account) ?? []).map(\.kind)
     }
 
+    /// The card's one line: each kind held with its count, then the earliest use-by.
+    public struct Row: Equatable, Sendable {
+        /// `1 weekly · 2 Fable`: may be cut at its end when the card is narrow.
+        public let kinds: String
+        /// `Dec 10`, the earliest use-by among the kinds held, or `nil` when none was
+        /// sent. Never cut (Gil, 2026-11-16): the card cuts the kinds instead.
+        public let date: String?
+        /// Every kind in full, what it refills and its use-by.
+        public let help: String
+
+        /// `1 weekly · 2 Fable · Dec 10`: the whole line, as it reads uncut.
+        public var text: String { date.map { "\(kinds) · \($0)" } ?? kinds }
+    }
+
     /// The card's one line and its help, or `nil` when the account holds no reset or its
-    /// provider has not said, which draws no row at all.
-    ///
-    /// `3 weekly · first expires Nov 30`, `1 weekly · 2 Fable · first expires Dec 10`, or the
-    /// counts alone when no expiry was sent. `timeZone` is the clock dates are printed in.
-    public static func row(_ account: Account, timeZone: TimeZone = .current)
-        -> (text: String, help: String)?
-    {
+    /// provider has not said, which draws no row at all. `timeZone` is the clock dates
+    /// are printed in.
+    public static func row(_ account: Account, timeZone: TimeZone = .current) -> Row? {
         guard let held = held(account), !held.isEmpty else { return nil }
-        var text = held.map { "\($0.count) \($0.kind.short)" }.joined(separator: " · ")
-        if let first = held.compactMap(\.earliestExpiryMs).min() {
-            text += " · first expires \(day(first, timeZone: timeZone))"
-        }
+        let kinds = held.map { "\($0.count) \($0.kind.short)" }.joined(separator: " · ")
+        let date = held.compactMap(\.earliestExpiryMs).min().map { day($0, timeZone: timeZone) }
         let lines = held.map { held -> String in
             let noun = held.count == 1 ? held.kind.noun : held.kind.noun + "s"
             var line = "\(held.count) \(noun): \(refills(held.kind))."
@@ -98,7 +106,9 @@ public enum ResetRowFacts {
             }
             return line
         }
-        return (text, (lines + ["Reset spends one, after you confirm."]).joined(separator: "\n"))
+        return Row(
+            kinds: kinds, date: date,
+            help: (lines + ["Reset spends one, after you confirm."]).joined(separator: "\n"))
     }
 
     /// `↻3`: the badge at the end of a collapsed account's line, every kind counted, or

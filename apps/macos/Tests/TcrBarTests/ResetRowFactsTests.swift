@@ -16,7 +16,7 @@ final class ResetRowFactsTests: XCTestCase {
     func testThreeResetsNameTheFirstExpiry() throws {
         let bob = try codex(["availableCount": 3, "earliestExpiryMs": nov30])
         let row = try XCTUnwrap(ResetRowFacts.row(bob, timeZone: utc))
-        XCTAssertEqual(row.text, "3 weekly · first expires Nov 30")
+        XCTAssertEqual(row.text, "3 weekly · Nov 30")
         XCTAssertEqual(
             row.help,
             "3 weekly resets: refills the 7-day window. The first, use by Nov 30, 22:37.\n"
@@ -28,7 +28,7 @@ final class ResetRowFactsTests: XCTestCase {
     func testOneResetIsSingularInItsHelp() throws {
         let bob = try codex(["availableCount": 1, "earliestExpiryMs": nov30])
         let row = try XCTUnwrap(ResetRowFacts.row(bob, timeZone: utc))
-        XCTAssertEqual(row.text, "1 weekly · first expires Nov 30")
+        XCTAssertEqual(row.text, "1 weekly · Nov 30")
         XCTAssertTrue(row.help.hasPrefix("1 weekly reset: refills the 7-day window. Use by "), row.help)
     }
 
@@ -37,7 +37,7 @@ final class ResetRowFactsTests: XCTestCase {
         let bob = try codex(["availableCount": 2, "earliestExpiryMs": nov30])
         let tokyo = try XCTUnwrap(TimeZone(identifier: "Asia/Tokyo"))
         XCTAssertEqual(
-            ResetRowFacts.row(bob, timeZone: tokyo)?.text, "2 weekly · first expires Dec 1")
+            ResetRowFacts.row(bob, timeZone: tokyo)?.text, "2 weekly · Dec 1")
     }
 
     func testNoExpirySaysTheCountAlone() throws {
@@ -75,7 +75,7 @@ final class ResetRowFactsTests: XCTestCase {
 
     // MARK: - Claude
 
-    /// `1 weekly · 2 Fable · first expires …`: each kind held, in kind order, a kind with no
+    /// `1 weekly · 2 Fable · Nov 30`: each kind held, in kind order, a kind with no
     /// reset left omitted, and the earliest use-by among them.
     func testAClaudeLineCountsEachKindHeld() throws {
         let alice = try claude([
@@ -85,7 +85,9 @@ final class ResetRowFactsTests: XCTestCase {
             ["kind": "something-new", "resetsLeft": 5],
         ])
         let row = try XCTUnwrap(ResetRowFacts.row(alice, timeZone: utc))
-        XCTAssertEqual(row.text, "1 weekly · 2 Fable · first expires Nov 30")
+        XCTAssertEqual(row.text, "1 weekly · 2 Fable · Nov 30")
+        XCTAssertEqual(row.kinds, "1 weekly · 2 Fable")
+        XCTAssertEqual(row.date, "Nov 30", "the date is drawn apart, so the card never cuts it")
         XCTAssertTrue(row.help.contains("2 Fable resets: gives back what Fable used"), row.help)
         XCTAssertEqual(ResetRowFacts.badge(alice), "↻3")
         XCTAssertEqual(ResetRowFacts.choices(alice), [.weekly, .fable])

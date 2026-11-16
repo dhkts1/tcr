@@ -184,12 +184,11 @@ struct AccountCard<Actions: View>: View {
                 minHeight: CGFloat(CodexCardFacts.reservedQuotaRows(account))
                     * (V4.lineHeight(V4.dimSize) + V4.quotaMarginTop),
                 alignment: .topLeading)
-            // Option B's one line (Gil, 2026-11-16): the banked resets, when the
-            // first expires, and a small Reset button. Drawn only for an account
+            // Option B's one line (Gil, 2026-11-16): the banked resets, the first
+            // use-by, and a small Reset button. Drawn only for an account
             // holding at least one, so every other card keeps its height.
             if let resets = ResetRowFacts.row(account) {
-                CardResetRow(
-                    text: resets.text, help: resets.help, action: reset, snapshotMode: snapshotMode)
+                CardResetRow(row: resets, action: reset, snapshotMode: snapshotMode)
             }
             // A Codex request always leaves from this Mac, so a Codex card draws
             // no lease line, and in place of the exit picker one statement of
@@ -621,24 +620,28 @@ struct CardResetAction {
     let redeem: (ResetKind) -> Void
 }
 
-/// Option B's row (`docs/design/banked-resets.md`): one mute line,
-/// `1 weekly · 2 Fable · first expires Dec 10`, and a small Reset button at its end.
+/// Option B's row (`docs/design/codex-weekly-reset-mockup.html`, `docs/design/banked-resets.md`):
+/// a hairline across the whole card, then one mute line, `1 weekly · 2 Fable · Dec 10`, and a
+/// compact Reset button sized to its label at the line's right end. The hairline makes the
+/// row the card's footer, so the bars' tail divider ends above it.
 ///
-/// The button reads "Resetting…" while a reset runs; it is disabled, and dimmed, while one
-/// is pending,
-/// when no reset is usable now (its hover says why), or when no host wired it. With
-/// several kinds held it is a menu: "Which reset do you want to use?", one item each.
+/// The date is never cut (Gil, 2026-11-16: "doesnt look that good" of a cut one): on a
+/// narrow card the kinds give way, and the hover holds every kind in full. The button reads
+/// "Resetting…" while a reset runs; it is disabled, and dimmed, while one is pending, when
+/// no reset is usable now (its hover says why), or when no host wired it. With several kinds
+/// held it is a menu: "Which reset do you want to use?", one item each.
 private struct CardResetRow: View {
-    let text: String
-    let help: String
+    let row: ResetRowFacts.Row
     let action: CardResetAction?
     let snapshotMode: Bool
 
-    /// The button's side padding and its dimmed alpha. Small, because the row is one
-    /// mute line and a full `V4Button` (28 pt) would make it two.
+    /// The button's padding and its dimmed alpha: the mockup's `.btn.sm`, about 20 pt tall.
     private static let insetH: CGFloat = 8
+    private static let insetV: CGFloat = 2
     private static let disabledAlpha: Double = 0.45
     private static let runningLabel = "Resetting…"
+    /// The gap between the hairline and the line under it.
+    private static let ruleGap: CGFloat = 5
 
     private var pending: Bool { action?.pending ?? false }
     private var enabled: Bool {
@@ -651,19 +654,33 @@ private struct CardResetRow: View {
     }
 
     var body: some View {
-        HStack(spacing: V4.pillGap) {
-            Text(text)
+        VStack(alignment: .leading, spacing: Self.ruleGap) {
+            Rectangle()
+                .fill(Tok.cardLine)
+                .frame(height: V4.panelBorderWidth)
+                .padding(.horizontal, -V4.cardPaddingH)
+            HStack(spacing: V4.pillGap) {
+                HStack(spacing: 0) {
+                    Text(row.kinds)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if let date = row.date {
+                        Text(" · \(date)")
+                            .lineLimit(1)
+                            .fixedSize()
+                            .layoutPriority(1)
+                    }
+                }
                 .font(V4.font(V4.muteSize))
                 .foregroundStyle(Tok.mute)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .help(help)
-            Spacer(minLength: 0)
-            control
-                .disabled(!enabled)
-                .opacity(enabled ? 1 : Self.disabledAlpha)
-                .help(buttonHelp)
-                .accessibilityLabel("Redeem a reset")
+                .help(row.help)
+                Spacer(minLength: V4.pillGap)
+                control
+                    .disabled(!enabled)
+                    .opacity(enabled ? 1 : Self.disabledAlpha)
+                    .help(buttonHelp)
+                    .accessibilityLabel("Redeem a reset")
+            }
         }
         .padding(.top, V4.quotaMarginTop)
     }
@@ -708,7 +725,7 @@ private struct CardResetRow: View {
             .lineLimit(1)
             .fixedSize()
             .padding(.horizontal, Self.insetH)
-            .frame(minHeight: V4.lineHeight(V4.muteSize))
+            .padding(.vertical, Self.insetV)
             .background(
                 RoundedRectangle(cornerRadius: V4.buttonRadius)
                     .fill(Tok.ink.opacity(V4.buttonFillAlpha))

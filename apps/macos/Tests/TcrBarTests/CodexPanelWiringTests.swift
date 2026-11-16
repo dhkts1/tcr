@@ -105,6 +105,10 @@ final class CodexPanelWiringTests: XCTestCase {
     func testResetRowReachesTheCardAndTheBadgeIsReservedOnLines() throws {
         let card = try source("apps/macos/Sources/TcrBar/PanelV4/AccountCard.swift")
         XCTAssertTrue(card.contains("ResetRowFacts.row(account)"))
+        let row = try slice(card, from: "if let date = row.date {", to: ".help(row.help)")
+        XCTAssertTrue(
+            row.contains(".fixedSize()") && row.contains(".layoutPriority(1)"),
+            "the reset row's date can be cut again; the kinds must give way instead")
         XCTAssertTrue(card.contains("action?.redeem(kind)"))
         XCTAssertTrue(
             card.contains("Section(\"Which reset do you want to use?\")"),

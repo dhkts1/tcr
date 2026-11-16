@@ -488,7 +488,7 @@ Cancel
 Redeem
 Retry
 --idempotency-key reuses one attempt across retries; it is never printed.
-{count} weekly · first expires {Mon D}  [Reset]   (card; no line when none or unknown)
+{count} weekly · {Mon D}  [Reset]   (card footer; no line when none or unknown)
 ↻{count}                                           (collapsed line, after its status)
 Only a confirmed operator action redeems; nothing redeems automatically.
 ```
@@ -511,5 +511,5 @@ Reset used. | Already used. | Nothing to reset. | Not usable yet.   exit 0
 No reset left.                                                      exit 6
 Reset failed. {fixed reason}                                        exit 4
 Couldn't confirm the reset went through; check again in a minute.  exit 4
-Card: 1 weekly · 2 Fable · first expires {Mon D}  [Reset]; several kinds ask which.
+Card: 1 weekly · 2 Fable · {Mon D}  [Reset]; the date is never cut; several kinds ask which.
 ```

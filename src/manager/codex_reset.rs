@@ -588,6 +588,24 @@ mod tests {
     /// "unknown". A query naming no row logs `index=none`.
     #[tokio::test(flavor = "current_thread")]
     async fn reset_attempt_logs_one_info_line_with_index_outcome_and_cause() {
+        // Register both of the attempt's log callsites before capturing: one first reached
+        // by another test thread with no subscriber is cached as never enabled, and the
+        // rebuild below only repairs callsites already registered. CI lost both failure
+        // lines this way (run 43859778702).
+        let warm = Backend::new("reset", StatusCode::OK);
+        let warm_manager = manager(&warm);
+        assert!(
+            warm_manager
+                .reset_codex("alice@example.com", "warm-up-attempt")
+                .await
+                .is_ok()
+        );
+        assert!(
+            warm_manager
+                .reset_codex("nobody@example.com", "warm-up-attempt")
+                .await
+                .is_err()
+        );
         let logs = crate::test_support::log_capture::SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -595,6 +613,7 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
 
         let backend = Backend::new("reset", StatusCode::OK);
         let live = manager(&backend);
