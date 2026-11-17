@@ -193,6 +193,49 @@ pub struct BankedReset {
     pub unavailable_reason: Option<String>,
 }
 
+/// The last banked reset tcr spent by itself on an account because it was about to expire
+/// unused (Gil, 2026-11-17: "auto use reset when its going to expire"). Shown for a day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoReset {
+    pub kind: ResetKind,
+    /// When tcr tried, in Unix ms.
+    pub at_ms: i64,
+    pub outcome: AutoResetOutcome,
+}
+
+/// How an automatic spend ended, in words fixed here and never the provider's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AutoResetOutcome {
+    /// Spent: the windows it refills are empty.
+    Applied,
+    /// The reset works only once the account is at its limit, and it was not.
+    NeedsLimit,
+    /// The provider said the reset is cooling down.
+    NotUsableYet,
+    /// Already spent, by this attempt earlier or by someone else.
+    AlreadyUsed,
+    /// The provider holds no usable reset any more.
+    NoneLeft,
+    /// The attempt failed or its result is unknown; the tcr log has the cause.
+    Failed,
+}
+
+impl AutoResetOutcome {
+    /// The token `tcr status` prints.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::NeedsLimit => "needs_limit",
+            Self::NotUsableYet => "not_usable_yet",
+            Self::AlreadyUsed => "already_used",
+            Self::NoneLeft => "none_left",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// What a banked reset refills, named the way Claude Code names it, so tcr and
 /// `/limit-reset` use the same words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -887,6 +930,9 @@ pub struct AccountStatusRow {
     /// A Claude row's banked limit resets ([`BankedResets`]). Absent: never read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub banked_resets: Option<BankedResets>,
+    /// The last reset tcr spent by itself on this row, within the last day ([`AutoReset`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_reset: Option<AutoReset>,
     /// Why this account's login is known dead: `refresh_token_reused`,
     /// `refresh_token_expired`, `refresh_token_invalidated`, `invalid_grant`, `http_401`,
     /// or another raw code. Absent when the login is not known dead.

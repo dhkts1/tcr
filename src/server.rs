@@ -2634,6 +2634,20 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         })));
     }
 
+    // Spend a banked reset two hours before it would expire unused
+    // (`manager::auto_reset`). On unless `"autoUseExpiringResets": false`; the tick reads
+    // memory only, so it costs nothing until a reset is due.
+    if manager.auto_reset_enabled() {
+        let m = Arc::clone(&manager);
+        let mut stop = shutdown_tx.subscribe();
+        background.push(tokio::spawn(supervise("reset-expiry", async move {
+            tokio::select! {
+                () = crate::manager::auto_reset::run(m) => {}
+                _ = stop.changed() => {}
+            }
+        })));
+    }
+
     // Opt-in keep-warm loop: periodically warm idle accounts so their 5h session
     // window stays live. Ships DARK — `warmupSeconds` defaults to 0, and when it is
     // absent/0 NO task is spawned here at all (unlike the probe, warming spends real

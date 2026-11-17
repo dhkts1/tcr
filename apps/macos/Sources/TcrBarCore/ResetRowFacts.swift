@@ -89,6 +89,9 @@ public enum ResetRowFacts {
         /// The first use-by is less than `soonMs` away: the card draws the date, and the
         /// collapsed line its badge, in the warning ink.
         public let soon: Bool
+        /// The date slot says a reset tcr spent by itself (`Fable auto-used`), drawn in the
+        /// ready ink instead of the date, for the day the server keeps the record.
+        public let autoUsed: Bool
         /// Every kind in full, what it refills and its use-by.
         public let help: String
 
@@ -129,6 +132,11 @@ public enum ResetRowFacts {
             let when = soon ? near(expiry, now: now, timeZone: timeZone) : day(expiry, timeZone: timeZone)
             date = "\(subject) \(when)"
         }
+        // A reset tcr spent by itself takes the date's place for the day, unless another
+        // reset is itself about to expire: that warning matters more.
+        let auto = account.autoReset
+        let autoUsed = auto?.outcome == .applied && !soon
+        if let auto, autoUsed { date = "\(auto.kind.short) auto-used" }
         let lines = held.map { held -> String in
             let noun = held.count == 1 ? held.kind.noun : held.kind.noun + "s"
             var line = "\(held.count) \(noun): \(refills(held.kind))."
@@ -139,9 +147,36 @@ public enum ResetRowFacts {
             }
             return line
         }
+        var tail = ["Reset spends one, after you confirm."]
+        if let auto {
+            tail.append(autoNote(auto, timeZone: timeZone))
+        } else if held.contains(where: { $0.earliestExpiryMs != nil }) {
+            tail.append("tcr uses a reset itself 2 hours before it would expire.")
+        }
         return Row(
-            kinds: kinds, date: date, soon: soon,
-            help: (lines + ["Reset spends one, after you confirm."]).joined(separator: "\n"))
+            kinds: kinds, date: date, soon: soon, autoUsed: autoUsed,
+            help: (lines + tail).joined(separator: "\n"))
+    }
+
+    /// The hover's sentence on what tcr did by itself, in fixed words.
+    static func autoNote(_ auto: AutoReset, timeZone: TimeZone) -> String {
+        let at = format(auto.atMs, "HH:mm", timeZone: timeZone)
+        let noun = auto.kind.noun
+        switch auto.outcome {
+        case .applied:
+            return "tcr used a \(noun) at \(at), before it expired."
+        case .needsLimit:
+            return
+                "tcr could not use the \(noun) at \(at): it works only once this account reaches its limit."
+        case .notUsableYet:
+            return "tcr could not use the \(noun) at \(at): it was not usable yet."
+        case .alreadyUsed:
+            return "tcr found the \(noun) already used at \(at)."
+        case .noneLeft:
+            return "tcr found no \(noun) left at \(at)."
+        case .failed:
+            return "tcr could not use the \(noun) at \(at); the tcr log has why."
+        }
     }
 
     /// Whether the collapsed line's badge warns: a reset expires within `soonMs`.

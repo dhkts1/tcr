@@ -198,8 +198,18 @@ impl Manager {
         query: &str,
         key: &str,
     ) -> Result<CodexResetResponse, CodexResetError> {
+        self.reset_codex_at(ResetTarget::Name(query), key).await
+    }
+
+    /// [`Self::reset_codex`] for an account named by a user's query or by its rotation
+    /// slot: the slot is how [`super::auto_reset`] names the account it chose itself.
+    pub(super) async fn reset_codex_at(
+        &self,
+        target: ResetTarget<'_>,
+        key: &str,
+    ) -> Result<CodexResetResponse, CodexResetError> {
         let mut index = None;
-        let result = self.redeem_codex_reset(query, key, &mut index).await;
+        let result = self.redeem_codex_reset(target, key, &mut index).await;
         let index = index.map_or_else(|| "none".to_owned(), |idx| idx.to_string());
         match &result {
             Ok(response) => tracing::info!(
@@ -221,7 +231,7 @@ impl Manager {
     /// [`Self::reset_codex`]'s body. `index` is set once the query names one row.
     async fn redeem_codex_reset(
         &self,
-        query: &str,
+        target: ResetTarget<'_>,
         key: &str,
         index: &mut Option<usize>,
     ) -> Result<CodexResetResponse, ResetFailure> {
@@ -233,7 +243,7 @@ impl Manager {
             timeout_at(deadline, async {
                 let (idx, identity) = {
                     let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
-                    let idx = match match_listed(&accounts, query) {
+                    let idx = match target.resolve(&accounts) {
                         crate::identity::Match::None => {
                             return Err(ResetFailure::from(CodexResetError::Missing));
                         }

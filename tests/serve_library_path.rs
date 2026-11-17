@@ -31,10 +31,10 @@ use tcr::usage::LedgerShutdown;
 /// it is protecting rather than showing a bare number.
 const LIVE_PROXY_PORT: u16 = 3456;
 
-/// A config that binds an ephemeral port and enables exactly the two background
-/// loops this file counts: the session-affinity flusher and the quota prober.
-/// `warmupSeconds` stays 0, so the keep-warm loop is not spawned at all (it
-/// spends real quota; it ships dark).
+/// A config that binds an ephemeral port and leaves the default background loops on:
+/// the session-affinity, bound-token and wire-sessions flushers, the quota prober and
+/// the expiring-reset spender. `warmupSeconds` stays 0, so the keep-warm loop is not
+/// spawned at all (it spends real quota; it ships dark).
 ///
 /// No accounts: the rotation never has anything to pick, which is deliberate —
 /// nothing in this file may reach Anthropic.
@@ -160,17 +160,18 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
     );
     assert!(addr.ip().is_loopback(), "the proxy binds loopback only");
 
-    // The four loops this config enables: affinity flush + bound-token flush +
-    // wire-sessions flush + quota probe. The bound-token flusher joined them when
+    // The five loops this config enables: affinity flush + bound-token flush +
+    // wire-sessions flush + quota probe + the expiring-reset spender
+    // (`autoUseExpiringResets` defaults on, `tcr::manager::auto_reset`). The bound-token flusher joined them when
     // account-bound history (advisor ids, thinking signatures, message ids) became routing
     // state that has to survive a restart (`tcr::bound_tokens`); it is keyed on the
     // same `affinity_path` this config sets. The keep-warm loop is off, so it must NOT have
     // been spawned.
     assert_eq!(
         handle.background_task_count(),
-        4,
+        5,
         "expected the affinity flusher, the bound-token flusher, the wire-sessions \
-         flusher and the quota prober, and no keep-warm loop"
+         flusher, the quota prober and the expiring-reset spender, and no keep-warm loop"
     );
 
     // One real request, over a real socket, through the real listener.
@@ -206,8 +207,8 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
         .await
         .expect("shutdown did not finish: a background task ignored the shutdown signal");
     assert_eq!(
-        report.tasks_joined, 5,
-        "the accept loop plus all four background loops must be joined"
+        report.tasks_joined, 6,
+        "the accept loop plus all five background loops must be joined"
     );
     assert_eq!(
         report.tasks_aborted, 0,
@@ -263,8 +264,9 @@ async fn dropping_the_handle_stops_the_accept_loop_and_every_background_loop() {
         .expect_started();
     let port = handle.addr().port();
     assert_ne!(port, LIVE_PROXY_PORT);
-    // Affinity flusher + server-tool-pin flusher + wire-sessions flusher + quota prober.
-    assert_eq!(handle.background_task_count(), 4);
+    // Affinity flusher + server-tool-pin flusher + wire-sessions flusher + quota prober +
+    // expiring-reset spender.
+    assert_eq!(handle.background_task_count(), 5);
 
     // Every task `serve` spawned captured one of these.
     let manager = Arc::clone(handle.manager());

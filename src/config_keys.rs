@@ -85,6 +85,7 @@ const KNOWN_KEYS: &[KnownKey] = &[
     key("throttleExemptNoise", KeyKind::ReadFromExtra),
     key("divertBudget", KeyKind::ReadFromExtra),
     key("claudeCodeImport", KeyKind::ReadFromExtra),
+    key("autoUseExpiringResets", KeyKind::ReadFromExtra),
     key("routes", KeyKind::KeptUnread),
     key("sx", KeyKind::KeptUnread),
     key("logDir", KeyKind::KeptUnread),

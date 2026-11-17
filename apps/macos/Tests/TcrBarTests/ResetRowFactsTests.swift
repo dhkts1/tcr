@@ -20,7 +20,8 @@ final class ResetRowFactsTests: XCTestCase {
         XCTAssertEqual(
             row.help,
             "3 weekly resets: refills the 7-day window. The first, use by Nov 30, 22:37.\n"
-                + "Reset spends one, after you confirm.")
+                + "Reset spends one, after you confirm.\n"
+                + "tcr uses a reset itself 2 hours before it would expire.")
         XCTAssertEqual(ResetRowFacts.badge(bob), "↻3")
         XCTAssertTrue(ResetRowFacts.canRedeem(bob))
     }
@@ -191,6 +192,46 @@ final class ResetRowFactsTests: XCTestCase {
         XCTAssertFalse(far.soon)
         XCTAssertFalse(ResetRowFacts.badgeSoon(alice, now: at(nov30 - 2 * 86_400_000)))
         XCTAssertFalse(ResetRowFacts.badgeSoon(alice, now: at(nov30 + 1)), "a past use-by does not warn")
+    }
+
+    /// A reset tcr spent by itself takes the date's place for the day, in fixed words, and
+    /// a refusal leaves the date and says why in the hover. An unknown outcome is no record.
+    func testAnAutoUsedResetTakesTheDatesPlace() throws {
+        let grants: [[String: Any]] = [
+            ["kind": "fable", "resetsLeft": 1, "usableNow": true, "endsAtMs": nov30],
+            ["kind": "weekly", "resetsLeft": 1, "usableNow": true, "endsAtMs": nov30 + 86_400_000],
+        ]
+        let at = Date(timeIntervalSince1970: Double(nov30 - 2 * 86_400_000) / 1000)
+        let used = try account(
+            "alice@example.com",
+            [
+                "bankedResets": ["eligible": true, "grants": grants],
+                "autoReset": ["kind": "fable", "atMs": nov30 - 7_200_000, "outcome": "applied"],
+            ])
+        let row = try XCTUnwrap(ResetRowFacts.row(used, now: at, timeZone: utc))
+        XCTAssertEqual(row.text, "1 weekly · 1 Fable · Fable auto-used")
+        XCTAssertTrue(row.autoUsed)
+        XCTAssertTrue(row.help.hasSuffix("tcr used a Fable reset at 20:37, before it expired."), row.help)
+        let refused = try account(
+            "alice@example.com",
+            [
+                "bankedResets": ["eligible": true, "grants": grants],
+                "autoReset": ["kind": "fable", "atMs": nov30 - 7_200_000, "outcome": "needsLimit"],
+            ])
+        let kept = try XCTUnwrap(ResetRowFacts.row(refused, now: at, timeZone: utc))
+        XCTAssertEqual(kept.date, "Fable expires Nov 30")
+        XCTAssertFalse(kept.autoUsed)
+        XCTAssertTrue(kept.help.contains("only once this account reaches its limit"), kept.help)
+        let unknown = try account(
+            "alice@example.com",
+            [
+                "bankedResets": ["eligible": true, "grants": grants],
+                "autoReset": ["kind": "fable", "atMs": 1, "outcome": "somethingNew"],
+            ])
+        XCTAssertNil(unknown.autoReset)
+        let plain = try XCTUnwrap(ResetRowFacts.row(try claude(grants), now: at, timeZone: utc))
+        XCTAssertTrue(
+            plain.help.hasSuffix("tcr uses a reset itself 2 hours before it would expire."), plain.help)
     }
 
     // MARK: - Fixtures

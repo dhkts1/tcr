@@ -417,6 +417,40 @@ public enum ResetKind: String, Equatable, Hashable, Sendable, CaseIterable, Comp
     }
 }
 
+/// The last banked reset tcr spent by itself on an account, because its use-by was under two
+/// hours away (`autoReset`; Gil, 2026-11-17). The server keeps it a day. A kind or outcome
+/// this build cannot name decodes as no record at all, never a guessed one.
+public struct AutoReset: Equatable, Sendable, Decodable {
+    public enum Outcome: String, Equatable, Sendable {
+        case applied, needsLimit, notUsableYet, alreadyUsed, noneLeft, failed
+    }
+
+    public let kind: ResetKind
+    public let atMs: Int64
+    public let outcome: Outcome
+
+    public init(kind: ResetKind, atMs: Int64, outcome: Outcome) {
+        self.kind = kind
+        self.atMs = atMs
+        self.outcome = outcome
+    }
+
+    private enum CodingKeys: String, CodingKey { case kind, atMs, outcome }
+
+    /// Decodes a record, or throws for one whose kind or outcome is unknown, which the
+    /// account decoder turns into `nil` (`Account.autoReset`).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        guard let kind = ResetKind(rawValue: try c.decode(String.self, forKey: .kind)),
+            let outcome = Outcome(rawValue: try c.decode(String.self, forKey: .outcome))
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kind, in: c, debugDescription: "an auto reset this build cannot name")
+        }
+        self.init(kind: kind, atMs: try c.decode(Int64.self, forKey: .atMs), outcome: outcome)
+    }
+}
+
 /// A Claude account's banked limit resets, as `bankedResets` carries them: no grant ids.
 /// `eligible == false` is Anthropic not saying what the account holds (e.g. reason
 /// `surface`): unknown, never zero. A grant of a kind this build cannot name is dropped, so
@@ -2092,6 +2126,8 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let resetCredits: ResetCredits?
     /// A Claude account's banked limit resets; `nil` when never read.
     public let bankedResets: BankedResets?
+    /// The last reset tcr spent by itself on this account, within a day; `nil` otherwise.
+    public let autoReset: AutoReset?
     /// The refresh error that signed this account out, verbatim. An absent
     /// reason is never drawn.
     public let loginError: String?
@@ -2165,6 +2201,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         credits: CodexCredits? = nil,
         resetCredits: ResetCredits? = nil,
         bankedResets: BankedResets? = nil,
+        autoReset: AutoReset? = nil,
         loginError: String? = nil,
         codexHome: String? = nil,
         tokenSyncPending: Bool = false,
@@ -2222,6 +2259,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.credits = credits
         self.resetCredits = resetCredits
         self.bankedResets = bankedResets
+        self.autoReset = autoReset
         self.loginError = loginError
         self.codexHome = codexHome
         self.tokenSyncPending = tokenSyncPending
@@ -2239,7 +2277,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         case plan, organizationType, rateLimitTier, seatTier, orgUuid, orgName, gate, freeAtMs
         case provider, quotaWindows, fiveHourWindowMinutes, sevenDayWindowMinutes
         case limitReachedType, spendControlReached, credits, loginError, codexHome, tokenSyncPending
-        case resetCredits, bankedResets
+        case resetCredits, bankedResets, autoReset
         case codexRoute, codexTraffic
     }
 
@@ -2311,6 +2349,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         credits = try c.decodeIfPresent(CodexCredits.self, forKey: .credits)
         resetCredits = try c.decodeIfPresent(ResetCredits.self, forKey: .resetCredits)
         bankedResets = try c.decodeIfPresent(BankedResets.self, forKey: .bankedResets)
+        autoReset = try? c.decodeIfPresent(AutoReset.self, forKey: .autoReset)
         loginError = try c.decodeIfPresent(String.self, forKey: .loginError)
         codexHome = try c.decodeIfPresent(String.self, forKey: .codexHome)
         tokenSyncPending = try c.decodeIfPresent(Bool.self, forKey: .tokenSyncPending) ?? false

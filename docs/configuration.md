@@ -387,7 +387,7 @@ unchanged from the value already running in production, and only the fleet ceili
 
 ## Keys read from the unmodelled map
 
-These eight are not fields of `Config`. They land in the flattened `extra` map and are read
+These ten are not fields of `Config`. They land in the flattened `extra` map and are read
 back out by name across the manager (see `src/manager/state.rs` and `src/manager/throttle.rs`).
 They are fully live config with a caller in the boot or request path, not compatibility
 leftovers.
@@ -396,6 +396,7 @@ leftovers.
 |---|---|---|---|---|
 | `quotaProbeSeconds` | i64 seconds | **`300`** | no | quota probe cadence, the CENTRE of a per-account random draw, not a fleet period; halved for an account held out by its own quota; at most 20 probes per account in any trailing hour; `<= 0` disables probing |
 | `warmupSeconds` | i64 seconds | **`0`** (OFF) | no | keep-warm cadence, drawn the same per-account random way; `<= 0` spawns no warm task |
+| `autoUseExpiringResets` | bool | **`true`** | no | spend a banked limit reset by itself two hours before its use-by, once per reset, through the same claim as the Reset button; `false` spawns no task (`src/manager/auto_reset.rs`) |
 
 ### Both cadences are random per account, not a fleet sweep
 

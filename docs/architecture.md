@@ -490,7 +490,7 @@ Retry
 --idempotency-key reuses one attempt across retries; it is never printed.
 {count} weekly · {Mon D}  [Reset]   (card footer; no line when none or unknown)
 ↻{count}                                           (collapsed line, after its status)
-Only a confirmed operator action redeems; nothing redeems automatically.
+A confirmed operator action redeems, and so does the one automatic spend below.
 ```
 
 A Claude account's banked limit resets (Claude Code's `/limit-reset`) ride the usage
@@ -511,5 +511,22 @@ Reset used. | Already used. | Nothing to reset. | Not usable yet.   exit 0
 No reset left.                                                      exit 6
 Reset failed. {fixed reason}                                        exit 4
 Couldn't confirm the reset went through; check again in a minute.  exit 4
-Card: 1 weekly · 2 Fable · {Mon D}  [Reset]; the date is never cut; several kinds ask which.
+Card: 1 weekly · 2 Fable · Fable expires {Mon D}  [Reset]; the date names the kind that
+expires first and is never cut; under a day out it reads "today HH:MM" in the warning ink,
+as does the collapsed ↻ badge; several kinds ask which.
+```
+
+A reset that reaches its use-by unspent is lost, so tcr spends one by itself two hours before
+its use-by (Gil, 2026-11-17), through the same claim path as the button. Once a minute
+`manager::auto_reset` reads what the last usage read said each account holds; nothing is
+sent until a reset is due. Each reset is tried once, keyed by (slot, kind, use-by), and that
+key is the Claude claim's `request_id`, so no tick or retry spends two. A reset that needs
+the account at its limit first answers "nothing to reset" when it is not; that is recorded
+as `needs_limit` and not retried. `"autoUseExpiringResets": false` turns it off.
+
+```text
+autoReset is optional: {kind, atMs, outcome}, the last automatic attempt, kept a day
+outcome: applied | needsLimit | notUsableYet | alreadyUsed | noneLeft | failed
+tcr status: auto_reset=weekly:applied
+log: INFO reset auto-used before its use-by index=<n> kind=<kind> outcome=<token>
 ```
