@@ -16,7 +16,7 @@ final class ResetRowFactsTests: XCTestCase {
     func testThreeResetsNameTheFirstExpiry() throws {
         let bob = try codex(["availableCount": 3, "earliestExpiryMs": nov30])
         let row = try XCTUnwrap(ResetRowFacts.row(bob, timeZone: utc))
-        XCTAssertEqual(row.text, "3 weekly · Nov 30")
+        XCTAssertEqual(row.text, "3 weekly · expires Nov 30")
         XCTAssertEqual(
             row.help,
             "3 weekly resets: refills the 7-day window. The first, use by Nov 30, 22:37.\n"
@@ -28,7 +28,7 @@ final class ResetRowFactsTests: XCTestCase {
     func testOneResetIsSingularInItsHelp() throws {
         let bob = try codex(["availableCount": 1, "earliestExpiryMs": nov30])
         let row = try XCTUnwrap(ResetRowFacts.row(bob, timeZone: utc))
-        XCTAssertEqual(row.text, "1 weekly · Nov 30")
+        XCTAssertEqual(row.text, "1 weekly · expires Nov 30")
         XCTAssertTrue(row.help.hasPrefix("1 weekly reset: refills the 7-day window. Use by "), row.help)
     }
 
@@ -37,7 +37,7 @@ final class ResetRowFactsTests: XCTestCase {
         let bob = try codex(["availableCount": 2, "earliestExpiryMs": nov30])
         let tokyo = try XCTUnwrap(TimeZone(identifier: "Asia/Tokyo"))
         XCTAssertEqual(
-            ResetRowFacts.row(bob, timeZone: tokyo)?.text, "2 weekly · Dec 1")
+            ResetRowFacts.row(bob, timeZone: tokyo)?.text, "2 weekly · expires Dec 1")
     }
 
     func testNoExpirySaysTheCountAlone() throws {
@@ -85,9 +85,13 @@ final class ResetRowFactsTests: XCTestCase {
             ["kind": "something-new", "resetsLeft": 5],
         ])
         let row = try XCTUnwrap(ResetRowFacts.row(alice, timeZone: utc))
-        XCTAssertEqual(row.text, "1 weekly · 2 Fable · Nov 30")
+        XCTAssertEqual(row.text, "1 weekly · 2 Fable · Fable expires Nov 30")
         XCTAssertEqual(row.kinds, "1 weekly · 2 Fable")
-        XCTAssertEqual(row.date, "Nov 30", "the date is drawn apart, so the card never cuts it")
+        XCTAssertEqual(
+            row.date, "Fable expires Nov 30",
+            "the date names the kind it belongs to, and is drawn apart so the card never cuts it")
+        XCTAssertTrue(row.help.contains("Nov 30, 22:37. Expires first."), row.help)
+        XCTAssertFalse(row.help.contains("Dec 1, 22:37. Expires first."), row.help)
         XCTAssertTrue(row.help.contains("2 Fable resets: gives back what Fable used"), row.help)
         XCTAssertEqual(ResetRowFacts.badge(alice), "↻3")
         XCTAssertEqual(ResetRowFacts.choices(alice), [.weekly, .fable])
@@ -161,6 +165,32 @@ final class ResetRowFactsTests: XCTestCase {
         XCTAssertEqual(
             CodexResetController.arguments(account: ref, key: "k", kind: nil),
             ["codex", "reset", "alice@example.com", "--idempotency-key", "k", "--yes"])
+    }
+
+    /// Under a day before the first use-by, the date becomes the time and warns, on the card
+    /// and on the collapsed badge; a day out, or already past, it does not.
+    func testAUseByUnderADayAwayWarnsWithItsTime() throws {
+        let alice = try claude([
+            ["kind": "fable", "resetsLeft": 2, "usableNow": true, "endsAtMs": nov30],
+            ["kind": "weekly", "resetsLeft": 1, "usableNow": true, "endsAtMs": nov30 + 86_400_000],
+        ])
+        let at = { (ms: Int64) in Date(timeIntervalSince1970: Double(ms) / 1000) }
+        let sameDay = try XCTUnwrap(ResetRowFacts.row(alice, now: at(nov30 - 3_600_000), timeZone: utc))
+        XCTAssertEqual(sameDay.date, "Fable expires today 22:37")
+        XCTAssertTrue(sameDay.soon)
+        XCTAssertTrue(ResetRowFacts.badgeSoon(alice, now: at(nov30 - 3_600_000)))
+        let nextDay = try XCTUnwrap(
+            ResetRowFacts.row(alice, now: at(nov30 - 23 * 3_600_000), timeZone: utc))
+        XCTAssertEqual(nextDay.date, "Fable expires tomorrow 22:37", "23 h before is 23:37 on Nov 29 UTC")
+        let tokyo = try XCTUnwrap(TimeZone(identifier: "Asia/Tokyo"))
+        let tomorrow = try XCTUnwrap(
+            ResetRowFacts.row(alice, now: at(nov30 - 20 * 3_600_000), timeZone: tokyo))
+        XCTAssertEqual(tomorrow.date, "Fable expires tomorrow 07:37")
+        let far = try XCTUnwrap(ResetRowFacts.row(alice, now: at(nov30 - 2 * 86_400_000), timeZone: utc))
+        XCTAssertEqual(far.date, "Fable expires Nov 30")
+        XCTAssertFalse(far.soon)
+        XCTAssertFalse(ResetRowFacts.badgeSoon(alice, now: at(nov30 - 2 * 86_400_000)))
+        XCTAssertFalse(ResetRowFacts.badgeSoon(alice, now: at(nov30 + 1)), "a past use-by does not warn")
     }
 
     // MARK: - Fixtures

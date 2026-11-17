@@ -80,9 +80,15 @@ public enum ResetRowFacts {
     public struct Row: Equatable, Sendable {
         /// `1 weekly · 2 Fable`: may be cut at its end when the card is narrow.
         public let kinds: String
-        /// `Dec 10`, the earliest use-by among the kinds held, or `nil` when none was
-        /// sent. Never cut (Gil, 2026-11-16): the card cuts the kinds instead.
+        /// `Fable expires Dec 10`: the earliest use-by among the kinds held, named with
+        /// the kind it belongs to when the account holds more than one kind (Gil,
+        /// 2026-11-17: "show which one is the expiring"), or `nil` when none was sent.
+        /// Within `soonMs` of it the day becomes the time: `Fable expires today 18:00`.
+        /// Never cut (Gil, 2026-11-16): the card cuts the kinds instead.
         public let date: String?
+        /// The first use-by is less than `soonMs` away: the card draws the date, and the
+        /// collapsed line its badge, in the warning ink.
+        public let soon: Bool
         /// Every kind in full, what it refills and its use-by.
         public let help: String
 
@@ -90,25 +96,60 @@ public enum ResetRowFacts {
         public var text: String { date.map { "\(kinds) · \($0)" } ?? kinds }
     }
 
+    /// How close a use-by must be for the row and badge to warn: one day.
+    public static let soonMs: Int64 = 86_400_000
+
+    /// The kind whose reset expires first, or `nil` when no use-by was sent. A tie goes to
+    /// the first in kind order.
+    public static func expiringFirst(_ held: [Held]) -> Held? {
+        held.filter { $0.earliestExpiryMs != nil }
+            .min { ($0.earliestExpiryMs ?? .max) < ($1.earliestExpiryMs ?? .max) }
+    }
+
+    /// Whether `expiry` is still ahead and less than `soonMs` away.
+    static func isSoon(_ expiry: Int64, now: Date) -> Bool {
+        let left = expiry - Int64(now.timeIntervalSince1970 * 1000)
+        return left > 0 && left < soonMs
+    }
+
     /// The card's one line and its help, or `nil` when the account holds no reset or its
     /// provider has not said, which draws no row at all. `timeZone` is the clock dates
     /// are printed in.
-    public static func row(_ account: Account, timeZone: TimeZone = .current) -> Row? {
+    public static func row(
+        _ account: Account, now: Date = Date(), timeZone: TimeZone = .current
+    ) -> Row? {
         guard let held = held(account), !held.isEmpty else { return nil }
         let kinds = held.map { "\($0.count) \($0.kind.short)" }.joined(separator: " · ")
-        let date = held.compactMap(\.earliestExpiryMs).min().map { day($0, timeZone: timeZone) }
+        let first = expiringFirst(held)
+        var date: String?
+        var soon = false
+        if let first, let expiry = first.earliestExpiryMs {
+            soon = isSoon(expiry, now: now)
+            let subject = held.count > 1 ? "\(first.kind.short) expires" : "expires"
+            let when = soon ? near(expiry, now: now, timeZone: timeZone) : day(expiry, timeZone: timeZone)
+            date = "\(subject) \(when)"
+        }
         let lines = held.map { held -> String in
             let noun = held.count == 1 ? held.kind.noun : held.kind.noun + "s"
             var line = "\(held.count) \(noun): \(refills(held.kind))."
             if let expiry = held.earliestExpiryMs {
                 let which = held.count == 1 ? "Use by" : "The first, use by"
                 line += " \(which) \(moment(expiry, timeZone: timeZone))."
+                if first?.kind == held.kind && kinds.contains(" · ") { line += " Expires first." }
             }
             return line
         }
         return Row(
-            kinds: kinds, date: date,
+            kinds: kinds, date: date, soon: soon,
             help: (lines + ["Reset spends one, after you confirm."]).joined(separator: "\n"))
+    }
+
+    /// Whether the collapsed line's badge warns: a reset expires within `soonMs`.
+    public static func badgeSoon(_ account: Account, now: Date = Date()) -> Bool {
+        guard let held = held(account), let expiry = expiringFirst(held)?.earliestExpiryMs else {
+            return false
+        }
+        return isSoon(expiry, now: now)
     }
 
     /// `↻3`: the badge at the end of a collapsed account's line, every kind counted, or
@@ -202,6 +243,15 @@ public enum ResetRowFacts {
             lines.append(left + ".")
         }
         return (message, lines.joined(separator: "\n"))
+    }
+
+    /// `today 22:37` or `tomorrow 09:00`, in `timeZone`: a use-by under a day away.
+    private static func near(_ ms: Int64, now: Date, timeZone: TimeZone) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let date = Date(timeIntervalSince1970: Double(ms) / 1000)
+        let word = calendar.isDate(date, inSameDayAs: now) ? "today" : "tomorrow"
+        return "\(word) \(format(ms, "HH:mm", timeZone: timeZone))"
     }
 
     /// `Nov 30`, in `timeZone`.
