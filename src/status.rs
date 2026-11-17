@@ -660,6 +660,9 @@ pub struct AccountStatus {
     /// [`CodexFacts::banked_resets`]: a Claude row's banked limit resets, without grant ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub banked_resets: Option<tcr_status_wire::BankedResets>,
+    /// [`CodexFacts::auto_reset`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_reset: Option<tcr_status_wire::AutoReset>,
     /// [`CodexFacts::login_error`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_error: Option<String>,
@@ -747,6 +750,7 @@ impl StatusPayload {
                 credits: a.codex.credits.clone(),
                 reset_credits: a.codex.reset_credits.clone(),
                 banked_resets: a.codex.banked_resets.clone(),
+                auto_reset: a.codex.auto_reset.clone(),
                 login_error: a.codex.login_error.clone(),
                 codex_home: a.codex.codex_home.clone(),
                 token_sync_pending: a.codex.token_sync_pending,
@@ -865,6 +869,7 @@ impl StatusPayload {
                         credits: a.credits,
                         reset_credits: a.reset_credits,
                         banked_resets: a.banked_resets,
+                        auto_reset: a.auto_reset,
                         login_error: a.login_error,
                         codex_home: a.codex_home,
                         token_sync_pending: a.token_sync_pending,
@@ -2996,6 +3001,7 @@ mod tests {
             codex_home: Some("/Users/example/.codex".into()),
             token_sync_pending: true,
             banked_resets: None,
+            auto_reset: None,
             reset_credits: Some(tcr_status_wire::ResetCredits {
                 available_count: 3,
                 earliest_expiry_ms: Some(1_800_000_000_000),

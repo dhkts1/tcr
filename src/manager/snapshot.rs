@@ -248,7 +248,10 @@ impl Manager {
                 let reserved_groups = groups::carried_in(&a.groups, &groups.reserved);
                 let parked_groups = groups::carried_in(&a.groups, &groups.parked);
                 let control_allowed_groups = groups::carried_in(&a.groups, &groups.control_allowed);
-                let codex = codex_snapshot_facts(a);
+                let codex = crate::stats::CodexFacts {
+                    auto_reset: self.auto_reset_for(idx, now_ms),
+                    ..codex_snapshot_facts(a)
+                };
                 // A Codex row's weekly window: its live weekly reset, and the length its plan
                 // reported, or a week when it reported none. `None` on an Anthropic row, which
                 // therefore never carries the key.
@@ -451,6 +454,7 @@ fn codex_snapshot_facts(a: &AccountRuntime) -> crate::stats::CodexFacts {
         credits: a.quota.codex.credits.clone(),
         reset_credits: a.quota.codex.reset_credits.clone(),
         banked_resets: None,
+        auto_reset: None,
         login_error: a.login_error.clone(),
         codex_home: a.codex_home.clone(),
         token_sync_pending: a.pending_codex_writeback.is_some(),

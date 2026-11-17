@@ -3180,6 +3180,14 @@ fn claude_resets_token(resets: Option<&tcr_status_wire::BankedResets>) -> String
     token
 }
 
+/// ` auto_reset=fable:applied`: the reset tcr spent by itself on this row in the last day,
+/// and how that ended. Nothing when it spent none.
+fn auto_reset_token(last: Option<&tcr_status_wire::AutoReset>) -> String {
+    last.map_or_else(String::new, |last| {
+        format!(" auto_reset={}:{}", last.kind.token(), last.outcome.token())
+    })
+}
+
 /// `Dec 10`: the UTC day of a Unix-ms instant.
 fn utc_day(ms: i64) -> Option<String> {
     let at = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()?;
@@ -3195,7 +3203,10 @@ fn utc_day(ms: i64) -> Option<String> {
 /// row, whatever its Codex facts hold.
 fn codex_tail(a: &AccountSnapshot) -> String {
     match a.provider {
-        Provider::Anthropic => return claude_resets_token(a.codex.banked_resets.as_ref()),
+        Provider::Anthropic => {
+            return claude_resets_token(a.codex.banked_resets.as_ref())
+                + &auto_reset_token(a.codex.auto_reset.as_ref());
+        }
         Provider::Codex => {}
     }
     let mut tail = String::new();
@@ -3205,6 +3216,7 @@ fn codex_tail(a: &AccountSnapshot) -> String {
             tail.push_str(&format!(" reset_expires_at_ms={expiry}"));
         }
     }
+    tail.push_str(&auto_reset_token(a.codex.auto_reset.as_ref()));
     if a.codex.token_sync_pending {
         tail.push_str(" token_sync=pending");
     }
@@ -3403,6 +3415,7 @@ fn account_status_rows_at(
                             .five_hour_absent_on_plan
                             .then(|| vec!["sevenDay".to_string()]),
                         banked_resets: a.codex.banked_resets.clone(),
+                        auto_reset: a.codex.auto_reset.clone(),
                         ..CodexFacts::default()
                     },
                     None,
@@ -3725,6 +3738,7 @@ fn account_status_rows_at(
                 credits: facts.credits,
                 reset_credits: facts.reset_credits,
                 banked_resets: facts.banked_resets,
+                auto_reset: facts.auto_reset,
                 login_error: facts.login_error,
                 codex_home: facts.codex_home,
                 token_sync_pending: facts.token_sync_pending,
@@ -12326,6 +12340,7 @@ mod tests {
                 codex_home: Some("/Users/example/.codex".to_string()),
                 token_sync_pending: true,
                 banked_resets: None,
+                auto_reset: None,
                 reset_credits: Some(tcr_status_wire::ResetCredits {
                     available_count: 3,
                     earliest_expiry_ms: Some(1_800_000_000_000),

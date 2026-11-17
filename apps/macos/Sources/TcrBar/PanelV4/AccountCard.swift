@@ -667,7 +667,9 @@ private struct CardResetRow: View {
                     if let date = row.date {
                         // Within a day of its use-by the date takes the warning ink
                         // (Gil, 2026-11-17). Same line, same height.
-                        (Text(" · ") + Text(date).foregroundColor(row.soon ? Tok.near : Tok.mute))
+                        (Text(" · ")
+                            + Text(date).foregroundColor(
+                                row.soon ? Tok.near : row.autoUsed ? Tok.ok : Tok.mute))
                             .lineLimit(1)
                             .fixedSize()
                             .layoutPriority(1)

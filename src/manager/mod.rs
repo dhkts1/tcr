@@ -63,6 +63,7 @@ mod peer_lend;
 // private, so this re-export is the whole of its surface beyond the methods on
 // `Manager`.
 pub use peer_lend::HandedCredential;
+pub mod auto_reset;
 mod claude_reset;
 mod codex_reset;
 mod pins;
@@ -730,6 +731,27 @@ fn match_listed(accounts: &[AccountRuntime], query: &str) -> crate::identity::Ma
     }
 }
 
+/// Which account a banked-reset spend names: a user's query, resolved by
+/// [`match_listed`]'s rule, or a rotation slot the server chose itself
+/// ([`auto_reset`]), which is never ambiguous and never a deleted row.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ResetTarget<'a> {
+    Name(&'a str),
+    Slot(usize),
+}
+
+impl ResetTarget<'_> {
+    fn resolve(self, accounts: &[AccountRuntime]) -> crate::identity::Match {
+        match self {
+            Self::Name(query) => match_listed(accounts, query),
+            Self::Slot(idx) if accounts.get(idx).is_some_and(|row| !row.removed) => {
+                crate::identity::Match::One(idx)
+            }
+            Self::Slot(_) => crate::identity::Match::None,
+        }
+    }
+}
+
 /// What [`Manager::set_disabled_by_query`] did.
 ///
 /// `Applied` carries the RESOLVED name plus the durable half's fate, which the
@@ -1174,6 +1196,9 @@ pub struct Manager {
     warmer: Arc<dyn AccountWarmer>,
     /// Ensures two keep-warm sweeps never overlap.
     warm_in_flight: AtomicBool,
+    /// What [`auto_reset`] tried: every reset it attempted, so none is tried twice, and
+    /// each account's last attempt, for the status wire.
+    auto_resets: Mutex<auto_reset::Ledger>,
     /// Wakes the keep-warm loop the moment an account's quota is first READ, so the
     /// boot gate on [`Self::warm_targets`] costs a probe cycle rather than a full
     /// `warmupSeconds` of dark time.
@@ -1761,6 +1786,7 @@ impl Manager {
             plan_prober: RwLock::new(Arc::new(crate::probe::LivePlanProber)),
             warmer,
             warm_in_flight: AtomicBool::new(false),
+            auto_resets: Mutex::new(auto_reset::Ledger::default()),
             warm_wake: Notify::new(),
             config: Mutex::new(config),
             config_write: Arc::new(Mutex::new(())),

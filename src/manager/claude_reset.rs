@@ -152,8 +152,20 @@ impl Manager {
         kind: Option<ResetKind>,
         key: &str,
     ) -> Result<ClaudeResetResponse, ClaudeResetError> {
+        self.reset_claude_at(ResetTarget::Name(query), kind, key)
+            .await
+    }
+
+    /// [`Self::reset_claude`] for an account named by a user's query or by its rotation
+    /// slot: the slot is how [`super::auto_reset`] names the account it chose itself.
+    pub(super) async fn reset_claude_at(
+        &self,
+        target: ResetTarget<'_>,
+        kind: Option<ResetKind>,
+        key: &str,
+    ) -> Result<ClaudeResetResponse, ClaudeResetError> {
         let mut index = None;
-        let result = self.claim_claude_reset(query, kind, key, &mut index).await;
+        let result = self.claim_claude_reset(target, kind, key, &mut index).await;
         let index = index.map_or_else(|| "none".to_owned(), |idx| idx.to_string());
         match &result {
             Ok(response) => tracing::info!(
@@ -175,7 +187,7 @@ impl Manager {
 
     async fn claim_claude_reset(
         &self,
-        query: &str,
+        target: ResetTarget<'_>,
         kind: Option<ResetKind>,
         key: &str,
         index: &mut Option<usize>,
@@ -187,7 +199,7 @@ impl Manager {
         let claimed = timeout_at(deadline, async {
             let (idx, org) = {
                 let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
-                let idx = match match_listed(&accounts, query) {
+                let idx = match target.resolve(&accounts) {
                     crate::identity::Match::None => {
                         return Err(ClaimFailure::from(ClaudeResetError::Missing));
                     }
@@ -776,5 +788,96 @@ mod tests {
         ] {
             assert!(!text.contains(private), "the logs disclose {private}");
         }
+    }
+
+    // MARK: automatic spend before the use-by (`super::super::auto_reset`)
+
+    /// 2030-01-01T00:00:00Z, the fake's earliest weekly use-by.
+    const WEEKLY_ENDS: i64 = 1_893_456_000_000;
+
+    /// An hour before its use-by the expiring weekly reset is spent, once, under a key
+    /// derived from the reset itself; a second tick spends nothing more, and the status
+    /// wire says what happened.
+    #[tokio::test]
+    async fn an_expiring_reset_is_spent_once_before_its_use_by() {
+        let anthropic = Anthropic::new("reset", true, 1);
+        let manager = anthropic.manager();
+        manager.probe_account(0).await;
+        let now = WEEKLY_ENDS - 3_600_000;
+        assert_eq!(manager.spend_expiring_resets(now).await, 1);
+        assert_eq!(manager.spend_expiring_resets(now + 60_000).await, 0);
+        assert_eq!(
+            anthropic.claims.load(Ordering::SeqCst),
+            1,
+            "one reset, one claim"
+        );
+        {
+            let seen = anthropic.seen.lock().unwrap();
+            assert_eq!(
+                seen[0].0,
+                serde_json::json!({"program": "cedar_ember", "grant_id": "fake-weekly-early",
+                    "request_id": "auto-0-weekly-1893456000000"})
+            );
+        }
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            snapshot.accounts[0].codex.auto_reset,
+            Some(tcr_status_wire::AutoReset {
+                kind: ResetKind::Weekly,
+                at_ms: now,
+                outcome: tcr_status_wire::AutoResetOutcome::Applied,
+            })
+        );
+    }
+
+    /// Three hours out nothing is due, and with `autoUseExpiringResets: false` nothing is
+    /// spent even inside the window.
+    #[tokio::test]
+    async fn nothing_is_spent_early_or_when_switched_off() {
+        let anthropic = Anthropic::new("reset", true, 1);
+        let manager = anthropic.manager();
+        manager.probe_account(0).await;
+        assert_eq!(
+            manager
+                .spend_expiring_resets(WEEKLY_ENDS - 3 * 3_600_000)
+                .await,
+            0
+        );
+        manager.config.lock().unwrap().extra.insert(
+            "autoUseExpiringResets".into(),
+            serde_json::Value::Bool(false),
+        );
+        assert!(!manager.auto_reset_enabled());
+        assert_eq!(
+            manager.spend_expiring_resets(WEEKLY_ENDS - 3_600_000).await,
+            0
+        );
+        assert_eq!(anthropic.claims.load(Ordering::SeqCst), 0);
+        assert!(
+            anthropic.reads.load(Ordering::SeqCst) >= 1,
+            "positive control: the bank was read"
+        );
+    }
+
+    /// A reset that needs the account at its limit first answers "nothing to reset": that
+    /// is recorded as needing the limit and never retried.
+    #[tokio::test]
+    async fn a_reset_that_needs_the_limit_is_tried_once() {
+        let anthropic = Anthropic::new("not_limited", true, 1);
+        let manager = anthropic.manager();
+        manager.probe_account(0).await;
+        let now = WEEKLY_ENDS - 3_600_000;
+        assert_eq!(manager.spend_expiring_resets(now).await, 1);
+        assert_eq!(manager.spend_expiring_resets(now + 600_000).await, 0);
+        assert_eq!(anthropic.claims.load(Ordering::SeqCst), 1);
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            snapshot.accounts[0]
+                .codex
+                .auto_reset
+                .as_ref()
+                .map(|a| a.outcome),
+            Some(tcr_status_wire::AutoResetOutcome::NeedsLimit)
+        );
     }
 }

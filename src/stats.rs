@@ -359,6 +359,9 @@ pub struct CodexFacts {
     /// provider, and every row literal already carries it, so a Claude fact rides here
     /// rather than through forty-one `AccountSnapshot` literals. `None` on a Codex row.
     pub banked_resets: Option<tcr_status_wire::BankedResets>,
+    /// The last reset tcr spent by itself on this row, within the last day
+    /// ([`crate::manager::Manager::spend_expiring_resets`]). Either provider.
+    pub auto_reset: Option<tcr_status_wire::AutoReset>,
     /// Why the account's login is known dead (`refresh_token_reused`, …).
     pub login_error: Option<String>,
     /// The absolute path of the folder the account's login was imported from.
