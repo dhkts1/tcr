@@ -5375,8 +5375,8 @@ extension RenderStates {
     }
 
     /// Scenes `25i-codex-reset-row` and `25j-codex-reset-lines`: bob with three banked
-    /// weekly resets, the first expiring in 14 days, dana with one expiring in 3 days, and
-    /// carol with none. Quiet traffic, so no refusal banner draws.
+    /// weekly resets, the first expiring in 14 days, dana with one expiring in 6 hours, which
+    /// warns, and carol with none. Quiet traffic, so no refusal banner draws.
     private static var codexResetJSON: String {
         let now = Date()
         func atMs(days: Double) -> Int64 {
@@ -5392,7 +5392,7 @@ extension RenderStates {
             .dana, now: now,
             extra: [
                 "codexTraffic": quietCodexTraffic,
-                "resetCredits": ["availableCount": 1, "earliestExpiryMs": atMs(days: 3)],
+                "resetCredits": ["availableCount": 1, "earliestExpiryMs": atMs(days: 0.25)],
             ])
         let carol = codexRow(
             .carol, now: now,

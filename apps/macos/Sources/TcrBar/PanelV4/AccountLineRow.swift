@@ -233,7 +233,7 @@ struct WaitingLineRow<MenuItems: View>: View {
             } else if let badge = ResetRowFacts.badge(account) {
                 Text(badge)
                     .font(V4.font(V4.lineSignalSize))
-                    .foregroundStyle(Tok.mute)
+                    .foregroundStyle(ResetBadge.ink(account))
                     .lineLimit(1)
                     .fixedSize()
             }
@@ -439,10 +439,16 @@ private enum LineColor {
 }
 
 /// A collapsed account's reset badge, after its line's signal: ` · ↻3` in the mute
-/// ink, or nothing when the account holds no reset (``ResetRowFacts/badge(_:)``).
+/// ink, the warning ink when a reset expires within a day, or nothing when the account
+/// holds no reset (``ResetRowFacts/badge(_:)``).
 private enum ResetBadge {
+    static func ink(_ account: Account) -> Color {
+        ResetRowFacts.badgeSoon(account) ? Tok.near : Tok.mute
+    }
+
     static func text(_ account: Account) -> Text {
         guard let badge = ResetRowFacts.badge(account) else { return Text(verbatim: "") }
-        return Text(verbatim: ResetRowFacts.badgeSeparator + badge).foregroundColor(Tok.mute)
+        return Text(verbatim: ResetRowFacts.badgeSeparator).foregroundColor(Tok.mute)
+            + Text(verbatim: badge).foregroundColor(ink(account))
     }
 }
