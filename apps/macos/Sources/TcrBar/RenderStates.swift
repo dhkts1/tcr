@@ -2420,9 +2420,12 @@ enum RenderStates {
     /// The Tailscale row of the pane under `--render-settings`: the mockup's
     /// scene 1, the app mode working. Documentation-range values only.
     static var settingsTailnetFixture: PeerTailnetRead {
-        .read(tailnetReading(.app, held: .init(
-            mode: .app, state: .ready, address: "100.64.0.7", found: 2,
-            recordedAtMs: peerMsAgo(5))))
+        .read(
+            tailnetReading(
+                .app,
+                held: .init(
+                    mode: .app, state: .ready, address: "100.64.0.7", found: 2,
+                    recordedAtMs: peerMsAgo(5))))
     }
 
     static func tailnetReading(
@@ -2994,7 +2997,7 @@ enum RenderStates {
     /// The strip alone, at every badge extreme and two selections, so
     /// `apps/macos/scripts/check-tab-strip-still.swift` can prove that nothing in it
     /// moves when a count changes: every PNG of one selection must match the
-    /// no-badge one outside the badge corners (Gil, 2026-10-14: "avoid layout
+    /// no-badge one outside the badges (Gil, 2026-10-14: "avoid layout
     /// shifts"). `100` draws the cap, `99+`.
     private static var tabStripScenes: [TabStripScene] {
         let sets: [(name: String, count: Int?)] = [

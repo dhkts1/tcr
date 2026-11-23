@@ -56,7 +56,7 @@ final class SegmentedTabsFitTests: XCTestCase {
                 + "of residual overflow once shortened")
     }
 
-    /// Why the badge is drawn over its tab's corner and not beside its label:
+    /// Why the badge is drawn over its tab's icon and not beside its label:
     /// a slot beside the label, reserved at its worst case so a count could
     /// never move the strip, does not fit three badged tabs. Even a slot for a
     /// single digit on Sessions, Tools and Peers overflows the strip once every
@@ -139,9 +139,9 @@ final class SegmentedTabsFitTests: XCTestCase {
     }
 
     /// The view lays the strip out with ``TabStripFit`` and `V4.tabInset`, and
-    /// draws the badge as an overlay on the tab's top-trailing corner, so the
-    /// arithmetic the tests here check is the arithmetic drawn. An overlay
-    /// takes no room; a badge back inside the `HStack` would.
+    /// draws the badge as an overlay on the tab's content, centred on the
+    /// icon's box, so the arithmetic the tests here check is the arithmetic
+    /// drawn. An overlay takes no room; a badge back inside the `HStack` would.
     func testTheStripIsLaidOutByTabStripFit() throws {
         let source = try panelSource("PanelV4/SegmentedTabs.swift")
         XCTAssertTrue(
@@ -151,8 +151,9 @@ final class SegmentedTabsFitTests: XCTestCase {
             source.contains("inset: V4.tabInset"),
             "SegmentedTabs no longer passes V4.tabInset to TabStripFit")
         XCTAssertTrue(
-            source.contains(".overlay(alignment: .topTrailing)"),
-            "the badge is no longer an overlay on the tab's corner")
+            source.contains(
+                ".overlay(alignment: .leading) { countBadge(tab).frame(width: V4.tabIconBox) }"),
+            "the badge is no longer an overlay centred on the tab's icon box")
         XCTAssertTrue(
             source.contains("TabStripFit.badgeText("),
             "the badge no longer draws TabStripFit.badgeText, so its cap is not the one tested")
@@ -160,10 +161,39 @@ final class SegmentedTabsFitTests: XCTestCase {
             source.range(of: "HStack(spacing: V4.tabGap) {").map { String(source[$0.upperBound...]) },
             "the tab's content HStack is not in the shape this test reads")
         let rowBody = try XCTUnwrap(row.components(separatedBy: "\n            }").first)
+        // The row may read the count (the icon stops being painted while the
+        // badge is drawn over it), but may not lay the badge out.
         XCTAssertFalse(
-            rowBody.lowercased().contains("badge"),
+            rowBody.contains("countBadge("),
             "the badge is back inside the tab's content row, where it takes room and "
                 + "moves the strip when a count changes")
+    }
+
+    /// The badge is drawn in place of the icon, centred on the icon's box, on
+    /// the label's line. At its widest, `99+`, it must stay inside its pill
+    /// and clear of its label on every tab that can carry one, at the
+    /// Comfortable label size, the larger of the two, which leaves the least
+    /// room. "Sessions" is the tight one: 4.7 pt of pill beyond its icon.
+    func testTheWidestBadgeFitsWhereTheIconIsOnEveryBadgedTab() throws {
+        let frames = try stripFrames(badges: [:])
+        let iconBox = try token("tabIconBox")
+        let tabGap = try token("tabGap")
+        let width =
+            badgeWidth(TabStripFit.badgeOverflow, size: try token("tabBadgeSize"))
+            + 2 * (try token("tabBadgePaddingH"))
+        for (name, frame) in zip(["accounts", "sessions", "tools", "peers"], frames).dropFirst() {
+            let centre = frame.labelX - tabGap - iconBox / 2
+            let toPillEdge = centre - width / 2 - frame.x
+            let toLabel = frame.labelX - (centre + width / 2)
+            XCTAssertGreaterThanOrEqual(
+                toPillEdge, 1,
+                "\(name)'s 99+ badge is \(String(format: "%.2f", toPillEdge)) pt from its pill's "
+                    + "edge, under 1 pt")
+            XCTAssertGreaterThanOrEqual(
+                toLabel, 2,
+                "\(name)'s 99+ badge is \(String(format: "%.2f", toLabel)) pt from its label, "
+                    + "under 2 pt")
+        }
     }
 
     /// Nothing in the strip moves because data changed (Gil, 2026-10-14: "avoid

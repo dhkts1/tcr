@@ -81,22 +81,22 @@ enum V4 {
     /// sides, on every tab. Without it a tab wider than its quarter of the
     /// strip ("Sessions" with a badge) drew its pill flush against the icon
     /// and the badge while "Accts" kept the leftover of its quarter as room.
-    /// The badge takes no room (it sits over the tab's corner), so eight
+    /// The badge takes no room (it is drawn over the icon), so eight
     /// insets on top of the four labels fit at every count, and
     /// `SegmentedTabsFitTests` fails if they stop fitting.
     static let tabInset: CGFloat = 4
     static let badgeRadius: CGFloat = 9
     static let badgePaddingH: CGFloat = 6
     static let badgeFillAlpha: Double = 0.14
-    /// The tab's count is drawn small over its pill's top-trailing corner,
-    /// not at the mockup's inline `.badge` size beside the label: inline, every
-    /// count change moved the strip, and a slot reserved for the widest count
-    /// does not fit (`TabStripFit`). At the mockup's 11 pt the corner badge
-    /// reached down into the label's letters; 9 pt with 4 pt of padding, lifted
-    /// so its top sits above the pill, clears them.
-    static let tabBadgeSize: CGFloat = 9
-    static let tabBadgePaddingH: CGFloat = 4
-    static let tabBadgeLift: CGFloat = 5
+    /// The tab's count is drawn small in place of the tab's icon, not at the
+    /// mockup's inline `.badge` size beside the label: inline, every count
+    /// change moved the strip, and a slot reserved for the widest count does
+    /// not fit (`TabStripFit`). The icon's 14 pt box and the 6 pt gap after it
+    /// are the room it has; at 8.5 pt with 2 pt of padding `99+` is about 21 pt
+    /// wide and keeps a point clear of the "Sessions" pill's edge and 2.5 pt
+    /// clear of its label (`SegmentedTabs.countBadge`).
+    static let tabBadgeSize: CGFloat = 8.5
+    static let tabBadgePaddingH: CGFloat = 2
 
     // MARK: - Card (`.card` / `.row`)
 
