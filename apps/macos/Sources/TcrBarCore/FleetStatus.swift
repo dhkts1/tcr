@@ -2503,6 +2503,50 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         return windows
     }
 
+    /// What a card row's right-hand tail column carries on a Claude card: the
+    /// money and tokens, the Fable weekly figure (``fableTailLabel``), or nothing.
+    public enum CardRowTail: Equatable, Sendable {
+        case usage
+        case fable
+        case none
+    }
+
+    /// One row under a card's name: a window's bar, or no bar at all (`window`
+    /// is `nil`), and what its tail column carries.
+    public struct CardRow: Equatable, Sendable {
+        public let window: QuotaWindow?
+        public let tail: CardRowTail
+
+        public init(window: QuotaWindow?, tail: CardRowTail) {
+            self.window = window
+            self.tail = tail
+        }
+    }
+
+    /// The rows a card draws under its name, top to bottom: one per
+    /// ``reportedWindows``, the first carrying the money tail and the one after
+    /// it the Fable figure.
+    ///
+    /// A Claude plan with ONE window (Ultra, `quotaWindows: ["sevenDay"]`) has no
+    /// second window row to hang the Fable figure on, so it gets a row with no bar
+    /// whose tail is the figure, when the account has one. The figure then sits
+    /// where it sits on a two-window card, one row under the money, and the card is
+    /// as tall as a two-window one. Before this row existed the figure was tied to
+    /// row index 1, which an Ultra card never draws, so no Ultra card showed it.
+    ///
+    /// A Codex card's tails are its own (`CodexCardFacts.tail`), so it never gets
+    /// the extra row.
+    public var cardRows: [CardRow] {
+        let windows = reportedWindows
+        var rows = windows.enumerated().map { index, window in
+            CardRow(window: window, tail: index == 0 ? .usage : index == 1 ? .fable : .none)
+        }
+        if windows.count == 1, provider == .anthropic, sevenDayOi != nil {
+            rows.append(CardRow(window: nil, tail: .fable))
+        }
+        return rows
+    }
+
     /// Whether this account's card reserves its `Re-login…` button's width in the
     /// name row: a signed-out Codex account. Its card then measures the plan against
     /// the room the button really leaves, and drops it rather than squeezing it.

@@ -303,6 +303,36 @@ final class AccountLineTests: XCTestCase {
         XCTAssertEqual(alice.lineSlotLabels, ["5h", "7d"])
     }
 
+    /// An Ultra card shows its Fable figure. The figure was tied to the card's
+    /// second row by index, and an Ultra plan reports one window, so its card had
+    /// no second row and drew no figure, though the server sends `sevenDayOi`. It
+    /// now gets a row with no bar whose tail is the figure, one row under the
+    /// money, as on a two-window card; the two-window card is unchanged, and an
+    /// Ultra card with no Fable reading draws no extra row.
+    func testAnUltraCardCarriesItsFableFigureOnARowUnderTheMoney() throws {
+        let ultra = try canonical(
+            "alice@example.com", ["fiveHour": NSNull(), "quotaWindows": ["sevenDay"]])
+        XCTAssertNotNil(ultra.sevenDayOi)
+        XCTAssertEqual(
+            ultra.cardRows,
+            [.init(window: .sevenDay, tail: .usage), .init(window: nil, tail: .fable)])
+
+        let alice = try canonical("alice@example.com")
+        XCTAssertEqual(
+            alice.cardRows,
+            [.init(window: .fiveHour, tail: .usage), .init(window: .sevenDay, tail: .fable)])
+
+        let noFable = try canonical(
+            "alice@example.com",
+            ["fiveHour": NSNull(), "quotaWindows": ["sevenDay"], "sevenDayOi": NSNull()])
+        XCTAssertEqual(noFable.cardRows, [.init(window: .sevenDay, tail: .usage)])
+
+        // A Codex weekly-only card keeps one row: its tails are its own.
+        XCTAssertEqual(
+            try canonical("bob@example.com/codex", ["sevenDayOi": 0.5]).cardRows,
+            [.init(window: .sevenDay, tail: .usage)])
+    }
+
     func testTheCodexSignalWords() throws {
         let forbiddenHold: [String: Any] = [
             "gate": "refused", "freeAtMs": 1_767_225_690_000,

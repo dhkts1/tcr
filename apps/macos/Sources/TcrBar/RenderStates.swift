@@ -2420,9 +2420,12 @@ enum RenderStates {
     /// The Tailscale row of the pane under `--render-settings`: the mockup's
     /// scene 1, the app mode working. Documentation-range values only.
     static var settingsTailnetFixture: PeerTailnetRead {
-        .read(tailnetReading(.app, held: .init(
-            mode: .app, state: .ready, address: "100.64.0.7", found: 2,
-            recordedAtMs: peerMsAgo(5))))
+        .read(
+            tailnetReading(
+                .app,
+                held: .init(
+                    mode: .app, state: .ready, address: "100.64.0.7", found: 2,
+                    recordedAtMs: peerMsAgo(5))))
     }
 
     static func tailnetReading(
@@ -3290,7 +3293,45 @@ enum RenderStates {
                     .init(
                         route: .via(exitPeerId), strict: true, peerDown: true,
                         waitingSeconds: 40))),
+            // An Ultra card has one window, `7d`, and the Fable figure used to
+            // hang on the card's second row, which it never drew. See
+            // ``ultraFableCards``.
+            ControlScene(name: "w13-card-ultra-fable", view: ultraFableCards),
         ]
+    }
+
+    /// Three cards, top to bottom: a two-window plan with a Fable reading (the
+    /// shape every Claude card had), an Ultra plan (`quotaWindows: ["sevenDay"]`)
+    /// with a Fable reading, and an Ultra plan with none. The second must show
+    /// `fable 21%` one row under its money, as the first does, and be as tall as
+    /// it; the third draws its one row and nothing under it.
+    @MainActor
+    private static var ultraFableCards: AnyView {
+        let ultra: [String: Any] = ["quotaWindows": ["sevenDay"], "fiveHour": NSNull()]
+        let rows = [
+            account(
+                "alice@example.com", quota: "0.12", state: "ok", fiveHourResetInMinutes: 130,
+                sevenDayResetInMinutes: 4_320, sevenDayOi: "0.21", sevenDayOiState: "ok",
+                sevenDayOiResetInMinutes: 6_498, plan: "Max 20x", now: peerNow),
+            account(
+                "bob@example.com", quota: "0.34", state: "ok", sevenDayResetInMinutes: 4_320,
+                sevenDayOi: "0.21", sevenDayOiState: "ok", sevenDayOiResetInMinutes: 6_498,
+                plan: "Ultra", now: peerNow, extra: ultra),
+            account(
+                "carol@example.com", quota: "0.34", state: "ok", sevenDayResetInMinutes: 4_320,
+                plan: "Ultra", now: peerNow, extra: ultra),
+        ]
+        let accounts = fleet("[\(rows.joined(separator: ","))]").accounts
+        return AnyView(
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(accounts) { account in
+                    AccountCard(
+                        account: account, shape: .full, now: peerNow, snapshotMode: true,
+                        actions: { EmptyView() }
+                    )
+                    .frame(width: V4.panelWidth)
+                }
+            })
     }
 
     /// One account card in one exit state, at the panel's own width.
