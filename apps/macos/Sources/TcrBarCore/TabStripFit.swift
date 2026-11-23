@@ -5,7 +5,7 @@ import CoreGraphics
 /// where each tab and its label sit.
 ///
 /// A tab's content is its icon and its label, and nothing that changes with
-/// the data. The badge (a count) is drawn over the tab's top-trailing corner
+/// the data. The badge (a count) is drawn over the icon, in its place,
 /// and takes no room, so the strip is laid out from the labels alone and
 /// never moves when a count appears, vanishes or gains a digit (Gil,
 /// 2026-10-14, of 1.1.20, where the badge sat inline and every count change
@@ -60,7 +60,7 @@ public enum TabStripFit {
 
     /// The largest count a badge spells out. Above it the badge reads
     /// ``badgeOverflow``, so the widest badge the strip can ever draw is known
-    /// before any count arrives and stays inside its tab's corner.
+    /// before any count arrives and fits where the icon was.
     public static let badgeCap = 99
     public static let badgeOverflow = "99+"
 

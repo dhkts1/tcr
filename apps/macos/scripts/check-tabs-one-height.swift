@@ -111,7 +111,7 @@ guard arguments.count == 2 else {
 let directory = URL(fileURLWithPath: arguments[1])
 
 // At the render's 2x scale. A tab is about a quarter of the 352 pt strip and
-// 28 to 32 pt tall plus its badge's 5 pt lift; the strip ends well inside the
+// 28 to 32 pt tall, its badge inside it; the strip ends well inside the
 // top 100 pt (header 44 pt, strip 38 pt).
 let maxBoxWidth = 2 * 110
 let maxBoxHeight = 2 * 44

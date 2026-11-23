@@ -51,6 +51,7 @@ struct SegmentedTabs: View {
                 Image(systemName: tab.systemImage)
                     .font(.system(size: V4.tabLabelSize))
                     .frame(width: V4.tabIconBox, height: V4.tabIconBox)
+                    .opacity(TabStripFit.badgeText(badges[tab]) == nil ? 1 : 0)
                 // ONE line, at its own width, never a share of the strip.
                 // `fixedSize` reports the label's ideal width to the layout
                 // instead of accepting a smaller one (an equal share once broke
@@ -64,6 +65,7 @@ struct SegmentedTabs: View {
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
             }
+            .overlay(alignment: .leading) { countBadge(tab).frame(width: V4.tabIconBox) }
             .foregroundStyle(isOn ? Tok.ink : Tok.dim)
             .frame(maxWidth: .infinity)
             .frame(minHeight: V4.tabMinHeight)
@@ -75,7 +77,6 @@ struct SegmentedTabs: View {
                         radius: 1, x: 0, y: 1)
             )
             .animation(reduceMotion ? nil : .easeOut(duration: V4.hoverDuration), value: isOn)
-            .overlay(alignment: .topTrailing) { countBadge(tab) }
             .contentShape(Rectangle())
         }
         .buttonStyle(V4PressStyle(cornerRadius: V4.tabRadius))
@@ -83,22 +84,32 @@ struct SegmentedTabs: View {
         .accessibilityAddTraits(isOn ? [.isSelected] : [])
     }
 
-    /// The tab's count, drawn small over its pill's top-trailing corner and
-    /// lifted above the pill's top edge, so it takes no room in the strip and
-    /// stays clear of the label's letters.
+    /// The tab's count, drawn in place of its icon: centred on the icon's box,
+    /// on the label's line, while the icon is hidden. It is an overlay, so it
+    /// takes no room in the strip, and nothing else in the tab moves when it
+    /// appears, vanishes or gains a digit; the icon only stops being painted.
     ///
     /// It sat inline after the label through 1.1.20, and every count that
     /// appeared, vanished or gained a digit re-laid the whole strip (Gil,
     /// 2026-10-14: "avoid layout shifts. now whats going on with our tabs is
     /// horrible"). A slot reserved beside the label at the badge's worst case
-    /// does not fit three badged tabs (``TabStripFit`` has the arithmetic), so
-    /// the badge is laid over the corner instead and only its own glyphs
-    /// change. ``TabStripFit/badgeText(_:)`` caps it at `99+`, so the widest
-    /// badge is known and stays inside its tab.
+    /// does not fit three badged tabs (``TabStripFit`` has the arithmetic).
     ///
-    /// Filled opaque under the usual tint, because it straddles the pill's
-    /// edge and the strip's: a translucent pill would show both edges through
-    /// its digits.
+    /// It then sat over the pill's top-trailing corner, lifted above the pill's
+    /// top edge, where it read as floating over the label rather than belonging
+    /// to the tab. The label's trailing side has no room for it: at 372 pt,
+    /// "Sessions" leaves 4.7 pt between its last letter and its pill's edge, and
+    /// `99+` needs 21. Inside the corner without the lift, the Compact pill is
+    /// 28 pt tall and the badge came down over the letters (rendered
+    /// 2026-11-23). The icon's box and the gap after it are the only room on
+    /// the label's line, and `99+` fits there with about a point to the pill's
+    /// edge on "Sessions"; `SegmentedTabsFitTests` and
+    /// `scripts/check-tab-strip-still.swift` fail if it stops fitting.
+    /// ``TabStripFit/badgeText(_:)`` caps it at `99+`, so the widest badge is
+    /// known.
+    ///
+    /// Filled opaque under the usual tint, so the selected pill's fill does not
+    /// show through its digits.
     @ViewBuilder
     private func countBadge(_ tab: PanelTab) -> some View {
         if let text = TabStripFit.badgeText(badges[tab]) {
@@ -116,7 +127,6 @@ struct SegmentedTabs: View {
                             .fill(Tok.ink.opacity(V4.badgeFillAlpha))
                     }
                 )
-                .offset(y: -V4.tabBadgeLift)
                 .accessibilityHidden(true)
         }
     }
