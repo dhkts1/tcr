@@ -766,6 +766,141 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" '. "$CLAUDE_ENV_FILE"; INNER=yes HTTPS_PROXY=ht
     );
 }
 
+/// Every variable the shell helpers reset, in the order [`show_proxies`] prints them.
+const RESET_KEYS: [&str; 8] = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "CODEX_CA_CERTIFICATE",
+];
+
+/// A script at `<home>/show-proxies` that prints `<stage> KEY=value` for each of
+/// [`RESET_KEYS`], `<unset>` for one that is not set.
+fn show_proxies(fixture: &AgentFixture) {
+    script(
+        &fixture.home.path().join("show-proxies"),
+        &format!(
+            "for k in {}; do printf '%s %s=%s\\n' \"$1\" \"$k\" \"$(printenv \"$k\" || printf '<unset>')\"; done",
+            RESET_KEYS.join(" ")
+        ),
+    );
+}
+
+/// The `KEY=value` lines `stage` printed, in [`RESET_KEYS`] order.
+fn stage(stdout: &str, stage: &str) -> Vec<String> {
+    let prefix = format!("{stage} ");
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix).map(str::to_string))
+        .collect()
+}
+
+/// Claude Code's Bash sandbox gives each command its own proxy, on a loopback port
+/// that is not tcr's, through the same variables. A value the helpers did not get
+/// from `tcr run` is not theirs to change: both the prefix and the env file keep it.
+#[test]
+fn a_sandbox_proxy_set_per_command_survives_both_helpers() {
+    let fixture = AgentFixture::new();
+    show_proxies(&fixture);
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"
+export HTTPS_PROXY=http://u:p@127.0.0.1:50337 https_proxy=http://u:p@127.0.0.1:50337
+export HTTP_PROXY=http://u:p@127.0.0.1:50337 http_proxy=http://u:p@127.0.0.1:50337
+export ALL_PROXY=socks5h://127.0.0.1:50338 all_proxy=socks5h://127.0.0.1:50338
+export NODE_EXTRA_CA_CERTS=/sandbox/ca.pem CODEX_CA_CERTIFICATE=/sandbox/codex-ca.pem
+"$CLAUDE_CODE_SHELL_PREFIX" '"$HOME/show-proxies" prefix'
+/bin/sh -c '. "$CLAUDE_ENV_FILE"; "$HOME/show-proxies" env-file'
+"#,
+    );
+    // A caller value for one key, so the restoring branch is checked as well as `unset`.
+    let output = fixture
+        .command()
+        .env("ALL_PROXY", "http://proxy.example:3999")
+        .output()
+        .unwrap();
+    assert_ran(&output, "the sandbox fixture failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let want: Vec<String> = [
+        "HTTPS_PROXY=http://u:p@127.0.0.1:50337",
+        "https_proxy=http://u:p@127.0.0.1:50337",
+        "HTTP_PROXY=http://u:p@127.0.0.1:50337",
+        "http_proxy=http://u:p@127.0.0.1:50337",
+        "ALL_PROXY=socks5h://127.0.0.1:50338",
+        "all_proxy=socks5h://127.0.0.1:50338",
+        "NODE_EXTRA_CA_CERTS=/sandbox/ca.pem",
+        "CODEX_CA_CERTIFICATE=/sandbox/codex-ca.pem",
+    ]
+    .map(String::from)
+    .to_vec();
+    for helper in ["prefix", "env-file"] {
+        assert_eq!(
+            stage(&stdout, helper),
+            want,
+            "the {helper} helper changed a sandbox's per-command value"
+        );
+    }
+}
+
+/// What `tcr run` gave claude never reaches a shell tool: the caller's value comes
+/// back or the variable is unset, in both spellings. The nested `claude` launcher's
+/// form of tcr's proxy and CA counts as tcr's too, so its shells go direct as well.
+#[test]
+fn tcrs_own_proxy_and_ca_are_replaced_by_the_callers_or_unset() {
+    let fixture = AgentFixture::new();
+    show_proxies(&fixture);
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"
+for helper in prefix env-file; do
+    case "$helper" in
+        prefix) run() { "$CLAUDE_CODE_SHELL_PREFIX" "\"\$HOME/show-proxies\" $1"; } ;;
+        env-file) run() { /bin/sh -c ". \"\$CLAUDE_ENV_FILE\"; \"\$HOME/show-proxies\" $1"; } ;;
+    esac
+    run "launch-$helper"
+    HTTPS_PROXY=$TCR_TOOL_CLAUDE_PROXY https_proxy=$TCR_TOOL_CLAUDE_PROXY NODE_EXTRA_CA_CERTS=$TCR_TOOL_CLAUDE_CA run "nested-$helper"
+done
+"#,
+    );
+    let output = fixture
+        .command()
+        .env("HTTPS_PROXY", "http://corporate.example:8123")
+        .env("ALL_PROXY", "http://proxy.example:3999")
+        .output()
+        .unwrap();
+    assert_ran(&output, "the tcr-values fixture failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let want: Vec<String> = [
+        "HTTPS_PROXY=http://corporate.example:8123",
+        "https_proxy=<unset>",
+        "HTTP_PROXY=<unset>",
+        "http_proxy=<unset>",
+        "ALL_PROXY=http://proxy.example:3999",
+        "all_proxy=<unset>",
+        "NODE_EXTRA_CA_CERTS=<unset>",
+        "CODEX_CA_CERTIFICATE=<unset>",
+    ]
+    .map(String::from)
+    .to_vec();
+    assert_eq!(want.len(), RESET_KEYS.len());
+    for name in [
+        "launch-prefix",
+        "nested-prefix",
+        "launch-env-file",
+        "nested-env-file",
+    ] {
+        assert_eq!(
+            stage(&stdout, name),
+            want,
+            "{name}: tcr's own value reached a shell tool"
+        );
+    }
+}
+
 /// cmux's per-pane shim and wrapper in one: run the next `name` on `PATH` past its own
 /// directory, as cmux's wrapper does. It counts its runs, so a loop fails fast.
 fn cmux_shim_dir(fixture: &AgentFixture, name: &str) -> std::path::PathBuf {

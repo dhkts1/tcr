@@ -245,16 +245,34 @@ pub(crate) fn apply(
     let directory = parent.join(format!("setup-{}", setup.digest()));
     private_dir(&directory)?;
     let root = directory.as_path();
+    // Decided when each command runs: a variable is reset only while it still holds
+    // what the agent was launched with, or the nested `claude` launcher's form of
+    // tcr's proxy or CA. Any other value was set for that command by someone else,
+    // such as Claude Code's Bash sandbox, whose own loopback proxy is the only way
+    // its commands reach the network; it is left alone.
     let mut cleanup = String::new();
     for key in PROXIES.iter().chain(CAS.iter()) {
         let saved = format!("TCR_TOOL_CALLER_{key}");
-        if let Some(value) = caller.get(*key) {
+        let launched = format!("TCR_TOOL_LAUNCH_{key}");
+        match inherited(cmd, key, &host) {
+            Some(value) => cmd.env(&launched, value),
+            None => cmd.env_remove(&launched),
+        };
+        let reset = if let Some(value) = caller.get(*key) {
             cmd.env(&saved, value);
-            cleanup.push_str(&format!("export {key}=\"${{{saved}}}\"\n"));
+            format!("export {key}=\"${{{saved}}}\"")
         } else {
             cmd.env_remove(&saved);
-            cleanup.push_str(&format!("unset {key}\n"));
-        }
+            format!("unset {key}")
+        };
+        let own = if CAS.contains(key) {
+            "TCR_TOOL_CLAUDE_CA"
+        } else {
+            "TCR_TOOL_CLAUDE_PROXY"
+        };
+        cleanup.push_str(&format!(
+            "if [ \"${{{key}:-}}\" = \"${{{launched}:-}}\" ] || {{ [ -n \"${{{own}:-}}\" ] && [ \"${{{key}:-}}\" = \"${{{own}}}\" ]; }}; then {reset}; fi\n"
+        ));
     }
     // Runtime environment only: no request key or proxy credential is written
     // into a helper file or used to choose its directory.
