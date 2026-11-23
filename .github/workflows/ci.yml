@@ -38,6 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       inert: ${{ steps.classify.outputs.inert }}
+      tailnet: ${{ steps.classify.outputs.tailnet }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -47,6 +48,7 @@ jobs:
         id: classify
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
 
@@ -54,13 +56,37 @@ jobs:
           # says `code` for source before trusting it to say `inert` for prose.
           .github/scripts/changed-is-inert.sh --self-check
 
+          # Whether the opt-in tailnet-node job runs: a changed file that mentions
+          # the feature, or the manifest, the lockfile or this workflow. Decided
+          # on pushes to main too, so a release waiting on `macos` does not pay
+          # for it either. With no base to diff against, it runs.
+          tailnet_for() {
+            if printf '%s\n' "$1" | grep -qxE 'Cargo\.toml|Cargo\.lock|\.github/workflows/ci\.yml'; then
+              echo true; return
+            fi
+            for f in $1; do
+              if [ -f "$f" ] && grep -qE 'tailnet-node|tailnet_node' "$f"; then echo true; return; fi
+            done
+            echo false
+          }
+
           if [ -z "${BASE_SHA}" ]; then
-            echo "not a pull request (push to main) — running everything."
+            echo "not a pull request (push to main) — running everything but the opt-in tailnet job."
             echo "inert=false" >>"${GITHUB_OUTPUT}"
+            if [ -z "${BEFORE_SHA}" ] || ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+              echo "tailnet=true" >>"${GITHUB_OUTPUT}"
+            else
+              tailnet="$(tailnet_for "$(git diff --name-only "${BEFORE_SHA}...HEAD")")"
+              echo "tailnet: ${tailnet}"
+              echo "tailnet=${tailnet}" >>"${GITHUB_OUTPUT}"
+            fi
             exit 0
           fi
 
           paths="$(git diff --name-only "${BASE_SHA}...HEAD")"
+          tailnet="$(tailnet_for "${paths}")"
+          echo "tailnet: ${tailnet}"
+          echo "tailnet=${tailnet}" >>"${GITHUB_OUTPUT}"
           echo "changed paths:"
           printf '%s\n' "${paths}" | sed 's/^/  /'
 
@@ -282,14 +308,55 @@ jobs:
   # helper` and the macOS half of the fan identity exist only on macOS. macOS
   # runner minutes are billed at a multiple of Linux, so this job runs only
   # what Linux cannot answer.
-  macos:
-    name: macos
+  # ── macos ───────────────────────────────────────────────────────────────
+  # Only what a Linux runner cannot answer, on macOS runners that run side by
+  # side. As one serial job this took 16 to 18 minutes, and every merge and
+  # `ship-release.sh` waited on it: 8 of those minutes re-ran the whole Rust
+  # suite `ci` already runs on Linux, and 4.75 built an opt-in feature for 24
+  # tests that take one second. Now each job carries only its macOS reason, and
+  # the wall time is the slowest of them. The `macos` job at the end is the one
+  # branch protection and ship-release.sh name; it passes only when every job
+  # it waits on passed or, for the opt-in tailnet job alone, was skipped.
+  macos-test:
+    name: macos-test
     needs: changes
     if: needs.changes.outputs.inert != 'true'
     runs-on: macos-latest
-    # macOS runners are slower than ubuntu-latest and this job compiles both
-    # toolchains; 20 (the `ci` budget) is too tight for a cold cache.
-    timeout-minutes: 40
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.100.0
+
+      - name: Toolchain version
+        run: rustc -V && cargo -V
+
+      # Auto-keys on runner OS and job id as well as Cargo.lock, so each macOS
+      # job keeps its own target cache.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The modules whose behaviour differs on macOS, and only those: the rest of
+      # the suite is platform-neutral and `ci` runs it on Linux. singleton shells
+      # out to `ps`/`lsof` (BSD flags, other columns); update places a binary by
+      # rename(2); fan, fan_probe and the four fan crates drive Apple's SMC;
+      # handoff, claude_code_login and peer::reach carry
+      # `#[cfg(target_os = "macos")]` paths. `--lib` builds one test binary
+      # instead of every integration target, which is most of the time saved.
+      # A module that gains macOS-only behaviour joins this filter list.
+      - name: Test (rust, macOS-specific modules)
+        run: |
+          cargo test --locked -p tcr --lib -- \
+            singleton:: update:: fan:: fan_probe:: handoff:: claude_code_login:: peer::reach::
+          cargo test --locked -p tcr-fan -p tcr-smc -p tcr-fdpass -p tcr-fan-helper
+
+  macos-clippy:
+    name: macos-clippy
+    needs: changes
+    if: needs.changes.outputs.inert != 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -301,36 +368,52 @@ jobs:
       - name: Toolchain version
         run: rustc -V && cargo -V && cargo clippy -V
 
-      # Auto-keys on runner OS as well as Cargo.lock, so this shares nothing
-      # with the ubuntu jobs' caches.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-
-      # Not a duplicate of the ubuntu `cargo test`: several modules take a
-      # different code path here. src/singleton.rs shells out to `ps`/`lsof`
-      # (BSD flags, different output columns), install placement relies on
-      # rename(2) semantics, and $TMPDIR is a per-user sandbox path on macOS
-      # rather than /tmp. macOS is also the only platform this app ships on.
-      - name: Test (rust)
-        run: cargo test --all --locked
 
       # The same command as `ci`'s Clippy step, here for the code that step
       # never compiles: everything under `#[cfg(target_os = "macos")]`.
       - name: Clippy (macOS-only code)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # tcr's own tailnet node (`src/peer/tailnet_node.rs`) compiles only with
-      # the `tailnet-node` feature on Apple silicon, which no release build and
-      # no other step here turns on. Without this the library adapter can rot
-      # unseen. macos-latest is Apple silicon, the one target it supports.
+  # tcr's own tailnet node (`src/peer/tailnet_node.rs`) compiles only with the
+  # `tailnet-node` feature on Apple silicon, which no release build turns on.
+  # It runs only when the change touches a file that mentions the feature, or
+  # Cargo.toml, Cargo.lock or this workflow (the `changes` job decides), so the
+  # adapter cannot rot unseen and the other changes do not pay ~5 minutes for it.
+  macos-tailnet:
+    name: macos-tailnet
+    needs: changes
+    if: needs.changes.outputs.inert != 'true' && needs.changes.outputs.tailnet == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
       - name: Clippy (tailnet-node feature)
         run: cargo clippy --workspace --all-targets --locked --features tailnet-node -- -D warnings
 
       # The one test that touches the real library (keys tcr mints read back
-      # into the library's type) runs only with the feature; the rest of the
-      # module's tests run in every build already.
+      # into the library's type) runs only with the feature.
       - name: Test (tailnet-node feature)
         run: cargo test --locked --features tailnet-node --lib tailnet_node
+
+  macos-swift:
+    name: macos-swift
+    needs: changes
+    if: needs.changes.outputs.inert != 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
 
       # Recorded so a runner-image bump that changes the Swift language mode is
       # attributable from the log rather than looking like a source regression.
@@ -339,8 +422,7 @@ jobs:
 
       # The Swift half of the `Format` job above. It lives here and not in `ci`
       # because swift-format ships inside the Xcode toolchain, which only the
-      # macOS runner has — that is exactly the "only what Linux cannot answer"
-      # rule in the comment above this job, not an exception to it.
+      # macOS runner has.
       #
       # Resolved through xcrun rather than assumed on PATH: the toolchain binary
       # is not on a bare runner's PATH, and a bare `swift-format` would resolve
@@ -382,6 +464,30 @@ jobs:
       # read-backs, and the TcrBar.dmg copy the site's Download button links to.
       - name: Test (release upload)
         run: apps/macos/scripts/release-upload-race-fixture-test.sh
+
+  # The required check. Skipped when the change is inert, like the jobs above
+  # (a skipped required check counts as passed, as the single job's did).
+  # macos-test, macos-clippy and macos-swift must succeed; macos-tailnet must
+  # succeed or have been skipped by its own gate. Anything else fails it,
+  # cancelled included.
+  macos:
+    name: macos
+    needs: [changes, macos-test, macos-clippy, macos-tailnet, macos-swift]
+    if: always() && needs.changes.outputs.inert != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every macOS job passed
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          TEST: ${{ needs.macos-test.result }}
+          CLIPPY: ${{ needs.macos-clippy.result }}
+          TAILNET: ${{ needs.macos-tailnet.result }}
+          SWIFT: ${{ needs.macos-swift.result }}
+        run: |
+          echo "changes=$CHANGES macos-test=$TEST macos-clippy=$CLIPPY macos-tailnet=$TAILNET macos-swift=$SWIFT"
+          [ "$CHANGES" = success ] && [ "$TEST" = success ] && [ "$CLIPPY" = success ] && [ "$SWIFT" = success ] \
+            && { [ "$TAILNET" = success ] || [ "$TAILNET" = skipped ]; }
 
   audit:
     name: audit
