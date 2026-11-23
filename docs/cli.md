@@ -239,7 +239,9 @@ both spellings of `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` from before the mo
 `tcr run --codex` supplies the same defaults through its shell environment policy, preserving
 explicit `set` entries from the caller's Codex config and later CLI overrides. With no caller
 proxy these tools connect directly. Shells also drop tcr's extra CA variables, while retaining
-caller CA bundles. Model clients and their own auxiliary HTTP traffic still use tcr.
+caller CA bundles. Model clients and their own auxiliary HTTP traffic still use tcr. Only the
+values `tcr run` gave the model client are replaced, checked when each command runs: a proxy or CA
+that something else set for one command, such as Claude Code's Bash sandbox, is left alone.
 
 tcr prepends private `claude` and `codex` launchers to PATH. Nested Claude restores its plain
 proxy marker and own CA only when the caller supplied no value; an explicit
