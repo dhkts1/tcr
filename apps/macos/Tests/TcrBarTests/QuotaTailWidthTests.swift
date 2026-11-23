@@ -161,8 +161,8 @@ final class QuotaTailWidthTests: XCTestCase {
             "the caption line under the bars is back — the card is one line taller per "
                 + "fable account again, which is what Gil asked to undo")
         XCTAssertTrue(
-            squashed.contains("case1:returnaccount.fableTailLabel"),
-            "row 2's tail no longer reads from Account.fableTailLabel, so the panel now has "
+            squashed.contains("case.fable:returnaccount.fableTailLabel"),
+            "the Fable tail no longer reads from Account.fableTailLabel, so the panel now has "
                 + "a second spelling of that string and the two can drift")
     }
 
@@ -201,7 +201,7 @@ final class QuotaTailWidthTests: XCTestCase {
         let source = try panelSource("PanelV4/AccountCard.swift")
         let squashed = source.components(separatedBy: .whitespacesAndNewlines).joined()
         XCTAssertFalse(
-            squashed.contains("ifshape==.full{ForEach(Array(quotaWindows"),
+            squashed.contains("ifshape==.full{ForEach(Array(account.cardRows"),
             "the quota rows are gated on the card's shape again, so accounts inside a group "
                 + "draw no windows at all")
         // Comments survive whitespace-squashing, so an adjacency string here

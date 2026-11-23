@@ -154,17 +154,28 @@ struct AccountCard<Actions: View>: View {
             // Compact's own tighter density tokens (`V4.quotaLabelWidth`,
             // `V4.quotaMarginTop`, `V4.barHeight`).
             VStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(quotaWindows.enumerated()), id: \.element.window) {
-                    index, window in
-                    QuotaRow(
-                        label: window.label, value: window.value, tint: window.tint,
-                        resetAtMs: window.resetAtMs, now: now,
-                        trailing: trailingText(index, window),
-                        trailingReserved: trailingReserved,
-                        trailingHelp: trailingHelp(index, window),
-                        trailingTint: trailingTint(index),
-                        barHelp: window.window == .sevenDay
-                            ? ResetRowFacts.unknownNote(account) : nil)
+                // ``Account/cardRows``: one row per window, plus, on a
+                // one-window Claude card with a Fable reading (Ultra), a row
+                // with no bar that carries the Fable figure in the tail column.
+                ForEach(Array(account.cardRows.enumerated()), id: \.offset) { _, row in
+                    if let window = row.window.map(quotaWindow) {
+                        QuotaRow(
+                            label: window.label, value: window.value, tint: window.tint,
+                            resetAtMs: window.resetAtMs, now: now,
+                            trailing: trailingText(row.tail, window),
+                            trailingReserved: trailingReserved,
+                            trailingHelp: trailingHelp(row.tail, window),
+                            trailingTint: trailingTint(row.tail),
+                            barHelp: window.window == .sevenDay
+                                ? ResetRowFacts.unknownNote(account) : nil)
+                    } else {
+                        QuotaTailRow(
+                            trailing: rowTail(row.tail),
+                            trailingHelp: trailingHelp(row.tail),
+                            trailingTint: trailingTint(row.tail),
+                            spoken: row.tail == .fable
+                                ? account.fableWeeklySpokenLabel(now: now) : nil)
+                    }
                 }
                 // A Codex plan that reports no usage window draws no row, and this
                 // one line in its place says so, with its credits. `nil` on every
@@ -465,52 +476,65 @@ struct AccountCard<Actions: View>: View {
         return CodexCardFacts.stateHelp(account, now: now) ?? account.stateHelp
     }
 
-    /// What row `index` draws in the tail column. A Claude card keeps
+    /// What a window row draws in the tail column. A Claude card keeps
     /// ``rowTail(_:)``; a Codex card draws that window's output tokens
     /// (``CodexCardFacts/tail(_:window:)``), since its plan is not billed per
     /// request and a dollar figure would be a claim nobody measured.
-    private func trailingText(_ index: Int, _ window: QuotaWindowSpec) -> String? {
-        guard account.provider == .codex else { return rowTail(index) }
+    private func trailingText(_ tail: Account.CardRowTail, _ window: QuotaWindowSpec) -> String? {
+        guard account.provider == .codex else { return rowTail(tail) }
         return CodexCardFacts.tail(account, window: window.window)?.text
     }
 
     /// The tail's hover: the Claude card's own, or the Codex tail's, which names
     /// the window its tokens were counted in.
-    private func trailingHelp(_ index: Int, _ window: QuotaWindowSpec) -> String? {
-        guard account.provider == .codex else {
-            return index == 1 ? row1TrailingHelp : usageTailHelp
-        }
+    private func trailingHelp(_ tail: Account.CardRowTail, _ window: QuotaWindowSpec) -> String? {
+        guard account.provider == .codex else { return trailingHelp(tail) }
         return CodexCardFacts.tail(account, window: window.window)?.help
     }
 
-    /// The tail's colour: the Fable figure's own on a Claude card's second row,
+    /// A Claude card's tail hover, by what the tail carries.
+    private func trailingHelp(_ tail: Account.CardRowTail) -> String? {
+        switch tail {
+        case .usage: return usageTailHelp
+        case .fable: return fableTrailingHelp
+        case .none: return nil
+        }
+    }
+
+    /// The tail's colour: the Fable figure's own wherever a Claude card draws it,
     /// and the ordinary mute everywhere else, every Codex tail included.
-    private func trailingTint(_ index: Int) -> Color? {
-        guard account.provider == .codex else { return index == 1 ? fableTailTint : nil }
+    private func trailingTint(_ tail: Account.CardRowTail) -> Color? {
+        guard account.provider == .codex else { return tail == .fable ? fableTailTint : nil }
         return nil
     }
 
     /// Whether every row reserves the tail column, so all the bars keep one width:
     /// when any row the card draws has a tail.
     private var trailingReserved: Bool {
-        guard account.provider == .codex else { return usageTail != nil || rowTail(1) != nil }
-        return quotaWindows.contains { CodexCardFacts.tail(account, window: $0.window) != nil }
+        guard account.provider == .codex else {
+            return account.cardRows.contains { rowTail($0.tail) != nil }
+        }
+        return account.reportedWindows.contains {
+            CodexCardFacts.tail(account, window: $0) != nil
+        }
     }
 
-    /// What the reserved right-hand column says on row `index`. The plan name
-    /// left the tail entirely in round 2 — it is visible in ``nameRow`` now,
-    /// in both shapes, so a second copy here would say it twice.
+    /// What the reserved right-hand column says, by what the row's tail carries
+    /// (``Account/cardRows``). The plan name left the tail entirely in round 2 —
+    /// it is visible in ``nameRow`` now, in both shapes, so a second copy here
+    /// would say it twice.
     ///
-    /// Row 0 carries the money and tokens. Row 1 carries the Fable weekly
-    /// figure (``Account/fableTailLabel``) when this account has one, which is
-    /// where the pre-v4 card drew it too (Gil, 2026-09-13: "no like we had
-    /// both … align it like we had before") — `nil`, an EMPTY column, for
-    /// every account this window was never learned for.
-    private func rowTail(_ index: Int) -> String? {
-        switch index {
-        case 0: return usageTail
-        case 1: return account.fableTailLabel
-        default: return nil
+    /// The first row carries the money and tokens. The row after it carries the
+    /// Fable weekly figure (``Account/fableTailLabel``) when this account has
+    /// one, which is where the pre-v4 card drew it too (Gil, 2026-09-13: "no like
+    /// we had both … align it like we had before") — `nil`, an EMPTY column, for
+    /// every account this window was never learned for. On an Ultra card that
+    /// row has no bar (``QuotaTailRow``).
+    private func rowTail(_ tail: Account.CardRowTail) -> String? {
+        switch tail {
+        case .usage: return usageTail
+        case .fable: return account.fableTailLabel
+        case .none: return nil
         }
     }
 
@@ -525,12 +549,12 @@ struct AccountCard<Actions: View>: View {
         account.sevenDayOi != nil ? account.fableBarTintSource.fillColor : nil
     }
 
-    /// The row-2 tail's hover text: the full ``Account/fableWeeklyLabel(now:)``,
+    /// The Fable tail's hover text: the full ``Account/fableWeeklyLabel(now:)``,
     /// reset included — `"fable 72% · in 3d 18h"`, the mockup's own tail
     /// title, with no plan appended, since the plan is already visible in
-    /// ``nameRow``. `nil` when the column is empty, matching what row 2
+    /// ``nameRow``. `nil` when the column is empty, matching what the row
     /// actually shows.
-    private var row1TrailingHelp: String? {
+    private var fableTrailingHelp: String? {
         guard account.sevenDayOi != nil else { return nil }
         return account.fableWeeklyLabel(now: now)
     }
@@ -571,7 +595,7 @@ struct AccountCard<Actions: View>: View {
         return parts.joined(separator: " · ")
     }
 
-    /// The windows that get a BAR ROW: the rolling session window and the
+    /// A window that gets a BAR ROW: the rolling session window or the
     /// weekly one, and only those two.
     ///
     /// `fable` is a SEPARATE window with a separate reset, gating Fable
@@ -590,16 +614,15 @@ struct AccountCard<Actions: View>: View {
     /// plan's one `7d` row, and no row at all for a Codex plan that reports none. A
     /// window the plan does not have is not a reading nobody took, so it gets no empty
     /// row. A plan that has not said draws both, `5h` and `7d`, as every Claude card
-    /// always did.
-    private var quotaWindows: [QuotaWindowSpec] {
-        account.reportedWindows.map { window in
-            QuotaWindowSpec(
-                window: window, label: account.windowLabel(for: window),
-                value: window == .fiveHour ? account.fiveHour : account.sevenDay,
-                tint: account.quotaBarTintSource(for: window),
-                resetAtMs: window == .fiveHour
-                    ? account.fiveHourResetAtMs : account.sevenDayResetAtMs)
-        }
+    /// always did. A one-window Claude card with a Fable reading still draws the
+    /// figure, on a row with no bar under its one window (``Account/cardRows``).
+    private func quotaWindow(_ window: Account.QuotaWindow) -> QuotaWindowSpec {
+        QuotaWindowSpec(
+            window: window, label: account.windowLabel(for: window),
+            value: window == .fiveHour ? account.fiveHour : account.sevenDay,
+            tint: account.quotaBarTintSource(for: window),
+            resetAtMs: window == .fiveHour
+                ? account.fiveHourResetAtMs : account.sevenDayResetAtMs)
     }
 }
 

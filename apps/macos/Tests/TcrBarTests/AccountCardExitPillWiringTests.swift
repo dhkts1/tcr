@@ -62,7 +62,7 @@ final class AccountCardExitPillWiringTests: XCTestCase {
         let card = try source("apps/macos/Sources/TcrBar/PanelV4/AccountCard.swift")
         let afterHeader = try slice(
             card, from: ".accessibilityElement(children: .combine)",
-            to: "ForEach(Array(quotaWindows.enumerated())")
+            to: "ForEach(Array(account.cardRows.enumerated())")
         XCTAssertTrue(
             afterHeader.contains("exitWaitingPillText") && afterHeader.contains("role: .warn"),
             "the waiting pill is not between the header and the quota rows, so it is either "

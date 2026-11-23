@@ -207,3 +207,39 @@ struct QuotaRow: View {
                 value: value, state: role, resetAtMs: resetAtMs, now: now))
     }
 }
+
+/// A ``QuotaRow`` with no window: no label, no bar, no percentage, no reset, only
+/// the tail column, drawn at the same height and in the same column, divider
+/// included. A one-window Claude card (Ultra) puts its Fable figure here, so the
+/// figure sits one row under the money as it does on a two-window card
+/// (`Account.cardRows`).
+struct QuotaTailRow: View {
+    let trailing: String?
+    let trailingHelp: String?
+    let trailingTint: Color?
+    /// What VoiceOver reads for the row: the figure in words
+    /// (`Account.fableWeeklySpokenLabel(now:)`), not the printed `fable 72%`.
+    let spoken: String?
+
+    var body: some View {
+        HStack(spacing: V4.quotaGap) {
+            Spacer(minLength: 0)
+            Rectangle()
+                .fill(Tok.cardLine)
+                .frame(width: V4.panelBorderWidth)
+                .frame(maxHeight: .infinity)
+            Text(trailing ?? "")
+                .font(V4.font(V4.muteSize))
+                .foregroundStyle(trailingTint ?? Tok.mute)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(width: V4.usageTailWidth, alignment: .trailing)
+                .help(trailingHelp ?? trailing ?? "")
+        }
+        .frame(minHeight: V4.lineHeight(V4.dimSize))
+        .padding(.top, V4.quotaMarginTop)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(spoken ?? trailing ?? "")
+        .accessibilityHidden(trailing == nil)
+    }
+}
