@@ -21,7 +21,7 @@ use super::*;
 // `listener.rs` as of this commit, and the two tests that measured it go with it rather than being
 // converted to `noise::accept_handshake`, which has no window parameter to
 // convert them to. The SAME invariant, under the CURRENT gate, is
-// `tests/peer_pairing.rs::xx_from_an_unaccepted_instance_gets_zero_bytes` (the
+// `tests/peer_pairing/knock.rs::xx_from_an_unaccepted_instance_gets_zero_bytes` (the
 // zero-bytes refusal) and its own positive control (the same dial answered
 // after Accept); `the_six_digit_code_binds_the_handshake_not_the_keys` above
 // keeps the six-digit-code assertion these two also made, through

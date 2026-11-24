@@ -18,7 +18,8 @@ use super::*;
 // `serve_connection` reads inside the accept loop and not a copy of it, and
 // the wire-bytes half of the invariant is kept honest by one real-socket leg
 // from the one address this box has. That is the split
-// `tests/peer_pairing.rs:872-884` uses for the same reason.
+// `tests/peer_pairing/caps.rs` uses for the same reason, in
+// `eight_concurrent_reservations_at_a_seven_row_queue_leave_exactly_eight_never_nine`.
 
 /// One Mac's files: a peers file, a state file beside it, a node key.
 struct GateNode {
