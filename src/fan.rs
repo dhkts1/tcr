@@ -145,6 +145,13 @@ impl FanFile {
         };
         Ok(Saved { desired, hold })
     }
+
+    /// The process this file says holds the fans, unless that is `pid`.
+    fn held_by_other_than(self, pid: u32) -> Option<u32> {
+        self.hold
+            .map(|hold| hold.writer_pid)
+            .filter(|&writer| writer != pid)
+    }
 }
 
 /// Read `fan.json`. Missing is Auto, quietly; anything else that stops it is
@@ -231,10 +238,7 @@ impl FileStore {
         if self.known.as_ref() == Some(&on_disk) {
             return None;
         }
-        on_disk
-            .hold
-            .map(|hold| hold.writer_pid)
-            .filter(|&writer| writer != self.pid)
+        on_disk.held_by_other_than(self.pid)
     }
 }
 

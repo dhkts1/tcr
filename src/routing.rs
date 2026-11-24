@@ -214,6 +214,13 @@ impl ErrorLog {
             .map(|(_, counts)| counts[kind.index()])
             .fold(0, u32::saturating_add)
     }
+
+    /// The last error as `(kind, at_ms, count of that kind in the ten minutes ending at
+    /// now_ms)`, or `None` when none was seen.
+    fn last_with_count(&self, now_ms: i64) -> Option<(ErrorKind, i64, u32)> {
+        self.last
+            .map(|(kind, at_ms)| (kind, at_ms, self.count(kind, now_ms)))
+    }
 }
 
 /// What this boot has observed that the document reports per provider: upstream errors and
@@ -238,9 +245,7 @@ impl Observations {
     /// The last error on `provider` as `(kind, at_ms, count of that kind in the ten minutes
     /// ending at now_ms)`, or `None` when none was seen this boot.
     pub fn last_error(&self, provider: Provider, now_ms: i64) -> Option<(ErrorKind, i64, u32)> {
-        let log = &self.errors[slot(provider)];
-        log.last
-            .map(|(kind, at_ms)| (kind, at_ms, log.count(kind, now_ms)))
+        self.errors[slot(provider)].last_with_count(now_ms)
     }
 
     /// Every model id `provider` served this boot.

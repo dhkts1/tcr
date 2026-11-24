@@ -2219,89 +2219,111 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
         }
     }
 
-    let mut config: Config = serde_json::from_value(doc)?;
-    config.quarantined_accounts = quarantined;
-    config.migrated_legacy_throttle = migrated_legacy_throttle;
-    migrate_duplicate_names(path, &mut config, &file_index);
-    Ok(config)
+    Config::from_loaded(
+        path,
+        doc,
+        &file_index,
+        quarantined,
+        migrated_legacy_throttle,
+    )
 }
 
-/// Restore unique account names on a config that has duplicates, in memory AND
-/// on disk, once.
-///
-/// Never refuses. A loader that rejected a duplicated config would take the
-/// whole fleet down the moment it upgraded — the config is what it is, and it
-/// was written by earlier `tcr` builds that permitted it. So: rename, log a line
-/// per rename, continue. The durable write failing is recorded on
-/// [`Config::rename_write_error`] rather than returned, because a server has to
-/// boot either way; the CLI's own load ([`crate::cli::load_for_edit`]) reads
-/// that field and refuses to run an edit verb on top of it, since a rename that
-/// never reached disk is one every future process re-derives.
-fn migrate_duplicate_names(path: &Path, config: &mut Config, file_index: &[usize]) {
-    let renames = plan_renames(&config.accounts);
-    if renames.is_empty() {
-        return;
+impl Config {
+    /// The config [`load`] read from `path`: `doc` after its accounts were screened, carrying
+    /// the names set aside and whether a legacy `throttle` key was migrated, with duplicate
+    /// account names made unique.
+    fn from_loaded(
+        path: &Path,
+        doc: Value,
+        file_index: &[usize],
+        quarantined: Vec<String>,
+        migrated_legacy_throttle: bool,
+    ) -> Result<Self, ConfigError> {
+        let mut config: Self = serde_json::from_value(doc)?;
+        config.quarantined_accounts = quarantined;
+        config.migrated_legacy_throttle = migrated_legacy_throttle;
+        config.migrate_duplicate_names(path, file_index);
+        Ok(config)
     }
 
-    // The control account, if it names a duplicated row, currently resolves to
-    // the FIRST row in file order carrying that name — that is what the running
-    // server does with it today, so that is the row it must keep pointing at.
-    let control_rename = config.control_account.as_ref().and_then(|control| {
-        let first = config
-            .accounts
-            .iter()
-            .position(|a| a.name == control.name())?;
-        renames
-            .iter()
-            .find(|(index, _)| *index == first)
-            .map(|(_, rename)| rename.to.clone())
-    });
+    /// Restore unique account names on a config that has duplicates, in memory AND
+    /// on disk, once.
+    ///
+    /// Never refuses. A loader that rejected a duplicated config would take the
+    /// whole fleet down the moment it upgraded — the config is what it is, and it
+    /// was written by earlier `tcr` builds that permitted it. So: rename, log a line
+    /// per rename, continue. The durable write failing is recorded on
+    /// [`Config::rename_write_error`] rather than returned, because a server has to
+    /// boot either way; the CLI's own load ([`crate::cli::load_for_edit`]) reads
+    /// that field and refuses to run an edit verb on top of it, since a rename that
+    /// never reached disk is one every future process re-derives.
+    fn migrate_duplicate_names(&mut self, path: &Path, file_index: &[usize]) {
+        let renames = plan_renames(&self.accounts);
+        if renames.is_empty() {
+            return;
+        }
 
-    // Both channels, deliberately, matching what `main.rs` already does for the
-    // legacy-`throttle` migration a dozen lines from its own call to this.
-    // `tracing` alone reaches nobody here: a CLI verb never installs a
-    // subscriber at all, and `run_server` loads the config BEFORE
-    // `init_tracing`, so the tracing line is dropped on the floor on every path
-    // that can reach this code. Renaming a person's accounts under them is the
-    // last thing that may happen silently.
-    let say = |line: &str| {
-        tracing::warn!("{line}");
-        eprintln!("[tcr] {line}");
-    };
+        // The control account, if it names a duplicated row, currently resolves to
+        // the FIRST row in file order carrying that name — that is what the running
+        // server does with it today, so that is the row it must keep pointing at.
+        let control_rename = self.control_account.as_ref().and_then(|control| {
+            let first = self
+                .accounts
+                .iter()
+                .position(|a| a.name == control.name())?;
+            renames
+                .iter()
+                .find(|(index, _)| *index == first)
+                .map(|(_, rename)| rename.to.clone())
+        });
 
-    for (index, rename) in &renames {
-        let where_from = match &rename.org {
-            Some(org) => format!("org {org}"),
-            None => "no org on file".to_string(),
+        // Both channels, deliberately, matching what `main.rs` already does for the
+        // legacy-`throttle` migration a dozen lines from its own call to this.
+        // `tracing` alone reaches nobody here: a CLI verb never installs a
+        // subscriber at all, and `run_server` loads the config BEFORE
+        // `init_tracing`, so the tracing line is dropped on the floor on every path
+        // that can reach this code. Renaming a person's accounts under them is the
+        // last thing that may happen silently.
+        let say = |line: &str| {
+            tracing::warn!("{line}");
+            eprintln!("[tcr] {line}");
         };
-        say(&format!(
-            "renamed account: {} -> {} ({where_from})",
-            rename.from, rename.to
-        ));
-        config.accounts[*index].name.clone_from(&rename.to);
-    }
-    if let Some(name) = &control_rename {
-        say(&format!(
-            "control account followed the rename to '{name}' — it named the first row in file \
-             order, which is the row the server resolved it to"
-        ));
-        config.control_account = Some(ControlAccountRef::Name(name.clone()));
-    }
 
-    let writes: Vec<(usize, &str)> = renames
-        .iter()
-        .filter_map(|(index, rename)| Some((*file_index.get(*index)?, rename.to.as_str())))
-        .collect();
-    if writes.len() != renames.len() {
-        config.rename_write_error =
-            Some("could not map every renamed account back to its entry in the file".to_string());
-    } else if let Err(err) = save_renames(path, &writes, control_rename.as_deref()) {
-        tracing::error!(error = %err, "could not persist the account renames");
-        eprintln!("[tcr] could not persist the account renames: {err}");
-        config.rename_write_error = Some(err.to_string());
-    }
+        for (index, rename) in &renames {
+            let where_from = match &rename.org {
+                Some(org) => format!("org {org}"),
+                None => "no org on file".to_string(),
+            };
+            say(&format!(
+                "renamed account: {} -> {} ({where_from})",
+                rename.from, rename.to
+            ));
+            self.accounts[*index].name.clone_from(&rename.to);
+        }
+        if let Some(name) = &control_rename {
+            say(&format!(
+                "control account followed the rename to '{name}' — it named the first row in file \
+                 order, which is the row the server resolved it to"
+            ));
+            self.control_account = Some(ControlAccountRef::Name(name.clone()));
+        }
 
-    config.renamed_accounts = renames.into_iter().map(|(_, rename)| rename).collect();
+        let writes: Vec<(usize, &str)> = renames
+            .iter()
+            .filter_map(|(index, rename)| Some((*file_index.get(*index)?, rename.to.as_str())))
+            .collect();
+        if writes.len() != renames.len() {
+            self.rename_write_error = Some(
+                "could not map every renamed account back to its entry in the file".to_string(),
+            );
+        } else if let Err(err) = save_renames(path, &writes, control_rename.as_deref()) {
+            tracing::error!(error = %err, "could not persist the account renames");
+            eprintln!("[tcr] could not persist the account renames: {err}");
+            self.rename_write_error = Some(err.to_string());
+        }
+
+        self.renamed_accounts = renames.into_iter().map(|(_, rename)| rename).collect();
+    }
 }
 
 /// The rename each duplicated-name account needs, as `(index into `accounts`,

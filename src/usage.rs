@@ -595,20 +595,22 @@ struct DecodedDay {
 /// checked decoder, independently of account resolution, and the day's hours marked
 /// covered only when the file was present, complete and clean.
 fn history_day(history: &mut crate::forecast::History, day: &DecodedDay, date: Date, now_ms: i64) {
-    history.partial |= !day.complete || day.malformed != 0;
+    if !day.complete || day.malformed != 0 {
+        history.mark_partial();
+    }
     for line in &day.lines {
         if line
             .p
             .as_deref()
             .is_some_and(|p| Provider::from_name(p).is_none())
         {
-            history.partial = true;
+            history.mark_partial();
             continue;
         }
         if let Some(record) = ledger_record(line, line_provider(line)) {
             history.record(&record);
         } else {
-            history.partial = true;
+            history.mark_partial();
         }
     }
     if day.present && day.complete && day.malformed == 0 {
@@ -1731,8 +1733,11 @@ impl UsageTracker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Sticky until the next boot: a dropped line or a failed write is missing from
         // the history for good, and a handoff rebuild no longer replaces the history.
-        history.partial |= self.dropped_lines() != 0
-            || (self.is_attached() && !self.healthy.load(Ordering::Relaxed));
+        if self.dropped_lines() != 0
+            || (self.is_attached() && !self.healthy.load(Ordering::Relaxed))
+        {
+            history.mark_partial();
+        }
         history.estimates(now_ms)
     }
 
