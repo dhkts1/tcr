@@ -1071,7 +1071,7 @@ async fn predecessor_closed(channel: std::os::unix::net::UnixStream) -> std::io:
 
 /// Give the server a request key ([`crate::request_key`]) when its config has none:
 /// generate one and write it to the config file through the targeted writer
-/// ([`crate::config::save_request_key`]), then hold whatever the file now says.
+/// ([`Config::persist_request_key`]), then hold whatever the file now says.
 ///
 /// Only with a file to write. A key the server held and the file did not would
 /// be one `tcr request-key` cannot print, so a launcher could never present it;
@@ -1081,12 +1081,7 @@ async fn predecessor_closed(channel: std::os::unix::net::UnixStream) -> std::io:
 ///
 /// One boot line says a key was written or adopted. It never carries the key.
 pub(crate) fn ensure_request_key(config: &mut Config, persist_path: Option<&std::path::Path>) {
-    if config
-        .proxy
-        .request_key
-        .as_deref()
-        .is_some_and(|key| !key.is_empty())
-    {
+    if config.holds_request_key() {
         return;
     }
     let Some(path) = persist_path else {
@@ -1099,20 +1094,18 @@ pub(crate) fn ensure_request_key(config: &mut Config, persist_path: Option<&std:
             return;
         }
     };
-    match crate::config::save_request_key(path, &candidate) {
-        Ok(crate::config::RequestKeyWrite::Written(key)) => {
+    match config.persist_request_key(path, &candidate) {
+        Ok(crate::config::RequestKeyWrite::Written(_)) => {
             tracing::info!(
                 path = %path.display(),
                 "request key: generated one and saved it to the config (`tcr request-key` prints it)"
             );
-            config.proxy.request_key = Some(key);
         }
-        Ok(crate::config::RequestKeyWrite::AlreadyPresent(key)) => {
+        Ok(crate::config::RequestKeyWrite::AlreadyPresent(_)) => {
             tracing::info!(
                 path = %path.display(),
                 "request key: the config gained one since it was loaded; using that"
             );
-            config.proxy.request_key = Some(key);
         }
         Err(err) => tracing::warn!(
             path = %path.display(),

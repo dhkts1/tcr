@@ -14,7 +14,7 @@
 //! `proxy.apiKey`: that one gates the `/_tcr/` control routes, and a container
 //! forwarder that holds the request key must not get control access with it.
 //! The server writes one at boot when the file has none ([`generate`],
-//! `config::save_request_key`); `tcr request-key` prints it and never writes one,
+//! `Config::persist_request_key`); `tcr request-key` prints it and never writes one,
 //! so the CLI and the server cannot hold two different keys.
 //!
 //! A caller presents it in one of four places, all read by ONE parse

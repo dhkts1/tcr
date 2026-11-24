@@ -32,7 +32,6 @@ pub(crate) use edit::{CODEX_SYNC_PENDING_KEY, save_codex_token_sync_pending};
 pub use edit::{
     ControlWrite, DisabledWrite, DocEdit, Edit, GroupWrite, PlanWrite, RequestKeyWrite,
     read_request_key, save_control_account, save_disabled, save_group_membership, save_plan,
-    save_request_key,
 };
 pub use file::save;
 pub(crate) use file::{Durability, read_document, write_atomic, write_atomic_with};
@@ -292,7 +291,7 @@ pub struct ProxyConfig {
     /// The request key ([`crate::request_key`]): what a caller presents to say
     /// it was launched on purpose. Separate from [`Self::api_key`], which gates
     /// the `/_tcr/` control routes. The server writes one at boot when the file
-    /// has none ([`save_request_key`]); absent, behaviour is exactly as before.
+    /// has none ([`Config::persist_request_key`]); absent, behaviour is exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_key: Option<String>,
     /// Any `proxy.*` keys we do not model, preserved verbatim on save.
