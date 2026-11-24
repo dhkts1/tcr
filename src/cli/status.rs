@@ -173,10 +173,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                 // way, so this is the same reading a live server would derive
                 // at boot.
                 let http1_only = config.http1_only;
-                let control = config
-                    .control_account
-                    .as_ref()
-                    .map(|c| c.name().to_string());
+                let control = config.control_account_name().map(str::to_string);
                 let group_colors = config.group_colors();
                 let prober = LiveUsageProber::new().with_codex_base(config.codex_upstream.clone());
                 let snapshot =

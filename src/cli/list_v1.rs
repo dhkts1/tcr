@@ -62,10 +62,7 @@ pub(super) async fn render_list_v1(
     // Every account in the file, in file order, with nothing measured.
     let thresholds = resolve_thresholds(&config);
     let http1_only = config.http1_only;
-    let control = config
-        .control_account
-        .as_ref()
-        .map(|c| c.name().to_string());
+    let control = config.control_account_name().map(str::to_string);
     let group_colors = config.group_colors();
     let snapshot = snapshot_offline(config, Arc::new(NoRefresh), prober, false).await;
     let file_rows = account_status_rows(

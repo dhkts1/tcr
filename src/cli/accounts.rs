@@ -491,10 +491,7 @@ pub async fn show_control(config_path: &Path) -> anyhow::Result<()> {
     let config = load_config(config_path)?;
     let control = match fetch_live_status(&config).await {
         Ok(payload) => payload.control,
-        Err(_) => config
-            .control_account
-            .as_ref()
-            .map(|c| c.name().to_string()),
+        Err(_) => config.control_account_name().map(str::to_string),
     };
     match control {
         Some(name) => println!("{name}"),

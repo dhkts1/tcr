@@ -94,12 +94,7 @@ pub(super) fn control_account_group_notice(
     account: &str,
     group: &str,
 ) -> Option<String> {
-    if config
-        .control_account
-        .as_ref()
-        .map(config::ControlAccountRef::name)
-        != Some(account)
-    {
+    if config.control_account_name() != Some(account) {
         return None;
     }
     Some(format!(
@@ -840,11 +835,7 @@ fn group_route_block(config: &Config, group: &str, members: &[&str]) -> Option<&
     if anthropic.is_empty() {
         return Some(ROUTE_BLOCK_CODEX_ONLY);
     }
-    let routes = match config
-        .control_account
-        .as_ref()
-        .map(config::ControlAccountRef::name)
-    {
+    let routes = match config.control_account_name() {
         Some(control) => {
             anthropic.iter().any(|member| *member != control) || config.group_allows_control(group)
         }

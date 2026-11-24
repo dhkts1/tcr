@@ -63,4 +63,11 @@ impl Config {
     pub fn holds_provider(&self, provider: crate::provider::Provider) -> bool {
         self.accounts.iter().any(|a| a.provider == provider)
     }
+
+    /// The name `controlAccount` names, in either of its shapes; `None` when unset.
+    pub fn control_account_name(&self) -> Option<&str> {
+        self.control_account
+            .as_ref()
+            .map(super::ControlAccountRef::name)
+    }
 }
