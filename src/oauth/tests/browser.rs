@@ -560,3 +560,50 @@ fn a_name_override_wins_over_the_profile_email() {
     .unwrap();
     assert_eq!(name, "carol-personal");
 }
+
+// --- the `unnamed` fallback ---------------------------------------------
+
+/// An `Account` carrying nothing but a name — the only field
+/// [`unnamed_fallback`] reads.
+fn named_account(name: &str) -> Account {
+    Account {
+        access_token: "at-placeholder".to_string(),
+        refresh_token: None,
+        expires_at: None,
+        priority: None,
+        ..Account::fixture(name)
+    }
+}
+
+#[test]
+fn unnamed_fallback_is_plain_unnamed_when_free() {
+    assert_eq!(unnamed_fallback(&[]), "unnamed");
+    assert_eq!(
+        unnamed_fallback(&[named_account("alice@example.com")]),
+        "unnamed"
+    );
+}
+
+/// The collision case, and the reason this function exists at all: an
+/// inference-only account has no email and no uuid, so `identity::resolve`
+/// can only match it by NAME. Handing out `unnamed` twice would resolve the
+/// second login onto the first row and overwrite its token instead of
+/// adding an account.
+#[test]
+fn unnamed_fallback_skips_taken_names() {
+    assert_eq!(unnamed_fallback(&[named_account("unnamed")]), "unnamed-2");
+    assert_eq!(
+        unnamed_fallback(&[named_account("unnamed"), named_account("unnamed-2")]),
+        "unnamed-3"
+    );
+}
+
+/// Gaps are filled rather than skipped past — the name is chosen by
+/// scanning for the first FREE suffix, never by counting rows, so removing
+/// `unnamed-2` and adding an account reuses that slot instead of colliding
+/// with `unnamed-3`. A count-derived fallback gets this wrong.
+#[test]
+fn unnamed_fallback_fills_a_gap_left_by_a_removed_account() {
+    let accounts = [named_account("unnamed"), named_account("unnamed-3")];
+    assert_eq!(unnamed_fallback(&accounts), "unnamed-2");
+}

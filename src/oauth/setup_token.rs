@@ -78,62 +78,6 @@ pub(super) fn parse_setup_token(input: &str) -> anyhow::Result<String> {
     Ok(token)
 }
 
-/// Add an account from a `claude setup-token` credential instead of the
-/// browser flow. Reuses every downstream layer [`login`] does — the same
-/// [`admit_login`] guard against a live server, the same [`fetch_profile`] /
-/// [`finish_login`] pipeline — and replaces only the browser half: instead of
-/// a PKCE round trip, the access token is read from stdin
-/// ([`read_setup_token`]) and wrapped in a [`Tokens`] with `refresh_token:
-/// None` — a setup-token mint carries only the `user:inference` scope, and
-/// the Claude CLI that produces it never surfaces its refresh token to the
-/// caller, so there is genuinely nothing to store.
-///
-/// `--account` is refused up front (before the port probe or the
-/// stdin read): an inference-only token carries no identity for
-/// [`assert_requested_identity`] to confirm, and an assertion that cannot be
-/// evaluated must fail closed rather than pass — so this calls [`finish_login`]
-/// directly, never `finish_login_checked`.
-///
-/// Because the scope is inference-only, [`fetch_profile`] will very likely
-/// come back all-`None` (no email, no org) — expected, not an error. The
-/// account name falls back to `--name`, then a prompt, exactly like the
-/// browser flow's own fallback ([`prompt_account_name`]).
-///
-/// Always prints [`crate::proxy::NO_REFRESH_TOKEN_WARNING`] on success: this
-/// account serves until its (assumed) one-year expiry and then goes dead,
-/// with nothing to renew it, and — unlike the live-add wire route — this
-/// offline path has no other caller that would say so.
-/// The name a setup-token account falls back to when the operator declines to
-/// type one: `unnamed`, or the first free `unnamed-N` when that is taken.
-///
-/// Deliberately NOT the browser flow's `account-{len+1}` fallback. That one is
-/// derived from the account COUNT, so removing a row and adding another hands
-/// out a name already in use — harmless for a credential that carries an email
-/// and a uuid to be resolved by, and not harmless here. A setup-token account
-/// has neither (the scope is inference-only), so
-/// [`crate::identity::resolve`] can only match it on its NAME: two accounts
-/// sharing one would resolve onto the same row, and the second login would
-/// overwrite the first one's token instead of adding an account.
-///
-/// Scanning for the first free suffix rather than counting is what makes that
-/// structurally impossible instead of merely unlikely.
-pub(super) fn unnamed_fallback(accounts: &[Account]) -> String {
-    const BASE: &str = "unnamed";
-    if !accounts.iter().any(|a| a.name == BASE) {
-        return BASE.to_string();
-    }
-    // Start at 2: `unnamed` itself is the first, so the next one a human reads
-    // should be `unnamed-2`, not `unnamed-1`.
-    let mut n: u64 = 2;
-    loop {
-        let candidate = format!("{BASE}-{n}");
-        if !accounts.iter().any(|a| a.name == candidate) {
-            return candidate;
-        }
-        n = n.saturating_add(1);
-    }
-}
-
 /// What one authenticated call said about a pasted setup token, before it is
 /// written anywhere.
 #[derive(Debug, PartialEq, Eq)]
@@ -184,6 +128,31 @@ pub async fn verify_setup_token(upstream: &str, access_token: &str) -> SetupToke
     }
 }
 
+/// Add an account from a `claude setup-token` credential instead of the
+/// browser flow. Reuses every downstream layer [`login`] does — the same
+/// [`admit_login`] guard against a live server, the same [`fetch_profile`] /
+/// [`finish_login`] pipeline — and replaces only the browser half: instead of
+/// a PKCE round trip, the access token is read from stdin
+/// ([`read_setup_token`]) and wrapped in a [`Tokens`] with `refresh_token:
+/// None` — a setup-token mint carries only the `user:inference` scope, and
+/// the Claude CLI that produces it never surfaces its refresh token to the
+/// caller, so there is genuinely nothing to store.
+///
+/// `--account` is refused up front (before the port probe or the
+/// stdin read): an inference-only token carries no identity for
+/// [`assert_requested_identity`] to confirm, and an assertion that cannot be
+/// evaluated must fail closed rather than pass — so this calls [`finish_login`]
+/// directly, never `finish_login_checked`.
+///
+/// Because the scope is inference-only, [`fetch_profile`] will very likely
+/// come back all-`None` (no email, no org) — expected, not an error. The
+/// account name falls back to `--name`, then a prompt, exactly like the
+/// browser flow's own fallback ([`prompt_account_name`]).
+///
+/// Always prints [`crate::proxy::NO_REFRESH_TOKEN_WARNING`] on success: this
+/// account serves until its (assumed) one-year expiry and then goes dead,
+/// with nothing to renew it, and — unlike the live-add wire route — this
+/// offline path has no other caller that would say so.
 pub async fn login_with_token(
     config_path: &Path,
     force: bool,

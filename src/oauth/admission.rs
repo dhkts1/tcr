@@ -3,18 +3,6 @@
 
 use super::*;
 
-/// Where an admitted login writes its finished credential. The two routes the
-/// guard lets through; a refusal is not one of them (it is [`LoginRoute::Refuse`],
-/// which [`admit_login_against`] turns into an error), so code after admission
-/// cannot match on a refusal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WriteRoute {
-    /// Write the config file ([`LoginRoute::File`]).
-    File,
-    /// Post to the live proxy's add route ([`LoginRoute::Live`]).
-    Live,
-}
-
 /// What `login()` should do with the finished credential, decided purely from
 /// the incumbent detected on the guarded port, whether a probe already
 /// confirmed THAT incumbent carries the live account-add route, and
@@ -355,4 +343,20 @@ pub(super) async fn admit_login_against(
         pid,
         providers,
     })
+}
+
+/// [`import_codex_login`]'s refusal of a live proxy that did not name `codex`
+/// among the providers it can store. `pid` is the incumbent process detection
+/// found on the port, when it found one; `command` is the login that was run,
+/// named as the one to run again.
+pub(super) fn codex_live_route_refusal(port: u16, pid: Option<u32>, command: &str) -> String {
+    let pid = pid.map_or_else(|| "pid unknown".to_string(), |pid| format!("pid {pid}"));
+    format!(
+        "the proxy on :{port} ({pid}) predates Codex accounts and would store this login as a \
+         Claude account and send its token to Anthropic — nothing was written. Restart the proxy \
+         on this build (update TcrBar first if it supervises the proxy), then re-run `{command}`. \
+         --force does not get past this: it never trades a confirmed live route for a file \
+         write, and that proxy would refuse the file at its next start, or read it the same way \
+         if it is older still."
+    )
 }

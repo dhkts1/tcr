@@ -3,6 +3,18 @@
 
 use super::*;
 
+/// Where an admitted login writes its finished credential. The two routes the
+/// guard lets through; a refusal is not one of them (it is [`LoginRoute::Refuse`],
+/// which [`admit_login_against`] turns into an error), so code after admission
+/// cannot match on a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WriteRoute {
+    /// Write the config file ([`LoginRoute::File`]).
+    File,
+    /// Post to the live proxy's add route ([`LoginRoute::Live`]).
+    Live,
+}
+
 /// Add or update an OAuth account in `config`, keyed on `(account_uuid, org)`
 /// via [`identity::resolve`] — never a loose first-match — so the legacy
 /// two-org tie ([`identity::same_identity_strict`]) is broken the same way

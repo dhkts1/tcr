@@ -407,22 +407,6 @@ fn codex_workspace_refusal(refusal: crate::codex_login::WorkspaceRefusal) -> Log
     }
 }
 
-/// [`import_codex_login`]'s refusal of a live proxy that did not name `codex`
-/// among the providers it can store. `pid` is the incumbent process detection
-/// found on the port, when it found one; `command` is the login that was run,
-/// named as the one to run again.
-pub(super) fn codex_live_route_refusal(port: u16, pid: Option<u32>, command: &str) -> String {
-    let pid = pid.map_or_else(|| "pid unknown".to_string(), |pid| format!("pid {pid}"));
-    format!(
-        "the proxy on :{port} ({pid}) predates Codex accounts and would store this login as a \
-         Claude account and send its token to Anthropic — nothing was written. Restart the proxy \
-         on this build (update TcrBar first if it supervises the proxy), then re-run `{command}`. \
-         --force does not get past this: it never trades a confirmed live route for a file \
-         write, and that proxy would refuse the file at its next start, or read it the same way \
-         if it is older still."
-    )
-}
-
 /// The row of `config` this Codex login already is, resolved the way the write
 /// resolves its row: [`crate::identity::resolve`] over a Codex probe carrying the
 /// login's email, its ChatGPT user and its workspace, so only a Codex row of that

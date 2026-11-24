@@ -629,6 +629,37 @@ pub(super) fn mint_login_name(
     ))
 }
 
+/// The name a setup-token account falls back to when the operator declines to
+/// type one: `unnamed`, or the first free `unnamed-N` when that is taken.
+///
+/// Deliberately NOT the browser flow's `account-{len+1}` fallback. That one is
+/// derived from the account COUNT, so removing a row and adding another hands
+/// out a name already in use — harmless for a credential that carries an email
+/// and a uuid to be resolved by, and not harmless here. A setup-token account
+/// has neither (the scope is inference-only), so
+/// [`crate::identity::resolve`] can only match it on its NAME: two accounts
+/// sharing one would resolve onto the same row, and the second login would
+/// overwrite the first one's token instead of adding an account.
+///
+/// Scanning for the first free suffix rather than counting is what makes that
+/// structurally impossible instead of merely unlikely.
+pub(super) fn unnamed_fallback(accounts: &[Account]) -> String {
+    const BASE: &str = "unnamed";
+    if !accounts.iter().any(|a| a.name == BASE) {
+        return BASE.to_string();
+    }
+    // Start at 2: `unnamed` itself is the first, so the next one a human reads
+    // should be `unnamed-2`, not `unnamed-1`.
+    let mut n: u64 = 2;
+    loop {
+        let candidate = format!("{BASE}-{n}");
+        if !accounts.iter().any(|a| a.name == candidate) {
+            return candidate;
+        }
+        n = n.saturating_add(1);
+    }
+}
+
 /// Whether `s` is plausibly an email address — no whitespace, and exactly one
 /// `@` with at least one character on each side. Deliberately not a full RFC
 /// 5322 validator: this only ever gates whether a value is safe to hand to
