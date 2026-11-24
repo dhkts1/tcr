@@ -61,6 +61,7 @@ use crate::manager::{
 };
 use crate::provider::Provider;
 use crate::quota::{UnifiedRejectionKind, quota_rejections};
+use crate::request_key::key_matches;
 use crate::stats::{GateReason, SessionKind};
 
 mod client_error;
@@ -6224,28 +6225,6 @@ async fn handle_request(
         strict_group,
         bound_to,
     )
-}
-
-/// Length-independent comparison of the presented key against the configured
-/// one. It never returns early on a length mismatch, so the loop count depends
-/// only on the *presented* key's length (attacker-controlled) and never reveals
-/// the configured key's length via timing. The length delta is folded into the
-/// accumulator so a matching-prefix but wrong-length key still compares unequal.
-pub(crate) fn key_matches(provided: Option<&str>, expected: &str) -> bool {
-    let Some(provided) = provided else {
-        return false;
-    };
-    let (a, b) = (provided.as_bytes(), expected.as_bytes());
-    // Seed the accumulator with the length mismatch instead of branching on it
-    // (a bare `as u8` truncation would alias e.g. 256 vs 0, so reduce to 0/1).
-    let mut diff: u8 = u8::from(a.len() != b.len());
-    for (i, &x) in a.iter().enumerate() {
-        // Read past the configured key's end as 0 rather than short-circuiting;
-        // the length delta above already forces a non-match in that case.
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Why [`read_capped_body`] stopped short of a full buffer.

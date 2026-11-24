@@ -42,7 +42,7 @@
 //! Codex's HTTP client passes proxy URL userinfo to reqwest; its WebSocket client enables
 //! the pinned Tungstenite forks' proxy support (`openai/codex` `http-client/src/outbound_proxy.rs`,
 //! `websocket-client/src/dialer.rs`, `Cargo.toml`). Both send that userinfo as HTTP CONNECT
-//! [`CODEX_PROXY_AUTHORIZATION`]. The pinned Tungstenite `proxy.rs`
+//! [`crate::request_key::CODEX_PROXY_AUTHORIZATION`]. The pinned Tungstenite `proxy.rs`
 //! parses a username without a password and builds the same Basic header as reqwest's
 //! hyper-util matcher. This permits one listener without terminating another client's
 //! `chatgpt.com` TLS. The marker selects routing; it is not an authentication secret.
@@ -60,7 +60,7 @@ use tower::ServiceExt as _;
 use tracing::instrument::WithSubscriber as _;
 
 use crate::manager::Manager;
-use crate::request_key::{ConnectClass, ProxyCredential, Unkeyed};
+use crate::request_key::{CODEX_PROXY_USERNAME, ConnectClass, ProxyCredential, Unkeyed};
 
 /// Hosts we intend to MITM-terminate + inject tokens for — a POLICY list, not
 /// a firewall (everything else on `CONNECT` is blind-tunneled, no
@@ -95,14 +95,6 @@ use crate::request_key::{ConnectClass, ProxyCredential, Unkeyed};
 /// Peer egress has its own narrower list ([`crate::peer::egress::PEER_EGRESS_HOSTS`]);
 /// adding a local interception host grants no LAN gateway access to it.
 pub const ALLOWED_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com", "chatgpt.com"];
-
-/// Proxy URL userinfo set by `tcr run --codex`, selecting Codex interception on CONNECT.
-/// This is a route marker, not process authentication. The launch makes shell-tool
-/// proxies empty through Codex's shell policy; explicit MCP proxy env and other
-/// helper processes can still inherit the marker and must opt out when needed.
-pub const CODEX_PROXY_USERNAME: &str = "tcr-codex";
-/// Basic encoding of `tcr-codex:` sent by both Codex transports, including an empty password.
-pub const CODEX_PROXY_AUTHORIZATION: &str = "Basic dGNyLWNvZGV4Og==";
 
 /// Does a proxy URL opt in to Codex interception? Used by the doctor without displaying userinfo.
 /// The username alone decides, as on a `CONNECT` ([`ProxyCredential::codex_marked`]): a keyed

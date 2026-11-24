@@ -23,7 +23,7 @@
 //! - `Proxy-Authorization: Basic base64(<user>:<key>)` on a `CONNECT`, which is
 //!   what `HTTPS_PROXY=http://<user>:<key>@127.0.0.1:<port>` makes a client send.
 //!   The username stays the route marker it already was: `tcr-codex` selects
-//!   Codex interception ([`crate::mitm::CODEX_PROXY_USERNAME`]), with or without
+//!   Codex interception ([`CODEX_PROXY_USERNAME`]), with or without
 //!   a key in the password.
 //! - [`HEADER`] (`x-tcr-key: <key>`), for a base-URL client, which Claude Code
 //!   sends through `ANTHROPIC_CUSTOM_HEADERS`. Its own name, because `x-api-key`
@@ -71,6 +71,14 @@ impl RequestKeyMode {
         }
     }
 }
+
+/// Proxy URL userinfo set by `tcr run --codex`, selecting Codex interception on CONNECT.
+/// This is a route marker, not process authentication. The launch makes shell-tool
+/// proxies empty through Codex's shell policy; explicit MCP proxy env and other
+/// helper processes can still inherit the marker and must opt out when needed.
+pub const CODEX_PROXY_USERNAME: &str = "tcr-codex";
+/// Basic encoding of `tcr-codex:` sent by both Codex transports, including an empty password.
+pub const CODEX_PROXY_AUTHORIZATION: &str = "Basic dGNyLWNvZGV4Og==";
 
 /// What a caller presented, built ONCE at the edge: per `CONNECT` head in
 /// `mitm::handle_connect`, per plain request in `proxy::handle_request`. Every
@@ -125,7 +133,7 @@ impl ProxyCredential {
                 let Some((user, password)) = basic_user_password(value) else {
                     continue;
                 };
-                credential.codex_marked |= user == crate::mitm::CODEX_PROXY_USERNAME;
+                credential.codex_marked |= user == CODEX_PROXY_USERNAME;
                 credential.key_ok |= key_ok(Some(&password), request_key);
             } else if name.eq_ignore_ascii_case(HEADER) || name.eq_ignore_ascii_case("x-api-key") {
                 credential.key_ok |= key_ok(Some(value), request_key);
@@ -143,7 +151,29 @@ impl ProxyCredential {
 fn key_ok(provided: Option<&str>, request_key: Option<&str>) -> bool {
     request_key
         .filter(|key| !key.is_empty())
-        .is_some_and(|key| crate::proxy::key_matches(provided, key))
+        .is_some_and(|key| key_matches(provided, key))
+}
+
+/// Length-independent comparison of the presented key against the configured
+/// one. It never returns early on a length mismatch, so the loop count depends
+/// only on the *presented* key's length (attacker-controlled) and never reveals
+/// the configured key's length via timing. The length delta is folded into the
+/// accumulator so a matching-prefix but wrong-length key still compares unequal.
+pub(crate) fn key_matches(provided: Option<&str>, expected: &str) -> bool {
+    let Some(provided) = provided else {
+        return false;
+    };
+    let (a, b) = (provided.as_bytes(), expected.as_bytes());
+    // Seed the accumulator with the length mismatch instead of branching on it
+    // (a bare `as u8` truncation would alias e.g. 256 vs 0, so reduce to 0/1).
+    let mut diff: u8 = u8::from(a.len() != b.len());
+    for (i, &x) in a.iter().enumerate() {
+        // Read past the configured key's end as 0 rather than short-circuiting;
+        // the length delta above already forces a non-match in that case.
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// The `(user, password)` of a `Basic` credential (RFC 7617), scheme matched
@@ -461,7 +491,7 @@ mod tests {
     fn the_fixture_encoder_matches_the_codex_marker() {
         assert_eq!(
             format!("Basic {}", basic("tcr-codex:")),
-            crate::mitm::CODEX_PROXY_AUTHORIZATION
+            CODEX_PROXY_AUTHORIZATION
         );
     }
 
@@ -695,5 +725,49 @@ mod tests {
         );
         assert_eq!(ConnectClass::of("chatgpt.com"), ConnectClass::Chatgpt);
         assert_eq!(ConnectClass::of("example.com"), ConnectClass::Other);
+    }
+
+    /// `key_matches` behaviour is preserved after the length side-channel fix:
+    /// equal ⇔ true, and any mismatch (byte or length) ⇔ false.
+    #[test]
+    fn key_matches_equal_keys_true() {
+        assert!(key_matches(Some("sk-proxy-secret"), "sk-proxy-secret"));
+    }
+
+    #[test]
+    fn key_matches_unequal_same_length_false() {
+        // Same length, one byte differs.
+        assert!(!key_matches(Some("sk-proxy-secreu"), "sk-proxy-secret"));
+    }
+
+    #[test]
+    fn key_matches_different_length_false() {
+        // Shorter and longer than the configured key, incl. a matching prefix.
+        assert!(!key_matches(Some("sk-proxy"), "sk-proxy-secret"));
+        assert!(!key_matches(
+            Some("sk-proxy-secret-extra"),
+            "sk-proxy-secret"
+        ));
+        assert!(!key_matches(Some("sk-proxy-secret"), "sk-proxy"));
+    }
+
+    #[test]
+    fn key_matches_edge_cases() {
+        assert!(
+            !key_matches(None, "sk-proxy-secret"),
+            "absent key never matches"
+        );
+        assert!(
+            key_matches(Some(""), ""),
+            "empty ⇔ empty (degenerate config)"
+        );
+        assert!(
+            !key_matches(Some("x"), ""),
+            "non-empty vs empty configured key"
+        );
+        assert!(
+            !key_matches(Some(""), "x"),
+            "empty vs non-empty configured key"
+        );
     }
 }
