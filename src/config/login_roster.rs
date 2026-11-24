@@ -1,6 +1,8 @@
 //! The account-list walks a login, an import, `tcr mint` and `tcr doctor` make
 //! over [`Config::accounts`], so none of them borrows the list to do it by hand.
 
+use std::collections::HashSet;
+
 use super::{Account, Config};
 use crate::identity::Resolved;
 
@@ -12,6 +14,11 @@ impl Config {
             Resolved::One(index) => self.accounts.get(index),
             Resolved::None | Resolved::Many => None,
         }
+    }
+
+    /// Every row's name: the names a new login must not take.
+    pub fn taken_names(&self) -> HashSet<String> {
+        self.accounts.iter().map(|a| a.name.clone()).collect()
     }
 
     /// Each Codex row's name beside the reserved groups it carries, sorted, in

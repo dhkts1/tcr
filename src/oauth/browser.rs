@@ -591,8 +591,7 @@ pub(super) fn mint_login_name(
     name_override: Option<&str>,
     ui: LoginUi,
 ) -> anyhow::Result<String> {
-    let taken: std::collections::HashSet<String> =
-        config.accounts.iter().map(|a| a.name.clone()).collect();
+    let taken = config.taken_names();
 
     if let Some(explicit) = name_override {
         if taken.contains(explicit) {
@@ -608,8 +607,7 @@ pub(super) fn mint_login_name(
     // A re-login keeps the row's own name: it IS the identity every pin, group
     // and `controlAccount` key already points at.
     if let Some(query) = requested_account {
-        let idx = config::resolve_account(&config.accounts, query)?;
-        return Ok(config.accounts[idx].name.clone());
+        return Ok(config.resolve_account(query)?.name.clone());
     }
 
     let base = match (&profile.email, ui) {
@@ -618,8 +616,8 @@ pub(super) fn mint_login_name(
         // defaults to on an empty answer, rather than prompting into a pipe
         // and reading EOF. A machine caller that wants a specific name passes
         // `--name`.
-        (None, LoginUi::Machine) => unnamed_fallback(&config.accounts),
-        (None, LoginUi::Terminal) => prompt_account_name(&unnamed_fallback(&config.accounts)),
+        (None, LoginUi::Machine) => unnamed_fallback(&taken),
+        (None, LoginUi::Terminal) => prompt_account_name(&unnamed_fallback(&taken)),
     };
     Ok(crate::identity::mint_name(
         &base,
@@ -643,9 +641,9 @@ pub(super) fn mint_login_name(
 ///
 /// Scanning for the first free suffix rather than counting is what makes that
 /// structurally impossible instead of merely unlikely.
-pub(super) fn unnamed_fallback(accounts: &[Account]) -> String {
+pub(super) fn unnamed_fallback(taken: &std::collections::HashSet<String>) -> String {
     const BASE: &str = "unnamed";
-    if !accounts.iter().any(|a| a.name == BASE) {
+    if !taken.contains(BASE) {
         return BASE.to_string();
     }
     // Start at 2: `unnamed` itself is the first, so the next one a human reads
@@ -653,7 +651,7 @@ pub(super) fn unnamed_fallback(accounts: &[Account]) -> String {
     let mut n: u64 = 2;
     loop {
         let candidate = format!("{BASE}-{n}");
-        if !accounts.iter().any(|a| a.name == candidate) {
+        if !taken.contains(&candidate) {
             return candidate;
         }
         n = n.saturating_add(1);
