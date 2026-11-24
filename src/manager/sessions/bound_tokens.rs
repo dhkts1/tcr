@@ -327,7 +327,7 @@ impl Manager {
     }
 
     /// Consume the dirty flag: `true` when something changed since the last call.
-    pub fn take_bound_tokens_dirty(&self) -> bool {
+    fn take_bound_tokens_dirty(&self) -> bool {
         self.bound_tokens_file.take()
     }
 
@@ -819,14 +819,27 @@ impl Manager {
 
     /// The flusher's save: [`Self::flush_bound_tokens`] unless the map is what the last write
     /// put on disk. Every change here is one a restart needs, so nothing is deferred.
+    ///
+    /// Clears the dirty flag FIRST, as [`Self::flush_affinity_if_changed`] does, so a record
+    /// that lands after it is what [`Self::flush_bound_tokens_if_dirty`] writes at shutdown.
     pub fn flush_bound_tokens_if_changed(
         &self,
         path: &Path,
     ) -> Result<crate::save_gate::SaveOutcome, ConfigError> {
+        self.take_bound_tokens_dirty();
         let prepared = bound_tokens::prepare(self.bound_token_snapshot())?;
         let content = prepared.content_hash()?;
         self.bound_tokens_file
             .save_if_changed((content, content), || prepared.write(path, crate::now_ms()))
+    }
+
+    /// The shutdown save: [`Self::flush_bound_tokens`] when the map changed since the last
+    /// save took the dirty flag, `Ok(None)` for a clean map, which writes nothing.
+    pub fn flush_bound_tokens_if_dirty(&self, path: &Path) -> Result<Option<usize>, ConfigError> {
+        if !self.take_bound_tokens_dirty() {
+            return Ok(None);
+        }
+        self.flush_bound_tokens(path).map(Some)
     }
 
     /// Restore the map from `path`, resolving each stored identity against the accounts loaded

@@ -843,18 +843,9 @@ impl SavedCache {
         path: &std::path::Path,
     ) -> Result<crate::save_gate::SaveOutcome, crate::config::ConfigError> {
         match self {
-            Self::Affinity => {
-                manager.take_affinity_dirty();
-                manager.flush_affinity_if_changed(path)
-            }
-            Self::BoundTokens => {
-                manager.take_bound_tokens_dirty();
-                manager.flush_bound_tokens_if_changed(path)
-            }
-            Self::WireSessions => {
-                manager.take_wire_sessions_dirty();
-                manager.flush_wire_sessions_if_changed(path)
-            }
+            Self::Affinity => manager.flush_affinity_if_changed(path),
+            Self::BoundTokens => manager.flush_bound_tokens_if_changed(path),
+            Self::WireSessions => manager.flush_wire_sessions_if_changed(path),
         }
     }
 
@@ -891,8 +882,7 @@ impl SavedCache {
         match self {
             Self::Affinity if !manager.session_affinity_enabled() => Ok(None),
             Self::Affinity => manager.flush_affinity(path).map(Some),
-            Self::BoundTokens if !manager.take_bound_tokens_dirty() => Ok(None),
-            Self::BoundTokens => manager.flush_bound_tokens(path).map(Some),
+            Self::BoundTokens => manager.flush_bound_tokens_if_dirty(path),
             Self::WireSessions => manager.flush_wire_sessions(path).map(Some),
         }
     }

@@ -40,7 +40,7 @@ impl Manager {
     }
 
     /// Consume the dirty flag: `true` when something changed since the last call.
-    pub fn take_affinity_dirty(&self) -> bool {
+    fn take_affinity_dirty(&self) -> bool {
         self.affinity_file.take()
     }
 
@@ -174,7 +174,11 @@ impl Manager {
     /// write put on disk, by the rule [`crate::save_gate`] states. A save that would write the
     /// same pins writes nothing, and one that would only move touch times waits until
     /// [`crate::manager::AFFINITY_TOUCH_REFRESH`] has passed since the last write.
+    ///
+    /// Clears the dirty flag FIRST, before the snapshot, so a change that lands while the
+    /// write runs leaves the flag up for the next save to see.
     pub fn flush_affinity_if_changed(&self, path: &Path) -> Result<SaveOutcome, ConfigError> {
+        self.take_affinity_dirty();
         let pins = self.affinity_pin_snapshot();
         self.affinity_file
             .save_if_changed(affinity::save_hashes(&pins)?, || {

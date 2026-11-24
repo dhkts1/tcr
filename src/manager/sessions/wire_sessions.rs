@@ -401,7 +401,7 @@ impl Manager {
     }
 
     /// Consume the dirty flag: `true` when something changed since the last call.
-    pub fn take_wire_sessions_dirty(&self) -> bool {
+    fn take_wire_sessions_dirty(&self) -> bool {
         self.wire_sessions_file.take()
     }
 
@@ -423,10 +423,13 @@ impl Manager {
     /// last write put on disk, by the rule [`crate::save_gate`] states. A new or departed
     /// session is written at once; a change to the sessions already on disk waits until
     /// [`crate::manager::WIRE_SESSIONS_REFRESH`] has passed since the last write.
+    ///
+    /// Clears the dirty flag FIRST, as [`Self::flush_affinity_if_changed`] does.
     pub fn flush_wire_sessions_if_changed(
         &self,
         path: &Path,
     ) -> Result<crate::save_gate::SaveOutcome, config::ConfigError> {
+        self.take_wire_sessions_dirty();
         let now_ms = crate::now_ms();
         let sessions = self.wire_sessions_to_save(now_ms);
         self.wire_sessions_file
