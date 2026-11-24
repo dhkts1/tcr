@@ -2,6 +2,17 @@
 
 use crate::manager::*;
 
+/// A client signed in as another account than the control account, as
+/// [`Manager::foreign_client`] found it: the two names the refusal and the log
+/// line show, and whether this is the first sight of the bearer, which alone
+/// writes the warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignClient {
+    pub control_email: String,
+    pub client_shown: String,
+    pub first_warning: bool,
+}
+
 /// What [`Manager::set_control_by_query`] did. Same shape as
 /// [`SetDisabledOutcome`], with one difference: a `None` query is a legitimate
 /// request (clear the control account), not a missing argument, so `Applied`'s
@@ -125,9 +136,33 @@ impl Manager {
         })
     }
 
-    /// The resolved-client-identity cache the check reads and fills.
-    pub const fn client_identities(&self) -> &crate::control_identity::ClientIdentityCache {
-        &self.client_identities
+    /// The `controlIdentity` question the proxy asks of a client bearer: is it
+    /// signed in as an account other than the control account? `Some` only on a
+    /// [`Verdict::Mismatch`](crate::control_identity::Verdict); `None` when no
+    /// control account is set, when the bearer did not resolve (logged at debug,
+    /// fail-open), or when it matches. The bearer is resolved through
+    /// `{upstream}/api/oauth/profile` and cached in `client_identities`; the
+    /// first-warning flag is taken only on a mismatch, so a matching client never
+    /// spends it.
+    pub async fn foreign_client(&self, bearer: &str) -> Option<ForeignClient> {
+        use crate::control_identity::{Verdict, verdict};
+
+        let control = self.control_identity_target()?;
+        let profile_url = format!("{}/api/oauth/profile", self.upstream());
+        let Some(client) = self.client_identities.resolve(&profile_url, bearer).await else {
+            tracing::debug!(
+                "control identity: client bearer did not resolve to an identity; serving"
+            );
+            return None;
+        };
+        let Verdict::Mismatch(client) = verdict(&control, &client) else {
+            return None;
+        };
+        Some(ForeignClient {
+            control_email: crate::identity::email_of(&control.name).to_string(),
+            client_shown: client.display(),
+            first_warning: self.client_identities.first_warning(bearer).await,
+        })
     }
 
     /// Persist ONLY the top-level `controlAccount` key, via

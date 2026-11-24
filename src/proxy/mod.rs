@@ -1611,28 +1611,14 @@ fn client_bearer_of(headers: &HeaderMap) -> Option<&str> {
 /// debug and the request is served.
 async fn refuse_foreign_client(manager: &Manager, bearer: &str) -> Option<Response> {
     use crate::config::ControlIdentityMode;
-    use crate::control_identity::{Verdict, verdict};
 
     let mode = manager.control_identity();
     if mode == ControlIdentityMode::Off {
         return None;
     }
-    let control = manager.control_identity_target()?;
-    let profile_url = format!("{}/api/oauth/profile", manager.upstream());
-    let Some(client) = manager
-        .client_identities()
-        .resolve(&profile_url, bearer)
-        .await
-    else {
-        tracing::debug!("control identity: client bearer did not resolve to an identity; serving");
-        return None;
-    };
-    let Verdict::Mismatch(client) = verdict(&control, &client) else {
-        return None;
-    };
-    let control_email = crate::identity::email_of(&control.name).to_string();
-    let client_shown = client.display();
-    if manager.client_identities().first_warning(bearer).await {
+    let foreign = manager.foreign_client(bearer).await?;
+    let (control_email, client_shown) = (foreign.control_email, foreign.client_shown);
+    if foreign.first_warning {
         tracing::warn!(
             client = %client_shown,
             control_account = %control_email,
