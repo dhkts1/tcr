@@ -8,8 +8,7 @@ use time::OffsetDateTime;
 
 use super::live_client::{LiveStatusError, fetch_live_status};
 use super::render::{
-    StatusSource, account_status_rows_at, render_accounts, resolve_thresholds, snapshot_offline,
-    status_rows_json,
+    StatusSource, account_status_rows_at, render_accounts, snapshot_offline, status_rows_json,
 };
 use super::{
     import_claude_code_login_if_empty, load_config, load_config_with_creation, warn_if_no_accounts,
@@ -164,7 +163,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                         config.proxy.port
                     );
                 }
-                let thresholds = resolve_thresholds(&config);
+                let thresholds = config.switch_thresholds();
                 // `config` is consumed by `snapshot_offline` below, so read
                 // `http1_only`/`control_account`/`group_colors` off it first —
                 // this is the config FILE's value, not a running server's

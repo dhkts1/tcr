@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::live_client::{LiveStatusError, fetch_live_status};
 use super::load_config;
-use super::render::{StatusSource, account_status_rows, resolve_thresholds, snapshot_offline};
+use super::render::{StatusSource, account_status_rows, snapshot_offline};
 use crate::oauth::NoRefresh;
 use crate::probe::{LiveUsageProber, UsageProber};
 use crate::provider::Provider;
@@ -60,7 +60,7 @@ pub(super) async fn render_list_v1(
     let proxy_port = config.proxy.port;
 
     // Every account in the file, in file order, with nothing measured.
-    let thresholds = resolve_thresholds(&config);
+    let thresholds = config.switch_thresholds();
     let http1_only = config.http1_only;
     let control = config.control_account_name().map(str::to_string);
     let group_colors = config.group_colors();

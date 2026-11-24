@@ -140,12 +140,7 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
 /// so a Codex account's priority says nothing about where a Claude account sits.
 /// In a fleet with no Codex account that is every account, as it always was.
 pub(super) fn priority_value(config: &Config, provider: Provider, priority: PriorityArg) -> i64 {
-    let existing = config
-        .accounts
-        .iter()
-        .filter(|a| a.provider == provider)
-        .filter_map(|a| a.priority)
-        .chain(std::iter::once(0));
+    let existing = config.priorities_of(provider).chain(std::iter::once(0));
     match priority {
         PriorityArg::N(n) => n,
         PriorityArg::First => existing.min().unwrap_or(0) - 1,

@@ -69,7 +69,7 @@ async fn render_accounts_emits_one_greppable_line_per_account() {
 #[tokio::test]
 async fn offline_status_reports_null_not_zero_hit_ratio() {
     let config = load_from(TWO_ACCOUNTS);
-    let thresholds = resolve_thresholds(&config);
+    let thresholds = config.switch_thresholds();
     let snapshot = snapshot_offline(
         config,
         Arc::new(NoRefresh),
@@ -163,7 +163,7 @@ async fn offline_status_reports_null_not_zero_hit_ratio() {
 #[tokio::test]
 async fn an_account_under_the_signal_floor_reports_no_signal_not_a_number() {
     let config = load_from(TWO_ACCOUNTS);
-    let thresholds = resolve_thresholds(&config);
+    let thresholds = config.switch_thresholds();
     let snapshot = snapshot_offline(
         config,
         Arc::new(NoRefresh),
@@ -232,7 +232,7 @@ async fn an_account_under_the_signal_floor_reports_no_signal_not_a_number() {
 #[tokio::test]
 async fn offline_status_reports_null_not_zero_stream_errors() {
     let config = load_from(TWO_ACCOUNTS);
-    let thresholds = resolve_thresholds(&config);
+    let thresholds = config.switch_thresholds();
     let snapshot = snapshot_offline(
         config,
         Arc::new(NoRefresh),
@@ -443,7 +443,7 @@ async fn live_status_shows_a_codex_accounts_provider_and_chatgpt_plan() {
 #[tokio::test]
 async fn offline_rows_report_a_null_server_sha() {
     let config = load_from(TWO_ACCOUNTS);
-    let thresholds = resolve_thresholds(&config);
+    let thresholds = config.switch_thresholds();
     let snapshot = snapshot_offline(
         config,
         Arc::new(NoRefresh),
@@ -585,7 +585,7 @@ async fn free_in_names_the_instant_and_is_omitted_when_none_can_be_promised() {
     // WindowProber gates alice on 5h (~+92m) and bob on 7d (+3d) — real gates
     // with known resets, so account_gate yields a free_at for both.
     let config = load_from(TWO_ACCOUNTS);
-    let thresholds = resolve_thresholds(&config);
+    let thresholds = config.switch_thresholds();
     let gated = snapshot_offline(config, Arc::new(NoRefresh), Arc::new(WindowProber), true).await;
     let text = render_accounts(&gated, StatusSource::Live);
     for line in text.lines() {
@@ -682,7 +682,7 @@ async fn render_accounts_shows_held_window_and_reset_for_over_threshold_accounts
     // 3a: a held account's binding window carries an inline `(+countdown)`,
     // gated on the same per-account threshold `eligible` uses.
     let config = load_from(TWO_ACCOUNTS);
-    let thresholds = resolve_thresholds(&config);
+    let thresholds = config.switch_thresholds();
     let snapshot =
         snapshot_offline(config, Arc::new(NoRefresh), Arc::new(WindowProber), true).await;
     let text = render_accounts(&snapshot, StatusSource::Live);
@@ -773,7 +773,7 @@ async fn render_accounts_json_carries_reset_for_a_below_threshold_window() {
     // threshold (so it never appears in `held[]`) still has a live reset,
     // and that reset must now reach the JSON wire unconditionally.
     let config = load_from(TWO_ACCOUNTS);
-    let thresholds = resolve_thresholds(&config);
+    let thresholds = config.switch_thresholds();
     let snapshot = snapshot_offline(
         config,
         Arc::new(NoRefresh),
@@ -808,7 +808,7 @@ async fn render_accounts_json_carries_reset_for_a_below_threshold_window() {
 #[tokio::test]
 async fn render_accounts_json_carries_quota_updated_at() {
     let config = load_from(TWO_ACCOUNTS);
-    let thresholds = resolve_thresholds(&config);
+    let thresholds = config.switch_thresholds();
     let before = crate::now_ms();
     let snapshot = snapshot_offline(
         config,
@@ -851,7 +851,7 @@ async fn render_accounts_json_carries_quota_updated_at() {
 #[tokio::test]
 async fn render_accounts_json_omits_reset_when_no_live_reset_exists() {
     let config = load_from(TWO_ACCOUNTS);
-    let thresholds = resolve_thresholds(&config);
+    let thresholds = config.switch_thresholds();
     let snapshot = snapshot_offline(
         config,
         Arc::new(NoRefresh),
@@ -880,7 +880,7 @@ async fn render_accounts_json_held_array_is_unchanged_for_over_threshold_account
     // reset fields must not change a single byte of the existing `held[]`
     // shape for an account whose window WAS already binding.
     let config = load_from(TWO_ACCOUNTS);
-    let thresholds = resolve_thresholds(&config);
+    let thresholds = config.switch_thresholds();
     let snapshot =
         snapshot_offline(config, Arc::new(NoRefresh), Arc::new(WindowProber), true).await;
     let json = status_json(&snapshot, &thresholds, StatusSource::Offline);

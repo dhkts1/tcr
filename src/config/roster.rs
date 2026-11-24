@@ -150,6 +150,24 @@ impl Config {
         (groups, ungrouped)
     }
 
+    /// The priorities `provider`'s accounts carry, in config order; a row with none is skipped.
+    pub fn priorities_of(&self, provider: crate::provider::Provider) -> impl Iterator<Item = i64> {
+        self.accounts
+            .iter()
+            .filter(move |a| a.provider == provider)
+            .filter_map(|a| a.priority)
+    }
+
+    /// Per-account gating threshold — the account's `switchThreshold`, else the global
+    /// one — collected in config order (which is the snapshot's account order), so the
+    /// held-window display gates on exactly the threshold `Manager::eligible` routes on.
+    pub fn switch_thresholds(&self) -> Vec<f64> {
+        self.accounts
+            .iter()
+            .map(|a| a.switch_threshold.unwrap_or(self.switch_threshold))
+            .collect()
+    }
+
     /// The name `controlAccount` names, in either of its shapes; `None` when unset.
     pub fn control_account_name(&self) -> Option<&str> {
         self.control_account
