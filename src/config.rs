@@ -1183,6 +1183,19 @@ impl Config {
         self.control_reserve.clamp(0.0, 0.5)
     }
 
+    /// The fleet bucket as `(burst, spacing_ms)` when the file sets a burst
+    /// and the spacing is on ([`ThrottleConfig::effective_min_spacing`]);
+    /// `None` otherwise. The load test bounds the stub's arrivals with it.
+    pub const fn fleet_bucket(&self) -> Option<(u32, u64)> {
+        match (
+            self.fleet_throttle.burst,
+            self.fleet_throttle.effective_min_spacing(),
+        ) {
+            (Some(burst), Some(spacing)) => Some((burst, spacing)),
+            _ => None,
+        }
+    }
+
     /// The Fable weekly threshold the fleet-wide gate applies: the override
     /// when the file sets one, otherwise [`Self::switch_threshold`]. Resolved
     /// through the manager's own resolver, so this and the selection path

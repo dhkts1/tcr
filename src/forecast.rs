@@ -214,6 +214,11 @@ impl WindowFit {
         self.scales.clear();
     }
 
+    /// The fitted scale for `family`, if this window's fit has one.
+    fn scale(&self, family: &str) -> Option<Scale> {
+        self.scales.get(family).copied()
+    }
+
     fn observe(&mut self, bucket: Option<crate::probe::UsageBucket>, now: i64, tokens: Tokens) {
         let reading = bucket
             .and_then(|b| Some((b.utilization?, b.reset_at_ms?)))
@@ -386,7 +391,7 @@ impl Calibration {
     }
 
     pub(crate) fn scale(&self, window: usize, family: &str) -> Option<Scale> {
-        self.windows.get(window)?.scales.get(family).copied()
+        self.windows.get(window)?.scale(family)
     }
 
     pub(crate) fn ready(&self, families: &BTreeSet<String>, scoped: bool) -> bool {
