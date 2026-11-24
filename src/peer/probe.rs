@@ -48,12 +48,12 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{CollapseHint, Control, PeerId};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::peer::config::{Endpoint, EndpointSource, Locator, PathPolicy, PathsConfig, PeerRow};
 use crate::peer::noise::{self, PeerSession};
+use crate::peer::state::{PathStat, rtt_key};
 
 /// One probe per trusted peer per minute, on a session that is already open.
 ///
@@ -99,64 +99,6 @@ fn ewma(previous: Option<f64>, sample: f64) -> f64 {
 // ---------------------------------------------------------------------------
 // What was measured
 // ---------------------------------------------------------------------------
-
-/// One path's cost, as the EWMA left it.
-///
-/// Keyed by peer AND locator, because "how far away is that Mac" is not one
-/// number: the same peer reached directly and through a forwarder are two
-/// paths with two costs, and collapsing them is exactly how a lossy hop comes
-/// to look like a lossy Mac.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PathStat {
-    /// The peer at the far end.
-    pub peer: PeerId,
-    /// The path that was measured.
-    #[serde(flatten)]
-    pub locator: Locator,
-    /// Round trip in milliseconds, smoothed. `None` until an ack arrives: a
-    /// path that has only ever timed out has a loss figure and no RTT, and
-    /// writing a zero there would make it look like the fastest path on the
-    /// row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rtt_ms: Option<f64>,
-    /// Loss in percent, smoothed over the same window.
-    pub loss_pct: f64,
-    /// How many probes this row has seen. Kept because an EWMA over one sample
-    /// and over twenty read the same and are not worth the same.
-    pub samples: u32,
-    /// When the last sample landed, Unix milliseconds.
-    pub updated_at_ms: i64,
-}
-
-impl PathStat {
-    /// [`Self::rtt_ms`] as the sort key uses it: a path nobody has measured
-    /// sorts after every path that has been.
-    fn rtt_key(&self) -> u32 {
-        rtt_key(self.rtt_ms)
-    }
-}
-
-/// A smoothed round trip as a whole number of milliseconds, saturating at both
-/// ends.
-///
-/// One function rather than a cast at each reader: an `as` on a `f64` that is
-/// NaN or out of range is a silent zero or a silent `u32::MAX`, and the two
-/// readers here, the sort key and the collapse hint, would not have gone
-/// wrong the same way.
-fn rtt_key(rtt_ms: Option<f64>) -> u32 {
-    rtt_ms.map_or(u32::MAX, |rtt| {
-        let rounded = rtt.round();
-        if !rounded.is_finite() || rounded <= 0.0 {
-            0
-        } else if rounded >= f64::from(u32::MAX) {
-            u32::MAX
-        } else {
-            // Bounded by the two arms above, so the cast cannot saturate.
-            rounded as u32
-        }
-    })
-}
 
 /// One endpoint's cooldown: the instant [`dial_order`] may try it again.
 ///

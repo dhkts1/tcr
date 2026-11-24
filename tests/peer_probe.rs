@@ -36,8 +36,9 @@ use tcr::peer::config::{
 use tcr::peer::id::NodeKey;
 use tcr::peer::listener::{self, SessionContext};
 use tcr::peer::noise::{self, Handshake, PeerSession};
-use tcr::peer::probe::{self, PathStat, PathTable, ProbeOutcome, ProbeStop};
+use tcr::peer::probe::{self, PathTable, ProbeOutcome, ProbeStop};
 use tcr::peer::serve;
+use tcr::peer::state::PathStat;
 use tcr_peer_wire::{Control, PeerId, StreamHeader, StreamKind};
 use tokio::net::{TcpListener, TcpStream};
 
