@@ -149,9 +149,10 @@ impl RequestBody {
         &self.bytes
     }
 
-    /// The client's body length when the rewrite changed it, else `None`.
-    pub const fn rewritten_from(&self) -> Option<usize> {
-        self.rewritten_from
+    /// The client's body length and the forwarded one, when the rewrite changed the body,
+    /// else `None`.
+    pub fn rewritten(&self) -> Option<(usize, usize)> {
+        self.rewritten_from.map(|before| (before, self.bytes.len()))
     }
 
     /// The top-level `model`.
@@ -180,6 +181,40 @@ impl RequestBody {
     /// What the session peek reads.
     pub const fn wire(&self) -> &WireFacts {
         &self.wire
+    }
+
+    /// What the session peek reads, as the request is served on it: the wire session, the
+    /// newest turn's tool events, and the bound state with every server-side thread id the
+    /// body names folded in. `on_thread` is called with each id's path, in the body's order.
+    ///
+    /// Thread state is bound exactly as a signature is, and it binds even when this process
+    /// never saw the response that created it. Unlike a signature, no other account can read
+    /// it, so a cold hold never releases it.
+    pub fn session_facts(
+        &self,
+        mut on_thread: impl FnMut(&'static str),
+    ) -> (
+        Option<String>,
+        Vec<ToolUseEvent>,
+        Vec<ToolResultEvent>,
+        BoundHistory,
+    ) {
+        let wire = &self.wire;
+        let mut bound = wire.bound.clone();
+        for (path, id) in &wire.previous_message_ids {
+            on_thread(path);
+            bound.carries_bound_history = true;
+            bound.carries_account_only_state = true;
+            if !bound.tokens.contains(id) {
+                bound.tokens.push(id.clone());
+            }
+        }
+        (
+            wire.session_id.clone(),
+            wire.tool_uses.clone(),
+            wire.tool_results.clone(),
+            bound,
+        )
     }
 
     /// Whether a breakpoint in a legal position asks for the 1-hour window.
@@ -1534,11 +1569,14 @@ mod tests {
         let body = Bytes::from(conversation(5, true));
         let parsed = RequestBody::parse(body.clone(), false);
         assert_eq!(parsed.bytes().as_ptr(), body.as_ptr(), "no copy");
-        assert_eq!(parsed.rewritten_from(), None);
+        assert_eq!(parsed.rewritten(), None);
         let same = parsed.for_account("11111111-1111-1111-1111-111111111111");
         assert_eq!(same.as_ptr(), body.as_ptr(), "the uuid matches: no copy");
         let rewritten = RequestBody::parse(body.clone(), true);
-        assert_eq!(rewritten.rewritten_from(), Some(body.len()));
+        assert_eq!(
+            rewritten.rewritten(),
+            Some((body.len(), rewritten.bytes().len()))
+        );
         let all_1h = Bytes::copy_from_slice(rewritten.bytes());
         let again = RequestBody::parse(all_1h.clone(), true);
         assert_eq!(
