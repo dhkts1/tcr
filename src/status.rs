@@ -689,6 +689,16 @@ fn from_ms(ms: i64) -> Option<OffsetDateTime> {
 }
 
 impl StatusPayload {
+    /// Does the serving proxy present a leaf tcr minted that lets it terminate
+    /// `host`? `false` when the payload reports no MITM status at all (an older
+    /// server), or another leaf. For `chatgpt.com` the pool must also hold a
+    /// Codex account, which the account rows answer.
+    pub fn minted_leaf_intercepts(&self, host: &str) -> bool {
+        self.mitm
+            .as_ref()
+            .is_some_and(|mitm| mitm.leaf == MitmStatus::LEAF_MINTED && mitm.intercepts(host))
+    }
+
     /// Project a live snapshot onto the wire. `thresholds` is the server's own
     /// per-account list (see [`crate::manager::Manager::thresholds`]); a short
     /// list falls back to `1.0` per account, which can only fail CLOSED — at 1.0

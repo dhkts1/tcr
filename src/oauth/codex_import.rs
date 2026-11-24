@@ -159,10 +159,7 @@ pub fn first_codex_account_notice(
     ca_readable: bool,
 ) -> String {
     let leaf_takes_chatgpt = match live {
-        Ok(payload) => payload.mitm.as_ref().is_some_and(|mitm| {
-            mitm.leaf == crate::status::MitmStatus::LEAF_MINTED
-                && mitm.intercepts(crate::provider::CODEX_HOST)
-        }),
+        Ok(payload) => payload.minted_leaf_intercepts(crate::provider::CODEX_HOST),
         Err(crate::cli::LiveStatusError::NoServer) => true,
         Err(_) => false,
     };
