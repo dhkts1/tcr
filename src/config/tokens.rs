@@ -6,7 +6,7 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use super::credential_version::{stamp_credential_version, with_codex_credential_versions};
+use super::credential_version::stamp_credential_version;
 use super::edit::CODEX_SYNC_PENDING_KEY;
 use super::edit::{DiskIdentity, provider_of_entry};
 use super::file::{read_document, save, write_atomic};
@@ -85,7 +85,7 @@ pub fn save_settings(path: &Path, config: &Config) -> Result<(), ConfigError> {
         return save(path, config);
     };
     let Ok(Value::Object(mut doc)) =
-        serde_json::to_value(with_codex_credential_versions(config).as_ref())
+        serde_json::to_value(config.with_codex_credential_versions().as_ref())
     else {
         // `Config` is a struct, so this is the total-function tail rather than a
         // reachable outcome. Falling back rather than failing keeps a verb that
