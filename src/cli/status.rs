@@ -273,10 +273,7 @@ pub(super) fn status_holds_provider(
         Ok(payload) if payload.mitm.is_some() => {
             payload.accounts.iter().any(|row| row.provider == provider)
         }
-        Ok(_) | Err(_) => config
-            .accounts
-            .iter()
-            .any(|account| account.provider == provider),
+        Ok(_) | Err(_) => config.holds_provider(provider),
     }
 }
 

@@ -467,8 +467,8 @@ fn codex_pool_preflight(
 /// Does `config` hold a Codex account and no Claude account, in any state? Only then does
 /// `tcr run` ask the running proxy whether it holds a Claude account.
 fn holds_only_codex(config: &Config) -> bool {
-    let holds = |provider| config.accounts.iter().any(|a| a.provider == provider);
-    holds(tcr::provider::Provider::Codex) && !holds(tcr::provider::Provider::Anthropic)
+    config.holds_provider(tcr::provider::Provider::Codex)
+        && !config.holds_provider(tcr::provider::Provider::Anthropic)
 }
 
 /// The warning `tcr run` prints for a claude session when the running proxy on `port` holds

@@ -58,4 +58,9 @@ impl Config {
     pub fn holds_no_accounts(&self) -> bool {
         self.accounts.is_empty()
     }
+
+    /// Whether any account of `provider` is configured, in any state.
+    pub fn holds_provider(&self, provider: crate::provider::Provider) -> bool {
+        self.accounts.iter().any(|a| a.provider == provider)
+    }
 }
