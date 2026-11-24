@@ -4,7 +4,7 @@
 //!
 //! The guard-band arithmetic a lease must respect is
 //! `effective_threshold(threshold, reserve, allow_reserve)`
-//! (`src/manager/select.rs:248`), and it is **`pub(super)`**, so
+//! (`src/manager/select/mod.rs:238`), and it is **`pub(super)`**, so
 //! `src/peer/lease.rs` cannot call it, and cannot name its result either. The
 //! two wrong answers are widening that function's visibility and copying its
 //! arithmetic; both put the fleet's guard band in two places, and the house
