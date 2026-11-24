@@ -6,7 +6,7 @@
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tcr_smc::FanMode;
+use tcr_smc::{FanMode, FanReading};
 
 use super::*;
 
