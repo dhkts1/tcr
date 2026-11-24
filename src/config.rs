@@ -21,6 +21,7 @@ mod group_edit;
 mod identity_roster;
 mod load;
 mod login_roster;
+mod projections;
 mod roster;
 mod serve_inputs;
 mod tokens;

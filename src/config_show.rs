@@ -93,26 +93,9 @@ pub struct ConfigSettings {
 
 impl ConfigSettings {
     /// Built once from a loaded config; every consumer reads this value.
+    /// [`Config::settings`] builds it.
     pub fn from_config(config: &Config, config_path: &Path) -> Self {
-        Self {
-            config_path: config_path.to_path_buf(),
-            switch_threshold: config.switch_threshold,
-            control_reserve: config.effective_control_reserve(),
-            fable_weekly_threshold: config.effective_fable_weekly_threshold(),
-            fable_weekly_threshold_follows: config.fable_weekly_threshold.is_none(),
-            reset_urgency_tier_hours: config.reset_urgency_tier_hours,
-            session_affinity: config.session_affinity_enabled(),
-            control_account: config
-                .control_account
-                .as_ref()
-                .map(|control| control.name().to_owned()),
-            control_pooled: config.control_pooled,
-            account_throttle: ThrottleSetting::effective(&config.account_throttle),
-            fleet_throttle: ThrottleSetting::effective(&config.fleet_throttle),
-            pacing: PacingSetting::effective(&config.pacing),
-            usage_retention_days: config.usage_retention_days,
-            http1_only: config.http1_only,
-        }
+        config.settings(config_path)
     }
 
     /// The table `tcr config show` prints without `--json`: one `key: value`
