@@ -196,8 +196,8 @@ pub(super) async fn boot_peer_listener(
     // The state file that belongs with THIS peers file, not the one in the
     // operator's own cache directory: a `--config` pointing at a temp profile
     // must not write the real machine's pairing window, knock queue, mutes or
-    // bans. See `serve::peer_state_path`.
-    let state_path = crate::peer::serve::peer_state_path(peers_path);
+    // bans. See `state::peer_state_path`.
+    let state_path = crate::peer::state::peer_state_path(peers_path);
 
     // The path table's boot install: this peers file's `paths` policy, plus
     // whatever this state file already carries from a probe before this boot.

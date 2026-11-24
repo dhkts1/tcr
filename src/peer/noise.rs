@@ -123,9 +123,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tcr_peer_wire::{MAX_FRAME_BYTES, PeerId, decode_frame, encode_frame};
 
 use crate::peer::config::{PeerRow, PeerStore};
-use crate::peer::id::{KEY_BYTES, NodeKey};
-// Compat for `src/main.rs` (it names `noise::random_secret`); wave 2 repoints it to `id`.
-pub use crate::peer::id::random_secret;
+use crate::peer::id::{KEY_BYTES, NodeKey, random_secret};
 
 /// `XX`, a FIRST pairing, where neither side knows the other's key. The
 /// default path: a discovered row carries no key, so there is nothing else to

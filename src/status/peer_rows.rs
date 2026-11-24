@@ -394,7 +394,7 @@ pub fn peers_block_with_error(
             return (Vec::new(), Some(err.to_string()));
         }
     };
-    let state_path = crate::peer::serve::peer_state_path(peers_path);
+    let state_path = crate::peer::state::peer_state_path(peers_path);
     let state = match crate::peer::state::load(&state_path, now_ms) {
         Ok(state) => state,
         Err(err) => {

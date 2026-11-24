@@ -76,7 +76,7 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
     };
     let rows = store.peers();
     let state_path = peer_state_path(&peers_path);
-    let state = peer::state::load(&state_path, peer::pair::now_ms())?;
+    let state = peer::state::load(&state_path, peer::state::now_ms())?;
 
     // The main config, read once for both forms: the JSON form keys its
     // `lentTo` block by account label and reads each account's exit
@@ -104,7 +104,7 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
         // ONCE for the whole listing: two rows read a second apart
         // could otherwise disagree about whether the same 18:00 has
         // arrived.
-        let now_s = u64::try_from(peer::pair::now_ms().max(0) / 1_000).unwrap_or(0);
+        let now_s = u64::try_from(peer::state::now_ms().max(0) / 1_000).unwrap_or(0);
 
         // The claimed name on a pending row is text a stranger on this
         // network chose. It was already sanitized on arrival; it is
@@ -190,7 +190,7 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
             &config_accounts,
             &file.peers,
             &state.last_seen,
-            peer::pair::now_ms(),
+            peer::state::now_ms(),
         );
         let out = status::PeerLsJson {
             supported: true,
@@ -230,8 +230,11 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
         // JSON array follows.
         for row in state.visible_found() {
             let found = found_row_for_readers(&row);
-            let age_secs =
-                (peer::pair::now_ms().saturating_sub(row.last_seen_ms).max(0) / 1_000).max(0);
+            let age_secs = (peer::state::now_ms()
+                .saturating_sub(row.last_seen_ms)
+                .max(0)
+                / 1_000)
+                .max(0);
             let name = found
                 .name
                 .as_deref()

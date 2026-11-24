@@ -31,7 +31,7 @@ pub fn peer_graph_block(
             Vec::new()
         }
     };
-    let state_path = crate::peer::serve::peer_state_path(peers_path);
+    let state_path = crate::peer::state::peer_state_path(peers_path);
     let state = match crate::peer::state::load(&state_path, now_ms) {
         Ok(state) => state,
         Err(err) => {

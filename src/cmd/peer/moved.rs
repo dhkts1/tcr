@@ -113,7 +113,7 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
     let keys = peer::moved::MovedKeys::for_row(row.rendezvous_secret.as_ref())
         .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
 
-    let now_ms = peer::pair::now_ms();
+    let now_ms = peer::state::now_ms();
     // Read off the state file a keeper wrote, not off `reach::external_socket`:
     // this process has run no keeper of its own, and the reader both `mint`
     // and `tcr peer invite` share is `peer::reach::recorded_external_socket`.
@@ -239,7 +239,7 @@ fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
 
     let field = peer::moved::link_field(&raw).map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
     let now_s = now_unix_secs();
-    let now_ms = peer::pair::now_ms();
+    let now_ms = peer::state::now_ms();
     let file = peer::config::read_or_default(peers_path)?;
 
     let mut opened = None;

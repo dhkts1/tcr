@@ -376,7 +376,7 @@ pub fn random_secret() -> Result<[u8; KEY_BYTES]> {
 
 /// 128 opaque bits, from the platform CSPRNG.
 ///
-/// `getrandom` directly rather than `noise::random_secret`: a lease id is not
+/// `getrandom` directly rather than `id::random_secret`: a lease id is not
 /// Noise material, and routing it through the one file that may name `snow::`
 /// would make a handshake module the source of a number that has nothing to do
 /// with a handshake. It is a DIRECT dependency, already

@@ -134,7 +134,7 @@ fn lock_peer_state(
     peers_path: &Path,
 ) -> anyhow::Result<(PathBuf, i64, peer::config::FileLock, peer::state::PeerState)> {
     let state_path = peer_state_path(peers_path);
-    let now = peer::pair::now_ms();
+    let now = peer::state::now_ms();
     let lock = peer::config::FileLock::acquire(&state_path)?;
     let state = peer::state::load(&state_path, now)?;
     Ok((state_path, now, lock, state))

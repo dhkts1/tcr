@@ -182,9 +182,6 @@ pub use policy::{
 /// file with no opinion behaves exactly as it did before that field existed.
 pub const BORROW_TIMEOUT: Duration = Duration::from_millis(10_000);
 
-// Compat for outside callers (src/server.rs, src/status.rs); wave 2 repoints them.
-pub use crate::peer::state::peer_state_path;
-
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;

@@ -152,7 +152,7 @@ pub(super) fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()
     // A record whose deadline has passed reads as no mapping. It is what a
     // process that died without deleting its mapping leaves behind, and
     // reporting it would tell an operator a port is open that nothing renews.
-    let now_ms = peer::pair::now_ms();
+    let now_ms = peer::state::now_ms();
     let state = peer::state::load(&peer_state_path(&peers_path), now_ms).ok();
     let held = state
         .as_ref()

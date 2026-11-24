@@ -73,6 +73,7 @@ use crate::peer::id::KEY_BYTES;
 use crate::peer::id::{NodeKey, default_config_dir};
 use crate::peer::listener::{NodeFacts, hello_for_peer};
 use crate::peer::noise::{self, Handshake};
+use crate::peer::state::now_ms;
 
 mod addresses;
 
@@ -1376,9 +1377,6 @@ fn random_id() -> Result<u64> {
     head.copy_from_slice(&bytes[..8]);
     Ok(u64::from_be_bytes(head))
 }
-
-// Compat for outside callers (src/main.rs); wave 2 repoints them to `state`.
-pub use crate::peer::state::now_ms;
 
 /// A 32-byte join secret is the same width as a static key, which is why both
 /// are [`KEY_BYTES`].

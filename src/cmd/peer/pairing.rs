@@ -186,9 +186,9 @@ pub(super) async fn run_peer_invite(a: peer_cli::PeerInviteArgs) -> anyhow::Resu
     }
     if a.sealed {
         let (secret, public) = tcr::peer::noise::generate_static()?;
-        let now_ms = tcr::peer::pair::now_ms();
+        let now_ms = tcr::peer::state::now_ms();
         let until_ms = now_ms.saturating_add(600_000);
-        let id_bytes = tcr::peer::noise::random_secret()?;
+        let id_bytes = tcr::peer::id::random_secret()?;
         let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = id_bytes;
         let id = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
         tcr::peer::state::add_ask(
@@ -224,7 +224,7 @@ pub(super) async fn run_peer_invite(a: peer_cli::PeerInviteArgs) -> anyhow::Resu
                 tcr::peer::ask::REPLY_PREFIX
             );
         }
-        let now_ms = tcr::peer::pair::now_ms();
+        let now_ms = tcr::peer::state::now_ms();
         let opened =
             tcr::peer::state::open_and_spend_ask(&peer_state_path(&path), line.trim(), now_ms)?;
         let tcr::peer::ask::Opened::Key(token) = opened;
@@ -248,7 +248,7 @@ pub(super) async fn run_peer_invite(a: peer_cli::PeerInviteArgs) -> anyhow::Resu
     // sitting in `reach::external_socket`; it is read off the state
     // file a serving process wrote, the same reader `peer moved mint`
     // uses (`peer::reach::recorded_external_socket`).
-    let now_ms = tcr::peer::pair::now_ms();
+    let now_ms = tcr::peer::state::now_ms();
     let (external, reason) =
         tcr::peer::reach::recorded_external_socket(&peer_state_path(&path), now_ms);
     if let Some(reason) = reason {
@@ -321,7 +321,7 @@ pub(super) async fn run_peer_join(a: peer_cli::PeerJoinArgs) -> anyhow::Result<(
     let input = tcr::peer::pair::read_join_input(source)?;
 
     if let tcr::peer::pair::JoinInput::Ask(ask) = &input {
-        let now_ms = tcr::peer::pair::now_ms();
+        let now_ms = tcr::peer::state::now_ms();
         let (external, reason) =
             tcr::peer::reach::recorded_external_socket(&peer_state_path(&path), now_ms);
         if let Some(reason) = reason {
