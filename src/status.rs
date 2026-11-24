@@ -794,12 +794,12 @@ impl StatusPayload {
     }
 
     /// The server's heat reading ([`Self::heat`]), or why there is none.
-    pub fn heat_reading(&self) -> Result<&tcr_status_wire::HeatRow, Unread<'_>> {
+    pub const fn heat_reading(&self) -> Result<&tcr_status_wire::HeatRow, Unread<'_>> {
         Lenient::read(self.heat.as_ref())
     }
 
     /// The server's fan-control reading ([`Self::fan_control`]), or why there is none.
-    pub fn fan_control_reading(&self) -> Result<&tcr_status_wire::FanControlRow, Unread<'_>> {
+    pub const fn fan_control_reading(&self) -> Result<&tcr_status_wire::FanControlRow, Unread<'_>> {
         Lenient::read(self.fan_control.as_ref())
     }
 

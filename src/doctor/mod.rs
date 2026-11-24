@@ -1089,43 +1089,41 @@ fn codex_rows(
     live: Result<&StatusPayload, &crate::cli::LiveStatusError>,
     config: &crate::config::Config,
 ) -> Vec<CodexRow> {
-    match live
+    if let Some(rows) = live
         .ok()
         .and_then(|payload| payload.current_accounts_of(crate::provider::Provider::Codex))
     {
-        Some(rows) => rows
+        return rows
             .map(|row| CodexRow {
                 name: row.name.clone(),
                 gate: Some(row.gate),
                 reserved_groups: row.reserved_groups.clone(),
                 limit_reached_type: row.limit_reached_type.clone(),
             })
-            .collect(),
-        None => {
-            let reserved = config.reserved_group_names();
-            config
-                .accounts
-                .iter()
-                .filter(|account| account.provider == crate::provider::Provider::Codex)
-                .map(|account| {
-                    let mut reserved_groups: Vec<String> = account
-                        .groups
-                        .iter()
-                        .flatten()
-                        .filter(|group| reserved.contains(*group))
-                        .cloned()
-                        .collect();
-                    reserved_groups.sort();
-                    CodexRow {
-                        name: account.name.clone(),
-                        gate: None,
-                        reserved_groups,
-                        limit_reached_type: None,
-                    }
-                })
-                .collect()
-        }
+            .collect();
     }
+    let reserved = config.reserved_group_names();
+    config
+        .accounts
+        .iter()
+        .filter(|account| account.provider == crate::provider::Provider::Codex)
+        .map(|account| {
+            let mut reserved_groups: Vec<String> = account
+                .groups
+                .iter()
+                .flatten()
+                .filter(|group| reserved.contains(*group))
+                .cloned()
+                .collect();
+            reserved_groups.sort();
+            CodexRow {
+                name: account.name.clone(),
+                gate: None,
+                reserved_groups,
+                limit_reached_type: None,
+            }
+        })
+        .collect()
 }
 
 /// The Codex block's I/O half, beside [`inspect`]: build the report for the proxy on `port`
