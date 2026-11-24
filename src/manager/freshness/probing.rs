@@ -1,6 +1,6 @@
 //! `Manager` probing methods, split verbatim from `mod.rs`.
 
-use super::*;
+use crate::manager::*;
 
 const PROBE_MAX_RETRY_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -12,6 +12,58 @@ const PROBE_MAX_RETRY_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
 /// feed this, or a benign self-throttle would get painted with the same
 /// "endpoint is down" signal a sustained 5xx run is.
 pub(crate) const SUSTAINED_5XX_THRESHOLD: u32 = 3;
+
+/// A snapshot for rechecking identity after awaits; never formatted or logged.
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::manager) struct BoundAccount {
+    name: String,
+    provider: crate::provider::Provider,
+    account: Option<String>,
+    org: Option<String>,
+    org_name: Option<String>,
+}
+
+impl BoundAccount {
+    pub(in crate::manager) fn of(row: &AccountRuntime) -> Self {
+        Self {
+            name: row.name.clone(),
+            provider: row.provider,
+            account: row.account_uuid.clone(),
+            org: row.org_uuid.clone(),
+            org_name: row.org_name.clone(),
+        }
+    }
+}
+
+impl Manager {
+    /// The identity row `idx` holds now, or `None` once it is removed.
+    pub(in crate::manager) fn bound_account(&self, idx: usize) -> Option<BoundAccount> {
+        self.accounts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(idx)
+            .filter(|row| !row.removed)
+            .map(BoundAccount::of)
+    }
+
+    /// Whether row `idx` still holds the identity `identity` was taken from.
+    pub(in crate::manager) fn is_still_bound(&self, idx: usize, identity: &BoundAccount) -> bool {
+        self.bound_account(idx).as_ref() == Some(identity)
+    }
+
+    pub(in crate::manager) fn usage_gate(&self, idx: usize) -> Option<Arc<AsyncMutex<()>>> {
+        self.bound_account(idx)?;
+        let mut gates = self
+            .usage_gates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Some(Arc::clone(
+            gates
+                .entry(idx)
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        ))
+    }
+}
 
 impl Manager {
     /// Record the health of account `idx`'s most recent probe. A failing probe
@@ -205,8 +257,8 @@ impl Manager {
 
     /// The one probe implementation, called only while owning the row's usage gate.
     /// True means this call applied usage, not merely that a previous probe succeeded.
-    pub(super) async fn probe_account_unlocked(&self, idx: usize) -> bool {
-        let Some(identity) = codex_reset::BoundAccount::at(self, idx) else {
+    pub(in crate::manager) async fn probe_account_unlocked(&self, idx: usize) -> bool {
+        let Some(identity) = self.bound_account(idx) else {
             return false;
         };
         // An `Error` row only reaches here once its recovery backoff elapsed (see
@@ -229,18 +281,18 @@ impl Manager {
             return false;
         };
 
-        if !identity.is_current(self, idx) {
+        if !self.is_still_bound(idx, &identity) {
             return false;
         }
         let result = self.prober.probe(credential).await;
         let result = match result {
             Err(err) if err.status == Some(401) => {
                 // Token rejected: force a refresh and retry once with the new one.
-                if !identity.is_current(self, idx) {
+                if !self.is_still_bound(idx, &identity) {
                     return false;
                 }
                 self.ensure_fresh_force(idx).await;
-                if !identity.is_current(self, idx) {
+                if !self.is_still_bound(idx, &identity) {
                     return false;
                 }
                 match self
@@ -256,7 +308,7 @@ impl Manager {
 
         self.backfill_plan_if_unknown(idx).await;
 
-        if !identity.is_current(self, idx) {
+        if !self.is_still_bound(idx, &identity) {
             return false;
         }
         match result {
@@ -324,7 +376,7 @@ impl Manager {
     /// is no provider to pick the endpoint by, and the default one, Anthropic, would receive
     /// the bearer whichever provider issued it. No row can vanish today (nothing shrinks the
     /// account vector), so this closes a path rather than fixing one.
-    pub(super) fn probe_credential(
+    pub(in crate::manager) fn probe_credential(
         &self,
         idx: usize,
         access_token: String,

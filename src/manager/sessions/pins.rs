@@ -22,7 +22,7 @@ use crate::config::ConfigError;
 use crate::identity;
 use crate::save_gate::SaveOutcome;
 
-use super::{Manager, WarmWindow};
+use crate::manager::{Manager, WarmWindow};
 
 impl Manager {
     /// Flag the pin map as changed since the last flush, and wake the flusher.
@@ -173,7 +173,7 @@ impl Manager {
     /// The flusher's save: [`Self::flush_affinity`] when the pins differ from what the last
     /// write put on disk, by the rule [`crate::save_gate`] states. A save that would write the
     /// same pins writes nothing, and one that would only move touch times waits until
-    /// [`super::AFFINITY_TOUCH_REFRESH`] has passed since the last write.
+    /// [`crate::manager::AFFINITY_TOUCH_REFRESH`] has passed since the last write.
     pub fn flush_affinity_if_changed(&self, path: &Path) -> Result<SaveOutcome, ConfigError> {
         let pins = self.affinity_pin_snapshot();
         self.affinity_file
@@ -222,7 +222,7 @@ impl Manager {
     /// Each live account's identity, in account order: what a cache file's stored identities
     /// resolve against at restore. Copied under the accounts lock and returned after it is
     /// released, so the file read happens under no lock.
-    pub(super) fn restore_candidates(&self) -> Vec<crate::config::Account> {
+    pub(in crate::manager) fn restore_candidates(&self) -> Vec<crate::config::Account> {
         let accounts = self
             .accounts
             .read()
