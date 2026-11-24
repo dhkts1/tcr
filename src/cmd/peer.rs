@@ -11,7 +11,7 @@ mod find;
 mod grants;
 mod graph;
 mod knock;
-pub(crate) mod ls;
+mod ls;
 mod moved;
 mod network_key;
 mod pairing;

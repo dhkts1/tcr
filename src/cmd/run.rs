@@ -10,16 +10,40 @@ use tcr::doctor::{no_proxy_entry_exempts, points_at_tcr};
 use tcr::proxy::{self, GROUP_HEADER_NAME};
 use tcr::{codex_route, mitm, status};
 
-use crate::RunArgs;
-use crate::server_cmd::load_config;
+use super::ConfigFile;
+use super::server::load_config;
 use crate::tool_env;
 
-pub(crate) mod launch_env;
+mod launch_env;
+#[cfg(test)]
+mod tests;
 
 use launch_env::{
     LaunchKey, apply_base_url_env, apply_codex_see_through_env, apply_nested_claude_ca,
     apply_see_through_env, compose_group_header, mitm_codex_host,
 };
+
+#[derive(clap::Args)]
+pub(crate) struct RunArgs {
+    #[command(flatten)]
+    config: ConfigFile,
+    /// Serve this session from accounts labelled with this group. Strict by
+    /// default: when no member can serve, the request waits for one or gets a
+    /// 429, and is never sent to an account outside the group, even one the
+    /// session is already pinned to. Set `groupSettings.<group>.spillToPool:
+    /// true` in the config to let it fall back to the whole pool instead (a
+    /// reserved group stays strict either way).
+    /// Claude sessions only; a Codex session cannot ask for a group.
+    #[arg(long)]
+    group: Option<String>,
+    /// Launch `codex` instead of `claude`, routed through the proxy's Codex accounts.
+    #[arg(long)]
+    codex: bool,
+    /// Args passed verbatim to `claude`, or to `codex` with `--codex` (e.g. `tcr run -- -p "hi"`,
+    /// or `tcr run --codex -- exec "hi"`).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+}
 
 /// `TCR_CLAUDE_BIN` overrides which `claude` binary we launch, taking
 /// priority over the legacy `CLAUDE_BIN` (kept for compatibility with
@@ -47,7 +71,7 @@ fn resolve_harness_bin(specific_key: &str, legacy_key: &str, default: &str) -> S
 /// [`resolve_harness_bin`]'s pure half, split out so the precedence order and
 /// the empty-string-counts-as-unset rule are unit-testable without mutating
 /// process-global env vars (which is unsound to do from parallel tests).
-pub(crate) fn resolve_harness_bin_from(
+fn resolve_harness_bin_from(
     specific: Option<String>,
     legacy: Option<String>,
     default: &str,
@@ -69,7 +93,7 @@ fn claude_bin() -> String {
 /// A fresh [`std::process::Command`] for [`claude_bin`] — the one place that
 /// spawns or would spawn the user's harness, so every call site resolves the
 /// same way.
-pub(crate) fn claude_command() -> std::process::Command {
+fn claude_command() -> std::process::Command {
     let name = claude_bin();
     std::process::Command::new(
         tool_env::executable(Path::new(&name)).unwrap_or_else(|| PathBuf::from(name)),
@@ -248,7 +272,7 @@ fn exec_agent(cmd: &mut std::process::Command) -> std::io::Error {
 /// `--group` is a Claude Code mechanism (`ANTHROPIC_CUSTOM_HEADERS`); Codex has no custom-header
 /// env, so until the `[model_providers]` route lands this is refused rather than silently
 /// routing the session to the whole Codex pool.
-pub(crate) fn refuse_group_with_codex(args: &RunArgs) -> anyhow::Result<()> {
+fn refuse_group_with_codex(args: &RunArgs) -> anyhow::Result<()> {
     if args.codex && args.group.is_some() {
         anyhow::bail!("--group is not supported with --codex yet; run without --group");
     }
@@ -258,7 +282,7 @@ pub(crate) fn refuse_group_with_codex(args: &RunArgs) -> anyhow::Result<()> {
 /// How `tcr run --codex` launches `codex`: [`codex_launch`]'s decision, which
 /// [`apply_codex_launch`] carries out.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum CodexLaunch {
+enum CodexLaunch {
     /// Pooled: see-through via this tcr, trusting `ca` for the leaf it presents.
     SeeThrough {
         ca: PathBuf,
@@ -279,7 +303,7 @@ pub(crate) enum CodexLaunch {
 impl CodexLaunch {
     /// The `[tcr]` lines this launch prints, besides the see-through banner
     /// [`apply_codex_see_through_env`] prints itself.
-    pub(crate) fn notices(&self, port: u16) -> Vec<String> {
+    fn notices(&self, port: u16) -> Vec<String> {
         match self {
             Self::SeeThrough { no_proxy, .. } => no_proxy
                 .iter()
@@ -349,7 +373,7 @@ impl CodexLaunch {
 /// this tcr ([`proxy_vars_at`]), so a tcr that is down, or not intercepting,
 /// cannot capture the launch that goes around it. A dead tcr behind an
 /// exported `HTTPS_PROXY` refuses the connection instead.
-pub(crate) fn codex_launch(
+fn codex_launch(
     args: &RunArgs,
     port: u16,
     status: &Result<status::StatusPayload, cli::LiveStatusError>,
@@ -397,7 +421,7 @@ pub(crate) fn codex_launch(
 /// A row held by an upstream hold or 403 that carries ChatGPT's own refusal
 /// (`limitReachedType`) is counted as refused by ChatGPT: the refusal outlasts the hold, and is
 /// why the account stays out.
-pub(crate) fn codex_pool_preflight(
+fn codex_pool_preflight(
     payload: &status::StatusPayload,
     now: time::OffsetDateTime,
 ) -> Option<String> {
@@ -450,10 +474,7 @@ fn holds_only_codex(config: &Config) -> bool {
 /// The warning `tcr run` prints for a claude session when the running proxy on `port` holds
 /// Codex accounts and no Claude account: every request this session sends will be refused.
 /// `None` when the proxy lists any Claude account, or no account at all.
-pub(crate) fn no_claude_account_warning(
-    port: u16,
-    payload: &status::StatusPayload,
-) -> Option<String> {
+fn no_claude_account_warning(port: u16, payload: &status::StatusPayload) -> Option<String> {
     let holds = |provider| payload.accounts.iter().any(|row| row.provider == provider);
     (holds(tcr::provider::Provider::Codex) && !holds(tcr::provider::Provider::Anthropic)).then(
         || {
@@ -470,7 +491,7 @@ pub(crate) fn no_claude_account_warning(
 /// one never reaches tcr. Everything it reads from the machine (the caller's
 /// environment, the Codex config file, tcr's CA path) comes from `host`.
 #[must_use]
-pub(crate) fn apply_codex_launch(
+fn apply_codex_launch(
     cmd: &mut std::process::Command,
     port: u16,
     launch: &CodexLaunch,
@@ -532,14 +553,14 @@ fn proxy_vars_at(port: u16, inherited: &dyn Fn(&str) -> Option<String>) -> Vec<&
 
 /// One inherited `NO_PROXY` spelling, rewritten for a see-through launch.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct NoProxyRewrite {
-    pub(crate) var: &'static str,
+struct NoProxyRewrite {
+    var: &'static str,
     /// What codex gets: the inherited entries minus [`Self::dropped`], in
     /// their order. Empty when nothing else was listed; see
     /// [`no_proxy_rewrites`] for why the variable stays set then.
-    pub(crate) kept: String,
+    kept: String,
     /// The entries that exempted the host, trimmed.
-    pub(crate) dropped: Vec<String>,
+    dropped: Vec<String>,
 }
 
 /// Each inherited `NO_PROXY`/`no_proxy`, without the entries that exempt
@@ -594,7 +615,7 @@ const MIN_CLAUDE_VERSION_FOR_GROUP_STR: &str = "2.1.227";
 /// semantics that would silently route every session across the whole pool
 /// with no error at all, which is the quiet-wrong-answer this refusal exists
 /// to prevent.
-pub(crate) fn validate_group(config: &Config, group: &str) -> anyhow::Result<()> {
+fn validate_group(config: &Config, group: &str) -> anyhow::Result<()> {
     if let Err(reason) = validate_group_label_chars(group) {
         anyhow::bail!("--group {group:?}: invalid group label — {reason}");
     }
@@ -645,7 +666,7 @@ pub(crate) fn validate_group(config: &Config, group: &str) -> anyhow::Result<()>
 /// on an unreadable version would tell the operator they were contained to
 /// the group while the session actually ran across the whole fleet.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ClaudeVersionCheck {
+enum ClaudeVersionCheck {
     Ok,
     /// The parsed version, for the error message.
     TooOld(String),
@@ -665,7 +686,7 @@ fn check_claude_version() -> ClaudeVersionCheck {
 /// [`check_claude_version`]'s classification half, split out so it is testable
 /// without spawning a `claude` process: feed it `claude --version`'s stdout
 /// directly.
-pub(crate) fn classify_claude_version_output(stdout: &str) -> ClaudeVersionCheck {
+fn classify_claude_version_output(stdout: &str) -> ClaudeVersionCheck {
     match parse_claude_version(stdout) {
         Some(found) if found >= MIN_CLAUDE_VERSION_FOR_GROUP => ClaudeVersionCheck::Ok,
         Some((maj, min, patch)) => ClaudeVersionCheck::TooOld(format!("{maj}.{min}.{patch}")),
@@ -678,7 +699,7 @@ pub(crate) fn classify_claude_version_output(stdout: &str) -> ClaudeVersionCheck
 /// `None` on anything else — garbage, a `v`-prefixed or two-component
 /// version, empty output — which is exactly what routes [`check_claude_version`]
 /// to `Unknown` rather than a wrong guess.
-pub(crate) fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
+fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
     let first_token = output.split_whitespace().next()?;
     let mut parts = first_token.split('.');
     let major = parts.next()?.parse().ok()?;
@@ -707,13 +728,13 @@ pub(crate) fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
 /// a marker named for the wrapper it has to survive would be erased in transit by
 /// exactly the process it exists to inform. [`marker_survives_the_cmux_prefix_sweep`]
 /// pins that.
-pub(crate) const RUN_ACTIVE_ENV: &str = "TCR_RUN_ACTIVE";
+const RUN_ACTIVE_ENV: &str = "TCR_RUN_ACTIVE";
 
 /// Set on **every** `tcr run` child, including the proxy-down passthrough: the
 /// claim is about this chain already containing a `tcr run`, which is true there
 /// too, and a launcher re-wrapping that case just prints the passthrough notice
 /// twice instead of the routing banner.
-pub(crate) fn mark_run_active(cmd: &mut std::process::Command) {
+fn mark_run_active(cmd: &mut std::process::Command) {
     cmd.env(RUN_ACTIVE_ENV, "1");
 }
 
@@ -730,7 +751,7 @@ fn see_through_ca() -> Option<PathBuf> {
     see_through_ca_in(ca.parent().unwrap_or_else(|| Path::new(".")))
 }
 
-pub(crate) fn see_through_ca_in(dir: &Path) -> Option<PathBuf> {
+fn see_through_ca_in(dir: &Path) -> Option<PathBuf> {
     match mitm::existing_ca_path_in(dir) {
         Ok(ca_path) => match ca_path {
             Some(ca) if ca.is_file() => Some(ca),
@@ -768,7 +789,7 @@ pub(crate) fn see_through_ca_in(dir: &Path) -> Option<PathBuf> {
 /// A value the CALLER exported is inherited untouched — an explicit choice wins, and
 /// it is the escape hatch for a `claude` with no claude.ai login of its own, which
 /// does need some credential to start.
-pub(crate) fn withheld_api_key_notice(configured: bool, caller_set: bool) -> Option<&'static str> {
+fn withheld_api_key_notice(configured: bool, caller_set: bool) -> Option<&'static str> {
     (configured && !caller_set).then_some(
         "[tcr] not exporting ANTHROPIC_API_KEY from proxy.apiKey: it would outrank claude's \
          claude.ai login and disable every claude.ai connector. The proxy does not need it — \

@@ -686,7 +686,7 @@ mod peer_lend_fraction_tests {
 #[cfg(test)]
 mod peer_grant_tests {
     use super::*;
-    use crate::peer_cmd::run_peer;
+    use crate::cmd::peer::run_peer;
     use std::path::PathBuf;
 
     /// One pinned peer and nothing else: what `share`, `allow` and `lend` all

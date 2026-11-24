@@ -9,15 +9,47 @@ use tcr::cli;
 use tcr::config::{self, Config, ConfigError};
 use tcr::{affinity, build_info, config_keys, oauth, server, singleton, tui};
 
-use crate::ServerArgs;
+use super::ConfigFile;
 
-pub(crate) mod logging;
+mod logging;
+#[cfg(test)]
+mod tests;
 
 use logging::init_tracing;
 
+#[derive(clap::Args)]
+pub(crate) struct ServerArgs {
+    /// Port to bind (overrides `proxy.port` from the config).
+    #[arg(long)]
+    port: Option<u16>,
+    #[command(flatten)]
+    config: ConfigFile,
+    /// Run without the TUI, logging to stdout.
+    #[arg(long)]
+    headless: bool,
+    /// Take over the listening socket without unbinding the port. The old server
+    /// drains its accepted connections. An older server without handoff support
+    /// is left running and must be stopped explicitly once to upgrade.
+    #[arg(long)]
+    replace: bool,
+    /// DEPRECATED and now a no-op: this is the default. Kept accepted so existing
+    /// scripts and launch agents that pass it keep working. Pass `--replace` for
+    /// the old default (take the port over).
+    ///
+    /// `conflicts_with` rather than a silent precedence rule: the two flags are a
+    /// contradiction, and the previous wiring resolved it by quietly discarding
+    /// `--replace`. An operator whose launchd plist or shell alias already carries
+    /// `--no-replace`, adding `--replace` to force a rebuilt binary onto the port,
+    /// got a stand-down and exit 0 — while `--help` told them the flag they left
+    /// in place does nothing. clap now rejects the pair by name, which is the only
+    /// outcome that cannot be misread.
+    #[arg(long, conflicts_with = "replace")]
+    no_replace: bool,
+}
+
 /// A stand-down that resolved cleanly: a peer proxy holds the port and is
 /// serving this binary's code (or something we have no reason to doubt).
-pub(crate) const EXIT_STOOD_DOWN_OK: i32 = 0;
+const EXIT_STOOD_DOWN_OK: i32 = 0;
 /// A stand-down where the incumbent is serving a DIFFERENT commit than the
 /// binary that was just run.
 ///
@@ -27,12 +59,12 @@ pub(crate) const EXIT_STOOD_DOWN_OK: i32 = 0;
 /// `tcr && <next step>` stops instead of proceeding as if the new build were
 /// live. Not `1`: that is a genuine startup failure, and not `2`, which clap
 /// uses for a usage error.
-pub(crate) const EXIT_STOOD_DOWN_STALE: i32 = 3;
+const EXIT_STOOD_DOWN_STALE: i32 = 3;
 /// A stand-down where the incumbent never answered the liveness probe — it holds
 /// the listening socket and serves nothing. Distinct from [`EXIT_STOOD_DOWN_STALE`]
 /// because the operator's next command is different: `--replace` is a recovery
 /// here, not an upgrade.
-pub(crate) const EXIT_STOOD_DOWN_NOT_ANSWERING: i32 = 4;
+const EXIT_STOOD_DOWN_NOT_ANSWERING: i32 = 4;
 
 /// The stand-down's exit code, as a pure function of what was actually measured.
 ///
@@ -42,7 +74,7 @@ pub(crate) const EXIT_STOOD_DOWN_NOT_ANSWERING: i32 = 4;
 /// Liveness outranks build skew because it is the more urgent fact — nothing is
 /// serving at all — and because a proxy that would not answer also could not
 /// report a build, so its build verdict is `Unknown` by construction.
-pub(crate) const fn stand_down_exit_code(
+const fn stand_down_exit_code(
     liveness: &cli::Liveness,
     verdict: build_info::StandDownBuild,
 ) -> i32 {
@@ -400,7 +432,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
 /// port-owner claim being withdrawn) — deleting the SIGTERM arm here makes
 /// that test fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShutdownTrigger {
+enum ShutdownTrigger {
     CtrlC,
     Sigterm,
     ServingStopped,
@@ -421,7 +453,7 @@ impl ShutdownTrigger {
     /// Returned rather than logged inline so every variant is forced to have
     /// one by the type system, and so `every_shutdown_trigger_logs_a_line` can
     /// check them without a running server.
-    pub(crate) const fn shutdown_line(self) -> &'static str {
+    const fn shutdown_line(self) -> &'static str {
         match self {
             Self::CtrlC => "shutdown signal received",
             Self::Sigterm => "SIGTERM received; shutting down",
@@ -441,7 +473,7 @@ impl ShutdownTrigger {
 /// the advice that DOES work — quitting the host application — was never printed.
 /// An instruction that cannot succeed is a bug even when the code behind it is
 /// correct.
-pub(crate) const fn wedged_incumbent_recovery(kind: singleton::ProxyKind) -> &'static str {
+const fn wedged_incumbent_recovery(kind: singleton::ProxyKind) -> &'static str {
     match kind {
         singleton::ProxyKind::TcrEmbedded => {
             "`tcr --replace` cannot take this one over: the pid belongs to the host application \
@@ -504,7 +536,7 @@ fn stand_down_exit(stand_down: &server::StandDown, file_log: Option<tcr::file_lo
 /// (`importFrom` pointer included) and drop it permanently, so this skips the
 /// write and leaves the on-disk file for a human to fix — same hazard, same
 /// guard.
-pub(crate) fn migration_persist_target<'a>(
+fn migration_persist_target<'a>(
     config: &Config,
     persist_path: &'a Option<PathBuf>,
 ) -> Option<&'a Path> {
@@ -529,7 +561,7 @@ pub(crate) fn migration_persist_target<'a>(
 ///   legitimate first run and still boots on defaults; a file that exists and
 ///   fails to parse is now the operator's problem to fix, not something this
 ///   binary papers over.
-pub(crate) fn load_config(path: &Path) -> anyhow::Result<(Config, Option<PathBuf>)> {
+pub(super) fn load_config(path: &Path) -> anyhow::Result<(Config, Option<PathBuf>)> {
     match config::load_or_init(path) {
         Ok((config, _created)) => Ok((config, Some(path.to_path_buf()))),
         Err(ConfigError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -560,6 +592,6 @@ fn parse_default_config() -> anyhow::Result<Config> {
 }
 
 #[cfg(test)]
-pub(crate) fn default_config() -> Config {
+pub(super) fn default_config() -> Config {
     parse_default_config().expect("an empty JSON object is always a valid default config")
 }

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 /// It now shares `paths::cache_dir` with it on purpose: two resolutions of the
 /// cache directory could disagree, and an install would split its cache across
 /// two folders.
-pub(crate) fn log_location() -> (PathBuf, &'static str) {
+fn log_location() -> (PathBuf, &'static str) {
     (tcr::paths::cache_dir().log_dir(), tcr::paths::LOG_PREFIX)
 }
 
@@ -78,7 +78,7 @@ pub(crate) fn log_location() -> (PathBuf, &'static str) {
 /// `Rotation::DAILY`'s UTC clock (`rolling.rs` uses `OffsetDateTime::now_utc`),
 /// not local midnight — for the stated goal of human discoverability, that
 /// means the daily boundary lands at 03:00 in Asia/Jerusalem, not midnight.
-pub(crate) fn open_log_appender(
+fn open_log_appender(
     log_dir: &Path,
     prefix: &str,
 ) -> std::io::Result<tracing_appender::rolling::RollingFileAppender> {
@@ -151,7 +151,7 @@ pub(crate) fn open_log_appender(
 /// `tests/peer_e2e.rs` on CI, where `NO_COLOR` is unset and the children's
 /// boot logs are files: every field name arrived as
 /// `\e[3mpeer_listen\e[0m\e[2m=\e[0m`.
-pub(crate) fn headless_subscriber<W>(
+fn headless_subscriber<W>(
     filter: tracing_subscriber::EnvFilter,
     file: Option<tracing_appender::non_blocking::NonBlocking>,
     stdout_sink: Option<W>,
@@ -200,7 +200,7 @@ const DEFAULT_LOG_FILTER: &str = "info,tailscale=warn,ts_=warn,kameo=warn";
 #[cfg(not(feature = "tailnet-node"))]
 const DEFAULT_LOG_FILTER: &str = "info";
 
-pub(crate) fn init_tracing(headless: bool) -> Option<tcr::file_log::FileLog> {
+pub(super) fn init_tracing(headless: bool) -> Option<tcr::file_log::FileLog> {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::util::SubscriberInitExt as _;
     let filter =
@@ -250,3 +250,6 @@ pub(crate) fn init_tracing(headless: bool) -> Option<tcr::file_log::FileLog> {
     }
     file_log
 }
+
+#[cfg(test)]
+mod tests;

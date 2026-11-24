@@ -22,7 +22,7 @@ use tcr::{mitm, status};
 ///
 /// Pure — takes the inherited value and the group name, returns the new
 /// value — so all of the above is testable without spawning a process.
-pub(crate) fn compose_group_header(inherited: Option<&str>, group: &str) -> String {
+pub(super) fn compose_group_header(inherited: Option<&str>, group: &str) -> String {
     compose_custom_header(inherited, GROUP_HEADER_NAME, group)
 }
 
@@ -53,7 +53,7 @@ fn compose_custom_header(inherited: Option<&str>, name: &str, value: &str) -> St
 /// unescaped. The server's own keys are hex. Built only by [`LaunchKey::decide`],
 /// and its `Debug` never prints the value, so a `{:?}` cannot leak it.
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct LaunchRequestKey(String);
+pub(super) struct LaunchRequestKey(String);
 
 impl std::fmt::Debug for LaunchRequestKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -63,7 +63,7 @@ impl std::fmt::Debug for LaunchRequestKey {
 
 impl LaunchRequestKey {
     /// `None` for an empty key, or one holding any other character.
-    pub(crate) fn parse(raw: &str) -> Option<Self> {
+    pub(super) fn parse(raw: &str) -> Option<Self> {
         (!raw.is_empty()
             && raw
                 .bytes()
@@ -71,7 +71,7 @@ impl LaunchRequestKey {
         .then(|| Self(raw.to_string()))
     }
 
-    pub(crate) fn as_str(&self) -> &str {
+    pub(super) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -87,7 +87,7 @@ impl LaunchRequestKey {
 /// there. Every other case launches exactly as before keys existed, and
 /// [`Self::notice`] says why.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LaunchKey {
+pub(super) enum LaunchKey {
     /// Send this key.
     Send(LaunchRequestKey),
     /// The config holds no `proxy.requestKey` (the server writes one at boot).
@@ -105,7 +105,7 @@ impl LaunchKey {
     /// `config_key` is the loaded config's `proxy.requestKey`; `status` is the
     /// launch's one read of the running server ([`cli::fetch_live_status`]).
     /// `tcr run` never writes a key: only the server generates one.
-    pub(crate) fn decide(
+    pub(super) fn decide(
         config_key: Option<&str>,
         status: &Result<status::StatusPayload, cli::LiveStatusError>,
     ) -> Self {
@@ -123,7 +123,7 @@ impl LaunchKey {
     }
 
     /// The key to send, when this launch sends one.
-    pub(crate) const fn key(&self) -> Option<&LaunchRequestKey> {
+    pub(super) const fn key(&self) -> Option<&LaunchRequestKey> {
         match self {
             Self::Send(key) => Some(key),
             _ => None,
@@ -131,7 +131,7 @@ impl LaunchKey {
     }
 
     /// The one stderr line an unkeyed launch prints, saying why. Never the key.
-    pub(crate) fn notice(&self, port: u16) -> Option<String> {
+    pub(super) fn notice(&self, port: u16) -> Option<String> {
         let why = match self {
             Self::Send(_) => return None,
             Self::NoKeyInConfig => {
@@ -207,7 +207,7 @@ fn loopback_proxy_url(marker: Option<&str>, key: Option<&LaunchRequestKey>, port
 /// every `CONNECT`. Returns the stderr lines for the caller to print; they show
 /// the URL with the key as `***`.
 #[must_use]
-pub(crate) fn apply_see_through_env(
+pub(super) fn apply_see_through_env(
     cmd: &mut std::process::Command,
     port: u16,
     ca: &Path,
@@ -231,7 +231,7 @@ pub(crate) fn apply_see_through_env(
 }
 
 /// The CA a see-through Claude session trusts; Codex's trust settings are untouched.
-pub(crate) fn see_through_ca_notice(ca: &Path) -> String {
+pub(super) fn see_through_ca_notice(ca: &Path) -> String {
     format!(
         "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS={}",
         ca.display()
@@ -255,7 +255,7 @@ pub(crate) fn see_through_ca_notice(ca: &Path) -> String {
 /// `tcr-codex` username stays: a server that reports `requestKeyMode` reads the
 /// marker from the username alone. Returns the stderr lines, the key as `***`.
 #[must_use]
-pub(crate) fn apply_codex_see_through_env(
+pub(super) fn apply_codex_see_through_env(
     cmd: &mut std::process::Command,
     port: u16,
     ca: &Path,
@@ -299,7 +299,7 @@ pub(crate) fn apply_codex_see_through_env(
 /// node trusts that leaf only through this variable; without it the nested
 /// session fails TLS. codex itself reads only `CODEX_CA_CERTIFICATE`, so this
 /// changes nothing for codex. Silent, as the rest of the launch's defaults are.
-pub(crate) fn apply_nested_claude_ca(
+pub(super) fn apply_nested_claude_ca(
     cmd: &mut std::process::Command,
     ca: &Path,
     caller_exported: bool,
@@ -323,7 +323,7 @@ pub(super) const fn mitm_codex_host() -> &'static str {
 /// in `ANTHROPIC_CUSTOM_HEADERS`, appended after whatever the caller (or
 /// `--group`) set there ([`compose_custom_header`]). Returns the stderr lines.
 #[must_use]
-pub(crate) fn apply_base_url_env(
+pub(super) fn apply_base_url_env(
     cmd: &mut std::process::Command,
     port: u16,
     key: &LaunchKey,

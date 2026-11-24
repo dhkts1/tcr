@@ -319,7 +319,7 @@ fn peer_ls_handed_key_until(
 /// A Claude account's pin is a real one and is not listed here, and nothing is
 /// listed for a Codex account left on `local`. `--json` is unchanged: its
 /// `exits` map already carries every pin.
-pub(crate) fn peer_ls_inert_exit_lines(accounts: &[config::Account]) -> Vec<String> {
+fn peer_ls_inert_exit_lines(accounts: &[config::Account]) -> Vec<String> {
     accounts
         .iter()
         .filter(|account| account.provider == tcr::provider::Provider::Codex)
@@ -464,5 +464,50 @@ fn found_row_for_readers(row: &peer::state::Found) -> status::PeerFoundRow {
         trusted: false,
         last_seen_ms: row.last_seen_ms,
         sources: row.sources.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::test_support::account_with_groups;
+
+    /// `tcr peer ls` lists a Codex account's exit pin with what it really does:
+    /// a loose pin is inert, because a Codex request always leaves from this Mac,
+    /// and a strict one skips the account during selection, so its line
+    /// names the command that clears it. A Claude pin, and a Codex account left
+    /// local, get no line.
+    #[test]
+    fn peer_ls_marks_a_codex_exit_pin_inert() {
+        use tcr::provider::Provider;
+        let peer = tcr_peer_wire::PeerId([7_u8; 32]);
+        let pinned = |name: &str, provider: Provider, strict: bool| config::Account {
+            provider,
+            egress: config::Egress::Via(peer),
+            egress_strict: strict,
+            ..account_with_groups(name, None)
+        };
+        let accounts = vec![
+            pinned("bob@example.com/codex", Provider::Codex, false),
+            pinned("carol@example.com/codex", Provider::Codex, true),
+            pinned("alice@example.com", Provider::Anthropic, false),
+            config::Account {
+                provider: Provider::Codex,
+                ..account_with_groups("dana@example.com/codex", None)
+            },
+        ];
+        assert_eq!(
+            peer_ls_inert_exit_lines(&accounts),
+            vec![
+                format!(
+                    "bob@example.com/codex  exits={} (inert: Codex accounts always leave from this Mac)",
+                    peer.display()
+                ),
+                format!(
+                    "carol@example.com/codex  exits={} (refused: a Codex account cannot exit from another Mac, so tcr skips this account; clear it with `tcr peer account carol@example.com/codex --exits-from local --no-must`)",
+                    peer.display()
+                ),
+            ]
+        );
     }
 }
