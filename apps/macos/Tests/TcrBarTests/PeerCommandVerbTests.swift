@@ -23,7 +23,7 @@ import XCTest
 /// `PeersStatusBlockTests`. This is the one link neither of those covers:
 /// that the word exists at all.
 final class PeerCommandVerbTests: XCTestCase {
-    /// `src/main.rs`, read from the repository this test file lives in.
+    /// `src/cmd/peer/peer_cli.rs` (the `PeerAction` enum), read from this repository.
     private func rustMain() throws -> String {
         let thisFile = URL(fileURLWithPath: #filePath)
         let repoRoot =
@@ -34,7 +34,7 @@ final class PeerCommandVerbTests: XCTestCase {
             .deletingLastPathComponent()  // apps/macos -> apps
             .deletingLastPathComponent()  // apps -> repo root
         return try String(
-            contentsOf: repoRoot.appendingPathComponent("src/main.rs"), encoding: .utf8)
+            contentsOf: repoRoot.appendingPathComponent("src/cmd/peer/peer_cli.rs"), encoding: .utf8)
     }
 
     /// Every `tcr peer <verb>` this app can run, taken off `PeerCommand`
@@ -72,7 +72,7 @@ final class PeerCommandVerbTests: XCTestCase {
             let arm = verb.prefix(1).uppercased() + verb.dropFirst()
             XCTAssertTrue(
                 source.contains("\(arm)(Peer") || source.contains("\(arm)(peer_cli::"),
-                "the panel runs `tcr peer \(verb)` (\(invocation.label)) and src/main.rs has no "
+                "the panel runs `tcr peer \(verb)` (\(invocation.label)) and src/cmd/peer/peer_cli.rs has no "
                     + "`\(arm)(…)` arm in `PeerAction`, the tab would read the non-zero exit as "
                     + "an older tcr and silently keep its file half, which is how "
                     + "`peer status` shipped as a verb nothing answered"

@@ -617,18 +617,18 @@ final class PeersPanelWiringTests: XCTestCase {
     /// so this is not pinned to words `tcr` has already moved past, and the
     /// `PeerInviteSheet` slice contains none of them re-spelled.
     func testTheInviteSheetQuotesTheCliRatherThanRespellingIt() throws {
-        let mainRs = try source("src/main.rs")
+        let mainRs = try source("src/cmd/peer/pairing.rs")
         XCTAssertTrue(
             mainRs.contains("no internet address"),
-            "the no-internet-address sentence has moved or been reworded in src/main.rs; "
+            "the no-internet-address sentence has moved or been reworded in src/cmd/peer/pairing.rs; "
                 + "update this check and confirm PeerInviteSheet still says nothing of its own "
                 + "about it")
         XCTAssertTrue(
             mainRs.contains("needs this Mac's router to forward the"),
-            "the router-forwarding sentence has moved or been reworded in src/main.rs")
+            "the router-forwarding sentence has moved or been reworded in src/cmd/peer/pairing.rs")
         XCTAssertTrue(
             mainRs.contains("is used or expires"),
-            "the join-capable-until sentence has moved or been reworded in src/main.rs")
+            "the join-capable-until sentence has moved or been reworded in src/cmd/peer/pairing.rs")
         let pairRs = try source("src/peer/pair.rs")
         XCTAssertTrue(
             pairRs.contains("one use and ten minutes"),
@@ -677,7 +677,7 @@ final class PeersPanelWiringTests: XCTestCase {
             askRs.contains(#"pub const REPLY_PREFIX: &str = "tcr-reply:v1:";"#),
             "REPLY_PREFIX has moved or been reworded in src/peer/ask.rs")
 
-        let mainRs = try source("src/main.rs")
+        let mainRs = try source("src/cmd/peer/pairing.rs")
         for sentence in [
             "this names no address and grants nothing",
             "it is good for ten minutes; paste what comes back with",
@@ -686,7 +686,7 @@ final class PeersPanelWiringTests: XCTestCase {
         ] {
             XCTAssertTrue(
                 mainRs.contains(sentence),
-                "the sentence \"\(sentence)\" has moved or been reworded in src/main.rs; "
+                "the sentence \"\(sentence)\" has moved or been reworded in src/cmd/peer/pairing.rs; "
                     + "update this check and confirm PeerInviteSheet still says nothing of "
                     + "its own about it")
         }

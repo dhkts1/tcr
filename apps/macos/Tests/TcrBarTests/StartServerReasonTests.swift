@@ -98,7 +98,7 @@ final class StartServerReasonTests: XCTestCase {
         XCTAssertEqual(PredatesCodexRefusal.displayed("connection refused"), "connection refused")
 
         let loader = try String(
-            contentsOf: repoRoot().appendingPathComponent("src/config.rs"), encoding: .utf8)
+            contentsOf: repoRoot().appendingPathComponent("src/config/load.rs"), encoding: .utf8)
         for words in [
             "carries credentialVersion {v}, which this build", "only understands up to {understood}",
         ] {
