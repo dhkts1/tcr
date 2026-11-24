@@ -120,6 +120,35 @@ impl Homes {
             .join("fish")
     }
 
+    /// `~/.bashrc`, the file interactive bash reads and tcr writes its block into.
+    fn bashrc(&self) -> PathBuf {
+        self.home.join(".bashrc")
+    }
+
+    /// The login file macOS bash reads: the first of the three that exists, or
+    /// `~/.bash_profile` when none does.
+    fn bash_login_file(&self) -> PathBuf {
+        [".bash_profile", ".bash_login", ".profile"]
+            .iter()
+            .map(|name| self.home.join(name))
+            .find(|path| path.exists())
+            .unwrap_or_else(|| self.home.join(".bash_profile"))
+    }
+
+    /// Every bash startup file that could define `claude`.
+    fn bash_startup_files(&self) -> Vec<PathBuf> {
+        [
+            ".bashrc",
+            ".bash_profile",
+            ".bash_login",
+            ".profile",
+            ".bash_aliases",
+        ]
+        .iter()
+        .map(|name| self.home.join(name))
+        .collect()
+    }
+
     /// `~/.claude/settings.json`, the same file `tcr doctor` reads as the
     /// user's settings.
     pub fn claude_settings(&self) -> PathBuf {
@@ -306,16 +335,6 @@ fn fish_function_file(homes: &Homes) -> PathBuf {
     homes.fish_dir().join("functions").join("claude.fish")
 }
 
-/// The login file macOS bash reads: the first of the three that exists, or
-/// `~/.bash_profile` when none does.
-fn bash_login_file(homes: &Homes) -> PathBuf {
-    [".bash_profile", ".bash_login", ".profile"]
-        .iter()
-        .map(|name| homes.home.join(name))
-        .find(|path| path.exists())
-        .unwrap_or_else(|| homes.home.join(".bash_profile"))
-}
-
 /// Does this startup file already pull in `~/.bashrc`? Any non-comment line
 /// naming `.bashrc` counts: the usual `[ -f ~/.bashrc ] && . ~/.bashrc` and
 /// its many spellings all do.
@@ -329,9 +348,9 @@ pub fn shell_targets(shell: Shell, homes: &Homes) -> Vec<PathBuf> {
     match shell {
         Shell::Zsh => vec![homes.zsh_dir().join(".zshrc")],
         Shell::Bash => {
-            let mut targets = vec![homes.home.join(".bashrc")];
+            let mut targets = vec![homes.bashrc()];
             if homes.macos {
-                let login = bash_login_file(homes);
+                let login = homes.bash_login_file();
                 let already =
                     std::fs::read_to_string(&login).is_ok_and(|text| sources_bashrc(&text));
                 if !already {
@@ -352,16 +371,7 @@ fn shell_scan_files(shell: Shell, homes: &Homes) -> Vec<PathBuf> {
             .iter()
             .map(|name| homes.zsh_dir().join(name))
             .collect(),
-        Shell::Bash => [
-            ".bashrc",
-            ".bash_profile",
-            ".bash_login",
-            ".profile",
-            ".bash_aliases",
-        ]
-        .iter()
-        .map(|name| homes.home.join(name))
-        .collect(),
+        Shell::Bash => homes.bash_startup_files(),
         Shell::Fish => {
             let dir = homes.fish_dir();
             let mut files = vec![dir.join("config.fish")];
