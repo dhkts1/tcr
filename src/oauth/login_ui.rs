@@ -2,8 +2,6 @@
 //! machine mode, the JSON events TcrBar parses, the coded refusals and the
 //! notices and command names the messages quote.
 
-use super::*;
-
 /// Who is on the other end of `tcr login`.
 ///
 /// Every interactive thing the login does — reading stdin, prompting for a
@@ -230,40 +228,6 @@ pub fn machine_error_line(error: &anyhow::Error) -> (String, String) {
 /// to join the pool (`mitm::handle_connect`); unmarked clients keep their own TLS and login.
 pub const CODEX_FIRST_ACCOUNT_NOTICE: &str = "tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`; keep \
     the marker scoped to that launch, since unmarked connections keep their own login";
-
-/// The warning for a `tcr` at `path`, reporting `version`, that is 0.2.45 or older: it predates
-/// the `credentialVersion` check, so it would read a Codex row as a Claude account and send its
-/// OpenAI token to Anthropic the next time it starts on this config.
-pub fn older_tcr_reads_codex_as_claude_notice(path: &Path, version: &str) -> String {
-    format!(
-        "the tcr at {} ({version}) predates Codex accounts: update it before it next starts — it \
-         would read this login as a Claude account and send its token to Anthropic",
-        path.display()
-    )
-}
-
-/// The warning for a `tcr` at `path`, reporting `version`, from 0.2.46 on that still lacks
-/// `--from-codex`: it checks `credentialVersion`, so it refuses a config holding a Codex row
-/// outright, and every command it runs on this config fails until it is updated.
-pub fn older_tcr_refuses_config_notice(path: &Path, version: &str) -> String {
-    format!(
-        "the tcr at {} ({version}) predates Codex accounts: update it — until then it refuses \
-         this config, so every command it runs fails",
-        path.display()
-    )
-}
-
-/// The notice for a codex with no login of its own at `path` (an existence check, never a
-/// read): tcr re-credentials a pooled codex's requests, but codex itself still has to start
-/// signed in. A login kept in the system keyring (codex's `keyring` and `auto` stores) is
-/// invisible to tcr, which is why the sentence leaves that case open.
-pub fn codex_has_no_login_notice(path: &Path) -> String {
-    format!(
-        "codex needs a login of its own to start, even when pooled, and none is at {}: unless \
-         codex keeps its login in the keyring, run `codex login` once",
-        path.display()
-    )
-}
 
 /// The line `tcr login --from-codex` prints after its import lines in the terminal: how to use
 /// the account it just saved.
