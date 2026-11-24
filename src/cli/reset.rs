@@ -170,12 +170,8 @@ pub async fn reset(
     key: Option<&str>,
     assume_yes: bool,
 ) -> anyhow::Result<i32> {
-    let claude = config::load(config_path).is_ok_and(|config| {
-        config
-            .accounts
-            .iter()
-            .any(|a| a.name == account && a.provider == Provider::Anthropic)
-    });
+    let claude = config::load(config_path)
+        .is_ok_and(|config| config.provider_of(account) == Some(Provider::Anthropic));
     if !claude {
         if kind.is_some_and(|kind| kind != tcr_status_wire::ResetKind::Weekly) {
             eprintln!("Reset failed. A Codex reset is a weekly reset.");

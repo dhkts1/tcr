@@ -64,6 +64,39 @@ impl Config {
         self.accounts.iter().any(|a| a.provider == provider)
     }
 
+    /// Resolve `name` to exactly one configured account by EXACT match on
+    /// `Account.name`.
+    ///
+    /// [`resolve_account`]'s rule, with the group verbs' own not-found message.
+    ///
+    /// The one thing it does not borrow from `resolve_account` is the not-found
+    /// text. The panel shells out blind, so an unknown name has to come back with
+    /// the full roster to act on rather than a bare "no account matches".
+    pub fn find_account_by_name(&self, name: &str) -> anyhow::Result<&Account> {
+        match identity::match_one(&self.accounts, name) {
+            identity::Match::One(idx) => Ok(&self.accounts[idx]),
+            identity::Match::Ambiguous(names) => {
+                bail!("{}", ambiguous_query_message(name, &names))
+            }
+            identity::Match::None => {
+                let configured: Vec<&str> = self.accounts.iter().map(|a| a.name.as_str()).collect();
+                bail!(
+                    "no account named '{name}' in the config. Configured accounts: {}",
+                    configured.join(", ")
+                );
+            }
+        }
+    }
+
+    /// The provider of the account named `name`, by exact name (names are unique
+    /// across a config). `None` for a name no row carries.
+    pub fn provider_of(&self, name: &str) -> Option<crate::provider::Provider> {
+        self.accounts
+            .iter()
+            .find(|account| account.name == name)
+            .map(|account| account.provider)
+    }
+
     /// The name `controlAccount` names, in either of its shapes; `None` when unset.
     pub fn control_account_name(&self) -> Option<&str> {
         self.control_account

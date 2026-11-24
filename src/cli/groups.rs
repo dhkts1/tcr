@@ -7,7 +7,6 @@ use anyhow::{Context as _, bail};
 
 use super::load_config;
 use crate::config::{self, Account, Config};
-use crate::identity;
 use crate::log_err::LogErr as _;
 use crate::provider::Provider;
 
@@ -59,30 +58,6 @@ pub fn validate_group_label_chars(label: &str) -> Result<(), &'static str> {
 /// without over-promising instant propagation.
 const GROUP_LIVE_RELOAD_NOTE: &str = "note: the running proxy picks this up automatically (next request or status check) — no restart needed";
 
-/// Resolve `name` to exactly one configured account by EXACT match on
-/// `Account.name`.
-///
-/// [`config::resolve_account`]'s rule, with the group verbs' own not-found message.
-///
-/// The one thing it does not borrow from `resolve_account` is the not-found
-/// text. The panel shells out blind, so an unknown name has to come back with
-/// the full roster to act on rather than a bare "no account matches".
-fn find_account_by_name(accounts: &[Account], name: &str) -> anyhow::Result<usize> {
-    match identity::match_one(accounts, name) {
-        identity::Match::One(idx) => Ok(idx),
-        identity::Match::Ambiguous(names) => {
-            bail!("{}", config::ambiguous_query_message(name, &names))
-        }
-        identity::Match::None => {
-            let configured: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
-            bail!(
-                "no account named '{name}' in the config. Configured accounts: {}",
-                configured.join(", ")
-            );
-        }
-    }
-}
-
 /// The warning [`add_to_group`] prints when the account being labelled is the
 /// control account. Split out as a pure function so a test can assert the text
 /// without capturing stderr — the notice IS the fix here, so it needs a gate of
@@ -125,7 +100,7 @@ pub(super) fn codex_group_add_notice(target: &Account, group: &str) -> Option<St
 
 /// `tcr group add <group> <account>` — label `account` with `group`.
 ///
-/// Resolves through [`find_account_by_name`], which applies exactly the rule
+/// Resolves through [`Config::find_account_by_name`], which applies exactly the rule
 /// `tcr enable`/`disable`/`token`/`remove`/`priority` use, and refuses an
 /// ambiguous name rather than resolving it to whichever row comes first. That
 /// refusal used to be reachable: on a fleet holding one email twice, this
@@ -154,8 +129,7 @@ pub fn add_to_group(config_path: &Path, group: &str, account: &str) -> anyhow::R
     // command with the proxy always up, which is exactly the case that makes
     // a false-but-constant warning turn into wallpaper.
     let config = load_config(config_path)?;
-    let idx = find_account_by_name(&config.accounts, account)?;
-    let target = &config.accounts[idx];
+    let target = config.find_account_by_name(account)?;
     // The label itself is real and the write below is correct — but on the
     // CONTROL account it buys nothing, because `Manager::select_with_group`
     // excludes that account from every inference pick
@@ -204,7 +178,7 @@ pub fn add_to_group(config_path: &Path, group: &str, account: &str) -> anyhow::R
 /// `tcr group rm <group> <account>` / `tcr group rm <group> --all` — remove
 /// `account`'s (or every member's, with `--all`) `group` label.
 ///
-/// The single-account path resolves through [`find_account_by_name`], same as
+/// The single-account path resolves through [`Config::find_account_by_name`], same as
 /// [`add_to_group`] and for the same reasons.
 ///
 /// `account == None` iff `all` — clap's `ArgGroup` on `GroupRmArgs` refuses
@@ -271,8 +245,7 @@ pub fn remove_from_group(
     let Some(account) = account else {
         bail!("name the account to remove from the group, or pass --all");
     };
-    let idx = find_account_by_name(&config.accounts, account)?;
-    let target = &config.accounts[idx];
+    let target = config.find_account_by_name(account)?;
     let outcome = config::save_group_membership(config_path, target, group, false)
         .with_context(|| format!("save config at {}", config_path.display()))?;
     match outcome {
@@ -638,7 +611,7 @@ pub fn disallow_control_group(config_path: &Path, group: &str) -> anyhow::Result
 ///
 /// Unlike `reserve`/`unreserve`, this refuses a group with no current
 /// member — matching what [`add_to_group`] does for an unknown ACCOUNT
-/// (`find_account_by_name`'s error), applied here to the group name instead:
+/// (`Config::find_account_by_name`'s error), applied here to the group name instead:
 /// a color for a label nothing carries could never appear on any account
 /// row, so setting one would silently do nothing and look like success.
 ///
@@ -781,22 +754,12 @@ pub(super) const ROUTE_BLOCK_CONTROL_ONLY: &str = "control-account-only";
 /// for this group has nobody to be served by.
 const ROUTE_BLOCK_CODEX_ONLY: &str = "codex-only";
 
-/// The provider of the account named `name`, by exact name (names are unique
-/// across a config). `None` for a name no row carries.
-fn provider_of(config: &Config, name: &str) -> Option<Provider> {
-    config
-        .accounts
-        .iter()
-        .find(|account| account.name == name)
-        .map(|account| account.provider)
-}
-
 /// How many of `members` are Codex accounts: the `codex_members=` field of
 /// `tcr group ls`, and its `codexMembers` key.
 fn codex_member_count(config: &Config, members: &[&str]) -> usize {
     members
         .iter()
-        .filter(|member| provider_of(config, member) == Some(Provider::Codex))
+        .filter(|member| config.provider_of(member) == Some(Provider::Codex))
         .count()
 }
 
@@ -830,7 +793,7 @@ fn group_route_block(config: &Config, group: &str, members: &[&str]) -> Option<&
     let anthropic: Vec<&str> = members
         .iter()
         .copied()
-        .filter(|member| provider_of(config, member) == Some(Provider::Anthropic))
+        .filter(|member| config.provider_of(member) == Some(Provider::Anthropic))
         .collect();
     if anthropic.is_empty() {
         return Some(ROUTE_BLOCK_CODEX_ONLY);
