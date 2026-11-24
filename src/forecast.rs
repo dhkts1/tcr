@@ -155,25 +155,13 @@ pub(crate) fn header_ticks(
                     }
                 }
             }
-            let Some(reported) = quota.codex.header_windows.as_ref() else {
+            let Some((distinct, [five_hour, seven_day])) = quota.codex_header_readings() else {
                 return Some([None; 3]);
             };
-            let distinct = usize::from(reported.five_hour.is_some())
-                + usize::from(reported.seven_day.is_some());
             if distinct != supplied {
                 return Some([None; 3]);
             }
-            Some([
-                reported
-                    .five_hour
-                    .as_ref()
-                    .and_then(|_| bucket(quota.five_hour)),
-                reported
-                    .seven_day
-                    .as_ref()
-                    .and_then(|_| bucket(quota.seven_day)),
-                None,
-            ])
+            Some([bucket(five_hour), bucket(seven_day), None])
         }
     }
 }

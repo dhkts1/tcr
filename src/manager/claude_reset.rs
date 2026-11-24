@@ -230,8 +230,7 @@ impl Manager {
                 let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                 let bank = accounts
                     .get(idx)
-                    .and_then(|row| row.quota.claude_resets.as_ref())
-                    .filter(|bank| bank.eligible)
+                    .and_then(|row| row.quota.eligible_claude_resets())
                     .ok_or(ClaudeResetError::NotRead)?;
                 let grant = bank.pick(kind).map_err(|error| match error {
                     PickError::NoneHeld => ClaudeResetError::NoneHeld,

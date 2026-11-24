@@ -579,8 +579,9 @@ impl Manager {
                                 divert_until_ms = accounts
                                     .get(idx)
                                     .and_then(|a| {
-                                        a.rate_limited_until_ms
-                                            .or_else(|| Self::rejection_reset_ms(a))
+                                        a.rate_limited_until_ms.or_else(|| {
+                                            a.quota.five_hour_rejection_reset().map(odt_to_ms)
+                                        })
                                     })
                                     .unwrap_or(0);
                                 None
@@ -1113,7 +1114,10 @@ impl Manager {
                 && let Some(idx) = self.pick_fable_last_resort(&accounts, &ask)
             {
                 if let Some(account) = accounts.get(idx) {
-                    let seven_day_oi = account.quota.seven_day_oi.map_or(0.0, |w| w.effective(now));
+                    let seven_day_oi = account
+                        .quota
+                        .effective(crate::quota::QuotaBucket::SevenDayOi, now)
+                        .unwrap_or(0.0);
                     tracing::info!(
                         account = %account.name,
                         seven_day_oi,

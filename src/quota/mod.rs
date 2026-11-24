@@ -68,6 +68,29 @@ impl QuotaWindow {
     }
 }
 
+/// One of the three rate-limit windows a [`Quota`] tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaBucket {
+    /// The shared 5-hour session window (`unified-5h`).
+    FiveHour,
+    /// The shared weekly window (`unified-7d`).
+    SevenDay,
+    /// The model-scoped weekly window (`unified-7d_oi`, the Fable weekly).
+    SevenDayOi,
+}
+
+/// Where the deadline a standing Codex refusal named for itself stands at a given instant
+/// ([`Quota::codex_refusal_deadline`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalDeadline {
+    /// No refusal stands, or the one that stands named no deadline.
+    Unnamed,
+    /// The named deadline is still ahead.
+    Ahead(OffsetDateTime),
+    /// The named deadline has passed, and no probe has read the refusal over yet.
+    Passed,
+}
+
 /// All quota dimensions tracked for one account.
 #[derive(Debug, Clone, Default)]
 pub struct Quota {
@@ -308,28 +331,31 @@ impl Quota {
         {
             return true;
         }
-        // Standard (API-key) token/request limits have no live-past-reset path of
-        // their own, so once `standard_reset` has passed the upstream limit has
-        // refreshed and a spent count must NOT keep gating — otherwise a spent
-        // standard window pins the account out of rotation forever (there is no
-        // OAuth probe for API-key accounts to re-read it). Only gate while the
-        // window is still unexpired.
-        let standard_expired = self.standard_reset.is_some_and(|r| now >= r);
-        if !standard_expired {
-            if let (Some(limit), Some(remaining)) = (self.tokens_limit, self.tokens_remaining)
-                && limit > 0
-                && 1.0 - (remaining as f64 / limit as f64) >= threshold
-            {
-                return true;
-            }
-            if let (Some(limit), Some(remaining)) = (self.requests_limit, self.requests_remaining)
-                && limit > 0
-                && 1.0 - (remaining as f64 / limit as f64) >= threshold
-            {
-                return true;
-            }
+        self.standard_limited(threshold, now)
+    }
+
+    /// Are the standard (API-key) token or request limits at/over `threshold` at `now`?
+    /// One answer for [`Self::is_near`] and `Manager::account_gate`, so the gate and
+    /// eligibility agree. OAuth accounts carry every standard field `None`, so this is
+    /// always `false` for them.
+    ///
+    /// Standard limits have no live-past-reset path of their own, so once
+    /// `standard_reset` has passed the upstream limit has refreshed and a spent count
+    /// must NOT keep gating — otherwise a spent standard window pins the account out of
+    /// rotation forever (there is no OAuth probe for API-key accounts to re-read it).
+    /// Only gate while the window is still unexpired.
+    pub fn standard_limited(&self, threshold: f64, now: OffsetDateTime) -> bool {
+        if self.standard_reset.is_some_and(|r| now >= r) {
+            return false;
         }
-        false
+        let near = |limit: Option<i64>, remaining: Option<i64>| {
+            matches!(
+                (limit, remaining),
+                (Some(l), Some(r)) if l > 0 && 1.0 - (r as f64 / l as f64) >= threshold
+            )
+        };
+        near(self.tokens_limit, self.tokens_remaining)
+            || near(self.requests_limit, self.requests_remaining)
     }
 
     /// Is the model-scoped weekly bucket (`7d_oi`, the Fable weekly) at/over
@@ -410,6 +436,140 @@ impl Quota {
     /// quota first; `None` sorts an account first (unknown quota → probe it).
     pub fn governing_weekly_reset(&self, now: OffsetDateTime) -> Option<OffsetDateTime> {
         self.seven_day.and_then(|w| w.live_reset(now))
+    }
+
+    /// When a `rejected` unified status will clear on its own, if that can be known: the
+    /// 5-hour window's reset instant, when the 5-hour window is the one carrying the
+    /// rejection (its stored utilization is at least the weekly's). `None` when the account
+    /// is not rejected, the weekly window is the fuller one (its reset is days away, never
+    /// inside a cache window), or no reset was reported.
+    ///
+    /// Why this is knowable at all: `rejected` is upstream's verdict on a WINDOW, and
+    /// [`Self::apply_usage`] drops it when that window rolls (the next probe reads a
+    /// utilization that fell). So a 5h rejection is a timer with a deadline the headers
+    /// already gave us, even though it carries no `retry-after`.
+    pub fn five_hour_rejection_reset(&self) -> Option<OffsetDateTime> {
+        if self.status.as_deref() != Some("rejected") {
+            return None;
+        }
+        let five_hour = self.five_hour?;
+        let weekly_util = self.seven_day.map_or(0.0, |w| w.utilization);
+        if five_hour.utilization < weekly_util {
+            return None;
+        }
+        five_hour.reset
+    }
+
+    /// `bucket`'s utilization as it reads at `now` ([`QuotaWindow::effective`]: a window
+    /// past its reset reads a fresh `0.0`). `None` when the window was never read.
+    pub fn effective(&self, bucket: QuotaBucket, now: OffsetDateTime) -> Option<f64> {
+        self.window(bucket).map(|w| w.effective(now))
+    }
+
+    /// `bucket`'s reset while it is still ahead of `now` ([`QuotaWindow::live_reset`]).
+    pub fn live_reset(&self, bucket: QuotaBucket, now: OffsetDateTime) -> Option<OffsetDateTime> {
+        self.window(bucket).and_then(|w| w.live_reset(now))
+    }
+
+    fn window(&self, bucket: QuotaBucket) -> Option<QuotaWindow> {
+        match bucket {
+            QuotaBucket::FiveHour => self.five_hour,
+            QuotaBucket::SevenDay => self.seven_day,
+            QuotaBucket::SevenDayOi => self.seven_day_oi,
+        }
+    }
+
+    /// A quota as if these readings had been taken: the windows, and for a Codex row the
+    /// windows its plan reported. Builds the fake rows of `tcr demo`, which reads no account.
+    pub fn seeded(
+        five_hour: Option<QuotaWindow>,
+        seven_day: Option<QuotaWindow>,
+        probed_codex_windows: Option<CodexWindows>,
+    ) -> Self {
+        Self {
+            five_hour,
+            seven_day,
+            codex: CodexQuotaFacts {
+                probed_windows: probed_codex_windows,
+                ..CodexQuotaFacts::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Anthropic's banked resets while the last read says this account may spend them: what
+    /// a claim picks a grant from and what the auto-spend looks for expiring grants in.
+    /// `None` when never read, or the read answered ineligible.
+    pub fn eligible_claude_resets(&self) -> Option<&crate::claude_resets::ClaudeResetBank> {
+        self.claude_resets.as_ref().filter(|bank| bank.eligible)
+    }
+
+    /// A Codex account's banked reset credits while it holds at least one.
+    pub fn spendable_codex_reset_credits(&self) -> Option<&tcr_status_wire::ResetCredits> {
+        self.codex
+            .reset_credits
+            .as_ref()
+            .filter(|credits| credits.available_count > 0)
+    }
+
+    /// Where the deadline the standing Codex refusal named for itself (the usage-limit body's
+    /// reset, [`CodexQuotaRefusal::reset`]) stands at `now`.
+    pub fn codex_refusal_deadline(&self, now: OffsetDateTime) -> RefusalDeadline {
+        match self.codex.refusal_reset {
+            None => RefusalDeadline::Unnamed,
+            Some(reset) if reset > now => RefusalDeadline::Ahead(reset),
+            Some(_) => RefusalDeadline::Passed,
+        }
+    }
+
+    /// What the last Codex response that carried any window said: how many windows it
+    /// carried, and the stored reading of each it carried, five-hour then weekly (`None` for
+    /// one it did not carry, or one carried but since cleared). `None` before any response
+    /// carried a window.
+    pub fn codex_header_readings(&self) -> Option<(usize, [Option<QuotaWindow>; 2])> {
+        let carried = self.codex.header_windows?;
+        Some((
+            usize::from(carried.five_hour.is_some()) + usize::from(carried.seven_day.is_some()),
+            [
+                carried.five_hour.and(self.five_hour),
+                carried.seven_day.and(self.seven_day),
+            ],
+        ))
+    }
+
+    /// The provider facts this quota reports on a row of the status wire. An Anthropic row
+    /// reports its banked resets (without grant ids) and nothing else; a Codex row reports
+    /// which windows its plan has (the probe's once any probe answered, else the headers'),
+    /// each one's length, the refusal's kind while that refusal stands, the spend control,
+    /// the credits and the banked reset credits. The row's own facts (its login, its folder)
+    /// are the caller's.
+    pub fn wire_facts(&self, provider: crate::provider::Provider) -> crate::stats::CodexFacts {
+        match provider {
+            crate::provider::Provider::Anthropic => crate::stats::CodexFacts {
+                banked_resets: self
+                    .claude_resets
+                    .as_ref()
+                    .map(crate::claude_resets::ClaudeResetBank::wire),
+                ..crate::stats::CodexFacts::default()
+            },
+            crate::provider::Provider::Codex => {
+                let windows = self.codex.windows();
+                crate::stats::CodexFacts {
+                    quota_windows: windows.map(|w| w.wire_names()),
+                    five_hour_window_minutes: windows
+                        .and_then(|w| w.five_hour)
+                        .and_then(|w| w.minutes),
+                    seven_day_window_minutes: windows
+                        .and_then(|w| w.seven_day)
+                        .and_then(|w| w.minutes),
+                    limit_reached_type: self.codex_limit_reached_type().map(str::to_string),
+                    spend_control_reached: self.codex.spend_control_reached,
+                    credits: self.codex.credits.clone(),
+                    reset_credits: self.codex.reset_credits.clone(),
+                    ..crate::stats::CodexFacts::default()
+                }
+            }
+        }
     }
 
     /// Fold a background probe's usage into the tracked windows. Only fields the

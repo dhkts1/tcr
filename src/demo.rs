@@ -122,12 +122,18 @@ const ONE_WEEK: CodexWindow = CodexWindow {
 };
 
 /// A Codex row: a ChatGPT login on `plan`, whose readings carried `windows`, as a usage probe
-/// records them. Its windows' utilization is set by the caller.
-fn codex(name: &str, plan: &str, windows: CodexWindows) -> AccountRuntime {
+/// records them, at the given five-hour and weekly readings.
+fn codex(
+    name: &str,
+    plan: &str,
+    windows: CodexWindows,
+    five_hour: Option<QuotaWindow>,
+    seven_day: Option<QuotaWindow>,
+) -> AccountRuntime {
     let mut row = base(name, 0);
     row.provider = Provider::Codex;
     row.organization_type = Some(plan.to_string());
-    row.quota.codex.probed_windows = Some(windows);
+    row.quota = Quota::seeded(five_hour, seven_day, Some(windows));
     row
 }
 
@@ -136,8 +142,7 @@ fn codex(name: &str, plan: &str, windows: CodexWindows) -> AccountRuntime {
 fn demo_accounts() -> Vec<AccountRuntime> {
     // alice — green, healthy, actively serving.
     let mut alice = base("alice", 0);
-    alice.quota.five_hour = Some(five_hour(0.45));
-    alice.quota.seven_day = Some(seven_day(0.20));
+    alice.quota = Quota::seeded(Some(five_hour(0.45)), Some(seven_day(0.20)), None);
     alice.requests = 1200;
     alice.input_tokens = 4_200_000;
     alice.output_tokens = 310_000;
@@ -145,8 +150,7 @@ fn demo_accounts() -> Vec<AccountRuntime> {
 
     // bob — green, low use.
     let mut bob = base("bob", 0);
-    bob.quota.five_hour = Some(five_hour(0.12));
-    bob.quota.seven_day = Some(seven_day(0.08));
+    bob.quota = Quota::seeded(Some(five_hour(0.12)), Some(seven_day(0.08)), None);
     bob.requests = 340;
     bob.input_tokens = 1_100_000;
     bob.output_tokens = 88_000;
@@ -156,8 +160,7 @@ fn demo_accounts() -> Vec<AccountRuntime> {
     // threshold makes 0.88 read as near without touching the fleet default.
     let mut carol = base("carol", 0);
     carol.switch_threshold = Some(0.85);
-    carol.quota.five_hour = Some(five_hour(0.88));
-    carol.quota.seven_day = Some(seven_day(0.76));
+    carol.quota = Quota::seeded(Some(five_hour(0.88)), Some(seven_day(0.76)), None);
     carol.requests = 2100;
     carol.input_tokens = 7_800_000;
     carol.output_tokens = 540_000;
@@ -168,8 +171,7 @@ fn demo_accounts() -> Vec<AccountRuntime> {
     team_prod.organization_type = Some("claude_team".to_string());
     team_prod.rate_limit_tier = Some("default_claude_max_5x".to_string());
     team_prod.seat_tier = Some("team_tier_1".to_string());
-    team_prod.quota.five_hour = Some(five_hour(0.30));
-    team_prod.quota.seven_day = Some(seven_day(0.15));
+    team_prod.quota = Quota::seeded(Some(five_hour(0.30)), Some(seven_day(0.15)), None);
     team_prod.requests = 890;
     team_prod.input_tokens = 2_600_000;
     team_prod.output_tokens = 190_000;
@@ -179,8 +181,7 @@ fn demo_accounts() -> Vec<AccountRuntime> {
     let mut dave = base("dave", 10);
     dave.status = AccountStatus::Throttled;
     dave.rate_limited_until_ms = Some(crate::now_ms() + 15 * 60_000);
-    dave.quota.five_hour = Some(five_hour(1.00));
-    dave.quota.seven_day = Some(seven_day(0.40));
+    dave.quota = Quota::seeded(Some(five_hour(1.00)), Some(seven_day(0.40)), None);
     dave.requests = 60;
     dave.input_tokens = 300_000;
     dave.output_tokens = 22_000;
@@ -204,43 +205,45 @@ fn demo_accounts() -> Vec<AccountRuntime> {
             five_hour: None,
             seven_day: Some(ONE_WEEK),
         },
+        None,
+        Some(seven_day(0.34)),
     );
-    codex_bob.quota.seven_day = Some(seven_day(0.34));
     codex_bob.requests = 140;
     codex_bob.input_tokens = 2_900_000;
     codex_bob.output_tokens = 120_000;
     codex_bob.last_used_ms = Some(ago_ms(1));
 
     // dana — ChatGPT Plus, with both windows.
-    let mut dana = codex(
+    let dana = codex(
         "dana@example.com",
         "plus",
         CodexWindows {
             five_hour: Some(FIVE_HOURS),
             seven_day: Some(ONE_WEEK),
         },
+        Some(five_hour(0.18)),
+        Some(QuotaWindow {
+            utilization: 0.25,
+            reset: Some(OffsetDateTime::now_utc() + Duration::days(5)),
+        }),
     );
-    dana.quota.five_hour = Some(five_hour(0.18));
-    dana.quota.seven_day = Some(QuotaWindow {
-        utilization: 0.25,
-        reset: Some(OffsetDateTime::now_utc() + Duration::days(5)),
-    });
 
     // carol — ChatGPT Pro at its weekly limit, out until the window resets. `rel` rounds
     // down, so a reset exactly 3 days out would already paint `7D 2d` when the frame is
     // drawn a moment later; the 30 seconds keep it at `7D 3d`.
-    let mut codex_carol = codex(
+    let codex_carol = codex(
         "carol@example.com",
         "pro",
         CodexWindows {
             five_hour: None,
             seven_day: Some(ONE_WEEK),
         },
+        None,
+        Some(QuotaWindow {
+            utilization: 1.00,
+            reset: Some(OffsetDateTime::now_utc() + Duration::days(3) + Duration::seconds(30)),
+        }),
     );
-    codex_carol.quota.seven_day = Some(QuotaWindow {
-        utilization: 1.00,
-        reset: Some(OffsetDateTime::now_utc() + Duration::days(3) + Duration::seconds(30)),
-    });
 
     vec![
         alice,

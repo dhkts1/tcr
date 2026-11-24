@@ -666,15 +666,14 @@ impl Manager {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
-            let hold = account
-                .quota
-                .codex
-                .refusal_reset
-                .filter(|reset| *reset > now)
-                .map_or_else(
-                    || seconds.clamp(1, MAX_RATE_LIMIT_HOLD_SECONDS),
-                    |reset| reset.unix_timestamp().saturating_sub(now.unix_timestamp()),
-                );
+            let hold = match account.quota.codex_refusal_deadline(now) {
+                crate::quota::RefusalDeadline::Ahead(reset) => {
+                    reset.unix_timestamp().saturating_sub(now.unix_timestamp())
+                }
+                crate::quota::RefusalDeadline::Unnamed | crate::quota::RefusalDeadline::Passed => {
+                    seconds.clamp(1, MAX_RATE_LIMIT_HOLD_SECONDS)
+                }
+            };
             account.status = AccountStatus::Throttled;
             account.rate_limited_until_ms =
                 Some(odt_to_ms(now).saturating_add(hold.saturating_mul(1000)));
