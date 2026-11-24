@@ -17,6 +17,7 @@ mod credential_version;
 mod edit;
 mod file;
 mod group_edit;
+mod identity_roster;
 mod load;
 mod tokens;
 
