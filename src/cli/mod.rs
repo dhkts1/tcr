@@ -113,7 +113,7 @@ fn load_config_with_creation(config_path: &Path) -> anyhow::Result<(Config, bool
 /// empty-fleet hint.
 async fn import_claude_code_login_if_empty(config_path: &Path, config: Config) -> Config {
     // A fleet a delete emptied stays empty: see `Config::refuses_claude_code_import`.
-    if !config.accounts.is_empty() || config.refuses_claude_code_import() {
+    if !config.holds_no_accounts() || config.refuses_claude_code_import() {
         return config;
     }
     if crate::oauth::auto_import_claude_code_login(config_path)
@@ -140,7 +140,7 @@ async fn import_claude_code_login_if_empty(config_path: &Path, config: Config) -
 /// ([`crate::codex_local::codex_login_exists`], a `metadata` call that never
 /// opens the file), so a fleet with accounts costs nothing extra.
 fn warn_if_no_accounts(config: &Config) {
-    let codex_login = (config.accounts.is_empty() && crate::codex_local::codex_login_exists())
+    let codex_login = (config.holds_no_accounts() && crate::codex_local::codex_login_exists())
         .then(crate::codex_local::codex_login_path);
     for line in no_accounts_lines(config, codex_login.as_deref()) {
         eprintln!("{line}");
@@ -158,7 +158,7 @@ fn warn_if_no_accounts(config: &Config) {
 /// person's choice. `claudeCodeImport: false` does not stop
 /// the line either, since it stops only the Claude Code import.
 fn no_accounts_lines(config: &Config, codex_login: Option<&Path>) -> Vec<String> {
-    if !config.accounts.is_empty() {
+    if !config.holds_no_accounts() {
         return Vec::new();
     }
     let mut lines = vec!["no accounts configured — run `tcr login` to add one".to_string()];

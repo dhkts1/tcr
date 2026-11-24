@@ -96,7 +96,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
     // Read-only verb: plain load, no clobber-warning (we never save).
     let (config, created) = load_config_with_creation(config_path)?;
     let config = import_claude_code_login_if_empty(config_path, config).await;
-    let first_empty_config = created && config.accounts.is_empty();
+    let first_empty_config = created && config.holds_no_accounts();
     warn_if_no_accounts(&config);
 
     // Read before the match: the offline arm CONSUMES `config`, and the route

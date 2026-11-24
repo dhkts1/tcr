@@ -53,4 +53,9 @@ impl Config {
         let idx = resolve_account(&self.accounts, query)?;
         Ok(&mut self.accounts[idx])
     }
+
+    /// Whether the fleet is empty: no usable account row, so a quarantined row does not count.
+    pub fn holds_no_accounts(&self) -> bool {
+        self.accounts.is_empty()
+    }
 }
