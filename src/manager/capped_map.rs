@@ -43,6 +43,13 @@ impl<K: Hash + Eq + Copy, V> CappedMap<K, V> {
         prior
     }
 
+    /// [`Self::insert`] for a caller that needs the evicted key rather than
+    /// the value `key` held before: [`CappedSet`] keeps its set in step by it.
+    pub(super) fn insert_evicting(&mut self, key: K, value: V) -> Option<K> {
+        self.map.insert(key, value);
+        self.evict_sparing(key)
+    }
+
     /// When the map is over its cap, remove the entry with the oldest
     /// `touched`, unless that entry is `key` (the one the caller just
     /// touched), in which case nothing is removed this time.
@@ -107,8 +114,7 @@ impl<K: Hash + Eq + Copy> CappedSet<K> {
     /// whether `key` is new, as `HashSet::insert`.
     pub(super) fn insert(&mut self, key: K) -> bool {
         self.next += 1;
-        self.order.map.insert(key, self.next);
-        if let Some(evicted) = self.order.evict_sparing(key) {
+        if let Some(evicted) = self.order.insert_evicting(key, self.next) {
             self.set.remove(&evicted);
         }
         self.set.insert(key)
