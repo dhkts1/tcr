@@ -2,6 +2,7 @@
 //! answer it gives when it has no move left.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
@@ -181,7 +182,8 @@ impl Tally {
     }
 }
 
-/// What one attempt decided, applied by the loop in [`super::handle_request`] in one `match`.
+/// What one attempt decided, applied by the loop in [`super::handle_request`] through
+/// [`Ladder::apply`].
 ///
 /// The transport-failure arm and every status arm (401, 403, 429, 529) evaluate to one of
 /// these instead of changing the ladder and jumping themselves, so every move of the ladder is
@@ -189,7 +191,7 @@ impl Tally {
 /// 529 backoff, an offline wait) is taken inside the arm, where it always was, before it hands
 /// back [`Step::RetrySame`].
 pub(super) enum Step {
-    /// The next attempt uses the same account ([`Ladder::retry_same`]).
+    /// The next attempt uses the same account.
     RetrySame,
     /// The account is benched for the rest of this request and the next attempt selects
     /// afresh ([`Ladder::bench`]).
@@ -208,6 +210,21 @@ pub(super) enum Step {
         status: StatusCode,
         up_headers: HeaderMap,
     },
+}
+
+/// What one request's account selection reads besides the benched set and the clock. Built
+/// once, before the rotation loop: none of it changes between attempts.
+#[derive(Clone, Copy)]
+pub(super) struct Wants<'a> {
+    pub(super) model: Option<&'a str>,
+    /// The session key affinity pins on, if any.
+    pub(super) session_key: Option<u64>,
+    pub(super) path: &'a str,
+    /// The raw per-connection key, the noise-routing grain.
+    pub(super) conn_key: Option<u64>,
+    pub(super) group: Option<&'a str>,
+    /// Whether the request targets a Fable model.
+    pub(super) is_fable: bool,
 }
 
 /// The per-request state of the rotation ladder: which accounts are benched, which one the
@@ -307,8 +324,118 @@ pub(super) struct Ladder {
 }
 
 impl Ladder {
-    pub(super) const fn tried(&self) -> &HashSet<usize> {
-        &self.tried
+    /// How many accounts this request has benched.
+    pub(super) fn benched(&self) -> usize {
+        self.tried.len()
+    }
+
+    /// How many of the benched accounts `count` accepts.
+    pub(super) fn benched_where(&self, count: impl Fn(usize) -> bool) -> usize {
+        self.tried.iter().filter(|&&i| count(i)).count()
+    }
+
+    /// The account this attempt uses: the one a move named, or else the request's own pick
+    /// ([`Manager::select_with_group`]) from the accounts not benched.
+    pub(super) fn pick(
+        &mut self,
+        manager: &Manager,
+        wants: Wants<'_>,
+        now: OffsetDateTime,
+    ) -> Option<usize> {
+        match self.next_idx.take() {
+            Some(i) => Some(i),
+            None => manager.select_with_group(
+                &self.tried,
+                now,
+                wants.model,
+                wants.session_key,
+                wants.path,
+                wants.conn_key,
+                wants.group,
+            ),
+        }
+    }
+
+    /// The serve of last resort once [`Self::pick`] found nothing: the held account while
+    /// the history is held to `bound_to` ([`Manager::select_bound`]), else a revalidation
+    /// serve when no strict group holds the request and the operator left it on
+    /// ([`Manager::select_revalidation`]).
+    pub(super) fn last_resort(
+        &self,
+        manager: &Manager,
+        wants: Wants<'_>,
+        now: OffsetDateTime,
+        bound_to: Option<usize>,
+        strict_group: Option<&str>,
+    ) -> Option<usize> {
+        match bound_to {
+            Some(bound) => manager.select_bound(
+                bound,
+                &self.tried,
+                now,
+                wants.is_fable,
+                wants.group,
+                strict_group,
+                manager.warm_window(wants.session_key),
+            ),
+            None if strict_group.is_none() && manager.revalidation_serve_enabled() => manager
+                .select_revalidation(&self.tried, now, wants.model, wants.session_key, wants.path),
+            None => None,
+        }
+    }
+
+    /// What `select` would pick with `idx` benched as well, `idx` itself left as it is:
+    /// the 529 failover's probe, asked before the overloaded account is benched.
+    pub(super) fn probe_without(
+        &self,
+        idx: usize,
+        select: impl FnOnce(&HashSet<usize>) -> Option<usize>,
+    ) -> Option<usize> {
+        let mut with_this_one = self.tried.clone();
+        with_this_one.insert(idx);
+        select(&with_this_one)
+    }
+
+    /// Release a held conversation: re-admit what the hold benched ([`Self::release_hold`]),
+    /// then seed the next attempt with the account `release` picks from what is still
+    /// benched, or leave it to select afresh when that is `None`.
+    pub(super) fn release_to(&mut self, release: impl FnOnce(&HashSet<usize>) -> Option<usize>) {
+        self.release_hold();
+        self.next_idx = release(&self.tried);
+    }
+
+    /// Apply the move one attempt decided. `Continue(None)`: the ladder moved and the loop
+    /// goes round again. `Break`: the client gets this answer now. `Continue(Some(_))`:
+    /// upstream's answer goes to the terminal outcome.
+    pub(super) fn apply(
+        &mut self,
+        idx: usize,
+        step: Step,
+    ) -> ControlFlow<Response, Option<(reqwest::Response, StatusCode, HeaderMap)>> {
+        match step {
+            Step::RetrySame => {
+                self.next_idx = Some(idx);
+                ControlFlow::Continue(None)
+            }
+            Step::Rotate => {
+                self.bench(idx);
+                ControlFlow::Continue(None)
+            }
+            Step::Park => {
+                self.park(idx);
+                ControlFlow::Continue(None)
+            }
+            Step::FailOver(other) => {
+                self.fail_over_529(idx, other);
+                ControlFlow::Continue(None)
+            }
+            Step::Answer(response) => ControlFlow::Break(response),
+            Step::Forward {
+                resp,
+                status,
+                up_headers,
+            } => ControlFlow::Continue(Some((resp, status, up_headers))),
+        }
     }
 
     pub(super) const fn tally(&self) -> &Tally {
@@ -337,7 +464,7 @@ impl Ladder {
 
     /// Park `idx` on a timer: benched, and re-admittable by the soft wait once its hold
     /// expires. The two always go together.
-    pub(super) fn park(&mut self, idx: usize) {
+    fn park(&mut self, idx: usize) {
         self.tried.insert(idx);
         self.parked_transient.insert(idx);
     }
@@ -360,21 +487,6 @@ impl Ladder {
             self.parked_transient.remove(i);
         }
         (freed.len(), self.parked_transient.len())
-    }
-
-    /// The next attempt uses `idx` again.
-    pub(super) const fn retry_same(&mut self, idx: usize) {
-        self.next_idx = Some(idx);
-    }
-
-    /// The next attempt uses `next`, already selected, or selects afresh when `None`.
-    pub(super) const fn set_next(&mut self, next: Option<usize>) {
-        self.next_idx = next;
-    }
-
-    /// The account the next attempt must use, if a move named one.
-    pub(super) const fn take_next(&mut self) -> Option<usize> {
-        self.next_idx.take()
     }
 
     /// `true` the first time `idx` asks for a 401 force-refresh in this request.
@@ -409,7 +521,7 @@ impl Ladder {
 
     /// Fail this request over from the overloaded `idx` to `other`, which the availability
     /// probe already selected: `idx` benched, one failover spent, `other` next.
-    pub(super) fn fail_over_529(&mut self, idx: usize, other: usize) {
+    fn fail_over_529(&mut self, idx: usize, other: usize) {
         self.tried.insert(idx);
         self.failovers_529 += 1;
         self.next_idx = Some(other);
