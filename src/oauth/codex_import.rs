@@ -420,10 +420,7 @@ pub(crate) fn existing_codex_row<'a>(
         login.account_id.clone(),
         None,
     );
-    match crate::identity::resolve(config.accounts.iter().enumerate(), &this_login) {
-        crate::identity::Resolved::One(index) => config.accounts.get(index),
-        crate::identity::Resolved::None | crate::identity::Resolved::Many => None,
-    }
+    config.identity_row(&this_login)
 }
 
 /// Whether the credential tcr already stores (`stored`, its `expiresAt`) is

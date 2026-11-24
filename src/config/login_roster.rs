@@ -1,9 +1,19 @@
 //! The account-list walks a login, an import, `tcr mint` and `tcr doctor` make
 //! over [`Config::accounts`], so none of them borrows the list to do it by hand.
 
-use super::Config;
+use super::{Account, Config};
+use crate::identity::Resolved;
 
 impl Config {
+    /// The one row `probe` names ([`Self::resolve_identity`]); `None` when no
+    /// row does, and when two tie, which every caller refuses rather than guess.
+    pub fn identity_row(&self, probe: &Account) -> Option<&Account> {
+        match self.resolve_identity(probe) {
+            Resolved::One(index) => self.accounts.get(index),
+            Resolved::None | Resolved::Many => None,
+        }
+    }
+
     /// Each Codex row's name beside the reserved groups it carries, sorted, in
     /// config order: the rows `tcr doctor` lists when no proxy answered.
     pub fn codex_reserved_groups(&self) -> Vec<(&str, Vec<String>)> {

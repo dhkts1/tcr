@@ -165,8 +165,7 @@ pub(super) fn assert_requested_identity(
     query: &str,
     profile: &Profile,
 ) -> anyhow::Result<()> {
-    let idx = config::resolve_account(&config.accounts, query)?;
-    let requested = &config.accounts[idx];
+    let requested = config.resolve_account(query)?;
     refuse_a_non_claude_row(requested)?;
 
     if profile.email.is_none() && profile.account_uuid.is_none() {
@@ -196,17 +195,15 @@ pub(super) fn assert_requested_identity(
         profile.org_uuid.clone(),
         profile.org_name.clone(),
     );
-    let resolved = crate::identity::resolve(config.accounts.iter().enumerate(), &probe);
-    let resolved_idx = match resolved {
-        crate::identity::Resolved::One(i) => Some(i),
-        crate::identity::Resolved::None | crate::identity::Resolved::Many => None,
-    };
+    let resolved = config.identity_row(&probe);
 
-    if resolved_idx != Some(idx) {
-        let got = match resolved_idx {
+    // Both rows are borrowed from `config.accounts`, so the same address is the
+    // same row.
+    if !resolved.is_some_and(|row| std::ptr::eq(row, requested)) {
+        let got = match resolved {
             // The identity resolved cleanly, just to a DIFFERENT existing
             // row — name that row, it is the actionable fact.
-            Some(other) => config.accounts[other].name.clone(),
+            Some(other) => other.name.clone(),
             None if requested.account_uuid.is_none() && !requested.name.contains('@') => {
                 // `requested` has no stored account id, and its own display
                 // name isn't email-shaped (e.g. an account named "work"), so
