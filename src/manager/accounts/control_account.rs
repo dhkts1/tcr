@@ -1,6 +1,6 @@
 //! The control account: reading it, setting or clearing it by query, and persisting it.
 
-use super::*;
+use crate::manager::*;
 
 /// What [`Manager::set_control_by_query`] did. Same shape as
 /// [`SetDisabledOutcome`], with one difference: a `None` query is a legitimate

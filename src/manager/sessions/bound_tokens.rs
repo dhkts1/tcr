@@ -30,8 +30,8 @@
 //! `retry:tether-replay` on a 404 `thread_not_found`; `retry:thinking-signature-strip` is there
 //! too, for the 400 that no 5.5 model sent in that measurement). So holding a conversation on its account
 //! is worth a short wait, and never worth one that outlasts the cache: an account that is gone,
-//! or out for longer than [`super::CACHE_WARM_HOLD_SECS`], releases the conversation to the
-//! fleet. The cost of the other choice, measured 2026-09-22: a conversation bound to a
+//! or out for longer than [`crate::manager::CACHE_WARM_HOLD_SECS`], releases the conversation to
+//! the fleet. The cost of the other choice, measured 2026-09-22: a conversation bound to a
 //! `rejected` account got a 429 on every turn, 6-11 a minute, until the operator abandoned the
 //! session, because `/compact` keeps the thread id.
 //!
@@ -55,13 +55,13 @@ use crate::bound_tokens::{
 use crate::config::ConfigError;
 use crate::identity;
 
-use super::{Manager, WarmWindow};
+use crate::manager::{Manager, WarmWindow};
 
 /// How long a session stays told that its held conversation is moving off one account (see
 /// [`Manager::first_switch_warning`]). The client's own retry comes within seconds; this only
 /// has to outlast a user who cancels the retry and sends the next turn by hand, without
 /// silencing a warning that is due again much later.
-pub(super) const SWITCH_WARNING_TTL_MS: i64 = 10 * 60 * 1000;
+pub(in crate::manager) const SWITCH_WARNING_TTL_MS: i64 = 10 * 60 * 1000;
 
 /// One token as the response path hands it over: its kind and the token itself, unhashed. The
 /// hashing happens here, once, so no caller can forget it.
@@ -83,7 +83,7 @@ type Minted = (usize, BoundTokenKind, i64);
 /// Only these methods touch the two halves, which is what keeps an entry in `by_age` exactly
 /// when it is in `by_hash`, at its current mint time.
 #[derive(Debug, Default)]
-pub(super) struct BoundTokenMap {
+pub(in crate::manager) struct BoundTokenMap {
     by_hash: HashMap<Arc<str>, Minted>,
     /// (mint ms, hash), oldest first. Equal mint times fall to the hash's order; the sort this
     /// replaced left them to the map's iteration order, so no caller relied on one.
@@ -92,20 +92,20 @@ pub(super) struct BoundTokenMap {
 
 impl BoundTokenMap {
     #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
+    pub(in crate::manager) fn len(&self) -> usize {
         self.by_hash.len()
     }
 
-    pub(super) fn get(&self, hash: &str) -> Option<Minted> {
+    pub(in crate::manager) fn get(&self, hash: &str) -> Option<Minted> {
         self.by_hash.get(hash).copied()
     }
 
-    pub(super) fn iter(&self) -> impl Iterator<Item = (&str, Minted)> + '_ {
+    pub(in crate::manager) fn iter(&self) -> impl Iterator<Item = (&str, Minted)> + '_ {
         self.by_hash.iter().map(|(hash, &minted)| (&**hash, minted))
     }
 
     /// Set `hash`'s entry, replacing an earlier mint of the same token.
-    pub(super) fn insert(&mut self, hash: &str, value: Minted) {
+    pub(in crate::manager) fn insert(&mut self, hash: &str, value: Minted) {
         let key = match self.by_hash.get_key_value(hash) {
             Some((key, &(_, _, old_ms))) => {
                 let key = Arc::clone(key);
@@ -119,14 +119,14 @@ impl BoundTokenMap {
     }
 
     /// Drop `hash`'s entry, from both halves.
-    pub(super) fn remove(&mut self, hash: &str) {
+    pub(in crate::manager) fn remove(&mut self, hash: &str) {
         if let Some((key, (_, _, ms))) = self.by_hash.remove_entry(hash) {
             self.by_age.remove(&(ms, key));
         }
     }
 
     /// Set `hash`'s entry only when it has none, because the entry already here is fresher.
-    pub(super) fn insert_if_absent(&mut self, hash: &str, value: Minted) {
+    pub(in crate::manager) fn insert_if_absent(&mut self, hash: &str, value: Minted) {
         if !self.by_hash.contains_key(hash) {
             self.insert(hash, value);
         }
@@ -135,7 +135,7 @@ impl BoundTokenMap {
     /// Drop every entry minted more than `ttl_ms` before `now_ms`, then the oldest until at most
     /// `cap` remain. The expired entries are always the oldest ones, so both are pops from the
     /// same end.
-    pub(super) fn prune(&mut self, now_ms: i64, ttl_ms: i64, cap: usize) {
+    pub(in crate::manager) fn prune(&mut self, now_ms: i64, ttl_ms: i64, cap: usize) {
         while let Some(oldest_ms) = self.by_age.first().map(|&(minted, _)| minted) {
             if now_ms.saturating_sub(oldest_ms) <= ttl_ms && self.by_hash.len() <= cap {
                 break;
@@ -149,7 +149,7 @@ impl BoundTokenMap {
 }
 
 /// How many independently locked parts [`ShardedBoundTokens`] splits the map into.
-pub(super) const BOUND_TOKEN_SHARDS: usize = 16;
+pub(in crate::manager) const BOUND_TOKEN_SHARDS: usize = 16;
 
 /// The shard a token hash lives in: the hash's first 32 bits when it is the hex digest
 /// [`bound_tokens::hash_token`] makes (uniform, so the shards fill evenly), and std's hasher
@@ -198,7 +198,7 @@ fn shard_of(hash: &str, shards: usize) -> usize {
 /// against 16 parts' 1,393, of 65,536), and every part's share of the newest 90% sits closer to
 /// its cap.
 #[derive(Debug)]
-pub(super) struct ShardedBoundTokens {
+pub(in crate::manager) struct ShardedBoundTokens {
     shards: Box<[Mutex<BoundTokenMap>]>,
     shard_cap: usize,
 }
@@ -212,7 +212,7 @@ impl Default for ShardedBoundTokens {
 impl ShardedBoundTokens {
     /// `shards` parts sharing [`BOUND_TOKEN_CAP`]. One part is the single-lock map this
     /// replaced, which is what the comparison bench runs it as.
-    pub(super) fn with_shards(shards: usize) -> Self {
+    pub(in crate::manager) fn with_shards(shards: usize) -> Self {
         let shards = shards.max(1);
         Self {
             shards: (0..shards).map(|_| Mutex::default()).collect(),
@@ -227,7 +227,7 @@ impl ShardedBoundTokens {
     }
 
     #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
+    pub(in crate::manager) fn len(&self) -> usize {
         self.shards
             .iter()
             .map(|shard| {
@@ -241,14 +241,14 @@ impl ShardedBoundTokens {
 
     /// `hash`'s entry, unless it is past the TTL. A record prunes only its own part, so an
     /// expired entry can sit in a part no record has reached since; it is never honoured.
-    pub(super) fn get(&self, hash: &str) -> Option<Minted> {
+    pub(in crate::manager) fn get(&self, hash: &str) -> Option<Minted> {
         let minted = self.shard(hash).get(hash)?;
         (crate::now_ms().saturating_sub(minted.2) <= BOUND_TOKEN_TTL_MS).then_some(minted)
     }
 
     /// Set `hash`'s entry and bound its part: anything past the TTL, then the oldest past the
     /// part's cap.
-    pub(super) fn record(&self, hash: &str, value: Minted, now_ms: i64) {
+    pub(in crate::manager) fn record(&self, hash: &str, value: Minted, now_ms: i64) {
         let mut shard = self.shard(hash);
         shard.insert(hash, value);
         shard.prune(now_ms, BOUND_TOKEN_TTL_MS, self.shard_cap);
@@ -256,7 +256,13 @@ impl ShardedBoundTokens {
 
     /// Move `hash` to `value` only while it still names account `from`, checked and set under
     /// one lock: a mint that landed since the caller read the entry is fresher than this.
-    pub(super) fn rebind(&self, hash: &str, from: usize, value: Minted, now_ms: i64) -> bool {
+    pub(in crate::manager) fn rebind(
+        &self,
+        hash: &str,
+        from: usize,
+        value: Minted,
+        now_ms: i64,
+    ) -> bool {
         let mut shard = self.shard(hash);
         if shard.get(hash).is_none_or(|(idx, _, _)| idx != from) {
             return false;
@@ -268,7 +274,7 @@ impl ShardedBoundTokens {
 
     /// Drop `hash` only while it still names account `from`, checked and dropped under one
     /// lock, for the same reason as [`Self::rebind`].
-    pub(super) fn forget(&self, hash: &str, from: usize) -> bool {
+    pub(in crate::manager) fn forget(&self, hash: &str, from: usize) -> bool {
         let mut shard = self.shard(hash);
         if shard.get(hash).is_none_or(|(idx, _, _)| idx != from) {
             return false;
@@ -279,19 +285,19 @@ impl ShardedBoundTokens {
 
     /// Set `hash`'s entry only when it has none, without bounding: restore's path, whose
     /// entries were bounded when they were written.
-    pub(super) fn insert_if_absent(&self, hash: &str, value: Minted) {
+    pub(in crate::manager) fn insert_if_absent(&self, hash: &str, value: Minted) {
         self.shard(hash).insert_if_absent(hash, value);
     }
 
     /// Set `hash`'s entry without bounding, for a test that needs an entry the record path
     /// would drop.
     #[cfg(test)]
-    pub(super) fn insert_unbounded(&self, hash: &str, value: Minted) {
+    pub(in crate::manager) fn insert_unbounded(&self, hash: &str, value: Minted) {
         self.shard(hash).insert(hash, value);
     }
 
     /// Every entry, one part locked at a time: a save's copy, not a single instant's.
-    pub(super) fn entries(&self) -> Vec<(String, Minted)> {
+    pub(in crate::manager) fn entries(&self) -> Vec<(String, Minted)> {
         let mut out = Vec::new();
         for shard in &*self.shards {
             let shard = shard
@@ -494,7 +500,7 @@ impl Manager {
         group: Option<&str>,
         warm: WarmWindow,
     ) -> bool {
-        let now_ms = super::odt_to_ms(now);
+        let now_ms = crate::manager::odt_to_ms(now);
         let reserved = self.reserved_groups();
         let parked = self.parked_groups();
         let accounts = self
@@ -602,7 +608,7 @@ impl Manager {
         if unsupported_exit {
             return None;
         }
-        let now_ms = super::odt_to_ms(now);
+        let now_ms = crate::manager::odt_to_ms(now);
         let reserved = self.reserved_groups();
         let parked = self.parked_groups();
         let mut accounts = self
@@ -1302,7 +1308,7 @@ mod tests {
             assert!(
                 Manager::account_hard_ok(
                     &accounts[0],
-                    super::super::odt_to_ms(now),
+                    crate::manager::odt_to_ms(now),
                     None,
                     &HashSet::new(),
                     &HashSet::new(),

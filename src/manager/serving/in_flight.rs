@@ -1,10 +1,10 @@
 //! The RAII guards that count a request in flight on one account, and taking one.
 
-use super::*;
+use crate::manager::*;
 
 /// Resets the keep-warm in-flight flag on drop, so a sweep that unwinds early
 /// still clears the guard.
-pub(super) struct WarmInFlightGuard<'a>(pub(super) &'a AtomicBool);
+pub(in crate::manager) struct WarmInFlightGuard<'a>(pub(in crate::manager) &'a AtomicBool);
 
 impl Drop for WarmInFlightGuard<'_> {
     fn drop(&mut self) {
@@ -26,7 +26,7 @@ impl Drop for WarmInFlightGuard<'_> {
 /// table and its one lock; no second lock and no detached counter are introduced.
 pub struct InFlightGuard {
     accounts: Arc<RwLock<Vec<AccountRuntime>>>,
-    pub(super) idx: usize,
+    pub(in crate::manager) idx: usize,
 }
 
 impl Drop for InFlightGuard {

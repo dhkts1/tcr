@@ -1,6 +1,6 @@
 //! The ten-minute counts of Codex requests this process refused itself or relayed unpooled.
 
-use super::*;
+use crate::manager::*;
 
 /// How many one-minute buckets a [`MinuteRing`] holds: the minutes it counts back.
 const TRAFFIC_RING_MINUTES: i64 = 10;
@@ -10,7 +10,7 @@ const TRAFFIC_RING_MINUTES: i64 = 10;
 /// quiet stretch empties the count with no sweep; a bump that lands on a slot holding an
 /// older minute resets it first.
 #[derive(Debug, Default)]
-pub(super) struct MinuteRing {
+pub(in crate::manager) struct MinuteRing {
     buckets: [(i64, u64); TRAFFIC_RING_MINUTES as usize],
 }
 
@@ -37,7 +37,7 @@ impl MinuteRing {
 /// The Codex 429s this process sent itself: their ten-minute count, and the latest one's
 /// error `type` and when it was sent.
 #[derive(Debug, Default)]
-pub(super) struct CodexRefusals {
+pub(in crate::manager) struct CodexRefusals {
     ring: MinuteRing,
     last: Option<(tcr_status_wire::CodexRefusalKind, i64)>,
 }

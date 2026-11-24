@@ -1,6 +1,6 @@
 //! Mutation ownership and the flush of refreshed tokens to the config file.
 
-use super::*;
+use crate::manager::*;
 
 impl Manager {
     /// Flush the refreshed TOKENS to disk. Token refreshes already persist
@@ -68,7 +68,7 @@ impl Manager {
         }
     }
 
-    pub(super) fn persist_tokens(
+    pub(in crate::manager) fn persist_tokens(
         &self,
         name: &str,
         account_uuid: Option<String>,
@@ -113,7 +113,7 @@ impl Manager {
                             && a.org_uuid == probe.org_uuid
                     })
                     .and_then(|a| a.pending_codex_writeback.as_ref())
-                    .map(refresh::PendingCodexWriteback::record)
+                    .map(freshness::refresh::PendingCodexWriteback::record)
             }
         };
 
@@ -152,7 +152,7 @@ impl Manager {
             {
                 account.access_token.clone_from(&tokens.access_token);
                 // THE TRAP: same invariant as `apply_refresh` in
-                // `manager/refresh.rs` — `tokens.refresh_token` must be
+                // `manager/freshness/refresh.rs` — `tokens.refresh_token` must be
                 // `Some(...)` on every reachable refresh success.
                 account.refresh_token.clone_from(&tokens.refresh_token);
                 account.expires_at = Some(tokens.expires_at_ms);

@@ -1,5 +1,5 @@
 //! Confirmed named-account redemption. Probes share the row's gate but never call consume.
-use super::probing::BoundAccount;
+use super::freshness::probing::BoundAccount;
 use super::*;
 use crate::provider::Provider;
 use std::time::Duration;

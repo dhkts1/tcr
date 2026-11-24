@@ -19,7 +19,7 @@ use std::ops::{Deref, DerefMut};
 /// An insert through the `entry` API does not evict on its own; the caller
 /// follows it with [`Self::evict_sparing`].
 #[derive(Debug)]
-pub(super) struct CappedMap<K, V> {
+pub(in crate::manager) struct CappedMap<K, V> {
     map: HashMap<K, V>,
     cap: usize,
     touched: fn(&V) -> i64,
@@ -27,7 +27,7 @@ pub(super) struct CappedMap<K, V> {
 
 impl<K: Hash + Eq + Copy, V> CappedMap<K, V> {
     /// An empty map bounded at `cap`, ordered for eviction by `touched`.
-    pub(super) fn new(cap: usize, touched: fn(&V) -> i64) -> Self {
+    pub(in crate::manager) fn new(cap: usize, touched: fn(&V) -> i64) -> Self {
         Self {
             map: HashMap::new(),
             cap,
@@ -37,7 +37,7 @@ impl<K: Hash + Eq + Copy, V> CappedMap<K, V> {
 
     /// Insert `value` at `key`, then evict as [`Self::evict_sparing`] does
     /// for `key`. Returns the value `key` held before, as `HashMap::insert`.
-    pub(super) fn insert(&mut self, key: K, value: V) -> Option<V> {
+    pub(in crate::manager) fn insert(&mut self, key: K, value: V) -> Option<V> {
         let prior = self.map.insert(key, value);
         self.evict_sparing(key);
         prior
@@ -45,7 +45,7 @@ impl<K: Hash + Eq + Copy, V> CappedMap<K, V> {
 
     /// [`Self::insert`] for a caller that needs the evicted key rather than
     /// the value `key` held before: [`CappedSet`] keeps its set in step by it.
-    pub(super) fn insert_evicting(&mut self, key: K, value: V) -> Option<K> {
+    pub(in crate::manager) fn insert_evicting(&mut self, key: K, value: V) -> Option<K> {
         self.map.insert(key, value);
         self.evict_sparing(key)
     }
@@ -56,7 +56,7 @@ impl<K: Hash + Eq + Copy, V> CappedMap<K, V> {
     ///
     /// One entry per call: the scan is O(n), and a map only ever grows by one
     /// entry per insert. Returns the key it removed.
-    pub(super) fn evict_sparing(&mut self, key: K) -> Option<K> {
+    pub(in crate::manager) fn evict_sparing(&mut self, key: K) -> Option<K> {
         if self.map.len() <= self.cap {
             return None;
         }
@@ -93,7 +93,7 @@ impl<K, V> DerefMut for CappedMap<K, V> {
 /// (`contains`, `iter`, `clone`). Every write goes through the inherent
 /// methods below, which keep the set and its insert order in step.
 #[derive(Debug)]
-pub(super) struct CappedSet<K> {
+pub(in crate::manager) struct CappedSet<K> {
     set: HashSet<K>,
     order: CappedMap<K, i64>,
     next: i64,
@@ -101,7 +101,7 @@ pub(super) struct CappedSet<K> {
 
 impl<K: Hash + Eq + Copy> CappedSet<K> {
     /// An empty set bounded at `cap`.
-    pub(super) fn new(cap: usize) -> Self {
+    pub(in crate::manager) fn new(cap: usize) -> Self {
         Self {
             set: HashSet::new(),
             order: CappedMap::new(cap, |&inserted| inserted),
@@ -112,7 +112,7 @@ impl<K: Hash + Eq + Copy> CappedSet<K> {
     /// Insert `key`, or mark it the most recently inserted if already in, and
     /// evict the least recently inserted other key when over the cap. Returns
     /// whether `key` is new, as `HashSet::insert`.
-    pub(super) fn insert(&mut self, key: K) -> bool {
+    pub(in crate::manager) fn insert(&mut self, key: K) -> bool {
         self.next += 1;
         if let Some(evicted) = self.order.insert_evicting(key, self.next) {
             self.set.remove(&evicted);
@@ -121,20 +121,20 @@ impl<K: Hash + Eq + Copy> CappedSet<K> {
     }
 
     /// Remove `key`; whether it was in, as `HashSet::remove`.
-    pub(super) fn remove(&mut self, key: &K) -> bool {
+    pub(in crate::manager) fn remove(&mut self, key: &K) -> bool {
         self.order.remove(key);
         self.set.remove(key)
     }
 
     /// Keep only the keys `keep` answers `true` for.
-    pub(super) fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
+    pub(in crate::manager) fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
         self.set.retain(|key| keep(key));
         let set = &self.set;
         self.order.retain(|key, _| set.contains(key));
     }
 
     /// Remove every key.
-    pub(super) fn clear(&mut self) {
+    pub(in crate::manager) fn clear(&mut self) {
         self.set.clear();
         self.order.clear();
     }

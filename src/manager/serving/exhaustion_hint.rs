@@ -1,6 +1,6 @@
 //! What an exhausted fleet's synthetic 429 tells the client, and a refused Codex row's gate.
 
-use super::*;
+use crate::manager::*;
 
 /// What [`Manager::exhaustion_hint`] learned about an exhausted fleet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,7 +365,7 @@ impl Manager {
     /// remap cannot slow the probe that ends the refusal either.
     /// The tokens are ones every client already parses: they are variants of the closed
     /// `GateReason` enum, so no older CLI fails to read a payload that carries them.
-    pub(super) fn codex_refusal_gate(
+    pub(in crate::manager) fn codex_refusal_gate(
         account: &AccountRuntime,
         threshold: f64,
         now: OffsetDateTime,

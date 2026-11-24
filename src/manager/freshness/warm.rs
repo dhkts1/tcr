@@ -1,6 +1,6 @@
 //! `Manager` warm methods, split verbatim from `mod.rs`.
 
-use super::*;
+use crate::manager::*;
 
 /// Re-arm [`AccountRuntime::warm_evidence_retry_after_ms`] if this account is
 /// currently AT OR PAST [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`] — shared by

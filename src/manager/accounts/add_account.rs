@@ -1,6 +1,6 @@
 //! Adding an account to the live rotation or replacing its credentials, and persisting it.
 
-use super::*;
+use crate::manager::*;
 
 /// What [`Manager::add_or_update_account`] did.
 ///

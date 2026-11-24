@@ -27,14 +27,14 @@ use std::sync::PoisonError;
 
 use crate::config::{self, Config, ConfigError};
 
-use super::Manager;
+use crate::manager::Manager;
 
 impl Manager {
     /// Run `disk` against the config file at `path` under `config_write`, then
     /// run `apply` on the in-memory snapshot when the outcome says the file now
     /// carries the requested state. Returns `disk`'s outcome for the caller to
     /// report.
-    pub(super) fn write_through<E: config::Edit>(
+    pub(in crate::manager) fn write_through<E: config::Edit>(
         &self,
         path: &Path,
         disk: impl FnOnce(&Path) -> Result<E, ConfigError>,

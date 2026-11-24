@@ -326,7 +326,10 @@ impl Manager {
                     quota_state,
                     gate,
                     free_at,
-                    stream_error_count: usage::stream_error_count(&a.stream_error_times_ms, now_ms),
+                    stream_error_count: freshness::usage::stream_error_count(
+                        &a.stream_error_times_ms,
+                        now_ms,
+                    ),
                     last_stream_error: a.last_stream_error.clone(),
                     groups: a.groups.clone(),
                     reserved_groups,

@@ -926,7 +926,7 @@ async fn sustained_5xx_probes_escalate_to_upstream_down() {
         Arc::new(AlwaysStatusProber { status: 502 }),
     );
 
-    for sweep in 1..probing::SUSTAINED_5XX_THRESHOLD {
+    for sweep in 1..freshness::probing::SUSTAINED_5XX_THRESHOLD {
         manager.probe_all().await;
         let snap = manager.snapshot(OffsetDateTime::now_utc());
         assert_eq!(
@@ -958,7 +958,7 @@ async fn repeated_429s_never_escalate_to_upstream_down() {
         Arc::new(AlwaysStatusProber { status: 429 }),
     );
 
-    for _ in 0..(probing::SUSTAINED_5XX_THRESHOLD * 3) {
+    for _ in 0..(freshness::probing::SUSTAINED_5XX_THRESHOLD * 3) {
         manager.probe_all().await;
     }
     let snap = manager.snapshot(OffsetDateTime::now_utc());

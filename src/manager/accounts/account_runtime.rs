@@ -1,6 +1,6 @@
 //! One account's runtime row, its hard status, and how a query names a row.
 
-use super::*;
+use crate::manager::*;
 
 /// Hard state of an account.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,7 +122,7 @@ pub struct AccountRuntime {
     /// real outage. Bumped and read by [`Manager::probe_account`] via its
     /// private `note_5xx_probe` helper to escalate `ProbeStatus::RateLimited`
     /// to the visible `ProbeStatus::UpstreamDown` once a run crosses
-    /// `SUSTAINED_5XX_THRESHOLD` (`manager/probing.rs`).
+    /// `SUSTAINED_5XX_THRESHOLD` (`manager/freshness/probing.rs`).
     pub consecutive_5xx_probes: u32,
     /// Consecutive keep-warm requests ([`Manager::warm_account`]) that succeeded
     /// but carried none of the unified 5h rate-limit headers — a 200 that latched
@@ -175,15 +175,15 @@ pub struct AccountRuntime {
     pub hold_cause: HoldCause,
     /// Why a Codex row's login is known dead: the OAuth code its last refresh was rejected with
     /// (`refresh_token_reused`, `invalid_grant`, …), else `http_<status>`. Set by a rejected
-    /// refresh (`manager/refresh.rs`), cleared by a successful refresh or a re-login of the row
-    /// ([`Manager::add_or_update_account`]). Always `None` on an Anthropic row. Not persisted:
+    /// refresh (`manager/freshness/refresh.rs`), cleared by a successful refresh or a re-login of
+    /// the row ([`Manager::add_or_update_account`]). Always `None` on an Anthropic row. Not persisted:
     /// a restart forgets it, and the next refresh learns it again.
     pub login_error: Option<String>,
     /// [`config::Account::codex_home`]: the imported login's folder, for guarded token sharing
     /// and the status wire. A re-login replaces it with the submission's.
     pub codex_home: Option<String>,
     /// Latest shared tokens awaiting guarded auth.json publication; never part of status.
-    pub(crate) pending_codex_writeback: Option<refresh::PendingCodexWriteback>,
+    pub(crate) pending_codex_writeback: Option<freshness::refresh::PendingCodexWriteback>,
     /// A short self-clearing cooldown after a *transient* refresh failure. A
     /// transient failure leaves the access token UNCHANGED, so the access-token
     /// guard in [`Manager::ensure_fresh_inner`] can't catch a follower already
@@ -273,7 +273,10 @@ impl crate::identity::Queryable for AccountRuntime {
 /// from the config ([`AccountRuntime::removed`]). A deleted row keeps its slot,
 /// so without this a query could still park, prioritise or promote it, and a
 /// re-login under the same name would read as ambiguous.
-pub(super) fn match_listed(accounts: &[AccountRuntime], query: &str) -> crate::identity::Match {
+pub(in crate::manager) fn match_listed(
+    accounts: &[AccountRuntime],
+    query: &str,
+) -> crate::identity::Match {
     let hits: Vec<usize> = crate::identity::match_accounts(accounts, query)
         .into_iter()
         .filter(|&idx| !accounts[idx].removed)
@@ -297,7 +300,7 @@ pub(crate) enum ResetTarget<'a> {
 }
 
 impl ResetTarget<'_> {
-    pub(super) fn resolve(self, accounts: &[AccountRuntime]) -> crate::identity::Match {
+    pub(in crate::manager) fn resolve(self, accounts: &[AccountRuntime]) -> crate::identity::Match {
         match self {
             Self::Name(query) => match_listed(accounts, query),
             Self::Slot(idx) if accounts.get(idx).is_some_and(|row| !row.removed) => {
@@ -309,7 +312,7 @@ impl ResetTarget<'_> {
 }
 
 impl AccountRuntime {
-    pub(super) fn from_config(account: &config::Account, http1_only: bool) -> Self {
+    pub(in crate::manager) fn from_config(account: &config::Account, http1_only: bool) -> Self {
         Self {
             name: account.name.clone(),
             account_type: account.account_type.clone(),
@@ -353,7 +356,9 @@ impl AccountRuntime {
             hold_cause: HoldCause::RateLimit,
             login_error: None,
             codex_home: account.codex_home.clone(),
-            pending_codex_writeback: refresh::PendingCodexWriteback::from_config(account),
+            pending_codex_writeback: freshness::refresh::PendingCodexWriteback::from_config(
+                account,
+            ),
             refresh_retry_after_ms: None,
             error_retry_after_ms: None,
             error_backoff_ms: 0,

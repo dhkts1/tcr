@@ -1,6 +1,6 @@
 //! Benching, erroring and re-prioritising one account, by index or by query.
 
-use super::*;
+use crate::manager::*;
 
 /// What [`Manager::set_disabled_by_query`] did.
 ///

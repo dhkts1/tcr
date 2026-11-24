@@ -5,7 +5,7 @@
 //! every await, one 90 s deadline, a usage read afterwards so the bars drop at once, one INFO
 //! line per attempt naming the account by its tcr index only, and fixed reasons, never the
 //! provider's body or a token.
-use super::probing::BoundAccount;
+use super::freshness::probing::BoundAccount;
 use super::*;
 use crate::claude_resets::PickError;
 use crate::provider::Provider;

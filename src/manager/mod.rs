@@ -44,18 +44,12 @@ use crate::stats::{
 };
 use crate::warmer::{AccountWarmer, LiveWarmer};
 
-mod bound_tokens;
-mod capped_map;
-use capped_map::{CappedMap, CappedSet};
 mod groups;
 use groups::GroupPolicy;
-// The one TYPE that module owns and `proxy.rs` names: one minted token as the response path
-// hands it over, so a kind can never be paired with another token's string.
-pub use bound_tokens::MintedToken;
-// The ONE line `src/manager/select.rs`'s zero-change tripwire explicitly
-// permits: `Manager::lendable_fraction` has to live on a SIBLING of `select.rs`
-// to reach its `pub(super) fn effective_threshold`, and a sibling module that
-// is not declared does not exist. See `peer_lend.rs`'s own doc-comment.
+// `Manager::lendable_fraction` lives in `peer_lend`, inside `crate::manager`, so it reaches
+// `src/manager/select/mod.rs`'s `pub(super) fn effective_threshold` without widening it. This
+// declaration is the one line that tripwire permits, because a module that is not declared does
+// not exist. See `peer_lend.rs`'s own doc-comment.
 mod peer_lend;
 // The one TYPE that module owns and the lease layer names: what a hand grant
 // hands over, chosen as one value so a bearer can never be paired with another
@@ -66,50 +60,42 @@ pub use peer_lend::HandedCredential;
 pub mod auto_reset;
 mod claude_reset;
 mod codex_reset;
-mod pins;
-mod probing;
-pub use claude_reset::{ClaudeResetError, ClaudeResetOutcome, ClaudeResetResponse};
-pub use codex_reset::{CodexResetError, CodexResetOutcome, CodexResetResponse, valid_reset_key};
-mod refresh;
 mod select;
 mod snapshot;
 mod state;
-mod throttle;
-mod usage;
-mod warm;
-mod wire_sessions;
-mod write_through;
 
-// Split out of this file, one concern each. The imports keep every moved name
-// reachable here (siblings and `tests` read this module through `use super::*`),
-// and the `pub use` lines keep the `crate::manager::X` paths that `proxy.rs`,
-// `tui.rs`, `demo.rs` and `tests/` name.
-mod account_runtime;
-mod add_account;
-mod codex_traffic;
+// Split out of this file, one concern each, and grouped by concern into the directories
+// below. The imports keep every moved name reachable here (siblings and `tests` read this
+// module through `use super::*`, the grouped files through `use crate::manager::*`), and the
+// `pub use` lines keep the `crate::manager::X` paths that `proxy.rs`, `tui.rs`, `demo.rs` and
+// `tests/` name.
+mod accounts;
 mod construction;
-mod control_account;
-mod disable_and_priority;
-mod exhaustion_hint;
-mod in_flight;
-mod serving_client;
-mod token_persist;
-pub(crate) use account_runtime::ResetTarget;
-use account_runtime::match_listed;
-pub use account_runtime::{AccountRuntime, AccountStatus};
-pub use add_account::{AddAccountOutcome, AddPersist};
-use codex_traffic::{CodexRefusals, MinuteRing};
-pub use control_account::{
+mod freshness;
+mod serving;
+mod sessions;
+pub(crate) use accounts::account_runtime::ResetTarget;
+use accounts::account_runtime::match_listed;
+pub use accounts::account_runtime::{AccountRuntime, AccountStatus};
+pub use accounts::add_account::{AddAccountOutcome, AddPersist};
+pub use accounts::control_account::{
     CODEX_HAS_NO_CONTROL_ACCOUNT, ControlPersist, SetControlOutcome, codex_control_refusal,
 };
-pub use disable_and_priority::{DisablePersist, SetDisabledOutcome, SetPriorityOutcome};
-pub use exhaustion_hint::ExhaustionHint;
-pub use in_flight::InFlightGuard;
-use in_flight::WarmInFlightGuard;
-pub(crate) use serving_client::build_serving_client;
+pub use accounts::disable_and_priority::{DisablePersist, SetDisabledOutcome, SetPriorityOutcome};
+pub use claude_reset::{ClaudeResetError, ClaudeResetOutcome, ClaudeResetResponse};
+pub use codex_reset::{CodexResetError, CodexResetOutcome, CodexResetResponse, valid_reset_key};
+use serving::codex_traffic::{CodexRefusals, MinuteRing};
+pub use serving::exhaustion_hint::ExhaustionHint;
+pub use serving::in_flight::InFlightGuard;
+use serving::in_flight::WarmInFlightGuard;
+pub(crate) use serving::serving_client::build_serving_client;
 #[cfg(test)]
-pub(crate) use serving_client::fail_next_client_build;
-use serving_client::{MAX_SERVES_PER_CONNECTION, RecycleReason};
+pub(crate) use serving::serving_client::fail_next_client_build;
+use serving::serving_client::{MAX_SERVES_PER_CONNECTION, RecycleReason};
+use sessions::capped_map::{CappedMap, CappedSet};
+// The one TYPE that module owns and `proxy.rs` names: one minted token as the response path
+// hands it over, so a kind can never be paired with another token's string.
+pub use sessions::bound_tokens::MintedToken;
 
 // Re-exported so unit F's replay harness (`tests/`) can call the SAME
 // production predicate rather than a reimplementation — see
@@ -613,12 +599,12 @@ pub struct Manager {
     /// /_tcr/accounts/control`, mirroring `set_disabled_by_query`, so it needs
     /// interior mutability. Read by [`Self::probeable_indices`] to keep usage
     /// tracking on this account even while it stays `disabled` (out of the
-    /// inference rotation on purpose — see the module's `probing.rs` doc).
+    /// inference rotation on purpose — see the module's `freshness/probing.rs` doc).
     /// Selection itself does NOT consult this field (part 1's invariant);
     /// routing is added on top in part 2.
     ///
     /// Lock order: taken ALONE, never nested under `accounts` or `affinity` —
-    /// same discipline as `select.rs:253-256`.
+    /// same discipline as `select/routing.rs:159`'s reads ahead of the accounts lock.
     control_idx: RwLock<Option<usize>>,
     /// GCRA theoretical-arrival-times (epoch ms) for the PER-ORGANIZATION throttle,
     /// keyed by [`Self::throttle_bucket_key`].
@@ -665,11 +651,11 @@ pub struct Manager {
     affinity: Mutex<CappedMap<u64, (usize, i64)>>,
     /// Session keys whose MOST RECENT request carried Anthropic's extended
     /// `"cache_control": {"ttl": "1h"}` (see [`crate::cache_ttl`]), so
-    /// [`crate::manager::pins::affinity_pin_snapshot`] knows which persisted
+    /// [`Manager::affinity_pin_snapshot`] knows which persisted
     /// pins get [`crate::affinity::EXTENDED_PIN_TTL_MS`] instead of the
     /// default at the next restart. Deliberately a side map rather than a third
     /// tuple field on `affinity` itself: nothing on the selection path
-    /// (`select.rs`) needs to read it, only the snapshot/restore bridge does, so
+    /// (`select/`) needs to read it, only the snapshot/restore bridge does, so
     /// widening the hot map's value type for every read site there would be
     /// blast radius this doesn't need. Written directly from the request path
     /// (`crate::proxy`, alongside where `session_key` is computed) rather than
@@ -695,10 +681,10 @@ pub struct Manager {
     /// Positional like [`Self::affinity`], and for the same reason: the response path learns an
     /// index, and the request path needs an index to bench the rest of the fleet. The file half
     /// stores identities. Written from the response path, read from the request path; a plain
-    /// set of independently locked parts ([`bound_tokens::ShardedBoundTokens`]), none of them **ever**
-    /// held while the accounts lock is taken. Each part keeps its own mint order
-    /// ([`bound_tokens::BoundTokenMap`]), so holding it full costs nothing per record.
-    bound_tokens: bound_tokens::ShardedBoundTokens,
+    /// set of independently locked parts ([`sessions::bound_tokens::ShardedBoundTokens`]), none of
+    /// them **ever** held while the accounts lock is taken. Each part keeps its own mint order
+    /// ([`sessions::bound_tokens::BoundTokenMap`]), so holding it full costs nothing per record.
+    bound_tokens: sessions::bound_tokens::ShardedBoundTokens,
     /// The bound-token file's dirty flag, flusher wake-up and last write. Every change is shape
     /// here (a new token is what a restart needs), so the gate only skips a save whose map is
     /// already on disk.

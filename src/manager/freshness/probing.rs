@@ -1,6 +1,6 @@
 //! `Manager` probing methods, split verbatim from `mod.rs`.
 
-use super::*;
+use crate::manager::*;
 
 const PROBE_MAX_RETRY_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -15,7 +15,7 @@ pub(crate) const SUSTAINED_5XX_THRESHOLD: u32 = 3;
 
 /// A snapshot for rechecking identity after awaits; never formatted or logged.
 #[derive(Clone, PartialEq, Eq)]
-pub(super) struct BoundAccount {
+pub(in crate::manager) struct BoundAccount {
     name: String,
     provider: crate::provider::Provider,
     account: Option<String>,
@@ -24,7 +24,7 @@ pub(super) struct BoundAccount {
 }
 
 impl BoundAccount {
-    pub(super) fn of(row: &AccountRuntime) -> Self {
+    pub(in crate::manager) fn of(row: &AccountRuntime) -> Self {
         Self {
             name: row.name.clone(),
             provider: row.provider,
@@ -37,7 +37,7 @@ impl BoundAccount {
 
 impl Manager {
     /// The identity row `idx` holds now, or `None` once it is removed.
-    pub(super) fn bound_account(&self, idx: usize) -> Option<BoundAccount> {
+    pub(in crate::manager) fn bound_account(&self, idx: usize) -> Option<BoundAccount> {
         self.accounts
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -47,11 +47,11 @@ impl Manager {
     }
 
     /// Whether row `idx` still holds the identity `identity` was taken from.
-    pub(super) fn is_still_bound(&self, idx: usize, identity: &BoundAccount) -> bool {
+    pub(in crate::manager) fn is_still_bound(&self, idx: usize, identity: &BoundAccount) -> bool {
         self.bound_account(idx).as_ref() == Some(identity)
     }
 
-    pub(super) fn usage_gate(&self, idx: usize) -> Option<Arc<AsyncMutex<()>>> {
+    pub(in crate::manager) fn usage_gate(&self, idx: usize) -> Option<Arc<AsyncMutex<()>>> {
         self.bound_account(idx)?;
         let mut gates = self
             .usage_gates
@@ -257,7 +257,7 @@ impl Manager {
 
     /// The one probe implementation, called only while owning the row's usage gate.
     /// True means this call applied usage, not merely that a previous probe succeeded.
-    pub(super) async fn probe_account_unlocked(&self, idx: usize) -> bool {
+    pub(in crate::manager) async fn probe_account_unlocked(&self, idx: usize) -> bool {
         let Some(identity) = self.bound_account(idx) else {
             return false;
         };
@@ -376,7 +376,7 @@ impl Manager {
     /// is no provider to pick the endpoint by, and the default one, Anthropic, would receive
     /// the bearer whichever provider issued it. No row can vanish today (nothing shrinks the
     /// account vector), so this closes a path rather than fixing one.
-    pub(super) fn probe_credential(
+    pub(in crate::manager) fn probe_credential(
         &self,
         idx: usize,
         access_token: String,

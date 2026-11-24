@@ -1,6 +1,6 @@
 //! `Manager` usage methods, split verbatim from `mod.rs`.
 
-use super::*;
+use crate::manager::*;
 
 impl Manager {
     /// Fold a response's rate-limit headers into account `idx`'s quota. This runs
@@ -425,7 +425,7 @@ impl Manager {
     /// This account's usage row as of `now_ms` (see [`crate::usage::UsageTracker::row`]), plus a
     /// Codex row's weekly window. `seven_day` is the weekly reset and the window's length, both
     /// in milliseconds, and `None` leaves `seven_day_window` absent.
-    pub(super) fn usage_row(
+    pub(in crate::manager) fn usage_row(
         &self,
         idx: usize,
         now_ms: i64,
@@ -846,7 +846,7 @@ fn prune_stream_errors(times: &mut VecDeque<i64>, now_ms: i64) {
 /// holds only the accounts READ lock, so it cannot pop stale entries the way
 /// [`prune_stream_errors`] does on insert; this counts without mutating instead,
 /// which is equivalent for display purposes (the next insert physically prunes).
-pub(super) fn stream_error_count(times: &VecDeque<i64>, now_ms: i64) -> usize {
+pub(in crate::manager) fn stream_error_count(times: &VecDeque<i64>, now_ms: i64) -> usize {
     times
         .iter()
         .filter(|&&t| now_ms - t <= STREAM_ERROR_WINDOW_MS)

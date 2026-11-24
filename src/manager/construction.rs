@@ -176,7 +176,7 @@ impl Manager {
             affinity: Mutex::new(CappedMap::new(select::AFFINITY_CAP, |&(_, touch)| touch)),
             affinity_extended: Mutex::new(CappedSet::new(select::AFFINITY_CAP)),
             affinity_file: crate::cache_file::SavedFile::new(AFFINITY_TOUCH_REFRESH),
-            bound_tokens: bound_tokens::ShardedBoundTokens::default(),
+            bound_tokens: sessions::bound_tokens::ShardedBoundTokens::default(),
             bound_tokens_file: crate::cache_file::SavedFile::new(std::time::Duration::ZERO),
             bound_history_logged: Mutex::new(HashSet::new()),
             bound_switch_warned: Mutex::new(HashMap::new()),

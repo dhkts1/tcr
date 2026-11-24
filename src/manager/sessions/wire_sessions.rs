@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use super::*;
+use crate::manager::*;
 use crate::session_wire::{CodexToolCall, ToolResultEvent, ToolUseEvent};
 use crate::session_wire_persist::{self, LoadReport};
 
@@ -194,7 +194,7 @@ impl Manager {
 
     /// The live wire-session table, projected onto [`tcr_status_wire::SessionRow`] — what
     /// [`Self::snapshot`] hangs onto [`crate::stats::StatsSnapshot::wire_sessions`].
-    pub(super) fn wire_sessions_snapshot(
+    pub(in crate::manager) fn wire_sessions_snapshot(
         &self,
         now: OffsetDateTime,
     ) -> Vec<tcr_status_wire::SessionRow> {
@@ -355,7 +355,7 @@ impl Manager {
     /// Fleet-wide tool-call totals, summed across every row `Self::wire_sessions_snapshot`
     /// just built — the ONE place this sum happens server-side, so a panel's headline and
     /// "BY TOOL" bars read the same numbers as the per-session rows (see the bridge, F3).
-    pub(super) fn wire_sessions_summary(
+    pub(in crate::manager) fn wire_sessions_summary(
         rows: &[tcr_status_wire::SessionRow],
     ) -> tcr_status_wire::SessionsSummary {
         let mut by_tool: HashMap<String, tcr_status_wire::ToolBucketRow> = HashMap::new();
@@ -422,7 +422,7 @@ impl Manager {
     /// The flusher's save: [`Self::flush_wire_sessions`] when the table differs from what the
     /// last write put on disk, by the rule [`crate::save_gate`] states. A new or departed
     /// session is written at once; a change to the sessions already on disk waits until
-    /// [`super::WIRE_SESSIONS_REFRESH`] has passed since the last write.
+    /// [`crate::manager::WIRE_SESSIONS_REFRESH`] has passed since the last write.
     pub fn flush_wire_sessions_if_changed(
         &self,
         path: &Path,

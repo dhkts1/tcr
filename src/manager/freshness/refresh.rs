@@ -1,7 +1,7 @@
 //! `Manager` OAuth token-refresh methods, split verbatim from `mod.rs`.
 
-use super::*;
 use crate::log_err::LogErr as _;
+use crate::manager::*;
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -25,7 +25,7 @@ impl std::fmt::Debug for PendingCodexWriteback {
 use crate::config::CODEX_SYNC_PENDING_KEY;
 
 impl PendingCodexWriteback {
-    pub(super) fn from_config(account: &config::Account) -> Option<Self> {
+    pub(in crate::manager) fn from_config(account: &config::Account) -> Option<Self> {
         match account.provider {
             crate::provider::Provider::Anthropic => return None,
             crate::provider::Provider::Codex => {}
@@ -53,7 +53,7 @@ impl PendingCodexWriteback {
         })
     }
 
-    pub(super) fn record(&self) -> Value {
+    pub(in crate::manager) fn record(&self) -> Value {
         let mut record = serde_json::json!({"expectedRefreshSha256": self.expected_refresh});
         if let Some(id) = &self.tokens.id_token {
             record["idToken"] = id.clone().into();
@@ -684,7 +684,7 @@ impl Manager {
     /// to replace. `access_before` lets [`Self::ensure_fresh_inner`] detect, under
     /// the coalescing guard, that another caller already refreshed (the access
     /// token changed), coalescing even the force path (bug #10).
-    pub(super) fn refresh_plan(
+    pub(in crate::manager) fn refresh_plan(
         &self,
         idx: usize,
         force: bool,
@@ -777,7 +777,7 @@ impl Manager {
     /// [`ERROR_REPROBE_CAP_MS`], so a permanently dead credential is retried at most
     /// ~twice an hour instead of hammering the OAuth endpoint (which would risk
     /// rate-limiting the whole fleet).
-    pub(super) fn grow_error_backoff(&self, idx: usize) {
+    pub(in crate::manager) fn grow_error_backoff(&self, idx: usize) {
         let mut accounts = self
             .accounts
             .write()

@@ -1,6 +1,6 @@
 //! Each account's upstream HTTP client: how it is built, and when it is retired and rebuilt.
 
-use super::*;
+use crate::manager::*;
 
 // Test-only fault injection for `build_serving_client`: set via
 // `fail_next_client_build`, consumed (and cleared) by the next call on this
@@ -55,14 +55,14 @@ pub(crate) fn fail_next_client_build() {
 /// bytes arrived on. Account rotation is the expensive one (measured 5-10x the
 /// quota of a warm serve), and it is exactly what this constant exists to make
 /// rarer.
-pub(super) const MAX_SERVES_PER_CONNECTION: u32 = 500;
+pub(in crate::manager) const MAX_SERVES_PER_CONNECTION: u32 = 500;
 
 /// Why [`Manager::recycle_client`] is retiring one account's client, so its
 /// log line names the cause instead of always claiming a spent serve budget.
 /// A sleep retires every account at once and logs its own line
 /// (`Manager::retire_every_client_after_sleep`), so it is not a variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RecycleReason {
+pub(in crate::manager) enum RecycleReason {
     /// The client carried [`MAX_SERVES_PER_CONNECTION`] sends.
     ServeBudget,
     /// An HTTP/2 stream reset left the pooled connection open and broken.
@@ -151,7 +151,7 @@ impl Manager {
     /// CURRENT client.
     ///
     /// The one INFO line per wake is here; nothing logs per request.
-    pub(super) fn retire_every_client_after_sleep(&self, slept: std::time::Duration) {
+    pub(in crate::manager) fn retire_every_client_after_sleep(&self, slept: std::time::Duration) {
         let count = self
             .accounts
             .read()
@@ -218,7 +218,7 @@ impl Manager {
     /// `reason` is the caller's, and picks the one log line this writes: the
     /// line used to claim a spent serve budget for every recycle, including
     /// the stream-reset one.
-    pub(super) fn recycle_client(&self, idx: usize, reason: RecycleReason) {
+    pub(in crate::manager) fn recycle_client(&self, idx: usize, reason: RecycleReason) {
         let fresh = build_serving_client(self.http1_only());
         let mut accounts = self
             .accounts
