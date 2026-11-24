@@ -113,67 +113,38 @@ impl PeerId {
 
     /// The full, lossless wire form: 52 Crockford base32 characters, no prefix.
     pub fn to_wire(&self) -> String {
-        crockford_encode(&self.0)
+        Crockford::encode(&self.0)
     }
 
     /// Parse the full wire form. Refuses the display form. See the type docs.
     pub fn parse(wire: &str) -> Result<Self, PeerIdError> {
-        decode_key32(wire).map(PeerId)
+        Crockford::decode_key32(wire).map(PeerId)
     }
 }
 
-/// Encode 32 bytes that are **not** an identity (a join secret) in the same
-/// Crockford base32 this wire uses for a [`PeerId`].
-///
-/// Exists so `JoinToken` (`src/peer/pair.rs`) has a codec to call that does not
-/// make a secret pass through the identity type on its way to a string. The
-/// alternative, borrowing [`PeerId::to_wire`], reads as though a join secret
-/// were a node's public key; the alternative to THAT is a second Crockford
-/// implementation in the root crate, which is the drift this function exists to
-/// prevent.
+/// [`Crockford::encode`] for 32 bytes that are **not** an identity (a join
+/// secret, a network key). Forwards, and goes once `src/peer/pair.rs` and
+/// `src/peer/config.rs` call [`Crockford`] themselves.
 pub fn encode_key32(bytes: &[u8; 32]) -> String {
-    crockford_encode(bytes)
+    Crockford::encode(bytes)
 }
 
-/// The inverse of [`encode_key32`]: exactly 32 bytes, or a refusal that names
-/// what it found.
+/// [`Crockford::decode_key32`]. Forwards, and goes once `src/peer/pair.rs` and
+/// `src/peer/config.rs` call [`Crockford`] themselves.
 pub fn decode_key32(field: &str) -> Result<[u8; 32], Key32Refusal> {
-    let bytes = crockford_decode(field)?;
-    let got = bytes.len();
-    bytes.try_into().map_err(|_| PeerIdError::Length { got })
+    Crockford::decode_key32(field)
 }
 
-/// Encode a run of bytes of ANY length in the same Crockford base32, for a
-/// value that is neither an identity nor a 32-byte key.
-///
-/// The caller is a sealed record that has to survive a chat window: a framed
-/// record is magic, a version, a nonce and a sealed body, so its length is
-/// whatever the body came to and is rarely a multiple of five. The spec this
-/// codec is built on never sets `spec.padding`, so the encoding is unpadded and
-/// the last symbol carries the spare bits.
-///
-/// A third entry point rather than a third Crockford implementation, for
-/// [`encode_key32`]'s own stated reason: one alphabet, one translation table,
-/// one length refusal on this wire.
+/// [`Crockford::encode`]. Forwards, and goes once `src/peer/pair.rs` calls
+/// [`Crockford`] itself.
 pub fn encode_bytes(bytes: &[u8]) -> String {
-    crockford_encode(bytes)
+    Crockford::encode(bytes)
 }
 
-/// The inverse of [`encode_bytes`]: whatever bytes the field held, or a
-/// refusal.
-///
-/// [`PeerIdError::Length`] cannot come out of this one: there is no length to
-/// be wrong against. What a caller does see is [`PeerIdError::Alphabet`] for a
-/// character outside the alphabet and [`PeerIdError::Malformed`] for a string
-/// that is not a whole number of symbols, which is what a paste cut off
-/// mid-link looks like.
-///
-/// The refusal's own sentences are written for a peer id, so a caller reading a
-/// different kind of value maps this into its own vocabulary rather than
-/// printing it: telling somebody their cut-off link "is not a whole peer id"
-/// sends them hunting for something that was never there.
+/// [`Crockford::decode`]. Forwards, and goes once `src/peer/pair.rs` and
+/// `tests/peer_moved.rs` call [`Crockford`] themselves.
 pub fn decode_bytes(field: &str) -> Result<Vec<u8>, Key32Refusal> {
-    crockford_decode(field)
+    Crockford::decode(field)
 }
 
 /// Why 32 base32 characters could not be read.
@@ -328,7 +299,8 @@ impl std::error::Error for InstanceIdError {}
 // `data-encoding` is a runtime dependency of this crate
 // (already in `Cargo.lock` as a transitive dependency, so this is zero new
 // packages). `JoinToken::to_token`/`parse` (`src/peer/pair.rs`) call
-// [`encode_key32`] / [`decode_key32`] below, so there is one Crockford
+// [`encode_key32`] / [`decode_key32`], which forward to [`Crockford`] below, so
+// there is one Crockford
 // implementation on this wire, one alphabet, one translation table, one
 // length refusal, and not a hand-rolled one here and a second one there to
 // drift apart. That became true later: until then the token's two
@@ -342,56 +314,102 @@ use std::sync::OnceLock;
 
 use data_encoding::{Encoding, Specification};
 
-fn crockford_encoding() -> &'static Encoding {
-    static ENCODING: OnceLock<Encoding> = OnceLock::new();
-    ENCODING.get_or_init(|| {
-        let mut spec = Specification::new();
-        spec.symbols
-            .extend(CROCKFORD_ALPHABET.iter().map(|&byte| char::from(byte)));
-        spec.translate.from.push_str("abcdefghjkmnpqrstvwxyz");
-        spec.translate.to.push_str("ABCDEFGHJKMNPQRSTVWXYZ");
-        #[expect(
-            clippy::expect_used,
-            reason = "the alphabet is a fixed constant, and the OnceLock initialiser has no error channel"
-        )]
-        let encoding = spec
-            .encoding()
-            .expect("the Crockford alphabet is a valid data-encoding specification");
-        encoding
-    })
+/// Crockford base32, unpadded: the one text codec on this wire, and the three
+/// things every caller does with it.
+///
+/// A [`PeerId`]'s wire form, a join secret, a network key and a sealed record
+/// a person pastes into a chat window all go through here.
+///
+/// Exists so `JoinToken` (`src/peer/pair.rs`) has a codec to call that does not
+/// make a secret pass through the identity type on its way to a string. The
+/// alternative, borrowing [`PeerId::to_wire`], reads as though a join secret
+/// were a node's public key; the alternative to THAT is a second Crockford
+/// implementation in the root crate, which is the drift this type exists to
+/// prevent.
+#[derive(Debug, Clone, Copy)]
+pub struct Crockford;
+
+impl Crockford {
+    /// Encode a run of bytes of ANY length: a 32-byte key, or a value that is
+    /// neither an identity nor a 32-byte key.
+    ///
+    /// The second caller is a sealed record that has to survive a chat window: a framed
+    /// record is magic, a version, a nonce and a sealed body, so its length is
+    /// whatever the body came to and is rarely a multiple of five. The spec this
+    /// codec is built on never sets `spec.padding`, so the encoding is unpadded and
+    /// the last symbol carries the spare bits.
+    pub fn encode(bytes: &[u8]) -> String {
+        Self::encoding().encode(bytes)
+    }
+
+    /// The inverse of [`Self::encode`]: whatever bytes the field held, or a
+    /// refusal.
+    ///
+    /// [`PeerIdError::Length`] cannot come out of this one: there is no length to
+    /// be wrong against. What a caller does see is [`PeerIdError::Alphabet`] for a
+    /// character outside the alphabet and [`PeerIdError::Malformed`] for a string
+    /// that is not a whole number of symbols, which is what a paste cut off
+    /// mid-link looks like.
+    ///
+    /// The refusal's own sentences are written for a peer id, so a caller reading a
+    /// different kind of value maps this into its own vocabulary rather than
+    /// printing it: telling somebody their cut-off link "is not a whole peer id"
+    /// sends them hunting for something that was never there.
+    pub fn decode(s: &str) -> Result<Vec<u8>, PeerIdError> {
+        Self::encoding()
+            .decode(s.as_bytes())
+            .map_err(|err| match err.kind {
+                // The one refusal that is about a CHARACTER. `err.position` is a
+                // BYTE offset into the input and is read as one: a character index
+                // happens to agree here, because every symbol this alphabet accepts
+                // is one byte and so the first byte the decoder refuses is the first
+                // byte of the character it refused, but the two indices are
+                // different quantities and only one of them is what was reported.
+                data_encoding::DecodeKind::Symbol => PeerIdError::Alphabet(
+                    s.get(err.position..)
+                        .and_then(|rest| rest.chars().next())
+                        .unwrap_or('\u{fffd}'),
+                ),
+                // Everything else is about the input's SIZE or its last symbol's
+                // spare bits, and every one of them used to be reported as a bad
+                // character: a truncated id named whatever happened to sit at the
+                // failure's position, which sent the reader looking for a typo in
+                // a string whose characters were all fine.
+                _ => PeerIdError::Malformed {
+                    length: s.chars().count(),
+                },
+            })
+    }
+
+    /// [`Self::decode`] for a 32-byte key: exactly 32 bytes, or a refusal that
+    /// names what it found.
+    pub fn decode_key32(field: &str) -> Result<[u8; 32], Key32Refusal> {
+        let bytes = Self::decode(field)?;
+        let got = bytes.len();
+        bytes.try_into().map_err(|_| PeerIdError::Length { got })
+    }
+
+    fn encoding() -> &'static Encoding {
+        static ENCODING: OnceLock<Encoding> = OnceLock::new();
+        ENCODING.get_or_init(|| {
+            let mut spec = Specification::new();
+            spec.symbols
+                .extend(CROCKFORD_ALPHABET.iter().map(|&byte| char::from(byte)));
+            spec.translate.from.push_str("abcdefghjkmnpqrstvwxyz");
+            spec.translate.to.push_str("ABCDEFGHJKMNPQRSTVWXYZ");
+            #[expect(
+                clippy::expect_used,
+                reason = "the alphabet is a fixed constant, and the OnceLock initialiser has no error channel"
+            )]
+            let encoding = spec
+                .encoding()
+                .expect("the Crockford alphabet is a valid data-encoding specification");
+            encoding
+        })
+    }
 }
 
 const CROCKFORD_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-
-fn crockford_encode(bytes: &[u8]) -> String {
-    crockford_encoding().encode(bytes)
-}
-
-fn crockford_decode(s: &str) -> Result<Vec<u8>, PeerIdError> {
-    crockford_encoding()
-        .decode(s.as_bytes())
-        .map_err(|err| match err.kind {
-            // The one refusal that is about a CHARACTER. `err.position` is a
-            // BYTE offset into the input and is read as one: a character index
-            // happens to agree here, because every symbol this alphabet accepts
-            // is one byte and so the first byte the decoder refuses is the first
-            // byte of the character it refused, but the two indices are
-            // different quantities and only one of them is what was reported.
-            data_encoding::DecodeKind::Symbol => PeerIdError::Alphabet(
-                s.get(err.position..)
-                    .and_then(|rest| rest.chars().next())
-                    .unwrap_or('\u{fffd}'),
-            ),
-            // Everything else is about the input's SIZE or its last symbol's
-            // spare bits, and every one of them used to be reported as a bad
-            // character: a truncated id named whatever happened to sit at the
-            // failure's position, which sent the reader looking for a typo in
-            // a string whose characters were all fine.
-            _ => PeerIdError::Malformed {
-                length: s.chars().count(),
-            },
-        })
-}
 
 impl From<PeerId> for String {
     fn from(id: PeerId) -> Self {

@@ -356,7 +356,7 @@ async fn a_peer_that_answers_unknown_gets_exactly_one_probe() {
         "and the peer read exactly one"
     );
     assert!(
-        table.stats.is_empty(),
+        table == PathTable::default(),
         "an older build is not a lossy path: nothing is recorded about it, so the direct \
          path keeps the order it had"
     );
@@ -394,7 +394,7 @@ async fn a_peer_that_closes_the_session_gets_exactly_one_probe() {
     assert_eq!(run.sent, 1);
     assert_eq!(run.stop, ProbeStop::PeerDoesNotProbe);
     assert_eq!(script.probes.load(Ordering::SeqCst), 1);
-    assert!(table.stats.is_empty());
+    assert_eq!(table, PathTable::default());
     script.handle.await.expect("the far end").expect("no error");
 }
 
@@ -611,7 +611,7 @@ fn a_silent_probe_is_loss_and_an_older_build_is_not() {
         !untouched.record(peer, locator, ProbeOutcome::NotSupported, FIXED_MS),
         "an older build records nothing"
     );
-    assert!(untouched.stats.is_empty());
+    assert_eq!(untouched, PathTable::default());
 }
 
 // ---------------------------------------------------------------------------
@@ -978,11 +978,12 @@ fn the_measured_paths_survive_a_restart_and_keep_the_rest_of_the_file() {
             FIXED_MS,
         );
     }
-    tcr::peer::state::save_paths(&path, &table.stats).expect("the paths write");
+    table.save(&path).expect("the paths write");
 
     let restored = tcr::peer::state::load(&path, FIXED_MS).expect("the state reads");
-    assert_eq!(restored.paths.len(), 1, "the measured path survived");
-    let stat = restored.paths.first().expect("the row");
+    let stat = restored
+        .measured_path(&peer, &Locator::Direct { addr })
+        .expect("the measured path survived");
     assert_eq!(stat.peer, peer);
     assert_eq!(stat.locator, Locator::Direct { addr });
     assert_eq!(stat.rtt_ms, Some(40.0));
@@ -1244,9 +1245,7 @@ async fn a_completed_hello_measures_the_path_and_it_survives_a_restart() {
     let restored = tcr::peer::state::load(&dialer_state_path, FIXED_MS)
         .expect("the dialer's state file reads");
     let saved = restored
-        .paths
-        .iter()
-        .find(|stat| stat.peer == PeerId(listener_key.id().0) && stat.locator == locator)
+        .measured_path(&PeerId(listener_key.id().0), &locator)
         .expect("the measured path survived into the state file");
     assert!(
         saved.rtt_ms.is_some(),

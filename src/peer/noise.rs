@@ -117,14 +117,15 @@
 //! than on a log line.
 
 use anyhow::{Context, Result, anyhow, bail};
-use snow::resolvers::{CryptoResolver, DefaultResolver};
 use snow::{Builder, HandshakeState, TransportState};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use tcr_peer_wire::{MAX_FRAME_BYTES, PeerId, decode_frame, encode_frame};
 
 use crate::peer::config::{PeerRow, PeerStore};
-use crate::peer::id::NodeKey;
+use crate::peer::id::{KEY_BYTES, NodeKey};
+// Compat for `src/main.rs` (it names `noise::random_secret`); wave 2 repoints it to `id`.
+pub use crate::peer::id::random_secret;
 
 /// `XX`, a FIRST pairing, where neither side knows the other's key. The
 /// default path: a discovered row carries no key, so there is nothing else to
@@ -180,10 +181,6 @@ const PSK_POSITION_ONE: u8 = 1;
 /// The PSK position `NNpsk0` mixes the network key into: position zero, which
 /// is before the first token of message 1 rather than after it.
 const PSK_POSITION_ZERO: u8 = 0;
-
-/// A static X25519 key, a Noise message 1 ephemeral, and a PSK are all 32
-/// bytes. Named once so a `32` in a bounds check is readable.
-pub const KEY_BYTES: usize = 32;
 
 /// The exact length of an `XX` message 1: one ephemeral, plus the 8-byte
 /// instance id this design carries as its payload.
@@ -814,21 +811,6 @@ impl std::fmt::Debug for PeerSession {
             .field("code", &self.code)
             .finish_non_exhaustive()
     }
-}
-
-/// Generate 32 cryptographically random bytes through `snow`'s own resolver.
-///
-/// Here rather than in [`crate::peer::pair`] so the join secret and a Noise
-/// ephemeral come from the same CSPRNG, and so this file stays the only one
-/// that names `snow::`.
-pub fn random_secret() -> Result<[u8; KEY_BYTES]> {
-    let mut rng = DefaultResolver
-        .resolve_rng()
-        .ok_or_else(|| anyhow!("peer handshake: snow's default resolver offered no CSPRNG"))?;
-    let mut out = [0_u8; KEY_BYTES];
-    rng.try_fill_bytes(&mut out)
-        .map_err(|err| anyhow!("peer handshake: the CSPRNG failed: {err}"))?;
-    Ok(out)
 }
 
 /// Generate a static keypair, for a first boot and for a test that needs two

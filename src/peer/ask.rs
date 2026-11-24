@@ -47,9 +47,10 @@
 //! is told it was cut short rather than called a forgery
 //! (`src/peer/moved.rs:106`, `:430`).
 
-use tcr_peer_wire::{decode_bytes, encode_bytes};
+use tcr_peer_wire::Crockford;
 
-use crate::peer::noise::{self, KEY_BYTES};
+use crate::peer::id::KEY_BYTES;
+use crate::peer::noise;
 use crate::peer::pair::JoinToken;
 use crate::peer::state::PendingAsk;
 
@@ -97,7 +98,7 @@ impl Ask {
         body.extend_from_slice(&ASK_MAGIC);
         body.push(WIRE_VERSION);
         body.extend_from_slice(&self.key);
-        format!("{ASK_PREFIX}{}", encode_bytes(&body))
+        format!("{ASK_PREFIX}{}", Crockford::encode(&body))
     }
 
     /// Parse a pasted ask, or a refusal naming what was wrong. Never a paste's
@@ -108,7 +109,7 @@ impl Ask {
         let body = pasted
             .strip_prefix(ASK_PREFIX)
             .ok_or(AskRefusal::NotAnAsk)?;
-        let bytes = decode_bytes(body).map_err(|_| AskRefusal::CutShort)?;
+        let bytes = Crockford::decode(body).map_err(|_| AskRefusal::CutShort)?;
         let min_len = ASK_MAGIC.len() + 1 + KEY_BYTES;
         if bytes.len() < min_len {
             return Err(AskRefusal::CutShort);
@@ -193,7 +194,7 @@ const MIN_REPLY_BYTES: usize = REPLY_MAGIC.len() + 1 + 32 + 16 + 1;
 impl Reply {
     /// Render the reply for pasting.
     pub fn to_string_wire(&self) -> String {
-        format!("{REPLY_PREFIX}{}", encode_bytes(&self.body))
+        format!("{REPLY_PREFIX}{}", Crockford::encode(&self.body))
     }
 
     /// Parse a pasted reply's frame, or a refusal naming what was wrong. The
@@ -204,7 +205,7 @@ impl Reply {
         let body = pasted
             .strip_prefix(REPLY_PREFIX)
             .ok_or(ReplyRefusal::NotOurs)?;
-        let bytes = decode_bytes(body).map_err(|_| ReplyRefusal::CutShort)?;
+        let bytes = Crockford::decode(body).map_err(|_| ReplyRefusal::CutShort)?;
         if bytes.len() < MIN_REPLY_BYTES {
             return Err(ReplyRefusal::CutShort);
         }

@@ -99,8 +99,9 @@ use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
 use tokio::net::TcpListener;
 
 use crate::peer::config::{PeerFile, PeerRow};
+use crate::peer::id::KEY_BYTES;
 use crate::peer::id::NodeKey;
-use crate::peer::noise::{self, Handshake, KEY_BYTES};
+use crate::peer::noise::{self, Handshake};
 use crate::peer::tunnel::{self, NoiseStream};
 
 /// The ONLY origins a gateway will carry. Deny by default: a host absent from
@@ -522,7 +523,7 @@ pub async fn accept_once_splice(
         }),
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: crate::peer::lease::random_id()?,
+        request_id: crate::peer::id::random_id()?,
     };
     let bytes = serde_json::to_vec(&header).context("peer egress: the header did not serialize")?;
     noise::send_encrypted(&mut stream, &mut session.transport, &bytes)

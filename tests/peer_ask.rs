@@ -31,7 +31,10 @@ fn scratch(tag: &str) -> std::path::PathBuf {
     dir.join("peer-state.json")
 }
 
-fn keypair() -> ([u8; noise::KEY_BYTES], [u8; noise::KEY_BYTES]) {
+fn keypair() -> (
+    [u8; tcr::peer::id::KEY_BYTES],
+    [u8; tcr::peer::id::KEY_BYTES],
+) {
     noise::generate_static().expect("a test keypair")
 }
 
@@ -50,8 +53,8 @@ fn some_token() -> JoinToken {
 
 const fn row(
     id: u64,
-    public: [u8; noise::KEY_BYTES],
-    private: [u8; noise::KEY_BYTES],
+    public: [u8; tcr::peer::id::KEY_BYTES],
+    private: [u8; tcr::peer::id::KEY_BYTES],
     until_ms: i64,
 ) -> PendingAsk {
     PendingAsk {
@@ -247,5 +250,6 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// from a default that changed under them.
 #[test]
 fn a_fresh_state_carries_no_asks() {
-    assert!(PeerState::default().asks.is_empty());
+    let written = serde_json::to_value(PeerState::default()).expect("the state serializes");
+    assert_eq!(written["asks"], serde_json::json!([]));
 }

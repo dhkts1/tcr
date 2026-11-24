@@ -19,8 +19,7 @@
 
 use proptest::prelude::*;
 use tcr_peer_wire::{
-    InstanceId, LendScope, MAX_FRAME_BYTES, PeerId, decode_frame, decode_key32, encode_frame,
-    encode_key32,
+    Crockford, InstanceId, LendScope, MAX_FRAME_BYTES, PeerId, decode_frame, encode_frame,
 };
 
 /// A label `sanitize_label`/`LendScope::parse` accepts unchanged: short,
@@ -69,11 +68,11 @@ proptest! {
         }
     }
 
-    /// `decode_key32(encode_key32(bytes)) == bytes`, over every 32-byte value.
+    /// `Crockford::decode_key32(Crockford::encode(bytes)) == bytes`, over every 32-byte value.
     #[test]
     fn key32_roundtrips(bytes in prop::array::uniform32(any::<u8>())) {
-        let wire = encode_key32(&bytes);
-        let back = decode_key32(&wire).expect("a value this crate just encoded must decode");
+        let wire = Crockford::encode(&bytes);
+        let back = Crockford::decode_key32(&wire).expect("a value this crate just encoded must decode");
         prop_assert_eq!(back, bytes);
     }
 
