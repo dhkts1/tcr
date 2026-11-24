@@ -13,11 +13,7 @@ impl Manager {
         warmer: Arc<dyn AccountWarmer>,
         config_path: Option<PathBuf>,
     ) -> Arc<Self> {
-        let accounts: Vec<AccountRuntime> = config
-            .accounts
-            .iter()
-            .map(|a| AccountRuntime::from_config(a, config.http1_only))
-            .collect();
+        let accounts: Vec<AccountRuntime> = config.build_per_account(AccountRuntime::from_config);
         Self::assemble(config, refresher, prober, warmer, config_path, accounts)
     }
 

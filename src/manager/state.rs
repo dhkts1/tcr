@@ -255,9 +255,7 @@ impl Manager {
         self.config
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .accounts
-            .get(idx)
-            .map(config::Account::egress_pin)
+            .egress_pin_at(idx)
     }
 
     /// The pooled `account_uuid` to inject for account `idx` (a clone — the

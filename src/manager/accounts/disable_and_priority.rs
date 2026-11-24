@@ -173,12 +173,7 @@ impl Manager {
                 // provider. An unbreakable tie writes nothing: `save_disabled` refuses
                 // one too, and memory must not drift onto a record the file was not
                 // allowed to touch.
-                if let crate::identity::Resolved::One(position) =
-                    crate::identity::resolve(config.accounts.iter().enumerate(), target)
-                    && let Some(account) = config.accounts.get_mut(position)
-                {
-                    account.disabled = if disabled { Some(true) } else { None };
-                }
+                config.set_disabled_by_identity(target, disabled);
             },
         );
         match outcome {

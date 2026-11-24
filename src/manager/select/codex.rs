@@ -10,12 +10,7 @@ impl Manager {
         self.config
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .accounts
-            .iter()
-            .enumerate()
-            .filter(|(_, account)| account.has_unsupported_strict_peer_exit())
-            .map(|(idx, _)| idx)
-            .collect()
+            .unsupported_strict_exit_slots()
     }
 
     /// The slots a request of `provider` may never be served from: strict Codex peer exits

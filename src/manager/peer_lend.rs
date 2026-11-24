@@ -221,10 +221,7 @@ impl Manager {
             .config
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .accounts
-            .iter()
-            .map(config::Account::egress_pin)
-            .collect();
+            .egress_pins();
         let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
         accounts
             .iter()
