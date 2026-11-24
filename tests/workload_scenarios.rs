@@ -182,30 +182,40 @@ struct Fleet {
     next_key: u64,
 }
 
+/// The config over `accounts` (name, priority) with `pacing` and the default soft switch
+/// threshold.
+fn fleet_config(accounts: &[(&str, i64)], pacing: PacingConfig) -> Config {
+    // The global egress throttle stays at its inert default: it is an async sleep on the
+    // send path and has no bearing on selection.
+    Config {
+        switch_threshold: SWITCH_THRESHOLD,
+        pacing,
+        ..Config::fixture(accounts.iter().map(|(n, p)| account(n, *p)).collect())
+    }
+}
+
+/// A manager over `config` that never refreshes, probes or warms. `config_path: None` makes
+/// every persist a no-op, so nothing can reach disk.
+fn manager_over(config: Config) -> Arc<Manager> {
+    Manager::new(
+        config,
+        Arc::new(NeverRefreshes),
+        Arc::new(NeverProbes),
+        Arc::new(NeverWarms),
+        None,
+    )
+}
+
 impl Fleet {
     /// Build a manager over `accounts` (name, priority) with `pacing` and the
-    /// default soft switch threshold. `config_path: None` makes every persist a
-    /// no-op, so nothing can reach disk.
+    /// default soft switch threshold, through [`fleet_config`] and [`manager_over`].
     fn new(accounts: &[(&str, i64)], pacing: PacingConfig) -> Self {
-        // The global egress throttle stays at its inert default: it is an async sleep on the
-        // send path and has no bearing on selection.
-        let config = Config {
-            switch_threshold: SWITCH_THRESHOLD,
-            pacing,
-            ..Config::fixture(accounts.iter().map(|(n, p)| account(n, *p)).collect())
-        };
-        Self::from_config(config)
+        Self::from_config(fleet_config(accounts, pacing))
     }
 
     fn from_config(config: Config) -> Self {
         let account_names = config.accounts.iter().map(|a| a.name.clone()).collect();
-        let manager = Manager::new(
-            config,
-            Arc::new(NeverRefreshes),
-            Arc::new(NeverProbes),
-            Arc::new(NeverWarms),
-            None,
-        );
+        let manager = manager_over(config);
         let mut fleet = Self {
             manager,
             account_names,
@@ -318,6 +328,36 @@ impl Fleet {
     fn stream_anon(&mut self, now: OffsetDateTime) -> InFlightGuard {
         let idx = self.serve_anon(now);
         self.manager.enter_in_flight_at(idx, now)
+    }
+
+    /// Serve one request on each of `sessions` while account `offline` is disabled, so they
+    /// pin elsewhere, then bring it back. The accounts served, in order.
+    fn serve_while_offline(
+        &mut self,
+        offline: usize,
+        sessions: &[Lineage],
+        now: OffsetDateTime,
+    ) -> Vec<usize> {
+        self.manager.set_disabled(offline, true);
+        let served = sessions
+            .iter()
+            .map(|session| self.serve(*session, now))
+            .collect();
+        self.manager.set_disabled(offline, false);
+        served
+    }
+
+    /// An upstream 429 on account `idx` that parks it for `secs` seconds from `now`, through
+    /// the path the proxy takes.
+    fn rate_limit(&self, idx: usize, secs: i64, now: OffsetDateTime) {
+        self.manager.mark_rate_limited_at(idx, secs, now);
+    }
+
+    /// The account an identity-less `/v1/messages` request at `at` would get, without
+    /// recording a serve.
+    fn pick_anon(&self, at: OffsetDateTime) -> Option<usize> {
+        self.manager
+            .select(&HashSet::new(), at, None, None, "/v1/messages", None)
     }
 
     /// Drive account `idx` over the soft switch threshold on its shared weekly
@@ -635,10 +675,7 @@ fn two_sessions_on_one_account_do_not_pingpong() {
     let mut now = t0();
 
     // Both sessions arrive while only one account is up, so both pin to it.
-    fleet.manager.set_disabled(1, true);
-    assert_eq!(fleet.serve(first, now), 0);
-    assert_eq!(fleet.serve(second, now), 0);
-    fleet.manager.set_disabled(1, false);
+    assert_eq!(fleet.serve_while_offline(1, &[first, second], now), [0, 0]);
     now += Duration::seconds(1);
 
     for _ in 0..40 {
@@ -766,7 +803,7 @@ fn quota_crossing_moves_only_the_affected_sessions() {
     now += Duration::seconds(1);
 
     // Phase B — alpha 429s for real, which arms a live hold. THAT is hard.
-    fleet.manager.mark_rate_limited_at(0, 60, now);
+    fleet.rate_limit(0, 60, now);
 
     for _ in 0..5 {
         for session in [doomed_a, healthy, doomed_b] {
@@ -1026,10 +1063,7 @@ fn migration_never_moves_a_session_to_a_lower_priority_tier() {
 
     // Both sessions arrive while the overflow account is offline, so both pin to
     // the primary (priority-0) account.
-    fleet.manager.set_disabled(1, true);
-    assert_eq!(fleet.serve(first, now), 0);
-    assert_eq!(fleet.serve(second, now), 0);
-    fleet.manager.set_disabled(1, false);
+    assert_eq!(fleet.serve_while_offline(1, &[first, second], now), [0, 0]);
     now += Duration::seconds(1);
 
     for _ in 0..10 {
@@ -1159,7 +1193,7 @@ fn transient_hold_returns_the_session_home() {
     );
 
     // Phase 2 — a burst 429 with no guidance parks the home account for 15s.
-    fleet.manager.mark_rate_limited_at(home, HOLD_SECS, start);
+    fleet.rate_limit(home, HOLD_SECS, start);
 
     for turn in 0..HELD_TURNS {
         let at = start + Duration::seconds(1 + turn * 2);
@@ -1212,14 +1246,7 @@ fn fixed_epoch_spacing() {
         },
     );
     drop(fleet.stream_anon(t0()));
-    let pick = fleet.manager.select(
-        &HashSet::new(),
-        t0() + Duration::milliseconds(1_001),
-        None,
-        None,
-        "/v1/messages",
-        None,
-    );
+    let pick = fleet.pick_anon(t0() + Duration::milliseconds(1_001));
     assert_eq!(pick, Some(0), "spacing must expire on the replay clock");
 }
 
@@ -1258,24 +1285,18 @@ fn replay_clock_controls_quota_and_holds() {
         Some(now + Duration::days(7))
     );
 
-    let fleet = Fleet::new(&[("alpha", 0), ("bravo", 1)], pacing(CAP));
-    assert!(fleet.manager.update_quota_at(0, &headers, 200, now));
-    fleet.manager.mark_rate_limited_at(0, 5, now);
-    let pick = |at| {
-        fleet
-            .manager
-            .select(&HashSet::new(), at, None, None, "/v1/messages", None)
-    };
+    let manager = manager_over(fleet_config(&[("alpha", 0), ("bravo", 1)], pacing(CAP)));
+    assert!(manager.update_quota_at(0, &headers, 200, now));
+    manager.mark_rate_limited_at(0, 5, now);
+    let pick = |at| manager.select(&HashSet::new(), at, None, None, "/v1/messages", None);
     assert_eq!(pick(now + Duration::seconds(4)), Some(1));
     assert_eq!(pick(now + Duration::seconds(6)), Some(0));
-    fleet.manager.mark_refused_at(0, now);
+    manager.mark_refused_at(0, now);
     assert_eq!(pick(now), Some(1));
     assert_eq!(pick(now + Duration::days(1)), Some(0));
-    fleet
-        .manager
-        .mark_model_weekly_rejected_at(0, &reqwest::header::HeaderMap::new(), now);
+    manager.mark_model_weekly_rejected_at(0, &reqwest::header::HeaderMap::new(), now);
     assert_eq!(
-        fleet.manager.select(
+        manager.select(
             &HashSet::new(),
             now + Duration::days(1),
             Some(FABLE),
@@ -1291,19 +1312,19 @@ fn replay_clock_controls_quota_and_holds() {
 fn replay_clock_controls_codex_holds() {
     let mut a = account("alpha", 0);
     a.provider = tcr::provider::Provider::Codex;
-    let fleet = Fleet::from_config(Config::fixture(vec![a]));
+    let manager = manager_over(Config::fixture(vec![a]));
     let now = t0();
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("x-codex-primary-used-percent", "50".parse().unwrap());
     headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
-    assert!(fleet.manager.update_quota_at(0, &headers, 200, now));
+    assert!(manager.update_quota_at(0, &headers, 200, now));
     assert_eq!(
-        fleet.manager.snapshot(now).accounts[0].quota_updated_at,
+        manager.snapshot(now).accounts[0].quota_updated_at,
         Some(now)
     );
-    fleet.manager.mark_codex_quota_limited_at(0, 30, now);
+    manager.mark_codex_quota_limited_at(0, 30, now);
     let pick = |at| {
-        fleet.manager.select(
+        manager.select(
             &HashSet::new(),
             at,
             Some("gpt-5.1-codex"),
@@ -1742,7 +1763,7 @@ mod quota_replay {
             } else {
                 Provider::Codex
             };
-            let fleet = Fleet::from_config(Config::fixture(vec![a]));
+            let manager = manager_over(Config::fixture(vec![a]));
             let mut slot = Slot {
                 provider,
                 windows: [Budget {
@@ -1752,14 +1773,10 @@ mod quota_replay {
                     period: 5 * HOUR,
                 }; 3],
             };
-            slot.report(&fleet.manager, 0, t0());
+            slot.report(&manager, 0, t0());
             let until = t0() + Duration::seconds(if provider == 0 { 60 } else { 120 });
             assert_eq!(
-                fleet
-                    .manager
-                    .snapshot(t0() + Duration::seconds(59))
-                    .accounts[0]
-                    .rate_limited_until,
+                manager.snapshot(t0() + Duration::seconds(59)).accounts[0].rate_limited_until,
                 Some(until),
                 "a replay 429 must arm the production hold"
             );
@@ -1769,7 +1786,7 @@ mod quota_replay {
                 "/backend-api/codex/responses"
             };
             assert_eq!(
-                fleet.manager.select(
+                manager.select(
                     &HashSet::new(),
                     t0() + Duration::seconds(59),
                     None,
@@ -1784,9 +1801,9 @@ mod quota_replay {
                 window.used = 0.0;
                 window.reset += window.period;
             }
-            slot.report(&fleet.manager, 0, t0() + Duration::seconds(121));
+            slot.report(&manager, 0, t0() + Duration::seconds(121));
             assert_eq!(
-                fleet.manager.select(
+                manager.select(
                     &HashSet::new(),
                     t0() + Duration::seconds(121),
                     None,
@@ -1932,20 +1949,20 @@ mod quota_replay {
                 });
             }
         }
-        let fleet = Fleet::from_config(Config {
+        let manager = manager_over(Config {
             pacing: PacingConfig {
                 max_in_flight_per_account: Some(CAP),
                 min_spacing_ms: Some(1_000),
             },
             ..Config::fixture(accounts)
         });
-        replay_slots(requests, weight, fleet, slots, true)
+        replay_slots(requests, weight, manager, slots, true)
     }
 
     fn replay_slots(
         requests: &[Request],
         weight: u64,
-        fleet: Fleet,
+        manager: Arc<Manager>,
         mut slots: Vec<Slot>,
         fixed_holds: bool,
     ) -> Score {
@@ -1956,7 +1973,7 @@ mod quota_replay {
             events.insert((at, kind, seq), event);
         };
         for (i, slot) in slots.iter().enumerate() {
-            slot.report(&fleet.manager, i, t0()).schedule(&mut events);
+            slot.report(&manager, i, t0()).schedule(&mut events);
             let tracked = if slot.provider == 0 { 3 } else { 2 };
             for (w, window) in slot.windows.iter().enumerate().take(tracked) {
                 schedule(&mut events, window.reset, 0, Event::Reset(i, w));
@@ -2030,9 +2047,7 @@ mod quota_replay {
                     budget.used = 0.0;
                     budget.reset += budget.period;
                     schedule(&mut events, budget.reset, 0, Event::Reset(i, w));
-                    slots[i]
-                        .report(&fleet.manager, i, now)
-                        .schedule(&mut events);
+                    slots[i].report(&manager, i, now).schedule(&mut events);
                 }
                 Event::Complete(i, r, guard) => {
                     let request = &requests[r];
@@ -2091,14 +2106,12 @@ mod quota_replay {
                     for window in slots[i].windows.iter_mut().take(charged) {
                         window.used += charge as f64;
                     }
-                    fleet.manager.record_usage(i, record);
-                    slots[i]
-                        .report(&fleet.manager, i, now)
-                        .schedule(&mut events);
+                    manager.record_usage(i, record);
+                    slots[i].report(&manager, i, now).schedule(&mut events);
                     drop(guard);
                 }
                 Event::Hold(i) => {
-                    fleet.manager.mark_rate_limited_at(i, 15, now);
+                    manager.mark_rate_limited_at(i, 15, now);
                     schedule(&mut events, at + 15_000, 2, Event::Release);
                 }
                 Event::Release => {}
@@ -2133,10 +2146,7 @@ mod quota_replay {
                 // Do not infer this from a soft threshold or an empty pool.
                 let first = *queue.values().next().unwrap().front().unwrap();
                 let request = &requests[first];
-                let routed =
-                    fleet
-                        .manager
-                        .routing_candidates(now, Some(MODELS[family]), request.path());
+                let routed = manager.routing_candidates(now, Some(MODELS[family]), request.path());
                 let provider_accounts = slots
                     .iter()
                     .filter(|slot| slot.provider == request.provider())
@@ -2146,7 +2156,7 @@ mod quota_replay {
                         == Some(&provider_accounts);
                 if all_rejected {
                     assert_eq!(
-                        fleet.manager.select(
+                        manager.select(
                             &HashSet::new(),
                             now,
                             Some(MODELS[family]),
@@ -2157,7 +2167,7 @@ mod quota_replay {
                         None
                     );
                     assert_eq!(
-                        fleet.manager.select_revalidation(
+                        manager.select_revalidation(
                             &HashSet::new(),
                             now,
                             Some(MODELS[family]),
@@ -2182,8 +2192,7 @@ mod quota_replay {
                 while let Some((r, session)) = heads.pop_first() {
                     let request = &requests[r];
                     let tried = HashSet::new();
-                    let picked = fleet
-                        .manager
+                    let picked = manager
                         .select(
                             &tried,
                             now,
@@ -2193,7 +2202,7 @@ mod quota_replay {
                             None,
                         )
                         .or_else(|| {
-                            let pick = fleet.manager.select_revalidation(
+                            let pick = manager.select_revalidation(
                                 &tried,
                                 now,
                                 Some(MODELS[request.family]),
@@ -2216,7 +2225,7 @@ mod quota_replay {
                         queue.remove(&session);
                     }
                     assert_eq!(slots[i].provider, request.provider());
-                    let guard = fleet.manager.enter_in_flight_at(i, now);
+                    let guard = manager.enter_in_flight_at(i, now);
                     schedule(
                         &mut events,
                         at + 1_000 + (request.input + request.output) as i64 / 100,
@@ -2225,7 +2234,7 @@ mod quota_replay {
                     );
                 }
                 if let Some(r) = queue.values().next().and_then(|rs| rs.front()) {
-                    let (reason, wake) = wait_reason(&fleet.manager, &requests[*r], at, &slots);
+                    let (reason, wake) = wait_reason(&manager, &requests[*r], at, &slots);
                     waiting[family] = Some(reason);
                     if (TRAINING..END).contains(&at) {
                         *score.waits.entry(reason).or_default() += 1;
@@ -2407,14 +2416,14 @@ mod quota_replay {
                 period: WEEK,
             }),
         };
-        let fleet = Fleet::new(
+        let manager = manager_over(fleet_config(
             &[("alpha", 0)],
             PacingConfig {
                 max_in_flight_per_account: Some(CAP),
                 min_spacing_ms: Some(1_000),
             },
-        );
-        let score = replay_slots(&requests, 4, fleet, vec![slot], false);
+        ));
+        let score = replay_slots(&requests, 4, manager, vec![slot], false);
         assert_eq!(
             score.lockout_minutes, [0.0; 2],
             "a revalidation cooldown with unspent capacity is pacing, not lockout"
@@ -2448,14 +2457,14 @@ mod quota_replay {
         };
         slot.windows[2].used = slot.windows[2].capacity;
         slot.windows[2].reset = TRAINING + 10_000;
-        let fleet = Fleet::new(
+        let manager = manager_over(fleet_config(
             &[("alpha", 0)],
             PacingConfig {
                 max_in_flight_per_account: Some(CAP),
                 min_spacing_ms: Some(1_000),
             },
-        );
-        let score = replay_slots(&requests, 4, fleet, vec![slot], false);
+        ));
+        let score = replay_slots(&requests, 4, manager, vec![slot], false);
         assert!(
             (score.lockout_minutes[0] - 0.15).abs() < 1e-10,
             "a spent model-scoped budget is capacity lockout: {score:?}"
@@ -2485,14 +2494,14 @@ mod quota_replay {
                 period: WEEK,
             }; 3],
         };
-        let fleet = Fleet::new(
+        let manager = manager_over(fleet_config(
             &[("alpha", 0)],
             PacingConfig {
                 max_in_flight_per_account: Some(CAP),
                 min_spacing_ms: Some(1_000),
             },
-        );
-        let score = replay_slots(&requests, 4, fleet, vec![slot], false);
+        ));
+        let score = replay_slots(&requests, 4, manager, vec![slot], false);
         assert_eq!(
             score.lockout_minutes, [0.0; 2],
             "unspent capacity stays pacing when a reset beats the valve"

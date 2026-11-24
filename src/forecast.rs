@@ -207,6 +207,18 @@ impl WindowFit {
         self.scales.clear();
     }
 
+    /// A reading from a request still open cannot bracket completed vectors: the fit goes, and
+    /// the quiescent anchor and samples stay, so intervening response headers do not erase
+    /// evidence between two valid probe readings.
+    fn observe_unfinished(&mut self) {
+        self.scales.clear();
+    }
+
+    /// The fitted scale for `family`, if this window's fit has one.
+    fn scale(&self, family: &str) -> Option<Scale> {
+        self.scales.get(family).copied()
+    }
+
     fn observe(&mut self, bucket: Option<crate::probe::UsageBucket>, now: i64, tokens: Tokens) {
         let reading = bucket
             .and_then(|b| Some((b.utilization?, b.reset_at_ms?)))
@@ -341,11 +353,8 @@ impl Calibration {
         unfinished: bool,
     ) {
         if unfinished {
-            // This reading cannot bracket completed vectors. Keep the valid
-            // quiescent anchor and samples, so intervening response headers do
-            // not erase evidence between two valid probe readings.
             for window in &mut self.windows {
-                window.scales.clear();
+                window.observe_unfinished();
             }
             return;
         }
@@ -382,7 +391,7 @@ impl Calibration {
     }
 
     pub(crate) fn scale(&self, window: usize, family: &str) -> Option<Scale> {
-        self.windows.get(window)?.scales.get(family).copied()
+        self.windows.get(window)?.scale(family)
     }
 
     pub(crate) fn ready(&self, families: &BTreeSet<String>, scoped: bool) -> bool {
@@ -588,6 +597,11 @@ impl History {
             pruned: None,
             partial: false,
         }
+    }
+
+    /// Evidence was lost: the snapshot is partial from here until a new `History` is built.
+    pub(crate) fn mark_partial(&mut self) {
+        self.partial = true;
     }
 
     pub(crate) fn record(&mut self, record: &UsageRecord) {

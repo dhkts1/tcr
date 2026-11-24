@@ -324,17 +324,7 @@ async fn run_codex_login(
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to launch `{}`", codex.display()))?;
-    let identity = process_identity(child.id()).filter(|identity| identity.start_time > 0);
-    if identity.is_none() {
-        tracing::warn!(
-            pid = child.id(),
-            "could not record codex login process identity; cancellation cannot signal an unverified PID"
-        );
-    }
-    *session
-        .codex_process
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = identity;
+    session.track(child.id());
 
     let output = Arc::new(Output::default());
     let (done, drained) = std::sync::mpsc::channel::<()>();
@@ -350,14 +340,10 @@ async fn run_codex_login(
     drop(done);
 
     let waiting = Arc::clone(session);
-    let status = tokio::task::spawn_blocking(move || {
-        let status = child.wait();
-        waiting.reaped.store(true, Ordering::SeqCst);
-        status
-    })
-    .await
-    .context("waiting for `codex login`")?
-    .context("waiting for `codex login`")?;
+    let status = tokio::task::spawn_blocking(move || waiting.reap(&mut child))
+        .await
+        .context("waiting for `codex login`")?
+        .context("waiting for `codex login`")?;
 
     tokio::task::spawn_blocking(move || {
         let deadline = Instant::now() + DRAIN_GRACE;
@@ -371,7 +357,7 @@ async fn run_codex_login(
     .await
     .context("reading `codex login`'s output")?;
     // Whatever a straggler still writes is codex's, not this login's: nothing more is said.
-    session.quiet.store(true, Ordering::SeqCst);
+    session.hush();
     let said = output.said();
     Ok(Ran { status, said })
 }
@@ -428,12 +414,9 @@ fn spawn_reader(
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
-            if session.quiet.load(Ordering::SeqCst) {
+            if !session.echo(&raw) {
                 continue;
             }
-            std::io::stderr()
-                .write_all(&raw)
-                .log_debug("echoing codex output to stderr");
             let line = String::from_utf8_lossy(&raw);
             let cleaned: String = line.chars().filter(|c| !c.is_control()).collect();
             let cleaned = cleaned.trim();
@@ -505,6 +488,72 @@ impl Session {
 
     fn folder_path(&self) -> PathBuf {
         self.path.clone()
+    }
+
+    /// Record the `codex login` process at `pid` by PID and start time, so a signal can stop it.
+    /// When its identity cannot be read, nothing is recorded and a cancellation signals nothing.
+    fn track(&self, pid: u32) {
+        let identity = process_identity(pid).filter(|identity| identity.start_time > 0);
+        if identity.is_none() {
+            tracing::warn!(
+                pid,
+                "could not record codex login process identity; cancellation cannot signal an unverified PID"
+            );
+        }
+        *self
+            .codex_process
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = identity;
+    }
+
+    /// Wait for codex to exit, and from then on never signal its PID, which may name another
+    /// process.
+    fn reap(&self, child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+        let status = child.wait();
+        self.reaped.store(true, Ordering::SeqCst);
+        status
+    }
+
+    /// From here on, nothing codex writes is echoed.
+    fn hush(&self) {
+        self.quiet.store(true, Ordering::SeqCst);
+    }
+
+    /// Copy `raw` to tcr's stderr unless the session has gone quiet; whether it was copied.
+    fn echo(&self, raw: &[u8]) -> bool {
+        if self.quiet.load(Ordering::SeqCst) {
+            return false;
+        }
+        std::io::stderr()
+            .write_all(raw)
+            .log_debug("echoing codex output to stderr");
+        true
+    }
+
+    /// Signal codex and everything it started with `caught`, then SIGKILL what is left, waiting
+    /// up to [`STOP_GRACE`] after each. Codex itself is skipped once reaped, since its PID may
+    /// then name another process.
+    async fn stop_codex(&self, caught: Caught) {
+        let root = *self
+            .codex_process
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let reaped = || self.reaped.load(Ordering::SeqCst);
+        if let Some(root) = root.filter(|_| !reaped()) {
+            let family = family_of(root);
+            for &member in &family {
+                if member.pid != root.pid || !reaped() {
+                    signal(member, caught.as_sysinfo());
+                }
+            }
+            wait_for(&reaped, STOP_GRACE).await;
+            for &member in &family {
+                if member.pid != root.pid || !reaped() {
+                    signal(member, sysinfo::Signal::Kill);
+                }
+            }
+            wait_for(&reaped, STOP_GRACE).await;
+        }
     }
 
     /// Delete the folder now, if it is still there, with [`tempfile::TempDir::close`]: a
@@ -599,27 +648,8 @@ impl Caught {
 /// signal's number. A failed folder deletion is reported before exiting, since it can leave
 /// a live credential behind. It never returns.
 async fn stop_and_exit(session: &Session, caught: Caught) -> std::convert::Infallible {
-    session.quiet.store(true, Ordering::SeqCst);
-    let root = *session
-        .codex_process
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let reaped = || session.reaped.load(Ordering::SeqCst);
-    if let Some(root) = root.filter(|_| !reaped()) {
-        let family = family_of(root);
-        for &member in &family {
-            if member.pid != root.pid || !reaped() {
-                signal(member, caught.as_sysinfo());
-            }
-        }
-        wait_for(&reaped, STOP_GRACE).await;
-        for &member in &family {
-            if member.pid != root.pid || !reaped() {
-                signal(member, sysinfo::Signal::Kill);
-            }
-        }
-        wait_for(&reaped, STOP_GRACE).await;
-    }
+    session.hush();
+    session.stop_codex(caught).await;
     if let Err(error) = session.close_folder() {
         eprintln!("[tcr] {error:#}");
     }

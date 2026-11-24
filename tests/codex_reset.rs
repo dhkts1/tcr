@@ -238,6 +238,23 @@ impl ResetProxy {
         .unwrap()
     }
 
+    /// The upstream saw some attempt key.
+    fn saw_a_key(&self) -> bool {
+        !self.keys.lock().unwrap().is_empty()
+    }
+
+    /// The upstream saw exactly two attempts, the retry carrying the first one's key.
+    fn retry_kept_its_key(&self) -> bool {
+        let keys = self.keys.lock().unwrap();
+        keys.len() == 2 && keys[0] == keys[1]
+    }
+
+    /// The upstream saw exactly three attempts, the third under a key other than the first's.
+    fn third_attempt_has_a_new_key(&self) -> bool {
+        let keys = self.keys.lock().unwrap();
+        keys.len() == 3 && keys[0] != keys[2]
+    }
+
     async fn finish(mut self) {
         self.shutdown.take().unwrap().send(()).unwrap();
         self.task.take().unwrap().await.unwrap().unwrap();
@@ -371,23 +388,17 @@ async fn reset_cli_retry_retains_key_and_new_confirmation_mints_a_new_attempt() 
     let (out, err) = reset_output(&output);
     assert_eq!(out, "Already redeemed.\n");
     assert_eq!(err, format!("{ASK}Reset outcome unknown.\n{RETRY}"));
-    {
-        let keys = proxy.keys.lock().unwrap();
-        assert!(
-            keys.len() == 2 && keys[0] == keys[1],
-            "explicit retry must retain the attempt key"
-        );
-    }
+    assert!(
+        proxy.retry_kept_its_key(),
+        "explicit retry must retain the attempt key"
+    );
     let next = proxy.run(b"y\n", false).await;
     assert_eq!(next.status.code(), Some(0));
     reset_output(&next);
-    {
-        let keys = proxy.keys.lock().unwrap();
-        assert!(
-            keys.len() == 3 && keys[0] != keys[2],
-            "new consent must create a new attempt"
-        );
-    }
+    assert!(
+        proxy.third_attempt_has_a_new_key(),
+        "new consent must create a new attempt"
+    );
     proxy.finish().await;
 }
 
@@ -546,7 +557,7 @@ async fn reset_backend_error_after_debit_remains_unknown_and_retryable() {
     // The fake upstream recorded this attempt in its redeemed-key set before
     // emitting 503, exactly as the lost-response fixture records before bad JSON.
     assert!(proxy.consumes.load(Ordering::SeqCst) >= 1);
-    assert!(!proxy.keys.lock().unwrap().is_empty());
+    assert!(proxy.saw_a_key());
     assert_eq!(
         proxy.debits.load(Ordering::SeqCst),
         1,
@@ -557,12 +568,9 @@ async fn reset_backend_error_after_debit_remains_unknown_and_retryable() {
         "a backend 503 after debit must remain unknown, not refused"
     );
     assert_eq!(output.status.code(), Some(0));
-    {
-        let keys = proxy.keys.lock().unwrap();
-        assert!(
-            keys.len() == 2 && keys[0] == keys[1],
-            "retry after a server error must retain its attempt key"
-        );
-    }
+    assert!(
+        proxy.retry_kept_its_key(),
+        "retry after a server error must retain its attempt key"
+    );
     proxy.finish().await;
 }

@@ -214,13 +214,9 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     // The fleet ceiling as the proxy will read it: through its own loader, from the file it
     // boots on, rather than a copy of the defaults that could drift from them.
     let booted = tcr::config::load(&scratch.config_path())?;
-    let fleet_ceiling_per_s = match (
-        booted.fleet_throttle.burst,
-        booted.fleet_throttle.effective_min_spacing(),
-    ) {
-        (Some(burst), Some(spacing)) => Some(stats::gcra_window_bound(burst, spacing, 1_000)),
-        _ => None,
-    };
+    let fleet_ceiling_per_s = booted
+        .fleet_bucket()
+        .map(|(burst, spacing)| stats::gcra_window_bound(burst, spacing, 1_000));
 
     let stderr_path = a.out.join(format!("{name}.proxy.stderr"));
     let mut proxy = harness::Proxy::spawn(&a.tcr, &scratch, &a.guard, &stderr_path)?;
