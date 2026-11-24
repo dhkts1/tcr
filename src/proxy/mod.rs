@@ -1924,7 +1924,7 @@ async fn status_handler(
     // Present only while the server holds a key: its presence is what a launcher
     // reads as "this server understands keys" (see `StatusPayload::request_key_mode`).
     if let Some(mode) = manager.request_key_mode() {
-        let (connects, requests) = manager.unkeyed().wire();
+        let (connects, requests) = manager.unkeyed_wire();
         payload.request_key_mode = Some(mode.as_str().to_string());
         payload.unkeyed_connects = Some(connects);
         payload.unkeyed_requests = Some(requests);
@@ -3775,7 +3775,7 @@ async fn handle_request(
     if let crate::request_key::RequestKeying::Unkeyed(user_agent) =
         request_keying(&parts.extensions, &req_headers, manager.request_key())
     {
-        manager.unkeyed().record(
+        manager.record_unkeyed(
             crate::request_key::Unkeyed::Request(crate::request_key::PathClass::of(&path)),
             user_agent,
             parts

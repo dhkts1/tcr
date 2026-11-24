@@ -265,9 +265,27 @@ impl Manager {
             .map(|_| crate::request_key::RequestKeyMode::Log)
     }
 
-    /// The unkeyed-caller counters `GET /_tcr/status` reports.
-    pub const fn unkeyed(&self) -> &crate::request_key::UnkeyedCounters {
-        &self.unkeyed
+    /// Count one arrival that lacked the request key (log mode: counted, never
+    /// refused). See [`crate::request_key::UnkeyedCounters::record`] for the one
+    /// INFO line the first of each kind writes.
+    pub fn record_unkeyed(
+        &self,
+        what: crate::request_key::Unkeyed,
+        user_agent: crate::request_key::UaFamily,
+        peer_port: u16,
+    ) {
+        self.unkeyed.record(what, user_agent, peer_port);
+    }
+
+    /// The `unkeyedConnects` and `unkeyedRequests` rows `GET /_tcr/status`
+    /// reports, in that order.
+    pub fn unkeyed_wire(
+        &self,
+    ) -> (
+        Vec<crate::status::UnkeyedCount>,
+        Vec<crate::status::UnkeyedCount>,
+    ) {
+        self.unkeyed.wire()
     }
 
     /// `f` applied to account row `idx`, under a short read of the accounts

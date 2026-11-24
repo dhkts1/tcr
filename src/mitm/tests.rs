@@ -795,20 +795,24 @@ async fn an_unkeyed_connect_is_served_and_counted_and_a_keyed_one_is_not_counted
     // `tcr:<KEY>`, standard base64.
     let keyed = "Basic dGNyOjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE=";
     connect(Some(keyed.to_string())).await;
-    assert!(
-        manager.unkeyed().snapshot().is_empty(),
+    assert_eq!(
+        manager.unkeyed_wire(),
+        (Vec::new(), Vec::new()),
         "a keyed CONNECT counts nothing"
     );
 
     connect(None).await;
     connect(Some("Basic dGNyOndyb25n".to_string())).await; // `tcr:wrong`
     assert_eq!(
-        manager.unkeyed().snapshot(),
-        vec![crate::request_key::UnkeyedRow {
-            what: Unkeyed::Connect(ConnectClass::Other),
-            user_agent: crate::request_key::UaFamily::Curl,
-            count: 2,
-        }],
+        manager.unkeyed_wire(),
+        (
+            vec![crate::status::UnkeyedCount {
+                class: ConnectClass::Other.as_str().to_string(),
+                user_agent: crate::request_key::UaFamily::Curl.as_str().to_string(),
+                count: 2,
+            }],
+            Vec::new(),
+        ),
         "a missing and a wrong key both count, once each"
     );
 }
