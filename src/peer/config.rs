@@ -193,10 +193,10 @@ pub struct PeerFile {
     #[serde(default = "default_borrow_timeout_ms")]
     pub borrow_timeout_ms: u64,
     /// Which path to a peer is tried first, and what counts as too lossy to
-    /// try early. The type is [`crate::peer::probe::PathsConfig`], which is
+    /// try early. The type is [`PathsConfig`], which is
     /// where the sort it feeds lives. Hot: read per dial.
     #[serde(default)]
-    pub paths: crate::peer::probe::PathsConfig,
+    pub paths: PathsConfig,
     /// One row per pinned peer. Hot.
     #[serde(default)]
     pub peers: Vec<PeerRow>,
@@ -307,7 +307,7 @@ impl Default for PeerFile {
             max_hops: default_max_hops(),
             via: ViaSetting::default(),
             borrow_timeout_ms: default_borrow_timeout_ms(),
-            paths: crate::peer::probe::PathsConfig::default(),
+            paths: PathsConfig::default(),
             peers: Vec::new(),
             pending_invites: Vec::new(),
             default_lend: None,
@@ -633,6 +633,63 @@ impl ViaSetting {
             ViaRoute::Auto => "auto".to_string(),
             ViaRoute::Off => "off".to_string(),
             ViaRoute::Pinned(peer) => peer.to_wire(),
+        }
+    }
+}
+
+/// The default loss ceiling, in percent, above which a path is dialled after
+/// the paths that are under it.
+pub const DEFAULT_MAX_LOSS_PCT: u8 = 5;
+
+// ---------------------------------------------------------------------------
+// The operator's policy: the `paths` section of the peers file
+// ---------------------------------------------------------------------------
+
+/// Which kind of path the operator wants tried first.
+///
+/// A typed enum and not a string, so the peers file, the dial order and a
+/// future panel row cannot disagree about what `"direct"` meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PathPolicy {
+    /// A socket this Mac opens itself, first. The default, because a forwarded
+    /// hop spends a third machine's bytes and needs its consent.
+    #[default]
+    Direct,
+    /// A forwarded hop first. For the Mac whose direct path is the one that
+    /// keeps failing (a hotel network, a carrier NAT), where trying it first
+    /// buys nothing but a connect timeout per request.
+    Via,
+}
+
+/// The `paths` section of the peers file ([`crate::peer::config::PeerFile`]).
+///
+/// Every field has a default that reproduces the behaviour of a build with no
+/// `paths` section at all, which is what lets the field arrive without a
+/// migration: `Direct` first, five percent, and an empty allow list that allows
+/// every forwarder the row already carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PathsConfig {
+    /// Which kind of path is tried first.
+    pub prefer: PathPolicy,
+    /// The loss ceiling in percent. A path measured above it is tried after
+    /// every path under it. **After, and never dropped**: a lossy path that is
+    /// the only path is still the way home.
+    pub max_loss_pct: u8,
+    /// The forwarders this Mac is willing to be carried by. **Empty means every
+    /// forwarder already on the row**, not "none": the row's own `Via`
+    /// endpoints are written by the pinning code, so an empty list here is the
+    /// absence of a further restriction rather than a refusal.
+    pub via_allow: Vec<PeerId>,
+}
+
+impl Default for PathsConfig {
+    fn default() -> Self {
+        Self {
+            prefer: PathPolicy::Direct,
+            max_loss_pct: DEFAULT_MAX_LOSS_PCT,
+            via_allow: Vec::new(),
         }
     }
 }
