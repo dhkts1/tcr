@@ -49,7 +49,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tcr_peer_wire::{PeerId, decode_bytes, encode_bytes};
+use tcr_peer_wire::{Crockford, PeerId};
 
 use crate::peer::drop::{
     MAX_CLOCK_SKEW, MAX_RECORD_ENDPOINTS, NONCE_BYTES, OpenFailure, SealFailure, TAG_BYTES, expand,
@@ -397,7 +397,7 @@ pub fn seal_link_field(
     publisher: &PeerId,
     record: &MovedRecord,
 ) -> Result<String, MintRefusal> {
-    seal_link(keys, publisher, record).map(|sealed| encode_bytes(&sealed))
+    seal_link(keys, publisher, record).map(|sealed| Crockford::encode(&sealed))
 }
 
 /// Open and check a link's bytes against `now_s`, for the row `expected_publisher`
@@ -508,7 +508,7 @@ pub fn open_link_field(
     field: &str,
     now_s: u64,
 ) -> Result<MovedRecord, MovedRefusal> {
-    let sealed = decode_bytes(field).map_err(|_| MovedRefusal::CutShort)?;
+    let sealed = Crockford::decode(field).map_err(|_| MovedRefusal::CutShort)?;
     open_link(keys, expected_publisher, &sealed, now_s)
 }
 
