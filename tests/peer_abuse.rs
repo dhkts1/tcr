@@ -741,10 +741,10 @@ async fn twenty_parallel_knocks_with_a_churned_instance_id_leave_one_row() {
 
     let after = node.state();
     assert!(
-        after.pending.len() <= plan::MAX_PENDING_KNOCKS,
+        after.knocks_queued() <= plan::MAX_PENDING_KNOCKS,
         "the queue holds {} rows and the cap is {}; a rotating instance id must not buy a \
          row each",
-        after.pending.len(),
+        after.knocks_queued(),
         plan::MAX_PENDING_KNOCKS
     );
     let visible = after.visible_pending();
@@ -952,9 +952,9 @@ async fn a_valid_message_one_then_silence_holds_no_slot_and_no_queue_row() {
     // two admitted ones took.
     let during = node.state();
     assert!(
-        during.pending.len() <= plan::MAX_PENDING_KNOCKS,
+        during.knocks_queued() <= plan::MAX_PENDING_KNOCKS,
         "three stalled knocks reserved {} rows, and the cap is {}",
-        during.pending.len(),
+        during.knocks_queued(),
         plan::MAX_PENDING_KNOCKS
     );
     assert!(
@@ -970,11 +970,11 @@ async fn a_valid_message_one_then_silence_holds_no_slot_and_no_queue_row() {
     tokio::time::sleep(plan::MESSAGE_1_TIMEOUT + Duration::from_secs(2)).await;
     let after = node.state();
     assert!(
-        after.pending.is_empty(),
+        after.knocks_queued() == 0,
         "every reservation must be released once the handshake misses its deadline; {:?} \
          remain, and each one is an eighth of the pairing queue held by a socket that never \
          said who it was",
-        after.pending
+        after
     );
     assert_eq!(
         with_admission(&context, |guard| guard.live_unauthenticated(LOOPBACK)),
@@ -1114,10 +1114,10 @@ async fn a_knock_frame_at_the_bound_is_taken_and_one_byte_over_gets_nothing() {
     );
     let over_state = over_node.state();
     assert!(
-        over_state.pending.is_empty(),
+        over_state.knocks_queued() == 0,
         "an over-bound knock must leave no row at all, not even the reservation its own \
          handshake took: {:?}",
-        over_state.pending
+        over_state
     );
 
     // Exactly at the bound, on a fresh node with a full bucket.
@@ -1296,9 +1296,9 @@ async fn twenty_parallel_knocks_from_a_muted_address_get_nothing_and_shorten_not
 
     let after = node.state();
     assert!(
-        after.pending.is_empty(),
+        after.knocks_queued() == 0,
         "a muted address must reach no row at all, reservation included: {:?}",
-        after.pending
+        after
     );
     assert_eq!(
         after.muted, before,
@@ -1575,10 +1575,10 @@ fn a_flood_from_a_whole_slash_twenty_four_costs_eight_rows_not_two_hundred_and_f
         hosts - plan::MAX_PENDING_KNOCKS
     );
     assert_eq!(
-        value.pending.len(),
+        value.knocks_queued(),
         plan::MAX_PENDING_KNOCKS,
         "the queue itself holds {} rows and the cap is {}",
-        value.pending.len(),
+        value.knocks_queued(),
         plan::MAX_PENDING_KNOCKS
     );
 }
@@ -1635,10 +1635,10 @@ fn the_ninth_address_is_refused_queue_full_and_the_eight_already_queued_can_stil
          by a queue its row is part of"
     );
     assert_eq!(
-        value.pending.len(),
+        value.knocks_queued(),
         plan::MAX_PENDING_KNOCKS,
         "and the re-knock added nothing: {} rows",
-        value.pending.len()
+        value.knocks_queued()
     );
 }
 
@@ -1696,9 +1696,9 @@ fn eight_stalled_reservations_released_give_the_whole_queue_back() {
         value.release_knock_reservation(addr, now);
     }
     assert!(
-        value.pending.is_empty(),
+        value.knocks_queued() == 0,
         "every stalled reservation must be released; {:?} remain",
-        value.pending
+        value
     );
     assert_eq!(
         value.reserve_knock_slot("192.0.2.200", now),
@@ -1900,7 +1900,7 @@ async fn an_xx_inside_a_window_that_has_run_out_gets_zero_bytes() {
         learned_key: None,
     };
     let mut value = PeerState::default();
-    value.accepted.push(expired);
+    value.open_accepted_window(expired);
     node.write_state(&value);
 
     let written = count_written(addr, &xx_message_1(accepted)).await;
@@ -1920,7 +1920,7 @@ async fn an_xx_inside_a_window_that_has_run_out_gets_zero_bytes() {
         learned_key: None,
     };
     let mut open = PeerState::default();
-    open.accepted.push(live);
+    open.open_accepted_window(live);
     node.write_state(&open);
 
     let still = count_written(addr, &xx_message_1(accepted)).await;
@@ -1954,7 +1954,7 @@ fn reading_the_state_file_drops_a_window_that_has_run_out() {
     let now = pair::now_ms();
 
     let mut value = PeerState::default();
-    value.accepted.push(state::AcceptedInstance {
+    value.open_accepted_window(state::AcceptedInstance {
         instance_id: accepted,
         addr: LOOPBACK.to_string(),
         until_ms: now - 1_000,
@@ -1963,15 +1963,15 @@ fn reading_the_state_file_drops_a_window_that_has_run_out() {
     });
     node.write_state(&value);
     assert!(
-        node.state().accepted.is_empty(),
+        !node.state().holds_accepted_row(LOOPBACK),
         "a window a second past its deadline must not survive the read that every connection \
          makes; it came back as {:?}",
-        node.state().accepted
+        node.state()
     );
 
     // Control: the same file and the same reader keep a window that is open.
     let mut open = PeerState::default();
-    open.accepted.push(state::AcceptedInstance {
+    open.open_accepted_window(state::AcceptedInstance {
         instance_id: accepted,
         addr: LOOPBACK.to_string(),
         until_ms: now + plan::PAIRING_WINDOW_SECS * 1_000,
@@ -1979,9 +1979,8 @@ fn reading_the_state_file_drops_a_window_that_has_run_out() {
         learned_key: None,
     });
     node.write_state(&open);
-    assert_eq!(
-        node.state().accepted.len(),
-        1,
+    assert!(
+        node.state().holds_accepted_row(LOOPBACK),
         "positive control: an open window must survive the same read, or the assertion above \
          is about the reader and not about the deadline"
     );
@@ -2879,7 +2878,7 @@ async fn a_banned_key_is_refused_on_the_enrolment_arm_too() {
     let invite_secret = [3_u8; 32];
 
     let mut file = node.file();
-    file.pending_invites.push(config::PendingInvite {
+    file.add_invite(config::PendingInvite {
         id: 1,
         label: "joiner".to_string(),
         secret: invite_secret,

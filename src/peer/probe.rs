@@ -304,6 +304,73 @@ impl PathTable {
             .min_by(f64::total_cmp)
     }
 
+    /// `row`'s endpoints in the order a dial tries them. The rules are
+    /// [`order_endpoints`]'s.
+    pub fn order_endpoints(&self, row: &PeerRow) -> Vec<Endpoint> {
+        let mut order = row.endpoints.clone();
+        order.sort_by_key(|endpoint| {
+            let stat = self.stat(&row.node, &endpoint.locator);
+            let lossy = u8::from(
+                stat.is_some_and(|stat| stat.loss_pct > f64::from(self.config.max_loss_pct)),
+            );
+            let rtt = stat.map_or(u32::MAX, PathStat::rtt_key);
+            (
+                kind_rank(endpoint, &self.config),
+                source_rank(endpoint),
+                lossy,
+                rtt,
+                std::cmp::Reverse(endpoint.observed_at_ms),
+            )
+        });
+        order
+    }
+
+    /// The sort key for `peer` as a carrier. The rules are [`carrier_key`]'s.
+    pub fn carrier_key(
+        &self,
+        peer: &PeerId,
+        last_seen_ms: Option<i64>,
+    ) -> (u8, u32, std::cmp::Reverse<i64>) {
+        let best = self
+            .stats
+            .iter()
+            .filter(|stat| &stat.peer == peer)
+            .min_by_key(|stat| {
+                (
+                    stat.loss_pct > f64::from(self.config.max_loss_pct),
+                    stat.rtt_key(),
+                )
+            });
+        let lossy =
+            u8::from(best.is_some_and(|stat| stat.loss_pct > f64::from(self.config.max_loss_pct)));
+        let rtt = best.map_or(u32::MAX, PathStat::rtt_key);
+        (
+            lossy,
+            rtt,
+            std::cmp::Reverse(last_seen_ms.unwrap_or(i64::MIN)),
+        )
+    }
+
+    /// [`Self::carrier_key`] behind the operator's `via_allow` list: a Mac the
+    /// list leaves out sorts after every Mac it names, and an empty list names
+    /// none, so it leaves out none.
+    pub fn carrier_rank(
+        &self,
+        peer: &PeerId,
+        last_seen_ms: Option<i64>,
+    ) -> (u8, (u8, u32, std::cmp::Reverse<i64>)) {
+        (
+            u8::from(!self.config.via_allow.is_empty() && !self.config.via_allow.contains(peer)),
+            self.carrier_key(peer, last_seen_ms),
+        )
+    }
+
+    /// Write the measured path costs into the state file at `state_path`,
+    /// keeping every other key. See [`crate::peer::state::save_paths`].
+    pub fn save(&self, state_path: &std::path::Path) -> Result<()> {
+        crate::peer::state::save_paths(state_path, &self.stats)
+    }
+
     /// Fold one probe's answer into the EWMA for that path.
     ///
     /// Returns whether anything was recorded: [`ProbeOutcome::NotSupported`]
@@ -433,21 +500,7 @@ pub fn with_table<R>(apply: impl FnOnce(&mut PathTable) -> R) -> Result<R> {
 /// 5. **Newest observation first**, the rule [`PeerRow::observe_endpoint`]
 ///    already writes the row in.
 pub fn order_endpoints(row: &PeerRow, table: &PathTable) -> Vec<Endpoint> {
-    let mut order = row.endpoints.clone();
-    order.sort_by_key(|endpoint| {
-        let stat = table.stat(&row.node, &endpoint.locator);
-        let lossy =
-            u8::from(stat.is_some_and(|stat| stat.loss_pct > f64::from(table.config.max_loss_pct)));
-        let rtt = stat.map_or(u32::MAX, PathStat::rtt_key);
-        (
-            kind_rank(endpoint, &table.config),
-            source_rank(endpoint),
-            lossy,
-            rtt,
-            std::cmp::Reverse(endpoint.observed_at_ms),
-        )
-    });
-    order
+    table.order_endpoints(row)
 }
 
 /// Key 2 of [`order_endpoints`]: how much this node's own evidence backs the
@@ -600,24 +653,7 @@ pub fn carrier_key(
     last_seen_ms: Option<i64>,
     table: &PathTable,
 ) -> (u8, u32, std::cmp::Reverse<i64>) {
-    let best = table
-        .stats
-        .iter()
-        .filter(|stat| &stat.peer == peer)
-        .min_by_key(|stat| {
-            (
-                stat.loss_pct > f64::from(table.config.max_loss_pct),
-                stat.rtt_key(),
-            )
-        });
-    let lossy =
-        u8::from(best.is_some_and(|stat| stat.loss_pct > f64::from(table.config.max_loss_pct)));
-    let rtt = best.map_or(u32::MAX, PathStat::rtt_key);
-    (
-        lossy,
-        rtt,
-        std::cmp::Reverse(last_seen_ms.unwrap_or(i64::MIN)),
-    )
+    table.carrier_key(peer, last_seen_ms)
 }
 
 /// [`carrier_key`] against the process-local table, for a caller that holds no

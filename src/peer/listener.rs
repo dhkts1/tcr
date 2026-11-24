@@ -534,14 +534,11 @@ pub async fn serve_one<S>(
         // what is broken. Two instances rather than one so that a flood
         // of anonymous refusals cannot silence a real peer's first
         // line.
-        let mut guard = lock_admission(&context.admission);
-        let log = if failure.authenticated {
-            &mut guard.authenticated_refusals
-        } else {
-            &mut guard.unauthenticated_refusals
-        };
-        let admitted = log.admit(&addr, now_ms());
-        drop(guard);
+        let admitted = lock_admission(&context.admission).admit_refusal(
+            failure.authenticated,
+            &addr,
+            now_ms(),
+        );
         let Some(suppressed) = admitted else {
             return;
         };
@@ -792,6 +789,85 @@ impl Admission {
                 .min(KNOCK_BURST),
         }
     }
+
+    /// Whether a refused connection from `addr` earns a log line, through the
+    /// refusal log for its side of the handshake. See [`RefusalLog::admit`].
+    fn admit_refusal(&mut self, authenticated: bool, addr: &str, now_ms: i64) -> Option<u64> {
+        let log = if authenticated {
+            &mut self.authenticated_refusals
+        } else {
+            &mut self.unauthenticated_refusals
+        };
+        log.admit(addr, now_ms)
+    }
+
+    /// Count one more unauthenticated socket from `addr`, or report which cap
+    /// refused it. [`SocketSlot::acquire`] is the one caller.
+    fn take_socket_slot(
+        &mut self,
+        addr: &str,
+        allowance: (usize, usize),
+    ) -> Result<(), SocketRefusal> {
+        let (total_allowed, per_address_allowed) = allowance;
+        if self.live_total >= total_allowed {
+            return Err(SocketRefusal::NodeFull {
+                live: self.live_total,
+                allowed: total_allowed,
+            });
+        }
+        let per_address = self.live_per_address.get(addr).copied().unwrap_or(0);
+        if per_address >= per_address_allowed {
+            return Err(SocketRefusal::AddressFull {
+                live: per_address,
+                allowed: per_address_allowed,
+            });
+        }
+        self.live_total += 1;
+        *self.live_per_address.entry(addr.to_string()).or_insert(0) += 1;
+        Ok(())
+    }
+
+    /// Give back a slot [`Self::take_socket_slot`] counted.
+    fn release_socket_slot(&mut self, addr: &str) {
+        self.live_total = self.live_total.saturating_sub(1);
+        if let Some(count) = self.live_per_address.get_mut(addr) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.live_per_address.remove(addr);
+            }
+        }
+    }
+
+    /// Mark `peer` as punching. `false` when it already is.
+    fn start_punch(&mut self, peer: PeerId) -> bool {
+        self.punching.insert(peer)
+    }
+
+    /// Give back the punch [`Self::start_punch`] marked.
+    fn end_punch(&mut self, peer: &PeerId) {
+        self.punching.remove(peer);
+    }
+
+    /// Count one more headerless session for `peer`, or report how many it
+    /// already holds when that is [`MAX_HEADERLESS_PER_PEER`].
+    fn take_headerless(&mut self, peer: PeerId) -> Result<(), usize> {
+        let live = self.headerless.get(&peer).copied().unwrap_or(0);
+        if live >= MAX_HEADERLESS_PER_PEER {
+            return Err(live);
+        }
+        *self.headerless.entry(peer).or_insert(0) += 1;
+        Ok(())
+    }
+
+    /// Give back a session [`Self::take_headerless`] counted.
+    fn release_headerless(&mut self, peer: &PeerId) {
+        if let Some(count) = self.headerless.get_mut(peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.headerless.remove(peer);
+            }
+        }
+    }
 }
 
 /// How many whole [`KNOCK_INTERVAL_MS`] intervals have passed. Saturating and
@@ -823,24 +899,7 @@ impl SocketSlot {
         addr: &str,
         allowance: (usize, usize),
     ) -> Result<Self, SocketRefusal> {
-        let (total_allowed, per_address_allowed) = allowance;
-        let mut guard = lock_admission(admission);
-        if guard.live_total >= total_allowed {
-            return Err(SocketRefusal::NodeFull {
-                live: guard.live_total,
-                allowed: total_allowed,
-            });
-        }
-        let per_address = guard.live_per_address.get(addr).copied().unwrap_or(0);
-        if per_address >= per_address_allowed {
-            return Err(SocketRefusal::AddressFull {
-                live: per_address,
-                allowed: per_address_allowed,
-            });
-        }
-        guard.live_total += 1;
-        *guard.live_per_address.entry(addr.to_string()).or_insert(0) += 1;
-        drop(guard);
+        lock_admission(admission).take_socket_slot(addr, allowance)?;
         Ok(Self {
             admission: Arc::clone(admission),
             addr: addr.to_string(),
@@ -850,14 +909,7 @@ impl SocketSlot {
 
 impl Drop for SocketSlot {
     fn drop(&mut self) {
-        let mut guard = lock_admission(&self.admission);
-        guard.live_total = guard.live_total.saturating_sub(1);
-        if let Some(count) = guard.live_per_address.get_mut(&self.addr) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                guard.live_per_address.remove(&self.addr);
-            }
-        }
+        lock_admission(&self.admission).release_socket_slot(&self.addr);
     }
 }
 
@@ -887,11 +939,9 @@ impl PunchInFlight {
     /// and waiting out a slot boundary would measure the network rather than
     /// the bound.
     pub fn acquire(admission: &Arc<Mutex<Admission>>, peer: PeerId) -> Option<Self> {
-        let mut guard = lock_admission(admission);
-        if !guard.punching.insert(peer) {
+        if !lock_admission(admission).start_punch(peer) {
             return None;
         }
-        drop(guard);
         Some(Self {
             admission: Arc::clone(admission),
             peer,
@@ -901,7 +951,7 @@ impl PunchInFlight {
 
 impl Drop for PunchInFlight {
     fn drop(&mut self) {
-        lock_admission(&self.admission).punching.remove(&self.peer);
+        lock_admission(&self.admission).end_punch(&self.peer);
     }
 }
 
@@ -925,13 +975,7 @@ impl HeaderlessSession {
     /// drive the cap without opening [`MAX_HEADERLESS_PER_PEER`] real
     /// handshakes.
     pub fn acquire(admission: &Arc<Mutex<Admission>>, peer: PeerId) -> Result<Self, usize> {
-        let mut guard = lock_admission(admission);
-        let live = guard.headerless.get(&peer).copied().unwrap_or(0);
-        if live >= MAX_HEADERLESS_PER_PEER {
-            return Err(live);
-        }
-        *guard.headerless.entry(peer).or_insert(0) += 1;
-        drop(guard);
+        lock_admission(admission).take_headerless(peer)?;
         Ok(Self {
             admission: Arc::clone(admission),
             peer,
@@ -941,13 +985,7 @@ impl HeaderlessSession {
 
 impl Drop for HeaderlessSession {
     fn drop(&mut self) {
-        let mut guard = lock_admission(&self.admission);
-        if let Some(count) = guard.headerless.get_mut(&self.peer) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                guard.headerless.remove(&self.peer);
-            }
-        }
+        lock_admission(&self.admission).release_headerless(&self.peer);
     }
 }
 
@@ -2091,7 +2129,7 @@ where
                     )
                     .map_err(anyhow::Error::new)?;
                 crate::peer::state::save(&state_path, &peer_state)?;
-                Ok(peer_state.pending.len())
+                Ok(peer_state.knocks_queued())
             }
         }),
     )
@@ -2216,14 +2254,7 @@ async fn record_pairing_key(
         move || {
             let _lock = config::FileLock::acquire(&state_path)?;
             let mut peer_state = crate::peer::state::load(&state_path, now_ms)?;
-            let mut touched = false;
-            for window in &mut peer_state.accepted {
-                if window.addr == addr {
-                    window.learned_key = Some(key);
-                    touched = true;
-                }
-            }
-            if !touched {
+            if !peer_state.learn_pairing_key(&addr, key) {
                 return Ok(());
             }
             crate::peer::state::save(&state_path, &peer_state)
@@ -4066,12 +4097,7 @@ pub fn hello_for_peer(facts: &NodeFacts, grants: &ControlGrants) -> Hello {
 /// trial. An expired row is not offered: its deadline is absolute, so a clock
 /// that moved is not a second chance.
 pub fn outstanding_secrets(file: &PeerFile) -> Vec<[u8; KEY_BYTES]> {
-    let now = now_ms();
-    file.pending_invites
-        .iter()
-        .filter(|invite| invite.uses_left > 0 && invite.expires_at_ms > now)
-        .map(|invite| invite.secret)
-        .collect()
+    file.outstanding_secrets(now_ms())
 }
 
 /// Unix milliseconds, or 0 if the clock is before the epoch.

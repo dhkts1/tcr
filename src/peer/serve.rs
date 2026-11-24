@@ -2125,7 +2125,7 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
                         );
                     }
                     let state_path = peer_state_path(store.path());
-                    if let Err(err) = crate::peer::state::save_paths(&state_path, &table.stats) {
+                    if let Err(err) = table.save(&state_path) {
                         tracing::warn!(
                             peer = %peer.display(),
                             error = %err,
@@ -2883,21 +2883,14 @@ pub fn forwarders_for(target: &PeerId, store: &PeerStore) -> Vec<PeerId> {
             .iter()
             .find(|(peer, _)| *peer == row.node)
             .map(|(_, at)| *at);
-        crate::peer::probe::with_table(|table| {
-            (
-                u8::from(
-                    !table.config.via_allow.is_empty()
-                        && !table.config.via_allow.contains(&row.node),
-                ),
-                crate::peer::probe::carrier_key(&row.node, seen, table),
-            )
-        })
-        .unwrap_or_else(|_| {
-            (
-                0,
-                (0, u32::MAX, std::cmp::Reverse(seen.unwrap_or(i64::MIN))),
-            )
-        })
+        crate::peer::probe::with_table(|table| table.carrier_rank(&row.node, seen)).unwrap_or_else(
+            |_| {
+                (
+                    0,
+                    (0, u32::MAX, std::cmp::Reverse(seen.unwrap_or(i64::MIN))),
+                )
+            },
+        )
     };
     chosen.sort_by_key(|row| order(row));
     chosen.into_iter().map(|row| row.node).collect()

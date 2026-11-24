@@ -318,9 +318,9 @@ async fn a_two_process_join_leaves_a_pinned_row_on_both_sides() {
     );
     // And the invite is spent in the same write, so a one-use key is one use.
     assert!(
-        registrar_file.pending_invites.is_empty(),
-        "a one-use invite must be gone once it has admitted a machine, and {} remain",
-        registrar_file.pending_invites.len()
+        registrar_file.invite(invite.id).is_none(),
+        "a one-use invite must be gone once it has admitted a machine, and it remains as {:?}",
+        registrar_file.invite(invite.id)
     );
 
     // The joiner's half.
@@ -455,7 +455,7 @@ fn two_concurrent_joiners_on_one_use_invite_leave_exactly_one_ok() {
         node.write_file(&file);
 
         let store = config::PeerStore::open(&node.peers).expect("open the store");
-        let (_invite, token) = pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1, None)
+        let (invite, token) = pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1, None)
             .expect("mint a one-use invite");
 
         // Two joiners with DIFFERENT static keys, which is the case that
@@ -513,7 +513,7 @@ fn two_concurrent_joiners_on_one_use_invite_leave_exactly_one_ok() {
             after.peers.len()
         );
         assert!(
-            after.pending_invites.is_empty(),
+            after.invite(invite.id).is_none(),
             "trial {trial}: the spent invite is still on disk, which is still a live PSK"
         );
 
@@ -544,21 +544,20 @@ async fn a_knock_queues_one_row_and_earns_one_ack_byte() {
         .await
         .expect("a knock at a node with no network key is taken");
 
-    let pending = node.state().pending;
+    let after = node.state();
     assert_eq!(
-        pending.len(),
+        after.knocks_queued(),
         1,
         "one knock is one pending row, and this made {}",
-        pending.len()
+        after.knocks_queued()
     );
-    assert_eq!(pending[0].instance_id, instance(0x41));
-    assert_eq!(pending[0].proposed_name.as_deref(), Some("studio-mac"));
-    assert_eq!(pending[0].wire_version, tcr_peer_wire::PROTO_VERSION);
-    assert_eq!(
-        pending[0].addr, "127.0.0.1",
+    let row = after.find_pending("127.0.0.1").expect(
         "the row is keyed on the IP with the ephemeral source port dropped, or the \
-         eight-row cap would bound knocks rather than machines"
+         eight-row cap would bound knocks rather than machines",
     );
+    assert_eq!(row.instance_id, instance(0x41));
+    assert_eq!(row.proposed_name.as_deref(), Some("studio-mac"));
+    assert_eq!(row.wire_version, tcr_peer_wire::PROTO_VERSION);
 
     // Nothing was pinned and nothing was granted: a knock is a row.
     assert!(
@@ -586,17 +585,17 @@ async fn a_rotating_instance_id_from_one_address_is_one_row() {
             .expect("each knock is inside the burst");
     }
 
-    let pending = node.state().pending;
+    let after = node.state();
     assert_eq!(
-        pending.len(),
+        after.knocks_queued(),
         1,
         "three knocks from one address under three ids must coalesce into one row, and \
          they made {}",
-        pending.len()
+        after.knocks_queued()
     );
     assert_eq!(
-        pending[0].instance_id,
-        instance(0x53),
+        after.find_pending("127.0.0.1").map(|row| row.instance_id),
+        Some(instance(0x53)),
         "the row shows the id that knocked LAST, so an operator accepting it approves the \
          one that is actually asking"
     );
@@ -621,10 +620,17 @@ async fn a_hostile_knock_name_is_dropped_and_the_row_survives() {
         .await
         .expect("the knock itself is fine; only its name is not");
 
-    let pending = node.state().pending;
-    assert_eq!(pending.len(), 1, "the row survives a name it cannot render");
+    let after = node.state();
     assert_eq!(
-        pending[0].proposed_name, None,
+        after.knocks_queued(),
+        1,
+        "the row survives a name it cannot render"
+    );
+    assert_eq!(
+        after
+            .find_pending("127.0.0.1")
+            .map(|row| row.proposed_name.clone()),
+        Some(None),
         "a name this node will not render is no name at all: the row shows its address"
     );
 }
@@ -732,7 +738,7 @@ async fn a_knock_from_a_muted_address_gets_zero_bytes() {
     value.mute("127.0.0.1", pair::now_ms());
     node.write_state(&value);
     assert!(
-        node.state().pending.is_empty(),
+        node.state().knocks_queued() == 0,
         "Ignore drops the row it was pressed on"
     );
 
@@ -742,9 +748,9 @@ async fn a_knock_from_a_muted_address_gets_zero_bytes() {
         "a knock from a muted address must not earn an ack"
     );
     assert!(
-        node.state().pending.is_empty(),
+        node.state().knocks_queued() == 0,
         "and it must not earn a row either: {:?}",
-        node.state().pending
+        node.state()
     );
 
     // The byte count, on a fresh connection: zero, or the mute cost the
@@ -859,9 +865,9 @@ async fn a_banned_address_gets_zero_bytes_before_any_frame() {
     let refused = knock_at(addr, instance(0xA1), None).await;
     assert!(refused.is_err(), "a blocked address must earn no ack");
     assert!(
-        node.state().pending.is_empty(),
+        node.state().knocks_queued() == 0,
         "and no row: {:?}",
-        node.state().pending
+        node.state()
     );
 
     // Unblocking restores it, so the block above is a block and not a broken
@@ -872,7 +878,7 @@ async fn a_banned_address_gets_zero_bytes_before_any_frame() {
     knock_at(addr, instance(0xA2), None)
         .await
         .expect("positive control: unblocking lets the same knock through");
-    assert_eq!(node.state().pending.len(), 1);
+    assert_eq!(node.state().knocks_queued(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -942,7 +948,7 @@ fn the_ninth_outstanding_knock_is_refused() {
             "row {n} is a new address and must be a new row"
         );
     }
-    assert_eq!(value.pending.len(), state::MAX_PENDING_KNOCKS);
+    assert_eq!(value.knocks_queued(), state::MAX_PENDING_KNOCKS);
 
     let refused = value.record_knock("192.0.2.99", instance(0xFF), None, 1, None, 1_000);
     assert!(
@@ -950,7 +956,7 @@ fn the_ninth_outstanding_knock_is_refused() {
         "the ninth outstanding knock must be refused, and this one returned {refused:?}"
     );
     assert_eq!(
-        value.pending.len(),
+        value.knocks_queued(),
         state::MAX_PENDING_KNOCKS,
         "a refused knock must leave no row"
     );
@@ -1012,7 +1018,7 @@ fn eight_concurrent_reservations_at_a_seven_row_queue_leave_exactly_eight_never_
             .expect("seed row");
     }
     assert_eq!(
-        seeded.pending.len(),
+        seeded.knocks_queued(),
         7,
         "seed exactly seven rows before the race"
     );
@@ -1063,10 +1069,10 @@ fn eight_concurrent_reservations_at_a_seven_row_queue_leave_exactly_eight_never_
 
     let after = node.state();
     assert_eq!(
-        after.pending.len(),
+        after.knocks_queued(),
         state::MAX_PENDING_KNOCKS,
         "the queue must leave exactly eight rows, never nine, after the race: {:?}",
-        after.pending.iter().map(|k| &k.addr).collect::<Vec<_>>()
+        after
     );
 }
 
@@ -1116,7 +1122,7 @@ async fn the_ninth_outstanding_knock_writes_zero_bytes_on_the_wire() {
 
     let after = node.state();
     assert_eq!(
-        after.pending.len(),
+        after.knocks_queued(),
         state::MAX_PENDING_KNOCKS,
         "the refused knock must leave no row"
     );
@@ -1150,8 +1156,8 @@ fn a_knock_expires_after_ten_minutes() {
         .expect("re-knocking refreshes");
     let dropped = value.expire(1_000 + state::KNOCK_TTL_MS + 1);
     assert_eq!(dropped, 1, "exactly the silent row goes");
-    assert_eq!(value.pending.len(), 1);
-    assert_eq!(value.pending[0].addr, "192.0.2.7");
+    assert_eq!(value.knocks_queued(), 1);
+    assert!(value.find_pending("192.0.2.7").is_some());
 }
 
 /// **A mute lifts on its own after an hour; a ban does not lift at all.**
@@ -1547,9 +1553,9 @@ async fn a_knock_without_the_network_key_gets_zero_bytes() {
         "a knock with no network key must earn nothing at a node that requires one"
     );
     assert!(
-        node.state().pending.is_empty(),
+        node.state().knocks_queued() == 0,
         "and it must reach no row: {:?}",
-        node.state().pending
+        node.state()
     );
 
     // A knock under the WRONG key fails the same way, which is the case that
@@ -1559,14 +1565,14 @@ async fn a_knock_without_the_network_key_gets_zero_bytes() {
         refused.is_err(),
         "a knock under another network key must earn nothing either"
     );
-    assert!(node.state().pending.is_empty());
+    assert!(node.state().knocks_queued() == 0);
 
     // The positive control: with the right key, the same knock is taken.
     knock_at_with_key(addr, instance(0xC3), None, Some(key.as_bytes()))
         .await
         .expect("positive control: the right network key is admitted");
     assert_eq!(
-        node.state().pending.len(),
+        node.state().knocks_queued(),
         1,
         "the refusals above are the key check and not a listener that takes no knocks"
     );
@@ -1618,7 +1624,7 @@ async fn a_knock_whose_message_1_does_not_validate_reserves_nothing() {
          file, and nothing here was ever entitled to one"
     );
     assert!(
-        node.state().pending.is_empty(),
+        node.state().knocks_queued() == 0,
         "no row either, which was true before this fix as well"
     );
 
@@ -1634,7 +1640,7 @@ async fn a_knock_whose_message_1_does_not_validate_reserves_nothing() {
         "a knock that validates does write the state file"
     );
     assert_eq!(
-        node.state().pending.len(),
+        node.state().knocks_queued(),
         1,
         "and it leaves exactly one row for the operator"
     );
@@ -1666,7 +1672,7 @@ fn a_reservation_placeholder_is_counted_but_never_rendered() {
         "the reservation is created"
     );
     assert_eq!(
-        value.pending.len(),
+        value.knocks_queued(),
         1,
         "and the listener counts it, which is the whole reason it exists"
     );
@@ -1689,7 +1695,7 @@ fn a_reservation_placeholder_is_counted_but_never_rendered() {
         )
         .expect("the knock records onto the reserved row");
     assert_eq!(
-        value.pending.len(),
+        value.knocks_queued(),
         1,
         "it coalesced onto the reservation rather than adding a second row"
     );
@@ -1716,7 +1722,7 @@ async fn a_keyed_knock_at_a_keyless_node_is_refused() {
         refused.is_err(),
         "a node with no network key has nothing to verify a keyed knock against"
     );
-    assert!(node.state().pending.is_empty());
+    assert!(node.state().knocks_queued() == 0);
 
     knock_at(addr, instance(0xD2), None)
         .await
@@ -2178,7 +2184,7 @@ fn the_approval_verbs_and_ls_json_agree_about_one_pending_row() {
     assert!(out.contains("peer accept: ok"), "{out}");
     let after = state::load(&state_file, pair::now_ms()).expect("the state reads");
     assert!(
-        after.pending.is_empty(),
+        after.knocks_queued() == 0,
         "accepting a row consumes it: the operator has decided"
     );
     assert!(
@@ -2657,10 +2663,10 @@ async fn a_stalled_knock_after_message_1_is_bounded_and_releases_its_reservation
 
     let state = node.state();
     assert!(
-        state.pending.is_empty(),
+        state.knocks_queued() == 0,
         "a stalled knock handshake must release the reservation it took, not leave a \
          placeholder pending row behind: {:?}",
-        state.pending
+        state
     );
 }
 
@@ -3603,20 +3609,20 @@ fn a_reservation_placeholder_is_never_selected() {
     assert!(
         state.find_pending("192.0.2.9").is_none(),
         "a placeholder is not a pairing request: {:?}",
-        state.pending
+        state
     );
     assert!(
         state.accept_knock("192.0.2.9", reserved_at, 120).is_none(),
         "and no window opens for one: {:?}",
-        state.accepted
+        state
     );
     assert!(
-        state.accepted.is_empty(),
+        !state.holds_accepted_row("192.0.2.9"),
         "nothing was admitted: {:?}",
-        state.accepted
+        state
     );
     assert_eq!(
-        state.pending.len(),
+        state.knocks_queued(),
         1,
         "the reservation still holds its slot, which is what it is for"
     );
@@ -3636,7 +3642,7 @@ fn a_reservation_placeholder_is_never_selected() {
 fn a_learned_key_survives_the_window_it_was_learned_in() {
     let mut state = PeerState::default();
     let learned = PeerId([0x44; 32]);
-    state.accepted.push(state::AcceptedInstance {
+    state.open_accepted_window(state::AcceptedInstance {
         instance_id: InstanceId([0x01; INSTANCE_ID_BYTES]),
         addr: "192.0.2.30".to_string(),
         until_ms: 2_000,
@@ -3645,7 +3651,7 @@ fn a_learned_key_survives_the_window_it_was_learned_in() {
     });
     // A window with no key at all: it goes, which is what keeps the kept rows
     // from being "expire stopped working".
-    state.accepted.push(state::AcceptedInstance {
+    state.open_accepted_window(state::AcceptedInstance {
         instance_id: InstanceId([0x02; INSTANCE_ID_BYTES]),
         addr: "192.0.2.31".to_string(),
         until_ms: 2_000,
@@ -3660,7 +3666,7 @@ fn a_learned_key_survives_the_window_it_was_learned_in() {
         state.key_learned_at("192.0.2.30"),
         Some(learned),
         "the key that address revealed is still readable: {:?}",
-        state.accepted
+        state
     );
     assert_eq!(
         state.key_learned_at("192.0.2.31"),
@@ -3713,7 +3719,7 @@ fn an_open_window_does_not_evict_an_extra_learned_key() {
     // oldest is first, so "the oldest went" is visible by name.
     for nth in 0..=state::MAX_LEARNED_KEYS {
         let byte = u8::try_from(nth).expect("the bound is well under 255");
-        value.accepted.push(state::AcceptedInstance {
+        value.open_accepted_window(state::AcceptedInstance {
             instance_id: InstanceId([byte; INSTANCE_ID_BYTES]),
             addr: format!("10.0.0.{byte}"),
             opened_at_ms: now - 600_000 + i64::from(byte),
@@ -3722,7 +3728,7 @@ fn an_open_window_does_not_evict_an_extra_learned_key() {
         });
     }
     // And one window still OPEN, which is what used to cost a key.
-    value.accepted.push(state::AcceptedInstance {
+    value.open_accepted_window(state::AcceptedInstance {
         instance_id: InstanceId([200_u8; INSTANCE_ID_BYTES]),
         addr: "10.0.0.200".to_string(),
         opened_at_ms: now - 1_000,
@@ -3732,20 +3738,13 @@ fn an_open_window_does_not_evict_an_extra_learned_key() {
 
     value.expire(now);
 
-    let kept_keys = value
-        .accepted
-        .iter()
-        .filter(|window| window.learned_key.is_some())
+    let kept_keys = (0..=state::MAX_LEARNED_KEYS)
+        .filter(|nth| value.key_learned_at(&format!("10.0.0.{nth}")).is_some())
         .count();
     assert_eq!(
         kept_keys,
         state::MAX_LEARNED_KEYS,
-        "one row over the bound drops exactly one row, whatever else is open: {:?}",
-        value
-            .accepted
-            .iter()
-            .map(|window| (window.addr.clone(), window.learned_key.is_some()))
-            .collect::<Vec<_>>()
+        "one row over the bound drops exactly one row, whatever else is open: {value:?}"
     );
     assert!(
         value.key_learned_at("10.0.0.1").is_some(),
@@ -3756,10 +3755,7 @@ fn an_open_window_does_not_evict_an_extra_learned_key() {
         "while the oldest is the one that went, which is the rule the bound states"
     );
     assert!(
-        value
-            .accepted
-            .iter()
-            .any(|window| window.addr == "10.0.0.200"),
+        value.holds_accepted_row("10.0.0.200"),
         "the open window is untouched: it is not a learned key and never was"
     );
 }
@@ -3836,10 +3832,10 @@ fn a_concurrent_revoke_and_enrolment_never_resurrect_or_drop_a_row() {
 
         let after = node.file();
         assert!(
-            after.pending_invites.iter().all(|row| row.id != invite.id),
+            after.invite(invite.id).is_none(),
             "trial {trial}: the invite came back after a concurrent revoke and enrolment \
-             raced (revoked={revoked:?}), pending_invites={:?}",
-            after.pending_invites
+             raced (revoked={revoked:?}), as {:?}",
+            after.invite(invite.id)
         );
 
         if let Ok(row) = &enrolled {
@@ -4245,9 +4241,12 @@ fn a_second_knock_replaces_the_port_the_row_was_holding() {
         .record_knock("192.0.2.31", instance(0x81), None, 1, Some(7788), 2_000)
         .expect("the second knock coalesces onto the same address");
 
-    assert_eq!(value.pending.len(), 1, "one address is one row");
+    assert_eq!(value.knocks_queued(), 1, "one address is one row");
     assert_eq!(
-        value.pending[0].dial_address(),
+        value
+            .find_pending("192.0.2.31")
+            .expect("the row")
+            .dial_address(),
         "192.0.2.31:7788",
         "the newest knock's port wins: the old one is not being listened on"
     );
@@ -4257,7 +4256,10 @@ fn a_second_knock_replaces_the_port_the_row_was_holding() {
         .record_knock("192.0.2.31", instance(0x81), None, 1, None, 3_000)
         .expect("a third knock coalesces too");
     assert_eq!(
-        value.pending[0].dial_address(),
+        value
+            .find_pending("192.0.2.31")
+            .expect("the row")
+            .dial_address(),
         "192.0.2.31",
         "a knock that names no port must not be answered at a port an older knock named"
     );
@@ -4272,7 +4274,10 @@ fn the_dial_address_a_row_is_printed_under_selects_that_row() {
         .record_knock("192.0.2.32", instance(0x82), None, 1, Some(7766), 1_000)
         .expect("the knock records");
 
-    let printed = value.pending[0].dial_address();
+    let printed = value
+        .find_pending("192.0.2.32")
+        .expect("the row")
+        .dial_address();
     assert_eq!(printed, "192.0.2.32:7766");
     assert!(
         value.find_pending(&printed).is_some(),
@@ -4292,7 +4297,13 @@ fn an_ipv6_row_brackets_its_host() {
     value
         .record_knock("2001:db8::1", instance(0x83), None, 1, Some(7766), 1_000)
         .expect("the knock records");
-    assert_eq!(value.pending[0].dial_address(), "[2001:db8::1]:7766");
+    assert_eq!(
+        value
+            .find_pending("2001:db8::1")
+            .expect("the row")
+            .dial_address(),
+        "[2001:db8::1]:7766"
+    );
 }
 
 /// **`tcr peer pending` and `tcr peer ls --json` say the same thing**, through

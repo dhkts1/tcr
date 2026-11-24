@@ -2222,11 +2222,10 @@ pub fn set_internet_via(
 
     let _lock = config::FileLock::acquire(peers_path)?;
     let mut file = config::read_or_default(peers_path)?;
-    file.internet = on;
+    let listen_port = file.switch_internet(on);
     config::save(peers_path, &file)
         .with_context(|| format!("peer internet: could not write {}", peers_path.display()))?;
 
-    let listen_port = file.listen.map(|addr| addr.port());
     if on {
         return Ok(InternetSwitch::On { listen_port });
     }

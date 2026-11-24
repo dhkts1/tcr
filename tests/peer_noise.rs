@@ -1201,11 +1201,9 @@ fn opening_the_window_keeps_every_other_key_in_the_state_file() {
 
     let dir = tempfile::tempdir().expect("a temp dir");
     let state = dir.path().join("peer-state.json");
-    let mut seeded = state::PeerState::default();
-    seeded.rest.insert(
-        "somethingPhaseFourAdds".to_string(),
-        serde_json::json!({"keep": "me"}),
-    );
+    let seeded: state::PeerState =
+        serde_json::from_value(serde_json::json!({"somethingPhaseFourAdds": {"keep": "me"}}))
+            .expect("a state with one key this build does not know");
     state::save(&state, &seeded).expect("a state file written by another phase");
 
     pair::open_pairing_window(&state, 5_000).expect("the window opens");
@@ -1823,7 +1821,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
 
     // Item 3: `--uses` is decremented, and a one-use invite is gone.
     assert!(
-        registrar_file.pending_invites.is_empty(),
+        registrar_file.invite(invite.id).is_none(),
         "a one-use invite must be deleted when it is spent, not left on disk with \
          usesLeft: 0: a spent row is still a PSK in a file"
     );
@@ -1936,12 +1934,11 @@ fn a_hostile_enrolment_label_is_refused_and_spends_nothing() {
     let file = peer_config::read_or_default(&peers).expect("the file reads");
     assert!(file.peers.is_empty(), "nothing is pinned on a refusal");
     assert_eq!(
-        file.pending_invites.len(),
-        1,
+        file.invite(invite.id).map(|row| row.uses_left),
+        Some(1),
         "and the invite is untouched: a refused joiner must not be able to spend an \
          operator's one-use key"
     );
-    assert_eq!(file.pending_invites[0].uses_left, 1);
 }
 
 // ---------------------------------------------------------------------------

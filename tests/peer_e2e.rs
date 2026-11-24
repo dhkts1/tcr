@@ -370,14 +370,15 @@ impl Mac {
                  hands them out.",
                 self.label
             );
-            self.peer_port = free_loopback_port();
-            self.rewrite_listen_port();
+            self.move_listen_port(free_loopback_port());
         }
     }
 
-    /// Point the peers file at [`Self::peer_port`], leaving every other key,
-    /// including any pinned rows a previous boot wrote, exactly as it was.
-    fn rewrite_listen_port(&self) {
+    /// Move this Mac's peer listener to `port`: point the peers file at it,
+    /// leaving every other key, including any pinned rows a previous boot
+    /// wrote, exactly as it was.
+    fn move_listen_port(&mut self, port: u16) {
+        self.peer_port = port;
         let body = std::fs::read_to_string(&self.peers).expect("the peers file reads back");
         let mut file: serde_json::Value =
             serde_json::from_str(&body).expect("the peers file is JSON");
@@ -528,15 +529,26 @@ impl Mac {
         }
     }
 
-    /// Run `tcr peer <args> --peers <this Mac's peers file>` and hand back
-    /// (stdout, stderr, success).
-    fn peer(&self, args: &[&str]) -> (String, String, bool) {
+    /// `tcr peer <args> --peers <this Mac's peers file>`, not yet run.
+    fn peer_command(&self, args: &[&str]) -> Command {
         let mut command = self.command();
         command
             .arg("peer")
             .args(args)
             .args(["--peers", self.peers.to_str().expect("a utf-8 peers path")]);
-        let out = command
+        command
+    }
+
+    /// A file in this Mac's home directory.
+    fn home_file(&self, name: &str) -> PathBuf {
+        self.home.path().join(name)
+    }
+
+    /// Run `tcr peer <args> --peers <this Mac's peers file>` and hand back
+    /// (stdout, stderr, success).
+    fn peer(&self, args: &[&str]) -> (String, String, bool) {
+        let out = self
+            .peer_command(args)
             .output()
             .unwrap_or_else(|err| panic!("{}: spawning `tcr peer {args:?}`: {err}", self.label));
         (
@@ -1298,13 +1310,11 @@ impl PairProcess {
 }
 
 fn spawn_pair(mac: &Mac, addr: &str) -> PairProcess {
-    let out = mac.home.path().join("pair.out");
+    let out = mac.home_file("pair.out");
     let file = std::fs::File::create(&out).expect("the pair log opens");
     let err = file.try_clone().expect("the pair log clones for stderr");
-    let mut command = mac.command();
+    let mut command = mac.peer_command(&["pair", addr]);
     command
-        .args(["peer", "pair", addr])
-        .args(["--peers", mac.peers.to_str().expect("a utf-8 peers path")])
         .stdin(Stdio::piped())
         .stdout(Stdio::from(file))
         .stderr(Stdio::from(err));
@@ -1550,10 +1560,8 @@ async fn a_borrowed_request_reaches_the_lender_and_never_carries_the_borrowers_c
 /// `tcr peer join --stdin`, which is the path the panel and the `tcr://` handler
 /// use: the key is piped, so it never enters an argument vector.
 fn join_with_stdin(mac: &Mac, key: &str) -> String {
-    let mut command = mac.command();
+    let mut command = mac.peer_command(&["join", "--stdin", "--label", "borrower-mac"]);
     command
-        .args(["peer", "join", "--stdin", "--label", "borrower-mac"])
-        .args(["--peers", mac.peers.to_str().expect("a utf-8 peers path")])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2595,8 +2603,7 @@ async fn a_moved_peer_is_reached_through_a_refreshed_hello_endpoint() {
     // port first; that also keeps the kernel from handing it out, and
     // `loopback_port_other_than` still refuses it if it comes back anyway.
     let held_old_port = std::net::TcpListener::bind(("127.0.0.1", old_port));
-    mover.peer_port = loopback_port_other_than(old_port, free_loopback_port);
-    mover.rewrite_listen_port();
+    mover.move_listen_port(loopback_port_other_than(old_port, free_loopback_port));
     mover.boot();
     drop(held_old_port);
     assert_ne!(

@@ -247,5 +247,6 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// from a default that changed under them.
 #[test]
 fn a_fresh_state_carries_no_asks() {
-    assert!(PeerState::default().asks.is_empty());
+    let written = serde_json::to_value(PeerState::default()).expect("the state serializes");
+    assert_eq!(written["asks"], serde_json::json!([]));
 }

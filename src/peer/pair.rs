@@ -732,17 +732,12 @@ pub fn mint_invite_as(
     }
 
     let now = now_ms();
-    // An expired row is not an outstanding invite, so it does not spend the
-    // cap. Dropped here rather than filtered at read time, because the file is
-    // being rewritten anyway and a dead PSK on disk is still a PSK on disk.
-    file.pending_invites
-        .retain(|invite| invite.uses_left > 0 && invite.expires_at_ms > now);
-    if file.pending_invites.len() >= MAX_OUTSTANDING_INVITES {
+    if let Err(outstanding) = file.make_room_for_invite(now, MAX_OUTSTANDING_INVITES) {
         bail!(
             "peer invite: {} invites are already outstanding, which is the cap \
              (MAX_OUTSTANDING_INVITES); every one of them is a PSK the registrar must try \
              against message 1, so `tcr peer invite --revoke <id>` first",
-            file.pending_invites.len()
+            outstanding
         );
     }
 
@@ -754,7 +749,7 @@ pub fn mint_invite_as(
         expires_at_ms: now.saturating_add(i64::from(ttl_secs).saturating_mul(1000)),
         uses_left: uses,
     };
-    file.pending_invites.push(invite.clone());
+    file.add_invite(invite.clone());
     save(store.path(), &file)?;
 
     let token = JoinToken {
@@ -774,9 +769,7 @@ pub fn mint_invite_as(
 pub fn revoke_invite(store: &PeerStore, id: u64) -> Result<bool> {
     let _lock = crate::peer::config::FileLock::acquire(store.path())?;
     let mut file = read_or_default(store.path())?;
-    let before = file.pending_invites.len();
-    file.pending_invites.retain(|invite| invite.id != id);
-    let removed = file.pending_invites.len() != before;
+    let removed = file.revoke_invite(id);
     if removed {
         save(store.path(), &file)?;
     }
@@ -842,25 +835,12 @@ pub fn accept_enrolment(
     let _lock = crate::peer::config::FileLock::acquire(peers_path)?;
     let mut file = read_or_default(peers_path)?;
 
-    let Some(position) = file.pending_invites.iter().position(|invite| {
-        &invite.secret == secret && invite.uses_left > 0 && invite.expires_at_ms > now_ms
-    }) else {
+    let Some(invite) = file.spend_invite(secret, now_ms) else {
         bail!(
             "peer enrol: no outstanding invite matches the secret this handshake proved \
              (it was spent or it expired between message 1 and this frame); nothing was pinned"
         );
     };
-
-    // Spend one use, and delete the row at zero: a row with `usesLeft: 0` on
-    // disk is still a PSK on disk, and the module docs say what that means.
-    let invite = {
-        let invite = &mut file.pending_invites[position];
-        invite.uses_left = invite.uses_left.saturating_sub(1);
-        invite.clone()
-    };
-    if invite.uses_left == 0 {
-        file.pending_invites.remove(position);
-    }
 
     let row = PeerRow {
         node: joiner,

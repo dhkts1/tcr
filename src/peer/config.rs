@@ -636,6 +636,76 @@ impl PeerFile {
         let raw = self.name.clone().unwrap_or_else(host_name);
         tcr_peer_wire::sanitize_label(&raw).unwrap_or_else(|_| "peer".to_string())
     }
+
+    /// Turn `peer.internet` on or off, and answer the port a router mapping
+    /// for it is keyed on: the listener's, or `None` when this node has no
+    /// listener to map.
+    pub fn switch_internet(&mut self, on: bool) -> Option<u16> {
+        self.internet = on;
+        self.listen.map(|addr| addr.port())
+    }
+
+    /// Make room for one more invite: drop every row that is spent or past its
+    /// deadline, then refuse with the number still outstanding when `cap` of
+    /// them are live.
+    pub fn make_room_for_invite(&mut self, now_ms: i64, cap: usize) -> Result<(), usize> {
+        // An expired row is not an outstanding invite, so it does not spend the
+        // cap. Dropped here rather than filtered at read time, because the file is
+        // being rewritten anyway and a dead PSK on disk is still a PSK on disk.
+        self.pending_invites
+            .retain(|invite| invite.uses_left > 0 && invite.expires_at_ms > now_ms);
+        if self.pending_invites.len() >= cap {
+            return Err(self.pending_invites.len());
+        }
+        Ok(())
+    }
+
+    /// Add an invite minted here.
+    pub fn add_invite(&mut self, invite: PendingInvite) {
+        self.pending_invites.push(invite);
+    }
+
+    /// Revoke one outstanding invite by id. Answers whether there was one.
+    pub fn revoke_invite(&mut self, id: u64) -> bool {
+        let before = self.pending_invites.len();
+        self.pending_invites.retain(|invite| invite.id != id);
+        self.pending_invites.len() != before
+    }
+
+    /// Spend one use of the live invite whose PSK is `secret`, deleting the row
+    /// at zero, and answer the invite as it stands after the spend. `None` when
+    /// no live invite holds that secret.
+    pub fn spend_invite(&mut self, secret: &[u8; 32], now_ms: i64) -> Option<PendingInvite> {
+        let position = self.pending_invites.iter().position(|invite| {
+            &invite.secret == secret && invite.uses_left > 0 && invite.expires_at_ms > now_ms
+        })?;
+
+        // Spend one use, and delete the row at zero: a row with `usesLeft: 0` on
+        // disk is still a PSK on disk, and the module docs say what that means.
+        let invite = {
+            let invite = &mut self.pending_invites[position];
+            invite.uses_left = invite.uses_left.saturating_sub(1);
+            invite.clone()
+        };
+        if invite.uses_left == 0 {
+            self.pending_invites.remove(position);
+        }
+        Some(invite)
+    }
+
+    /// The secrets of every invite still outstanding at `now_ms`.
+    pub fn outstanding_secrets(&self, now_ms: i64) -> Vec<[u8; 32]> {
+        self.pending_invites
+            .iter()
+            .filter(|invite| invite.uses_left > 0 && invite.expires_at_ms > now_ms)
+            .map(|invite| invite.secret)
+            .collect()
+    }
+
+    /// The invite minted under `id`, while it is still on disk.
+    pub fn invite(&self, id: u64) -> Option<&PendingInvite> {
+        self.pending_invites.iter().find(|invite| invite.id == id)
+    }
 }
 
 /// How many endpoints one row keeps. Oldest are dropped first, so a peer that
