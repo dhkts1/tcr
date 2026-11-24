@@ -1894,8 +1894,8 @@ pub fn via_setting(file: &PeerFile) -> ViaSetting {
 /// A missing or unreadable state file is an empty list, not a refusal: it only
 /// costs the candidates their ordering.
 fn last_seen_from_state(peers_path: &Path) -> Vec<(PeerId, i64)> {
-    let state_path = crate::peer::serve::peer_state_path(peers_path);
-    match crate::peer::state::load(&state_path, crate::peer::pair::now_ms()) {
+    let state_path = crate::peer::state::peer_state_path(peers_path);
+    match crate::peer::state::load(&state_path, crate::peer::state::now_ms()) {
         Ok(state) => state.last_seen,
         Err(err) => {
             tracing::debug!(

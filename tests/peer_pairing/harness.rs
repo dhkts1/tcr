@@ -154,7 +154,7 @@ pub(super) async fn knock_at_with(
 pub(super) fn accept_pending(node: &Node, selector: &str) -> state::AcceptedInstance {
     let mut value = node.state();
     let window = value
-        .accept_knock(selector, pair::now_ms(), pair::PAIRING_WINDOW_SECS)
+        .accept_knock(selector, state::now_ms(), pair::PAIRING_WINDOW_SECS)
         .expect("a pending row to accept");
     node.write_state(&value);
     window

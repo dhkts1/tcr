@@ -1129,7 +1129,7 @@ pub fn start_peer_mapping(
             // thread's memory, so this record is the only way `tcr peer reach`
             // reports the live mapping without asking the router and changing
             // the table it is reporting on.
-            record_mappings_at(crate::peer::serve::peer_state_path(peers_path));
+            record_mappings_at(crate::peer::state::peer_state_path(peers_path));
             spawn_mapping_keeper(peers_path, internal_port)
         }
     }

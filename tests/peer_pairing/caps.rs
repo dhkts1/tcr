@@ -33,7 +33,7 @@ async fn the_fourth_knock_in_ten_seconds_gets_nothing() {
     let left = admission
         .lock()
         .expect("the admission lock")
-        .knock_tokens("127.0.0.1", pair::now_ms());
+        .knock_tokens("127.0.0.1", state::now_ms());
     assert_eq!(
         left, 0,
         "three knocks spend the whole burst, and {left} tokens are left"
@@ -225,7 +225,7 @@ async fn the_ninth_outstanding_knock_writes_zero_bytes_on_the_wire() {
                 None,
                 1,
                 None,
-                pair::now_ms(),
+                state::now_ms(),
             )
             .expect("seed row");
     }

@@ -12,8 +12,10 @@ use crate::peer::config::{Endpoint, Locator, PeerRow, PeerStore};
 use crate::peer::id::NodeKey;
 use crate::peer::noise::{self, Handshake};
 
+use super::BORROW_TIMEOUT;
 use super::frame::{recv_control, send_control};
-use super::{BORROW_TIMEOUT, node_key_dir, peer_state_path};
+use crate::peer::config::node_key_dir;
+use crate::peer::state::peer_state_path;
 
 /// Everything a stream to a peer has to be, as ONE name.
 ///
@@ -778,7 +780,7 @@ pub fn has_a_way_back(row: &PeerRow, store: &PeerStore) -> bool {
 /// costs the candidates their ordering and nothing else.
 fn last_seen_by_peer(store: &PeerStore) -> Vec<(PeerId, i64)> {
     let state_path = peer_state_path(store.path());
-    match crate::peer::state::load(&state_path, crate::peer::pair::now_ms()) {
+    match crate::peer::state::load(&state_path, crate::peer::state::now_ms()) {
         Ok(state) => state.last_seen,
         Err(err) => {
             tracing::debug!(

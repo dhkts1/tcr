@@ -70,7 +70,7 @@ fn the_approval_verbs_and_ls_json_agree_about_one_pending_row() {
             Some("studio-mac".to_string()),
             1,
             None,
-            pair::now_ms(),
+            state::now_ms(),
         )
         .expect("queued");
     state::save(&state_file, &value).expect("write the state file");
@@ -119,13 +119,13 @@ fn the_approval_verbs_and_ls_json_agree_about_one_pending_row() {
     let (out, err, ok) = run_tcr(&peers, &["accept", &instance(0xE1).to_wire()]);
     assert!(ok, "`tcr peer accept` must exit 0: {err}");
     assert!(out.contains("peer accept: ok"), "{out}");
-    let after = state::load(&state_file, pair::now_ms()).expect("the state reads");
+    let after = state::load(&state_file, state::now_ms()).expect("the state reads");
     assert!(
         after.knocks_queued() == 0,
         "accepting a row consumes it: the operator has decided"
     );
     assert!(
-        after.accepted_window("192.0.2.24", &instance(0xE1), pair::now_ms()),
+        after.accepted_window("192.0.2.24", &instance(0xE1), state::now_ms()),
         "and it opens a window for that one instance at that one address"
     );
 
@@ -147,7 +147,7 @@ fn the_approval_verbs_and_ls_json_agree_about_one_pending_row() {
     // `ignore` mutes, and the muted count follows.
     let mut value = PeerState::default();
     value
-        .record_knock("192.0.2.25", instance(0xE2), None, 1, None, pair::now_ms())
+        .record_knock("192.0.2.25", instance(0xE2), None, 1, None, state::now_ms())
         .expect("queued");
     state::save(&state_file, &value).expect("write the state file");
     let (out, err, ok) = run_tcr(&peers, &["ignore", "192.0.2.25"]);
@@ -201,7 +201,7 @@ fn every_pending_surface_masks_the_name_a_stranger_proposed() {
             Some("alice@example.com".to_string()),
             1,
             None,
-            pair::now_ms(),
+            state::now_ms(),
         )
         .expect("queued");
     state::save(&state_file, &value).expect("write the state file");
@@ -495,7 +495,7 @@ fn a_reservation_placeholder_is_filtered_from_every_read_surface() {
     // `listener.rs` needs to run for this row to exist.
     let mut value = PeerState::default();
     let created = value
-        .reserve_knock_slot("192.0.2.77", pair::now_ms())
+        .reserve_knock_slot("192.0.2.77", state::now_ms())
         .expect("a fresh reservation");
     assert!(
         created,

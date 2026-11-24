@@ -1108,7 +1108,7 @@ fn the_serving_process_block_reads_both_files_off_disk() {
     write_peers(&peers_path, vec![row(7, "studio-mac", &["127.0.0.1:7749"])]);
 
     let now_ms = 1_700_000_000_000;
-    let state_path = tcr::peer::serve::peer_state_path(&peers_path);
+    let state_path = tcr::peer::state::peer_state_path(&peers_path);
     let state = PeerState {
         last_seen: vec![(node(7), now_ms - FIVE_MINUTES_MS)],
         ..PeerState::default()

@@ -550,7 +550,7 @@ fn a_concurrent_revoke_and_enrolment_never_resurrect_or_drop_a_row() {
         };
 
         let peers_path = node.peers.clone();
-        let now = pair::now_ms();
+        let now = state::now_ms();
         let barrier = Arc::new(std::sync::Barrier::new(2));
 
         let revoke_handle = {

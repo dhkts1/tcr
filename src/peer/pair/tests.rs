@@ -171,7 +171,7 @@ fn a_v1_key_with_a_real_host_still_parses() {
     let key = format!(
         "{TOKEN_PREFIX}192.0.2.10:7755:{}:{}",
         PeerId([3_u8; 32]).to_wire(),
-        encode_key32(&[7_u8; 32])
+        Crockford::encode(&[7_u8; 32])
     );
     let parsed = JoinToken::parse(&key).expect("a v1 key with a real host parses");
     assert_eq!(
@@ -188,7 +188,7 @@ fn a_v1_key_on_an_unspecified_host_is_refused_with_the_fix() {
     let key = format!(
         "{TOKEN_PREFIX}0.0.0.0:7755:{}:{}",
         PeerId([3_u8; 32]).to_wire(),
-        encode_key32(&[7_u8; 32])
+        Crockford::encode(&[7_u8; 32])
     );
     let refusal = JoinToken::parse(&key).expect_err("0.0.0.0 is not an address to dial");
     let text = format!("{refusal:#}");
@@ -229,7 +229,7 @@ fn a_v2_key_carrying_an_unspecified_address_is_refused() {
     let key = format!(
         "{TOKEN_PREFIX_V2}192.0.2.10:7755,0.0.0.0:7755:{}:{}",
         PeerId([3_u8; 32]).to_wire(),
-        encode_key32(&[7_u8; 32])
+        Crockford::encode(&[7_u8; 32])
     );
     assert!(
         JoinToken::parse(&key).is_err(),
@@ -282,7 +282,7 @@ fn an_unknown_version_is_refused() {
     let key = format!(
         "tcr-join:v4:192.0.2.10:7755:{}:{}",
         PeerId([3_u8; 32]).to_wire(),
-        encode_key32(&[7_u8; 32])
+        Crockford::encode(&[7_u8; 32])
     );
     let refusal = JoinToken::parse(&key).expect_err("v4 is not a version this build reads");
     assert!(
@@ -295,7 +295,7 @@ fn an_unknown_version_is_refused() {
 /// silently read as if the magic matched.
 #[test]
 fn a_v3_key_with_the_wrong_magic_is_refused() {
-    let bytes = encode_bytes(&[0_u8; 70]);
+    let bytes = Crockford::encode(&[0_u8; 70]);
     let key = format!("{TOKEN_PREFIX_V3}{bytes}");
     let refusal = JoinToken::parse(&key).expect_err("the wrong magic must be refused");
     assert!(
@@ -348,7 +348,7 @@ fn an_invite_minted_in_node_mode_lists_the_node_address_first() {
     );
 
     crate::peer::state::save_tailnet(
-        &crate::peer::serve::peer_state_path(&peers_path),
+        &crate::peer::state::peer_state_path(&peers_path),
         crate::peer::state::TailnetRecord {
             mode: crate::peer::config::TailnetMode::Node.into(),
             state: crate::peer::state::TailnetState::Ready,

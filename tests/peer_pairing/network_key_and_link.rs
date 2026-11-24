@@ -140,7 +140,7 @@ async fn a_knock_whose_message_1_does_not_validate_reserves_nothing() {
 #[test]
 fn a_reservation_placeholder_is_counted_but_never_rendered() {
     let mut value = PeerState::default();
-    let now = pair::now_ms();
+    let now = state::now_ms();
 
     assert_eq!(
         value.reserve_knock_slot("10.0.0.9", now),
@@ -438,7 +438,7 @@ fn join_stdin_keeps_the_key_out_of_argv_and_every_log_line() {
         [0xAA; 32],
     );
     let rendered = token.to_token();
-    let secret_field = tcr_peer_wire::encode_key32(&token.secret);
+    let secret_field = tcr_peer_wire::Crockford::encode(&token.secret);
 
     let mut child = tcr_command(&dir.join("cli-home"))
         .args([

@@ -215,7 +215,7 @@ async fn a_knock_from_a_muted_address_gets_zero_bytes() {
         .expect("the first knock is taken");
     // `tcr peer ignore` on that row.
     let mut value = node.state();
-    value.mute("127.0.0.1", pair::now_ms());
+    value.mute("127.0.0.1", state::now_ms());
     node.write_state(&value);
     assert!(
         node.state().knocks_queued() == 0,
@@ -303,7 +303,7 @@ async fn a_banned_key_is_refused_from_a_new_address() {
         "203.0.113.9",
         Some(peer_id),
         BanReason::ForgottenAndBlocked,
-        pair::now_ms(),
+        state::now_ms(),
     );
     node.write_state(&value);
     assert!(
@@ -337,7 +337,7 @@ async fn a_banned_key_is_refused_from_a_new_address() {
 async fn a_banned_address_gets_zero_bytes_before_any_frame() {
     let node = Node::new("ban-addr");
     let mut value = node.state();
-    value.ban("127.0.0.1", None, BanReason::Blocked, pair::now_ms());
+    value.ban("127.0.0.1", None, BanReason::Blocked, state::now_ms());
     node.write_state(&value);
 
     let addr = serve(node.context()).await;

@@ -25,7 +25,7 @@ use tcr::peer::moved::{
     MAX_MOVED_AGE, MOVED_VERSION, MintRefusal, MovedKeys, MovedRecord, MovedRefusal, open_link,
     open_link_field, seal_link, seal_link_field,
 };
-use tcr_peer_wire::{PeerId, decode_bytes};
+use tcr_peer_wire::{Crockford, PeerId};
 
 /// A peer id that is plainly not a real one: 32 copies of one byte.
 const fn peer_id(fill: u8) -> PeerId {
@@ -283,7 +283,7 @@ fn a_record_whose_length_is_not_a_multiple_of_five_round_trips() {
              client could treat as the end of a URL: {field}"
         );
 
-        let decoded = decode_bytes(&field).expect("the field decodes back");
+        let decoded = Crockford::decode(&field).expect("the field decodes back");
         // Not the same bytes as `sealed`: each seal draws its own nonce. What
         // must match is the length and, below, the record itself.
         assert_eq!(
@@ -335,7 +335,7 @@ fn a_link_cut_short_by_a_chat_app_is_refused_as_a_cut_paste() {
     // The smallest link that could hold anything, read off the module's own
     // refusal rather than written here: one byte short of it must be a cut
     // paste and not a forgery.
-    let whole = decode_bytes(&field).expect("the field decodes");
+    let whole = Crockford::decode(&field).expect("the field decodes");
     let mut counts = (0_usize, 0_usize);
     for cut in 1..field.len() {
         let Some(shorter) = field.get(..cut) else {
@@ -344,7 +344,7 @@ fn a_link_cut_short_by_a_chat_app_is_refused_as_a_cut_paste() {
         let refusal = open_link_field(&keys, &friend, shorter, NOW + 10)
             .expect_err("a cut link must never open");
 
-        let decoded_bytes = decode_bytes(shorter).map(|bytes| bytes.len());
+        let decoded_bytes = Crockford::decode(shorter).map(|bytes| bytes.len());
         match refusal {
             MovedRefusal::CutShort => counts.0 += 1,
             MovedRefusal::NotForThisMac => {

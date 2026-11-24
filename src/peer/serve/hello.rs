@@ -9,7 +9,8 @@ use crate::peer::noise::{self, Handshake};
 
 use super::dial::dial_peer_with_endpoint;
 use super::frame::{recv_control, send_control};
-use super::{node_key_dir, peer_state_path};
+use crate::peer::config::node_key_dir;
+use crate::peer::state::peer_state_path;
 
 /// Say hello to one pinned peer: tell it where this node listens, and record
 /// where it says it listens.

@@ -308,7 +308,7 @@ impl Node {
     /// operator just opened, because `now` is then before the instant they
     /// opened it. Every read here passes the real clock for that reason.
     fn state(&self) -> PeerState {
-        state::load(&self.state, pair::now_ms()).expect("the state file reads")
+        state::load(&self.state, state::now_ms()).expect("the state file reads")
     }
 
     fn write_state(&self, value: &PeerState) {
@@ -389,7 +389,7 @@ async fn knock_frame_at(addr: SocketAddr, knock: &Knock) -> anyhow::Result<()> {
 fn accept_pending(node: &Node, selector: &str) -> state::AcceptedInstance {
     let mut value = node.state();
     let window = value
-        .accept_knock(selector, pair::now_ms(), pair::PAIRING_WINDOW_SECS)
+        .accept_knock(selector, state::now_ms(), pair::PAIRING_WINDOW_SECS)
         .expect("a pending row to accept");
     node.write_state(&value);
     window

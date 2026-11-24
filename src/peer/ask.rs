@@ -370,10 +370,10 @@ mod tests {
             id: 1,
             public: ask_public,
             private: ask_secret,
-            until_ms: crate::peer::pair::now_ms() + 600_000,
+            until_ms: crate::peer::state::now_ms() + 600_000,
         }];
         let (opened, id) =
-            open_reply(&rows, &rendered, crate::peer::pair::now_ms()).expect("it opens");
+            open_reply(&rows, &rendered, crate::peer::state::now_ms()).expect("it opens");
         assert_eq!(id, 1);
         assert_eq!(opened, Opened::Key(token));
     }

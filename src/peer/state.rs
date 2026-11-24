@@ -39,6 +39,45 @@ pub fn default_path() -> PathBuf {
     crate::paths::cache_dir().peer_state_file()
 }
 
+/// The runtime-state file that belongs with `peers_path`: the pairing window,
+/// the knock queue, the mutes and the bans.
+///
+/// The DEFAULT peers file lives in the config directory and its state file in
+/// the cache directory, a split [`crate::peer::state::default_path`] already
+/// owns, so the default is never derived here. Only an explicit `--peers` (or a
+/// `--config` that resolves a peers file beside it) moves the state file with
+/// it, which is what makes one argument select a whole profile and what stops a
+/// test writing the operator's real `peer-state.json`.
+///
+/// # There is a second copy of this, and it is not deleted
+///
+/// `src/main.rs`'s private `peer_state_path` is the same six lines, in the part
+/// of that file the `ls`, `pair` and `pending` verbs read rather than
+/// `lend`/`share`/`allow`. Nothing makes it call this one yet, so the two
+/// agree line for line,
+/// and this doc is where a reader learns there are two.
+pub fn peer_state_path(peers_path: &Path) -> PathBuf {
+    if peers_path == crate::peer::config::default_path() {
+        return default_path();
+    }
+    match peers_path.parent() {
+        Some(parent) => parent.join("peer-state.json"),
+        None => default_path(),
+    }
+}
+
+/// Unix milliseconds.
+///
+/// Public because `tcr peer pair` opens the pairing window and the listener
+/// compares that deadline: both have to read the same clock, and a second
+/// spelling of "now" between the writer and the reader of one deadline is the
+/// kind of drift that shows up as a window that is open on one side only.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or_default(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+}
+
 /// What survives a restart.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -507,7 +546,7 @@ impl TailnetReport {
     /// beside it.
     pub fn read(peers_path: &Path, now_ms: i64) -> Result<Self> {
         let file = crate::peer::config::read_or_default(peers_path)?;
-        let state_path = crate::peer::serve::peer_state_path(peers_path);
+        let state_path = peer_state_path(peers_path);
         let state = load(&state_path, now_ms)
             .with_context(|| format!("reading {}", state_path.display()))?;
         Ok(Self {
@@ -1906,7 +1945,7 @@ pub fn save_path_traffic(path: &Path, traffic: &[PathTraffic]) -> Result<()> {
 /// cap, so it is dropped here before the count is taken.
 pub fn add_ask(path: &Path, ask: PendingAsk) -> Result<()> {
     replace_section(path, "an outstanding ask", move |state| {
-        state.add_ask(ask, crate::peer::pair::now_ms());
+        state.add_ask(ask, now_ms());
     })
 }
 
@@ -2301,8 +2340,7 @@ mod tests {
             tailnet: Some(record.clone()),
             ..Default::default()
         };
-        save(&crate::peer::serve::peer_state_path(&peers_path), &state)
-            .expect("save the state file");
+        save(&peer_state_path(&peers_path), &state).expect("save the state file");
 
         let report = TailnetReport::read(&peers_path, 1_000).expect("read the report");
         assert_eq!(

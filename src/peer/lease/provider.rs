@@ -49,7 +49,7 @@ pub async fn request_lease(
     let Some(mut stream) = serve::dial_peer_reaching(&row, store).await else {
         return Ok(None);
     };
-    let key = crate::peer::id::NodeKey::load_or_mint(&serve::node_key_dir(store))
+    let key = crate::peer::id::NodeKey::load_or_mint(&crate::peer::config::node_key_dir(store))
         .context("peer lease: this node has no keypair to ask for a lease with")?;
     let mut session = crate::peer::noise::dial_handshake(
         &mut stream,
@@ -130,7 +130,7 @@ pub struct PeerLeaseProvider {
     /// `peer-state.json` ([`crate::peer::state::BorrowedRow`]).
     ///
     /// Derived from `peers_path` rather than passed in, by the same
-    /// [`crate::peer::serve::peer_state_path`] every other peer surface uses,
+    /// [`crate::peer::state::peer_state_path`] every other peer surface uses,
     /// so one `--peers` argument still points the whole peer surface at one
     /// directory and a test cannot write the operator's real file.
     state_path: PathBuf,
@@ -184,7 +184,7 @@ impl PeerLeaseProvider {
     /// refused to borrow over a cache file would have traded a real service
     /// for a durability promise.
     pub fn new(peers_path: PathBuf) -> Self {
-        let state_path = serve::peer_state_path(&peers_path);
+        let state_path = crate::peer::state::peer_state_path(&peers_path);
         let mut leases: HashMap<PeerId, Lease> = HashMap::new();
         let now_ms = crate::now_ms();
         match crate::peer::state::load(&state_path, now_ms) {

@@ -157,7 +157,7 @@ pub async fn leave_with(
     wait: Duration,
     poll: Duration,
 ) -> Result<LeaveOutcome> {
-    let state_path = crate::peer::serve::peer_state_path(peers_path);
+    let state_path = crate::peer::state::peer_state_path(peers_path);
     let held_at = |now_ms: i64| -> Result<Option<TailnetRecord>> {
         Ok(crate::peer::state::load(&state_path, now_ms)
             .with_context(|| format!("reading {}", state_path.display()))?

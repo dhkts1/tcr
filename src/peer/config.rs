@@ -57,6 +57,16 @@ pub fn default_path() -> PathBuf {
     crate::peer::id::default_config_dir().join("tcr-peers.json")
 }
 
+/// The peers file's own directory, which is also the node-key directory, the
+/// same resolution `tcr peer id` uses, so one `--peers` argument points the
+/// whole peer surface at a temp dir.
+pub(crate) fn node_key_dir(store: &PeerStore) -> PathBuf {
+    store
+        .path()
+        .parent()
+        .map_or_else(crate::peer::id::default_config_dir, Path::to_path_buf)
+}
+
 /// The whole file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -442,7 +452,7 @@ impl NetworkKey {
 
     /// The paste string: 52 Crockford base32 characters.
     pub fn to_paste_string(&self) -> String {
-        tcr_peer_wire::encode_key32(&self.0)
+        tcr_peer_wire::Crockford::encode(&self.0)
     }
 
     /// The raw bytes, for the Noise `psk0` a knock mixes in.
@@ -559,10 +569,10 @@ impl From<NetworkKey> for String {
 }
 
 impl TryFrom<String> for NetworkKey {
-    type Error = tcr_peer_wire::Key32Refusal;
+    type Error = tcr_peer_wire::PeerIdError;
 
     fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
-        tcr_peer_wire::decode_key32(value.trim()).map(Self)
+        tcr_peer_wire::Crockford::decode_key32(value.trim()).map(Self)
     }
 }
 

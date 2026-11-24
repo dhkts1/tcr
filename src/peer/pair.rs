@@ -62,10 +62,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tcr_peer_wire::{
-    Control, Enroll, PeerId, StreamHeader, StreamKind, decode_bytes, decode_key32, encode_bytes,
-    encode_key32, sanitize_label,
-};
+use tcr_peer_wire::{Control, Crockford, Enroll, PeerId, StreamHeader, StreamKind, sanitize_label};
 
 use crate::peer::config::{
     ControlGrants, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore, PendingInvite,
@@ -210,7 +207,7 @@ impl JoinToken {
         format!(
             "{TOKEN_PREFIX_V2}{addrs}:{}:{}",
             self.registrar.to_wire(),
-            encode_key32(&self.secret)
+            Crockford::encode(&self.secret)
         )
     }
 
@@ -226,7 +223,7 @@ impl JoinToken {
         body.extend_from_slice(&TOKEN_V3_MAGIC);
         body.push(TOKEN_V3_VERSION);
         body.extend_from_slice(&self.to_v3_body());
-        format!("{TOKEN_PREFIX_V3}{}", encode_bytes(&body))
+        format!("{TOKEN_PREFIX_V3}{}", Crockford::encode(&body))
     }
 
     /// The three fields, in v3's compact spelling, with no magic and no
@@ -328,7 +325,7 @@ impl JoinToken {
         // FIELD and its shape, and no arm of this function prints the value.
         // A pasted token that failed to parse is still a live bearer secret,
         // and the place operators paste one is a terminal that keeps scrollback.
-        let secret = decode_key32(secret)
+        let secret = Crockford::decode_key32(secret)
             .map_err(|refusal| anyhow!("{refusal}"))
             .context("peer join: the secret field is not 32 base32-encoded bytes")?;
         Ok(Self::new(addrs, registrar, secret))
@@ -338,7 +335,7 @@ impl JoinToken {
     /// version, then read the three fields by offset rather than by split,
     /// which is what an opaque run buys over the comma-and-colon shape of v2.
     fn parse_v3(body: &str) -> Result<Self> {
-        let bytes = decode_bytes(body)
+        let bytes = Crockford::decode(body)
             .map_err(|refusal| anyhow!("{refusal}"))
             .context(
                 "peer join: a v3 key is not a whole run of base32 bytes, which is what a paste cut \
@@ -505,7 +502,7 @@ pub fn mint_invite_as(
     // Derived BEFORE the invite row is written: a mint that is going to refuse
     // must not leave a live PSK on disk behind it.
     let node_address = crate::peer::tailnet_node::recorded_node_address(
-        &crate::peer::serve::peer_state_path(store.path()),
+        &crate::peer::state::peer_state_path(store.path()),
         now_ms(),
     );
     let addrs = local_dial_addresses(listen, external, node_address);
@@ -1380,17 +1377,8 @@ fn random_id() -> Result<u64> {
     Ok(u64::from_be_bytes(head))
 }
 
-/// Unix milliseconds.
-///
-/// Public because `tcr peer pair` opens the pairing window and the listener
-/// compares that deadline: both have to read the same clock, and a second
-/// spelling of "now" between the writer and the reader of one deadline is the
-/// kind of drift that shows up as a window that is open on one side only.
-pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or_default(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
-}
+// Compat for outside callers (src/main.rs); wave 2 repoints them to `state`.
+pub use crate::peer::state::now_ms;
 
 /// A 32-byte join secret is the same width as a static key, which is why both
 /// are [`KEY_BYTES`].

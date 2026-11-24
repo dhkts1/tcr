@@ -214,7 +214,7 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
     // The lease the provider is holding, read off the borrower's own state
     // file, which is where it writes the borrowed rows. Its id is what the
     // bearer is keyed by and what this test forgets on the way out.
-    let borrower_state = serve::peer_state_path(borrower_peers);
+    let borrower_state = tcr::peer::state::peer_state_path(borrower_peers);
     let handed = tcr::peer::state::load(&borrower_state, tcr::now_ms())
         .expect("the borrower's state file reads")
         .borrowed
