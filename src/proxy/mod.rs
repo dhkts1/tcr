@@ -3459,11 +3459,9 @@ impl RequestTiming {
         }
     }
 
-    /// A buffered body, read whole at `at`, is handed on toward the client. A first byte
-    /// already marked stays: none is, because the buffered arm is reached once per request
-    /// and leaves the rotation loop, and a streamed attempt marks its own handed-off clock.
+    /// A buffered body, read whole at `at`, is handed on toward the client.
     fn note_first_byte_at(&mut self, at: Instant) {
-        self.first_byte_at.get_or_insert(at);
+        self.first_byte_at = Some(at);
     }
 
     /// The upstream ended the stream (EOF or a transport error).
