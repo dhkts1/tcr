@@ -119,7 +119,7 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
     // shows on the row, rather than leaving the row listed with no reason.
     if parked_live
         && let Ok(payload) = fetch_live_status(&config).await
-        && payload.accounts.iter().any(|a| a.name == name)
+        && payload.lists_account(&name)
     {
         eprintln!(
             "[tcr] the proxy running on :{} stopped routing to '{name}', but it predates live removal and keeps listing it as disabled until it restarts. {}",

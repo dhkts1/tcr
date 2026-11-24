@@ -135,8 +135,8 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
     let (source, server_build, snapshot, thresholds, http1_only, control, group_colors) =
         match live_read {
             Ok(payload) => {
-                served_recently = Some(crate::doctor::requests_in_window(
-                    &payload,
+                served_recently = Some(payload.requests_in_window(
+                    Provider::Anthropic,
                     crate::doctor::REQUEST_WINDOW_MINUTES,
                 ));
                 let build = payload.build.clone();
@@ -269,11 +269,13 @@ pub(super) fn status_holds_provider(
     config: &Config,
     provider: Provider,
 ) -> bool {
-    match live {
-        Ok(payload) if payload.mitm.is_some() => {
-            payload.accounts.iter().any(|row| row.provider == provider)
-        }
-        Ok(_) | Err(_) => config
+    match live
+        .as_ref()
+        .ok()
+        .and_then(|payload| payload.current_accounts_of(provider))
+    {
+        Some(mut rows) => rows.next().is_some(),
+        None => config
             .accounts
             .iter()
             .any(|account| account.provider == provider),
@@ -495,10 +497,9 @@ pub async fn doctor(config_path: &Path, json: bool, codex_only: bool) -> anyhow:
     let config = load_config(config_path)?;
     let live = fetch_live_status(&config).await;
     let served_recently = match &live {
-        Ok(payload) => Some(crate::doctor::requests_in_window(
-            payload,
-            crate::doctor::REQUEST_WINDOW_MINUTES,
-        )),
+        Ok(payload) => Some(
+            payload.requests_in_window(Provider::Anthropic, crate::doctor::REQUEST_WINDOW_MINUTES),
+        ),
         Err(LiveStatusError::NoServer) => None,
         Err(reason) => {
             eprintln!(

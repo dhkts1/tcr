@@ -427,9 +427,7 @@ fn codex_pool_preflight(
 ) -> Option<String> {
     use tcr::stats::GateReason;
     let codex: Vec<&status::AccountStatus> = payload
-        .accounts
-        .iter()
-        .filter(|row| row.provider == tcr::provider::Provider::Codex)
+        .accounts_of(tcr::provider::Provider::Codex)
         .collect();
     if codex.is_empty() || codex.iter().any(|row| row.gate == GateReason::Ok) {
         return None;
@@ -475,15 +473,14 @@ fn holds_only_codex(config: &Config) -> bool {
 /// Codex accounts and no Claude account: every request this session sends will be refused.
 /// `None` when the proxy lists any Claude account, or no account at all.
 fn no_claude_account_warning(port: u16, payload: &status::StatusPayload) -> Option<String> {
-    let holds = |provider| payload.accounts.iter().any(|row| row.provider == provider);
-    (holds(tcr::provider::Provider::Codex) && !holds(tcr::provider::Provider::Anthropic)).then(
-        || {
-            format!(
-                "[tcr] warning: the proxy on :{port} holds no Claude account, so it will refuse \
+    (payload.holds_provider(tcr::provider::Provider::Codex)
+        && !payload.holds_provider(tcr::provider::Provider::Anthropic))
+    .then(|| {
+        format!(
+            "[tcr] warning: the proxy on :{port} holds no Claude account, so it will refuse \
              every request from this session — add one with `tcr login`"
-            )
-        },
-    )
+        )
+    })
 }
 
 /// Carry out [`codex_launch`]'s decision on `cmd`, and return its stderr lines

@@ -336,11 +336,36 @@ pub enum Lenient<T> {
     Unreadable(String),
 }
 
+/// One session's requests in the newest `minutes` of its sparkline
+/// ([`tcr_status_wire::SessionRow::req_per_minute`]); a sparkline shorter than
+/// the window counts what it has.
+fn session_requests_in_window(session: &tcr_status_wire::SessionRow, minutes: usize) -> u64 {
+    let minutes = session.req_per_minute.len().min(minutes);
+    session
+        .req_per_minute
+        .iter()
+        .rev()
+        .take(minutes)
+        .map(|&requests| u64::from(requests))
+        .sum::<u64>()
+}
+
+/// Why a [`Lenient`] status field holds no reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread<'a> {
+    /// The server sent no such object: one older than the key, or one with nothing to report.
+    NotSent,
+    /// The server sent one this build could not read; the parser's own words.
+    Unparsed(&'a str),
+}
+
 impl<T> Lenient<T> {
-    pub const fn reading(&self) -> Option<&T> {
-        match self {
-            Self::Reading(row) => Some(row),
-            Self::Unreadable(_) => None,
+    /// `field`'s reading, or why it holds none.
+    const fn read(field: Option<&Self>) -> Result<&T, Unread<'_>> {
+        match field {
+            Some(Self::Reading(row)) => Ok(row),
+            Some(Self::Unreadable(why)) => Err(Unread::Unparsed(why.as_str())),
+            None => Err(Unread::NotSent),
         }
     }
 }
@@ -697,6 +722,85 @@ impl StatusPayload {
         self.mitm
             .as_ref()
             .is_some_and(|mitm| mitm.leaf == MitmStatus::LEAF_MINTED && mitm.intercepts(host))
+    }
+
+    /// What the serving MITM listener can terminate ([`Self::mitm`]) and the sha of the build
+    /// the server runs, the two facts a Codex route decision names. `Err` with that sha from a
+    /// server older than the `mitm` key: it predates Codex interception, and the route it needs
+    /// is a restart on a current build.
+    pub fn codex_interception(&self) -> Result<(&MitmStatus, &str), &str> {
+        let sha = self.build.sha.as_str();
+        self.mitm.as_ref().map(|mitm| (mitm, sha)).ok_or(sha)
+    }
+
+    /// The account rows of `provider` this payload lists, in any state.
+    pub fn accounts_of(
+        &self,
+        provider: crate::provider::Provider,
+    ) -> impl Iterator<Item = &AccountStatus> {
+        self.accounts
+            .iter()
+            .filter(move |row| row.provider == provider)
+    }
+
+    /// Does this payload list an account of `provider`, in any state?
+    pub fn holds_provider(&self, provider: crate::provider::Provider) -> bool {
+        self.accounts_of(provider).next().is_some()
+    }
+
+    /// Does this payload list an account named `name`, in any state (a disabled row too)?
+    pub fn lists_account(&self, name: &str) -> bool {
+        self.accounts.iter().any(|row| row.name == name)
+    }
+
+    /// [`Self::accounts_of`], or `None` from a server older than the [`Self::mitm`] key. Such a
+    /// server predates Codex pooling: its rows carry no `provider`, so every one reads as
+    /// Anthropic, and the caller answers from its config instead.
+    pub fn current_accounts_of(
+        &self,
+        provider: crate::provider::Provider,
+    ) -> Option<impl Iterator<Item = &AccountStatus>> {
+        self.mitm.as_ref().map(|_| self.accounts_of(provider))
+    }
+
+    /// Requests the serving proxy answered for `provider`'s sessions in the last `minutes`
+    /// wall-clock minutes, summed over each session's per-minute sparkline
+    /// ([`tcr_status_wire::SessionRow::req_per_minute`], 30 entries, oldest first).
+    ///
+    /// The sparkline rather than [`AccountStatus::requests`]: that counter is cumulative since
+    /// the server booted, so it answers "has this proxy ever served anything", and a route that
+    /// broke an hour ago would still read as healthy.
+    ///
+    /// One provider at a time, because a Codex session's traffic says nothing about Claude's
+    /// route, and counting it would read a broken Claude route as healthy. A session names its
+    /// provider only when it is not Anthropic ([`tcr_status_wire::SessionRow::provider`]).
+    pub fn requests_in_window(&self, provider: crate::provider::Provider, minutes: usize) -> u64 {
+        let wire = match provider {
+            crate::provider::Provider::Anthropic => None,
+            crate::provider::Provider::Codex => Some(provider.as_str()),
+        };
+        self.sessions
+            .iter()
+            .filter(|session| session.provider.as_deref() == wire)
+            .map(|session| session_requests_in_window(session, minutes))
+            .sum()
+    }
+
+    /// Does the serving process understand request keys? Its [`Self::request_key_mode`] is
+    /// sent whenever it holds one, and that PRESENCE is the contract a launcher reads before
+    /// it adds the key to a launch. `false` from a server that holds no key or predates them.
+    pub const fn understands_request_keys(&self) -> bool {
+        self.request_key_mode.is_some()
+    }
+
+    /// The server's heat reading ([`Self::heat`]), or why there is none.
+    pub fn heat_reading(&self) -> Result<&tcr_status_wire::HeatRow, Unread<'_>> {
+        Lenient::read(self.heat.as_ref())
+    }
+
+    /// The server's fan-control reading ([`Self::fan_control`]), or why there is none.
+    pub fn fan_control_reading(&self) -> Result<&tcr_status_wire::FanControlRow, Unread<'_>> {
+        Lenient::read(self.fan_control.as_ref())
     }
 
     /// Project a live snapshot onto the wire. `thresholds` is the server's own

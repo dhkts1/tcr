@@ -117,7 +117,7 @@ impl LaunchKey {
         };
         match status {
             Err(err) => Self::StatusUnread(err.why()),
-            Ok(payload) if payload.request_key_mode.is_none() => Self::ServerPredatesKeys,
+            Ok(payload) if !payload.understands_request_keys() => Self::ServerPredatesKeys,
             Ok(_) => Self::Send(key),
         }
     }

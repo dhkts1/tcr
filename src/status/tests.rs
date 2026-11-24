@@ -1147,3 +1147,46 @@ fn payload_carries_the_kind_discriminator() {
         "payload names its kind: {wire}"
     );
 }
+
+/// A server older than the `mitm` key lists no provider on its rows, so its account list is
+/// no answer to "does it hold a Codex account", and `current_accounts_of` says so with `None`.
+/// The positive control first: the same rows from a current server do answer, and list the
+/// Codex row.
+#[test]
+fn only_a_current_server_answers_which_accounts_it_holds() {
+    let mut payload = StatusPayload::from_snapshot(
+        &snapshot_with_counters(),
+        &[0.9],
+        false,
+        None,
+        Default::default(),
+    );
+    let mut codex = payload.accounts[0].clone();
+    codex.name = "bob@example.com/codex".to_string();
+    codex.provider = crate::provider::Provider::Codex;
+    payload.accounts.push(codex);
+    payload.mitm = Some(MitmStatus {
+        intercepted_hosts: Vec::new(),
+        leaf: MitmStatus::LEAF_NONE.to_string(),
+    });
+
+    let names = |payload: &StatusPayload| {
+        payload
+            .current_accounts_of(crate::provider::Provider::Codex)
+            .map(|rows| rows.map(|row| row.name.clone()).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        names(&payload),
+        Some(vec!["bob@example.com/codex".to_string()])
+    );
+    assert!(payload.holds_provider(crate::provider::Provider::Anthropic));
+    assert!(payload.lists_account("alice@example.com"));
+    assert!(!payload.lists_account("carol@example.com"));
+
+    payload.mitm = None;
+    assert_eq!(
+        names(&payload),
+        None,
+        "an older server's rows are not the answer"
+    );
+}
