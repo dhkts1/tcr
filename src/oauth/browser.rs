@@ -504,9 +504,9 @@ pub async fn login(
     let hint = match account {
         Some(query) => {
             let probe_config = load_or_default(config_path)?;
-            let idx = config::resolve_account(&probe_config.accounts, query)?;
-            refuse_a_non_claude_row(&probe_config.accounts[idx])?;
-            let email = crate::identity::email_of(&probe_config.accounts[idx].name);
+            let row = probe_config.resolve_account(query)?;
+            refuse_a_non_claude_row(row)?;
+            let email = crate::identity::email_of(&row.name);
             // Only ever send something address-shaped: a non-email display
             // name (e.g. an account named "work") produces `login_hint=work`
             // otherwise — an unvalidated non-address value on an endpoint
