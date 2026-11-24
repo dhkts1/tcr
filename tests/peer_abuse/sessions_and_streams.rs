@@ -571,7 +571,7 @@ async fn a_banned_key_is_refused_on_the_enrolment_arm_too() {
         id: 1,
         label: "joiner".to_string(),
         secret: invite_secret,
-        expires_at_ms: pair::now_ms() + 600_000,
+        expires_at_ms: state::now_ms() + 600_000,
         uses_left: 5,
     });
     node.write_file(&file);
@@ -583,7 +583,7 @@ async fn a_banned_key_is_refused_on_the_enrolment_arm_too() {
         "192.0.2.77",
         Some(blocked.id()),
         state::BanReason::Blocked,
-        pair::now_ms(),
+        state::now_ms(),
     );
     node.write_state(&peer_state);
 

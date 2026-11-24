@@ -16,7 +16,7 @@
 use tcr::log_err::LogErr as _;
 use tcr::peer::ask::{self, Ask};
 use tcr::peer::noise;
-use tcr::peer::pair::{self, JoinToken};
+use tcr::peer::pair::JoinToken;
 use tcr::peer::state::{self, PeerState, PendingAsk};
 use tcr_peer_wire::PeerId;
 
@@ -84,7 +84,7 @@ fn a_reply_opens_against_its_own_ask_and_yields_the_key_that_went_in() {
         "a reply is minted with its own prefix: {rendered}"
     );
 
-    let now = pair::now_ms();
+    let now = state::now_ms();
     let rows = vec![row(1, ask_public, ask_secret, now + 600_000)];
     let (opened, id) =
         ask::open_reply(&rows, &rendered, now).expect("it opens against its own ask");
@@ -112,7 +112,7 @@ fn the_same_reply_against_a_second_macs_row_is_refused_with_the_quiet_refusal() 
     let reply = ask::seal_key(&ask, &token).expect("it seals");
     let rendered = reply.to_string_wire();
 
-    let now = pair::now_ms();
+    let now = state::now_ms();
     // The reply was sealed to `ask_public`; this row is a DIFFERENT Mac's
     // outstanding ask, with no relation to it at all.
     let rows = vec![row(2, other_public, other_secret, now + 600_000)];
@@ -150,7 +150,7 @@ fn a_truncated_paste_is_cut_short_not_a_forgery() {
     let cut_len = (ask::REPLY_PREFIX.len() + 40).min(rendered.len());
     let cut = &rendered[..cut_len];
 
-    let now = pair::now_ms();
+    let now = state::now_ms();
     let rows = vec![row(3, ask_public, ask_secret, now + 600_000)];
     let error = ask::open_reply(&rows, cut, now).expect_err("a cut-short paste must be refused");
     assert_eq!(
@@ -174,7 +174,7 @@ fn a_second_open_of_the_same_reply_is_refused() {
     let rendered = reply.to_string_wire();
 
     let path = scratch("second-open");
-    let now = pair::now_ms();
+    let now = state::now_ms();
     state::add_ask(&path, row(4, ask_public, ask_secret, now + 600_000))
         .expect("the ask is written");
 
@@ -204,7 +204,7 @@ fn a_reply_past_the_asks_deadline_is_refused_and_just_before_it_still_opens() {
     let reply = ask::seal_key(&ask, &token).expect("it seals");
     let rendered = reply.to_string_wire();
 
-    let until_ms = pair::now_ms() + 600_000;
+    let until_ms = state::now_ms() + 600_000;
     let rows = vec![row(5, ask_public, ask_secret, until_ms)];
 
     let (opened, _id) = ask::open_reply(&rows, &rendered, until_ms - 1)
@@ -233,7 +233,7 @@ fn an_ask_round_trips_and_names_nothing() {
 #[test]
 fn a_pending_asks_debug_output_never_carries_its_private_key() {
     let (secret, public) = keypair();
-    let ask = row(6, public, secret, pair::now_ms() + 600_000);
+    let ask = row(6, public, secret, state::now_ms() + 600_000);
     let text = format!("{ask:?}");
     assert!(
         !text.contains(&hex_lower(&secret)),

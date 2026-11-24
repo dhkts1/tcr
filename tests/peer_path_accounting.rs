@@ -42,11 +42,11 @@ use tcr::peer::config::{
 use tcr::peer::lease::Ledger;
 use tcr::peer::listener;
 use tcr::peer::noise::{self, Handshake};
+use tcr::peer::state;
 use tcr::peer::tunnel::{
     self, BUDGET_WINDOW_MS, Carry, Forward, NoiseStream, OriginRoute, PathMeter, TunnelBudget,
     path_meter,
 };
-use tcr::peer::{serve, state};
 use tcr_peer_wire::{
     Lease, LeaseUnit, LendScope, PeerId, StreamHeader, StreamKind, TunnelTarget, Window,
 };
@@ -332,7 +332,7 @@ async fn two_carried_requests_land_on_one_path_and_the_other_stays_at_zero() {
         let mut meter = path_meter().lock().expect("the meter lock");
         meter.rows(now_ms)
     };
-    let state_path = serve::peer_state_path(&peers_path);
+    let state_path = state::peer_state_path(&peers_path);
     state::save_path_traffic(&state_path, &rows).expect("write the traffic section");
 
     let peers = tcr::status::peers_block(&peers_path, now_ms);
@@ -444,7 +444,7 @@ fn an_hour_old_window_rolls_off_at_the_meter_and_at_the_reader() {
         )],
     );
     state::save_path_traffic(
-        &serve::peer_state_path(&peers_path),
+        &state::peer_state_path(&peers_path),
         &[state::PathTraffic {
             peer: peer.id,
             locator: path,
@@ -514,7 +514,7 @@ fn a_peer_nothing_has_metered_reports_absence_and_not_zero() {
     // The control: the same path, once something has measured it, reports the
     // zero.
     state::save_path_traffic(
-        &serve::peer_state_path(&peers_path),
+        &state::peer_state_path(&peers_path),
         &[state::PathTraffic {
             peer: peer.id,
             locator: Locator::Direct { addr },
@@ -849,7 +849,7 @@ async fn the_written_row_carries_nothing_time_shaped_beyond_updated_at_ms() {
         let mut meter = path_meter().lock().expect("the meter lock");
         meter.rows(now_ms)
     };
-    let state_path = serve::peer_state_path(&peers_path);
+    let state_path = state::peer_state_path(&peers_path);
     state::save_path_traffic(&state_path, &rows).expect("write the traffic section");
 
     let raw = std::fs::read_to_string(&state_path).expect("read the state file");

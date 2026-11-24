@@ -140,7 +140,7 @@ async fn a_knock_whose_message_1_does_not_validate_reserves_nothing() {
 #[test]
 fn a_reservation_placeholder_is_counted_but_never_rendered() {
     let mut value = PeerState::default();
-    let now = pair::now_ms();
+    let now = state::now_ms();
 
     assert_eq!(
         value.reserve_knock_slot("10.0.0.9", now),

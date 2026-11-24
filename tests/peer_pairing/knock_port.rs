@@ -176,7 +176,7 @@ fn the_two_pending_surfaces_print_the_same_dial_address() {
             Some("studio-mac".to_string()),
             1,
             Some(7766),
-            pair::now_ms(),
+            state::now_ms(),
         )
         .expect("the knock with a port records");
     value
@@ -186,7 +186,7 @@ fn the_two_pending_surfaces_print_the_same_dial_address() {
             Some("attic-nuc".to_string()),
             1,
             None,
-            pair::now_ms(),
+            state::now_ms(),
         )
         .expect("the knock with no port records");
     node.write_state(&value);

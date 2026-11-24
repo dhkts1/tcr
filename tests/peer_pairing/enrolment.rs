@@ -214,7 +214,7 @@ fn two_concurrent_joiners_on_one_use_invite_leave_exactly_one_ok() {
         };
 
         let peers_path = node.peers.clone();
-        let now = pair::now_ms();
+        let now = state::now_ms();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let handles: Vec<_> = [first, second]
             .into_iter()

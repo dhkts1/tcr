@@ -559,7 +559,7 @@ async fn an_accepted_handshake_that_stalls_is_closed_by_the_handshake_deadline()
     // spent by a stranger stalling.
     let state = node.state();
     assert!(
-        state.accepted_window(LOOPBACK, &id, pair::now_ms()),
+        state.accepted_window(LOOPBACK, &id, state::now_ms()),
         "a stalled handshake must not consume the operator's window"
     );
 }
@@ -765,7 +765,7 @@ async fn a_fresh_instance_id_knocking_after_an_accept_never_inherits_the_window(
     );
     assert!(
         node.state()
-            .accepted_window(LOOPBACK, &accepted, pair::now_ms()),
+            .accepted_window(LOOPBACK, &accepted, state::now_ms()),
         "and the window is still keyed to the id the operator saw"
     );
 }
@@ -789,7 +789,7 @@ async fn twenty_parallel_knocks_from_a_muted_address_get_nothing_and_shorten_not
     let addr = serve(node.context()).await;
 
     // The operator pressed Ignore.
-    let muted_at = pair::now_ms();
+    let muted_at = state::now_ms();
     let mut value = node.state();
     value.mute(LOOPBACK, muted_at);
     node.write_state(&value);

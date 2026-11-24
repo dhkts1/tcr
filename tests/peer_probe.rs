@@ -1241,7 +1241,7 @@ async fn a_completed_hello_measures_the_path_and_it_survives_a_restart() {
         measured.rtt_ms
     );
 
-    let dialer_state_path = serve::peer_state_path(&dialer_peers_path);
+    let dialer_state_path = tcr::peer::state::peer_state_path(&dialer_peers_path);
     let restored = tcr::peer::state::load(&dialer_state_path, FIXED_MS)
         .expect("the dialer's state file reads");
     let saved = restored

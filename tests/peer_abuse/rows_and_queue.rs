@@ -234,7 +234,7 @@ fn beating_one_addresss_quiet_hour_costs_a_thousand_fresh_addresses() {
 fn a_flood_from_a_whole_slash_twenty_four_costs_eight_rows_not_two_hundred_and_fifty_four() {
     let hosts = 254_usize;
     let mut value = PeerState::default();
-    let now = pair::now_ms();
+    let now = state::now_ms();
 
     let mut admitted = 0_usize;
     let mut queue_full = 0_usize;
@@ -295,7 +295,7 @@ fn a_flood_from_a_whole_slash_twenty_four_costs_eight_rows_not_two_hundred_and_f
 #[test]
 fn the_ninth_address_is_refused_queue_full_and_the_eight_already_queued_can_still_reknock() {
     let mut value = PeerState::default();
-    let now = pair::now_ms();
+    let now = state::now_ms();
 
     for host in 1..=plan::MAX_PENDING_KNOCKS {
         let addr = format!("192.0.2.{host}");
@@ -359,7 +359,7 @@ fn the_ninth_address_is_refused_queue_full_and_the_eight_already_queued_can_stil
 #[test]
 fn eight_stalled_reservations_released_give_the_whole_queue_back() {
     let mut value = PeerState::default();
-    let now = pair::now_ms();
+    let now = state::now_ms();
 
     let mut held = Vec::new();
     for host in 1..=plan::MAX_PENDING_KNOCKS {
@@ -425,7 +425,7 @@ fn eight_stalled_reservations_released_give_the_whole_queue_back() {
 #[test]
 fn a_stalled_connections_release_never_deletes_the_row_that_coalesced_onto_it() {
     let mut value = PeerState::default();
-    let reserved_at = pair::now_ms();
+    let reserved_at = state::now_ms();
     let victim = "192.0.2.42";
 
     assert_eq!(
@@ -501,7 +501,7 @@ fn a_stalled_connections_release_never_deletes_the_row_that_coalesced_onto_it() 
 #[test]
 fn an_accepted_window_is_shut_at_the_instant_it_expires_and_before_it_opens() {
     let mut value = PeerState::default();
-    let opened = pair::now_ms();
+    let opened = state::now_ms();
     let accepted = instance(8);
     let addr = "192.0.2.77";
 
@@ -582,7 +582,7 @@ async fn an_xx_inside_a_window_that_has_run_out_gets_zero_bytes() {
     let node = Node::new("window-expiry-wire");
     let addr = serve(node.context()).await;
     let accepted = instance(9);
-    let now = pair::now_ms();
+    let now = state::now_ms();
 
     let expired = state::AcceptedInstance {
         instance_id: accepted,
@@ -643,7 +643,7 @@ async fn an_xx_inside_a_window_that_has_run_out_gets_zero_bytes() {
 fn reading_the_state_file_drops_a_window_that_has_run_out() {
     let node = Node::new("window-expire-load");
     let accepted = instance(10);
-    let now = pair::now_ms();
+    let now = state::now_ms();
 
     let mut value = PeerState::default();
     value.open_accepted_window(state::AcceptedInstance {

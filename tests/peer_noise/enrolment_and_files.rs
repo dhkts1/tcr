@@ -661,7 +661,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
             session.peer,
             &enroll,
             &matched,
-            pair::now_ms(),
+            tcr::peer::state::now_ms(),
             Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
         )
         .expect("the joiner is pinned and the invite is spent");
@@ -754,7 +754,7 @@ fn a_one_use_invite_refuses_its_second_joiner() {
         PeerId([4_u8; 32]),
         &enroll,
         &invite.secret,
-        pair::now_ms(),
+        tcr::peer::state::now_ms(),
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
     )
     .expect("the first joiner proves the invite and is pinned");
@@ -765,7 +765,7 @@ fn a_one_use_invite_refuses_its_second_joiner() {
         PeerId([5_u8; 32]),
         &enroll,
         &invite.secret,
-        pair::now_ms(),
+        tcr::peer::state::now_ms(),
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
     );
     let refusal = second.expect_err("a spent invite admits nobody");
@@ -810,7 +810,7 @@ fn a_hostile_enrolment_label_is_refused_and_spends_nothing() {
                 label: hostile.to_string(),
             },
             &invite.secret,
-            pair::now_ms(),
+            tcr::peer::state::now_ms(),
             Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
         )
         .expect_err("a label this node will not render is refused");
@@ -1109,7 +1109,7 @@ fn a_pin_takes_the_file_lock_and_an_enrolment_still_completes() {
             label: "attic-nuc".to_string(),
         },
         &invite.secret,
-        pair::now_ms(),
+        tcr::peer::state::now_ms(),
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
     )
     .expect("the registrar pins the joiner under its own lock");

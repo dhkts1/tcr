@@ -14,7 +14,7 @@
 //! peer port, so the kernel picks both and neither can be `3456`. The config
 //! and the peers file are in a fresh `tempfile::tempdir`, and the peers file's
 //! own directory is where the node key and the `peer-state.json` resolve
-//! (`serve::peer_state_path`), so no test here reads or writes anything under
+//! (`tcr::peer::state::peer_state_path`), so no test here reads or writes anything under
 //! the operator's config directory or cache directory. No account is
 //! configured, so nothing can reach
 //! Anthropic.
@@ -317,7 +317,7 @@ fn the_listener_and_the_beacon_name_one_boot_instance_id() {
     let context = tcr::peer::listener::SessionContext::new(
         &key,
         &peers,
-        &peer_serve::peer_state_path(&peers),
+        &tcr::peer::state::peer_state_path(&peers),
     );
 
     let boot = tcr::peer::id::boot_instance_id();
@@ -332,7 +332,7 @@ fn the_listener_and_the_beacon_name_one_boot_instance_id() {
     let second = tcr::peer::listener::SessionContext::new(
         &key,
         &peers,
-        &peer_serve::peer_state_path(&peers),
+        &tcr::peer::state::peer_state_path(&peers),
     );
     assert_eq!(second.instance_id(), boot);
 
@@ -355,8 +355,9 @@ fn the_listener_and_the_beacon_name_one_boot_instance_id() {
 /// comes to depend on whether the developer has a pairing window open.
 #[test]
 fn a_profiles_peer_state_file_is_the_one_beside_its_peers_file() {
-    let beside =
-        peer_serve::peer_state_path(std::path::Path::new("/tmp/tcr-unit-profile/tcr-peers.json"));
+    let beside = tcr::peer::state::peer_state_path(std::path::Path::new(
+        "/tmp/tcr-unit-profile/tcr-peers.json",
+    ));
     assert_eq!(
         beside,
         std::path::PathBuf::from("/tmp/tcr-unit-profile/peer-state.json")
@@ -366,7 +367,7 @@ fn a_profiles_peer_state_file_is_the_one_beside_its_peers_file() {
     // `state::default_path` owns, rather than putting runtime state in the
     // config directory.
     assert_eq!(
-        peer_serve::peer_state_path(&peer_config::default_path()),
+        tcr::peer::state::peer_state_path(&peer_config::default_path()),
         tcr::peer::state::default_path()
     );
 }
@@ -973,7 +974,7 @@ mod lender {
         let context = SessionContext::new(
             &lender_key,
             store.path(),
-            &serve::peer_state_path(store.path()),
+            &tcr::peer::state::peer_state_path(store.path()),
         )
         .with_lease_serving(Some(LeaseServing {
             ledger,
