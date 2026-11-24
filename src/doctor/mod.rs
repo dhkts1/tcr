@@ -56,15 +56,12 @@ use serde::Serialize;
 use tcr_status_wire::{CodexRoute, CodexTraffic};
 
 use crate::config_keys::UnknownKey;
+use crate::setup::{BASE_URL_VAR, routes_to_port};
 use crate::stats::GateReason;
 use crate::status::StatusPayload;
 
 /// The base URL Claude Code talks to when nothing sets one.
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-
-/// The environment variable Claude Code reads its base URL from, and the one
-/// `tcr run` exports onto its child.
-pub const BASE_URL_VAR: &str = "ANTHROPIC_BASE_URL";
 
 /// How many minutes of serving history the `requests10m:` line covers. Ten
 /// minutes because the question it answers is "is anything reaching this proxy
@@ -225,63 +222,6 @@ pub fn resolve_base_url(env_value: Option<&str>, home: &Path, cwd: &Path) -> Res
         },
     };
     Resolution { route, problems }
-}
-
-/// The host and port of an `http[s]://…` URL, without a URL parser.
-///
-/// Hand-rolled deliberately: this crate has no `url` dependency and adding one
-/// for two fields would be a new dependency for nothing. Scope is exactly what
-/// the caller needs: scheme, optional userinfo, host (bracketed IPv6
-/// included), optional port. Anything else returns `None` rather than a
-/// half-parsed guess.
-pub fn authority(url: &str) -> Option<(String, u16)> {
-    let (scheme, rest) = url.split_once("://")?;
-    let default_port = match scheme.to_ascii_lowercase().as_str() {
-        "http" => 80,
-        "https" => 443,
-        _ => return None,
-    };
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .filter(|part| !part.is_empty())?;
-    // Userinfo, if any, is everything before the LAST `@`.
-    let authority = match authority.rsplit_once('@') {
-        Some((_, after)) => after,
-        None => authority,
-    };
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (host, after) = rest.split_once(']')?;
-        let port = match after.strip_prefix(':') {
-            Some(digits) => digits.parse().ok()?,
-            None => default_port,
-        };
-        return Some((host.to_string(), port));
-    }
-    match authority.split_once(':') {
-        Some((host, digits)) => Some((host.to_string(), digits.parse().ok()?)),
-        None => Some((authority.to_string(), default_port)),
-    }
-}
-
-/// Is this URL one that reaches a proxy on THIS machine's `port`?
-///
-/// Loopback by address, not by spelling: `127.0.0.1`, `127.0.0.2`, `localhost`
-/// and `[::1]` all reach the same listener, and an operator who wrote any of
-/// them has a working route. A non-loopback host is another machine's proxy
-/// (or Anthropic), whatever port it names.
-pub fn routes_to_port(url: &str, port: u16) -> bool {
-    let Some((host, url_port)) = authority(url) else {
-        return false;
-    };
-    if url_port != port {
-        return false;
-    }
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<IpAddr>()
-        .is_ok_and(|address| address.is_loopback())
 }
 
 /// The process holding the proxy port.

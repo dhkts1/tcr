@@ -122,43 +122,6 @@ fn a_non_string_base_url_is_a_problem_not_a_value() {
     ));
 }
 
-#[test]
-fn authority_reads_host_and_port_including_ipv6_and_userinfo() {
-    assert_eq!(
-        authority("http://127.0.0.1:3456"),
-        Some(("127.0.0.1".to_string(), 3456))
-    );
-    assert_eq!(
-        authority("https://api.anthropic.com"),
-        Some(("api.anthropic.com".to_string(), 443))
-    );
-    assert_eq!(
-        authority("http://localhost/v1/messages?x=1"),
-        Some(("localhost".to_string(), 80))
-    );
-    assert_eq!(
-        authority("http://[::1]:3456/v1"),
-        Some(("::1".to_string(), 3456))
-    );
-    assert_eq!(
-        authority("http://user:pw@127.0.0.1:3456"),
-        Some(("127.0.0.1".to_string(), 3456))
-    );
-    assert_eq!(authority("api.anthropic.com"), None);
-    assert_eq!(authority("ftp://127.0.0.1:3456"), None);
-}
-
-#[test]
-fn routing_is_loopback_plus_the_configured_port() {
-    assert!(routes_to_port("http://127.0.0.1:3456", 3456));
-    assert!(routes_to_port("http://localhost:3456", 3456));
-    assert!(routes_to_port("http://[::1]:3456", 3456));
-    assert!(!routes_to_port("http://127.0.0.1:3457", 3456));
-    assert!(!routes_to_port("https://api.anthropic.com", 3456));
-    // Another machine's tcr on the same port is still not this proxy.
-    assert!(!routes_to_port("http://192.168.1.9:3456", 3456));
-}
-
 /// The enumeration half, against a listener this test process is holding:
 /// the pid reported must be this process. A holder that reads as `none`
 /// while something is demonstrably listening is the failure that makes the

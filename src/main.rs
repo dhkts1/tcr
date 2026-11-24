@@ -1141,7 +1141,7 @@ fn run_setup(args: SetupArgs) -> anyhow::Result<()> {
                 setup::install_settings(&homes, port, args.force)?
             };
             let path = change.path.display();
-            let var = tcr::doctor::BASE_URL_VAR;
+            let var = setup::BASE_URL_VAR;
             println!(
                 "{}",
                 match change.change {
