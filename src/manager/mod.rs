@@ -75,6 +75,9 @@ mod freshness;
 mod serving;
 mod sessions;
 pub(crate) use accounts::account_runtime::ResetTarget;
+pub(crate) use accounts::account_runtime::build_serving_client;
+#[cfg(test)]
+pub(crate) use accounts::account_runtime::fail_next_client_build;
 use accounts::account_runtime::match_listed;
 pub use accounts::account_runtime::{AccountRuntime, AccountStatus};
 pub use accounts::add_account::{AddAccountOutcome, AddPersist};
@@ -88,9 +91,6 @@ use serving::codex_traffic::{CodexRefusals, MinuteRing};
 pub use serving::exhaustion_hint::ExhaustionHint;
 pub use serving::in_flight::InFlightGuard;
 use serving::in_flight::WarmInFlightGuard;
-pub(crate) use serving::serving_client::build_serving_client;
-#[cfg(test)]
-pub(crate) use serving::serving_client::fail_next_client_build;
 use serving::serving_client::{MAX_SERVES_PER_CONNECTION, RecycleReason};
 use sessions::capped_map::{CappedMap, CappedSet};
 // The one TYPE that module owns and `proxy.rs` names: one minted token as the response path
@@ -394,6 +394,72 @@ pub struct DivertEpisode {
     /// The first destination, so the sticky overlay has a single preferred index
     /// without scanning the mask.
     pub sticky: usize,
+}
+
+/// A Codex token rotation not yet written back to the imported Codex login it came from.
+/// The account row carries it ([`AccountRuntime::pending_codex_writeback`]), the token flush
+/// persists it, and the refresh path publishes it and backs it off. It sits in this parent
+/// module, below all three, so the row's own field does not name the refresh code.
+#[derive(Clone)]
+pub(crate) struct PendingCodexWriteback {
+    expected_refresh: String,
+    tokens: Tokens,
+    retry_after_ms: i64,
+    failures: u8,
+}
+
+impl std::fmt::Debug for PendingCodexWriteback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingCodexWriteback")
+            .field("expected_refresh", &"<redacted>")
+            .field("tokens", &"<redacted>")
+            .finish()
+    }
+}
+
+impl PendingCodexWriteback {
+    pub(in crate::manager) fn from_config(account: &config::Account) -> Option<Self> {
+        match account.provider {
+            crate::provider::Provider::Anthropic => return None,
+            crate::provider::Provider::Codex => {}
+        }
+        account.codex_home.as_ref()?;
+        let record = account.extra.get(config::CODEX_SYNC_PENDING_KEY)?;
+        let expected_refresh = record.get("expectedRefreshSha256")?.as_str()?;
+        if expected_refresh.len() != 64 || !expected_refresh.bytes().all(|c| c.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some(Self {
+            expected_refresh: expected_refresh.to_string(),
+            tokens: Tokens {
+                id_token: record
+                    .get("idToken")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                access_token: account.access_token.clone(),
+                refresh_token: account.refresh_token.clone(),
+                expires_at_ms: account.expires_at.map_or(0, oauth::normalize_expires_at),
+            },
+            retry_after_ms: 0,
+            failures: 0,
+        })
+    }
+
+    pub(in crate::manager) fn record(&self) -> serde_json::Value {
+        let mut record = serde_json::json!({"expectedRefreshSha256": self.expected_refresh});
+        if let Some(id) = &self.tokens.id_token {
+            record["idToken"] = id.clone().into();
+        }
+        record
+    }
+
+    fn back_off(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+        let seconds = (5_i64 << self.failures.saturating_sub(1).min(6)).min(300);
+        self.retry_after_ms = crate::now_ms().saturating_add(seconds * 1000);
+    }
 }
 
 /// Owns all rotation state and the machinery to refresh tokens and reach upstream.
@@ -827,6 +893,37 @@ fn cooldown_elapsed(deadline_ms: Option<i64>, now_ms: i64) -> bool {
 }
 
 impl Manager {
+    /// `f` applied to account row `idx`, under a short read of the accounts
+    /// lock. `None` is the one answer for an index past the end, so no reader
+    /// decides on its own what a missing row means. `f` runs with the lock
+    /// held: it must not take `affinity` or any lock ordered before accounts.
+    pub(in crate::manager) fn account<R>(
+        &self,
+        idx: usize,
+        f: impl FnOnce(&AccountRuntime) -> R,
+    ) -> Option<R> {
+        self.accounts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(idx)
+            .map(f)
+    }
+
+    /// The Anthropic origin. A request's own origin, which depends on its provider, is
+    /// [`Self::upstream_for`].
+    pub fn upstream(&self) -> &str {
+        &self.upstream
+    }
+
+    /// The origin a request for `provider` is rewritten to. `upstream()` stays the Anthropic
+    /// accessor its existing callers (profile fetch, control identity) mean.
+    pub fn upstream_for(&self, provider: crate::provider::Provider) -> &str {
+        match provider {
+            crate::provider::Provider::Anthropic => &self.upstream,
+            crate::provider::Provider::Codex => &self.codex_upstream,
+        }
+    }
+
     /// Hard state of account `idx` — lets the proxy skip an account that a
     /// refresh just proved dead (`Error`) without wasting an upstream round-trip.
     pub fn account_status(&self, idx: usize) -> Option<AccountStatus> {

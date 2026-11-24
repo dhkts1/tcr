@@ -236,21 +236,6 @@ impl Manager {
         }
     }
 
-    /// The Anthropic origin. A request's own origin, which depends on its provider, is
-    /// [`Self::upstream_for`].
-    pub fn upstream(&self) -> &str {
-        &self.upstream
-    }
-
-    /// The origin a request for `provider` is rewritten to. `upstream()` stays the Anthropic
-    /// accessor its existing callers (profile fetch, control identity) mean.
-    pub fn upstream_for(&self, provider: crate::provider::Provider) -> &str {
-        match provider {
-            crate::provider::Provider::Anthropic => &self.upstream,
-            crate::provider::Provider::Codex => &self.codex_upstream,
-        }
-    }
-
     pub fn proxy_api_key(&self) -> Option<&str> {
         self.proxy_api_key.as_deref()
     }
@@ -297,18 +282,6 @@ impl Manager {
         Vec<crate::status::UnkeyedCount>,
     ) {
         self.unkeyed.wire()
-    }
-
-    /// `f` applied to account row `idx`, under a short read of the accounts
-    /// lock. `None` is the one answer for an index past the end, so no reader
-    /// decides on its own what a missing row means. `f` runs with the lock
-    /// held: it must not take `affinity` or any lock ordered before accounts.
-    pub(super) fn account<R>(&self, idx: usize, f: impl FnOnce(&AccountRuntime) -> R) -> Option<R> {
-        self.accounts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(idx)
-            .map(f)
     }
 
     /// Account `idx`'s OWN upstream-forwarding client — see
