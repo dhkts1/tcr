@@ -55,7 +55,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+use serde::Serialize;
 
 /// Whether this binary can act on `tailnet: "node"`: built with the
 /// `tailnet-node` feature, for the one Mac target the library supports.
@@ -68,6 +69,38 @@ pub const SUPPORTED: bool = cfg!(all(
     target_os = "macos",
     target_arch = "aarch64"
 ));
+
+/// `tcr peer tailnet --json`: the setting, whether this binary can act on
+/// `node`, and what the serving process last recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailnetReport {
+    /// The setting, as the peers file says now: the word as written, a word
+    /// this build does not know included.
+    pub mode: crate::peer::config::TailnetSetting,
+    /// Whether this binary was built with the `tailnet-node` cargo feature.
+    pub node_supported: bool,
+    /// What the serving process recorded, or `None` when none has.
+    /// Serialized as `null`, never left out: a reader tells "no server has
+    /// recorded one" from a missing key by this.
+    pub held: Option<crate::peer::state::TailnetRecord>,
+}
+
+impl TailnetReport {
+    /// The report for the peers file at `peers_path` and the state file
+    /// beside it.
+    pub fn read(peers_path: &Path, now_ms: i64) -> Result<Self> {
+        let file = crate::peer::config::read_or_default(peers_path)?;
+        let state_path = crate::peer::state::peer_state_path(peers_path);
+        let state = crate::peer::state::load(&state_path, now_ms)
+            .with_context(|| format!("reading {}", state_path.display()))?;
+        Ok(Self {
+            mode: file.tailnet,
+            node_supported: SUPPORTED,
+            held: state.tailnet,
+        })
+    }
+}
 
 /// How often the supervisor wakes: re-reads the mode and refreshes the record.
 pub const TICK: Duration = Duration::from_secs(10);

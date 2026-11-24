@@ -585,38 +585,6 @@ impl PeerState {
     }
 }
 
-/// `tcr peer tailnet --json`: the setting, whether this binary can act on
-/// `node`, and what the serving process last recorded.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TailnetReport {
-    /// The setting, as the peers file says now: the word as written, a word
-    /// this build does not know included.
-    pub mode: crate::peer::config::TailnetSetting,
-    /// Whether this binary was built with the `tailnet-node` cargo feature.
-    pub node_supported: bool,
-    /// What the serving process recorded, or `None` when none has.
-    /// Serialized as `null`, never left out: a reader tells "no server has
-    /// recorded one" from a missing key by this.
-    pub held: Option<TailnetRecord>,
-}
-
-impl TailnetReport {
-    /// The report for the peers file at `peers_path` and the state file
-    /// beside it.
-    pub fn read(peers_path: &Path, now_ms: i64) -> Result<Self> {
-        let file = crate::peer::config::read_or_default(peers_path)?;
-        let state_path = peer_state_path(peers_path);
-        let state = load(&state_path, now_ms)
-            .with_context(|| format!("reading {}", state_path.display()))?;
-        Ok(Self {
-            mode: file.tailnet,
-            node_supported: crate::peer::tailnet_node::SUPPORTED,
-            held: state.tailnet,
-        })
-    }
-}
-
 /// One knock waiting on the operator, as the Peers tab renders it.
 ///
 /// `addr` is the key: see [`PeerState::pending`]. `instance_id` and
@@ -2131,6 +2099,7 @@ fn holds_exactly(path: &Path, json: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer::tailnet_node::TailnetReport;
     use tracing_subscriber::layer::SubscriberExt as _;
 
     /// One captured tracing event: its level and its message, which is all

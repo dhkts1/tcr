@@ -159,7 +159,7 @@ fn run_peer_tailnet_with(
         }
     }
 
-    let report = peer::state::TailnetReport::read(&peers_path, peer::pair::now_ms())?;
+    let report = peer::tailnet_node::TailnetReport::read(&peers_path, peer::pair::now_ms())?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
