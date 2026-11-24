@@ -163,7 +163,7 @@ fn via_round_trips_through_the_peers_file() {
     );
     assert_eq!(
         ViaSetting::auto().setup_timeout(),
-        egress::CARRY_SETUP_TIMEOUT,
+        tcr::peer::config::CARRY_SETUP_TIMEOUT,
         "and an untuned setting is the constant"
     );
 

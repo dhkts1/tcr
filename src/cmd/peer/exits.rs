@@ -20,10 +20,10 @@ pub(super) fn run_peer_via(a: peer_cli::PeerViaArgs) -> anyhow::Result<()> {
     let lock = peer::config::FileLock::acquire(&peers_path)?;
     let file = peer::config::read_or_default(&peers_path)?;
     let asked = match a.setup_timeout_ms {
-        None => peer::egress::ViaSetting::parse(&a.target)?,
-        Some(ms) => peer::egress::ViaSetting::parse(&a.target)?.with_setup_timeout_ms(ms)?,
+        None => peer::config::ViaSetting::parse(&a.target)?,
+        Some(ms) => peer::config::ViaSetting::parse(&a.target)?.with_setup_timeout_ms(ms)?,
     };
-    if let peer::egress::ViaRoute::Pinned(peer_id) = &asked.route {
+    if let peer::config::ViaRoute::Pinned(peer_id) = &asked.route {
         let known = file.peers.iter().any(|row| row.node == *peer_id);
         if !known {
             anyhow::bail!(
@@ -56,17 +56,17 @@ pub(super) fn run_peer_via(a: peer_cli::PeerViaArgs) -> anyhow::Result<()> {
         println!("peer via: a carry gives a Mac {ms}ms to take it, then gives up");
     }
     match asked.route {
-        peer::egress::ViaRoute::Off => println!(
+        peer::config::ViaRoute::Off => println!(
             "peer via: off, this Mac never routes out through a peer, and a request \
              whose direct path fails gets exactly the answer it got before this \
              feature existed"
         ),
-        peer::egress::ViaRoute::Auto => println!(
+        peer::config::ViaRoute::Auto => println!(
             "peer via: auto carries a request through a trusted Mac only after the \
              direct path has failed with nothing having left this Mac, and the carry \
              is blind, the credential stays inside this Mac's own TLS"
         ),
-        peer::egress::ViaRoute::Pinned(peer_id) => println!(
+        peer::config::ViaRoute::Pinned(peer_id) => println!(
             "peer via: only {} is asked, and never any other Mac, a pin that stops \
              answering means no carry at all, which is the point of pinning one",
             peer_id.display()

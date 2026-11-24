@@ -163,7 +163,7 @@ pub use policy::{
 /// an unbounded `dial_handshake` and an unbounded wait for the reply, on the
 /// answer path of a live client's request, while the listener's own half
 /// ([`crate::peer::listener::HANDSHAKE_TIMEOUT`]) and the blind-egress carry
-/// ([`crate::peer::egress::CARRY_SETUP_TIMEOUT`]) each carry one. Per-hop
+/// ([`crate::peer::config::CARRY_SETUP_TIMEOUT`]) each carry one. Per-hop
 /// deadlines would sum to a bound no caller can state; the client is waiting on
 /// the total, so the total is what is bounded.
 ///
