@@ -619,7 +619,7 @@ fn an_unpinned_account_writes_no_egress_keys() {
 /// above `exhausted_or_fallback` in `src/proxy.rs`.
 #[test]
 fn the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead() {
-    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/proxy.rs"))
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/proxy/mod.rs"))
         .expect("the proxy's source is readable from the workspace root");
     let lines: Vec<&str> = source.lines().collect();
 
@@ -632,7 +632,7 @@ fn the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead() {
         .iter()
         .position(|line| line.starts_with("async fn exhausted_or_fallback("))
         .expect(
-            "positive control failed: no `exhausted_or_fallback` in src/proxy.rs, so the doc \
+            "positive control failed: no `exhausted_or_fallback` in src/proxy/mod.rs, so the doc \
              block below is measuring nothing. If the dry-fleet terminal was renamed, rename \
              it here too.",
         );

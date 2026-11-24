@@ -262,8 +262,11 @@ fn the_json_pairing_lines_are_exactly_these() {
 /// handshake or sit forever on a process that has already exited.
 #[test]
 fn the_announced_wait_is_the_deadline_the_command_keeps() {
-    let main = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
-        .expect("main.rs reads");
+    let main = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/cmd/peer/pairing.rs"
+    ))
+    .expect("src/cmd/peer/pairing.rs reads");
     assert!(
         main.contains("wait_seconds: tcr::peer::pair::PAIR_WAIT.as_secs()"),
         "the asking line no longer takes its wait from PAIR_WAIT, so the panel's deadline and \
@@ -278,15 +281,18 @@ fn the_announced_wait_is_the_deadline_the_command_keeps() {
 /// blocker this whole flag exists to close.
 #[test]
 fn every_refusal_is_announced_before_it_is_returned() {
-    let main = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
-        .expect("main.rs reads");
+    let main = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/cmd/peer/pairing.rs"
+    ))
+    .expect("src/cmd/peer/pairing.rs reads");
     let start = main
-        .find("PeerAction::Pair(a) => {")
-        .expect("the pair arm is still there");
+        .find("async fn run_peer_pair(")
+        .expect("the pair verb is still there");
     let arm = &main[start..];
     let end = arm
-        .find("PeerAction::Invite(a) => {")
-        .expect("the arm still ends where the next one begins");
+        .find("async fn run_peer_invite(")
+        .expect("the pair verb still ends where the invite verb begins");
     let arm = &arm[..end];
     assert_eq!(
         arm.matches("PairEvent::Refused").count(),
