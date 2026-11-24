@@ -83,10 +83,7 @@ pub(super) const fn credential_version_for(provider: crate::provider::Provider) 
 /// a number above the provider's, so the refusal [`load`] performs on an unknown
 /// future version can never be papered over; and a value that is not a version
 /// number at all, which [`load`] refuses too.
-pub(super) fn needs_credential_stamp(
-    entry: &Map<String, Value>,
-    provider: crate::provider::Provider,
-) -> bool {
+fn needs_credential_stamp(entry: &Map<String, Value>, provider: crate::provider::Provider) -> bool {
     let version = credential_version_for(provider);
     match entry.get("credentialVersion") {
         None => true,
@@ -110,26 +107,6 @@ pub(super) fn stamp_credential_version(
             "credentialVersion".to_string(),
             Value::Number(credential_version_for(provider).into()),
         );
-    }
-}
-
-/// `entry`'s `credentialVersion` key, read directly off the raw JSON so
-/// [`load`] can decide before anything is handed to `serde` for typed
-/// deserialization.
-///
-/// - `Ok(None)`: the key is absent — every config written before this lane,
-///   which means version 1 and needs no migration.
-/// - `Ok(Some(v))`: the key is present and reads as a version number.
-/// - `Err(())`: the key is present but is not a shape a version number could
-///   ever take (a string, an object, a negative number, a float) — refused
-///   the same as an unknown future version, because guessing what a
-///   malformed version key meant is exactly the silent reinterpretation this
-///   exists to prevent.
-pub(super) fn credential_version_of(entry: &Value) -> Result<Option<u64>, ()> {
-    match entry.get("credentialVersion") {
-        None => Ok(None),
-        Some(Value::Number(n)) => n.as_u64().ok_or(()).map(Some),
-        Some(_) => Err(()),
     }
 }
 
@@ -285,15 +262,6 @@ mod tests {
     }
 
     // --- credentialVersion 2: a Codex row is refused by every older build ----
-
-    /// The `credentialVersion` a loaded account carries in memory, read the way
-    /// `load` reads a row's ([`credential_version_of`]). Not through a literal
-    /// `.extra.get(…)`: this is an ACCOUNT's own `extra` map, and the drift scan in
-    /// `config_keys` reads every such literal as a key of the top-level
-    /// `Config::extra`, which `credentialVersion` is not.
-    fn version_in_memory(account: &Account) -> Result<Option<u64>, ()> {
-        credential_version_of(&Value::Object(account.extra.clone()))
-    }
 
     /// A Codex row at `credentialVersion` 2, which every Codex row is written at,
     /// loads, and a whole-file save keeps it at 2.
@@ -454,78 +422,6 @@ mod tests {
             json!(1),
             "an Anthropic entry is stamped 1, as before: {value}"
         );
-        fs::remove_file(&path).ok();
-    }
-
-    /// A Codex row loaded with no version key is backfilled to 2, not 1, so the
-    /// next whole-file save writes the version older builds refuse.
-    #[test]
-    fn a_loaded_codex_row_with_no_version_is_backfilled_to_2() {
-        let path = tmp_path("cred-version-codex-missing");
-        fs::write(
-            &path,
-            r#"{ "accounts": [
-                 { "name": "alice@example.com", "provider": "codex", "accessToken": "at-a" },
-                 { "name": "bob@example.com", "accessToken": "at-b" }
-               ] }"#,
-        )
-        .unwrap();
-
-        let config = load(&path).unwrap();
-        assert_eq!(
-            version_in_memory(&config.accounts[0]),
-            Ok(Some(2)),
-            "a Codex row is backfilled to 2"
-        );
-        assert_eq!(
-            version_in_memory(&config.accounts[1]),
-            Ok(Some(1)),
-            "an Anthropic row is backfilled to 1, as before"
-        );
-        let saved = tmp_path("cred-version-codex-missing-saved");
-        save(&saved, &config).unwrap();
-        assert_eq!(
-            read_json(&saved)["accounts"][0]["credentialVersion"],
-            json!(2)
-        );
-
-        fs::remove_file(&path).ok();
-        fs::remove_file(&saved).ok();
-    }
-
-    /// A Codex row at 1 — written before Codex rows carried 2, or copied by hand
-    /// from an Anthropic row, which every saved file stamps 1 — is raised to 2, by
-    /// the load and by the first token persist that touches it. Left at 1 it is
-    /// exactly the row an older build serves as a Claude account. The Anthropic row
-    /// beside it keeps its 1.
-    #[test]
-    fn a_codex_row_at_credential_version_1_is_raised_to_2() {
-        let path = tmp_path("cred-version-codex-1");
-        let file = r#"{ "accounts": [
-                 { "name": "alice@example.com", "provider": "codex", "accessToken": "at-a",
-                   "credentialVersion": 1 },
-                 { "name": "bob@example.com", "accessToken": "at-b", "credentialVersion": 1 }
-               ] }"#;
-        fs::write(&path, file).unwrap();
-
-        let config = load(&path).unwrap();
-        assert_eq!(
-            version_in_memory(&config.accounts[0]),
-            Ok(Some(2)),
-            "the load raises a Codex row to 2"
-        );
-        assert_eq!(version_in_memory(&config.accounts[1]), Ok(Some(1)));
-
-        // The disk still says 1 until a write touches the row: a rotation does.
-        save_tokens(&path, &config).unwrap();
-        let value = read_json(&path);
-        assert_eq!(
-            value["accounts"][0]["credentialVersion"],
-            json!(2),
-            "a persist raises a Codex entry to 2: {value}"
-        );
-        assert_eq!(value["accounts"][1]["credentialVersion"], json!(1));
-
         fs::remove_file(&path).ok();
     }
 

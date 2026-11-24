@@ -359,8 +359,6 @@ pub(super) fn read_json(path: &Path) -> Value {
         .expect("persisted config is valid JSON")
 }
 
-// --- save_disabled (the TUI's `d`/`e`, made durable) -------------------
-
 /// A file carrying keys the server does not model, plus a second account, so
 /// a targeted flag write can be checked for collateral damage.
 pub(super) const DISABLE_SAMPLE: &str = r#"{

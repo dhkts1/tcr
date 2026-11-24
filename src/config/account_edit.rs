@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use super::credential_version::stamp_credential_version;
 use super::edit::CODEX_SYNC_PENDING_KEY;
 use super::edit::{Edit, edit_document};
-use super::entry::{EntryMatch, locate_account_entry};
+use super::edit::{EntryMatch, locate_account_entry};
 use super::file::{read_document, write_atomic};
 use super::tokens::Credentials;
 use super::{Account, Config, ConfigError, ControlAccountRef};

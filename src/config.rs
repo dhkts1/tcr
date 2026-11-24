@@ -15,11 +15,9 @@ mod account_edit;
 mod color;
 mod credential_version;
 mod edit;
-mod entry;
 mod file;
 mod group_edit;
 mod load;
-mod rename;
 mod tokens;
 
 pub use account_edit::{
@@ -28,18 +26,17 @@ pub use account_edit::{
 pub use color::{ColorSource, best_readable_apca, derive_group_color, validate_hex_color};
 pub(crate) use edit::{CODEX_SYNC_PENDING_KEY, save_codex_token_sync_pending};
 pub use edit::{
-    ControlWrite, DisabledWrite, DocEdit, Edit, PlanWrite, RequestKeyWrite, read_request_key,
-    save_control_account, save_disabled, save_plan, save_request_key,
+    ControlWrite, DisabledWrite, DocEdit, Edit, GroupWrite, PlanWrite, RequestKeyWrite,
+    read_request_key, save_control_account, save_disabled, save_group_membership, save_plan,
+    save_request_key,
 };
 pub use file::save;
 pub(crate) use file::{Durability, read_document, write_atomic, write_atomic_with};
 pub use group_edit::{
-    GroupColorWrite, GroupControlWrite, GroupParkWrite, GroupReserveWrite, GroupWrite,
-    save_group_allow_control, save_group_color, save_group_membership, save_group_parked,
-    save_group_reserved,
+    GroupColorWrite, GroupControlWrite, GroupParkWrite, GroupReserveWrite,
+    save_group_allow_control, save_group_color, save_group_parked, save_group_reserved,
 };
 pub use load::{load, load_or_init};
-pub use rename::AccountRename;
 pub use tokens::{CredentialScope, save_settings, save_tokens, save_tokens_for};
 
 /// Typed config-layer errors: I/O vs malformed JSON stay distinguishable so a
@@ -68,7 +65,7 @@ pub(crate) fn default_codex_upstream() -> String {
 }
 
 /// The shared default-omission rule for config serialization, status and Codex routing.
-pub(crate) fn is_default_codex_upstream(value: &str) -> bool {
+fn is_default_codex_upstream(value: &str) -> bool {
     value == crate::provider::CODEX_UPSTREAM
 }
 
@@ -1150,6 +1147,18 @@ pub struct Config {
     /// second process would re-derive different names from the same duplicates.
     #[serde(skip)]
     pub rename_write_error: Option<String>,
+}
+
+/// One account [`load`] renamed to restore unique names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRename {
+    /// The duplicated name the entry carried on disk.
+    pub from: String,
+    /// The unique name it now carries, minted by [`crate::identity::mint_name`].
+    pub to: String,
+    /// The org the new name was derived from, for the log line. `None` when the
+    /// entry stored no org at all and the name fell through to a counter.
+    pub org: Option<String>,
 }
 
 impl Config {

@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 
 use super::credential_version::{stamp_credential_version, with_codex_credential_versions};
 use super::edit::CODEX_SYNC_PENDING_KEY;
-use super::entry::{DiskIdentity, provider_of_entry};
+use super::edit::{DiskIdentity, provider_of_entry};
 use super::file::{read_document, save, write_atomic};
 use super::{Account, Config, ConfigError};
 
