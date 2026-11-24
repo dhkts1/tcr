@@ -14,10 +14,11 @@
 //! So the peer code asks the manager, and this sibling module is where the
 //! manager answers. `pub(super)` reaches a sibling, which is the whole trick.
 //!
-//! **`src/manager/select.rs` changes by ZERO lines**, and that is the tripwire:
-//! if it changes by one, stop and re-read this comment. Explicitly permitted
-//! and not a trip: the single `mod peer_lend;` line in `src/manager/mod.rs`,
-//! because a sibling module that is not declared does not exist.
+//! **`effective_threshold`'s visibility in `src/manager/select/mod.rs` does not
+//! widen**, and that is the tripwire: if it widens, stop and re-read this
+//! comment. Explicitly permitted and not a trip: the single `mod peer_lend;`
+//! line in `src/manager/mod.rs`, because a sibling module that is not
+//! declared does not exist.
 //!
 //! # The reserve is being GENERALISED, not transcribed
 //!
@@ -327,7 +328,7 @@ impl Manager {
     ///
     /// # The reserve is applied to EVERY account, which is the generalisation
     ///
-    /// `pool_pick_respects_control_reserve` (`src/manager/select.rs:2303`)
+    /// `pool_pick_respects_control_reserve` (`src/manager/select/pool.rs:23`)
     /// applies `effective_threshold` to the control account alone, because there
     /// the reserve means "leave the control account headroom against our own
     /// pool traffic". Here it means "leave every account headroom against
@@ -580,7 +581,7 @@ impl crate::peer::serve::WindowUtilization for Manager {
     ///    [`crate::proxy::GROUP_HEADER_NAME`] **for exactly the groups the
     ///    picker holds strictly, which is the whole of the picker's own rule
     ///    and not half of it**: `select_with_group`'s `strict_group`
-    ///    (`src/manager/select.rs:1148`) is
+    ///    (`src/manager/select/with_group.rs:110`) is
     ///    `reserved_groups.contains(g) || !spill_groups.contains(g)`, a
     ///    RESERVED group ignores `spillToPool` and stays strict. This used to
     ///    read the spill half alone and so refused a reserved-and-spill group
@@ -1063,7 +1064,7 @@ mod tests {
     ///   answer;
     /// - a group that is BOTH reserved and spill is enforceable, because the
     ///   picker's own rule is `reserved || !spill` and a reserved group
-    ///   ignores `spillToPool` (`src/manager/select.rs:1139`). This arm
+    ///   ignores `spillToPool` (`src/manager/groups.rs:55`). This arm
     ///   asserted the opposite once: reading the spill half alone
     ///   refused a lease the picker would have held perfectly;
     /// - a named account set is enforceable for the labels this fleet carries,
