@@ -193,7 +193,7 @@ pub(super) async fn run_peer_invite(a: peer_cli::PeerInviteArgs) -> anyhow::Resu
         let id = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
         tcr::peer::state::add_ask(
             &peer_state_path(&path),
-            tcr::peer::state::PendingAsk {
+            tcr::peer::ask::PendingAsk {
                 id,
                 public,
                 private: secret,

@@ -14,10 +14,10 @@
 //! and cleans up itself.
 
 use tcr::log_err::LogErr as _;
-use tcr::peer::ask::{self, Ask};
+use tcr::peer::ask::{self, Ask, PendingAsk};
 use tcr::peer::noise;
 use tcr::peer::pair::JoinToken;
-use tcr::peer::state::{self, PeerState, PendingAsk};
+use tcr::peer::state::{self, PeerState};
 use tcr_peer_wire::PeerId;
 
 fn scratch(tag: &str) -> std::path::PathBuf {

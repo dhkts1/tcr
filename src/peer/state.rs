@@ -26,6 +26,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{InstanceId, Lease, PeerId};
 
+use crate::peer::ask::PendingAsk;
+
 /// This file's own format version. See the module docs: additive fields do NOT
 /// bump it.
 pub const FORMAT_VERSION: u32 = 1;
@@ -906,38 +908,6 @@ pub const MAX_PENDING_KNOCKS: usize = 8;
 /// over at most eight live one-time keypairs, not a PSK the registrar must
 /// trial-decrypt message 1 against.
 pub const MAX_OUTSTANDING_ASKS: usize = 8;
-
-/// One outstanding ask: a one-time keypair minted for a sealed exchange, with
-/// the clock that sweeps it. Lives in the state file, never the peers file:
-/// it is transient, it has a deadline, and losing it costs one re-minted ask,
-/// where losing the peers file costs every pin.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct PendingAsk {
-    /// This row's id, so `spend_ask` can remove exactly the row that opened,
-    /// even when two rows are live at once.
-    pub id: u64,
-    /// The public half, printed as the ask a friend pastes into a chat.
-    pub public: [u8; 32],
-    /// The private half. Never logged, never printed: see [`Debug`] below.
-    pub private: [u8; 32],
-    /// The absolute deadline, swept by [`PeerState::expire`] like every other
-    /// transient row with a clock.
-    pub until_ms: i64,
-}
-
-impl std::fmt::Debug for PendingAsk {
-    /// The private key is deliberately not printed, [`MovedKeys`]'s own move
-    /// (`src/peer/moved.rs:148-153`) for the same reason: a `{:?}` in a log
-    /// line is how a secret reaches a file that keeps scrollback.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingAsk")
-            .field("id", &self.id)
-            .field("public", &"[32 bytes]")
-            .field("private", &"(withheld)")
-            .field("until_ms", &self.until_ms)
-            .finish()
-    }
-}
 
 /// The coalescing key for a knock: the peer's IP, with the ephemeral source
 /// port dropped.
