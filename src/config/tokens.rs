@@ -40,7 +40,7 @@ use super::{Account, Config, ConfigError};
 /// A credential that cannot be placed on a SPECIFIC entry — the entry is
 /// malformed, or its identity matches nothing the server loaded — is never a
 /// reason to fail the whole write: every other account's token still lands, and
-/// [`merge_tokens`] hands back what it could not place so each miss is warned
+/// [`Config::merge_tokens`] hands back what it could not place so each miss is warned
 /// about by name here. Silence was the old defect: the merge skipped, the write
 /// succeeded, `Ok(())` came back, and the caller's error branch never ran.
 ///
@@ -51,8 +51,8 @@ use super::{Account, Config, ConfigError};
 /// document leaves the file byte-identical apart from the credential fields.
 /// The credential fields, named once.
 ///
-/// [`merge_tokens`] writes exactly these from memory (via [`Credentials`]) and
-/// [`carry_disk_credentials`] preserves exactly these from disk. A key in one
+/// [`Config::merge_tokens`] writes exactly these from memory (via [`Credentials`]) and
+/// [`Config::carry_disk_credentials`] preserves exactly these from disk. A key in one
 /// list and not the other is a field that silently stops being protected, which
 /// is what `the_credential_key_list_matches_what_merge_tokens_writes` exists to
 /// catch.
@@ -92,45 +92,44 @@ pub fn save_settings(path: &Path, config: &Config) -> Result<(), ConfigError> {
         // would have worked before working.
         return save(path, config);
     };
-    carry_disk_credentials(&mut doc, &disk, &config.accounts);
+    config.carry_disk_credentials(&mut doc, &disk);
     write_atomic(path, &serde_json::to_string_pretty(&doc)?)
 }
 
-/// Copy each matched account's credential fields from `disk` into `doc`.
-///
-/// Matched with [`plan_merge`], the same unambiguous-in-both-directions pairing
-/// [`merge_tokens`] uses, so the two cannot drift on what counts as the same
-/// account. An entry the planner declines to pair keeps whatever the snapshot
-/// held, which is what it would have had anyway.
-fn carry_disk_credentials(
-    doc: &mut Map<String, Value>,
-    disk: &Map<String, Value>,
-    memory: &[Account],
-) {
-    let Some(entries) = disk.get("accounts").and_then(Value::as_array) else {
-        return;
-    };
-    let Some(out) = doc.get_mut("accounts").and_then(Value::as_array_mut) else {
-        return;
-    };
-    for (entry, (_, plan)) in entries.iter().zip(plan_merge(entries, memory)) {
-        let EntryPlan::Write(position) = plan else {
-            continue;
+impl Config {
+    /// Copy each matched account's credential fields from `disk` into `doc`.
+    ///
+    /// Matched with [`plan_merge`], the same unambiguous-in-both-directions pairing
+    /// [`Config::merge_tokens`] uses, so the two cannot drift on what counts as the
+    /// same account. An entry the planner declines to pair keeps whatever the
+    /// snapshot held, which is what it would have had anyway.
+    fn carry_disk_credentials(&self, doc: &mut Map<String, Value>, disk: &Map<String, Value>) {
+        let Some(entries) = disk.get("accounts").and_then(Value::as_array) else {
+            return;
         };
-        let (Some(from), Some(Value::Object(into))) = (entry.as_object(), out.get_mut(position))
-        else {
-            continue;
+        let Some(out) = doc.get_mut("accounts").and_then(Value::as_array_mut) else {
+            return;
         };
-        for key in CREDENTIAL_KEYS {
-            match from.get(key) {
-                Some(value) => {
-                    into.insert(key.to_string(), value.clone());
-                }
-                // Absent on disk, so absent here. Leaving the snapshot's value
-                // would reinstate a credential the user or another process
-                // deliberately removed.
-                None => {
-                    into.remove(key);
+        for (entry, (_, plan)) in entries.iter().zip(plan_merge(entries, &self.accounts)) {
+            let EntryPlan::Write(position) = plan else {
+                continue;
+            };
+            let (Some(from), Some(Value::Object(into))) =
+                (entry.as_object(), out.get_mut(position))
+            else {
+                continue;
+            };
+            for key in CREDENTIAL_KEYS {
+                match from.get(key) {
+                    Some(value) => {
+                        into.insert(key.to_string(), value.clone());
+                    }
+                    // Absent on disk, so absent here. Leaving the snapshot's value
+                    // would reinstate a credential the user or another process
+                    // deliberately removed.
+                    None => {
+                        into.remove(key);
+                    }
                 }
             }
         }
@@ -207,7 +206,7 @@ pub fn save_tokens_for(
             return save(path, memory);
         }
     };
-    let report = match merge_tokens(&mut doc, memory, scope) {
+    let report = match memory.merge_tokens(&mut doc, scope) {
         Ok(report) => report,
         Err(reason) => {
             tracing::warn!(
@@ -383,130 +382,132 @@ impl MergeReport {
     }
 }
 
-/// Overwrite the credential fields of every account present in BOTH `memory` and
-/// the on-disk `doc`, matched by identity and never by position. Nothing else in
-/// the document is touched.
-///
-/// Iterating the ON-DISK list and pulling tokens in gives both removal semantics
-/// for free: an account the user deleted from the file is never resurrected (it
-/// has no entry to write into), and an account on disk the server never loaded
-/// is left alone (no memory match).
-///
-/// Every path that declines to write a credential is REPORTED, never silent: the
-/// per-entry misses come back in the [`MergeReport`], and a document with no
-/// usable `accounts` list comes back as [`Unmergeable`] so the caller can fall
-/// back to writing the config whole rather than lose every rotated token in the
-/// one write. A skipped entry is not an error for the others — the merge runs to
-/// the end of the list either way.
-fn merge_tokens(
-    doc: &mut Map<String, Value>,
-    memory: &Config,
-    scope: CredentialScope,
-) -> Result<MergeReport, Unmergeable> {
-    // Plan against an IMMUTABLE view first. Deciding one entry at a time under a
-    // mutable borrow is what made the old first-match resolution unfixable: the
-    // assignment for entry N depends on which accounts the other entries claim,
-    // which a single mutable pass cannot see. Same split, and for the same reason,
-    // as `locate_account_entry` vs `find_account_entry`.
-    let Some(accounts) = doc.get("accounts") else {
-        return Err(Unmergeable::Missing);
-    };
-    let Some(entries) = accounts.as_array() else {
-        return Err(Unmergeable::NotAnArray);
-    };
-    let plan = plan_merge(entries, &memory.accounts);
+impl Config {
+    /// Overwrite the credential fields of every account present in BOTH this config
+    /// and the on-disk `doc`, matched by identity and never by position. Nothing else
+    /// in the document is touched.
+    ///
+    /// Iterating the ON-DISK list and pulling tokens in gives both removal semantics
+    /// for free: an account the user deleted from the file is never resurrected (it
+    /// has no entry to write into), and an account on disk the server never loaded
+    /// is left alone (no memory match).
+    ///
+    /// Every path that declines to write a credential is REPORTED, never silent: the
+    /// per-entry misses come back in the [`MergeReport`], and a document with no
+    /// usable `accounts` list comes back as [`Unmergeable`] so the caller can fall
+    /// back to writing the config whole rather than lose every rotated token in the
+    /// one write. A skipped entry is not an error for the others — the merge runs to
+    /// the end of the list either way.
+    fn merge_tokens(
+        &self,
+        doc: &mut Map<String, Value>,
+        scope: CredentialScope,
+    ) -> Result<MergeReport, Unmergeable> {
+        // Plan against an IMMUTABLE view first. Deciding one entry at a time under a
+        // mutable borrow is what made the old first-match resolution unfixable: the
+        // assignment for entry N depends on which accounts the other entries claim,
+        // which a single mutable pass cannot see. Same split, and for the same reason,
+        // as `locate_account_entry` vs `find_account_entry`.
+        let Some(accounts) = doc.get("accounts") else {
+            return Err(Unmergeable::Missing);
+        };
+        let Some(entries) = accounts.as_array() else {
+            return Err(Unmergeable::NotAnArray);
+        };
+        let plan = plan_merge(entries, &self.accounts);
 
-    let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) else {
-        // The immutable read above already proved both of these; this is the
-        // total-function tail, not a reachable outcome.
-        return Err(Unmergeable::Missing);
-    };
+        let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) else {
+            // The immutable read above already proved both of these; this is the
+            // total-function tail, not a reachable outcome.
+            return Err(Unmergeable::Missing);
+        };
 
-    let mut report = MergeReport::default();
-    // Which loaded accounts found a home, so the ones that did not can be named
-    // afterwards — a rename shows up here as well as in `skipped`.
-    let mut placed = vec![false; memory.accounts.len()];
+        let mut report = MergeReport::default();
+        // Which loaded accounts found a home, so the ones that did not can be named
+        // afterwards — a rename shows up here as well as in `skipped`.
+        let mut placed = vec![false; self.accounts.len()];
 
-    for (index, (entry, (name, plan))) in accounts.iter_mut().zip(plan).enumerate() {
-        let position = match plan {
-            EntryPlan::Skip(reason) => {
+        for (index, (entry, (name, plan))) in accounts.iter_mut().zip(plan).enumerate() {
+            let position = match plan {
+                EntryPlan::Skip(reason) => {
+                    report.skipped.push(SkippedEntry {
+                        index,
+                        name,
+                        reason,
+                    });
+                    continue;
+                }
+                EntryPlan::Write(position) => position,
+            };
+            // Not this write's account. NOT a `skipped` entry: that list means "a
+            // credential we meant to write and could not", and every one of those is
+            // warned about as a consumed single-use token. Declining to write an
+            // account we never rotated is the opposite of a loss.
+            if !scope.covers(position) {
+                report.out_of_scope += 1;
+                continue;
+            }
+            // A `Write` plan only comes from an entry the planner parsed, so both of
+            // these hold by construction.
+            let (Some(object), Some(fresh)) = (entry.as_object_mut(), self.accounts.get(position))
+            else {
+                continue;
+            };
+            let credentials = Credentials {
+                access_token: &fresh.access_token,
+                refresh_token: fresh.refresh_token.as_deref(),
+                expires_at: fresh.expires_at,
+            };
+            let Ok(Value::Object(fields)) = serde_json::to_value(&credentials) else {
                 report.skipped.push(SkippedEntry {
                     index,
                     name,
-                    reason,
+                    reason: SkipReason::CredentialEncoding,
                 });
                 continue;
-            }
-            EntryPlan::Write(position) => position,
-        };
-        // Not this write's account. NOT a `skipped` entry: that list means "a
-        // credential we meant to write and could not", and every one of those is
-        // warned about as a consumed single-use token. Declining to write an
-        // account we never rotated is the opposite of a loss.
-        if !scope.covers(position) {
-            report.out_of_scope += 1;
-            continue;
-        }
-        // A `Write` plan only comes from an entry the planner parsed, so both of
-        // these hold by construction.
-        let (Some(object), Some(fresh)) = (entry.as_object_mut(), memory.accounts.get(position))
-        else {
-            continue;
-        };
-        let credentials = Credentials {
-            access_token: &fresh.access_token,
-            refresh_token: fresh.refresh_token.as_deref(),
-            expires_at: fresh.expires_at,
-        };
-        let Ok(Value::Object(fields)) = serde_json::to_value(&credentials) else {
-            report.skipped.push(SkippedEntry {
-                index,
-                name,
-                reason: SkipReason::CredentialEncoding,
-            });
-            continue;
-        };
-        object.extend(fields);
-        match fresh.provider {
-            crate::provider::Provider::Anthropic => {}
-            crate::provider::Provider::Codex => {
-                let key = CODEX_SYNC_PENDING_KEY;
-                match fresh.extra.get(key) {
-                    Some(value) => {
-                        object.insert(key.to_string(), value.clone());
-                    }
-                    None => {
-                        object.remove(key);
+            };
+            object.extend(fields);
+            match fresh.provider {
+                crate::provider::Provider::Anthropic => {}
+                crate::provider::Provider::Codex => {
+                    let key = CODEX_SYNC_PENDING_KEY;
+                    match fresh.extra.get(key) {
+                        Some(value) => {
+                            object.insert(key.to_string(), value.clone());
+                        }
+                        None => {
+                            object.remove(key);
+                        }
                     }
                 }
             }
+
+            // Stamp the version on every entry this write actually touches, since
+            // nothing else in the live path does — see [`CREDENTIAL_VERSION`]'s
+            // doc-comment — at the version of the account's own provider: the
+            // pairing above never crosses providers, so it is the entry's too.
+            // Backfill only, except that a Codex entry below its version is raised
+            // (see [`needs_credential_stamp`]); a number above the provider's is
+            // never touched, so this can never paper over the refusal `load`
+            // performs on an unknown future version.
+            stamp_credential_version(object, fresh.provider);
+            if let Some(seen) = placed.get_mut(position) {
+                *seen = true;
+            }
         }
 
-        // Stamp the version on every entry this write actually touches, since
-        // nothing else in the live path does — see [`CREDENTIAL_VERSION`]'s
-        // doc-comment — at the version of the account's own provider: the
-        // pairing above never crosses providers, so it is the entry's too.
-        // Backfill only, except that a Codex entry below its version is raised
-        // (see [`needs_credential_stamp`]); a number above the provider's is
-        // never touched, so this can never paper over the refusal `load`
-        // performs on an unknown future version.
-        stamp_credential_version(object, fresh.provider);
-        if let Some(seen) = placed.get_mut(position) {
-            *seen = true;
-        }
+        // In-scope only: an account this write was never going to touch is not
+        // "absent from disk", it is none of this write's business.
+        report.absent_from_disk = self
+            .accounts
+            .iter()
+            .enumerate()
+            .zip(&placed)
+            .filter(|((position, _), seen)| scope.covers(*position) && !**seen)
+            .map(|((_, account), _)| account.name.clone())
+            .collect();
+        Ok(report)
     }
-
-    // In-scope only: an account this write was never going to touch is not
-    // "absent from disk", it is none of this write's business.
-    report.absent_from_disk = memory
-        .accounts
-        .iter()
-        .enumerate()
-        .zip(&placed)
-        .filter(|((position, _), seen)| scope.covers(*position) && !**seen)
-        .map(|((_, account), _)| account.name.clone())
-        .collect();
-    Ok(report)
 }
 
 /// What the read-only planning pass decided about one on-disk entry.
@@ -890,7 +891,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = merge_tokens(&mut doc, &memory, CredentialScope::All).unwrap();
+        let report = memory.merge_tokens(&mut doc, CredentialScope::All).unwrap();
 
         assert_eq!(
             report.skipped,
@@ -1035,7 +1036,7 @@ mod tests {
 
         let mut doc: Map<String, Value> = serde_json::from_str(malformed).unwrap();
         assert_eq!(
-            merge_tokens(&mut doc, &memory, CredentialScope::All),
+            memory.merge_tokens(&mut doc, CredentialScope::All),
             Err(Unmergeable::Missing),
             "the caller must be told, not handed a silently untouched document"
         );
@@ -1069,7 +1070,7 @@ mod tests {
 
         let mut doc: Map<String, Value> = serde_json::from_str(malformed).unwrap();
         assert_eq!(
-            merge_tokens(&mut doc, &memory, CredentialScope::All),
+            memory.merge_tokens(&mut doc, CredentialScope::All),
             Err(Unmergeable::NotAnArray)
         );
 
@@ -1103,7 +1104,8 @@ mod tests {
         .unwrap();
 
         let mut doc = read_document(&path).unwrap();
-        let report = merge_tokens(&mut doc, &memory, CredentialScope::All)
+        let report = memory
+            .merge_tokens(&mut doc, CredentialScope::All)
             .expect("the document has an accounts array");
         assert_eq!(
             report.skipped,
@@ -1156,7 +1158,8 @@ mod tests {
         .unwrap();
 
         let mut doc = read_document(&path).unwrap();
-        let report = merge_tokens(&mut doc, &memory, CredentialScope::All)
+        let report = memory
+            .merge_tokens(&mut doc, CredentialScope::All)
             .expect("the document has an accounts array");
         assert_eq!(
             report.skipped,
@@ -1218,7 +1221,8 @@ mod tests {
         .unwrap();
 
         let mut doc = read_document(&path).unwrap();
-        let report = merge_tokens(&mut doc, &memory, CredentialScope::All)
+        let report = memory
+            .merge_tokens(&mut doc, CredentialScope::All)
             .expect("the document has an accounts array");
         assert!(
             report.skipped.is_empty(),
@@ -1313,7 +1317,9 @@ mod tests {
         .unwrap();
 
         let mut doc: Map<String, Value> = serde_json::from_str(disk).unwrap();
-        let report = merge_tokens(&mut doc, &codex_memory, CredentialScope::All).unwrap();
+        let report = codex_memory
+            .merge_tokens(&mut doc, CredentialScope::All)
+            .unwrap();
         assert_eq!(
             doc["accounts"][0]["refreshToken"],
             json!("rt-anthropic"),
@@ -1337,7 +1343,9 @@ mod tests {
         )
         .unwrap();
         let mut doc: Map<String, Value> = serde_json::from_str(disk).unwrap();
-        merge_tokens(&mut doc, &anthropic_memory, CredentialScope::All).unwrap();
+        anthropic_memory
+            .merge_tokens(&mut doc, CredentialScope::All)
+            .unwrap();
         assert_eq!(
             doc["accounts"][0]["refreshToken"],
             json!("rt-anthropic-rotated"),
@@ -1366,7 +1374,9 @@ mod tests {
                      "accessToken": "at-old", "refreshToken": "rt-old" } ] }"#,
         )
         .unwrap();
-        let report = merge_tokens(&mut typo, &memory, CredentialScope::All).unwrap();
+        let report = memory
+            .merge_tokens(&mut typo, CredentialScope::All)
+            .unwrap();
         assert_eq!(
             typo["accounts"][0]["refreshToken"],
             json!("rt-old"),
@@ -1387,7 +1397,9 @@ mod tests {
                      "accessToken": "at-old", "refreshToken": "rt-old" } ] }"#,
         )
         .unwrap();
-        merge_tokens(&mut control, &memory, CredentialScope::All).unwrap();
+        memory
+            .merge_tokens(&mut control, CredentialScope::All)
+            .unwrap();
         assert_eq!(control["accounts"][0]["refreshToken"], json!("rt-rotated"));
     }
 
@@ -1494,7 +1506,8 @@ mod tests {
             serde_json::from_str(two_account_file()).expect("fixture parses");
         let memory: Config = serde_json::from_str(two_account_file()).expect("fixture loads");
 
-        let report = merge_tokens(&mut doc, &memory, CredentialScope::Only(0))
+        let report = memory
+            .merge_tokens(&mut doc, CredentialScope::Only(0))
             .expect("the document has an accounts array");
 
         assert_eq!(

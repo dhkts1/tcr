@@ -116,7 +116,7 @@ pub enum AccountWrite {
     /// this is what permanently stops a legacy no-org entry from loosely
     /// matching every org variant of that person forever). `priority`,
     /// `disabled`, `switchThreshold`, and any unmodelled `extra` key are
-    /// untouched, exactly as [`merge_tokens`] leaves them.
+    /// untouched, exactly as [`Config::merge_tokens`] leaves them.
     Updated,
     /// More than one on-disk entry carries this identity; nothing was written.
     /// Same refusal as [`DisabledWrite::Ambiguous`], for the same reason: a
