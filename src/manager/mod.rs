@@ -1175,7 +1175,9 @@ pub struct Manager {
     /// [`Self::assemble`] the moment the `Arc` exists. Unset means "built some other
     /// way": the refresh then runs inline, exactly as it did before.
     me: std::sync::OnceLock<std::sync::Weak<Self>>,
-    accounts: RwLock<Vec<AccountRuntime>>,
+    /// An `Arc` so an [`InFlightGuard`] can hold the account table it decrements
+    /// without holding the whole manager.
+    accounts: Arc<RwLock<Vec<AccountRuntime>>>,
     /// Lazily allocated gates for append-only account slots. The registry lock
     /// is released before awaiting a gate; unrelated accounts never queue together.
     usage_gates: Mutex<HashMap<usize, Arc<AsyncMutex<()>>>>,
@@ -1575,19 +1577,18 @@ impl Drop for WarmInFlightGuard<'_> {
 /// Modeled on [`WarmInFlightGuard`]; the count lives under the accounts write-lock
 /// (no second lock — preserves the no-lock-nesting discipline).
 ///
-/// Holds an owned `Arc<Manager>` (not a borrow) so the guard is `'static` and can be
-/// MOVED into a streamed response body — its Drop then fires at stream completion
-/// rather than at handler return. The shared `Arc` is the one the proxy already
-/// threads into the handler; no second lock and no detached counter are introduced.
+/// Holds an owned `Arc` of the manager's account table (not a borrow) so the guard is
+/// `'static` and can be MOVED into a streamed response body — its Drop then fires at
+/// stream completion rather than at handler return. The `Arc` shares the manager's own
+/// table and its one lock; no second lock and no detached counter are introduced.
 pub struct InFlightGuard {
-    manager: Arc<Manager>,
+    accounts: Arc<RwLock<Vec<AccountRuntime>>>,
     idx: usize,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         let mut accounts = self
-            .manager
             .accounts
             .write()
             .unwrap_or_else(PoisonError::into_inner);
@@ -1779,7 +1780,7 @@ impl Manager {
                     .map(|_| crate::forecast::Calibration::default())
                     .collect(),
             ),
-            accounts: RwLock::new(accounts),
+            accounts: Arc::new(RwLock::new(accounts)),
             usage,
             refresher,
             prober,
@@ -2373,7 +2374,7 @@ impl Manager {
             self.recycle_client(idx, RecycleReason::ServeBudget);
         }
         InFlightGuard {
-            manager: Arc::clone(self),
+            accounts: Arc::clone(&self.accounts),
             idx,
         }
     }

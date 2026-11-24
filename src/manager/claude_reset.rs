@@ -215,7 +215,9 @@ impl Manager {
                 }
                 (idx, row.org_uuid.clone())
             };
-            let identity = BoundAccount::at(self, idx).ok_or(ClaudeResetError::Unavailable)?;
+            let identity = self
+                .bound_account(idx)
+                .ok_or(ClaudeResetError::Unavailable)?;
             let org = org.filter(|org| !org.is_empty()).ok_or_else(|| {
                 ClaimFailure::because(ClaudeResetError::Auth, "no organization on the row".into())
             })?;
@@ -324,11 +326,12 @@ impl Manager {
             )
         })??;
         let (idx, identity, guard, outcome, kind, resets_left) = claimed;
-        let usage_refreshed = if identity.is_current(self, idx) && !self.mutation_is_released() {
+        let usage_refreshed = if self.is_still_bound(idx, &identity) && !self.mutation_is_released()
+        {
             timeout_at(deadline, self.probe_account_unlocked(idx))
                 .await
                 .unwrap_or(false)
-                && identity.is_current(self, idx)
+                && self.is_still_bound(idx, &identity)
         } else {
             false
         };

@@ -33,25 +33,26 @@ impl BoundAccount {
             org_name: row.org_name.clone(),
         }
     }
+}
 
-    pub(super) fn at(manager: &Manager, idx: usize) -> Option<Self> {
-        manager
-            .accounts
+impl Manager {
+    /// The identity row `idx` holds now, or `None` once it is removed.
+    pub(super) fn bound_account(&self, idx: usize) -> Option<BoundAccount> {
+        self.accounts
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(idx)
             .filter(|row| !row.removed)
-            .map(Self::of)
+            .map(BoundAccount::of)
     }
 
-    pub(super) fn is_current(&self, manager: &Manager, idx: usize) -> bool {
-        Self::at(manager, idx).as_ref() == Some(self)
+    /// Whether row `idx` still holds the identity `identity` was taken from.
+    pub(super) fn is_still_bound(&self, idx: usize, identity: &BoundAccount) -> bool {
+        self.bound_account(idx).as_ref() == Some(identity)
     }
-}
 
-impl Manager {
     pub(super) fn usage_gate(&self, idx: usize) -> Option<Arc<AsyncMutex<()>>> {
-        BoundAccount::at(self, idx)?;
+        self.bound_account(idx)?;
         let mut gates = self
             .usage_gates
             .lock()
@@ -257,7 +258,7 @@ impl Manager {
     /// The one probe implementation, called only while owning the row's usage gate.
     /// True means this call applied usage, not merely that a previous probe succeeded.
     pub(super) async fn probe_account_unlocked(&self, idx: usize) -> bool {
-        let Some(identity) = BoundAccount::at(self, idx) else {
+        let Some(identity) = self.bound_account(idx) else {
             return false;
         };
         // An `Error` row only reaches here once its recovery backoff elapsed (see
@@ -280,18 +281,18 @@ impl Manager {
             return false;
         };
 
-        if !identity.is_current(self, idx) {
+        if !self.is_still_bound(idx, &identity) {
             return false;
         }
         let result = self.prober.probe(credential).await;
         let result = match result {
             Err(err) if err.status == Some(401) => {
                 // Token rejected: force a refresh and retry once with the new one.
-                if !identity.is_current(self, idx) {
+                if !self.is_still_bound(idx, &identity) {
                     return false;
                 }
                 self.ensure_fresh_force(idx).await;
-                if !identity.is_current(self, idx) {
+                if !self.is_still_bound(idx, &identity) {
                     return false;
                 }
                 match self
@@ -307,7 +308,7 @@ impl Manager {
 
         self.backfill_plan_if_unknown(idx).await;
 
-        if !identity.is_current(self, idx) {
+        if !self.is_still_bound(idx, &identity) {
             return false;
         }
         match result {

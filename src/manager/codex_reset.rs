@@ -284,11 +284,12 @@ impl Manager {
             })
             .await
             .map_err(ResetFailure::deadline)??;
-        let usage_refreshed = if identity.is_current(self, idx) && !self.mutation_is_released() {
+        let usage_refreshed = if self.is_still_bound(idx, &identity) && !self.mutation_is_released()
+        {
             timeout_at(deadline, self.probe_account_unlocked(idx))
                 .await
                 .unwrap_or(false)
-                && identity.is_current(self, idx)
+                && self.is_still_bound(idx, &identity)
         } else {
             false
         };
@@ -304,7 +305,7 @@ impl Manager {
         idx: usize,
         identity: &BoundAccount,
     ) -> Result<(), CodexResetError> {
-        if self.mutation_is_released() || !identity.is_current(self, idx) {
+        if self.mutation_is_released() || !self.is_still_bound(idx, identity) {
             Err(CodexResetError::Unavailable)
         } else {
             Ok(())
