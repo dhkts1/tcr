@@ -100,9 +100,7 @@ pub use sessions::bound_tokens::MintedToken;
 // Re-exported so unit F's replay harness (`tests/`) can call the SAME
 // production predicate rather than a reimplementation — see
 // the divert-budget design notes §6. Import path: `tcr::manager::{divert_verdict, DivertVerdict}`.
-pub use select::{
-    DivertVerdict, PoolPass, RoutingCandidates, divert_verdict, effective_fable_threshold,
-};
+pub use select::{DivertVerdict, PoolPass, RoutingCandidates, divert_verdict};
 
 /// How long the session-affinity flusher waits after a change before it saves, so a burst of
 /// changes is one write. It is also the most of a new or moved pin a SIGKILL can lose: a
@@ -519,7 +517,7 @@ pub struct Manager {
     /// Override for the Fable weekly bucket alone — see
     /// [`crate::config::Config::fable_weekly_threshold`]. `None` means "use
     /// whatever threshold the site would apply anyway", resolved by
-    /// [`crate::manager::select::effective_fable_threshold`] at the two call
+    /// [`crate::config::effective_fable_threshold`] at the two call
     /// sites ([`Self::model_blocked`], [`Self::account_gate`]'s `FableWeekly`
     /// push). Snapshotted at construction, same restart-to-take-effect contract
     /// as `global_threshold` above.
