@@ -15,6 +15,7 @@ mod account_edit;
 mod color;
 mod credential_version;
 mod edit;
+mod extra_keys;
 mod file;
 mod group_edit;
 mod identity_roster;
