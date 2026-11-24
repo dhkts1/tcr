@@ -281,7 +281,6 @@ impl Manager {
                 .accounts
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
-            let fresh_control = fresh.control_account.as_ref().map(|c| c.name().to_string());
             for (idx, account) in accounts.iter_mut().enumerate() {
                 let probe = crate::identity::probe(
                     account.provider,
@@ -329,7 +328,7 @@ impl Manager {
                     // entry holds whatever tokens it held, and the next refresh decides.
                     account.codex_home.clone_from(&matched.codex_home);
                     changed.push(format!("{}: back in the config", account.name));
-                    if fresh_control.as_deref() == Some(account.name.as_str()) {
+                    if fresh.is_control_account(&account.name) {
                         let mut control = self
                             .control_idx
                             .write()

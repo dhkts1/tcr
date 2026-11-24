@@ -7,8 +7,8 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use super::edit::CODEX_SYNC_PENDING_KEY;
-use super::{Account, Config, EgressPin};
-use crate::identity::Resolved;
+use super::{Account, Config, ControlAccountRef, EgressPin};
+use crate::identity::{Match, Queryable, Resolved};
 
 impl Config {
     /// The one row of [`Self::accounts`] that `probe` names, by
@@ -194,5 +194,27 @@ impl Config {
             .filter(|(_, account)| account.has_unsupported_strict_peer_exit())
             .map(|(idx, _)| idx)
             .collect()
+    }
+
+    /// Whether `controlAccount` names `name`.
+    pub fn is_control_account(&self, name: &str) -> bool {
+        self.control_account.as_ref().map(ControlAccountRef::name) == Some(name)
+    }
+
+    /// Name `target` as the control account, or none.
+    pub fn name_control_account(&mut self, target: Option<&Account>) {
+        self.control_account = target.map(ControlAccountRef::from);
+    }
+
+    /// Where in `rows` the account `controlAccount` names sits, by exact name
+    /// ([`crate::identity::match_one`]), beside the name it was matched on.
+    /// `None` when the config names no control account.
+    pub fn match_control_account<T: Queryable>(&self, rows: &[T]) -> Option<(&str, Match)> {
+        self.control_account.as_ref().map(|identity| {
+            (
+                identity.name(),
+                crate::identity::match_one(rows, identity.name()),
+            )
+        })
     }
 }

@@ -158,9 +158,7 @@ impl Manager {
         let outcome = self.write_through(
             path,
             |path| config::save_control_account(path, target.as_ref()),
-            |config| {
-                config.control_account = target.as_ref().map(config::ControlAccountRef::from);
-            },
+            |config| config.name_control_account(target.as_ref()),
         );
         let name = target.as_ref().map(|a| a.name.as_str());
         match outcome {

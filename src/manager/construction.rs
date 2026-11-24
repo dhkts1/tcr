@@ -75,13 +75,13 @@ impl Manager {
         let reset_urgency_tier_ms =
             i64::from(config.reset_urgency_tier_hours).saturating_mul(3_600_000);
 
-        let control_idx = config.control_account.as_ref().and_then(|identity| {
-            match crate::identity::match_one(&accounts[..], identity.name()) {
+        let control_idx = config.match_control_account(&accounts[..]).and_then(|(name, found)| {
+            match found {
                 crate::identity::Match::One(idx) => Some(idx),
                 crate::identity::Match::None => {
                     let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
                     tracing::error!(
-                        control_account = %identity.name(), available = ?names,
+                        control_account = %name, available = ?names,
                         "controlAccount did not match any account — running with NO control account"
                     );
                     None
@@ -93,7 +93,7 @@ impl Manager {
                 // while the account that resolved it live stays unpinned.
                 crate::identity::Match::Ambiguous(candidates) => {
                     tracing::error!(
-                        control_account = %identity.name(), candidates = ?candidates,
+                        control_account = %name, candidates = ?candidates,
                         "controlAccount matches more than one account — refusing to guess, running with NO control account"
                     );
                     None
