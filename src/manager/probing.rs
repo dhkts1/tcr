@@ -13,6 +13,57 @@ const PROBE_MAX_RETRY_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
 /// "endpoint is down" signal a sustained 5xx run is.
 pub(crate) const SUSTAINED_5XX_THRESHOLD: u32 = 3;
 
+/// A snapshot for rechecking identity after awaits; never formatted or logged.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct BoundAccount {
+    name: String,
+    provider: crate::provider::Provider,
+    account: Option<String>,
+    org: Option<String>,
+    org_name: Option<String>,
+}
+
+impl BoundAccount {
+    pub(super) fn of(row: &AccountRuntime) -> Self {
+        Self {
+            name: row.name.clone(),
+            provider: row.provider,
+            account: row.account_uuid.clone(),
+            org: row.org_uuid.clone(),
+            org_name: row.org_name.clone(),
+        }
+    }
+
+    pub(super) fn at(manager: &Manager, idx: usize) -> Option<Self> {
+        manager
+            .accounts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(idx)
+            .filter(|row| !row.removed)
+            .map(Self::of)
+    }
+
+    pub(super) fn is_current(&self, manager: &Manager, idx: usize) -> bool {
+        Self::at(manager, idx).as_ref() == Some(self)
+    }
+}
+
+impl Manager {
+    pub(super) fn usage_gate(&self, idx: usize) -> Option<Arc<AsyncMutex<()>>> {
+        BoundAccount::at(self, idx)?;
+        let mut gates = self
+            .usage_gates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Some(Arc::clone(
+            gates
+                .entry(idx)
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        ))
+    }
+}
+
 impl Manager {
     /// Record the health of account `idx`'s most recent probe. A failing probe
     /// stamps a visible status + message (never a silently-frozen bar), while an
@@ -206,7 +257,7 @@ impl Manager {
     /// The one probe implementation, called only while owning the row's usage gate.
     /// True means this call applied usage, not merely that a previous probe succeeded.
     pub(super) async fn probe_account_unlocked(&self, idx: usize) -> bool {
-        let Some(identity) = codex_reset::BoundAccount::at(self, idx) else {
+        let Some(identity) = BoundAccount::at(self, idx) else {
             return false;
         };
         // An `Error` row only reaches here once its recovery backoff elapsed (see

@@ -1,4 +1,5 @@
 //! Confirmed named-account redemption. Probes share the row's gate but never call consume.
+use super::probing::BoundAccount;
 use super::*;
 use crate::provider::Provider;
 use std::time::Duration;
@@ -101,42 +102,6 @@ impl ResetFailure {
     }
 }
 
-/// A snapshot for rechecking identity after awaits; never formatted or logged.
-#[derive(Clone, PartialEq, Eq)]
-pub(super) struct BoundAccount {
-    name: String,
-    provider: Provider,
-    account: Option<String>,
-    org: Option<String>,
-    org_name: Option<String>,
-}
-
-impl BoundAccount {
-    fn of(row: &AccountRuntime) -> Self {
-        Self {
-            name: row.name.clone(),
-            provider: row.provider,
-            account: row.account_uuid.clone(),
-            org: row.org_uuid.clone(),
-            org_name: row.org_name.clone(),
-        }
-    }
-
-    pub(super) fn at(manager: &Manager, idx: usize) -> Option<Self> {
-        manager
-            .accounts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(idx)
-            .filter(|row| !row.removed)
-            .map(Self::of)
-    }
-
-    pub(super) fn is_current(&self, manager: &Manager, idx: usize) -> bool {
-        Self::at(manager, idx).as_ref() == Some(self)
-    }
-}
-
 /// The accepted local key alphabet, with a small fixed bound.
 pub fn valid_reset_key(key: &str) -> bool {
     !key.is_empty()
@@ -172,19 +137,6 @@ impl From<ConsumeCode> for CodexResetOutcome {
 }
 
 impl Manager {
-    pub(super) fn usage_gate(&self, idx: usize) -> Option<Arc<AsyncMutex<()>>> {
-        BoundAccount::at(self, idx)?;
-        let mut gates = self
-            .usage_gates
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        Some(Arc::clone(
-            gates
-                .entry(idx)
-                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
-        ))
-    }
-
     /// The only path that consumes. The caller must have confirmed operator input.
     /// Queueing, refresh and consume share one deadline. A known result survives a
     /// post-read timeout, and the gate stays held until that read finishes or expires.
