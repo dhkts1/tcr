@@ -471,7 +471,7 @@ impl Quota {
         self.window(bucket).and_then(|w| w.live_reset(now))
     }
 
-    fn window(&self, bucket: QuotaBucket) -> Option<QuotaWindow> {
+    const fn window(&self, bucket: QuotaBucket) -> Option<QuotaWindow> {
         match bucket {
             QuotaBucket::FiveHour => self.five_hour,
             QuotaBucket::SevenDay => self.seven_day,
