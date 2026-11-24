@@ -1,4 +1,4 @@
-//! In-flight caps, throttle slots, pacing, and the lifetime of each account's upstream serving client.
+//! In-flight caps, throttle slots, pacing, and the lifetime of the upstream serving client.
 
 use super::*;
 

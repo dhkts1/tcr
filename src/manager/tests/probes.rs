@@ -1,4 +1,4 @@
-//! Usage probing: plan backfill, probe credentials, and how probe readings and failures land on a row.
+//! Usage probing: plan backfill, probe credentials, and how readings and failures land on a row.
 
 use super::*;
 

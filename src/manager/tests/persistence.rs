@@ -1,4 +1,4 @@
-//! Writing account state back to the config file: token rotations, disable toggles, and what each persist outcome reports.
+//! Writing account state back to the config file: rotated tokens, disable toggles, outcomes.
 
 use super::*;
 

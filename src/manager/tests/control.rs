@@ -1,4 +1,4 @@
-//! The lock and control accounts: how assembly resolves them, how routing prefers them, and set_control_by_query.
+//! The lock and control accounts: assembly, routing preference, `set_control_by_query`.
 
 use super::*;
 

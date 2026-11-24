@@ -1,4 +1,4 @@
-//! Codex rows beside Anthropic ones: refusals, weekly windows, provider routing, and the Codex traffic rings.
+//! Codex rows beside Anthropic ones: refusals, weekly windows, provider routing, traffic rings.
 
 use super::*;
 

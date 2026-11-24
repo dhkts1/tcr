@@ -1,4 +1,4 @@
-//! Group policy: preferences, reserved, parked and control-allowed groups, and hot reload of the group config.
+//! Group policy: preferences, reserved, parked and control-allowed groups, and hot reload.
 
 use super::*;
 

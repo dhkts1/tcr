@@ -1,4 +1,4 @@
-//! add_or_update_account: matching a submission to a row, appending, priorities, and what it persists.
+//! `add_or_update_account`: matching a submission to a row, appending, priorities, persisting.
 
 use super::*;
 

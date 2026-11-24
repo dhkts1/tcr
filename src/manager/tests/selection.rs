@@ -1,4 +1,4 @@
-//! Account selection: priority tiers, eligibility, Fable bucket exhaustion, and revalidation when every account is over threshold.
+//! Account selection: priority tiers, eligibility, Fable exhaustion, and revalidation.
 
 use super::*;
 

@@ -1,4 +1,4 @@
-//! Session affinity: pins, diverts, holds and re-keys, and the prompt-cache TTL settings they protect.
+//! Session affinity: pins, diverts, holds and re-keys, and the prompt-cache TTL settings.
 
 use super::*;
 
