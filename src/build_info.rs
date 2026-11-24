@@ -37,7 +37,25 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::restart::HANDOFF_SINCE;
+/// The first tcr release with listener handoff, the version every "use
+/// `--replace` if it runs tcr X or newer" message names. A macro so `concat!`
+/// can build a constant message from it; read it as [`HANDOFF_SINCE`]
+/// everywhere else.
+///
+/// Copies no Rust constant can reach, to change with this one:
+/// - `apps/macos/Sources/TcrBarCore/ServerController.swift` (two messages)
+/// - `apps/macos/Tests/TcrBarTests/TakeoverIntentTests.swift`
+/// - `docs/troubleshooting.md` (a `build_info` test checks it names this
+///   version)
+#[macro_export]
+macro_rules! handoff_since {
+    () => {
+        "1.2.17"
+    };
+}
+
+/// [`handoff_since!`] as a constant.
+pub const HANDOFF_SINCE: &str = handoff_since!();
 
 /// What a build or checkout field reads when git could not be consulted: a
 /// source tarball with no `.git`, no git on `PATH`, an unborn HEAD.

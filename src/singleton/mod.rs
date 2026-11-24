@@ -849,7 +849,7 @@ fn stand_down_message(port: u16, pid: u32) -> String {
          alone and exiting without binding. Replacing it would wipe its session→account pin map \
          and cold-start every live session's prompt cache, the most expensive event in this \
          system. Stop it, or use --replace if it runs tcr {} or newer.",
-        crate::restart::HANDOFF_SINCE
+        crate::build_info::HANDOFF_SINCE
     )
 }
 

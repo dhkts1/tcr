@@ -35,7 +35,7 @@ fn a_wedged_embedded_incumbent_is_not_told_to_run_replace() {
     let advice = wedged_incumbent_recovery(singleton::ProxyKind::Tcr);
     assert!(
         advice.contains("Stop the proxy explicitly")
-            && advice.contains(&format!("tcr {} or newer", tcr::restart::HANDOFF_SINCE)),
+            && advice.contains(&format!("tcr {} or newer", build_info::HANDOFF_SINCE)),
         "standalone recovery must explain when handoff is available: {advice}"
     );
 }

@@ -2,13 +2,11 @@
 //! status read and the incumbent probe.
 
 use super::*;
+use crate::build_info::HANDOFF_SINCE;
 #[test]
 fn the_restart_hint_names_the_first_version_with_handoff() {
     assert!(RESTART_HINT.contains("stop it"));
-    assert!(RESTART_HINT.contains(&format!(
-        "if it runs tcr {} or newer",
-        crate::restart::HANDOFF_SINCE
-    )));
+    assert!(RESTART_HINT.contains(&format!("if it runs tcr {HANDOFF_SINCE} or newer")));
 }
 /// A minimal valid live server config: the port, no accounts, no api-key.
 fn add_route_config(port: u16) -> Config {

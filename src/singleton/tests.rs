@@ -4,7 +4,7 @@
 fn the_stand_down_line_names_the_first_version_with_handoff() {
     assert!(stand_down_message(12345, 42).contains(&format!(
         "if it runs tcr {} or newer",
-        crate::restart::HANDOFF_SINCE
+        crate::build_info::HANDOFF_SINCE
     )));
 }
 use super::*;
