@@ -471,8 +471,11 @@ fn a_payload_from_a_server_with_no_peers_block_still_parses() {
     });
     let payload: tcr::status::StatusPayload =
         serde_json::from_value(old).expect("an old server's payload still parses");
+    // Read back through the wire, where an empty mesh is no key or an empty list.
+    let wire = serde_json::to_value(&payload).expect("the payload re-serializes");
     assert!(
-        payload.peers.is_empty(),
+        wire.get("peers")
+            .is_none_or(|peers| peers == &serde_json::json!([])),
         "absent reads as an empty mesh, never as a fabricated one"
     );
     assert_eq!(
@@ -504,9 +507,10 @@ fn the_peers_block_round_trips_through_the_status_payload() {
     });
     let text = serde_json::to_string(&payload).expect("the payload serializes");
     let back: tcr::status::StatusPayload = serde_json::from_str(&text).expect("and parses back");
-    assert_eq!(back.peers.len(), 1);
+    let back = serde_json::to_value(&back).expect("re-serializes");
+    assert_eq!(back["peers"].as_array().map(Vec::len), Some(1));
     assert_eq!(
-        serde_json::to_value(&back.peers).expect("re-serializes"),
+        back["peers"],
         serde_json::to_value(&derived).expect("re-serializes"),
         "byte-for-byte the same block after a full round trip"
     );
