@@ -893,7 +893,7 @@ final class AccountHealthTests: XCTestCase {
             .deletingLastPathComponent()  // Tests -> apps/macos
             .deletingLastPathComponent()  // apps/macos -> apps
             .deletingLastPathComponent()  // apps -> repo root
-        let rustSource = repoRoot.appendingPathComponent("src/manager/mod.rs")
+        let rustSource = repoRoot.appendingPathComponent("src/manager/accounts/account_runtime.rs")
         let contents = try String(contentsOf: rustSource, encoding: .utf8)
         // The arm is spelled `Self::Error` inside `impl AccountStatus` (clippy's `use_self`)
         // and `AccountStatus::Error` outside it; either spelling maps the same token.

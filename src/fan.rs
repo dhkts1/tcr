@@ -145,6 +145,13 @@ impl FanFile {
         };
         Ok(Saved { desired, hold })
     }
+
+    /// The process this file says holds the fans, unless that is `pid`.
+    fn held_by_other_than(self, pid: u32) -> Option<u32> {
+        self.hold
+            .map(|hold| hold.writer_pid)
+            .filter(|&writer| writer != pid)
+    }
 }
 
 /// Read `fan.json`. Missing is Auto, quietly; anything else that stops it is
@@ -231,10 +238,29 @@ impl FileStore {
         if self.known.as_ref() == Some(&on_disk) {
             return None;
         }
-        on_disk
-            .hold
-            .map(|hold| hold.writer_pid)
-            .filter(|&writer| writer != self.pid)
+        on_disk.held_by_other_than(self.pid)
+    }
+
+    /// The newest command number given out so far: where the controller and
+    /// the first snapshot start counting.
+    fn newest_command(&self) -> u64 {
+        *self.sent.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The handle that numbers commands on this store's counter, so every
+    /// save persists the newest one sent.
+    fn handle(
+        &self,
+        tx: Sender<Input>,
+        shown: Arc<Mutex<Snapshot>>,
+        done: mpsc::Receiver<()>,
+    ) -> FanHandle {
+        FanHandle {
+            tx,
+            shown,
+            sent: Arc::clone(&self.sent),
+            done: Mutex::new(done),
+        }
     }
 }
 
@@ -524,8 +550,7 @@ impl FanHandle {
 pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
     let (store, saved) = FileStore::open(file, std::process::id());
     let desired = saved.as_ref().map_or(FanDesired::Auto, |s| s.desired);
-    let sent = Arc::clone(&store.sent);
-    let commands_before = *sent.lock().unwrap_or_else(PoisonError::into_inner);
+    let commands_before = store.newest_command();
     let (tx, rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let shown = Arc::new(Mutex::new(Snapshot {
@@ -540,6 +565,7 @@ pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
     let published = Arc::clone(&shown);
     let after_panic = Arc::clone(&shown);
     let events = tx.clone();
+    let handle = store.handle(tx, shown, done_rx);
     std::thread::Builder::new()
         .name("tcr-fan".into())
         .spawn(move || {
@@ -568,12 +594,7 @@ pub fn start(file: PathBuf) -> std::io::Result<Arc<FanHandle>> {
                 // Nobody waits on the stop: the handle is gone.
             }
         })?;
-    Ok(Arc::new(FanHandle {
-        tx,
-        shown,
-        sent,
-        done: Mutex::new(done_rx),
-    }))
+    Ok(Arc::new(handle))
 }
 
 /// Run the controller; a panic on its thread publishes
@@ -961,8 +982,8 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         let shown = Arc::new(Mutex::new(snapshot(State::Off, &[], None)));
         let published = Arc::clone(&shown);
-        let sent = Arc::clone(&store.sent);
-        let commands_before = *sent.lock().unwrap();
+        let commands_before = store.newest_command();
+        let fan = Arc::new(store.handle(tx, shown, done_rx));
         let controller = Controller::new(
             Parts {
                 helper: machine.clone(),
@@ -981,12 +1002,6 @@ mod tests {
         let thread = std::thread::spawn(move || {
             controller.run();
             done_tx.send(()).unwrap();
-        });
-        let fan = Arc::new(FanHandle {
-            tx,
-            shown,
-            sent,
-            done: Mutex::new(done_rx),
         });
         tokio::time::timeout(Duration::from_secs(2), async {
             while fan.row().state != FanStateRow::Holding {

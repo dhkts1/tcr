@@ -22,6 +22,7 @@ on:
       - scripts/check-e2e-first-run-safe.sh
       - src/claude_code_login.rs
       - src/config.rs
+      - src/config/**
       - .github/workflows/e2e-install.yml
 
 permissions:

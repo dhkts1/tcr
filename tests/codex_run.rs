@@ -136,6 +136,20 @@ impl Fixture {
             .current_dir(self.home.path());
         command
     }
+
+    /// Put a fake `codex` at `TCR_CODEX_BIN` that prints each argument it gets on a line.
+    fn install_echo_codex(&self) {
+        let codex = self.home.path().join("fake-codex");
+        std::fs::write(&codex, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Write `text` as codex's own `config.toml` under `CODEX_HOME`; its path.
+    fn write_codex_config(&self, text: &str) -> PathBuf {
+        let path = self.home.path().join(".codex/config.toml");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
 }
 
 impl Drop for Fixture {
@@ -179,9 +193,7 @@ fn the_codex_status_stub_accepts_delayed_request_headers() {
 #[test]
 fn a_pooled_codex_launch_gives_shell_tools_direct_defaults() {
     let fixture = Fixture::new(true);
-    let codex = fixture.home.path().join("fake-codex");
-    std::fs::write(&codex, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
-    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.install_echo_codex();
     let before = std::fs::read(&fixture.config).unwrap();
     let caller_override = "shell_environment_policy.set.HTTPS_PROXY=\"http://proxy.example:3999\"";
     let output = fixture
@@ -280,12 +292,9 @@ fn an_older_proxy_keeps_the_configured_codex_doctor_verdict() {
 #[test]
 fn shell_defaults_preserve_corporate_proxies_and_explicit_config_set_entries() {
     let fixture = Fixture::new(true);
-    let codex = fixture.home.path().join("fake-codex");
-    std::fs::write(&codex, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
-    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let policy = fixture.home.path().join(".codex/config.toml");
+    fixture.install_echo_codex();
     let policy_text = "[shell_environment_policy]\ninherit = 'none'\n[shell_environment_policy.set]\nHTTPS_PROXY = 'http://configured.example:8080'\nSENTINEL = 'keep'\n";
-    std::fs::write(&policy, policy_text).unwrap();
+    let policy = fixture.write_codex_config(policy_text);
     let output = fixture
         .command()
         .args(["run", "--codex", "--config"])

@@ -39,6 +39,45 @@ pub fn default_path() -> PathBuf {
     crate::paths::cache_dir().peer_state_file()
 }
 
+/// The runtime-state file that belongs with `peers_path`: the pairing window,
+/// the knock queue, the mutes and the bans.
+///
+/// The DEFAULT peers file lives in the config directory and its state file in
+/// the cache directory, a split [`crate::peer::state::default_path`] already
+/// owns, so the default is never derived here. Only an explicit `--peers` (or a
+/// `--config` that resolves a peers file beside it) moves the state file with
+/// it, which is what makes one argument select a whole profile and what stops a
+/// test writing the operator's real `peer-state.json`.
+///
+/// # There is a second copy of this, and it is not deleted
+///
+/// `src/main.rs`'s private `peer_state_path` is the same six lines, in the part
+/// of that file the `ls`, `pair` and `pending` verbs read rather than
+/// `lend`/`share`/`allow`. Nothing makes it call this one yet, so the two
+/// agree line for line,
+/// and this doc is where a reader learns there are two.
+pub fn peer_state_path(peers_path: &Path) -> PathBuf {
+    if peers_path == crate::peer::config::default_path() {
+        return default_path();
+    }
+    match peers_path.parent() {
+        Some(parent) => parent.join("peer-state.json"),
+        None => default_path(),
+    }
+}
+
+/// Unix milliseconds.
+///
+/// Public because `tcr peer pair` opens the pairing window and the listener
+/// compares that deadline: both have to read the same clock, and a second
+/// spelling of "now" between the writer and the reader of one deadline is the
+/// kind of drift that shows up as a window that is open on one side only.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or_default(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+}
+
 /// What survives a restart.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -507,7 +546,7 @@ impl TailnetReport {
     /// beside it.
     pub fn read(peers_path: &Path, now_ms: i64) -> Result<Self> {
         let file = crate::peer::config::read_or_default(peers_path)?;
-        let state_path = crate::peer::serve::peer_state_path(peers_path);
+        let state_path = peer_state_path(peers_path);
         let state = load(&state_path, now_ms)
             .with_context(|| format!("reading {}", state_path.display()))?;
         Ok(Self {
@@ -968,6 +1007,38 @@ impl PeerState {
                 + self.asks.len())
     }
 
+    /// Drop every row a load must not hand back at `now_ms` (leases and
+    /// borrowed leases past their deadline, and what [`Self::expire`] ages
+    /// out), and count what is left for the "peer state restored" line.
+    fn restore(&mut self, now_ms: i64) -> RestoreCounts {
+        let total = self.leases.len();
+        self.leases.retain(|row| row.lease.expires_at_ms > now_ms);
+        let restored = self.leases.len();
+        // The borrowed rows age out on the ledger rows' rule and are counted into
+        // the same two numbers: a borrower whose lease TTL ran out while the
+        // process was down has to re-ask, which is the same fact "expired" already
+        // names on the lending side. `borrowed` is reported separately in the log
+        // line so an operator can tell which direction a restore came back in.
+        let borrowed_total = self.borrowed.len();
+        self.borrowed.retain(|row| row.lease.expires_at_ms > now_ms);
+        let borrowed = self.borrowed.len();
+        // Knocks, mutes and accepted windows age out on the same absolute-deadline
+        // rule the leases do, and dropping them HERE is what makes every reader of
+        // this file agree: the listener, `tcr peer pending` and the panel all load
+        // through this function, so an expired row is never something one of them
+        // sees and another does not.
+        let aged_out = self.expire(now_ms);
+        let expired = total - restored + aged_out + (borrowed_total - borrowed);
+        RestoreCounts {
+            restored,
+            borrowed,
+            expired,
+            pending: self.pending.len(),
+            muted: self.muted.len(),
+            banned: self.banned.len(),
+        }
+    }
+
     /// Remove one outstanding ask by id, `true` if a row was there to remove.
     ///
     /// Called in the same locked write as a successful open
@@ -977,6 +1048,28 @@ impl PeerState {
         let before = self.asks.len();
         self.asks.retain(|ask| ask.id != id);
         self.asks.len() != before
+    }
+
+    /// Add one freshly minted ask, unless [`MAX_OUTSTANDING_ASKS`] are still
+    /// live at `now_ms`: an expired row does not spend the cap, so it is
+    /// dropped before the count is taken.
+    pub fn add_ask(&mut self, ask: PendingAsk, now_ms: i64) {
+        self.asks.retain(|row| now_ms < row.until_ms);
+        if self.asks.len() < MAX_OUTSTANDING_ASKS {
+            self.asks.push(ask);
+        }
+    }
+
+    /// Try `pasted` against every live ask, and spend the first one that
+    /// opens it. See [`crate::peer::ask::open_reply`].
+    pub fn open_and_spend_ask(
+        &mut self,
+        pasted: &str,
+        now_ms: i64,
+    ) -> std::result::Result<crate::peer::ask::Opened, crate::peer::ask::ReplyRefusal> {
+        let (opened, id) = crate::peer::ask::open_reply(&self.asks, pasted, now_ms)?;
+        self.spend_ask(id);
+        Ok(opened)
     }
 
     /// Whether `addr` is muted right now.
@@ -1182,7 +1275,11 @@ impl PeerState {
     /// see is dropped: this is a replace, not a merge, because a Mac that
     /// stopped announcing must leave, and [`Self::expire`] is the TTL path
     /// for the ordinary case of a scan simply landing late.
-    pub fn observe_found(&mut self, rows: Vec<Found>, now_ms: i64) {
+    ///
+    /// `not_shown` is how many rows the browse held back past
+    /// `crate::peer::discovery::MAX_FOUND_ROWS`, kept beside the rows as
+    /// [`Self::found_not_shown`].
+    pub fn observe_found(&mut self, rows: Vec<Found>, not_shown: usize, now_ms: i64) {
         let previous = std::mem::take(&mut self.found);
         self.found = rows
             .into_iter()
@@ -1195,6 +1292,7 @@ impl PeerState {
                 row
             })
             .collect();
+        self.found_not_shown = not_shown;
     }
 
     /// The found rows an OPERATOR should see: [`Self::found`] minus any row
@@ -1306,9 +1404,52 @@ impl PeerState {
         // One accepted window at a time per address: a second Accept for the
         // same address replaces the first rather than stacking, so "how long is
         // this address welcome for" has one answer.
-        self.accepted.retain(|open| open.addr != window.addr);
-        self.accepted.push(window.clone());
+        self.open_accepted_window(window.clone());
         Some(window)
+    }
+
+    /// Record an accepted window, replacing any window already open for its
+    /// address: one accepted window at a time per address.
+    pub fn open_accepted_window(&mut self, window: AcceptedInstance) {
+        self.accepted.retain(|open| open.addr != window.addr);
+        self.accepted.push(window);
+    }
+
+    /// Write the static key an `XX` handshake learned onto every accepted
+    /// window for `addr`, so `tcr peer block` can ban the key as well. Answers
+    /// whether there was a window to write it on.
+    pub fn learn_pairing_key(&mut self, addr: &str, key: PeerId) -> bool {
+        let mut touched = false;
+        for window in &mut self.accepted {
+            if window.addr == addr {
+                window.learned_key = Some(key);
+                touched = true;
+            }
+        }
+        touched
+    }
+
+    /// Whether an accepted-window row for `addr` is held, open or kept for
+    /// the key it learned.
+    pub fn holds_accepted_row(&self, addr: &str) -> bool {
+        self.accepted.iter().any(|open| open.addr == addr)
+    }
+
+    /// How many rows the knock queue holds, a reservation placeholder
+    /// included: the number [`MAX_PENDING_KNOCKS`] is counted against.
+    pub const fn knocks_queued(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The measured cost of one path, as the prober last saved it.
+    pub fn measured_path(
+        &self,
+        peer: &PeerId,
+        locator: &crate::peer::config::Locator,
+    ) -> Option<&crate::peer::probe::PathStat> {
+        self.paths
+            .iter()
+            .find(|stat| &stat.peer == peer && &stat.locator == locator)
     }
 
     /// Whether an `XX` message 1 from `addr` claiming `instance_id` is inside
@@ -1609,34 +1750,7 @@ pub fn load_with_origin(path: &Path, now_ms: i64) -> Result<(PeerState, StateOri
     }
 
     let mut state = parsed.state;
-    let total = state.leases.len();
-    state.leases.retain(|row| row.lease.expires_at_ms > now_ms);
-    let restored = state.leases.len();
-    // The borrowed rows age out on the ledger rows' rule and are counted into
-    // the same two numbers: a borrower whose lease TTL ran out while the
-    // process was down has to re-ask, which is the same fact "expired" already
-    // names on the lending side. `borrowed` is reported separately in the log
-    // line so an operator can tell which direction a restore came back in.
-    let borrowed_total = state.borrowed.len();
-    state
-        .borrowed
-        .retain(|row| row.lease.expires_at_ms > now_ms);
-    let borrowed = state.borrowed.len();
-    // Knocks, mutes and accepted windows age out on the same absolute-deadline
-    // rule the leases do, and dropping them HERE is what makes every reader of
-    // this file agree: the listener, `tcr peer pending` and the panel all load
-    // through this function, so an expired row is never something one of them
-    // sees and another does not.
-    let aged_out = state.expire(now_ms);
-    let expired = total - restored + aged_out + (borrowed_total - borrowed);
-    let counts = RestoreCounts {
-        restored,
-        borrowed,
-        expired,
-        pending: state.pending.len(),
-        muted: state.muted.len(),
-        banned: state.banned.len(),
-    };
+    let counts = state.restore(now_ms);
     // `tcr status` polls this function once a second, so an unconditional
     // `info!` here is not a boot line, it is a busy loop's worth of identical
     // lines burying whatever else the log holds. Only a first read for this
@@ -1762,10 +1876,7 @@ pub fn save_borrowed(path: &Path, borrowed: &[BorrowedRow]) -> Result<()> {
 /// minute would move the file's mtime often enough to make every `PeerStore`
 /// on this Mac re-read its config for nothing.
 pub fn save_paths(path: &Path, paths: &[crate::peer::probe::PathStat]) -> Result<()> {
-    let paths = paths.to_vec();
-    replace_section(path, "measured path costs", move |state| {
-        state.paths = paths;
-    })
+    PeerState::save_paths(path, paths.to_vec())
 }
 
 /// Fold one browse's rows into the found list, keeping every other key.
@@ -1782,8 +1893,7 @@ pub fn save_paths(path: &Path, paths: &[crate::peer::probe::PathStat]) -> Result
 /// ten minutes does not read as freshly found on every browse.
 pub fn save_found(path: &Path, rows: Vec<Found>, not_shown: usize, now_ms: i64) -> Result<()> {
     replace_section(path, "the found list", move |state| {
-        state.observe_found(rows, now_ms);
-        state.found_not_shown = not_shown;
+        state.observe_found(rows, not_shown, now_ms);
     })
 }
 
@@ -1795,10 +1905,7 @@ pub fn save_found(path: &Path, rows: Vec<Found>, not_shown: usize, now_ms: i64) 
 /// the app no longer reaches. The same locked read-modify-write as
 /// [`save_found`], for the same reason.
 pub fn save_tailnet(path: &Path, record: TailnetRecord, peers: Vec<TailnetPeer>) -> Result<()> {
-    replace_section(path, "the tailnet record", move |state| {
-        state.tailnet = Some(record);
-        state.tailnet_peers = peers;
-    })
+    PeerState::save_tailnet(path, record, peers)
 }
 
 /// Replace ONLY the held-mapping record, keeping every other key.
@@ -1813,9 +1920,7 @@ pub fn save_tailnet(path: &Path, record: TailnetRecord, peers: Vec<TailnetPeer>)
 /// last record behind would have `tcr peer reach` report a mapping that was
 /// deleted on purpose, for as long as its old deadline had left to run.
 pub fn save_mapping(path: &Path, mapping: Option<MappingRecord>) -> Result<()> {
-    replace_section(path, "the held mapping", move |state| {
-        state.mapping = mapping;
-    })
+    PeerState::save_mapping(path, mapping)
 }
 
 /// Replace ONLY the per-path traffic totals, keeping every other key.
@@ -1831,10 +1936,7 @@ pub fn save_mapping(path: &Path, mapping: Option<MappingRecord>) -> Result<()> {
 /// enough to make every `PeerStore` on this Mac re-read its config for nothing,
 /// which is the same trade [`save_paths`] makes and for the same reason.
 pub fn save_path_traffic(path: &Path, traffic: &[PathTraffic]) -> Result<()> {
-    let traffic = traffic.to_vec();
-    replace_section(path, "per-path traffic totals", move |state| {
-        state.path_traffic = traffic;
-    })
+    PeerState::save_path_traffic(path, traffic.to_vec())
 }
 
 /// Add one freshly minted ask, keeping every other key, refusing past
@@ -1843,11 +1945,7 @@ pub fn save_path_traffic(path: &Path, traffic: &[PathTraffic]) -> Result<()> {
 /// cap, so it is dropped here before the count is taken.
 pub fn add_ask(path: &Path, ask: PendingAsk) -> Result<()> {
     replace_section(path, "an outstanding ask", move |state| {
-        let now = crate::peer::pair::now_ms();
-        state.asks.retain(|row| now < row.until_ms);
-        if state.asks.len() < MAX_OUTSTANDING_ASKS {
-            state.asks.push(ask);
-        }
+        state.add_ask(ask, now_ms());
     })
 }
 
@@ -1878,11 +1976,45 @@ pub fn open_and_spend_ask(
             )
         );
     }
-    let (opened, id) = crate::peer::ask::open_reply(&state.asks, pasted, now_ms)
+    let opened = state
+        .open_and_spend_ask(pasted, now_ms)
         .map_err(|refusal| anyhow::anyhow!("peer join: {refusal}"))?;
-    state.spend_ask(id);
     save(path, &state)?;
     Ok(opened)
+}
+
+/// The section writers whose whole change is one section of the state, under
+/// [`replace_section`]. Each one's reasons are on the free function of the
+/// same name.
+impl PeerState {
+    /// [`save_paths`].
+    fn save_paths(path: &Path, paths: Vec<crate::peer::probe::PathStat>) -> Result<()> {
+        replace_section(path, "measured path costs", move |state| {
+            state.paths = paths;
+        })
+    }
+
+    /// [`save_tailnet`].
+    fn save_tailnet(path: &Path, record: TailnetRecord, peers: Vec<TailnetPeer>) -> Result<()> {
+        replace_section(path, "the tailnet record", move |state| {
+            state.tailnet = Some(record);
+            state.tailnet_peers = peers;
+        })
+    }
+
+    /// [`save_mapping`].
+    fn save_mapping(path: &Path, mapping: Option<MappingRecord>) -> Result<()> {
+        replace_section(path, "the held mapping", move |state| {
+            state.mapping = mapping;
+        })
+    }
+
+    /// [`save_path_traffic`].
+    fn save_path_traffic(path: &Path, traffic: Vec<PathTraffic>) -> Result<()> {
+        replace_section(path, "per-path traffic totals", move |state| {
+            state.path_traffic = traffic;
+        })
+    }
 }
 
 /// The locked read-modify-write every section writer above shares, so the lock,
@@ -2103,7 +2235,7 @@ mod tests {
     fn a_found_row_leaves_after_its_ttl() {
         let now = 1_000_000_i64;
         let mut state = PeerState::default();
-        state.observe_found(vec![fixture_found("198.51.100.7", now)], now);
+        state.observe_found(vec![fixture_found("198.51.100.7", now)], 0, now);
         state
             .reserve_knock_slot("198.51.100.9:5150", now)
             .expect("reserve a knock slot for the fixture");
@@ -2208,8 +2340,7 @@ mod tests {
             tailnet: Some(record.clone()),
             ..Default::default()
         };
-        save(&crate::peer::serve::peer_state_path(&peers_path), &state)
-            .expect("save the state file");
+        save(&peer_state_path(&peers_path), &state).expect("save the state file");
 
         let report = TailnetReport::read(&peers_path, 1_000).expect("read the report");
         assert_eq!(

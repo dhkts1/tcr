@@ -50,7 +50,68 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::PeerId;
 
-use crate::peer::config::{Endpoint, EndpointSource, Observed, hmac_sha256};
+use crate::peer::config::{Endpoint, EndpointSource, Observed};
+
+/// HMAC-SHA256, by hand over `sha2`, in the twenty lines RFC 2104 is.
+///
+/// # Why this is not the `hmac` crate
+///
+/// Measured rather than assumed: `sha2` 0.10.9 is already in `Cargo.lock`
+/// (`snow`'s `use-sha2` resolves it), so calling it is one dependency EDGE and
+/// zero new packages, the same precedent `getrandom` is in the root
+/// `Cargo.toml` under. `hmac` is **not** in the lock, so reaching for it would
+/// be a genuinely new package for the construction below. Re-derive with
+/// `cargo tree -i sha2` and `cargo tree -i hmac` (the second prints nothing).
+///
+/// Verified against RFC 4231's test case 2 rather than against itself:
+/// `hmac_sha256_matches_rfc_4231_case_2` in `tests/peer_pairing.rs`. A
+/// hand-rolled MAC that is only ever compared to its own output is
+/// self-consistent and agrees with nobody, including the next build of this
+/// program, if the construction is ever replaced by the `hmac` crate.
+///
+/// `pub` and over `&[u8]` rather than private and over `&[u8; 32]`, for that
+/// test's sake and for one reason beyond it: the RFC's vectors use keys of
+/// several widths, and a signature that could only take this program's own key
+/// width could only be checked against this program's own output. Every branch
+/// the RFC names is therefore written, including the long-key one no caller
+/// here reaches.
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+
+    /// SHA-256's block size.
+    const BLOCK: usize = 64;
+
+    // RFC 2104: a key longer than the block is replaced by its own hash. No
+    // caller in this tree reaches it, the network key is 32 bytes, but a
+    // function that silently truncated a long key would be a function whose
+    // agreement with the RFC held only for the inputs it was tested on.
+    let mut shortened = [0_u8; 32];
+    let key: &[u8] = if key.len() > BLOCK {
+        shortened.copy_from_slice(&Sha256::digest(key));
+        &shortened
+    } else {
+        key
+    };
+
+    let mut ipad = [0x36_u8; BLOCK];
+    let mut opad = [0x5c_u8; BLOCK];
+    for (slot, byte) in ipad.iter_mut().zip(key.iter()) {
+        *slot ^= byte;
+    }
+    for (slot, byte) in opad.iter_mut().zip(key.iter()) {
+        *slot ^= byte;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(message);
+    let inner = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner);
+    outer.finalize().into()
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -161,7 +222,7 @@ impl DropKeys {
 /// deriving a key off the same [`crate::peer::config::PeerRow::rendezvous_secret`]
 /// under its OWN versioned domain string calls this ladder instead of writing a
 /// second one. Two spellings of RFC 5869 § 2.3 in one crate is the drift
-/// `config::hmac_sha256`'s own doc warns about.
+/// `drop::hmac_sha256`'s own doc warns about.
 pub(crate) fn expand(pseudorandom_key: &[u8; 32], info: &[u8]) -> [u8; 32] {
     let mut block = Vec::with_capacity(info.len() + 1);
     block.extend_from_slice(info);

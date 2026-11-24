@@ -73,6 +73,39 @@ impl Stub {
         self.untagged.load(Ordering::Relaxed)
     }
 
+    /// The number for the next request, counting every request the stub has seen.
+    fn next_number(&self) -> u64 {
+        self.counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// A `/v1/messages` or `count_tokens` request arrived at `at`; one without a tag is
+    /// counted, since its two clocks cannot be paired.
+    fn note_arrival(&self, tag: Option<u64>, at: Instant) {
+        if tag.is_none() {
+            self.untagged.fetch_add(1, Ordering::Relaxed);
+        }
+        lock(&self.arrivals).push(at);
+    }
+
+    /// A request for a path the stub does not serve, counted by method and path.
+    fn note_unexpected(&self, method: &Method, path: &str) {
+        *lock(&self.unexpected)
+            .entry(format!("{method} {path}"))
+            .or_default() += 1;
+    }
+
+    /// How a streamed reply of `chunks` chunks spends [`Self::reply_time`]: the wait before
+    /// the first byte, and the wait between each later chunk.
+    fn stream_waits(&self, chunks: usize) -> (Duration, Duration) {
+        let first_byte = self.reply_time.mul_f64(0.4);
+        let between = if chunks > 1 {
+            self.reply_time.mul_f64(0.6) / (chunks as u32 - 1)
+        } else {
+            Duration::ZERO
+        };
+        (first_byte, between)
+    }
+
     fn record(&self, tag: Option<u64>, span: Span) {
         if let Some(id) = tag {
             lock(&self.spans).insert(id, span);
@@ -114,10 +147,10 @@ async fn handle(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     let path = uri.path();
-    let n = stub.counter.fetch_add(1, Ordering::Relaxed);
+    let n = stub.next_number();
     match (method.as_str(), path) {
         ("POST", "/v1/messages") => {
-            note_arrival(&stub, tag, start);
+            stub.note_arrival(tag, start);
             // A peek at `stream` alone: a multi-MB body built into a `Value` tree would cost
             // the driver's process tens of milliseconds a request in the big-body phases.
             #[derive(serde::Deserialize)]
@@ -144,7 +177,7 @@ async fn handle(
             }
         }
         ("POST", "/v1/messages/count_tokens") => {
-            note_arrival(&stub, tag, start);
+            stub.note_arrival(tag, start);
             let reply = json_response(StatusCode::OK, &json!({"input_tokens": INPUT_TOKENS}), n);
             stub.record(
                 tag,
@@ -157,9 +190,7 @@ async fn handle(
         }
         ("GET", "/api/oauth/profile") => json_response(StatusCode::OK, &profile_json(), n),
         _ => {
-            *lock(&stub.unexpected)
-                .entry(format!("{method} {path}"))
-                .or_default() += 1;
+            stub.note_unexpected(&method, path);
             json_response(
                 StatusCode::NOT_FOUND,
                 &json!({"type": "error", "error": {"type": "not_found_error", "message": "stub"}}),
@@ -169,21 +200,9 @@ async fn handle(
     }
 }
 
-fn note_arrival(stub: &Stub, tag: Option<u64>, at: Instant) {
-    if tag.is_none() {
-        stub.untagged.fetch_add(1, Ordering::Relaxed);
-    }
-    lock(&stub.arrivals).push(at);
-}
-
 fn streamed_reply(stub: Arc<Stub>, tag: Option<u64>, start: Instant, n: u64) -> Response {
     let chunks = sse_chunks(n);
-    let first_byte = stub.reply_time.mul_f64(0.4);
-    let between = if chunks.len() > 1 {
-        stub.reply_time.mul_f64(0.6) / (chunks.len() as u32 - 1)
-    } else {
-        Duration::ZERO
-    };
+    let (first_byte, between) = stub.stream_waits(chunks.len());
     let total = chunks.len();
     let stream = futures::stream::unfold(
         (chunks.into_iter().enumerate(), stub),
