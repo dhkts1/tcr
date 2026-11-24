@@ -313,6 +313,48 @@ async fn warm_all_is_noop_when_no_targets() {
     );
 }
 
+/// The warm loop's wait: a sleep that runs out sweeps nothing and says so, and a
+/// wake ends the wait early and runs the one-shot sweep before it returns.
+#[tokio::test]
+async fn the_warm_wait_sweeps_only_when_woken() {
+    let warmed = Arc::new(Mutex::new(Vec::new()));
+    let warmer = Arc::new(RecordingWarmer {
+        warmed: Arc::clone(&warmed),
+    });
+    let manager = build_manager_with_warmer(
+        config_with(vec![account("idle", 0)]),
+        counting_refresher(),
+        warmer,
+    );
+    mark_all_probed(&manager);
+
+    assert!(
+        !manager
+            .sleep_or_warm_on_wake(std::time::Duration::from_millis(20))
+            .await,
+        "a wait that runs out reports no sweep"
+    );
+    assert!(
+        warmed.lock().unwrap().is_empty(),
+        "a wait that runs out warms nothing"
+    );
+
+    // A permit stored before the wait is the wake the loop must not lose.
+    manager.warm_wake.notify_one();
+    let swept = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        manager.sleep_or_warm_on_wake(std::time::Duration::from_secs(3600)),
+    )
+    .await
+    .expect("a wake must end an hour-long wait at once");
+    assert!(swept, "a wake reports the sweep");
+    assert_eq!(
+        warmed.lock().unwrap().clone(),
+        vec!["at-idle".to_string()],
+        "the sweep has run by the time the wait returns"
+    );
+}
+
 /// `warm_account` folds the warm response's rate-limit headers into the
 /// account's quota, so its just-started 5h window is immediately visible
 /// (populated `five_hour`, a live future reset) — which suppresses a re-warm.
@@ -627,7 +669,7 @@ async fn a_successful_probe_opens_the_gate_and_wakes_the_warm_loop() {
     let wake_window = std::time::Duration::from_millis(50);
     assert!(manager.warm_targets().is_empty(), "boot: nothing read yet");
     assert!(
-        tokio::time::timeout(wake_window, manager.warm_wake().notified())
+        tokio::time::timeout(wake_window, manager.warm_wake.notified())
             .await
             .is_err(),
         "nothing may wake the warm loop before any quota has been read"
@@ -647,7 +689,7 @@ async fn a_successful_probe_opens_the_gate_and_wakes_the_warm_loop() {
         vec![0],
         "a read quota opens the gate even with no 5h bucket in the response"
     );
-    tokio::time::timeout(wake_window, manager.warm_wake().notified())
+    tokio::time::timeout(wake_window, manager.warm_wake.notified())
         .await
         .expect(
             "the first successful probe must wake the warm loop, not leave it a full interval away",
@@ -668,14 +710,14 @@ async fn a_repeat_probe_does_not_re_wake_the_warm_loop() {
 
     manager.probe_all().await;
     // Consume the one wake the first read is entitled to.
-    tokio::time::timeout(wake_window, manager.warm_wake().notified())
+    tokio::time::timeout(wake_window, manager.warm_wake.notified())
         .await
         .expect("first read wakes the loop");
 
     manager.probe_all().await;
 
     assert!(
-        tokio::time::timeout(wake_window, manager.warm_wake().notified())
+        tokio::time::timeout(wake_window, manager.warm_wake.notified())
             .await
             .is_err(),
         "quota_known is already latched, so a repeat probe must not re-wake the loop"
@@ -710,7 +752,7 @@ async fn a_served_response_header_is_quota_evidence_and_opens_the_gate() {
         vec![0],
         "with the window read and not live, the account is a target"
     );
-    tokio::time::timeout(wake_window, manager.warm_wake().notified())
+    tokio::time::timeout(wake_window, manager.warm_wake.notified())
         .await
         .expect("the first read wakes the warm loop whichever source it came from");
 }
@@ -764,7 +806,7 @@ async fn a_persistently_failing_probe_stops_blocking_keep_warm() {
             "sweep {sweep} of {PROBE_FAILURES_BEFORE_WARMING_UNPROBED}: one or two failures are a hiccup, not a verdict"
         );
         assert!(
-            tokio::time::timeout(wake_window, manager.warm_wake().notified())
+            tokio::time::timeout(wake_window, manager.warm_wake.notified())
                 .await
                 .is_err(),
             "sweep {sweep}: nothing may wake the loop while the gate is still waiting"
@@ -789,7 +831,7 @@ async fn a_persistently_failing_probe_stops_blocking_keep_warm() {
         vec![0],
         "a probe that has failed every sweep is not going to answer; waiting forever is a kill switch"
     );
-    tokio::time::timeout(wake_window, manager.warm_wake().notified())
+    tokio::time::timeout(wake_window, manager.warm_wake.notified())
         .await
         .expect("giving up on the wait must wake the loop, not leave it a full interval away");
 }

@@ -140,12 +140,23 @@ impl Manager {
             .map_or(0, |v| v.min(u64::from(u32::MAX)) as u32)
     }
 
-    /// The keep-warm wake signal. The warm loop `select!`s over its own ticker and
-    /// `warm_wake().notified()`, so the first sweep after boot happens as soon as
-    /// the probe has read some quota rather than a full `warmupSeconds` later. See
-    /// the field docs on [`Manager`] for why a lost wake is impossible here.
-    pub const fn warm_wake(&self) -> &Notify {
-        &self.warm_wake
+    /// The keep-warm loop's wait: sleep `wait`, or wake early on the `warm_wake`
+    /// signal and run the one-shot [`Self::warm_all`] sweep. `true` means the
+    /// sweep ran, so the caller re-draws every phase. The wake lets the first
+    /// sweep after boot happen as soon as the probe has read some quota rather
+    /// than a full `warmupSeconds` later; see the field docs on [`Manager`] for
+    /// why a lost wake is impossible here.
+    ///
+    /// The sweep runs AFTER the race is decided, never inside it: once the wake
+    /// wins, the sleep cannot cancel a sweep halfway through.
+    pub async fn sleep_or_warm_on_wake(&self, wait: std::time::Duration) -> bool {
+        tokio::select! {
+            () = tokio::time::sleep(wait) => false,
+            () = self.warm_wake.notified() => {
+                self.warm_all().await;
+                true
+            }
+        }
     }
 
     /// Mint the next session key: a strictly-increasing, unique `u64` starting at
