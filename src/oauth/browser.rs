@@ -504,7 +504,7 @@ pub async fn login(
     let hint = match account {
         Some(query) => {
             let probe_config = load_or_default(config_path)?;
-            let idx = crate::cli::resolve_account(&probe_config.accounts, query)?;
+            let idx = config::resolve_account(&probe_config.accounts, query)?;
             refuse_a_non_claude_row(&probe_config.accounts[idx])?;
             let email = crate::identity::email_of(&probe_config.accounts[idx].name);
             // Only ever send something address-shaped: a non-email display
@@ -608,7 +608,7 @@ pub(super) fn mint_login_name(
     // A re-login keeps the row's own name: it IS the identity every pin, group
     // and `controlAccount` key already points at.
     if let Some(query) = requested_account {
-        let idx = crate::cli::resolve_account(&config.accounts, query)?;
+        let idx = config::resolve_account(&config.accounts, query)?;
         return Ok(config.accounts[idx].name.clone());
     }
 

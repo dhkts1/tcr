@@ -22,7 +22,6 @@ use anyhow::{Context as _, bail};
 
 use crate::config::{self, Config};
 
-mod account_query;
 mod accounts;
 mod fan;
 mod groups;
@@ -35,7 +34,6 @@ mod reset;
 mod settings;
 mod status;
 
-pub use account_query::{ambiguous_query_message, resolve_account};
 pub use accounts::{
     PriorityArg, print_access_token, remove_account, request_key, set_account_egress, set_control,
     set_enabled, set_priority, show_control,
@@ -237,17 +235,15 @@ fn save_after_edit(config_path: &Path, config: &Config) -> anyhow::Result<()> {
 /// Centralizes the load→resolve→save chain (incl. the nonexistent-account error
 /// path) shared by every mutating verb. Resolution happens BEFORE `mutate`, so a
 /// non-matching query returns an error with the file left byte-identical (no
-/// partial write). `mutate` receives the resolved index and the whole config, so
-/// a command that needs the fleet (e.g. relative priority) or must `remove` the
-/// entry can still do so; it returns whatever the caller wants to report.
+/// partial write). `mutate` receives the resolved row and returns whatever the
+/// caller wants to report.
 fn edit_account<T>(
     config_path: &Path,
     query: &str,
-    mutate: impl FnOnce(&mut Config, usize) -> T,
+    mutate: impl FnOnce(&mut config::Account) -> T,
 ) -> anyhow::Result<T> {
     let mut config = load_for_edit(config_path)?;
-    let idx = resolve_account(&config.accounts, query)?;
-    let out = mutate(&mut config, idx);
+    let out = mutate(config.resolve_account_mut(query)?);
     save_after_edit(config_path, &config)?;
     Ok(out)
 }

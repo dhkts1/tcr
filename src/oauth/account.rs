@@ -49,11 +49,11 @@ pub fn claude_account_codex_import_refusal(name: &str) -> String {
 }
 
 /// The row `tcr login --codex --account <query>` re-signs: `query` resolved by the rule every
-/// verb's `--account` uses ([`crate::cli::resolve_account`], an exact row name), refused with
+/// verb's `--account` uses ([`crate::config::resolve_account`], an exact row name), refused with
 /// [`LoginRefusal::ACCOUNT_IS_CLAUDE`] when it names a Claude row. Runs before anything else the
 /// login does, so a refusal spawns nothing and writes nothing.
 pub fn codex_relogin_target(config: &Config, query: &str) -> anyhow::Result<usize> {
-    let idx = crate::cli::resolve_account(&config.accounts, query)?;
+    let idx = config::resolve_account(&config.accounts, query)?;
     let row = &config.accounts[idx];
     match row.provider {
         crate::provider::Provider::Codex => Ok(idx),
@@ -136,7 +136,7 @@ pub(super) async fn finish_login_checked(
 }
 
 /// The load-bearing half of `tcr login --account <query>`:
-/// resolve `query` against `config` via [`crate::cli::resolve_account`]
+/// resolve `query` against `config` via [`crate::config::resolve_account`]
 /// — the exact rule `tcr enable`/`tcr disable` and TcrBar's row buttons
 /// already rely on, not a second copy of it — then refuse to proceed unless
 /// the identity that came back from `fetch_profile` resolves, through
@@ -166,7 +166,7 @@ pub(super) fn assert_requested_identity(
     query: &str,
     profile: &Profile,
 ) -> anyhow::Result<()> {
-    let idx = crate::cli::resolve_account(&config.accounts, query)?;
+    let idx = config::resolve_account(&config.accounts, query)?;
     let requested = &config.accounts[idx];
     refuse_a_non_claude_row(requested)?;
 

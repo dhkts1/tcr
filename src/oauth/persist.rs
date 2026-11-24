@@ -122,7 +122,7 @@ pub fn upsert_account(
                 .filter(|a| crate::identity::same_identity(a, &probe))
                 .map(|a| a.name.clone())
                 .collect();
-            bail!("{}", crate::cli::ambiguous_query_message(name, &candidates));
+            bail!("{}", config::ambiguous_query_message(name, &candidates));
         }
     }
 }

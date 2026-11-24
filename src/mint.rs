@@ -275,7 +275,7 @@ fn plan_mint<'a>(
 ) -> anyhow::Result<Vec<MintTarget<'a>>> {
     match (account, group) {
         (Some(query), None) => {
-            let idx = crate::cli::resolve_account(accounts, query)?;
+            let idx = config::resolve_account(accounts, query)?;
             let row = &accounts[idx];
             provider_guard::provider_guard(row, ClaudeOnlyVerb::Mint)
                 .map_err(anyhow::Error::msg)?;
@@ -722,7 +722,7 @@ mod tests {
         let none = select_group_accounts(&accounts, "no-such-group");
         assert!(none.is_empty());
 
-        let idx = crate::cli::resolve_account(&accounts, "carol@example.com").unwrap();
+        let idx = config::resolve_account(&accounts, "carol@example.com").unwrap();
         assert_eq!(accounts[idx].name, "carol@example.com");
     }
 

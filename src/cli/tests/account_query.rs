@@ -1,6 +1,7 @@
-//! Tests for resolving an account query to one row, in `cli/account_query.rs`.
+//! Tests for resolving an account query to one row, in `config/roster.rs`.
 
 use super::*;
+use crate::config::resolve_account;
 #[test]
 fn resolve_exact_name_wins() {
     // An exact display-name match resolves outright; a distinct name is not

@@ -5,7 +5,6 @@ use std::path::Path;
 
 use anyhow::{Context as _, bail};
 
-use super::account_query::ambiguous_query_message;
 use super::load_config;
 use crate::config::{self, Account, Config};
 use crate::identity;
@@ -63,7 +62,7 @@ const GROUP_LIVE_RELOAD_NOTE: &str = "note: the running proxy picks this up auto
 /// Resolve `name` to exactly one configured account by EXACT match on
 /// `Account.name`.
 ///
-/// [`resolve_account`]'s rule, with the group verbs' own not-found message.
+/// [`config::resolve_account`]'s rule, with the group verbs' own not-found message.
 ///
 /// The one thing it does not borrow from `resolve_account` is the not-found
 /// text. The panel shells out blind, so an unknown name has to come back with
@@ -71,7 +70,9 @@ const GROUP_LIVE_RELOAD_NOTE: &str = "note: the running proxy picks this up auto
 fn find_account_by_name(accounts: &[Account], name: &str) -> anyhow::Result<usize> {
     match identity::match_one(accounts, name) {
         identity::Match::One(idx) => Ok(idx),
-        identity::Match::Ambiguous(names) => bail!("{}", ambiguous_query_message(name, &names)),
+        identity::Match::Ambiguous(names) => {
+            bail!("{}", config::ambiguous_query_message(name, &names))
+        }
         identity::Match::None => {
             let configured: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
             bail!(

@@ -2,6 +2,7 @@
 
 use anyhow::bail;
 
+use super::{Account, Config};
 use crate::identity;
 
 /// Resolve a user-supplied account `query` to exactly one index in `accounts`.
@@ -38,4 +39,18 @@ pub fn ambiguous_query_message(query: &str, names: &[String]) -> String {
         names.len(),
         names.join(", ")
     )
+}
+
+impl Config {
+    /// The one row `query` names, by [`resolve_account`]'s rule and with its errors.
+    pub fn resolve_account(&self, query: &str) -> anyhow::Result<&Account> {
+        let idx = resolve_account(&self.accounts, query)?;
+        Ok(&self.accounts[idx])
+    }
+
+    /// [`Config::resolve_account`], for a caller that edits the row it names.
+    pub fn resolve_account_mut(&mut self, query: &str) -> anyhow::Result<&mut Account> {
+        let idx = resolve_account(&self.accounts, query)?;
+        Ok(&mut self.accounts[idx])
+    }
 }

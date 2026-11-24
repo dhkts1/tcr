@@ -19,6 +19,7 @@ mod file;
 mod group_edit;
 mod identity_roster;
 mod load;
+mod roster;
 mod tokens;
 
 pub use account_edit::{
@@ -38,6 +39,7 @@ pub use group_edit::{
     save_group_allow_control, save_group_color, save_group_parked, save_group_reserved,
 };
 pub use load::{load, load_or_init};
+pub use roster::{ambiguous_query_message, resolve_account};
 pub use tokens::{CredentialScope, save_settings, save_tokens, save_tokens_for};
 
 /// Typed config-layer errors: I/O vs malformed JSON stay distinguishable so a

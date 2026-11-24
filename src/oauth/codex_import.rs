@@ -312,7 +312,7 @@ pub(crate) async fn import_codex_login_as(
             }
             crate::identity::Match::None => login.email.as_deref() == Some(wanted),
             crate::identity::Match::Ambiguous(names) => {
-                bail!("{}", crate::cli::ambiguous_query_message(wanted, &names))
+                bail!("{}", config::ambiguous_query_message(wanted, &names))
             }
         };
         if !is_this_login {
