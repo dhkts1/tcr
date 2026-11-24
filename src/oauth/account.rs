@@ -49,14 +49,13 @@ pub fn claude_account_codex_import_refusal(name: &str) -> String {
 }
 
 /// The row `tcr login --codex --account <query>` re-signs: `query` resolved by the rule every
-/// verb's `--account` uses ([`crate::config::resolve_account`], an exact row name), refused with
+/// verb's `--account` uses ([`Config::resolve_account`], an exact row name), refused with
 /// [`LoginRefusal::ACCOUNT_IS_CLAUDE`] when it names a Claude row. Runs before anything else the
 /// login does, so a refusal spawns nothing and writes nothing.
-pub fn codex_relogin_target(config: &Config, query: &str) -> anyhow::Result<usize> {
-    let idx = config::resolve_account(&config.accounts, query)?;
-    let row = &config.accounts[idx];
+pub fn codex_relogin_target<'a>(config: &'a Config, query: &str) -> anyhow::Result<&'a Account> {
+    let row = config.resolve_account(query)?;
     match row.provider {
-        crate::provider::Provider::Codex => Ok(idx),
+        crate::provider::Provider::Codex => Ok(row),
         crate::provider::Provider::Anthropic => Err(LoginRefusal {
             code: LoginRefusal::ACCOUNT_IS_CLAUDE,
             reason: claude_account_codex_login_refusal(&row.name),

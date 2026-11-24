@@ -344,7 +344,7 @@ async fn a_relogin_of_a_codex_row_is_refused_before_the_browser_opens() {
 /// row is refused with the code a GUI titles it by, before codex runs, and a name no row has
 /// is the error every `--account` gives it.
 ///
-/// Watched red: without the provider check, the Claude row resolves to `Ok(0)`.
+/// Watched red: without the provider check, the Claude row resolves to `Ok` with that row.
 #[tokio::test]
 async fn login_codex_account_on_a_claude_row_is_refused_before_any_event() {
     let (_dir, path) = claude_and_codex_rows().await;
@@ -361,8 +361,10 @@ async fn login_codex_account_on_a_claude_row_is_refused_before_any_event() {
          Nothing was written."
     );
     assert_eq!(
-        codex_relogin_target(&config, "bob@example.com/codex").unwrap(),
-        1
+        codex_relogin_target(&config, "bob@example.com/codex")
+            .unwrap()
+            .name,
+        "bob@example.com/codex"
     );
     assert_eq!(
         codex_relogin_target(&config, "nobody@example.com")
