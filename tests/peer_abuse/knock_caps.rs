@@ -493,10 +493,9 @@ async fn a_valid_message_one_then_silence_holds_no_slot_and_no_queue_row() {
     let after = node.state();
     assert!(
         after.knocks_queued() == 0,
-        "every reservation must be released once the handshake misses its deadline; {:?} \
+        "every reservation must be released once the handshake misses its deadline; {after:?} \
          remain, and each one is an eighth of the pairing queue held by a socket that never \
-         said who it was",
-        after
+         said who it was"
     );
     assert_eq!(
         with_admission(&context, |guard| guard.live_unauthenticated(LOOPBACK)),
@@ -638,8 +637,7 @@ async fn a_knock_frame_at_the_bound_is_taken_and_one_byte_over_gets_nothing() {
     assert!(
         over_state.knocks_queued() == 0,
         "an over-bound knock must leave no row at all, not even the reservation its own \
-         handshake took: {:?}",
-        over_state
+         handshake took: {over_state:?}"
     );
 
     // Exactly at the bound, on a fresh node with a full bucket.
@@ -819,8 +817,7 @@ async fn twenty_parallel_knocks_from_a_muted_address_get_nothing_and_shorten_not
     let after = node.state();
     assert!(
         after.knocks_queued() == 0,
-        "a muted address must reach no row at all, reservation included: {:?}",
-        after
+        "a muted address must reach no row at all, reservation included: {after:?}"
     );
     assert_eq!(
         after.muted, before,

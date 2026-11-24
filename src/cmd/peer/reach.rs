@@ -93,78 +93,6 @@ fn reach_tailnet_line(
     }
 }
 
-#[cfg(test)]
-mod reach_tailnet_line_tests {
-    use super::*;
-    use peer::config::{TailnetMode, TailnetSetting};
-    use peer::state::{TailnetRecord, TailnetState};
-
-    fn record(state: TailnetState, detail: Option<&str>) -> TailnetRecord {
-        TailnetRecord {
-            mode: TailnetMode::App.into(),
-            state,
-            address: Some(std::net::Ipv4Addr::new(100, 64, 0, 7)),
-            found: 2,
-            detail: detail.map(str::to_string),
-            recorded_at_ms: 1_000,
-            ..TailnetRecord::default()
-        }
-    }
-
-    /// **The line says what the server recorded, says stale when it is, and
-    /// says when nothing was recorded. The setting wins: off is off even
-    /// with a fresh record left from app mode, and an unknown word is shown
-    /// and treated as off.**
-    ///
-    /// Watch it fail by making the `Known(TailnetMode::Off)` arm fall through
-    /// instead of returning: the first row then reads `off: no serving process
-    /// has recorded a tailnet reading`, and the leftover-record row would
-    /// report app/ready.
-    #[test]
-    fn the_tailnet_line_for_each_case() {
-        let off = TailnetSetting::Known(TailnetMode::Off);
-        let app = TailnetSetting::Known(TailnetMode::App);
-        assert_eq!(reach_tailnet_line(&off, None, 1_000), "reach: tailnet: off");
-        assert!(reach_tailnet_line(&app, None, 1_000).contains("no serving process has recorded"));
-        let ready = record(TailnetState::Ready, None);
-        assert_eq!(
-            reach_tailnet_line(&app, Some(&ready), 2_000),
-            "reach: tailnet: app: 100.64.0.7, 2 of your Macs heard over it (recorded by the \
-             serving process)"
-        );
-        assert_eq!(
-            reach_tailnet_line(&off, Some(&ready), 2_000),
-            "reach: tailnet: off",
-            "a fresh record left from app mode does not outrank the setting"
-        );
-        assert!(
-            reach_tailnet_line(
-                &TailnetSetting::Unknown("both".to_string()),
-                Some(&ready),
-                2_000
-            )
-            .contains("\"both\" is a mode this tcr does not know"),
-        );
-        assert!(
-            reach_tailnet_line(
-                &app,
-                Some(&ready),
-                1_001 + peer::state::TAILNET_RECORD_STALE_MS
-            )
-            .contains("not running or not reading"),
-            "a stale record is reported as stale"
-        );
-        let failed = record(
-            TailnetState::AppNotRunning,
-            Some("The Tailscale app is not running on this Mac."),
-        );
-        assert_eq!(
-            reach_tailnet_line(&app, Some(&failed), 2_000),
-            "reach: tailnet: app: appNotRunning: The Tailscale app is not running on this Mac."
-        );
-    }
-}
-
 pub(super) fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
     use tcr::peer::reach;
 
@@ -498,4 +426,76 @@ pub(super) fn run_peer_internet(a: peer_cli::PeerInternetArgs) -> anyhow::Result
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod reach_tailnet_line_tests {
+    use super::*;
+    use peer::config::{TailnetMode, TailnetSetting};
+    use peer::state::{TailnetRecord, TailnetState};
+
+    fn record(state: TailnetState, detail: Option<&str>) -> TailnetRecord {
+        TailnetRecord {
+            mode: TailnetMode::App.into(),
+            state,
+            address: Some(std::net::Ipv4Addr::new(100, 64, 0, 7)),
+            found: 2,
+            detail: detail.map(str::to_string),
+            recorded_at_ms: 1_000,
+            ..TailnetRecord::default()
+        }
+    }
+
+    /// **The line says what the server recorded, says stale when it is, and
+    /// says when nothing was recorded. The setting wins: off is off even
+    /// with a fresh record left from app mode, and an unknown word is shown
+    /// and treated as off.**
+    ///
+    /// Watch it fail by making the `Known(TailnetMode::Off)` arm fall through
+    /// instead of returning: the first row then reads `off: no serving process
+    /// has recorded a tailnet reading`, and the leftover-record row would
+    /// report app/ready.
+    #[test]
+    fn the_tailnet_line_for_each_case() {
+        let off = TailnetSetting::Known(TailnetMode::Off);
+        let app = TailnetSetting::Known(TailnetMode::App);
+        assert_eq!(reach_tailnet_line(&off, None, 1_000), "reach: tailnet: off");
+        assert!(reach_tailnet_line(&app, None, 1_000).contains("no serving process has recorded"));
+        let ready = record(TailnetState::Ready, None);
+        assert_eq!(
+            reach_tailnet_line(&app, Some(&ready), 2_000),
+            "reach: tailnet: app: 100.64.0.7, 2 of your Macs heard over it (recorded by the \
+             serving process)"
+        );
+        assert_eq!(
+            reach_tailnet_line(&off, Some(&ready), 2_000),
+            "reach: tailnet: off",
+            "a fresh record left from app mode does not outrank the setting"
+        );
+        assert!(
+            reach_tailnet_line(
+                &TailnetSetting::Unknown("both".to_string()),
+                Some(&ready),
+                2_000
+            )
+            .contains("\"both\" is a mode this tcr does not know"),
+        );
+        assert!(
+            reach_tailnet_line(
+                &app,
+                Some(&ready),
+                1_001 + peer::state::TAILNET_RECORD_STALE_MS
+            )
+            .contains("not running or not reading"),
+            "a stale record is reported as stale"
+        );
+        let failed = record(
+            TailnetState::AppNotRunning,
+            Some("The Tailscale app is not running on this Mac."),
+        );
+        assert_eq!(
+            reach_tailnet_line(&app, Some(&failed), 2_000),
+            "reach: tailnet: app: appNotRunning: The Tailscale app is not running on this Mac."
+        );
+    }
 }

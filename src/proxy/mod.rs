@@ -3468,7 +3468,7 @@ impl RequestTiming {
     }
 
     /// The buffered body is handed on toward the client: its read instant is the first byte.
-    fn forward_buffered_body(&mut self) {
+    const fn forward_buffered_body(&mut self) {
         if let Some(at) = self.buffered_at {
             self.first_byte_at = Some(at);
         }
@@ -4468,192 +4468,293 @@ async fn handle_request(
     };
     for _ in 0..max_attempts {
         let now = OffsetDateTime::now_utc();
-        let idx = match ladder.pick(&manager, wants, now) {
-            Some(idx) => idx,
-            None => {
-                // A RESERVED group is strict: this request may only ever be
-                // served by one of its members, so every answer below — the
-                // wait it sizes, the revalidation it might attempt, the 429 it
-                // finally returns — has to be scoped to that group rather than
-                // to a fleet this request is not allowed to touch.
+        let idx = if let Some(idx) = ladder.pick(&manager, wants, now) {
+            idx
+        } else {
+            // A RESERVED group is strict: this request may only ever be
+            // served by one of its members, so every answer below — the
+            // wait it sizes, the revalidation it might attempt, the 429 it
+            // finally returns — has to be scoped to that group rather than
+            // to a fleet this request is not allowed to touch.
+            //
+            // Recomputed here rather than hoisted alongside `request_group`
+            // at the top of the handler: `reserved` hot-reloads, so
+            // `tcr group unreserve <g>` releases an already-stalled request
+            // on its next pass through this arm instead of after a restart.
+            // `is_group_strict`, not `is_group_reserved`: the THIRD
+            // door out of a strict group, which a measurement found
+            // open here and on the exhausted path below. The
+            // picker holds a request strictly for `reserved || !spill`
+            // and this arm asked only about `reserved`, so for a
+            // group that is neither reserved nor a spill group, a
+            // lease's scope is exactly one, every answer below was
+            // sized against a fleet the request was never allowed to
+            // touch. One rule, one function: see
+            // `Manager::is_group_strict`.
+            let strict_group = request_group
+                .as_deref()
+                .filter(|g| manager.is_group_strict(g));
+            // What a fallback provider would be told, built once for the
+            // three terminals below. It carries the client's own
+            // headers, MINUS every credential, and `Ask::scrubbed` is what
+            // removes them: `build_upstream_headers`, the only code in
+            // this file that strips a client's `authorization` and
+            // substitutes a pooled token, is 215 lines downstream of
+            // here, so the scrub cannot be left to it.
+            //
+            // They are carried rather than dropped because a relayed
+            // request with no `anthropic-version` and no
+            // `content-type` is answered 400 by the API: an `Ask` that
+            // carried nothing could only produce an answer the client
+            // cannot use, and the borrower served that 400 as if a
+            // lender had answered it.
+            //
+            // `None` for a path no provider may ever be offered, and
+            // that refusal is HERE rather than only inside the
+            // provider: the `Ask` clones the whole request body, so
+            // asking first means a client-credential body is never
+            // copied for a relay that cannot happen. The provider
+            // keeps the identical check as its own first act, a
+            // provider is written by whoever adds the next one, and
+            // this seam cannot rely on that, so this is the cheap
+            // half of a defence that exists twice on purpose.
+            //
+            // `None` for a non-POST for the same reason and one more of
+            // its own: a relayed request is a POST or nothing
+            // (`peer::serve::SERVE_METHOD`), and the borrower used to
+            // write the literal `"POST"` into the frame whatever its
+            // client had sent, so a `GET` was POSTed on somebody
+            // else's account, out of a lease. The lender refuses that
+            // frame now, but only after it has crossed a host
+            // boundary; refusing here means a non-POST this fleet
+            // cannot serve gets the SAME answer it got before any of
+            // this existed, from `exhausted_or_fallback`'s terminal.
+            // `RELAYED_HEADER_NAME` is the one-hop rule: a request
+            // that has already crossed one Mac is served here or
+            // refused here, never borrowed onward. See that constant.
+            let fallback_ask = (method == Method::POST
+                && crate::peer::serve::serve_is_allowed_for_path(&path)
+                && !req_headers.contains_key(RELAYED_HEADER_NAME))
+            .then(|| fallback::Ask {
+                path: &path,
+                // The query alongside the query-stripped path, never
+                // folded into it: the classifiers above match on the
+                // path, and a borrowed request that arrived upstream
+                // with its parameters dropped answered a different
+                // question from the one the client asked.
+                query: parts_query.as_deref(),
+                method: method.as_str(),
+                model: request_model.as_deref(),
+                group: request_group.as_deref(),
+                affinity: session_key,
+                tried_local: ladder.benched(),
+                body: body_bytes.clone(),
+                headers: fallback::Ask::scrubbed(&req_headers),
+            });
+            if let Some(answer) = ladder.verdict(
+                &manager,
+                provider,
+                request_model.as_deref(),
+                now,
+                bound_to,
+                strict_group,
+            ) {
+                return answer;
+            }
+            // A cold shared-limiter burst parks the whole fleet for ~15-20s.
+            // Rather than telling the client "all exhausted" for a transient
+            // blip, wait out the soonest un-park ONCE and retry select — the
+            // JS original's inline-wait-retry (L3). Real exhaustion (quota
+            // windows / long holds) has soonest_free >> the ceiling →
+            // soft_wait_secs returns None → fall through to the honest 429.
+            if let Some(secs) = soft_wait_secs(
+                match (bound_to, strict_group) {
+                    // Bound history: the one account it may use is the only
+                    // clock that matters, for the same reason as the group arm.
+                    (Some(idx), _) => {
+                        manager
+                            .exhaustion_hint_for_account(now, request_is_fable, idx)
+                            .retry_after
+                    }
+                    // Size the wait by when a MEMBER frees. The fleet-wide
+                    // hint would be won by any unrelated account un-gating
+                    // sooner, spending this request's one-shot soft-wait on
+                    // a recovery it cannot use and 429-ing while its own
+                    // member was still seconds away.
+                    //
+                    // Both arms fold only this request's PROVIDER's accounts,
+                    // for the same reason: an account of the other provider
+                    // freeing sooner is a recovery this request cannot use.
+                    (None, Some(group)) => {
+                        manager.retry_after_hint_for_group(now, request_is_fable, provider, group)
+                    }
+                    (None, None) => manager.retry_after_hint(now, request_is_fable, provider),
+                },
+                ladder.soft_waited_exhaustion(),
+            ) {
+                ladder.spend_soft_wait();
+                // Desync concurrent waiters: without this, every request
+                // sleeping the same integer-ceil `secs` wakes on the SAME
+                // second and races for the single earliest-freeing account,
+                // re-synchronizing the herd NO_GUIDANCE_JITTER (:555) spreads
+                // and re-bursting that account. Waking `jitter` seconds later
+                // still serves (the account already freed at `secs`); worst
+                // case adds NO_GUIDANCE_JITTER_MAX_SECS (5s) → total ≤ 25s.
+                let jitter =
+                    (i64::from(now.nanosecond()) % (NO_GUIDANCE_JITTER_MAX_SECS + 1)) as u64;
+                let wait = secs + jitter;
+                tracing::info!(
+                    wait_secs = wait,
+                    "fleet transiently parked — soft-waiting once before exhausted"
+                );
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                // Re-admit exactly what the sleep was timed for.
+                // `Transient429::Park` benches an account TWICE — a
+                // hold via `mark_rate_limited` AND an entry in
+                // `tried` — and both `pick_eligible` and
+                // `pick_least_loaded` test `tried` BEFORE they ever
+                // evaluate eligibility. So clearing only the hold
+                // leaves the account this sleep was timed for still
+                // skipped: select() returns `None` a second time, the
+                // one-shot guard blocks another wait, and the wait
+                // buys nothing. Dropping the now-expired parks from
+                // `tried` is what makes the recovery path actually
+                // reach the account it was built to preserve.
                 //
-                // Recomputed here rather than hoisted alongside `request_group`
-                // at the top of the handler: `reserved` hot-reloads, so
-                // `tcr group unreserve <g>` releases an already-stalled request
-                // on its next pass through this arm instead of after a restart.
-                // `is_group_strict`, not `is_group_reserved`: the THIRD
-                // door out of a strict group, which a measurement found
-                // open here and on the exhausted path below. The
-                // picker holds a request strictly for `reserved || !spill`
-                // and this arm asked only about `reserved`, so for a
-                // group that is neither reserved nor a spill group, a
-                // lease's scope is exactly one, every answer below was
-                // sized against a fleet the request was never allowed to
-                // touch. One rule, one function: see
-                // `Manager::is_group_strict`.
-                let strict_group = request_group
-                    .as_deref()
-                    .filter(|g| manager.is_group_strict(g));
-                // What a fallback provider would be told, built once for the
-                // three terminals below. It carries the client's own
-                // headers, MINUS every credential, and `Ask::scrubbed` is what
-                // removes them: `build_upstream_headers`, the only code in
-                // this file that strips a client's `authorization` and
-                // substitutes a pooled token, is 215 lines downstream of
-                // here, so the scrub cannot be left to it.
-                //
-                // They are carried rather than dropped because a relayed
-                // request with no `anthropic-version` and no
-                // `content-type` is answered 400 by the API: an `Ask` that
-                // carried nothing could only produce an answer the client
-                // cannot use, and the borrower served that 400 as if a
-                // lender had answered it.
-                //
-                // `None` for a path no provider may ever be offered, and
-                // that refusal is HERE rather than only inside the
-                // provider: the `Ask` clones the whole request body, so
-                // asking first means a client-credential body is never
-                // copied for a relay that cannot happen. The provider
-                // keeps the identical check as its own first act, a
-                // provider is written by whoever adds the next one, and
-                // this seam cannot rely on that, so this is the cheap
-                // half of a defence that exists twice on purpose.
-                //
-                // `None` for a non-POST for the same reason and one more of
-                // its own: a relayed request is a POST or nothing
-                // (`peer::serve::SERVE_METHOD`), and the borrower used to
-                // write the literal `"POST"` into the frame whatever its
-                // client had sent, so a `GET` was POSTed on somebody
-                // else's account, out of a lease. The lender refuses that
-                // frame now, but only after it has crossed a host
-                // boundary; refusing here means a non-POST this fleet
-                // cannot serve gets the SAME answer it got before any of
-                // this existed, from `exhausted_or_fallback`'s terminal.
-                // `RELAYED_HEADER_NAME` is the one-hop rule: a request
-                // that has already crossed one Mac is served here or
-                // refused here, never borrowed onward. See that constant.
-                let fallback_ask = (method == Method::POST
-                    && crate::peer::serve::serve_is_allowed_for_path(&path)
-                    && !req_headers.contains_key(RELAYED_HEADER_NAME))
-                .then(|| fallback::Ask {
-                    path: &path,
-                    // The query alongside the query-stripped path, never
-                    // folded into it: the classifiers above match on the
-                    // path, and a borrowed request that arrived upstream
-                    // with its parameters dropped answered a different
-                    // question from the one the client asked.
-                    query: parts_query.as_deref(),
-                    method: method.as_str(),
-                    model: request_model.as_deref(),
-                    group: request_group.as_deref(),
-                    affinity: session_key,
-                    tried_local: ladder.benched(),
-                    body: body_bytes.clone(),
-                    headers: fallback::Ask::scrubbed(&req_headers),
-                });
-                if let Some(answer) = ladder.verdict(
+                // Precision matters more than reach here: an account
+                // whose hold is still running stays parked, and one
+                // benched for any NON-hold reason was never in
+                // `parked_transient` to begin with.
+                let (readmitted, still_parked) =
+                    ladder.readmit_expired_parks(&manager, crate::now_ms());
+                tracing::info!(
+                    readmitted,
+                    still_parked,
+                    "soft-wait over — re-admitted the accounts whose hold expired"
+                );
+                continue; // re-run select(); the re-admitted accounts are eligible again
+            }
+            // A hard account lock has no failover. Normal selection
+            // returned None because that one account already failed
+            // this request. Revalidation must not escape the lock and
+            // send the request through another pooled credential.
+            //
+            // **And neither may a lease.** This arm was changed to
+            // `exhausted_or_fallback` when the fallback seam landed,
+            // which consults a provider that never reads
+            // `locked_account_name`: a request the operator pinned to
+            // ONE account was then served on a PEER's credential the
+            // moment that account 429'd, which is the same escape the
+            // revalidation serve is refused for and a wider one, the
+            // credential is not even this Mac's. The refusal is
+            // written once, inside `exhausted_or_fallback`, so it
+            // holds for this arm and for the two below it rather
+            // than only for the arm somebody remembered.
+            if manager.locked_account_for(provider).is_some() {
+                return exhausted_or_fallback(
+                    &manager,
+                    now,
+                    provider_account_count,
+                    request_is_fable,
+                    provider,
+                    strict_group,
+                    bound_to,
+                    fallback_ask.as_ref(),
+                )
+                .await;
+            }
+            // Not a transient park — the whole fleet reads over the
+            // SOFT switch threshold. Before synthesizing a 429, try a
+            // last-resort revalidation serve on the least-utilized
+            // account Anthropic still allows (default ON; disable via
+            // top-level `revalidationServe: false`). An upstream 200
+            // refreshes stale quota; a 429 arms a real hold via the
+            // existing inline-429 handling. `None` (throttled, or
+            // nothing servable) keeps the honest exhausted 429.
+            // `strict_group.is_none()` guards the THIRD spill door,
+            // and the least visible one. `select_revalidation`
+            // passes `group: None` to its hard gate, which by
+            // `Manager::reserved_blocks` EXCLUDES every account
+            // carrying a reserved group — so for a strict request
+            // it can only ever return a NON-member. Left ungated it
+            // would hand the request to precisely the account the
+            // reservation exists to keep it off, moments after the
+            // strict arm in `select_with_group` refused to. A
+            // reserved group falls straight through to the honest
+            // 429 instead.
+            //
+            // HELD HISTORY IS NOT A FLEET QUESTION. A request held to
+            // its bound account has every other account benched, so
+            // "the whole fleet is over the threshold" here means only
+            // "that one account is", and the fleet's revalidation
+            // window (one serve per 2 s, shared by every session) is
+            // the wrong gate for it: the turn that lost the race got
+            // a 429 naming the account's 5-hour window, which Claude
+            // Code shows as "You've hit your session limit"
+            // (2026-09-24). `bound_account_holds` already decided the
+            // soft threshold does not release this conversation, so
+            // the serve agrees with it: `Manager::select_bound`.
+            //
+            // And when the held account went out DURING this request
+            // (an upstream rejection on it just turned
+            // `bound_account_holds` to no), this is the same move the
+            // top of the handler makes on a later turn, so it gets the
+            // same answer now instead of a 429 that waits for that
+            // turn: the warning once, then the fleet.
+            if let Some(bound) = bound_to
+                && !manager.bound_account_holds(
+                    bound,
+                    now,
+                    request_is_fable,
+                    request_group.as_deref(),
+                    manager.warm_window(session_key),
+                )
+            {
+                if let Some(warning) = switch_warning(
                     &manager,
                     provider,
-                    request_model.as_deref(),
+                    session_key,
+                    bound,
                     now,
-                    bound_to,
-                    strict_group,
+                    request_is_fable,
+                    request_group.as_deref(),
                 ) {
-                    return answer;
+                    return warning;
                 }
-                // A cold shared-limiter burst parks the whole fleet for ~15-20s.
-                // Rather than telling the client "all exhausted" for a transient
-                // blip, wait out the soonest un-park ONCE and retry select — the
-                // JS original's inline-wait-retry (L3). Real exhaustion (quota
-                // windows / long holds) has soonest_free >> the ceiling →
-                // soft_wait_secs returns None → fall through to the honest 429.
-                if let Some(secs) = soft_wait_secs(
-                    match (bound_to, strict_group) {
-                        // Bound history: the one account it may use is the only
-                        // clock that matters, for the same reason as the group arm.
-                        (Some(idx), _) => {
-                            manager
-                                .exhaustion_hint_for_account(now, request_is_fable, idx)
-                                .retry_after
-                        }
-                        // Size the wait by when a MEMBER frees. The fleet-wide
-                        // hint would be won by any unrelated account un-gating
-                        // sooner, spending this request's one-shot soft-wait on
-                        // a recovery it cannot use and 429-ing while its own
-                        // member was still seconds away.
-                        //
-                        // Both arms fold only this request's PROVIDER's accounts,
-                        // for the same reason: an account of the other provider
-                        // freeing sooner is a recovery this request cannot use.
-                        (None, Some(group)) => manager.retry_after_hint_for_group(
-                            now,
-                            request_is_fable,
-                            provider,
-                            group,
-                        ),
-                        (None, None) => manager.retry_after_hint(now, request_is_fable, provider),
-                    },
-                    ladder.soft_waited_exhaustion(),
-                ) {
-                    ladder.spend_soft_wait();
-                    // Desync concurrent waiters: without this, every request
-                    // sleeping the same integer-ceil `secs` wakes on the SAME
-                    // second and races for the single earliest-freeing account,
-                    // re-synchronizing the herd NO_GUIDANCE_JITTER (:555) spreads
-                    // and re-bursting that account. Waking `jitter` seconds later
-                    // still serves (the account already freed at `secs`); worst
-                    // case adds NO_GUIDANCE_JITTER_MAX_SECS (5s) → total ≤ 25s.
-                    let jitter =
-                        (i64::from(now.nanosecond()) % (NO_GUIDANCE_JITTER_MAX_SECS + 1)) as u64;
-                    let wait = secs + jitter;
-                    tracing::info!(
-                        wait_secs = wait,
-                        "fleet transiently parked — soft-waiting once before exhausted"
-                    );
-                    tokio::time::sleep(Duration::from_secs(wait)).await;
-                    // Re-admit exactly what the sleep was timed for.
-                    // `Transient429::Park` benches an account TWICE — a
-                    // hold via `mark_rate_limited` AND an entry in
-                    // `tried` — and both `pick_eligible` and
-                    // `pick_least_loaded` test `tried` BEFORE they ever
-                    // evaluate eligibility. So clearing only the hold
-                    // leaves the account this sleep was timed for still
-                    // skipped: select() returns `None` a second time, the
-                    // one-shot guard blocks another wait, and the wait
-                    // buys nothing. Dropping the now-expired parks from
-                    // `tried` is what makes the recovery path actually
-                    // reach the account it was built to preserve.
-                    //
-                    // Precision matters more than reach here: an account
-                    // whose hold is still running stays parked, and one
-                    // benched for any NON-hold reason was never in
-                    // `parked_transient` to begin with.
-                    let (readmitted, still_parked) =
-                        ladder.readmit_expired_parks(&manager, crate::now_ms());
-                    tracing::info!(
-                        readmitted,
-                        still_parked,
-                        "soft-wait over — re-admitted the accounts whose hold expired"
-                    );
-                    continue; // re-run select(); the re-admitted accounts are eligible again
-                }
-                // A hard account lock has no failover. Normal selection
-                // returned None because that one account already failed
-                // this request. Revalidation must not escape the lock and
-                // send the request through another pooled credential.
-                //
-                // **And neither may a lease.** This arm was changed to
-                // `exhausted_or_fallback` when the fallback seam landed,
-                // which consults a provider that never reads
-                // `locked_account_name`: a request the operator pinned to
-                // ONE account was then served on a PEER's credential the
-                // moment that account 429'd, which is the same escape the
-                // revalidation serve is refused for and a wider one, the
-                // credential is not even this Mac's. The refusal is
-                // written once, inside `exhausted_or_fallback`, so it
-                // holds for this arm and for the two below it rather
-                // than only for the arm somebody remembered.
-                if manager.locked_account_for(provider).is_some() {
+                tracing::info!(
+                    account = manager.account_name(bound).as_deref().unwrap_or("?"),
+                    "bound history's account went out during the request; \
+                             releasing the request to the fleet"
+                );
+                // Re-admit only what the hold benched: a lease's
+                // account-set scope stays benched (see
+                // `Ladder::release_hold`), and so does `bound`, which
+                // failed this request.
+                ladder.release_to(|tried| {
+                    same_org_release(
+                        &manager,
+                        bound,
+                        tried,
+                        request_model.as_deref(),
+                        |narrowed| {
+                            manager.select_with_group(
+                                narrowed,
+                                now,
+                                request_model.as_deref(),
+                                session_key,
+                                &path,
+                                conn_key,
+                                request_group.as_deref(),
+                            )
+                        },
+                    )
+                });
+                bound_to = None;
+                continue;
+            }
+            match ladder.last_resort(&manager, wants, now, bound_to, strict_group) {
+                Some(idx) => idx,
+                None => {
                     return exhausted_or_fallback(
                         &manager,
                         now,
@@ -4665,111 +4766,6 @@ async fn handle_request(
                         fallback_ask.as_ref(),
                     )
                     .await;
-                }
-                // Not a transient park — the whole fleet reads over the
-                // SOFT switch threshold. Before synthesizing a 429, try a
-                // last-resort revalidation serve on the least-utilized
-                // account Anthropic still allows (default ON; disable via
-                // top-level `revalidationServe: false`). An upstream 200
-                // refreshes stale quota; a 429 arms a real hold via the
-                // existing inline-429 handling. `None` (throttled, or
-                // nothing servable) keeps the honest exhausted 429.
-                // `strict_group.is_none()` guards the THIRD spill door,
-                // and the least visible one. `select_revalidation`
-                // passes `group: None` to its hard gate, which by
-                // `Manager::reserved_blocks` EXCLUDES every account
-                // carrying a reserved group — so for a strict request
-                // it can only ever return a NON-member. Left ungated it
-                // would hand the request to precisely the account the
-                // reservation exists to keep it off, moments after the
-                // strict arm in `select_with_group` refused to. A
-                // reserved group falls straight through to the honest
-                // 429 instead.
-                //
-                // HELD HISTORY IS NOT A FLEET QUESTION. A request held to
-                // its bound account has every other account benched, so
-                // "the whole fleet is over the threshold" here means only
-                // "that one account is", and the fleet's revalidation
-                // window (one serve per 2 s, shared by every session) is
-                // the wrong gate for it: the turn that lost the race got
-                // a 429 naming the account's 5-hour window, which Claude
-                // Code shows as "You've hit your session limit"
-                // (2026-09-24). `bound_account_holds` already decided the
-                // soft threshold does not release this conversation, so
-                // the serve agrees with it: `Manager::select_bound`.
-                //
-                // And when the held account went out DURING this request
-                // (an upstream rejection on it just turned
-                // `bound_account_holds` to no), this is the same move the
-                // top of the handler makes on a later turn, so it gets the
-                // same answer now instead of a 429 that waits for that
-                // turn: the warning once, then the fleet.
-                if let Some(bound) = bound_to
-                    && !manager.bound_account_holds(
-                        bound,
-                        now,
-                        request_is_fable,
-                        request_group.as_deref(),
-                        manager.warm_window(session_key),
-                    )
-                {
-                    if let Some(warning) = switch_warning(
-                        &manager,
-                        provider,
-                        session_key,
-                        bound,
-                        now,
-                        request_is_fable,
-                        request_group.as_deref(),
-                    ) {
-                        return warning;
-                    }
-                    tracing::info!(
-                        account = manager.account_name(bound).as_deref().unwrap_or("?"),
-                        "bound history's account went out during the request; \
-                             releasing the request to the fleet"
-                    );
-                    // Re-admit only what the hold benched: a lease's
-                    // account-set scope stays benched (see
-                    // `Ladder::release_hold`), and so does `bound`, which
-                    // failed this request.
-                    ladder.release_to(|tried| {
-                        same_org_release(
-                            &manager,
-                            bound,
-                            tried,
-                            request_model.as_deref(),
-                            |narrowed| {
-                                manager.select_with_group(
-                                    narrowed,
-                                    now,
-                                    request_model.as_deref(),
-                                    session_key,
-                                    &path,
-                                    conn_key,
-                                    request_group.as_deref(),
-                                )
-                            },
-                        )
-                    });
-                    bound_to = None;
-                    continue;
-                }
-                match ladder.last_resort(&manager, wants, now, bound_to, strict_group) {
-                    Some(idx) => idx,
-                    None => {
-                        return exhausted_or_fallback(
-                            &manager,
-                            now,
-                            provider_account_count,
-                            request_is_fable,
-                            provider,
-                            strict_group,
-                            bound_to,
-                            fallback_ask.as_ref(),
-                        )
-                        .await;
-                    }
                 }
             }
         };

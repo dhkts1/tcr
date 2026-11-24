@@ -41,7 +41,7 @@ async fn a_knock_without_the_network_key_gets_zero_bytes() {
         refused.is_err(),
         "a knock under another network key must earn nothing either"
     );
-    assert!(node.state().knocks_queued() == 0);
+    assert_eq!(node.state().knocks_queued(), 0);
 
     // The positive control: with the right key, the same knock is taken.
     knock_at_with_key(addr, instance(0xC3), None, Some(key.as_bytes()))
@@ -198,7 +198,7 @@ async fn a_keyed_knock_at_a_keyless_node_is_refused() {
         refused.is_err(),
         "a node with no network key has nothing to verify a keyed knock against"
     );
-    assert!(node.state().knocks_queued() == 0);
+    assert_eq!(node.state().knocks_queued(), 0);
 
     knock_at(addr, instance(0xD2), None)
         .await

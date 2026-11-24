@@ -363,18 +363,15 @@ fn a_reservation_placeholder_is_never_selected() {
         .expect("the slot is reserved");
     assert!(
         state.find_pending("192.0.2.9").is_none(),
-        "a placeholder is not a pairing request: {:?}",
-        state
+        "a placeholder is not a pairing request: {state:?}"
     );
     assert!(
         state.accept_knock("192.0.2.9", reserved_at, 120).is_none(),
-        "and no window opens for one: {:?}",
-        state
+        "and no window opens for one: {state:?}"
     );
     assert!(
         !state.holds_accepted_row("192.0.2.9"),
-        "nothing was admitted: {:?}",
-        state
+        "nothing was admitted: {state:?}"
     );
     assert_eq!(
         state.knocks_queued(),
@@ -420,8 +417,7 @@ fn a_learned_key_survives_the_window_it_was_learned_in() {
     assert_eq!(
         state.key_learned_at("192.0.2.30"),
         Some(learned),
-        "the key that address revealed is still readable: {:?}",
-        state
+        "the key that address revealed is still readable: {state:?}"
     );
     assert_eq!(
         state.key_learned_at("192.0.2.31"),

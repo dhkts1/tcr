@@ -600,7 +600,7 @@ impl History {
     }
 
     /// Evidence was lost: the snapshot is partial from here until a new `History` is built.
-    pub(crate) fn mark_partial(&mut self) {
+    pub(crate) const fn mark_partial(&mut self) {
         self.partial = true;
     }
 

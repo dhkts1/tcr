@@ -602,8 +602,7 @@ async fn a_stalled_knock_after_message_1_is_bounded_and_releases_its_reservation
     assert!(
         state.knocks_queued() == 0,
         "a stalled knock handshake must release the reservation it took, not leave a \
-         placeholder pending row behind: {:?}",
-        state
+         placeholder pending row behind: {state:?}"
     );
 }
 

@@ -191,8 +191,7 @@ fn eight_concurrent_reservations_at_a_seven_row_queue_leave_exactly_eight_never_
     assert_eq!(
         after.knocks_queued(),
         state::MAX_PENDING_KNOCKS,
-        "the queue must leave exactly eight rows, never nine, after the race: {:?}",
-        after
+        "the queue must leave exactly eight rows, never nine, after the race: {after:?}"
     );
 }
 

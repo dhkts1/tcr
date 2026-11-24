@@ -1398,7 +1398,7 @@ impl PeerState {
 
     /// How many rows the knock queue holds, a reservation placeholder
     /// included: the number [`MAX_PENDING_KNOCKS`] is counted against.
-    pub fn knocks_queued(&self) -> usize {
+    pub const fn knocks_queued(&self) -> usize {
         self.pending.len()
     }
 

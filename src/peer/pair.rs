@@ -521,10 +521,9 @@ pub fn mint_invite_as(
     let now = now_ms();
     if let Err(outstanding) = file.make_room_for_invite(now, MAX_OUTSTANDING_INVITES) {
         bail!(
-            "peer invite: {} invites are already outstanding, which is the cap \
+            "peer invite: {outstanding} invites are already outstanding, which is the cap \
              (MAX_OUTSTANDING_INVITES); every one of them is a PSK the registrar must try \
-             against message 1, so `tcr peer invite --revoke <id>` first",
-            outstanding
+             against message 1, so `tcr peer invite --revoke <id>` first"
         );
     }
 

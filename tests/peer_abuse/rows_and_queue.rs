@@ -389,8 +389,7 @@ fn eight_stalled_reservations_released_give_the_whole_queue_back() {
     }
     assert!(
         value.knocks_queued() == 0,
-        "every stalled reservation must be released; {:?} remain",
-        value
+        "every stalled reservation must be released; {value:?} remain"
     );
     assert_eq!(
         value.reserve_knock_slot("192.0.2.200", now),
