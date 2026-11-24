@@ -348,7 +348,7 @@ fn an_invite_minted_in_node_mode_lists_the_node_address_first() {
     );
 
     crate::peer::state::save_tailnet(
-        &crate::peer::serve::peer_state_path(&peers_path),
+        &crate::peer::state::peer_state_path(&peers_path),
         crate::peer::state::TailnetRecord {
             mode: crate::peer::config::TailnetMode::Node.into(),
             state: crate::peer::state::TailnetState::Ready,

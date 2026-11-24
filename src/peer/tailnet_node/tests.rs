@@ -189,7 +189,7 @@ fn fixture(mode: TailnetMode) -> Fixture {
     .expect("seed the peers file");
     let paths = NodePaths {
         key: key_path_for_peers(&peers),
-        state: crate::peer::serve::peer_state_path(&peers),
+        state: crate::peer::state::peer_state_path(&peers),
         peers,
     };
     Fixture { _dir: dir, paths }

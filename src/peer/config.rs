@@ -57,6 +57,16 @@ pub fn default_path() -> PathBuf {
     crate::peer::id::default_config_dir().join("tcr-peers.json")
 }
 
+/// The peers file's own directory, which is also the node-key directory, the
+/// same resolution `tcr peer id` uses, so one `--peers` argument points the
+/// whole peer surface at a temp dir.
+pub(crate) fn node_key_dir(store: &PeerStore) -> PathBuf {
+    store
+        .path()
+        .parent()
+        .map_or_else(crate::peer::id::default_config_dir, Path::to_path_buf)
+}
+
 /// The whole file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -505,7 +505,7 @@ pub fn mint_invite_as(
     // Derived BEFORE the invite row is written: a mint that is going to refuse
     // must not leave a live PSK on disk behind it.
     let node_address = crate::peer::tailnet_node::recorded_node_address(
-        &crate::peer::serve::peer_state_path(store.path()),
+        &crate::peer::state::peer_state_path(store.path()),
         now_ms(),
     );
     let addrs = local_dial_addresses(listen, external, node_address);
@@ -1381,17 +1381,8 @@ fn random_id() -> Result<u64> {
     Ok(u64::from_be_bytes(head))
 }
 
-/// Unix milliseconds.
-///
-/// Public because `tcr peer pair` opens the pairing window and the listener
-/// compares that deadline: both have to read the same clock, and a second
-/// spelling of "now" between the writer and the reader of one deadline is the
-/// kind of drift that shows up as a window that is open on one side only.
-pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or_default(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
-}
+// Compat for outside callers (src/main.rs); wave 2 repoints them to `state`.
+pub use crate::peer::state::now_ms;
 
 /// A 32-byte join secret is the same width as a static key, which is why both
 /// are [`KEY_BYTES`].

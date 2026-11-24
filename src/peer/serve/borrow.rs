@@ -17,8 +17,8 @@ use super::frame::{
     SERVE_FLOW, ServeAck, ServeReply, recv_body, recv_json, send_body, send_json,
     serve_request_from,
 };
-use super::node_key_dir;
 use super::policy::serve_is_allowed_for_path;
+use crate::peer::config::node_key_dir;
 
 pub async fn open_serve(
     lender: &PeerId,

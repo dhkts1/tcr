@@ -99,10 +99,7 @@
 //! own path. `tests/peer_lease.rs` measures it against a tightened per-org
 //! bucket rather than asserting it in prose.
 
-use std::path::PathBuf;
 use std::time::Duration;
-
-use crate::peer::config::PeerStore;
 
 mod borrow;
 mod dial;
@@ -178,49 +175,15 @@ pub use policy::{
 /// # The operator's setting, and this constant's new job
 ///
 /// [`crate::peer::config::PeerFile::borrow_timeout_ms`] is now the value
-/// [`open_serve`] reads per call, off the [`PeerStore`] it is already handed,
+/// [`open_serve`] reads per call, off the [`PeerStore`](crate::peer::config::PeerStore) it is already handed,
 /// so a lowered timeout takes effect without a restart, exactly like `via`.
 /// This constant is what a fresh install starts at:
 /// `PeerFile::borrow_timeout_ms`'s own serde default mirrors it, so a peers
 /// file with no opinion behaves exactly as it did before that field existed.
 pub const BORROW_TIMEOUT: Duration = Duration::from_millis(10_000);
 
-/// The peers file's own directory, which is also the node-key directory, the
-/// same resolution `tcr peer id` uses, so one `--peers` argument points the
-/// whole peer surface at a temp dir.
-pub(crate) fn node_key_dir(store: &PeerStore) -> PathBuf {
-    store.path().parent().map_or_else(
-        crate::peer::id::default_config_dir,
-        std::path::Path::to_path_buf,
-    )
-}
-
-/// The runtime-state file that belongs with `peers_path`: the pairing window,
-/// the knock queue, the mutes and the bans.
-///
-/// The DEFAULT peers file lives in the config directory and its state file in
-/// the cache directory, a split [`crate::peer::state::default_path`] already
-/// owns, so the default is never derived here. Only an explicit `--peers` (or a
-/// `--config` that resolves a peers file beside it) moves the state file with
-/// it, which is what makes one argument select a whole profile and what stops a
-/// test writing the operator's real `peer-state.json`.
-///
-/// # There is a second copy of this, and it is not deleted
-///
-/// `src/main.rs`'s private `peer_state_path` is the same six lines, in the part
-/// of that file the `ls`, `pair` and `pending` verbs read rather than
-/// `lend`/`share`/`allow`. Nothing makes it call this one yet, so the two
-/// agree line for line,
-/// and this doc is where a reader learns there are two.
-pub fn peer_state_path(peers_path: &std::path::Path) -> PathBuf {
-    if peers_path == crate::peer::config::default_path() {
-        return crate::peer::state::default_path();
-    }
-    match peers_path.parent() {
-        Some(parent) => parent.join("peer-state.json"),
-        None => crate::peer::state::default_path(),
-    }
-}
+// Compat for outside callers (src/server.rs, src/status.rs); wave 2 repoints them.
+pub use crate::peer::state::peer_state_path;
 
 #[cfg(test)]
 mod tests {
