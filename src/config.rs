@@ -22,6 +22,7 @@ mod identity_roster;
 mod load;
 mod login_roster;
 mod roster;
+mod serve_inputs;
 mod tokens;
 
 pub use account_edit::{

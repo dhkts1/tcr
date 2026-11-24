@@ -1159,21 +1159,14 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         handover,
     } = options;
 
-    if let Some(port) = port_override {
-        config.proxy.port = port;
-    }
-    let port = config.proxy.port;
+    let port = config.apply_port_override(port_override);
 
     // `config::load` may have just renamed accounts to restore unique names. The
     // pin file is keyed by name, so carry it across before anything reads it —
     // otherwise every pin on a renamed account resolves to nothing and those
     // sessions cold-start their prompt cache, which is the most expensive event
     // in this system.
-    let renames: Vec<(String, String)> = config
-        .renamed_accounts
-        .iter()
-        .map(|rename| (rename.from.clone(), rename.to.clone()))
-        .collect();
+    let renames: Vec<(String, String)> = config.rename_pairs();
     if let Some(path) = &affinity_path {
         let rewritten = affinity::rename_pins(path, &renames);
         if rewritten > 0 {

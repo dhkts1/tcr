@@ -455,7 +455,7 @@ pub async fn dial_for_cli(
             .with_context(|| format!("reading {}", config_path.display()))?;
         let stream = dial_through_server(
             config.proxy.port,
-            config.proxy.api_key.as_deref(),
+            config.loopback_api_key(),
             addr,
             DIAL_TIMEOUT,
         )
