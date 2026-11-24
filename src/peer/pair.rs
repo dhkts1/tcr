@@ -909,7 +909,7 @@ const ENROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 ///
 /// The added clause names the ordinary cause: a found row leaves
 /// `tcr peer ls --json` within a minute of its last announcement (see
-/// `crate::peer::discovery::FOUND_TTL_MS`), so a Trust pressed on a row for a
+/// `crate::peer::state::FOUND_TTL_MS`), so a Trust pressed on a row for a
 /// Mac that just slept or left the network is not a bug, it is a race an
 /// operator can read as one.
 fn could_not_reach(addr: SocketAddr) -> String {

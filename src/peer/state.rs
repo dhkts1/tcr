@@ -229,7 +229,7 @@ pub struct PeerState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tailnet_peers: Vec<TailnetPeer>,
     /// Macs heard announcing on the LAN in the last
-    /// [`crate::peer::discovery::FOUND_TTL_MS`], not trusted, not pinned. See
+    /// [`FOUND_TTL_MS`], not trusted, not pinned. See
     /// [`Found`]. Written by the serving process's browse task and read by
     /// `tcr peer ls --json`, the same split `pending` already draws between a
     /// writer that runs continuously and a reader that runs once per
@@ -720,6 +720,24 @@ fn bracketed_dial_address(addr: &str, port: u16) -> String {
     }
 }
 
+/// How long a row survives after its last announcement.
+/// `abuse-resistance.md`: "a row that stops announcing leaves after 60 s".
+pub const FOUND_TTL_MS: i64 = 60_000;
+
+/// Where a found row was heard.
+///
+/// Ordered `Lan` before `Tailnet` so a sorted list of sources reads the way
+/// `tcr peer ls --json` writes it: `["lan", "tailnet"]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FoundSource {
+    /// An mDNS beacon on this LAN.
+    Lan,
+    /// A beacon datagram over the tailnet, from one of the operator's own
+    /// Macs as the Tailscale app on this Mac names them.
+    Tailnet,
+}
+
 /// One Mac this node heard announce on the LAN: not trusted, not pinned, and
 /// carrying no key to become either. [`Knock`]'s twin for the found list, and
 /// with `Knock`'s own doc discipline: [`Self::addr`] is the key in
@@ -753,18 +771,18 @@ pub struct Found {
     /// so a row's age is honest rather than reset every browse.
     pub first_seen_ms: i64,
     /// When it was last heard. A row is dropped
-    /// [`crate::peer::discovery::FOUND_TTL_MS`] after this.
+    /// [`FOUND_TTL_MS`] after this.
     pub last_seen_ms: i64,
     /// Which sources heard it: `lan`, `tailnet`, or both. A file written
     /// before this key existed reads as `lan`, the only source there was.
     #[serde(default = "lan_only")]
-    pub sources: Vec<crate::peer::discovery::FoundSource>,
+    pub sources: Vec<FoundSource>,
 }
 
 /// [`Found::sources`] for a row written before the key existed: mDNS was
 /// the only way a row was found then.
-fn lan_only() -> Vec<crate::peer::discovery::FoundSource> {
-    vec![crate::peer::discovery::FoundSource::Lan]
+fn lan_only() -> Vec<FoundSource> {
+    vec![FoundSource::Lan]
 }
 
 impl Found {
@@ -1013,9 +1031,8 @@ impl PeerState {
         // beacon stopped is gone from `tcr peer ls --json` within
         // `FOUND_TTL_MS` of its last announcement, never restored across a
         // boot older than its TTL.
-        self.found.retain(|row| {
-            now_ms.saturating_sub(row.last_seen_ms) < crate::peer::discovery::FOUND_TTL_MS
-        });
+        self.found
+            .retain(|row| now_ms.saturating_sub(row.last_seen_ms) < FOUND_TTL_MS);
         // A closed window whose handshake LEARNED A STATIC KEY is kept as a
         // record, and it authorizes nothing: [`Self::accepted_window`] reads
         // the clock, so an expired row admits no pairing either way.
@@ -2288,7 +2305,7 @@ mod tests {
     ///
     /// Watch it fail by removing the `self.found.retain(..)` line from
     /// [`PeerState::expire`]: the row then survives past
-    /// `discovery::FOUND_TTL_MS` and this assertion catches it still present.
+    /// `FOUND_TTL_MS` and this assertion catches it still present.
     #[test]
     fn a_found_row_leaves_after_its_ttl() {
         let now = 1_000_000_i64;
@@ -2300,7 +2317,7 @@ mod tests {
         assert_eq!(state.found.len(), 1, "the found row was written");
         assert_eq!(state.pending.len(), 1, "the pending row was written");
 
-        let past_ttl = now + crate::peer::discovery::FOUND_TTL_MS + 1;
+        let past_ttl = now + FOUND_TTL_MS + 1;
         state.expire(past_ttl);
 
         assert!(
@@ -2528,10 +2545,7 @@ mod tests {
             "the old file is read and trusted, not put aside: {origin:?}"
         );
         assert_eq!(state.found.len(), 1);
-        assert_eq!(
-            state.found[0].sources,
-            [crate::peer::discovery::FoundSource::Lan]
-        );
+        assert_eq!(state.found[0].sources, [FoundSource::Lan]);
     }
 
     /// **A route is answered only from a fresh, ready, app-mode reading, and

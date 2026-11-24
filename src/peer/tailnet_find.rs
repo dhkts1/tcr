@@ -398,7 +398,7 @@ impl BeaconSocket {
 mod tests {
     use super::*;
     use crate::peer::config::{Endpoint, EndpointSource};
-    use crate::peer::discovery::FoundSource;
+    use crate::peer::state::FoundSource;
     use tcr_peer_wire::{INSTANCE_ID_BYTES, InstanceId};
 
     /// `Self` is user 111 at 100.64.0.1; laptop-2 (100.64.0.2) is the

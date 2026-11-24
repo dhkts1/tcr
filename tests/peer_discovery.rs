@@ -9,7 +9,8 @@
 //! compare.
 
 use tcr::peer::config::NetworkKey;
-use tcr::peer::discovery::{self, Discovered, FoundList, FoundSource};
+use tcr::peer::discovery::{self, Discovered, FoundList};
+use tcr::peer::state::{self, FoundSource};
 use tcr_peer_wire::{INSTANCE_ID_BYTES, InstanceId, PeerId};
 
 /// An instance id distinctive enough that a fragment of it could not appear by
@@ -442,7 +443,7 @@ fn a_row_that_stops_announcing_leaves_after_sixty_seconds() {
     assert_eq!(found.len(), 2);
 
     // One keeps announcing, the other does not, one millisecond past the TTL.
-    let later = 1_000 + discovery::FOUND_TTL_MS + 1;
+    let later = 1_000 + state::FOUND_TTL_MS + 1;
     found.observe(vec![row(1, "192.0.2.7")], later);
     let shown = found.shown();
     assert_eq!(
@@ -1082,7 +1083,7 @@ fn a_flood_holds_two_rows_per_address_and_nothing_survives_the_ttl() {
     );
 
     // And the other half of the real bound: the window.
-    found.observe(Vec::new(), 1_000 + discovery::FOUND_TTL_MS);
+    found.observe(Vec::new(), 1_000 + state::FOUND_TTL_MS);
     assert_eq!(
         found.len(),
         0,
@@ -1101,10 +1102,10 @@ fn found_ttl_covers_three_browses() {
     let browse_interval_ms = i64::try_from(discovery::BROWSE_INTERVAL.as_millis())
         .expect("BROWSE_INTERVAL fits in an i64 of milliseconds");
     assert!(
-        discovery::FOUND_TTL_MS >= 3 * browse_interval_ms,
+        state::FOUND_TTL_MS >= 3 * browse_interval_ms,
         "FOUND_TTL_MS ({}) must cover three browses at BROWSE_INTERVAL ({}), or a row that \
          missed two scans in a row leaves before a third has a chance to renew it",
-        discovery::FOUND_TTL_MS,
+        state::FOUND_TTL_MS,
         browse_interval_ms
     );
 }

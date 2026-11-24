@@ -546,7 +546,8 @@ fn spawn_browse(
     background: &mut Vec<JoinHandle<()>>,
 ) {
     use crate::peer::config::TailnetMode;
-    use crate::peer::discovery::{self, FoundSource};
+    use crate::peer::discovery;
+    use crate::peer::state::FoundSource;
     use crate::peer::tailnet_find::{self, BeaconIntake, BeaconSocket};
 
     let peers_path = peers_path.to_path_buf();

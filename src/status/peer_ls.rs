@@ -143,7 +143,7 @@ pub struct PeerFoundRow {
     /// Every source that heard it: `"lan"` (mDNS) and/or `"tailnet"`. When
     /// both did, [`Self::address`] is the tailnet one: see
     /// [`crate::peer::discovery::FoundList::shown`].
-    pub sources: Vec<crate::peer::discovery::FoundSource>,
+    pub sources: Vec<crate::peer::state::FoundSource>,
 }
 
 /// One entry in `tcr peer ls --json`'s `peers` array: a pinned Mac or a found
@@ -293,7 +293,7 @@ mod tests {
             address: "198.51.100.7:7755".to_string(),
             trusted: false,
             last_seen_ms: 12_000,
-            sources: vec![crate::peer::discovery::FoundSource::Lan],
+            sources: vec![crate::peer::state::FoundSource::Lan],
         });
         let value = serde_json::to_value(&found).expect("serialize a found row");
         let object = value.as_object().expect("a found row is an object");
@@ -315,7 +315,7 @@ mod tests {
     /// **A found row carries `sources` as the contract spells it.**
     #[test]
     fn a_found_peer_lists_its_sources() {
-        use crate::peer::discovery::FoundSource;
+        use crate::peer::state::FoundSource;
         let found = PeerFoundRow {
             name: None,
             address: "100.64.0.2:7755".to_string(),

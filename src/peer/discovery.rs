@@ -58,9 +58,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use serde::{Deserialize, Serialize};
 
 use crate::peer::config::{Endpoint, EndpointSource, PeerRow, PeerStore};
+use crate::peer::state::{FOUND_TTL_MS, FoundSource};
 
 /// The DNS-SD service type this node registers and browses.
 pub const SERVICE_TYPE: &str = "_tcr-peer._tcp.local.";
@@ -100,10 +100,6 @@ pub const MAX_FOUND_ROWS: usize = 12;
 /// How many found rows one source address may hold. Two: a Mac with two
 /// interfaces on the same LAN is real, and 254 rows from one address is not.
 pub const MAX_FOUND_PER_ADDRESS: usize = 2;
-
-/// How long a row survives after its last announcement.
-/// `abuse-resistance.md`: "a row that stops announcing leaves after 60 s".
-pub const FOUND_TTL_MS: i64 = 60_000;
 
 /// How long one [`browse`] call listens before returning what it has seen.
 /// Short on purpose: a caller polls this repeatedly rather than holding a
@@ -1461,20 +1457,6 @@ impl Discovered {
             sources: self.sources.clone(),
         }
     }
-}
-
-/// Where a found row was heard.
-///
-/// Ordered `Lan` before `Tailnet` so a sorted list of sources reads the way
-/// `tcr peer ls --json` writes it: `["lan", "tailnet"]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FoundSource {
-    /// An mDNS beacon on this LAN.
-    Lan,
-    /// A beacon datagram over the tailnet, from one of the operator's own
-    /// Macs as the Tailscale app on this Mac names them.
-    Tailnet,
 }
 
 #[cfg(test)]
