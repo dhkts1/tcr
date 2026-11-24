@@ -91,7 +91,7 @@ pub fn any_usable(addrs: &[IpAddr]) -> bool {
 /// online.
 ///
 /// The name travels too, not just the address, because
-/// [`crate::peer::pair::host_addresses`] needs it to tell a tailnet address
+/// [`crate::peer::pair::addresses::host_addresses`] needs it to tell a tailnet address
 /// (on a `utun` interface) from a mobile hotspot's carrier-grade-NAT one (on
 /// anything else) and used to run this same walk a second time, by hand, to
 /// keep it.

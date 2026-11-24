@@ -52,15 +52,22 @@ backup() {
 PASS=0
 FAIL=0
 
-# The cargo arguments that run test <name> from tests/<file>.rs, one per line:
-# the file's own target when Cargo.toml declares one, otherwise the shared `it`
-# test crate, where the file is a module of the same name.
+# `test_module_path`: where a test lives inside its test file, read from the source.
+# shellcheck source=tests/tools/peer-test-path.sh
+source "$(dirname "${BASH_SOURCE[0]}")/peer-test-path.sh"
+
+# The cargo arguments that run test <name> from tests/<file>.rs, one per line. The libtest
+# path comes from `test_module_path`, so a test file that became a directory module
+# (`peer_pairing::enrolment::<name>`) is followed instead of matching nothing. Fails (and
+# prints why) when the name is defined in zero or two places; the caller reports the row
+# as a FAIL and never runs a filter it could not resolve.
 test_target() {
-  local file="$1" test_name="$2"
+  local file="$1" test_name="$2" inner
+  inner="$(test_module_path "$file" "$test_name")" || return 1
   if grep -qx "name = \"$file\"" "$ROOT/Cargo.toml"; then
-    printf '%s\n' --test "$file" "$test_name"
+    printf '%s\n' --test "$file" "$inner"
   else
-    printf '%s\n' --test it "$file::$test_name"
+    printf '%s\n' --test it "$file::$inner"
   fi
 }
 
@@ -68,7 +75,13 @@ test_target() {
 mutate() {
   local label="$1" file="$2" binary="$3" test_name="$4" mutation="$5"
   local -a target
-  mapfile -t target < <(test_target "$binary" "$test_name")
+  local resolved
+  if ! resolved="$(test_target "$binary" "$test_name")"; then
+    printf '%s: FAIL: test-name-did-not-resolve: %s\n' "$file" "$label"
+    FAIL=$((FAIL + 1))
+    return
+  fi
+  mapfile -t target <<<"$resolved"
   backup "$file"
   if ! MUT_FILE="$ROOT/$file" python3 -c "$mutation"; then
     printf '%s: FAIL: mutation-could-not-apply: %s\n' "$file" "$label"
@@ -141,7 +154,13 @@ pub struct Probe {
 """
 open(p, "w").write(s)
 '
-  cargo test --manifest-path "$ROOT/Cargo.toml" --test it "peer_wire::$pair" >"$LOG" 2>&1
+  if ! inner="$(test_module_path peer_wire "$pair")"; then
+    printf 'crates/tcr-peer-wire/src/lib.rs: FAIL: test-name-did-not-resolve: %s\n' "$pair"
+    FAIL=$((FAIL + 1))
+    restore_all
+    continue
+  fi
+  cargo test --manifest-path "$ROOT/Cargo.toml" --test it "peer_wire::$inner" >"$LOG" 2>&1
   rc=$?
   restore_all
   if [[ $rc -eq 0 ]]; then
@@ -156,11 +175,11 @@ done
 
 # --- Item 1: the enrolment caller ---------------------------------------------
 mutate 'the listener never calls accept_enrolment, so a headless join pins nothing' \
-  'src/peer/listener.rs' peer_pairing a_two_process_join_leaves_a_pinned_row_on_both_sides '
+  'src/peer/listener/connection.rs' peer_pairing a_two_process_join_leaves_a_pinned_row_on_both_sides '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
-old = "        return serve_enrolment(stream, &mut session, context, &secret).await;"
+old = "        return serve_enrolment(&mut stream, &mut session, context, &secret, store, origin).await;"
 assert old in s, "the enrolment dispatch line moved"
 s = s.replace(old, "        let _ = &secret;")
 open(p, "w").write(s)
@@ -172,21 +191,21 @@ mutate 'accept_enrolment without the file lock double-accepts a one-use invite' 
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
-old = "    let _lock = crate::peer::config::FileLock::acquire(peers_path)?;\n    let mut file = read_or_default(peers_path)?;\n\n    let Some(position)"
+old = "    let _lock = crate::peer::config::FileLock::acquire(peers_path)?;\n    let mut file = read_or_default(peers_path)?;\n\n    let Some(invite) = file.spend_invite(secret, now_ms) else {"
 assert old in s, "the lock line moved"
-s = s.replace(old, "    let mut file = read_or_default(peers_path)?;\n\n    let Some(position)")
+s = s.replace(old, "    let mut file = read_or_default(peers_path)?;\n\n    let Some(invite) = file.spend_invite(secret, now_ms) else {")
 open(p, "w").write(s)
 '
 
 # --- Item 5: the authenticated refusal bound ----------------------------------
 mutate 'every authenticated failure logs, so a reconnect loop fills the disk' \
-  'src/peer/listener.rs' peer_refusal_log an_authenticated_reconnect_loop_writes_one_log_line '
+  'src/peer/listener/admission.rs' peer_refusal_log an_authenticated_reconnect_loop_writes_one_log_line '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
-old = "                let admitted = log.admit(&addr, now_ms());"
+old = "        log.admit(addr, now_ms)\n    }"
 assert old in s, "the admit call moved"
-s = s.replace(old, "                let admitted = if failure.authenticated { Some(0) } else { log.admit(&addr, now_ms()) };")
+s = s.replace(old, "        if authenticated { Some(0) } else { log.admit(addr, now_ms) }\n    }")
 open(p, "w").write(s)
 '
 
@@ -196,36 +215,16 @@ mutate 'announceName back to default-on, so a fresh config announces a name' \
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
-old = "    #[serde(default)]\n    pub announce_name: bool,"
-assert old in s, "the announce_name field moved"
-s = s.replace(old, "    #[serde(default = \"default_announce_name\")]\n    pub announce_name: bool,")
-s = s.replace("fn default_max_hops() -> u8 {", "fn default_announce_name() -> bool {\n    true\n}\n\nfn default_max_hops() -> u8 {")
-# The DEFAULT impl is what the gate reads, so derive(Default) has to move too.
-old_derive = "#[derive(Debug, Clone, Default, Serialize, Deserialize)]\n#[serde(rename_all = \"camelCase\")]\npub struct PeerFile {"
-assert old_derive in s, "the PeerFile derive moved"
-s = s.replace(old_derive, "#[derive(Debug, Clone, Serialize, Deserialize)]\n#[serde(rename_all = \"camelCase\")]\npub struct PeerFile {")
-s = s.replace("fn default_announce_name() -> bool {", """impl Default for PeerFile {
-    fn default() -> Self {
-        Self {
-            listen: None,
-            discovery: false,
-            name: None,
-            announce_name: true,
-            network_key: None,
-            max_hops: default_max_hops(),
-            peers: Vec::new(),
-            pending_invites: Vec::new(),
-        }
-    }
-}
-
-fn default_announce_name() -> bool {""")
+# PeerFile::default is a hand-written impl now (no derive), and it is what the gate reads.
+old = "            announce_name: false,\n            internet: false,"
+assert old in s, "the PeerFile default impl moved"
+s = s.replace(old, "            announce_name: true,\n            internet: false,")
 open(p, "w").write(s)
 '
 
 # --- Item 9: the accepted-window gating ---------------------------------------
 mutate 'XX answered with no accepted window, disclosing this node static key' \
-  'src/peer/listener.rs' peer_pairing xx_from_an_unaccepted_instance_gets_zero_bytes '
+  'src/peer/listener/pairing.rs' peer_pairing xx_from_an_unaccepted_instance_gets_zero_bytes '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
@@ -251,14 +250,14 @@ mutate 'a muted address still reaches the pending queue' \
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
-old = "        if self.is_muted(addr, now_ms) {\n            return Err(KnockRefusal::Muted);\n        }"
+old = "        if self.is_muted(addr, now_ms) {\n            return Some(KnockRefusal::Muted);\n        }"
 assert old in s, "the mute check moved"
 s = s.replace(old, "")
 open(p, "w").write(s)
 '
 
 mutate 'a banned KEY is admitted from a new address, so DHCP undoes a block' \
-  'src/peer/listener.rs' peer_pairing a_banned_key_is_refused_from_a_new_address '
+  'src/peer/listener/pairing.rs' peer_pairing a_banned_key_is_refused_from_a_new_address '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
@@ -270,7 +269,7 @@ open(p, "w").write(s)
 
 # --- Item 10: the caps --------------------------------------------------------
 mutate 'the knock rate limit removed, so a flood is unbounded' \
-  'src/peer/listener.rs' peer_pairing the_fourth_knock_in_ten_seconds_gets_nothing '
+  'src/peer/listener/knock.rs' peer_pairing the_fourth_knock_in_ten_seconds_gets_nothing '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
@@ -285,14 +284,19 @@ mutate 'the pending-queue cap removed, so a /24 of hosts makes 254 rows' \
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
-old = "        if self.pending.len() >= MAX_PENDING_KNOCKS {"
-assert old in s, "the queue cap moved"
-s = s.replace(old, "        if false {")
+# The cap sits at two sites (the check, and the same check again under the reservation
+# guard). Each anchor below is unique and both are replaced, so the cap is gone as before.
+for old in (
+    "            return None;\n        }\n        if self.pending.len() >= MAX_PENDING_KNOCKS {",
+    "        // local should it ever run without that guard.\n        if self.pending.len() >= MAX_PENDING_KNOCKS {",
+):
+    assert old in s, "a queue cap moved"
+    s = s.replace(old, old.replace("if self.pending.len() >= MAX_PENDING_KNOCKS {", "if false {"))
 open(p, "w").write(s)
 '
 
 mutate 'the per-address socket cap removed' \
-  'src/peer/listener.rs' peer_pairing the_third_unauthenticated_socket_from_one_address_is_refused '
+  'src/peer/listener/admission.rs' peer_pairing the_third_unauthenticated_socket_from_one_address_is_refused '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
@@ -303,13 +307,13 @@ open(p, "w").write(s)
 '
 
 mutate 'the caps back to fixed constants, so a granted max_inflight is capped at 2' \
-  'src/peer/listener.rs' peer_pairing concurrent_handshakes_up_to_the_granted_inflight_all_complete '
+  'src/peer/listener/admission.rs' peer_pairing concurrent_handshakes_up_to_the_granted_inflight_all_complete '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
-old = "    (\n        MAX_UNAUTHENTICATED_SOCKETS.saturating_add(granted),\n        MAX_UNAUTHENTICATED_PER_ADDRESS.saturating_add(largest),\n    )"
+old = "    (\n        MAX_UNAUTHENTICATED_SOCKETS.saturating_add(largest),\n        MAX_UNAUTHENTICATED_PER_ADDRESS.saturating_add(largest),\n    )"
 assert old in s, "the allowance derivation moved"
-s = s.replace(old, "    let _ = (granted, largest);\n    (MAX_UNAUTHENTICATED_SOCKETS, MAX_UNAUTHENTICATED_PER_ADDRESS)")
+s = s.replace(old, "    let _ = largest;\n    (MAX_UNAUTHENTICATED_SOCKETS, MAX_UNAUTHENTICATED_PER_ADDRESS)")
 open(p, "w").write(s)
 '
 
@@ -327,24 +331,28 @@ open(p, "w").write(s)
 # spends HANDSHAKE_TIMEOUT of somebody else's allowance instead of
 # MESSAGE_1_TIMEOUT. A gate that cannot be shown failing is not a gate, so this
 # is reported as an ungated change and not counted as a proven one.
-backup 'src/peer/listener.rs'
-MUT_FILE="$ROOT/src/peer/listener.rs" python3 -c '
+backup 'src/peer/listener/connection.rs'
+MUT_FILE="$ROOT/src/peer/listener/connection.rs" python3 -c '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
-old = "    drop(slot);\n\n    // Check 4, in one place"
+old = "    drop(slot);\n\n    let psks = outstanding_secrets(&file);"
 assert old in s, "the slot release moved"
-s = s.replace(old, "    // Check 4, in one place")
-s = s.replace("        return serve_knock(&mut stream, context, &addr, pattern, &message_1, &file, now)", "        let _ = &slot;\n        return serve_knock(&mut stream, context, &addr, pattern, &message_1, &file, now)")
+# The knock branch above drops its own slot, so only this release (message 1 done, handshake
+# next) is removed: the slot is then held until the connection ends.
+s = s.replace(old, "    let psks = outstanding_secrets(&file);")
 open(p, "w").write(s)
 '
-if cargo test --manifest-path "$ROOT/Cargo.toml" --test peer_lease \
-     borrowed_requests_are_paced >"$LOG" 2>&1; then
-  printf 'src/peer/listener.rs: NOTE: the narrowed slot scope is UNGATED: every gate stays green without it\n'
+if ! slot_filter="$(test_module_path peer_lease borrowed_requests_are_paced_by_the_lenders_own_bucket)"; then
+  printf 'src/peer/listener/connection.rs: FAIL: test-name-did-not-resolve: borrowed_requests_are_paced_by_the_lenders_own_bucket\n'
+  FAIL=$((FAIL + 1))
+elif cargo test --manifest-path "$ROOT/Cargo.toml" --test peer_lease \
+     "$slot_filter" >"$LOG" 2>&1; then
+  printf 'src/peer/listener/connection.rs: NOTE: the narrowed slot scope is UNGATED: every gate stays green without it\n'
   printf '  unauthenticated_allowance is what carries the concurrency fix; see the row above\n'
   PASS=$((PASS + 1))
 else
-  printf 'src/peer/listener.rs: NOTE: the narrowed slot scope now HAS a gate, which is better than recorded\n'
+  printf 'src/peer/listener/connection.rs: NOTE: the narrowed slot scope now HAS a gate, which is better than recorded\n'
   PASS=$((PASS + 1))
 fi
 restore_all
@@ -365,7 +373,7 @@ mutate 'the found list shows every row, so an announcement flood fills the UI' \
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
-old = "            .take(MAX_FOUND_ROWS)\n"
+old = ".take(MAX_FOUND_ROWS)"
 assert old in s, "the found-row cap moved"
 s = s.replace(old, "")
 open(p, "w").write(s)
@@ -383,7 +391,7 @@ open(p, "w").write(s)
 '
 
 mutate 'the refusal log global again, so one flooder silences every address' \
-  'src/peer/listener.rs' peer_noise one_flooding_address_does_not_silence_another '
+  'src/peer/listener/admission.rs' peer_noise one_flooding_address_does_not_silence_another '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
@@ -395,7 +403,7 @@ open(p, "w").write(s)
 
 # --- Item 11: the network key ------------------------------------------------
 mutate 'a knock with no network key admitted at a node that requires one' \
-  'src/peer/listener.rs' peer_pairing a_knock_without_the_network_key_gets_zero_bytes '
+  'src/peer/listener/knock.rs' peer_pairing a_knock_without_the_network_key_gets_zero_bytes '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
@@ -429,7 +437,7 @@ open(p, "w").write(s)
 '
 
 mutate 'the HMAC inner/outer pads swapped, so it agrees with nobody' \
-  'src/peer/config.rs' peer_pairing hmac_sha256_matches_rfc_4231_case_2 '
+  'src/peer/drop.rs' peer_pairing hmac_sha256_matches_rfc_4231_case_2 '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
@@ -463,25 +471,27 @@ open(p, "w").write(s)
 '
 
 mutate 'the network key set AFTER the enrol attempt, so a dead link sets nothing' \
-  'src/main.rs' peer_pairing a_link_with_a_dead_join_key_still_sets_the_network_key_through_the_cli '
+  'src/cmd/peer/pairing.rs' peer_pairing a_link_with_a_dead_join_key_still_sets_the_network_key_through_the_cli '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
-old = "            if let Some(network_key) = input.network_key() {"
+old = "    if let Some(network_key) = input.network_key() {"
 assert old in s, "the network-key-first block moved"
-s = s.replace(old, "            if false {\n                let _ = input.network_key();\n            }\n            if false {")
+# `.filter(|_| false)` keeps the `network_key` binding the block body reads, so the mutant
+# still compiles and the key is simply never set.
+s = s.replace(old, "    if let Some(network_key) = input.network_key().filter(|_| false) {")
 open(p, "w").write(s)
 '
 
 # --- Item 4: the token never in output ---------------------------------------
 mutate 'the join key echoed to stderr on the failure path' \
-  'src/main.rs' peer_pairing join_stdin_keeps_the_key_out_of_argv_and_every_log_line '
+  'src/cmd/peer/pairing.rs' peer_pairing join_stdin_keeps_the_key_out_of_argv_and_every_log_line '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
-old = "            tcr::peer::pair::join(&store, token, &label).await?;"
+old = "    let joined = tcr::peer::pair::join(&store, token, &label).await?;"
 assert old in s, "the join call moved"
-s = s.replace(old, "            eprintln!(\"peer join: dialling {}\", token.to_token());\n            tcr::peer::pair::join(&store, token, &label).await?;")
+s = s.replace(old, "    eprintln!(\"peer join: dialling {}\", token.to_token());\n    let joined = tcr::peer::pair::join(&store, token, &label).await?;")
 open(p, "w").write(s)
 '
 
