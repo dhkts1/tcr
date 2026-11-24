@@ -20,6 +20,7 @@ mod file;
 mod group_edit;
 mod identity_roster;
 mod load;
+mod login_roster;
 mod roster;
 mod tokens;
 
