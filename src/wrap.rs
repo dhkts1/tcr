@@ -485,7 +485,7 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
 /// missing.
 pub fn pricing_table(config_path: &Path) -> PricingTable {
     let overrides: BTreeMap<String, PricingOverride> = crate::config::load(config_path)
-        .map_or_default(|config| config.pricing.into_iter().collect());
+        .map_or_default(crate::config::Config::into_pricing_overrides);
     PricingTable::new(overrides)
 }
 

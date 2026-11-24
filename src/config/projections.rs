@@ -1,10 +1,12 @@
 //! The read-only views other modules build from a whole config: the settings
-//! `tcr config show` reports.
+//! `tcr config show` reports, and the pricing overrides `tcr wrap` prices with.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::Config;
 use crate::config_show::{ConfigSettings, PacingSetting, ThrottleSetting};
+use crate::pricing::PricingOverride;
 
 impl Config {
     /// The settings a server started on this config would use, with every
@@ -27,5 +29,10 @@ impl Config {
             usage_retention_days: self.usage_retention_days,
             http1_only: self.http1_only,
         }
+    }
+
+    /// The config's `pricing` overrides, keyed by model, consuming the config.
+    pub fn into_pricing_overrides(self) -> BTreeMap<String, PricingOverride> {
+        self.pricing.into_iter().collect()
     }
 }
