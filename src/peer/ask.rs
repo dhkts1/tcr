@@ -49,7 +49,8 @@
 
 use tcr_peer_wire::Crockford;
 
-use crate::peer::noise::{self, KEY_BYTES};
+use crate::peer::id::KEY_BYTES;
+use crate::peer::noise;
 use crate::peer::pair::JoinToken;
 use crate::peer::state::PendingAsk;
 

@@ -1753,7 +1753,7 @@ pub const CLIENT_FORWARD_HOPS: u8 = 1;
 /// never the requester's.
 pub async fn open_forward_to(
     forwarder: &PeerRow,
-    node_secret: &[u8; noise::KEY_BYTES],
+    node_secret: &[u8; crate::peer::id::KEY_BYTES],
     target: &PeerId,
     via: &[PeerId],
     borrow_timeout_ms: u64,
@@ -1790,7 +1790,7 @@ pub async fn open_forward_to(
         target: Some(TunnelTarget::Peer { node: *target }),
         via: via.to_vec(),
         hops_remaining: CLIENT_FORWARD_HOPS,
-        request_id: crate::peer::lease::random_id()?,
+        request_id: crate::peer::id::random_id()?,
     };
     let bytes = serde_json::to_vec(&header)
         .context("peer forward: the forwarding header did not serialize")?;

@@ -12,9 +12,9 @@ use tcr_peer_wire::{
 };
 
 use super::hand::{handed_tokens, read_handed_bearers, serve_on_handed_bearer};
-use super::random_id;
 use crate::fallback::{Ask, FallbackProvider};
 use crate::peer::config::{PeerRow, PeerStore};
+use crate::peer::id::random_id;
 use crate::peer::serve;
 
 /// Ask one lender for a lease, over a CONTROL stream.

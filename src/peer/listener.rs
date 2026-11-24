@@ -73,9 +73,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 
 use crate::peer::config::{PeerFile, PeerRow, PeerStore};
+use crate::peer::id::KEY_BYTES;
 use crate::peer::id::NodeKey;
 use crate::peer::lease::Ledger;
-use crate::peer::noise::{self, Handshake, KEY_BYTES};
+use crate::peer::noise::{self, Handshake};
 use crate::peer::serve::{self, WindowUtilization};
 use crate::peer::state::knock_address;
 
@@ -628,7 +629,7 @@ pub async fn park_one_carrier(friend: &PeerRow, context: &SessionContext) -> Res
         target: None,
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: crate::peer::lease::random_id()
+        request_id: crate::peer::id::random_id()
             .context("peer reverse: no request id for the carrier")?,
     };
     let bytes =

@@ -271,7 +271,7 @@ async fn ask_owner_for_a_lease(
         target: None,
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: tcr::peer::lease::random_id().expect("a request id"),
+        request_id: tcr::peer::id::random_id().expect("a request id"),
     };
     tcr::peer::serve::send_control(&mut stream, &mut session, &header)
         .await

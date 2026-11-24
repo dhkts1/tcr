@@ -50,6 +50,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{LendScope, PeerId, Window};
 
+use crate::peer::drop::hmac_sha256;
+
 /// `tcr-peers.json` in the config directory, mode 0600.
 pub fn default_path() -> PathBuf {
     crate::peer::id::default_config_dir().join("tcr-peers.json")
@@ -429,7 +431,7 @@ impl NetworkKey {
     /// Mint a fresh one through the same CSPRNG every other secret here comes
     /// from.
     pub fn mint() -> Result<Self> {
-        Ok(Self(crate::peer::noise::random_secret()?))
+        Ok(Self(crate::peer::id::random_secret()?))
     }
 
     /// Build one from raw bytes, for a share link, which carries the key in
@@ -562,67 +564,6 @@ impl TryFrom<String> for NetworkKey {
     fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
         tcr_peer_wire::decode_key32(value.trim()).map(Self)
     }
-}
-
-/// HMAC-SHA256, by hand over `sha2`, in the twenty lines RFC 2104 is.
-///
-/// # Why this is not the `hmac` crate
-///
-/// Measured rather than assumed: `sha2` 0.10.9 is already in `Cargo.lock`
-/// (`snow`'s `use-sha2` resolves it), so calling it is one dependency EDGE and
-/// zero new packages, the same precedent `getrandom` is in the root
-/// `Cargo.toml` under. `hmac` is **not** in the lock, so reaching for it would
-/// be a genuinely new package for the construction below. Re-derive with
-/// `cargo tree -i sha2` and `cargo tree -i hmac` (the second prints nothing).
-///
-/// Verified against RFC 4231's test case 2 rather than against itself:
-/// `hmac_sha256_matches_rfc_4231_case_2` in `tests/peer_pairing.rs`. A
-/// hand-rolled MAC that is only ever compared to its own output is
-/// self-consistent and agrees with nobody, including the next build of this
-/// program, if the construction is ever replaced by the `hmac` crate.
-///
-/// `pub` and over `&[u8]` rather than private and over `&[u8; 32]`, for that
-/// test's sake and for one reason beyond it: the RFC's vectors use keys of
-/// several widths, and a signature that could only take this program's own key
-/// width could only be checked against this program's own output. Every branch
-/// the RFC names is therefore written, including the long-key one no caller
-/// here reaches.
-pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    use sha2::{Digest as _, Sha256};
-
-    /// SHA-256's block size.
-    const BLOCK: usize = 64;
-
-    // RFC 2104: a key longer than the block is replaced by its own hash. No
-    // caller in this tree reaches it, the network key is 32 bytes, but a
-    // function that silently truncated a long key would be a function whose
-    // agreement with the RFC held only for the inputs it was tested on.
-    let mut shortened = [0_u8; 32];
-    let key: &[u8] = if key.len() > BLOCK {
-        shortened.copy_from_slice(&Sha256::digest(key));
-        &shortened
-    } else {
-        key
-    };
-
-    let mut ipad = [0x36_u8; BLOCK];
-    let mut opad = [0x5c_u8; BLOCK];
-    for (slot, byte) in ipad.iter_mut().zip(key.iter()) {
-        *slot ^= byte;
-    }
-    for (slot, byte) in opad.iter_mut().zip(key.iter()) {
-        *slot ^= byte;
-    }
-
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(message);
-    let inner = inner.finalize();
-
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner);
-    outer.finalize().into()
 }
 
 impl PeerFile {
@@ -1938,7 +1879,7 @@ impl LendGrant {
             return Ok(false);
         }
         self.id = u128::from_be_bytes(
-            crate::peer::noise::random_secret()?[..16]
+            crate::peer::id::random_secret()?[..16]
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("a 32-byte secret has 16 bytes in it"))?,
         );
@@ -1989,18 +1930,6 @@ pub struct PeerStore {
     /// The file's mtime as of the last successful (or unmodified-since) read.
     /// `None` before the first successful read.
     mtime: Mutex<Option<SystemTime>>,
-    /// The runtime state beside the peers file, read at most ONCE per store and
-    /// then held. See [`Self::state`]. `None` until something asks for it, so
-    /// a store opened by a caller that never needs the state (the SERVE path,
-    /// `Ledger::grant`) reads no second file.
-    state: Mutex<Option<crate::peer::state::PeerState>>,
-    /// Which state file [`Self::state`] reads. Derived from [`Self::path`] by
-    /// [`crate::peer::serve::peer_state_path`], the one derivation this tree
-    /// has, and overridable with [`Self::with_state_path`] for the callers
-    /// that carry their own (`SessionContext` holds both paths, and
-    /// `listener::serve` pairs a temp-dir peers file with the DEFAULT state
-    /// file, so deriving it here unconditionally would read the wrong file).
-    state_path: PathBuf,
 }
 
 impl PeerStore {
@@ -2018,18 +1947,7 @@ impl PeerStore {
             path: path.to_path_buf(),
             file: Mutex::new(file),
             mtime: Mutex::new(mtime),
-            state: Mutex::new(None),
-            state_path: crate::peer::serve::peer_state_path(path),
         })
-    }
-
-    /// Read [`Self::state`] from `path` instead of the one derived beside the
-    /// peers file. Takes effect only before the first [`Self::state`] call,
-    /// which is the only call that reads.
-    #[must_use]
-    pub fn with_state_path(mut self, path: PathBuf) -> Self {
-        self.state_path = path;
-        self
     }
 
     /// Re-read the policy half if and only if the file's mtime moved. A cheap
@@ -2162,29 +2080,6 @@ impl PeerStore {
             .map(|row| row.with_derived_ends(now_s))
             .collect();
         file
-    }
-
-    /// The runtime state beside this peers file, read ONCE per store and then
-    /// cached, [`Self::file`]'s rule for the other file this listener reads.
-    ///
-    /// `now_ms` is the instant the rows are expired against
-    /// ([`crate::peer::state::load`]) and it is taken by the FIRST caller: a
-    /// second call inside the same connection gets that read back, which is the
-    /// point. A caller that must see another process's write, every
-    /// load-modify-save under [`FileLock`], takes the lock and calls
-    /// [`crate::peer::state::load`] itself; this accessor is for the READ path
-    /// only and says so rather than pretending to be fresh.
-    pub fn state(&self, now_ms: i64) -> Result<crate::peer::state::PeerState> {
-        let mut cached = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(state) = cached.as_ref() {
-            return Ok(state.clone());
-        }
-        let state = crate::peer::state::load(&self.state_path, now_ms)?;
-        *cached = Some(state.clone());
-        Ok(state)
     }
 
     /// Where this store reads from. Kept so a log line can name the file

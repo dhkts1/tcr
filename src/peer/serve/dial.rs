@@ -13,7 +13,7 @@ use crate::peer::id::NodeKey;
 use crate::peer::noise::{self, Handshake};
 
 use super::frame::{recv_control, send_control};
-use super::{BORROW_TIMEOUT, node_key_dir, peer_state_path, random_u128};
+use super::{BORROW_TIMEOUT, node_key_dir, peer_state_path};
 
 /// Everything a stream to a peer has to be, as ONE name.
 ///
@@ -1052,7 +1052,7 @@ async fn ask_through_a_friend(
                 continue;
             }
         };
-        let request_id = match random_u128() {
+        let request_id = match crate::peer::id::random_id() {
             Ok(id) => id,
             Err(err) => {
                 tracing::warn!(

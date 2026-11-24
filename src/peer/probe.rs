@@ -748,7 +748,7 @@ pub struct ProbeRun {
 /// session and a late ack from the previous one would match the new session's
 /// first probe.
 fn next_nonce() -> Result<u64> {
-    let bytes = noise::random_secret()?;
+    let bytes = crate::peer::id::random_secret()?;
     let Some(head) = bytes.get(..8) else {
         anyhow::bail!("peer probe: the CSPRNG returned fewer than eight bytes");
     };

@@ -7,7 +7,8 @@ use tcr_peer_wire::{Control, PeerId, StreamHeader, StreamKind, TunnelTarget};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::peer::config::{self as config, PeerStore};
-use crate::peer::noise::{self, Handshake, KEY_BYTES, PeerSession};
+use crate::peer::id::KEY_BYTES;
+use crate::peer::noise::{self, Handshake, PeerSession};
 use crate::peer::serve;
 use crate::peer::state::knock_address;
 
@@ -62,20 +63,17 @@ where
 
     // ONE store per accepted connection, and the review's L2 is why it is a
     // store rather than two reads: everything after this point that needs the
-    // peers file or the runtime state asks this value
-    // ([`PeerStore::file`], [`PeerStore::state`]), so an accepted connection
+    // peers file asks this value ([`PeerStore::file`]), and the connection
+    // reads the runtime state file once, here, so an accepted connection
     // opens each file once. It used to open the peers file twice, here, and
     // again in `serve_stream` for the same bytes, which `tests/peer_lease.rs`
     // now counts through `config::peers_file_opens`.
     //
     // Before `SocketSlot::acquire`, because the ban list and the cap the slot
     // is taken against are both read out of these two values.
-    let store = PeerStore::open(&context.peers_path)
-        .map_err(ConnectionFailure::unauthenticated)?
-        .with_state_path(context.state_path.clone());
+    let store = PeerStore::open(&context.peers_path).map_err(ConnectionFailure::unauthenticated)?;
     let file = store.file();
-    let peer_state = store
-        .state(now)
+    let peer_state = crate::peer::state::load(&context.state_path, now)
         .map_err(ConnectionFailure::unauthenticated)?;
 
     // Check 1. A banned address is refused before anything else happens, which

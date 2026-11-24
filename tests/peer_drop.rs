@@ -226,7 +226,7 @@ fn both_ends_derive_the_same_name_for_one_direction() {
 /// The key ladder against values computed outside this program.
 ///
 /// A hand-rolled MAC that is only ever compared to its own output is
-/// self-consistent and agrees with nobody, the rule `config::hmac_sha256`'s
+/// self-consistent and agrees with nobody, the rule `drop::hmac_sha256`'s
 /// own doc states, and a ladder built on one inherits the problem. Both halves
 /// below therefore come from a separate implementation.
 ///

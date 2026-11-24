@@ -76,7 +76,7 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
         target: None,
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: crate::peer::lease::random_id()?,
+        request_id: crate::peer::id::random_id()?,
     };
     send_control(&mut stream, &mut session, &header).await?;
 

@@ -102,8 +102,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
-
 use crate::peer::config::PeerStore;
 
 mod borrow;
@@ -222,12 +220,6 @@ pub fn peer_state_path(peers_path: &std::path::Path) -> PathBuf {
         Some(parent) => parent.join("peer-state.json"),
         None => crate::peer::state::default_path(),
     }
-}
-
-/// 128 opaque bits for a request id, from the same source
-/// [`crate::peer::lease::Ledger::grant`] mints a lease id with.
-fn random_u128() -> Result<u128> {
-    crate::peer::lease::random_id()
 }
 
 #[cfg(test)]

@@ -7,10 +7,11 @@ use anyhow::Result;
 use tcr_peer_wire::{Lease, LeaseRefusal, LeaseRequest, LeaseUnit, LendScope, PeerId, Window};
 
 use super::{
-    Granted, MIN_DEBIT, RelayRefusal, clamp_to_grant, fraction_budget, random_id,
-    schedule_closes_at_ms, schedule_refusal, seconds_of,
+    Granted, MIN_DEBIT, RelayRefusal, clamp_to_grant, fraction_budget, schedule_closes_at_ms,
+    schedule_refusal, seconds_of,
 };
 use crate::peer::config::{LendGrant, PeerStore};
+use crate::peer::id::random_id;
 use crate::peer::serve;
 
 /// How many `(lease_id, request_id)` pairs one ledger remembers.

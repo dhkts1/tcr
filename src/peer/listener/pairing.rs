@@ -3,7 +3,8 @@ use tcr_peer_wire::PeerId;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::peer::config::PeerRow;
-use crate::peer::noise::{self, Handshake, KEY_BYTES, PeerSession, PinRefusal};
+use crate::peer::id::KEY_BYTES;
+use crate::peer::noise::{self, Handshake, PeerSession, PinRefusal};
 use crate::peer::state::PeerState;
 
 use super::SessionContext;

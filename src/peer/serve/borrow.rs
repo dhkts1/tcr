@@ -17,8 +17,8 @@ use super::frame::{
     SERVE_FLOW, ServeAck, ServeReply, recv_body, recv_json, send_body, send_json,
     serve_request_from,
 };
+use super::node_key_dir;
 use super::policy::serve_is_allowed_for_path;
-use super::{node_key_dir, random_u128};
 
 pub async fn open_serve(
     lender: &PeerId,
@@ -173,7 +173,7 @@ async fn borrow_once(
         return Ok(Borrowed::NotThisLender);
     }
 
-    let request_id = random_u128()?;
+    let request_id = crate::peer::id::random_id()?;
     let request = serve_request_from(ask, headers, lease.lease_id, request_id)?;
 
     let key = NodeKey::load_or_mint(&node_key_dir(store))

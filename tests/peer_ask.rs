@@ -31,7 +31,10 @@ fn scratch(tag: &str) -> std::path::PathBuf {
     dir.join("peer-state.json")
 }
 
-fn keypair() -> ([u8; noise::KEY_BYTES], [u8; noise::KEY_BYTES]) {
+fn keypair() -> (
+    [u8; tcr::peer::id::KEY_BYTES],
+    [u8; tcr::peer::id::KEY_BYTES],
+) {
     noise::generate_static().expect("a test keypair")
 }
 
@@ -50,8 +53,8 @@ fn some_token() -> JoinToken {
 
 const fn row(
     id: u64,
-    public: [u8; noise::KEY_BYTES],
-    private: [u8; noise::KEY_BYTES],
+    public: [u8; tcr::peer::id::KEY_BYTES],
+    private: [u8; tcr::peer::id::KEY_BYTES],
     until_ms: i64,
 ) -> PendingAsk {
     PendingAsk {

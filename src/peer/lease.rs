@@ -35,7 +35,6 @@
 //! first debit lands. The cap bounds the overdraft to a known number of
 //! requests rather than to however many the borrower can open.
 
-use anyhow::{Context as _, Result};
 use tcr_peer_wire::{Lease, LeaseGrant, LeaseRefusal, LeaseRequest, LeaseUnit, LendScope, Window};
 
 use crate::peer::config::{LendGrant, PeerRow, PeerStore};
@@ -444,22 +443,6 @@ fn seconds_of(now_ms: i64) -> u64 {
 /// What is charged when the observed utilization rise is 0.000. See the module
 /// docs: a guess, flagged as one, with the measurement that would replace it.
 pub const MIN_DEBIT: f64 = 0.002;
-
-/// 128 opaque bits, from the platform CSPRNG.
-///
-/// `getrandom` directly rather than `noise::random_secret`: a lease id is not
-/// Noise material, and routing it through the one file that may name `snow::`
-/// would make a handshake module the source of a number that has nothing to do
-/// with a handshake. It is a DIRECT dependency, already
-/// in `Cargo.lock` through snow, so it adds one dependency edge and no package.
-///
-/// An error surfaces. A lease id that is not random is a lease anybody on the
-/// mesh can spend, so there is no fallback here that is not worse than refusing.
-pub fn random_id() -> Result<u128> {
-    let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).context("peer lease: the platform CSPRNG refused")?;
-    Ok(u128::from_be_bytes(bytes))
-}
 
 /// One line of an account card's "Lent to …", which is the read-only
 /// view of a lease **from the account's side**.

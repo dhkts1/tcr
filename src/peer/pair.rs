@@ -72,9 +72,10 @@ use crate::peer::config::{
     read_or_default, save,
 };
 use crate::peer::dialaddrs;
+use crate::peer::id::KEY_BYTES;
 use crate::peer::id::{NodeKey, default_config_dir};
 use crate::peer::listener::{NodeFacts, hello_for_peer};
-use crate::peer::noise::{self, Handshake, KEY_BYTES};
+use crate::peer::noise::{self, Handshake};
 
 mod addresses;
 
@@ -527,7 +528,7 @@ pub fn mint_invite_as(
         );
     }
 
-    let secret = noise::random_secret()?;
+    let secret = crate::peer::id::random_secret()?;
     let invite = PendingInvite {
         id: random_id()?,
         label,
@@ -1365,7 +1366,7 @@ pub fn pairing_window(state_path: &Path, now_ms: i64) -> Result<PairingWindow> {
 /// enrolments from the same machine must not collide, and a counter would
 /// restart at the same value on every process.
 fn random_request_id() -> Result<u128> {
-    let bytes = noise::random_secret()?;
+    let bytes = crate::peer::id::random_secret()?;
     let mut head = [0_u8; 16];
     head.copy_from_slice(&bytes[..16]);
     Ok(u128::from_be_bytes(head))
@@ -1374,7 +1375,7 @@ fn random_request_id() -> Result<u128> {
 /// A random invite id. Random rather than sequential so an id does not leak how
 /// many invites this node has ever minted.
 fn random_id() -> Result<u64> {
-    let bytes = noise::random_secret()?;
+    let bytes = crate::peer::id::random_secret()?;
     let mut head = [0_u8; 8];
     head.copy_from_slice(&bytes[..8]);
     Ok(u64::from_be_bytes(head))

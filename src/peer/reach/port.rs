@@ -76,7 +76,7 @@ pub const fn current_slot(unix_seconds: u64) -> u64 {
 /// handshake type belongs to `snow`, which by this module tree's own rule is
 /// named in `src/peer/noise.rs` and nowhere else.
 pub fn port_secret(handshake_hash: &[u8]) -> [u8; 32] {
-    use crate::peer::config::hmac_sha256;
+    use crate::peer::drop::hmac_sha256;
 
     // RFC 5869 § 2.2: with no salt, the salt is HashLen zero bytes.
     let pseudorandom_key = hmac_sha256(&[0_u8; 32], handshake_hash);
@@ -103,7 +103,7 @@ pub fn port_secret(handshake_hash: &[u8]) -> [u8; 32] {
 /// the two ends disagree the moment their loop counts differed, so the bias is
 /// taken deliberately.
 pub fn derived_port(secret: &[u8; 32], slot: u64) -> u16 {
-    use crate::peer::config::hmac_sha256;
+    use crate::peer::drop::hmac_sha256;
 
     let mut message = [0_u8; 12];
     message[..4].copy_from_slice(b"slot");

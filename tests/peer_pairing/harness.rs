@@ -196,7 +196,7 @@ pub(super) async fn count_written(addr: SocketAddr, message_1: &[u8]) -> usize {
 /// built with a throwaway ephemeral secret exactly as `noise::send_knock`
 /// builds its own.
 pub(super) fn knock_message_1() -> Vec<u8> {
-    let throwaway = noise::random_secret().expect("a throwaway secret");
+    let throwaway = tcr::peer::id::random_secret().expect("a throwaway secret");
     let mut state = noise::initiator_with_secret(&throwaway, noise::PATTERN_KNOCK, None, None)
         .expect("a knock initiator");
     let mut scratch = vec![0_u8; 1024];

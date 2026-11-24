@@ -26,7 +26,7 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tcr_peer_wire::PeerId;
 
 /// The mode both key files are created with. The private half is readable by
@@ -353,6 +353,41 @@ fn generate_keypair() -> Result<([u8; 32], [u8; 32])> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("unexpected public key length"))?;
     Ok((secret, public))
+}
+
+/// A static X25519 key, a Noise message 1 ephemeral, and a PSK are all 32
+/// bytes. Named once so a `32` in a bounds check is readable.
+pub const KEY_BYTES: usize = 32;
+
+/// Generate 32 cryptographically random bytes through `snow`'s own resolver.
+///
+/// Here rather than in [`crate::peer::pair`] so the join secret and a Noise
+/// ephemeral come from the same CSPRNG, the resolver this file mints the node
+/// key from.
+pub fn random_secret() -> Result<[u8; KEY_BYTES]> {
+    let mut rng = DefaultResolver
+        .resolve_rng()
+        .ok_or_else(|| anyhow!("peer handshake: snow's default resolver offered no CSPRNG"))?;
+    let mut out = [0_u8; KEY_BYTES];
+    rng.try_fill_bytes(&mut out)
+        .map_err(|err| anyhow!("peer handshake: the CSPRNG failed: {err}"))?;
+    Ok(out)
+}
+
+/// 128 opaque bits, from the platform CSPRNG.
+///
+/// `getrandom` directly rather than `noise::random_secret`: a lease id is not
+/// Noise material, and routing it through the one file that may name `snow::`
+/// would make a handshake module the source of a number that has nothing to do
+/// with a handshake. It is a DIRECT dependency, already
+/// in `Cargo.lock` through snow, so it adds one dependency edge and no package.
+///
+/// An error surfaces. A lease id that is not random is a lease anybody on the
+/// mesh can spend, so there is no fallback here that is not worse than refusing.
+pub fn random_id() -> Result<u128> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).context("peer lease: the platform CSPRNG refused")?;
+    Ok(u128::from_be_bytes(bytes))
 }
 
 #[cfg(test)]
