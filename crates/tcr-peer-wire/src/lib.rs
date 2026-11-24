@@ -122,40 +122,6 @@ impl PeerId {
     }
 }
 
-/// [`Crockford::encode`] for 32 bytes that are **not** an identity (a join
-/// secret, a network key). Forwards, and goes once `src/peer/pair.rs` and
-/// `src/peer/config.rs` call [`Crockford`] themselves.
-pub fn encode_key32(bytes: &[u8; 32]) -> String {
-    Crockford::encode(bytes)
-}
-
-/// [`Crockford::decode_key32`]. Forwards, and goes once `src/peer/pair.rs` and
-/// `src/peer/config.rs` call [`Crockford`] themselves.
-pub fn decode_key32(field: &str) -> Result<[u8; 32], Key32Refusal> {
-    Crockford::decode_key32(field)
-}
-
-/// [`Crockford::encode`]. Forwards, and goes once `src/peer/pair.rs` calls
-/// [`Crockford`] itself.
-pub fn encode_bytes(bytes: &[u8]) -> String {
-    Crockford::encode(bytes)
-}
-
-/// [`Crockford::decode`]. Forwards, and goes once `src/peer/pair.rs` and
-/// `tests/peer_moved.rs` call [`Crockford`] themselves.
-pub fn decode_bytes(field: &str) -> Result<Vec<u8>, Key32Refusal> {
-    Crockford::decode(field)
-}
-
-/// Why 32 base32 characters could not be read.
-///
-/// An alias rather than a second enum: an identity and a join secret differ in
-/// MEANING, not in shape, and one refusal type is what keeps two spellings of
-/// "that is not 32 Crockford bytes" from drifting apart. The name is here so a
-/// caller decoding a SECRET does not have to read `PeerIdError` and wonder
-/// which of the two it is holding.
-pub type Key32Refusal = PeerIdError;
-
 /// How many bytes an [`InstanceId`] is: eight, minted fresh on every boot.
 ///
 /// Eight and not 32, because this is deliberately NOT identity. See the type
@@ -299,7 +265,7 @@ impl std::error::Error for InstanceIdError {}
 // `data-encoding` is a runtime dependency of this crate
 // (already in `Cargo.lock` as a transitive dependency, so this is zero new
 // packages). `JoinToken::to_token`/`parse` (`src/peer/pair.rs`) call
-// [`encode_key32`] / [`decode_key32`], which forward to [`Crockford`] below, so
+// [`Crockford::encode`] / [`Crockford::decode_key32`] below, so
 // there is one Crockford
 // implementation on this wire, one alphabet, one translation table, one
 // length refusal, and not a hand-rolled one here and a second one there to
@@ -383,7 +349,7 @@ impl Crockford {
 
     /// [`Self::decode`] for a 32-byte key: exactly 32 bytes, or a refusal that
     /// names what it found.
-    pub fn decode_key32(field: &str) -> Result<[u8; 32], Key32Refusal> {
+    pub fn decode_key32(field: &str) -> Result<[u8; 32], PeerIdError> {
         let bytes = Self::decode(field)?;
         let got = bytes.len();
         bytes.try_into().map_err(|_| PeerIdError::Length { got })
@@ -977,7 +943,7 @@ impl std::fmt::Display for LendScope {
 
 /// Why a `--scope` spelling was refused.
 ///
-/// No `Serialize` derive, like [`LabelRefusal`] and [`Key32Refusal`]: a refusal
+/// No `Serialize` derive, like [`LabelRefusal`] and [`PeerIdError`]: a refusal
 /// is something an operator reads, never something that crosses this wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LendScopeRefusal {

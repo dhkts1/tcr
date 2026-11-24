@@ -438,7 +438,7 @@ fn join_stdin_keeps_the_key_out_of_argv_and_every_log_line() {
         [0xAA; 32],
     );
     let rendered = token.to_token();
-    let secret_field = tcr_peer_wire::encode_key32(&token.secret);
+    let secret_field = tcr_peer_wire::Crockford::encode(&token.secret);
 
     let mut child = tcr_command(&dir.join("cli-home"))
         .args([

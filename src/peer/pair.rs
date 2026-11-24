@@ -62,10 +62,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tcr_peer_wire::{
-    Control, Enroll, PeerId, StreamHeader, StreamKind, decode_bytes, decode_key32, encode_bytes,
-    encode_key32, sanitize_label,
-};
+use tcr_peer_wire::{Control, Crockford, Enroll, PeerId, StreamHeader, StreamKind, sanitize_label};
 
 use crate::peer::config::{
     ControlGrants, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore, PendingInvite,
@@ -210,7 +207,7 @@ impl JoinToken {
         format!(
             "{TOKEN_PREFIX_V2}{addrs}:{}:{}",
             self.registrar.to_wire(),
-            encode_key32(&self.secret)
+            Crockford::encode(&self.secret)
         )
     }
 
@@ -226,7 +223,7 @@ impl JoinToken {
         body.extend_from_slice(&TOKEN_V3_MAGIC);
         body.push(TOKEN_V3_VERSION);
         body.extend_from_slice(&self.to_v3_body());
-        format!("{TOKEN_PREFIX_V3}{}", encode_bytes(&body))
+        format!("{TOKEN_PREFIX_V3}{}", Crockford::encode(&body))
     }
 
     /// The three fields, in v3's compact spelling, with no magic and no
@@ -328,7 +325,7 @@ impl JoinToken {
         // FIELD and its shape, and no arm of this function prints the value.
         // A pasted token that failed to parse is still a live bearer secret,
         // and the place operators paste one is a terminal that keeps scrollback.
-        let secret = decode_key32(secret)
+        let secret = Crockford::decode_key32(secret)
             .map_err(|refusal| anyhow!("{refusal}"))
             .context("peer join: the secret field is not 32 base32-encoded bytes")?;
         Ok(Self::new(addrs, registrar, secret))
@@ -338,7 +335,7 @@ impl JoinToken {
     /// version, then read the three fields by offset rather than by split,
     /// which is what an opaque run buys over the comma-and-colon shape of v2.
     fn parse_v3(body: &str) -> Result<Self> {
-        let bytes = decode_bytes(body)
+        let bytes = Crockford::decode(body)
             .map_err(|refusal| anyhow!("{refusal}"))
             .context(
                 "peer join: a v3 key is not a whole run of base32 bytes, which is what a paste cut \

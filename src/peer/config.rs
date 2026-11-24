@@ -452,7 +452,7 @@ impl NetworkKey {
 
     /// The paste string: 52 Crockford base32 characters.
     pub fn to_paste_string(&self) -> String {
-        tcr_peer_wire::encode_key32(&self.0)
+        tcr_peer_wire::Crockford::encode(&self.0)
     }
 
     /// The raw bytes, for the Noise `psk0` a knock mixes in.
@@ -569,10 +569,10 @@ impl From<NetworkKey> for String {
 }
 
 impl TryFrom<String> for NetworkKey {
-    type Error = tcr_peer_wire::Key32Refusal;
+    type Error = tcr_peer_wire::PeerIdError;
 
     fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
-        tcr_peer_wire::decode_key32(value.trim()).map(Self)
+        tcr_peer_wire::Crockford::decode_key32(value.trim()).map(Self)
     }
 }
 
