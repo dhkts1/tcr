@@ -620,13 +620,7 @@ fn validate_group(config: &Config, group: &str) -> anyhow::Result<()> {
         anyhow::bail!("--group {group:?}: invalid group label — {reason}");
     }
 
-    let mut configured: Vec<&str> = config
-        .accounts
-        .iter()
-        .filter_map(|a| a.groups.as_ref())
-        .flatten()
-        .map(String::as_str)
-        .collect();
+    let mut configured: Vec<&str> = config.group_labels().collect();
     for label in &configured {
         if let Err(reason) = validate_group_label_chars(label) {
             anyhow::bail!("config carries an invalid group label {label:?}: {reason}");
@@ -640,9 +634,9 @@ fn validate_group(config: &Config, group: &str) -> anyhow::Result<()> {
         // account can serve one: a group whose every member is a Codex account
         // would route it nowhere. Only a fleet holding a Codex account can have
         // such a group, since a label exists only while some account carries it.
-        let has_claude = config.accounts.iter().any(|account| {
-            account.provider == tcr::provider::Provider::Anthropic && account.in_group(group)
-        });
+        let has_claude = config
+            .group_members(group)
+            .any(|account| account.provider == tcr::provider::Provider::Anthropic);
         if !has_claude {
             anyhow::bail!("{}", tcr::provider_guard::group_has_no_claude(group));
         }

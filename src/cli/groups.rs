@@ -202,10 +202,7 @@ pub fn remove_from_group(
 
     if all {
         let mut removed_from: Vec<String> = Vec::new();
-        for acct in &config.accounts {
-            if !acct.in_group(group) {
-                continue;
-            }
+        for acct in config.group_members(group) {
             let outcome = config::save_group_membership(config_path, acct, group, false)
                 .with_context(|| format!("save config at {}", config_path.display()))?;
             match outcome {
@@ -357,11 +354,7 @@ pub(super) fn plan_reserve(
     let codex_after = config.unreserved_enabled_count_for(&reserved_after, Provider::Codex);
 
     if claude_before >= 1 && claude_after == 0 {
-        let every_claude_in_group = config
-            .accounts
-            .iter()
-            .filter(|a| a.provider == Provider::Anthropic && !a.disabled.unwrap_or(false))
-            .all(|a| a.in_group(group));
+        let every_claude_in_group = config.group_holds_every_enabled(group, Provider::Anthropic);
         let advice = if every_claude_in_group {
             "every enabled Claude account belongs to this group".to_string()
         } else {
@@ -375,9 +368,8 @@ pub(super) fn plan_reserve(
     }
 
     let codex_members: Vec<&str> = config
-        .accounts
-        .iter()
-        .filter(|a| a.provider == Provider::Codex && a.in_group(group))
+        .group_members(group)
+        .filter(|a| a.provider == Provider::Codex)
         .map(|a| a.name.as_str())
         .collect();
     if !codex_members.is_empty() && !force {
@@ -491,17 +483,7 @@ pub fn park_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
         bail!("group {group:?}: invalid group label — {reason}");
     }
     let config = load_config(config_path)?;
-    let members = config
-        .accounts
-        .iter()
-        .filter(|a| {
-            a.groups
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .any(|g| g == group)
-        })
-        .count();
+    let members = config.group_members(group).count();
 
     let outcome = config::save_group_parked(config_path, group, true)
         .with_context(|| format!("save config at {}", config_path.display()))?;
@@ -719,30 +701,6 @@ pub fn list_groups(config_path: &Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Group name -> the (in-order) names of every account carrying that label,
-/// plus the count of accounts carrying NO label at all. An account in several
-/// groups appears once per group it is in — this is the shared aggregation
-/// both [`render_groups_text`] and [`render_groups_json`] render from, so the
-/// two outputs can never disagree about which account is in which group.
-fn group_membership(config: &Config) -> (std::collections::BTreeMap<&str, Vec<&str>>, usize) {
-    let mut groups: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
-    let mut ungrouped = 0usize;
-    for account in &config.accounts {
-        match account.groups.as_deref() {
-            Some(labels) if !labels.is_empty() => {
-                for label in labels {
-                    groups
-                        .entry(label.as_str())
-                        .or_default()
-                        .push(account.name.as_str());
-                }
-            }
-            _ => ungrouped += 1,
-        }
-    }
-    (groups, ungrouped)
-}
-
 /// The one reason a group can exist and still route nothing, spelled ONCE.
 /// Both `ls` surfaces render this same token — a text `route_block=` field and a
 /// JSON `routeBlock` value — so a script keying on one cannot be surprised by
@@ -830,7 +788,7 @@ struct GroupRow<'a> {
 
 /// Every group's row, in name order, and the count of accounts in no group.
 fn group_rows(config: &Config) -> (Vec<GroupRow<'_>>, usize) {
-    let (groups, ungrouped) = group_membership(config);
+    let (groups, ungrouped) = config.group_membership();
     let rows = groups
         .into_iter()
         .map(|(group, members)| {

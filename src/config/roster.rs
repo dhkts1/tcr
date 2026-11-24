@@ -1,5 +1,7 @@
 //! Resolving a user's account query to one config row, and the message for a query that matches more than one.
 
+use std::collections::BTreeMap;
+
 use anyhow::bail;
 
 use super::{Account, Config};
@@ -95,6 +97,57 @@ impl Config {
             .iter()
             .find(|account| account.name == name)
             .map(|account| account.provider)
+    }
+
+    /// Every account carrying the `group` label, in config order.
+    pub fn group_members<'a>(&'a self, group: &'a str) -> impl Iterator<Item = &'a Account> {
+        self.accounts.iter().filter(move |a| a.in_group(group))
+    }
+
+    /// Whether every enabled account of `provider` carries the `group` label.
+    pub fn group_holds_every_enabled(
+        &self,
+        group: &str,
+        provider: crate::provider::Provider,
+    ) -> bool {
+        self.accounts
+            .iter()
+            .filter(|a| a.provider == provider && !a.disabled.unwrap_or(false))
+            .all(|a| a.in_group(group))
+    }
+
+    /// Every group label on every account, in config order, a label once per
+    /// account that carries it.
+    pub fn group_labels(&self) -> impl Iterator<Item = &str> {
+        self.accounts
+            .iter()
+            .filter_map(|a| a.groups.as_ref())
+            .flatten()
+            .map(String::as_str)
+    }
+
+    /// Group name -> the (in-order) names of every account carrying that label,
+    /// plus the count of accounts carrying NO label at all. An account in several
+    /// groups appears once per group it is in — this is the shared aggregation
+    /// both `tcr group ls` renderings read, so the two outputs can never disagree
+    /// about which account is in which group.
+    pub fn group_membership(&self) -> (BTreeMap<&str, Vec<&str>>, usize) {
+        let mut groups: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let mut ungrouped = 0usize;
+        for account in &self.accounts {
+            match account.groups.as_deref() {
+                Some(labels) if !labels.is_empty() => {
+                    for label in labels {
+                        groups
+                            .entry(label.as_str())
+                            .or_default()
+                            .push(account.name.as_str());
+                    }
+                }
+                _ => ungrouped += 1,
+            }
+        }
+        (groups, ungrouped)
     }
 
     /// The name `controlAccount` names, in either of its shapes; `None` when unset.
