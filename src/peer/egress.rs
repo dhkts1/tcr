@@ -1649,7 +1649,7 @@ async fn record_the_hold_the_ladder_would(
         return;
     }
     let rejections = crate::quota::quota_rejections(headers);
-    let retry_after_raw = crate::proxy::parse_retry_after(headers);
+    let retry_after_raw = crate::http_client::parse_retry_after(headers);
     let retry_after = retry_after_raw.unwrap_or(60);
     if rejections.is_empty() {
         // No unified rejection: a transient limit, and the hold is the one the

@@ -54,6 +54,7 @@ use time::OffsetDateTime;
 use crate::bound_tokens::BoundTokenKind;
 use crate::config;
 use crate::fallback;
+use crate::http_client::parse_retry_after;
 use crate::manager::{
     AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, ExhaustionHint,
     InFlightGuard, Manager, MintedToken, SetControlOutcome, SetDisabledOutcome, SetPriorityOutcome,
@@ -7199,15 +7200,6 @@ fn build_response(
         headers.append(name.clone(), value.clone());
     }
     response
-}
-
-/// Parse a numeric `retry-after` header (seconds). RFC-date form is ignored (the
-/// caller falls back to a default).
-pub(crate) fn parse_retry_after(headers: &HeaderMap) -> Option<i64> {
-    headers
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<i64>().ok())
 }
 
 #[cfg(test)]

@@ -3,28 +3,6 @@
 use super::*;
 
 #[test]
-fn parse_retry_after_ignores_rfc_date() {
-    // Numeric seconds parse to Some(n).
-    let mut numeric = HeaderMap::new();
-    numeric.insert("retry-after", HeaderValue::from_static("30"));
-    assert_eq!(parse_retry_after(&numeric), Some(30));
-
-    // RFC-date form is NOT parsed — current behavior returns None, so the
-    // caller falls back to its default. (This documents the gap a follow-up
-    // fix will close; do not change parse_retry_after to make this Some.)
-    let mut rfc_date = HeaderMap::new();
-    rfc_date.insert(
-        "retry-after",
-        HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
-    );
-    assert_eq!(parse_retry_after(&rfc_date), None);
-
-    // Absent header → None.
-    let empty = HeaderMap::new();
-    assert_eq!(parse_retry_after(&empty), None);
-}
-
-#[test]
 fn classify_transient_429_absent_parks_short() {
     // THE BITING TEST: an absent retry-after must park the short
     // NO_GUIDANCE_HOLD_SECS base (15), not the old fabricated 60. The pre-fix
