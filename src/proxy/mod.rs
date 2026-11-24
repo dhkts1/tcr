@@ -3396,6 +3396,8 @@ struct RequestTiming {
     session: Option<u64>,
     stream: bool,
     first_byte_at: Option<Instant>,
+    /// When the last attempt's buffered body finished reading.
+    buffered_at: Option<Instant>,
     ended_at: Option<Instant>,
 }
 
@@ -3415,6 +3417,7 @@ impl RequestTiming {
             session: None,
             stream: false,
             first_byte_at: None,
+            buffered_at: None,
             ended_at: None,
         }
     }
@@ -3459,9 +3462,16 @@ impl RequestTiming {
         }
     }
 
-    /// A buffered body, read whole at `at`, is handed on toward the client.
-    fn note_first_byte_at(&mut self, at: Instant) {
-        self.first_byte_at = Some(at);
+    /// The attempt's buffered body is read whole, now.
+    fn mark_body_buffered(&mut self) {
+        self.buffered_at = Some(Instant::now());
+    }
+
+    /// The buffered body is handed on toward the client: its read instant is the first byte.
+    fn forward_buffered_body(&mut self) {
+        if let Some(at) = self.buffered_at {
+            self.first_byte_at = Some(at);
+        }
     }
 
     /// The upstream ended the stream (EOF or a transport error).
@@ -6118,7 +6128,7 @@ async fn handle_request(
                 .respond(provider);
             }
         };
-        let buffered_at = Instant::now();
+        timing.mark_body_buffered();
         match provider {
             Provider::Codex => {
                 if status == StatusCode::BAD_REQUEST
@@ -6136,7 +6146,7 @@ async fn handle_request(
         }
         // Only a forwarded body is the client's first byte. A model rejection
         // consumed here must not timestamp a later sibling's successful stream.
-        timing.note_first_byte_at(buffered_at);
+        timing.forward_buffered_body();
         if status.is_success() {
             // One parse of the body for all three readings below.
             let response = parse_non_streamed_response(&bytes, provider);
