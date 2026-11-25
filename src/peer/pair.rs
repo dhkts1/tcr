@@ -111,20 +111,12 @@ pub enum TokenSource<'a> {
     Stdin,
 }
 
-/// Read the join token from wherever the operator put it.
+/// Read one join key from any reader, so a test can drive the stdin path
+/// without a terminal.
 ///
 /// **Nothing here logs or prints the token.** A refusal names the field and
 /// its shape (see [`JoinToken::parse`]), because a terminal keeps scrollback
 /// and a failed paste is still a live bearer secret.
-pub fn read_join_token(source: TokenSource<'_>) -> Result<JoinToken> {
-    match source {
-        TokenSource::Argv(token) => JoinToken::parse(token),
-        TokenSource::Stdin => token_from_reader(std::io::stdin().lock()),
-    }
-}
-
-/// [`read_join_token`]'s stdin arm, against any reader, so a test can drive it
-/// without a terminal.
 ///
 /// One line: a token is one line by construction, and reading to end of file
 /// instead would make a trailing newline plus anything after it part of the
