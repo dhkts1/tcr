@@ -1488,7 +1488,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     //
     // Boot does ONE immediate whole-fleet sweep, then hands over to `schedule`,
     // which runs each account on its own randomly drawn schedule (`cadence +/-
-    // 30%`, random initial offset — see `crate::manager::freshness::schedule`). The boot sweep is
+    // 30%`, random initial offset — see `crate::manager::schedule`). The boot sweep is
     // kept deliberately: `interval`'s first tick used to fire immediately so the
     // bars populate at startup rather than after a lag, and a random first offset
     // would otherwise leave a fresh proxy showing blank bars for up to a whole
@@ -1501,9 +1501,9 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         background.push(tokio::spawn(supervise("quota-prober", async move {
             let probe = async {
                 prober.probe_all().await;
-                crate::manager::freshness::schedule::run(
+                crate::manager::schedule::run(
                     Arc::clone(&prober),
-                    crate::manager::freshness::schedule::Job::Probe,
+                    crate::manager::schedule::Job::Probe,
                     probe_seconds,
                 )
                 .await;
@@ -1539,7 +1539,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // here, because a warm spends real quota and `warm_targets`' boot gate exists
     // precisely to stop a restart from firing one at every account. Each account
     // gets a random initial offset and a random interval thereafter
-    // (`crate::manager::freshness::schedule`), and the edge-triggered `warm_wake` still starts a
+    // (`crate::manager::schedule`), and the edge-triggered `warm_wake` still starts a
     // one-shot sweep: it is what keeps the boot gate from being a kill switch on
     // a proxy restarted more often than `warmupSeconds`. That wake is handled
     // inside `schedule::run`, where a permit stored by `notify_one` while a warm
@@ -1549,9 +1549,9 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         let m = Arc::clone(&manager);
         let mut stop = shutdown_tx.subscribe();
         background.push(tokio::spawn(supervise("keep-warm", async move {
-            let warm = crate::manager::freshness::schedule::run(
+            let warm = crate::manager::schedule::run(
                 m,
-                crate::manager::freshness::schedule::Job::Warm,
+                crate::manager::schedule::Job::Warm,
                 warmup_seconds,
             );
             tokio::select! {

@@ -401,7 +401,7 @@ leftovers.
 ### Both cadences are random per account, not a fleet sweep
 
 Neither `quotaProbeSeconds` nor `warmupSeconds` is a period the fleet fires on. Each is the
-**centre of an independent random draw per account** (`src/manager/freshness/schedule.rs`):
+**centre of an independent random draw per account** (`src/manager/schedule.rs`):
 
 | draw | distribution | at the 300s default |
 |---|---|---|

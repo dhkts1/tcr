@@ -1133,10 +1133,10 @@ mod tests {
         manager.probe_all().await;
         assert_eq!(selected(&manager), Some(0));
         let snapshot = manager.snapshot(OffsetDateTime::now_utc());
-        let urgency = freshness::schedule::ProbeUrgency::of(&snapshot.accounts[0]);
-        assert!(freshness::schedule::probe_interval_secs(300, urgency, 10) > 0);
-        let mut schedule = freshness::schedule::FleetSchedule::capped(1);
-        let mut rng = freshness::schedule::Rng::from_clock();
+        let urgency = schedule::ProbeUrgency::of(&snapshot.accounts[0]);
+        assert!(schedule::probe_interval_secs(300, urgency, 10) > 0);
+        let mut schedule = schedule::FleetSchedule::capped(1);
+        let mut rng = schedule::Rng::from_clock();
         schedule.sync(crate::now_ms(), &[0], 300, &mut rng);
         for idx in schedule.due(crate::now_ms() + 600_000) {
             manager.probe_account(idx).await;

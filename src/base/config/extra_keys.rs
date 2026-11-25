@@ -10,7 +10,7 @@ use super::Config;
 /// Default probe cadence when `quotaProbeSeconds` is absent from the config.
 ///
 /// This is the CENTRE of a per-account random draw, not a fleet-wide period: the
-/// background scheduler ([`crate::manager::freshness::schedule`]) draws each account's next probe
+/// background scheduler ([`crate::manager::schedule`]) draws each account's next probe
 /// uniformly from `cadence +/- 30%` and gives each a random initial offset, so N
 /// accounts never share an instant and a restart re-scatters them. Raised from
 /// 75s to 300s together with that change — a synchronized 75s fleet sweep was

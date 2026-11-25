@@ -58,6 +58,7 @@ mod peer_lend;
 // `Manager`.
 pub use peer_lend::HandedCredential;
 pub mod resets;
+pub mod schedule;
 mod select;
 mod snapshot;
 mod state;
@@ -69,7 +70,7 @@ mod state;
 // `tests/` name.
 mod accounts;
 mod construction;
-pub mod freshness;
+mod freshness;
 mod serving;
 mod sessions;
 mod upstream_client;

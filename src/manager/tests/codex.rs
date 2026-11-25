@@ -394,7 +394,7 @@ async fn a_codex_rows_quota_updated_at_comes_from_its_own_readings() {
 /// carol lose the shorter cadence.
 #[test]
 fn a_held_codex_account_gets_the_near_limit_probe_cadence() {
-    use crate::manager::freshness::schedule::ProbeUrgency;
+    use crate::manager::schedule::ProbeUrgency;
     let manager = alice_then_codex_rows(&["bob", "carol", "dave"]);
     // bob: at its weekly limit, read from a served 200.
     manager.update_quota(1, &codex_weekly("97"), 200);
@@ -450,7 +450,7 @@ fn a_held_codex_account_gets_the_near_limit_probe_cadence() {
 /// near-limit.
 #[test]
 fn a_codex_refusal_keeps_the_near_limit_cadence_whatever_gate_its_row_reports() {
-    use crate::manager::freshness::schedule::ProbeUrgency;
+    use crate::manager::schedule::ProbeUrgency;
     use crate::records::stats::{GateReason, QuotaState};
     let manager = alice_then_codex_rows(&["bob", "carol", "dave", "erin", "frank"]);
     let refusal = |mut headers: reqwest::header::HeaderMap| {

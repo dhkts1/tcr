@@ -227,7 +227,7 @@ impl Manager {
     /// with no server behind it wants every row filled before it renders, not a
     /// schedule. The *background* refresh no longer goes through here — since
     /// every account fired inside one `N * 350ms` window on an exact period,
-    /// which is the fleet synchronization [`crate::manager::freshness::schedule`] exists to remove.
+    /// which is the fleet synchronization [`crate::manager::schedule`] exists to remove.
     /// The server drives [`Self::probe_account`] per account on independent
     /// random schedules instead.
     pub async fn probe_all(&self) {

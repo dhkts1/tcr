@@ -254,7 +254,7 @@ impl Manager {
 
     /// Warm ONE account, if it is still eligible at this instant.
     ///
-    /// The per-account entry point [`crate::manager::freshness::schedule`] drives, and the
+    /// The per-account entry point [`crate::manager::schedule`] drives, and the
     /// re-checking is the point: an account's due instant was drawn up to a whole
     /// cadence ago, and in between it may have started serving traffic (live 5h
     /// window), crossed its threshold, or been disabled — all of which
