@@ -5,10 +5,12 @@
 //! holds one concern: the entry points ([`routing`]), the whole selection path
 //! ([`with_group`]), the revalidation serve ([`revalidation`]), the per-account
 //! gates ([`gates`]), the Codex slot filters ([`codex`]), the pool picks
-//! ([`pool`]) and the memory-only connection and divert maps ([`ledgers`]).
+//! ([`pool`]), the memory-only connection and divert maps ([`ledgers`]) and the verdicts on a
+//! conversation's bound account ([`bound`]).
 
 use super::*;
 
+mod bound;
 mod codex;
 mod gates;
 mod ledgers;
