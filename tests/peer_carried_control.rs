@@ -171,9 +171,8 @@ async fn carried_hello_teaches_no_address() {
 
     let row = target
         .file()
-        .peers
-        .into_iter()
-        .find(|row| row.node == peer.id())
+        .row(&peer.id())
+        .cloned()
         .expect("the pinned row is still there");
     assert!(
         row.endpoints.is_empty(),
@@ -221,9 +220,8 @@ async fn a_direct_hello_still_teaches_the_address() {
 
     let row = target
         .file()
-        .peers
-        .into_iter()
-        .find(|row| row.node == peer.id())
+        .row(&peer.id())
+        .cloned()
         .expect("the pinned row is still there");
     assert_eq!(
         row.endpoints.len(),

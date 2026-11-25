@@ -207,8 +207,7 @@ fn share_on_keeps_the_mode_and_the_window_of_the_grant_it_replaces() {
     granted.until = Some(4_102_444_800);
     granted.between = Some("09:00-18:00".parse().expect("a daily window"));
     granted.ensure_id().expect("an id");
-    file.peers
-        .push(pinned_row(PeerId([0x31; 32]), "studio-mac", granted));
+    file.pin(pinned_row(PeerId([0x31; 32]), "studio-mac", granted));
     mac.write_file(&file);
 
     let shared = tcr(&[
@@ -229,7 +228,9 @@ fn share_on_keeps_the_mode_and_the_window_of_the_grant_it_replaces() {
     );
 
     let after = mac.file();
-    let grant = after.peers[0]
+    let grant = after
+        .row(&PeerId([0x31; 32]))
+        .expect("the studio-mac row")
         .lend
         .first()
         .expect("the row still has its grant")
@@ -271,9 +272,16 @@ fn share_on_keeps_the_mode_and_the_window_of_the_grant_it_replaces() {
         String::from_utf8_lossy(&removed.stderr)
     );
     assert!(
-        mac.file().peers[0].lend.is_empty(),
+        mac.file()
+            .row(&PeerId([0x31; 32]))
+            .expect("the studio-mac row")
+            .lend
+            .is_empty(),
         "--fraction 0 removes the grant rather than lending nothing: {:?}",
-        mac.file().peers[0].lend
+        mac.file()
+            .row(&PeerId([0x31; 32]))
+            .expect("the studio-mac row")
+            .lend
     );
 }
 
@@ -585,7 +593,7 @@ fn a_concurrent_revoke_and_enrolment_never_resurrect_or_drop_a_row() {
 
         if let Ok(row) = &enrolled {
             assert!(
-                after.peers.iter().any(|existing| existing.node == row.node),
+                after.row(&row.node).is_some(),
                 "trial {trial}: accept_enrolment said Ok but the pinned row for {:?} is gone \
                  from disk after the race with revoke_invite (revoked={revoked:?})",
                 row.node

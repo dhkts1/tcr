@@ -41,7 +41,7 @@ async fn a_knock_queues_one_row_and_earns_one_ack_byte() {
 
     // Nothing was pinned and nothing was granted: a knock is a row.
     assert!(
-        node.file().peers.is_empty(),
+        node.file().pinned_count() == 0,
         "a knock must pin nothing at all"
     );
 }
@@ -265,7 +265,7 @@ async fn a_banned_key_is_refused_from_a_new_address() {
 
     // The peer is pinned, which is the point: the refusal must be the ban.
     let mut file = node.file();
-    file.peers.push(config::PeerRow {
+    file.pin(config::PeerRow {
         node: peer_id,
         label: "laptop-2".to_string(),
         endpoints: Vec::new(),

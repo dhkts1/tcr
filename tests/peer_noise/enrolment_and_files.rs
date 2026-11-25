@@ -690,9 +690,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
     let registrar_file =
         peer_config::read_or_default(&registrar_peers).expect("the registrar's file reads");
     let registrar_row = registrar_file
-        .peers
-        .iter()
-        .find(|row| row.node == joiner_key.id())
+        .row(&joiner_key.id())
         .expect("the registrar recorded the joiner: the hole this test exists for");
     assert_eq!(registrar_row.label, "laptop-2");
     assert!(
@@ -706,7 +704,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
 
     let joiner_file = peer_config::read_or_default(&joiner_peers).expect("the joiner's file reads");
     assert!(
-        joiner_file.peers.iter().any(|row| row.node == registrar_id),
+        joiner_file.row(&registrar_id).is_some(),
         "and the joiner pins the registrar, so the row exists on both sides"
     );
 
@@ -778,10 +776,10 @@ fn a_one_use_invite_refuses_its_second_joiner() {
 
     let file = peer_config::read_or_default(&peers).expect("the file reads");
     assert_eq!(
-        file.peers.len(),
+        file.pinned_count(),
         1,
         "the second joiner must leave no row: {:?}",
-        file.peers
+        file.pinned_ids()
     );
     assert!(outstanding_secrets(&file).is_empty());
 }
@@ -823,7 +821,7 @@ fn a_hostile_enrolment_label_is_refused_and_spends_nothing() {
     }
 
     let file = peer_config::read_or_default(&peers).expect("the file reads");
-    assert!(file.peers.is_empty(), "nothing is pinned on a refusal");
+    assert!(file.pinned_count() == 0, "nothing is pinned on a refusal");
     assert_eq!(
         file.invite(invite.id).map(|row| row.uses_left),
         Some(1),
@@ -1037,8 +1035,8 @@ fn forget_takes_the_file_lock() {
     assert!(
         tcr::peer::config::read_or_default(&peers)
             .expect("the file reads")
-            .peers
-            .is_empty(),
+            .pinned_count()
+            == 0,
         "and both rows are gone"
     );
     assert!(
@@ -1078,11 +1076,11 @@ fn a_pin_takes_the_file_lock_and_an_enrolment_still_completes() {
     );
     let written = tcr::peer::config::read_or_default(&peers).expect("the file reads");
     assert_eq!(
-        written.peers.len(),
+        written.pinned_count(),
         1,
         "one row, for the peer just confirmed"
     );
-    assert_eq!(written.peers[0].node, peer);
+    assert_eq!(written.pinned_ids(), vec![peer]);
 
     let held = tcr::peer::config::FileLock::acquire(&peers).expect("take the file lock first");
     let started = std::time::Instant::now();

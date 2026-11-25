@@ -596,7 +596,7 @@ fn an_old_single_grant_object_reads_as_a_one_element_list() {
 
     let file =
         tcr::peer::config::read_or_default(&peers).expect("the pre-decision-12 shape still reads");
-    let row = &file.peers[0];
+    let row = file.row(&PeerId([31_u8; 32])).expect("the one pinned row");
     assert_eq!(row.lend.len(), 1, "one grant object is one lease: {row:?}");
     let grant = &row.lend[0];
     assert_eq!(grant.window, Window::SevenDay);
@@ -662,7 +662,10 @@ fn an_ended_flag_in_the_file_is_ignored_and_the_clock_decides() {
     );
 
     let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
-    let lend = &file.peers[0].lend;
+    let lend = &file
+        .row(&PeerId([31_u8; 32]))
+        .expect("the one pinned row")
+        .lend;
     assert!(
         lend[0].ended,
         "unix second 1 is long past, so this lease has ended whatever the file says"
@@ -693,7 +696,10 @@ fn an_ended_flag_in_the_file_is_ignored_and_the_clock_decides() {
     let raw: PeerFile = serde_json::from_str(&std::fs::read_to_string(&peers).expect("the bytes"))
         .expect("the fixture deserializes");
     assert!(
-        !raw.peers[0].lend[1].ended,
+        !raw.row(&PeerId([31_u8; 32]))
+            .expect("the one pinned row")
+            .lend[1]
+            .ended,
         "`ended` is derived, so a file claiming true cannot deserialize into true"
     );
 }

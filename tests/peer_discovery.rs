@@ -553,8 +553,9 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
     // ---- control: before the scan, A cannot reach B at all.
     let stale = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
-        .peers
-        .remove(0);
+        .row(&b)
+        .cloned()
+        .expect("B's row");
     assert!(
         tcr::peer::tunnel::dial::dial_peer(&stale).await.is_none(),
         "the control: A's only endpoint for B is a port nobody listens on, so the dial \
@@ -601,8 +602,9 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
 
     let refreshed = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
-        .peers
-        .remove(0);
+        .row(&b)
+        .cloned()
+        .expect("B's row");
     assert_eq!(
         refreshed.added_at, stale.added_at,
         "and without re-pinning: the row is the same row, so every grant on it survived"
@@ -709,9 +711,8 @@ async fn a_brief_from_a_mutual_friend_refreshes_that_friends_locator() {
 
     let refreshed = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
-        .peers
-        .into_iter()
-        .find(|row| row.node == c)
+        .row(&c)
+        .cloned()
         .expect("C is still a pinned row, not re-created");
     let learned = refreshed
         .endpoints
@@ -883,9 +884,8 @@ async fn five_hundred_brief_addresses_write_once_and_never_outrank_the_paired_en
 
     let row = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
-        .peers
-        .into_iter()
-        .find(|row| row.node == c)
+        .row(&c)
+        .cloned()
         .expect("C is still pinned");
     assert!(
         row.endpoints.len() <= tcr::peer::config::MAX_ENDPOINTS_PER_PEER,

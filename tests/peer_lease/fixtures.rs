@@ -583,7 +583,8 @@ pub(super) fn assert_the_list_shape_reads(dir: &Path, node: &str) {
         ),
     );
     let file = tcr::peer::config::read_or_default(&path).expect("the list shape reads");
-    assert_eq!(file.peers[0].lend.len(), 2);
+    let id = PeerId::parse(node).expect("the fixture node is a wire id");
+    assert_eq!(file.row(&id).expect("the one row").lend.len(), 2);
 }
 
 /// The built `tcr` with its `HOME` the directory holding `file`, so every call on one fixture

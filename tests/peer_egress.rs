@@ -444,9 +444,9 @@ fn carried_client(origin: &Origin, splice_port: u16) -> reqwest::Client {
 /// gateway grant off (we do not carry for it).
 fn write_carrying_gateway(peers: &std::path::Path, gateway: &PeerId, addr: &str) {
     let mut file = PeerFile::default();
-    file.peers
-        .push(row(gateway, "gateway", vec![addr.to_string()], false));
-    file.peers[0].allow.carry = true;
+    let mut carrying = row(gateway, "gateway", vec![addr.to_string()], false);
+    carrying.allow.carry = true;
+    file.pin(carrying);
     tcr::peer::config::save(peers, &file).expect("write the peers file");
 }
 
@@ -491,8 +491,7 @@ async fn real_gateway_pinning(
     let gateway_key = tcr::peer::id::NodeKey::load_or_mint(dir).expect("the gateway's node key");
     let peers = dir.join("tcr-peers.json");
     let mut file = PeerFile::default();
-    file.peers
-        .push(row(&requester.id, "requester", Vec::new(), true));
+    file.pin(row(&requester.id, "requester", Vec::new(), true));
     tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let listening = loopback().await;

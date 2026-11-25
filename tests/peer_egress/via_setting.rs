@@ -186,13 +186,13 @@ fn only_a_mac_inside_the_carry_grant_is_a_candidate() {
     let granted = PeerId([21_u8; 32]);
     let ungranted = PeerId([22_u8; 32]);
     let mut file = PeerFile::default();
-    file.peers.push(carry_row(
+    file.pin(carry_row(
         &granted,
         "granted",
         vec!["127.0.0.1:1".to_string()],
         true,
     ));
-    file.peers.push(carry_row(
+    file.pin(carry_row(
         &ungranted,
         "ungranted",
         vec!["127.0.0.1:2".to_string()],
@@ -223,7 +223,7 @@ fn only_a_mac_inside_the_carry_grant_is_a_candidate() {
 fn a_gateway_grant_alone_does_not_make_a_row_a_carry_candidate() {
     let peer = PeerId([23_u8; 32]);
     let mut file = PeerFile::default();
-    file.peers.push(PeerRow {
+    file.pin(PeerRow {
         node: peer,
         label: "gateway-only".to_string(),
         endpoints: paired_endpoints(&["127.0.0.1:1".to_string()]),
@@ -260,7 +260,7 @@ fn via_writes_the_choice_and_refuses_a_mac_this_one_never_pinned() {
     let pinned = PeerId([31_u8; 32]);
     let stranger = PeerId([32_u8; 32]);
     let mut file = PeerFile::default();
-    file.peers.push(row(
+    file.pin(row(
         &pinned,
         "studio-mac",
         vec!["127.0.0.1:1".to_string()],
@@ -539,7 +539,7 @@ async fn via_off_costs_no_dial_and_no_wait() {
     });
 
     let mut file = PeerFile::default();
-    file.peers.push(row(
+    file.pin(row(
         &PeerId([41_u8; 32]),
         "studio-mac",
         vec![gateway_addr.to_string()],
@@ -610,7 +610,7 @@ async fn the_operators_timeout_is_what_a_silent_gateway_is_given() {
     });
 
     let mut file = PeerFile::default();
-    file.peers.push(carry_row(
+    file.pin(carry_row(
         &PeerId([42_u8; 32]),
         "silent-mac",
         vec![gateway_addr.to_string()],
@@ -703,7 +703,7 @@ async fn a_lender_that_takes_the_carry_and_never_answers_still_releases_the_requ
     );
 
     let mut file = PeerFile::default();
-    file.peers.push(carry_row(
+    file.pin(carry_row(
         &gateway.id,
         "mute-lender",
         vec![gateway_addr.to_string()],

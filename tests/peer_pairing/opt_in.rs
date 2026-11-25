@@ -40,7 +40,7 @@ fn peers_file_with_no_listener(tag: &str) -> std::path::PathBuf {
 /// fake label: this repository is public.
 fn pin_one_peer(peers: &std::path::Path) {
     let mut file = config::read_or_default(peers).expect("the seeded peers file reads back");
-    file.peers.push(config::PeerRow {
+    file.pin(config::PeerRow {
         node: PeerId([0x5a; 32]),
         label: "laptop-2".to_string(),
         endpoints: Vec::new(),

@@ -506,7 +506,7 @@ async fn a_record_from_a_revoked_peer_is_refused() {
     // fetch needs, so the row being gone is the only reason the fetch below
     // finds nothing.
     let mut file = tcr::peer::config::PeerFile::default();
-    file.peers.push(tcr::peer::config::PeerRow {
+    file.pin(tcr::peer::config::PeerRow {
         node: friend,
         label: "revoked".to_string(),
         endpoints: Vec::new(),
@@ -526,7 +526,7 @@ async fn a_record_from_a_revoked_peer_is_refused() {
 
     // `tcr peer forget`'s own effect: the row is gone.
     let mut revoked = file.clone();
-    revoked.peers.clear();
+    revoked.forget(&friend);
     tcr::peer::config::save(&path, &revoked).expect("the revocation writes");
 
     let fetched = drop_exchange::fetch_for(&store, &path, &friend, 1_758_240_000)

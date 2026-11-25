@@ -300,7 +300,7 @@ async fn a_knock_that_renames_itself_never_takes_a_second_row_or_a_pinned_macs_p
     // One already-pinned Mac, with a label the attacker will try to wear.
     let pinned = PeerId([7_u8; 32]);
     let mut file = node.file();
-    file.peers.push(PeerRow {
+    file.pin(PeerRow {
         node: pinned,
         label: "studio-mac".to_string(),
         endpoints: vec![Endpoint::direct(
@@ -350,9 +350,10 @@ async fn a_knock_that_renames_itself_never_takes_a_second_row_or_a_pinned_macs_p
         "a knock proposing a pinned Mac's name must not touch the peers file at all"
     );
     let file = node.file();
-    assert_eq!(file.peers.len(), 1, "no row was added");
+    assert_eq!(file.pinned_count(), 1, "no row was added");
     assert_eq!(
-        file.peers[0].node, pinned,
+        file.pinned_ids(),
+        vec![pinned],
         "the pinned key is still the one the operator trusted; a name is a label, never \
          identity"
     );

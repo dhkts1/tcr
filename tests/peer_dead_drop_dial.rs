@@ -223,7 +223,7 @@ async fn a_freshly_fetched_address_is_dialled_in_the_same_call_it_was_learned() 
         1_000,
         peer_config::EndpointSource::Paired,
     ));
-    file.peers.push(row.clone());
+    file.pin(row.clone());
     peer_config::save(&path, &file).expect("the row and the dead-drop config write");
 
     // The friend's own record, sealed under the pair's secret, naming the

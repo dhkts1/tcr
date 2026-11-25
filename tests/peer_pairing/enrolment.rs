@@ -49,15 +49,12 @@ async fn a_two_process_join_leaves_a_pinned_row_on_both_sides() {
     // The registrar's half: the one this used to never write.
     let registrar_file = registrar.file();
     assert!(
-        registrar_file
-            .peers
-            .iter()
-            .any(|row| row.node == joiner.key.id()),
+        registrar_file.row(&joiner.key.id()).is_some(),
         "the registrar must hold a pinned row for the joiner; it holds {:?}",
         registrar_file
-            .peers
+            .pinned_ids()
             .iter()
-            .map(|row| row.node.display())
+            .map(PeerId::display)
             .collect::<Vec<_>>()
     );
     // And the invite is spent in the same write, so a one-use key is one use.
@@ -69,20 +66,14 @@ async fn a_two_process_join_leaves_a_pinned_row_on_both_sides() {
 
     // The joiner's half.
     assert!(
-        joiner
-            .file()
-            .peers
-            .iter()
-            .any(|row| row.node == registrar.key.id()),
+        joiner.file().row(&registrar.key.id()).is_some(),
         "the joiner must hold a pinned row for the registrar"
     );
 
     // Every grant is at its default on the row enrolment wrote: a bare pin can
     // say hello and nothing else.
     let row = registrar_file
-        .peers
-        .iter()
-        .find(|row| row.node == joiner.key.id())
+        .row(&joiner.key.id())
         .expect("the row just asserted");
     assert!(!row.allow.inspect, "enrolment grants nothing");
     assert!(!row.allow.gateway, "enrolment grants nothing");
@@ -134,9 +125,7 @@ async fn a_headless_join_teaches_the_registrar_the_joiners_listening_port() {
 
     let registrar_file = registrar.file();
     let row = registrar_file
-        .peers
-        .iter()
-        .find(|row| row.node == joiner.key.id())
+        .row(&joiner.key.id())
         .expect("the registrar pinned a row for the joiner");
 
     assert!(
@@ -245,10 +234,10 @@ fn two_concurrent_joiners_on_one_use_invite_leave_exactly_one_ok() {
         // And the file agrees: one pinned row, no invite left.
         let after = node.file();
         assert_eq!(
-            after.peers.len(),
+            after.pinned_count(),
             1,
             "trial {trial}: the peers file holds {} rows after a one-use invite",
-            after.peers.len()
+            after.pinned_count()
         );
         assert!(
             after.invite(invite.id).is_none(),

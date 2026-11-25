@@ -103,7 +103,7 @@ async fn a_gateway_that_does_not_answer_leaves_todays_503() {
     // and there would be no Mac to name. The fact under test: a Mac that does
     // not answer leaves the request with today's answer, and says which Mac
     // was asked: is unchanged.
-    file.peers.push(carry_row(
+    file.pin(carry_row(
         &PeerId([5_u8; 32]),
         "asleep",
         vec!["127.0.0.1:1".to_string()],

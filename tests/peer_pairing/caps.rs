@@ -524,7 +524,7 @@ async fn concurrent_handshakes_up_to_the_granted_inflight_all_complete() {
     let node = Node::new("concurrent-handshakes");
     let (peer_secret, peer_public) = noise::generate_static().expect("a peer keypair");
     let mut file = node.file();
-    file.peers.push(config::PeerRow {
+    file.pin(config::PeerRow {
         node: PeerId(peer_public),
         label: "laptop-2".to_string(),
         endpoints: Vec::new(),

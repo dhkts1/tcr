@@ -370,7 +370,7 @@ async fn an_authenticated_peer_that_never_sends_a_header_is_closed_on_a_deadline
     let client = NodeKey::load_or_mint(&client_dir).expect("mint the dialler's key");
 
     let mut file = node.file();
-    file.peers.push(PeerRow {
+    file.pin(PeerRow {
         node: client.id(),
         label: "dialler".to_string(),
         endpoints: vec![Endpoint::direct(

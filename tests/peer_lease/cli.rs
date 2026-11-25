@@ -33,6 +33,12 @@ fn cli_peers_file(dir: &Path) -> (PathBuf, String) {
     (peers, node.to_wire())
 }
 
+/// The one row [`cli_peers_file`] pins, as `file` holds it now.
+fn cli_row(file: &PeerFile) -> &PeerRow {
+    file.row(&PeerId([31_u8; 32]))
+        .expect("the row cli_peers_file pinned")
+}
+
 /// **`tcr peer lend` and `tcr peer share on` refuse a scope that names a Codex
 /// account, exit 1, and write nothing**, through the binary an operator and the
 /// panel run.
@@ -180,7 +186,7 @@ fn lend_with_a_scope_adds_a_second_lease_on_the_same_window() {
     assert!(out.contains("leases=2"), "{out}");
 
     let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
-    let lend = &file.peers[0].lend;
+    let lend = &cli_row(&file).lend;
     assert_eq!(lend.len(), 2, "one lease per scope: {lend:?}");
     assert_eq!(lend[0].scope, tcr_peer_wire::LendScope::All);
     assert_eq!(
@@ -195,7 +201,11 @@ fn lend_with_a_scope_adds_a_second_lease_on_the_same_window() {
     assert!(!ok, "a bare number is not a scope");
     assert!(err.contains("scope"), "{err}");
     let after = tcr::peer::config::read_or_default(&peers).expect("the file reads");
-    assert_eq!(after.peers[0].lend.len(), 2, "a refused lend wrote nothing");
+    assert_eq!(
+        cli_row(&after).lend.len(),
+        2,
+        "a refused lend wrote nothing"
+    );
 }
 
 /// **`--list` prints one greppable line per lease with its id, and `--revoke
@@ -238,8 +248,8 @@ fn lend_list_prints_ids_and_revoke_removes_exactly_one_lease() {
     assert!(lines[1].contains("until=none"), "{out}");
 
     let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
-    let doomed = tcr::peer::config::lease_id_string(file.peers[0].lend[0].id);
-    let kept = file.peers[0].lend[1].id;
+    let doomed = tcr::peer::config::lease_id_string(cli_row(&file).lend[0].id);
+    let kept = cli_row(&file).lend[1].id;
     assert!(
         out.contains(&doomed),
         "the printed line carries the id: {out}"
@@ -249,9 +259,10 @@ fn lend_list_prints_ids_and_revoke_removes_exactly_one_lease() {
     assert!(ok, "revoke: {out}{err}");
     assert!(out.contains("leases_left=1"), "{out}");
     let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
-    assert_eq!(file.peers[0].lend.len(), 1);
+    assert_eq!(cli_row(&file).lend.len(), 1);
     assert_eq!(
-        file.peers[0].lend[0].id, kept,
+        cli_row(&file).lend[0].id,
+        kept,
         "the lease that survived is the one that was not named"
     );
 
@@ -296,7 +307,7 @@ fn lend_for_a_duration_writes_an_end_and_relend_clears_it() {
     );
     assert!(ok, "lend --for: {out}{err}");
     let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
-    let grant = &file.peers[0].lend[0];
+    let grant = &cli_row(&file).lend[0];
     let until = grant.until.expect("`--for 2h` wrote an end");
     assert!(
         until >= before + 7_200 && until <= before + 7_260,
@@ -327,7 +338,7 @@ fn lend_for_a_duration_writes_an_end_and_relend_clears_it() {
     );
     let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
     assert_eq!(
-        file.peers[0].lend[0].until,
+        cli_row(&file).lend[0].until,
         Some(until),
         "a refused relend changes nothing: the two-hour end is still the one on disk"
     );
@@ -343,9 +354,9 @@ fn lend_for_a_duration_writes_an_end_and_relend_clears_it() {
     assert!(ok, "relend with no end: {out}{err}");
     assert!(out.contains("until=none"), "{out}");
     let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
-    assert_eq!(file.peers[0].lend[0].until, None);
+    assert_eq!(cli_row(&file).lend[0].until, None);
     assert_eq!(
-        tcr::peer::config::lease_id_string(file.peers[0].lend[0].id),
+        tcr::peer::config::lease_id_string(cli_row(&file).lend[0].id),
         id,
         "re-lending keeps the id, because deleting and re-creating would strand every \
          surface holding the old one"
