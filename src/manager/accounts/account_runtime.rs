@@ -293,7 +293,7 @@ pub(in crate::manager) fn match_listed(
 
 /// Which account a banked-reset spend names: a user's query, resolved by
 /// [`match_listed`]'s rule, or a rotation slot the server chose itself
-/// ([`auto_reset`]), which is never ambiguous and never a deleted row.
+/// ([`resets::auto`]), which is never ambiguous and never a deleted row.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ResetTarget<'a> {
     Name(&'a str),

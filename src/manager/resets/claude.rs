@@ -1,13 +1,13 @@
 //! Confirmed Claude banked-reset claims ([`crate::claude_resets`]). The usage probe reads the
 //! bank; nothing here runs unless an operator confirmed one reset of one account.
 //!
-//! The shape is [`super::codex_reset`]'s: the account's usage gate, an owner recheck after
+//! The shape is [`super::codex`]'s: the account's usage gate, an owner recheck after
 //! every await, one 90 s deadline, a usage read afterwards so the bars drop at once, one INFO
 //! line per attempt naming the account by its tcr index only, and fixed reasons, never the
 //! provider's body or a token.
-use super::freshness::probing::BoundAccount;
-use super::*;
 use crate::claude_resets::PickError;
+use crate::manager::freshness::probing::BoundAccount;
+use crate::manager::*;
 use crate::provider::Provider;
 use std::time::Duration;
 use tcr_status_wire::ResetKind;
@@ -157,8 +157,8 @@ impl Manager {
     }
 
     /// [`Self::reset_claude`] for an account named by a user's query or by its rotation
-    /// slot: the slot is how [`super::auto_reset`] names the account it chose itself.
-    pub(super) async fn reset_claude_at(
+    /// slot: the slot is how [`super::auto`] names the account it chose itself.
+    pub(in crate::manager) async fn reset_claude_at(
         &self,
         target: ResetTarget<'_>,
         kind: Option<ResetKind>,
@@ -784,7 +784,7 @@ mod tests {
         }
     }
 
-    // MARK: automatic spend before the use-by (`super::super::auto_reset`)
+    // MARK: automatic spend before the use-by (`super::auto`)
 
     /// 2030-01-01T00:00:00Z, the fake's earliest weekly use-by.
     const WEEKLY_ENDS: i64 = 1_893_456_000_000;

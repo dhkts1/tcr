@@ -1505,14 +1505,14 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     }
 
     // Spend a banked reset two hours before it would expire unused
-    // (`manager::auto_reset`). On unless `"autoUseExpiringResets": false`; the tick reads
+    // (`manager::resets::auto`). On unless `"autoUseExpiringResets": false`; the tick reads
     // memory only, so it costs nothing until a reset is due.
     if manager.auto_reset_enabled() {
         let m = Arc::clone(&manager);
         let mut stop = shutdown_tx.subscribe();
         background.push(tokio::spawn(supervise("reset-expiry", async move {
             tokio::select! {
-                () = crate::manager::auto_reset::run(m) => {}
+                () = crate::manager::resets::auto::run(m) => {}
                 _ = stop.changed() => {}
             }
         })));

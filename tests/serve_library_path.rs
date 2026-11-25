@@ -162,7 +162,7 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
 
     // The five loops this config enables: affinity flush + bound-token flush +
     // wire-sessions flush + quota probe + the expiring-reset spender
-    // (`autoUseExpiringResets` defaults on, `tcr::manager::auto_reset`). The bound-token flusher joined them when
+    // (`autoUseExpiringResets` defaults on, `tcr::manager::resets::auto`). The bound-token flusher joined them when
     // account-bound history (advisor ids, thinking signatures, message ids) became routing
     // state that has to survive a restart (`tcr::bound_tokens`); it is keyed on the
     // same `affinity_path` this config sets. The keep-warm loop is off, so it must NOT have

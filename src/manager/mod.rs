@@ -57,9 +57,7 @@ mod peer_lend;
 // private, so this re-export is the whole of its surface beyond the methods on
 // `Manager`.
 pub use peer_lend::HandedCredential;
-pub mod auto_reset;
-mod claude_reset;
-mod codex_reset;
+pub mod resets;
 mod select;
 mod snapshot;
 mod state;
@@ -83,8 +81,8 @@ pub use accounts::control_account::{
     CODEX_HAS_NO_CONTROL_ACCOUNT, ControlPersist, SetControlOutcome, codex_control_refusal,
 };
 pub use accounts::disable_and_priority::{DisablePersist, SetDisabledOutcome, SetPriorityOutcome};
-pub use claude_reset::{ClaudeResetError, ClaudeResetOutcome, ClaudeResetResponse};
-pub use codex_reset::{CodexResetError, CodexResetOutcome, CodexResetResponse, valid_reset_key};
+pub use resets::claude::{ClaudeResetError, ClaudeResetOutcome, ClaudeResetResponse};
+pub use resets::codex::{CodexResetError, CodexResetOutcome, CodexResetResponse, valid_reset_key};
 use serving::codex_traffic::{CodexRefusals, MinuteRing};
 pub use serving::exhaustion_hint::ExhaustionHint;
 pub use serving::in_flight::InFlightGuard;
@@ -551,9 +549,9 @@ pub struct Manager {
     warmer: Arc<dyn AccountWarmer>,
     /// Ensures two keep-warm sweeps never overlap.
     warm_in_flight: AtomicBool,
-    /// What [`auto_reset`] tried: every reset it attempted, so none is tried twice, and
+    /// What [`resets::auto`] tried: every reset it attempted, so none is tried twice, and
     /// each account's last attempt, for the status wire.
-    auto_resets: Mutex<auto_reset::Ledger>,
+    auto_resets: Mutex<resets::auto::Ledger>,
     /// Wakes the keep-warm loop the moment an account's quota is first READ, so the
     /// boot gate on [`Self::warm_targets`] costs a probe cycle rather than a full
     /// `warmupSeconds` of dark time.

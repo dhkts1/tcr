@@ -134,7 +134,7 @@ impl Manager {
             plan_prober: RwLock::new(Arc::new(crate::probe::LivePlanProber)),
             warmer,
             warm_in_flight: AtomicBool::new(false),
-            auto_resets: Mutex::new(auto_reset::Ledger::default()),
+            auto_resets: Mutex::new(resets::auto::Ledger::default()),
             warm_wake: Notify::new(),
             config: Mutex::new(config),
             config_write: Arc::new(Mutex::new(())),

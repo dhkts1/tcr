@@ -17,10 +17,10 @@
 //! It reads in-memory state only; the minute tick sends no request unless a reset is due.
 //! `"autoUseExpiringResets": false` in the config turns it off.
 
-use super::claude_reset::{ClaudeResetError, ClaudeResetOutcome};
-use super::codex_reset::CodexResetOutcome;
-use super::*;
+use super::claude::{ClaudeResetError, ClaudeResetOutcome};
+use super::codex::CodexResetOutcome;
 use crate::claude_resets::ClaudeResetBank;
+use crate::manager::*;
 use crate::provider::Provider;
 use std::time::Duration;
 use tcr_status_wire::{AutoReset, AutoResetOutcome, ResetCredits, ResetKind};
@@ -243,7 +243,7 @@ impl Manager {
     }
 
     /// The slot's last automatic attempt, while it is under [`SHOWN_MS`] old.
-    pub(super) fn auto_reset_for(&self, idx: usize, now_ms: i64) -> Option<AutoReset> {
+    pub(in crate::manager) fn auto_reset_for(&self, idx: usize, now_ms: i64) -> Option<AutoReset> {
         self.auto_resets
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
