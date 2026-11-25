@@ -56,7 +56,7 @@ pub use hand::{
 };
 pub use ledger::{
     Ledger, MAX_LEASES_PER_PEER, REQUEST_DEDUP_CAPACITY, REQUEST_DEDUP_TTL_MS, SERVED_CAPACITY,
-    SERVED_PER_LEASE_CAPACITY, SERVED_TTL_MS,
+    SERVED_PER_LEASE_CAPACITY, SERVED_TTL_MS, ScopeRestriction, WindowUtilization,
 };
 pub use lend_end::parse_lend_end;
 pub use provider::{PeerLeaseProvider, lenders_in_ask_order, nothing_left_this_mac, request_lease};

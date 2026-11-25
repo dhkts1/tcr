@@ -119,8 +119,7 @@ pub use frame::{
 };
 pub use hello::{NodeFacts, hello_for_peer, say_hello};
 pub use lender::{
-    LeaseServing, NoFleetUtilization, SERVED_LINE, ScopeRestriction, WindowUtilization,
-    handle_serve_on, utilization_rise,
+    LeaseServing, NoFleetUtilization, SERVED_LINE, handle_serve_on, utilization_rise,
 };
 pub use policy::{
     CLIENT_CREDENTIAL_HEADERS, LENDER_FORWARDED_HEADERS, SERVE_METHOD, lender_forwards_header,
@@ -193,7 +192,7 @@ mod tests {
     use super::lender::{RelaySlot, serve_on_own_account};
     use super::*;
     use crate::peer::config::{Endpoint, Locator, PeerRow};
-    use crate::peer::lease::Ledger;
+    use crate::peer::lease::{Ledger, ScopeRestriction};
     use tcr_peer_wire::{Lease, LeaseUnit};
 
     /// The request key is a credential for this proxy alone, so the borrower's scrub removes

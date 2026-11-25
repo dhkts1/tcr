@@ -2635,7 +2635,7 @@ impl PeerRow {
     /// The answer comes from the caller because it is a fact about the
     /// LENDER'S FLEET and this file knows nothing about accounts. Its one
     /// production source is
-    /// [`crate::peer::serve::WindowUtilization::scope_restriction`], the same
+    /// [`crate::peer::lease::WindowUtilization::scope_restriction`], the same
     /// function the serving leg asks, so a grant skipped here and a request
     /// refused there can never disagree.
     pub fn grant_for(

@@ -918,7 +918,7 @@ where
             u64::try_from(now / 1_000).unwrap_or_default(),
             &|scope| {
                 serving.utilization.scope_restriction(scope)
-                    != serve::ScopeRestriction::Unenforceable
+                    != crate::peer::lease::ScopeRestriction::Unenforceable
             },
         ) else {
             continue;

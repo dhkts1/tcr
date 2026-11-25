@@ -12,7 +12,6 @@ use super::{
 };
 use crate::peer::config::{LendGrant, PeerStore};
 use crate::peer::id::random_id;
-use crate::peer::serve;
 
 /// How many served request ids are remembered, per connection in the listener, and, by
 /// [`SERVED_CAPACITY`], per process in the ledger.
@@ -37,6 +36,133 @@ pub const SERVED_CAPACITY: usize = REQUEST_DEDUP_CAPACITY;
 
 /// How long a served pair is remembered. Same figure, same reason.
 pub const SERVED_TTL_MS: i64 = REQUEST_DEDUP_TTL_MS;
+
+/// One account's utilization on one window, read from the lender's own fleet.
+///
+/// A trait rather than a `Manager` handle in the signature so the lender's half
+/// can be driven without a fleet: the production implementation is
+/// [`crate::manager::Manager`] and reads its accounts' quota, and a test hands
+/// in a reader whose before/after answers are chosen.
+///
+/// The answer is **per account, positionally stable**: `select_with_group`
+/// returns an index into a vector accounts are appended to and never removed
+/// from, so index `i` is the same account across the two reads that bracket one
+/// relayed request. A single scalar cannot carry the same fact, the fleet's
+/// maximum can move because a DIFFERENT account's window moved, which is why
+/// [`utilization_rise`](crate::peer::serve::utilization_rise) compares elementwise.
+///
+/// `None` at an index is "never measured", never "empty": see
+/// [`utilization_rise`](crate::peer::serve::utilization_rise) for what that costs the lease.
+pub trait WindowUtilization: Send + Sync {
+    /// Every account's utilization on `window`, in account order.
+    fn read(&self, window: Window) -> Vec<Option<f64>>;
+
+    /// How a relayed request can be held inside `scope` on THIS node's fleet,
+    /// which is the picker restriction.
+    ///
+    /// On the same trait as the utilization read because both are questions
+    /// about the lender's own fleet that the serving leg has to ask without
+    /// holding a `Manager` (see this trait's doc). The production answer is
+    /// [`crate::manager::Manager`]'s, which reads its groups and its spill
+    /// settings.
+    ///
+    /// **The default answers [`ScopeRestriction::Unenforceable`] for anything
+    /// but [`tcr_peer_wire::LendScope::All`]**, and that direction is the
+    /// decision: a reader that cannot resolve the lender's groups or its
+    /// account labels cannot prove a request stayed inside the scope, and an
+    /// unprovable restriction on somebody else's account is the failure this
+    /// whole file exists to prevent. `handle_serve_on` refuses rather than
+    /// serving out of scope.
+    fn scope_restriction(&self, scope: &LendScope) -> ScopeRestriction {
+        match scope {
+            LendScope::All => ScopeRestriction::Unrestricted,
+            LendScope::Group(_) | LendScope::Accounts(_) => ScopeRestriction::Unenforceable,
+        }
+    }
+
+    /// How much of `window` this node's guard band leaves **on `scope`'s
+    /// accounts only**, or `None` for a reader that cannot answer per scope.
+    ///
+    /// The rule is: "the fraction is of the SCOPE's headroom (one account's
+    /// window, the set's pooled window, the group's pooled window), computed by
+    /// `lendable_fraction` over the scope's accounts only." A measurement
+    /// found `Ledger::note_owner_headroom` with no production caller and the
+    /// ledger's headroom keyed by window alone, so a group-scoped lease was
+    /// clamped by (and its owner guard decided against) the whole fleet.
+    ///
+    /// On this trait, and not on a `Manager` handle, for the reason the trait
+    /// exists: the serving leg asks it without holding a fleet, and a test hands
+    /// in a reader whose answers are chosen. The production implementation is
+    /// [`crate::manager::Manager::lendable_fraction`], which is the SAME
+    /// function `lent_to` and the picker restriction already agree with about
+    /// which accounts a scope draws from.
+    ///
+    /// **`None` is not zero.** A reader that cannot answer leaves the ledger's
+    /// last `LendScope::All` note in place as the ceiling
+    /// (`Ledger::headroom_for`), which is what every pre-decision-12 lease
+    /// already meant; answering `0.0` here would refuse every lease a test
+    /// reader is behind.
+    fn lendable(&self, _scope: &LendScope, _window: Window) -> Option<f64> {
+        None
+    }
+
+    /// The same figure for a `hand` grant: what may be lent out of the accounts
+    /// whose BEARER can leave this Mac, which is a different set from the one
+    /// above and often a smaller one.
+    ///
+    /// A hand lease is spent on the borrower's Mac with a token this one hands
+    /// over, so a figure measured on an account that cannot be handed over
+    /// funds a lease no bearer backs. `Ledger::grant` clamps a hand grant by
+    /// this as well, which is what makes "funded only if a bearer exists" hold.
+    ///
+    /// **`None` is "this reader cannot answer" and leaves the clamp off**, the
+    /// same direction [`Self::lendable`] takes and for the same reason: a
+    /// reader with no fleet behind it (every test one, and
+    /// [`NoFleetUtilization`](crate::peer::serve::NoFleetUtilization)) would otherwise refuse every hand lease. The
+    /// production answer is `Manager`'s and is never `None`.
+    fn lendable_by_hand(&self, _scope: &LendScope, _window: Window) -> Option<f64> {
+        None
+    }
+}
+
+/// How the lender's own proxy can be made to pick inside a lease's scope.
+///
+/// # Why this is three answers and not a list of accounts
+///
+/// The relayed request re-enters the lender's OWN proxy over loopback
+/// ([`handle_serve_on`](crate::peer::serve::handle_serve_on)), so the only thing that crosses into the picker is a
+/// header. The proxy reads two account-selection headers and both are STRICT:
+/// [`crate::proxy::GROUP_HEADER_NAME`], which `Manager::select_with_group`
+/// holds inside the named group (`strict_group`, `src/manager/select.rs:1139`,
+/// for every group that is reserved or not a spill group), and
+/// [`crate::proxy::ACCOUNTS_HEADER_NAME`], which holds the request inside a
+/// named SET of accounts by benching every account outside it before the
+/// rotation loop starts.
+///
+/// [`Self::Unenforceable`] is what is left: a scope this build cannot prove a
+/// request stayed inside, a spill-and-not-reserved group, a group with no
+/// member, an account set naming nothing this fleet carries. It is a refusal
+/// rather than a best-effort, because the alternative is serving a scoped
+/// lease on whichever account the picker liked, which is exactly the thing the
+/// operator scoped it to avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeRestriction {
+    /// Every account may serve it, [`tcr_peer_wire::LendScope::All`].
+    Unrestricted,
+    /// Send it with this group on [`crate::proxy::GROUP_HEADER_NAME`], which
+    /// the picker enforces strictly.
+    Group(String),
+    /// Send it with these account labels on
+    /// [`crate::proxy::ACCOUNTS_HEADER_NAME`], which the picker enforces
+    /// strictly. Already narrowed to the labels the lender's own fleet
+    /// carries, so an empty list never reaches here, a set that named no
+    /// local account is [`Self::Unenforceable`] instead, exactly as an empty
+    /// group is.
+    Accounts(Vec<String>),
+    /// This build cannot hold the request inside the scope, so it must not
+    /// serve it at all.
+    Unenforceable,
+}
 
 /// How many request ids are remembered **per lease**.
 ///
@@ -196,7 +322,7 @@ pub struct Ledger {
     /// does not derive `Hash`, and nothing here adds the derive there. Both
     /// writers ([`Self::grant`] and
     /// [`crate::peer::serve::handle_serve_on`]) note the scope's own figure
-    /// through [`crate::peer::serve::WindowUtilization::lendable`] immediately
+    /// through [`WindowUtilization::lendable`] immediately
     /// before they ask, so the measurement a relay is decided against is the
     /// scope's and is seconds old.
     headroom: HashMap<(String, Window), f64>,
@@ -554,7 +680,7 @@ impl Ledger {
     /// let a stale per-scope figure outlive the fleet running dry, and refusing
     /// outright on an absent scope note would refuse every lease minted by a
     /// build or a test whose reader cannot answer per scope
-    /// ([`crate::peer::serve::WindowUtilization::lendable`] defaults to `None`).
+    /// ([`WindowUtilization::lendable`] defaults to `None`).
     ///
     /// `None` for a window nothing has measured at all, which
     /// [`Self::may_relay`] refuses, because giving away quota on an unmeasured
@@ -593,7 +719,7 @@ impl Ledger {
     ///
     /// `fleet` is the lender's own fleet, and it is here for one question:
     /// which of this peer's grants this Mac's picker could actually hold a
-    /// request inside ([`crate::peer::serve::WindowUtilization::scope_restriction`]).
+    /// request inside ([`WindowUtilization::scope_restriction`]).
     /// The SAME reader the serving leg uses, so a lease this mints is one the
     /// serve path will not turn round and refuse. See
     /// [`crate::peer::config::PeerRow::grant_for`].
@@ -602,7 +728,7 @@ impl Ledger {
         peer: &PeerId,
         ask: &LeaseRequest,
         store: &PeerStore,
-        fleet: &dyn serve::WindowUtilization,
+        fleet: &dyn WindowUtilization,
     ) -> Granted {
         store.reload_if_changed();
         // THE CAP, before the row is even looked at: this refusal is about how
@@ -636,7 +762,7 @@ impl Ledger {
             .as_ref()
             .and_then(|row| {
                 row.grant_for(ask.window, seconds_of(crate::now_ms()), &|scope| {
-                    fleet.scope_restriction(scope) != serve::ScopeRestriction::Unenforceable
+                    fleet.scope_restriction(scope) != ScopeRestriction::Unenforceable
                 })
             })
             .cloned();

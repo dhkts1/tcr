@@ -134,7 +134,7 @@ impl Manager {
         // stickiness. For `tcr run --group` a lock is arguably the operator's
         // own louder instruction; for a LEASE it is not the same operator at
         // all. The lender expresses the scope as exactly this ask
-        // (`crate::peer::serve::ScopeRestriction::Group`), so a lender with
+        // (`crate::peer::lease::ScopeRestriction::Group`), so a lender with
         // `lockAccount` set served every borrowed request on the locked account
         // whatever the lease was scoped to, a scoped lease drawing on an
         // account outside its scope, on somebody else's Mac, which is the one
@@ -264,7 +264,7 @@ impl Manager {
                 // out of the group an operator typed; for a LEASE it is worse,
                 // because the lender's serving leg expresses a lease's
                 // scope as exactly this header
-                // ([`crate::peer::serve::ScopeRestriction::Group`]), so a
+                // ([`crate::peer::lease::ScopeRestriction::Group`]), so a
                 // borrowed request whose session key collided with a local
                 // session's pin was served on an account OUTSIDE the scope,
                 // on somebody else's Mac, which is the one outcome the scope

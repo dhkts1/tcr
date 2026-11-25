@@ -24,10 +24,11 @@ use tcr::manager::Manager;
 use tcr::peer::config::PeerStore;
 use tcr::peer::id::NodeKey;
 use tcr::peer::lease::Ledger;
+use tcr::peer::lease::WindowUtilization;
 use tcr::peer::listener::{self, SessionContext};
 use tcr::peer::noise;
+use tcr::peer::serve;
 use tcr::peer::serve::LeaseServing;
-use tcr::peer::serve::{self, WindowUtilization};
 use tcr_peer_wire::{Control, Lease, LeaseGrant, LeaseUnit, StreamHeader, StreamKind, Window};
 use tokio::net::TcpListener;
 

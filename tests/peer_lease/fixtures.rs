@@ -22,17 +22,17 @@ pub(super) const REQUEST: u128 = 0x2222_2222_2222_2222_2222_2222_2222_2222;
 /// premise those tests share.
 pub(super) struct AnyScope;
 
-impl serve::WindowUtilization for AnyScope {
+impl lease::WindowUtilization for AnyScope {
     fn read(&self, _window: Window) -> Vec<Option<f64>> {
         Vec::new()
     }
 
-    fn scope_restriction(&self, scope: &tcr_peer_wire::LendScope) -> serve::ScopeRestriction {
+    fn scope_restriction(&self, scope: &tcr_peer_wire::LendScope) -> lease::ScopeRestriction {
         match scope {
-            tcr_peer_wire::LendScope::All => serve::ScopeRestriction::Unrestricted,
-            tcr_peer_wire::LendScope::Group(name) => serve::ScopeRestriction::Group(name.clone()),
+            tcr_peer_wire::LendScope::All => lease::ScopeRestriction::Unrestricted,
+            tcr_peer_wire::LendScope::Group(name) => lease::ScopeRestriction::Group(name.clone()),
             tcr_peer_wire::LendScope::Accounts(labels) => {
-                serve::ScopeRestriction::Accounts(labels.clone())
+                lease::ScopeRestriction::Accounts(labels.clone())
             }
         }
     }
