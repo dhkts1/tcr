@@ -118,10 +118,7 @@ impl Manager {
             })
         });
 
-        let usage = crate::usage::UsageTracker::new(
-            accounts.len(),
-            crate::pricing::PricingTable::new(config.pricing.clone().into_iter().collect()),
-        );
+        let usage = crate::usage::UsageTracker::new(accounts.len(), config.pricing_table());
 
         let manager = Arc::new(Self {
             me: std::sync::OnceLock::new(),

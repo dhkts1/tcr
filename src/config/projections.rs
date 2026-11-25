@@ -1,12 +1,11 @@
 //! The read-only views other modules build from a whole config: the settings
-//! `tcr config show` reports, and the pricing overrides `tcr wrap` prices with.
+//! `tcr config show` reports, and the price table a request is priced with.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::Config;
 use crate::config_show::{ConfigSettings, PacingSetting, ThrottleSetting};
-use crate::pricing::PricingOverride;
+use crate::pricing::PricingTable;
 
 impl Config {
     /// The settings a server started on this config would use, with every
@@ -31,8 +30,10 @@ impl Config {
         }
     }
 
-    /// The config's `pricing` overrides, keyed by model, consuming the config.
-    pub fn into_pricing_overrides(self) -> BTreeMap<String, PricingOverride> {
-        self.pricing.into_iter().collect()
+    /// The price table a request is priced with: the built-in table under this
+    /// config's `pricing` overrides. The running proxy and `tcr wrap`'s report
+    /// both build it here, so a request prices the same in either.
+    pub fn pricing_table(&self) -> PricingTable {
+        PricingTable::new(self.pricing.clone().into_iter().collect())
     }
 }
