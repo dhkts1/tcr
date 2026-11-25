@@ -256,7 +256,7 @@ pub(crate) async fn import_claude_login(
     // A fleet emptied by `tcr remove` says so in the file; refilling it here
     // would undo that delete on the next poll.
     if into == ImportInto::EmptyFleetOnly
-        && (!config.accounts.is_empty() || config.refuses_claude_code_import())
+        && (!config.holds_no_accounts() || config.refuses_claude_code_import())
     {
         return Ok(ClaudeImported::FleetNotEmpty);
     }
