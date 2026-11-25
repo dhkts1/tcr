@@ -65,6 +65,11 @@ pub mod dialaddrs;
 /// name and the sealed record. Crypto and naming only, called by nothing yet.
 pub mod drop;
 
+/// What one Mac sends one friend after it changed networks: a sealed record
+/// saying where it is now. The seal and the refusals only, called by nothing
+/// yet.
+pub mod moved;
+
 /// `tcr-peers.json` in the config directory, mode 0600.
 pub fn default_path() -> PathBuf {
     crate::peer::id::default_config_dir().join("tcr-peers.json")
@@ -1007,7 +1012,7 @@ pub enum EndpointSource {
     /// see [`crate::peer::probe::order_endpoints`] for where that is enforced.
     Drop,
     /// Off a sealed link one friend sent another after changing networks, read
-    /// by [`crate::peer::config::drop::moved::open_link`] and written only when the operator
+    /// by [`crate::peer::config::moved::open_link`] and written only when the operator
     /// said `--yes`.
     ///
     /// **[`Self::Drop`]'s band and not its member.** It ranks the same, for the

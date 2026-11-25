@@ -59,7 +59,7 @@ pub enum DecodeRefusal {
     CutShort,
     /// A family byte this build does not know. Refused rather than skipped:
     /// half of what the sender meant is worse than none of it, the rule
-    /// [`crate::peer::config::drop::moved`]'s `MovedRefusal::UnknownField` states.
+    /// [`crate::peer::config::moved`]'s `MovedRefusal::UnknownField` states.
     UnknownFamily { byte: u8 },
 }
 

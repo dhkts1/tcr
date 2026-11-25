@@ -53,11 +53,6 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::PeerId;
 
-/// What one Mac sends one friend after it changed networks: a sealed record
-/// saying where it is now. The seal and the refusals only, called by nothing
-/// yet.
-pub mod moved;
-
 /// HMAC-SHA256, by hand over `sha2`, in the twenty lines RFC 2104 is.
 ///
 /// # Why this is not the `hmac` crate

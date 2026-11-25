@@ -41,7 +41,7 @@
 //!
 //! # Framing
 //!
-//! Both wire forms frame exactly like [`crate::peer::config::drop::moved`]: four magic
+//! Both wire forms frame exactly like [`crate::peer::config::moved`]: four magic
 //! bytes outside the seal, then a version byte, then the payload. The length
 //! is checked before any AEAD runs, so a chat client that truncated a paste
 //! is told it was cut short rather than called a forgery
@@ -188,7 +188,7 @@ pub struct Reply {
 
 /// The fewest bytes a reply can be and still hold something that could open:
 /// the frame, a 32-byte ephemeral public key, a tag, and at least one byte
-/// under the tag. [`crate::peer::config::drop::moved::MIN_LINK_BYTES`]'s own shape.
+/// under the tag. [`crate::peer::config::moved::MIN_LINK_BYTES`]'s own shape.
 const MIN_REPLY_BYTES: usize = REPLY_MAGIC.len() + 1 + 32 + 16 + 1;
 
 impl Reply {

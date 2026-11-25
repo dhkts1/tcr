@@ -37,7 +37,7 @@ use super::{masked_label, now_unix_secs, parse_peer_arg, peer_state_path};
 ///
 /// A line this function wrote itself reads `peer moved: …`, the greppable
 /// shape every other verb uses. A refusal that came out of
-/// [`tcr::peer::config::drop::moved`] is printed in the module's own words, which
+/// [`tcr::peer::config::moved`] is printed in the module's own words, which
 /// start `moved link:`, rather than re-spelled here: one sentence with two
 /// spellings is two sentences that drift, and the prefix says which layer
 /// refused.
@@ -110,7 +110,7 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
     // The option is handed over whole. There is no default to reach for: a row
     // with no secret is the one case this verb cannot serve, and sealing under
     // thirty-two zero bytes instead would be a key anybody can guess.
-    let keys = peer::config::drop::moved::MovedKeys::for_row(row.rendezvous_secret.as_ref())
+    let keys = peer::config::moved::MovedKeys::for_row(row.rendezvous_secret.as_ref())
         .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
 
     let now_ms = peer::state::now_ms();
@@ -170,19 +170,19 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
         .map_or_else(peer::id::default_config_dir, Path::to_path_buf);
     let this = peer::id::NodeKey::load_or_mint(&config_dir)?.id();
 
-    let record = peer::config::drop::moved::MovedRecord {
-        v: peer::config::drop::moved::MOVED_VERSION,
+    let record = peer::config::moved::MovedRecord {
+        v: peer::config::moved::MOVED_VERSION,
         at: now_unix_secs(),
         eps: carried,
     };
-    let link = peer::config::drop::moved::mint_link(&keys, &this, &record)
+    let link = peer::config::moved::mint_link(&keys, &this, &record)
         .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
 
     println!("{link}");
     println!(
         "peer moved: sealed for {}; only that Mac can read it, and it goes stale in {} hours",
         masked_label(&row.label),
-        peer::config::drop::moved::MAX_MOVED_AGE.as_secs() / 3_600
+        peer::config::moved::MAX_MOVED_AGE.as_secs() / 3_600
     );
     println!(
         "peer moved: it carries {} address(es) and nothing else: it joins nothing, grants \
@@ -202,7 +202,7 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
 /// not depend on the rows it walked: a link forwarded into the wrong group chat
 /// must teach its reader nothing about whose Mac it was for or whether this Mac
 /// came close. Every key that did not open it answers
-/// [`tcr::peer::config::drop::moved::MovedRefusal::NotForThisMac`], which is one
+/// [`tcr::peer::config::moved::MovedRefusal::NotForThisMac`], which is one
 /// sentence naming nothing, and the only refusals that can outrank it are the
 /// ones decided after a key DID open the bytes.
 fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> anyhow::Result<()> {
@@ -237,8 +237,8 @@ fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
         ),
     };
 
-    let field = peer::config::drop::moved::link_field(&raw)
-        .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+    let field =
+        peer::config::moved::link_field(&raw).map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
     let now_s = now_unix_secs();
     let now_ms = peer::state::now_ms();
     let file = peer::config::read_or_default(peers_path)?;
@@ -249,12 +249,11 @@ fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
         // A row with no shared secret has no key to try, and that is not an
         // error: its own doc says absent means no session has completed since
         // the key existed.
-        let Ok(keys) =
-            peer::config::drop::moved::MovedKeys::for_row(row.rendezvous_secret.as_ref())
+        let Ok(keys) = peer::config::moved::MovedKeys::for_row(row.rendezvous_secret.as_ref())
         else {
             continue;
         };
-        match peer::config::drop::moved::open_link_field(&keys, &row.node, field, now_s) {
+        match peer::config::moved::open_link_field(&keys, &row.node, field, now_s) {
             Ok(record) => {
                 opened = Some((row, record));
                 break;
@@ -264,7 +263,7 @@ fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
             // or after one opened the bytes, which makes it that row's own
             // diagnosis. Either way it outranks the quiet refusal and stops the
             // walk.
-            Err(peer::config::drop::moved::MovedRefusal::NotForThisMac) => continue,
+            Err(peer::config::moved::MovedRefusal::NotForThisMac) => continue,
             Err(refusal) => {
                 past_the_seal = Some(refusal);
                 break;
@@ -273,8 +272,7 @@ fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
     }
 
     let Some((row, record)) = opened else {
-        let refusal =
-            past_the_seal.unwrap_or(peer::config::drop::moved::MovedRefusal::NotForThisMac);
+        let refusal = past_the_seal.unwrap_or(peer::config::moved::MovedRefusal::NotForThisMac);
         println!(
             "peer moved: nothing was written and no row was created; a link only ever adds \
              an address to a Mac this one already pins"
