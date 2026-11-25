@@ -49,6 +49,16 @@ impl Config {
             })
     }
 
+    /// Whether `probe`'s name is free for it: every row carrying that name is
+    /// the same account as `probe` ([`crate::identity::same_identity`]), which
+    /// holds when no row carries it.
+    pub fn name_free_for(&self, probe: &Account) -> bool {
+        self.accounts
+            .iter()
+            .filter(|a| a.name == probe.name)
+            .all(|a| crate::identity::same_identity(a, probe))
+    }
+
     /// Every row's name: the names a new login must not take.
     pub fn taken_names(&self) -> HashSet<String> {
         self.accounts.iter().map(|a| a.name.clone()).collect()

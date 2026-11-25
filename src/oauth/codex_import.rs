@@ -494,11 +494,7 @@ pub(super) fn mint_codex_login_name(
             workspace_id.map(str::to_string),
             None,
         );
-        config
-            .accounts
-            .iter()
-            .filter(|a| a.name == candidate)
-            .all(|a| crate::identity::same_identity(a, &this_login))
+        config.name_free_for(&this_login)
     };
     if let Some(explicit) = name {
         if !free(explicit) {
