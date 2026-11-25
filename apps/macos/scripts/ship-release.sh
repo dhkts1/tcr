@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ship-release.sh — cut, land and publish a TcrBar release in one command.
 #
-#   apps/macos/scripts/ship-release.sh <X.Y.Z> [--next <X.Y.Z>] [--install] [--dry-run]
+#   apps/macos/scripts/ship-release.sh <X.Y.Z> [--next <X.Y.Z>] [--install] [--dry-run] [--no-ci-wait]
 #
 # Run from the Mac that holds the signing keys, in a checkout on `main`.
 #
@@ -46,6 +46,12 @@
 #
 # --dry-run runs step 1 and prints the plan; it changes nothing.
 #
+# --no-ci-wait (Gil, 2026-11-25: "it should be like that" when he wants the
+# release now) skips the two CI waits. Step 1 still refuses when `ci` or `macos`
+# has already FAILED on the commit; it only stops waiting for ones still running.
+# Step 6 admin-merges the appcast + bump PR after step 5's local
+# `cargo metadata --locked` check (Gil's 2026-10-31 ruling for that PR).
+#
 # NOTHING HERE PRINTS A SECRET OR NAMES A PERSON, same rule as release-local.sh:
 # this file is world-readable.
 #
@@ -64,12 +70,13 @@ wait_minutes="${SHIP_CHECK_WAIT_MINUTES:-60}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(git -C "$script_dir" rev-parse --show-toplevel)" || die "not inside a git checkout"
 
-version="" next="" install=0 dry_run=0
+version="" next="" install=0 dry_run=0 no_ci_wait=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --next) next="${2:-}"; shift 2 ;;
     --install) install=1; shift ;;
     --dry-run) dry_run=1; shift ;;
+    --no-ci-wait) no_ci_wait=1; shift ;;
     -h|--help) sed -n '2,5p' "${BASH_SOURCE[0]}"; exit 0 ;;
     -*) die "unknown flag: $1" ;;
     *) [ -z "$version" ] || die "one version only (got '$version' and '$1')"; version="$1"; shift ;;
@@ -77,7 +84,7 @@ while [ $# -gt 0 ]; do
 done
 
 semver='^[0-9]+\.[0-9]+\.[0-9]+$'
-[[ "$version" =~ $semver ]] || die "usage: ship-release.sh <X.Y.Z> [--next X.Y.Z] [--install] [--dry-run]"
+[[ "$version" =~ $semver ]] || die "usage: ship-release.sh <X.Y.Z> [--next X.Y.Z] [--install] [--dry-run] [--no-ci-wait]"
 if [ -z "$next" ]; then
   IFS=. read -r major minor patch <<<"$version"
   next="$major.$minor.$((patch + 1))"
@@ -148,10 +155,18 @@ git -C "$root" rev-parse -q --verify "refs/tags/$tag" >/dev/null && die "tag $ta
 git -C "$root" ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1 \
   && die "tag $tag already exists on origin"
 note "main is $head, Cargo.toml is $version, $tag is new"
-note "waiting for ci and macos on that commit…"
-wait_checks "$head" ci macos
-rc=$?
-[ "$rc" -eq 0 ] || die "ci/macos did not pass on $head (see above); not releasing unverified code"
+if [ "$no_ci_wait" = 1 ]; then
+  states="$(check_states "$head" ci macos)" || die "could not read check runs for $head"
+  printf '%s\n' "$states" | sed 's/^/    /'
+  printf '%s\n' "$states" | awk '$2 == "completed" && $3 != "success" && $3 != "skipped" && $3 != "neutral" { bad = 1 } END { exit bad }' \
+    || die "ci/macos already FAILED on $head (see above); not releasing a red commit"
+  note "--no-ci-wait: not waiting for checks still running on that commit"
+else
+  note "waiting for ci and macos on that commit…"
+  wait_checks "$head" ci macos
+  rc=$?
+  [ "$rc" -eq 0 ] || die "ci/macos did not pass on $head (see above); not releasing unverified code"
+fi
 
 if [ "$dry_run" = 1 ]; then
   say "dry run: every precondition holds; nothing was changed"
@@ -212,6 +227,11 @@ say "step 6/7  wait for ci, audit, macos and plan on #$pr, then merge"
 merged=0
 for attempt in 1 2; do
   pr_head="$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid)" || die "cannot read #$pr"
+  if [ "$no_ci_wait" = 1 ]; then
+    note "--no-ci-wait: admin-merging #$pr (step 5 checked cargo metadata --locked)"
+    gh pr merge "$pr" --repo "$repo" --squash --admin && { merged=1; break; }
+    die "#$pr admin merge was refused; it is open for a human"
+  fi
   wait_checks "$pr_head" ci audit macos plan
   rc=$?
   [ "$rc" -eq 0 ] || die "#$pr's required checks did not pass (see above); left open"
