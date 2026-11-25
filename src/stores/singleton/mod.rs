@@ -66,6 +66,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 
+use crate::base::log_err::LogErr as _;
+
 /// Which proxy a recognized incumbent is. The distinction is load-bearing for
 /// [`takeover_decision`], not cosmetic: a `tcr` peer is a program that is doing
 /// this program's job and whose session pins cost real money to discard, while an
@@ -419,7 +421,11 @@ pub fn classify_proxy_server(argv: &[String]) -> Option<ProxyKind> {
 /// caller reaching for that shortcut here would get an empty argv on every call
 /// and every proxy would silently stop being recognized.
 fn process_command(pid: u32) -> Vec<String> {
-    let mut sys = System::new();
+    let Some(mut sys) =
+        System::new().log_warn("building a sysinfo System to read a process's argv")
+    else {
+        return Vec::new();
+    };
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         false,
@@ -627,8 +633,15 @@ pub fn live_proxy_server(port: u16) -> Option<Incumbent> {
 /// signalled. [`process_command`] is the odd one out: it refreshes the same way
 /// but additionally requests `.with_cmd(UpdateKind::Always)`, since it is the
 /// only one of the three that needs the command line.
+///
+/// A [`System`] that cannot be built is logged and answers "alive": a process
+/// this code could not look at is not one it saw exit.
 fn is_alive(pid: u32) -> bool {
-    let mut sys = System::new();
+    let Some(mut sys) =
+        System::new().log_warn("building a sysinfo System to check a process is alive")
+    else {
+        return true;
+    };
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,
@@ -693,7 +706,11 @@ fn wait_for_exit(pid: u32, grace: Duration) -> bool {
 /// "we tried to signal it" from a `None` it never checked is exactly how a
 /// process that was never actually asked to stop ends up presumed dead.
 fn signal_pid(pid: u32, signal: Signal) {
-    let mut sys = System::new();
+    let Some(mut sys) = System::new()
+        .log_warn("building a sysinfo System to signal a process; the process was NOT signalled")
+    else {
+        return;
+    };
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,

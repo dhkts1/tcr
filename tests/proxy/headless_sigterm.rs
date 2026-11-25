@@ -223,7 +223,7 @@ fn a_supervised_sigterm_drains_before_the_process_exits() {
     );
 
     let pid = child.id();
-    let mut sys = System::new();
+    let mut sys = System::new().expect("sysinfo builds a System on this platform");
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,

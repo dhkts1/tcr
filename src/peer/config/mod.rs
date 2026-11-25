@@ -50,6 +50,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{LendScope, PeerId, Window};
 
+use crate::base::log_err::LogErr as _;
 use crate::peer::config::drop::hmac_sha256;
 
 /// The join key an operator pastes: [`join_key::JoinToken`] and the addresses
@@ -3254,7 +3255,9 @@ impl PeerRow {
 }
 
 fn host_name() -> String {
-    sysinfo::System::host_name().unwrap_or_else(|| "peer".to_string())
+    sysinfo::System::host_name()
+        .log_warn("reading the host name for the peer display name; using \"peer\"")
+        .unwrap_or_else(|| "peer".to_string())
 }
 
 #[cfg(test)]

@@ -669,7 +669,11 @@ async fn wait_for(done: &dyn Fn() -> bool, limit: Duration) {
 /// Snapshot the owned root and its descendants, retaining each process's start time.
 fn family_of(root: ProcessIdentity) -> Vec<ProcessIdentity> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-    let mut system = System::new();
+    let Some(mut system) =
+        System::new().log_warn("building a sysinfo System to list codex login's processes")
+    else {
+        return Vec::new();
+    };
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
     let Some(process) = system.process(Pid::from_u32(root.pid)) else {
         return Vec::new();
@@ -696,7 +700,8 @@ fn family_of(root: ProcessIdentity) -> Vec<ProcessIdentity> {
 
 fn process_identity(pid: u32) -> Option<ProcessIdentity> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-    let mut system = System::new();
+    let mut system =
+        System::new().log_warn("building a sysinfo System to read a process's identity")?;
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,
@@ -709,7 +714,11 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
 /// needs nothing, and a signal the platform cannot send is logged.
 fn signal(expected: ProcessIdentity, signal: sysinfo::Signal) {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
-    let mut system = System::new();
+    let Some(mut system) = System::new().log_warn(
+        "building a sysinfo System to signal a codex login process; it was NOT signalled",
+    ) else {
+        return;
+    };
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(expected.pid)]),
         true,
