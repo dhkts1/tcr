@@ -21,7 +21,7 @@ set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
-SERVER="src/server.rs"
+SERVER="src/proxy/server/mod.rs"
 MAIN="src/main.rs"
 BACKUP_DIR="$(mktemp -d -t deflake.XXXXXX)"
 cp "$SERVER" "$BACKUP_DIR/server.rs"

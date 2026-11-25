@@ -16,17 +16,17 @@
 # the drop's key ladder has, so that topology could never reach this
 # scenario's own first step.
 #
-# The publisher (`keep_drops_published`, `src/server.rs`) is boot-time gated
+# The publisher (`keep_drops_published`, `src/proxy/server/peer_mesh.rs`) is boot-time gated
 # on `DeadDropConfig::is_live()`: a Mac that turns the drop on after it has
 # already booted starts no publishing task until it boots again (the fetch
-# gate is hot, the publish gate is not, `src/peer/config.rs`'s own doc on
+# gate is hot, the publish gate is not, `src/peer/config/mod.rs`'s own doc on
 # `DeadDropConfig::enabled` says so). node-a1-overlay is therefore
 # configured and then restarted, the same kill-and-relaunch this harness
 # already uses in `lease-borrow.sh`.
 #
 # `dial_peer_reaching_within` (src/peer/serve.rs), where the drop fetch
 # lives, has exactly two production callers in this tree and both are the
-# peer-lease borrow path (`src/peer/lease.rs`, `src/peer/serve.rs`): there is
+# peer-lease borrow path (`src/peer/lease/mod.rs`, `src/peer/serve.rs`): there is
 # no lighter way to make a real dial happen. So this scenario is
 # `lease-borrow.sh`'s own cast and mechanism (lend, the inspect/disclose
 # pair, an account disabled and the borrower restarted) with the dead drop
@@ -64,7 +64,7 @@
 #      it can no longer reach
 #  11. restart node-b1-overlay (the account-disable and the peer-lease
 #      fallback provider are both boot-time)
-#  12. wait out `DEAD_DROP_PUBLISH_INTERVAL` (`src/server.rs`, 300s, fixed):
+#  12. wait out `DEAD_DROP_PUBLISH_INTERVAL` (`src/proxy/server/peer_mesh.rs`, 300s, fixed):
 #      node-a1-overlay's publisher fires its first tick the instant it boots,
 #      before its own internet keeper's UPnP round trip can possibly have
 #      finished, so that first publish carries no address at all. Its SECOND
@@ -291,7 +291,7 @@ nx "$B" ip link set utun0 down
 pass "the overlay is down on both sides"
 
 # --- restart node-b1-overlay: the account disable and the peer-lease -------
-# fallback provider are both boot-time, `src/fallback.rs`.
+# fallback provider are both boot-time, `src/peer/serve/fallback.rs`.
 oldpid="$(cat "$B_HOME/pid" 2>/dev/null || echo)"
 if [ -n "$oldpid" ]; then
   kill "$oldpid" 2>/dev/null || true
@@ -308,7 +308,7 @@ fi
 pass "$B restarted with its own account disabled and the overlay down"
 
 # --- wait out node-a1-overlay's publish interval ----------------------------
-# `DEAD_DROP_PUBLISH_INTERVAL` (`src/server.rs`) is 300s, fixed, and not a
+# `DEAD_DROP_PUBLISH_INTERVAL` (`src/proxy/server/peer_mesh.rs`) is 300s, fixed, and not a
 # peers-file setting: the first tick fired the instant node-a1-overlay
 # rebooted, before its own internet keeper's UPnP round trip could finish, so
 # that first publish carried no address. The steps between the restart above

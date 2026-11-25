@@ -14,7 +14,7 @@ import ServiceManagement
 /// goes to `SMAppService.status`; nothing caches an "installed" Bool.
 ///
 /// The plist is `Contents/Library/LaunchDaemons/<label>.plist`, placed by
-/// `scripts/build-tcrbar.sh`, which also writes the label it shipped into
+/// `apps/macos/scripts/build-tcrbar.sh`, which also writes the label it shipped into
 /// the app's `Info.plist` as ``infoPlistKey``. That key is the only source of
 /// the label here: the script picks `.dev` from the signing tier as well as
 /// `TCRBAR_DEV_BUILD`, so an Apple Development build of the shipping bundle id

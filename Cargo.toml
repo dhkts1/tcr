@@ -205,55 +205,55 @@ path = "tests/it/main.rs"
 # Owns MITM's process-global loaded leaf while preparing isolated agent fixtures.
 [[test]]
 name = "tool_proxy_env"
-path = "tests/tool_proxy_env.rs"
+path = "tests/proxy/tool_proxy_env.rs"
 
 [[test]]
 name = "codex_log_lines"
-path = "tests/codex_log_lines.rs"
+path = "tests/codex/codex_log_lines.rs"
 [[test]]
 name = "peer_forward"
-path = "tests/peer_forward.rs"
+path = "tests/peer/reach/peer_forward.rs"
 [[test]]
 name = "peer_refusal_log"
-path = "tests/peer_refusal_log.rs"
+path = "tests/peer/pairing/peer_refusal_log.rs"
 [[test]]
 name = "usage-ledger-write-failure-policy"
-path = "tests/usage-ledger-write-failure-policy.rs"
+path = "tests/proxy/usage-ledger-write-failure-policy.rs"
 # The global subscriber again, and an in-process `server::serve`, which installs the egress
 # peers path, the peer-lease fallback and the probe path table for the whole process:
 [[test]]
 name = "peer_boot"
-path = "tests/peer_boot.rs"
+path = "tests/peer/peer_boot.rs"
 # `server::serve` in process (see `peer_boot`):
 [[test]]
 name = "serve_library_path"
-path = "tests/serve_library_path.rs"
+path = "tests/proxy/serve_library_path.rs"
 [[test]]
 name = "peer_borrow_hot"
-path = "tests/peer_borrow_hot.rs"
+path = "tests/peer/lending/peer_borrow_hot.rs"
 # `fallback::install_provider`, which installs once per process:
 [[test]]
 name = "codex_never_borrowed"
-path = "tests/codex_never_borrowed.rs"
+path = "tests/codex/codex_never_borrowed.rs"
 [[test]]
 name = "peer_lease"
-path = "tests/peer_lease.rs"
+path = "tests/peer/lending/peer_lease.rs"
 # `egress::install_peers_path`, which installs once per process:
 [[test]]
 name = "peer_egress"
-path = "tests/peer_egress.rs"
+path = "tests/peer/reach/peer_egress.rs"
 # The leaf the process loaded last decides which CONNECT hosts `mitm` terminates:
 [[test]]
 name = "intercepted_host"
-path = "tests/intercepted_host.rs"
+path = "tests/proxy/intercepted_host.rs"
 # Both publish router mappings to the process-wide register `reach::external_socket` reads,
 # which the dead-drop and listener paths in other modules advertise:
 [[test]]
 name = "peer_reach"
-path = "tests/peer_reach.rs"
+path = "tests/peer/reach/peer_reach.rs"
 [[test]]
 name = "peer_reach_upnp"
-path = "tests/peer_reach_upnp.rs"
+path = "tests/peer/reach/peer_reach_upnp.rs"
 
 [dependencies]
 # The shared `tcr status --json` wire type (`AccountStatusRow`), consumed by
@@ -464,7 +464,7 @@ tailscale = { version = "=0.6.1", optional = true }
 
 [dev-dependencies]
 # Property tests over the peer-mesh wire's parse/decode boundary
-# (`tests/peer_props.rs`). Gil approved this as a dev-dependency on
+# (`tests/peer/peer_props.rs`). Gil approved this as a dev-dependency on
 # 2026-09-18, and no other new dependency.
 proptest = "1"
 # This crate again, with `test-support` on, so the integration tests under `tests/` reach the

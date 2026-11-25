@@ -1,7 +1,7 @@
 //! The proxy's fan controller: holds Auto, Fixed or Follow CPU through the root
 //! helper, judging on every step whose the fans are.
 //!
-//! Pure and synchronous. It runs on one std thread in the proxy (`src/fan.rs`,
+//! Pure and synchronous. It runs on one std thread in the proxy (`src/stores/fan.rs`,
 //! never a tokio worker) and is generic over everything that touches the
 //! machine: the helper connection ([`Helper`]), the heat reading ([`Heat`]),
 //! the Macs Fan Control probe ([`Probe`]), the clock ([`Clock`]) and the

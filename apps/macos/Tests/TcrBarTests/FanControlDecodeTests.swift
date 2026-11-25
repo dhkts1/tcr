@@ -156,7 +156,7 @@ final class FanControlDecodeTests: XCTestCase {
     // MARK: The committed cross-language fixture
 
     /// `<repo>/tests/fixtures/fan-control-contract.json`: the SAME file the
-    /// Rust side renders and compares against (`src/fan.rs`), located from
+    /// Rust side renders and compares against (`src/stores/fan.rs`), located from
     /// `#filePath` as ``RealWorldDecodeTests/contractFixtureURL`` locates
     /// `status-contract.json`.
     static var fanContractURL: URL {

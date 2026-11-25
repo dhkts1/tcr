@@ -22,7 +22,7 @@ import Foundation
 
 /// One line of `tcr peer pair --json`.
 ///
-/// `src/peer/pair.rs`'s `PairEvent`, and `tests/peer_pairing.rs` pins the exact
+/// `src/peer/pair.rs`'s `PairEvent`, and `tests/peer/pairing/peer_pairing.rs` pins the exact
 /// bytes of all four lines, because what breaks a decode is a renamed key
 /// rather than a wrong value: `waitSeconds` becoming `wait_seconds` decodes to
 /// nothing and the sheet simply never leaves its first state.

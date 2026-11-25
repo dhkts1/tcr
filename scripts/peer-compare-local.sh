@@ -8,7 +8,7 @@
 #    `lan-p2p-main-cmp`). A test present and green at the
 #    merge-base that is red here is printed as `finding: <name>`.
 # 2. Latency: runs `measure_latency_local_vs_borrowed` in
-#    `tests/peer_e2e.rs`: 50 requests served locally on the lender versus 50
+#    `tests/peer/peer_e2e.rs`: 50 requests served locally on the lender versus 50
 #    borrowed through the lender, through the same two-process harness
 #    `scripts/peer-e2e-local.sh` drives.
 # 3. Boot cost: runs `measure_boot_cost_with_and_without_peers_file`: ten
@@ -19,7 +19,7 @@
 # `finding: <text>`: grep for either. The numbers are printed here only,
 # never written into a committed doc.
 #
-# Safety, same as tests/peer_e2e.rs and scripts/peer-e2e-local.sh: every
+# Safety, same as tests/peer/peer_e2e.rs and scripts/peer-e2e-local.sh: every
 # proxy either comparison boots binds --port 0 with a scratch HOME; the live
 # proxy on 127.0.0.1:3456 is never probed, signalled or connected to.
 # Honours CARGO_TARGET_DIR for this worktree's build; the comparison

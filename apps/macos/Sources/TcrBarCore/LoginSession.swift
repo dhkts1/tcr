@@ -467,7 +467,7 @@ public enum LoginPhase: Equatable, Sendable {
 
 /// One line of `tcr login --non-interactive`'s stdout, parsed.
 ///
-/// The wire format is `LoginEvent::line` in `src/oauth.rs` — one JSON object
+/// The wire format is `LoginEvent::line` in `src/verbs/login/login_ui.rs` — one JSON object
 /// per line, `event` naming which.
 public enum LoginProgressEvent: Equatable, Sendable {
     /// Open this URL. Nothing has been read or written yet. `opened` means the

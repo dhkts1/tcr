@@ -25,8 +25,8 @@ set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
-CONFIG="src/config.rs"
-CLI="src/cli.rs"
+CONFIG="src/base/config.rs"
+CLI="src/verbs/cli/mod.rs"
 BACKUP_DIR="$(mktemp -d -t settings-save.XXXXXX)"
 cp "$CONFIG" "$BACKUP_DIR/config.rs"
 cp "$CLI" "$BACKUP_DIR/cli.rs"

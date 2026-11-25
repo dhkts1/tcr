@@ -37,7 +37,7 @@
 # one from a real forward.
 #
 # `via=` alone is not enough either, measured directly below: `open_forward_to`
-# (src/peer/tunnel.rs) returns a stream the instant it has ASKED node-c1 to
+# (src/peer/tunnel/mod.rs) returns a stream the instant it has ASKED node-c1 to
 # carry, before node-c1 has said yes, so `via=` prints whether node-c1
 # authorizes the forward or not. The second assertion is the one that actually
 # depends on the grant: a node-c1 that refuses closes the carried stream
@@ -153,7 +153,7 @@ fi
 pass "every pinned row resolved to exactly one id on each side"
 
 # --- the grant matrix, derived from src/peer/serve.rs:2658 and
-#     src/peer/tunnel.rs:1353 -------------------------------------------------
+#     src/peer/tunnel/mod.rs:1353 -------------------------------------------------
 nx node-a1 tcr peer allow "$c_id_from_a" carry on --peers "$PEERS" >/dev/null 2>&1 || true
 nx node-a1 tcr peer allow "$b_id_from_a" disclose on --peers "$PEERS" >/dev/null 2>&1 || true
 nx node-b1 tcr peer allow "$a_id_from_b" inspect on --peers "$PEERS" >/dev/null 2>&1 || true
@@ -237,7 +237,7 @@ echo "relay-friend: node-a1's borrow request: $borrow"
 
 # --- the observable, in two parts ---------------------------------------
 #
-# `open_forward_to` (src/peer/tunnel.rs) never waits for the forwarder's
+# `open_forward_to` (src/peer/tunnel/mod.rs) never waits for the forwarder's
 # answer before returning a stream (its own doc comment: "nothing here waits
 # for an acknowledgement"), so the `via=` line alone fires the instant this
 # Mac finishes asking node-c1 to carry, whether node-c1 actually authorizes

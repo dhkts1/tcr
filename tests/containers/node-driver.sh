@@ -9,7 +9,7 @@
 # Accept that has not happened yet when the command starts, so something inside
 # the container has to hold the write end of that stream open across the whole
 # wait. A fifo plus a writer that blocks until the digits are known is that
-# something, and it is the same shape `tests/peer_e2e.rs` gets for free by
+# something, and it is the same shape `tests/peer/peer_e2e.rs` gets for free by
 # keeping the child's `Stdio::piped()` stdin alive in the test process.
 #
 # Verbs, each one `docker exec`ed on its own:

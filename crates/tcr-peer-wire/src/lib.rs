@@ -20,7 +20,7 @@
 //! CONTROL stream, which nests end to end inside a TUNNEL, so a forwarding hop
 //! holds ciphertext for a session it has no key to.
 //!
-//! The gate is `wire_has_no_credential_field` in `tests/peer_wire.rs`: a source
+//! The gate is `wire_has_no_credential_field` in `tests/peer/pairing/peer_wire.rs`: a source
 //! grep with a positive control, so it fails if the grep itself stops working,
 //! and it exempts that one variant's declaration by name and nothing else.
 //!
@@ -32,7 +32,7 @@
 //! HANDLER refuses it (`src/peer/listener.rs`). Those are different decisions
 //! and this crate only makes the first. Degrading an unknown STREAM KIND to
 //! anything other than a refusal would be an open relay, which is the one place
-//! this differs from `ProxyHost::Unknown` (`src/singleton.rs:105-125`), where
+//! this differs from `ProxyHost::Unknown` (`src/stores/singleton/mod.rs`), where
 //! degrading to "a proxy is there, do not signal it" is strictly safer.
 //!
 //! # Nothing here identifies an account, an organization or a person
@@ -64,7 +64,7 @@ pub const PROTO_VERSION: u16 = 1;
 /// This is not a tuning knob: a Noise transport message is capped at 65535
 /// bytes by the protocol itself, so a `u16` length prefix is exactly the right
 /// width and no framing crate is needed. Plaintext is chunked well below it
-/// (see `src/peer/tunnel.rs`) so one large body cannot monopolise a splice.
+/// (see `src/peer/tunnel/mod.rs`) so one large body cannot monopolise a splice.
 pub const MAX_FRAME_BYTES: usize = 65_535;
 
 /// How many one-level neighbour briefs a [`Hello`] may carry, when the peer is
@@ -531,7 +531,7 @@ pub enum TunnelTarget {
     /// the enum is internally tagged (`tag = "target"`), `PeerId` serializes
     /// as a string, and serde refuses an internally-tagged newtype variant
     /// whose content is not a map. So every forwarded stream was unreachable
-    /// from a client, which is what `tests/peer_egress.rs`'s
+    /// from a client, which is what `tests/peer/reach/peer_egress.rs`'s
     /// `gateway_on_target` had to work around and what its
     /// `a_relay_target_cannot_be_serialized_yet` recorded as a wire-crate
     /// defect awaiting this patch. One named field is the smallest shape that
@@ -589,12 +589,12 @@ pub struct StreamHeader {
 /// Which rate-limit window a lease is against.
 ///
 /// **New on the wire, not a type this tree already has.** What exists in
-/// `src/quota.rs` is three separately named `Option<QuotaWindow>` fields
+/// `src/records/quota/mod.rs` is three separately named `Option<QuotaWindow>` fields
 /// (`five_hour` at `:75`, `seven_day` at `:77`, `seven_day_oi` at `:82`); this
 /// enum is the wire's name for those three plus a forward-compat arm.
 ///
 /// Only [`Self::SevenDayOi`] is model-scoped upstream
-/// (`Quota::model_weekly_exhausted`, `src/quota.rs:271`, whose single
+/// (`Quota::model_weekly_exhausted`, `src/records/quota/mod.rs`, whose single
 /// production caller sits behind `is_fable &&`), so a [`Self::FiveHour`] or
 /// [`Self::SevenDay`] lease is UNTIERED and every panel string that describes
 /// one has to say so. A design that advertised per-tier lending for opus would
@@ -638,10 +638,10 @@ pub enum Window {
 #[serde(from = "LeaseUnitWire", into = "LeaseUnitWire")]
 pub enum LeaseUnit {
     /// For OAuth accounts, whose only upstream measure is a utilization
-    /// fraction (`QuotaWindow::utilization`, `src/quota.rs:47`).
+    /// fraction (`QuotaWindow::utilization`, `src/records/quota/mod.rs`).
     Fraction(f64),
     /// For api-key accounts, which really do report exact counts
-    /// (`tokens_limit` / `tokens_remaining`, `src/quota.rs:86-87`). **Defined
+    /// (`tokens_limit` / `tokens_remaining`, `src/records/quota/mod.rs`). **Defined
     /// here and refused at runtime** until a fleet with such an account wants
     /// to lend one, so the refusal is typed rather than a surprise.
     Tokens(u64),
@@ -714,7 +714,7 @@ impl From<LeaseUnit> for LeaseUnitWire {
 #[serde(rename_all = "camelCase")]
 pub struct Lendable {
     /// The window. The blueprint's prose calls this a "tier" in §6 and a
-    /// "window" in §7; one name wins here, and it is the one `src/quota.rs`
+    /// "window" in §7; one name wins here, and it is the one `src/records/quota/mod.rs`
     /// already uses for the same three buckets.
     pub window: Window,
     pub unit: LeaseUnit,
@@ -745,7 +745,7 @@ pub struct Lendable {
 ///
 /// So the id goes on the wire as a STRING. That is also the shape this tree
 /// already chose for the same number in a file, `LendGrant::id` in
-/// `src/peer/config.rs`, whose doc gives the second reason: "a `u128` in JSON is
+/// `src/peer/config/mod.rs`, whose doc gives the second reason: "a `u128` in JSON is
 /// a number no double can hold, so every reader that parses JSON into doubles,
 /// the panel among them, would silently round it and then revoke a lease
 /// nobody minted." One spelling, two readers, and the id an operator pastes
@@ -839,7 +839,7 @@ pub struct Lease {
 /// from a lease which account paid for it.
 ///
 /// The gate that holds this is not this comment: it is
-/// `every_wire_type_serializes_only_allowlisted_keys` in `tests/peer_wire.rs`,
+/// `every_wire_type_serializes_only_allowlisted_keys` in `tests/peer/pairing/peer_wire.rs`,
 /// which asserts the exact key set of every message. Putting a scope on a
 /// message fails it.
 ///
@@ -1179,7 +1179,7 @@ pub struct LeaseGrant {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<Lease>,
     /// Why nothing was granted. Ordered vocabulary, so a borrower can tell "ask
-    /// again later" from "never ask again": see `src/peer/lease.rs`.
+    /// again later" from "never ask again": see `src/peer/lease/mod.rs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<LeaseRefusal>,
 }
@@ -1201,7 +1201,7 @@ pub enum LeaseRefusal {
     /// wait for one of its own leases to expire or spend, rather than
     /// retrying with a smaller ask or suspecting the lender's own guard.
     ///
-    /// Before this variant existed, `src/peer/lease.rs`'s
+    /// Before this variant existed, `src/peer/lease/mod.rs`'s
     /// `MAX_LEASES_PER_PEER` cap enforced the same rule and answered
     /// `OwnerGuard` for lack of a truer word.
     TooManyLeases,
@@ -1218,7 +1218,7 @@ pub enum LeaseRefusal {
     /// means retry in a moment. A borrower that read one for the other either
     /// hammers a dead lease or abandons a live one.
     ///
-    /// `src/peer/lease.rs`'s `RelayRefusal::TooManyInflight` could enforce the
+    /// `src/peer/lease/mod.rs`'s `RelayRefusal::TooManyInflight` could enforce the
     /// cap locally but had no wire word for it until this variant existed.
     InFlightFull,
     /// The grant that would have minted this lease has a schedule (decision
@@ -1227,7 +1227,7 @@ pub enum LeaseRefusal {
     /// window, just not at this hour, so a borrower that reads this one knows
     /// to retry later in the window rather than to stop asking altogether.
     ///
-    /// The check itself (`src/peer/lease.rs`'s `schedule_refusal`) is not yet
+    /// The check itself (`src/peer/lease/mod.rs`'s `schedule_refusal`) is not yet
     /// wired into `Ledger::grant`: it reads `LendGrant::schedule`, a field that
     /// has not landed.
     OutsideSchedule,
@@ -1363,7 +1363,7 @@ pub enum Control {
     /// A forwarder never sees it: a CONTROL stream through a hop is a fresh
     /// end-to-end Noise session, as the enum's own doc says.
     ///
-    /// `wire_has_no_credential_field` (`tests/peer_wire.rs`) exempts exactly
+    /// `wire_has_no_credential_field` (`tests/peer/pairing/peer_wire.rs`) exempts exactly
     /// this declaration's span and nothing else, so `refresh_token` here, or
     /// `access_token` on any other type, is still a red test.
     #[serde(rename_all = "camelCase")]

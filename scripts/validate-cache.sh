@@ -6,7 +6,7 @@
 # WHAT THIS PROVES
 #   Fires TWO POST /v1/messages turns at a LIVE tcr proxy, both carrying the
 #   SAME metadata.user_id (tcr's session-affinity key — see stable_session_key
-#   in src/proxy.rs) and an IDENTICAL large system prompt marked with a
+#   in src/proxy/mod.rs) and an IDENTICAL large system prompt marked with a
 #   cache_control:{"type":"ephemeral"} breakpoint.
 #
 #     turn 1 (cold)  -> Anthropic CREATES the cache: cache_creation_input_tokens > 0,
@@ -148,7 +148,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "$LOG_HINT"
   echo "  -> the two most-recent lines for this run must name the SAME session=<id>"
   echo "     AND the SAME account=<name>. Same session + same account = the pin held."
-  echo "     'request usage' (src/proxy.rs) is the one INFO line per served request and"
+  echo "     'request usage' (src/proxy/mod.rs) is the one INFO line per served request and"
   echo "     carries session, account and status; 'serving request' and a 2xx"
   echo "     'upstream response' are DEBUG lines, absent unless RUST_LOG asks for debug."
   echo

@@ -40,7 +40,7 @@
 # limit, so these scenarios run only when someone runs them by hand.
 #
 # This is the container half of the peer end-to-end. The in-process half,
-# `scripts/peer-e2e-local.sh` over `tests/peer_e2e.rs`, stays the fast gate and
+# `scripts/peer-e2e-local.sh` over `tests/peer/peer_e2e.rs`, stays the fast gate and
 # this does not replace it: what lives here is every fact that needs a network
 # shape one host cannot make, a NAT that refuses to map, a friend on another
 # network, an overlay address ranked ahead of a LAN one.

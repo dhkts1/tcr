@@ -218,7 +218,7 @@ expect_red "the handler logs the redacted shape, never the link" \
 echo "== 17. the tcr:// scheme is not written into the bundle"
 # shellcheck disable=SC2016  # the $names are Swift-side literals to MATCH in
 # the script's own text, not expansions to perform here.
-mutate "scripts/build-tcrbar.sh" \
+mutate "apps/macos/scripts/build-tcrbar.sh" \
     '<string>$peer_url_scheme</string>' \
     '<string>$url_scheme</string>'
 expect_red "both schemes are registered" \

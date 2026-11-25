@@ -12,7 +12,7 @@ import TcrBarCore
 /// Sparkle's `SPUStandardUpdaterController` is the whole user-facing flow (check,
 /// download, install, relaunch) plus its own UI. It reads `SUFeedURL`,
 /// `SUPublicEDKey` and `SUEnableAutomaticChecks` out of the bundle's Info.plist,
-/// which `scripts/build-tcrbar.sh` writes — so this class configures nothing and
+/// which `apps/macos/scripts/build-tcrbar.sh` writes — so this class configures nothing and
 /// hardcodes no URL. An unsigned or hand-assembled bundle simply has no feed and
 /// Sparkle reports that itself rather than being second-guessed here.
 ///

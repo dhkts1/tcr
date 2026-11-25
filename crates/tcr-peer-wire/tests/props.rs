@@ -1,6 +1,6 @@
 //! The wire crate's own encode/decode and parse/display pairs round-trip over
 //! the whole input domain, not just the hand-picked examples
-//! `tests/peer_wire.rs` already covers.
+//! `tests/peer/pairing/peer_wire.rs` already covers.
 //!
 //! # `PeerId`'s round trip uses `to_wire`, not `to_string`
 //!
@@ -25,7 +25,7 @@ use tcr_peer_wire::{
 /// A label `sanitize_label`/`LendScope::parse` accepts unchanged: short,
 /// alphanumeric, never uuid-shaped. Kept simple on purpose, the point of this
 /// property is the scope parser's own round trip, not `sanitize_label`'s
-/// alphabet, which `tests/peer_wire.rs` already covers on its own.
+/// alphabet, which `tests/peer/pairing/peer_wire.rs` already covers on its own.
 fn valid_label() -> impl Strategy<Value = String> {
     "[A-Za-z][A-Za-z0-9]{0,9}"
 }

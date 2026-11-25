@@ -2,7 +2,7 @@ import Combine
 import Foundation
 
 /// Deleting a single account from the config — `tcr remove <query>`
-/// (`src/cli.rs`'s `remove_account`, dispatched from `src/main.rs`'s
+/// (`src/verbs/cli/accounts.rs`'s `remove_account`, dispatched from `src/main.rs`'s
 /// `run_remove`). Same shape as ``AccountCommand``/``GroupCommand``, and for
 /// the same reasons:
 ///

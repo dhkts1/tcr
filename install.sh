@@ -57,7 +57,7 @@ Env:
   TCR_INSTALLER_GHE_BASE_URL,
   TCR_INSTALLER_GITHUB_BASE_URL, TCR_GITHUB_TOKEN
                   Passed through to the cargo-dist shell installer
-                  unmodified (see src/update.rs for what each one does).
+                  unmodified (see src/verbs/update/mod.rs for what each one does).
 USAGE
 }
 
@@ -106,7 +106,7 @@ if [ -d "${APPLICATIONS_DIR}/${APP_NAME}.app" ] && pgrep -x "$APP_NAME" >/dev/nu
   exit 0
 fi
 
-# validate_release_tag, mirrored from src/update.rs so this shell installer
+# validate_release_tag, mirrored from src/verbs/update/mod.rs so this shell installer
 # and the Rust update path agree on what a safe tag looks like. The tag is
 # interpolated into a URL path below, and an unvalidated one does not stay
 # inside dhkts1/tcr: see update.rs's own doc-comment for the

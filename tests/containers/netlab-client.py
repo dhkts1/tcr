@@ -11,7 +11,7 @@ generator that is a hundred lines and has to print one line per request
 either way.
 
 Run as a process in the node's OWN namespace, never a namespace beside it:
-`src/server.rs:1977-1979` binds `127.0.0.1`, so a client anywhere else could
+`src/proxy/server/mod.rs` binds `127.0.0.1`, so a client anywhere else could
 not reach the proxy at all, and moving that bind is not this tool's call.
 
 Usage:

@@ -1,6 +1,6 @@
 //! Serde types for the `tcr status --json` wire contract.
 //!
-//! This is the type that `render_accounts_json` (`src/cli.rs` in the main crate)
+//! This is the type that `render_accounts_json` (`src/verbs/cli/render.rs` in the main crate)
 //! builds and serializes, and that the macOS app's `FleetStatus.swift` decodes.
 //! Before this crate existed, the Rust side had no type at all for this shape —
 //! only an ad-hoc `serde_json::json!` literal — so the two sides could drift
@@ -424,14 +424,14 @@ pub struct RunningToolRow {
     /// waits on, a file path, a search pattern, a fetch HOST or a search query — per tool,
     /// capped at 120 characters. `None` for a tool with no rule, or when the input carried
     /// no such field. The full per-tool list is `ToolUseEvent::command_head` in the main
-    /// crate (`src/session_wire.rs`), which builds every one of these. On the server it is
+    /// crate (`src/records/session_wire/mod.rs`), which builds every one of these. On the server it is
     /// never written to a log, though it persists in the session-wire snapshot
     /// (`~/.cache/tcr/session-wire.json`; see that module's own doc).
     pub command_head: Option<String>,
     /// A Bash tool's coarse category (`"wait"`, `"compound"`, `"search"`, `"git-net"`,
     /// `"git-local"`, `"build"`, `"other"`) — `None` for any other tool, or when
     /// `command_head` is `None`. `#[serde(default)]` so a server that has not shipped this
-    /// field yet still decodes against a newer panel. See `src/session_wire.rs`'s
+    /// field yet still decodes against a newer panel. See `src/records/session_wire/mod.rs`'s
     /// `CommandClass` in the main crate for the classifier itself.
     #[serde(default)]
     pub command_class: Option<String>,
@@ -472,7 +472,7 @@ pub struct ToolBucketRow {
     #[serde(default)]
     pub errors: u64,
     /// Median duration (seconds) over a bounded reservoir of the most recent completed
-    /// calls — see `src/session_wire.rs` in the main crate.
+    /// calls — see `src/records/session_wire/mod.rs` in the main crate.
     #[serde(default)]
     pub seconds_p50: f64,
     /// Completed calls of this tool whose duration was 60 seconds or more.
@@ -703,7 +703,7 @@ pub struct FanTargetRow {
 
 /// One live session on the `tcr status --json` wire's `sessions` array (F1,
 /// `docs/design/panel-tabs.md`). One entry per session the proxy has seen in the last hour —
-/// see `src/session_wire.rs` in the main crate for how it is built and bounded.
+/// see `src/records/session_wire/mod.rs` in the main crate for how it is built and bounded.
 ///
 /// `#[serde(default)]` on every field but `sessionId` so a payload from a server built before
 /// this row existed simply omits `sessions` entirely (the array field itself is
@@ -730,7 +730,7 @@ pub struct SessionRow {
     #[serde(default)]
     pub cache_read_tokens: u64,
     /// Cache-write tokens (5-minute plus 1-hour TTL creation), kept apart from `input_tokens`
-    /// — see `crate::session_wire::WireSession::input_tokens`'s doc-comment for why folding
+    /// — see `crate::records::session_wire::WireSession::input_tokens`'s doc-comment for why folding
     /// cache dimensions into `input_tokens` double-counts them against `cache_read_tokens`.
     /// `#[serde(default)]` so a payload from a server built before this field existed decodes
     /// as `0` rather than a parse failure.
@@ -744,7 +744,7 @@ pub struct SessionRow {
     /// decodes as an empty sparkline rather than a parse failure.
     #[serde(default)]
     pub req_per_minute: Vec<u16>,
-    /// This session's usage priced through `src/pricing.rs`, server-side, from a per-model
+    /// This session's usage priced through `src/base/pricing.rs`, server-side, from a per-model
     /// token tally kept on the session — a session that spans two models sums each model's
     /// own price rather than being priced once against whichever model is current. Same
     /// list-price-equivalent meaning as [`UsageTotals::cost_usd`], but plain `f64` rather than
@@ -783,7 +783,7 @@ pub struct SessionRow {
 /// One account's row on the `tcr status --json` wire.
 ///
 /// Field-for-field mirror of what `render_accounts_json` emits today — see that
-/// function's doc-comments in `src/cli.rs` for why each field is shaped the way
+/// function's doc-comments in `src/verbs/cli/render.rs` for why each field is shaped the way
 /// it is (in particular, why several are `Option` rather than a fabricated `0`
 /// or `false` on the offline path). This type does not change the contract; it
 /// gives the existing contract a name.
@@ -1420,7 +1420,7 @@ mod tests {
     }
 
     /// An Anthropic account's row exactly as the status path renders it: the first row of the
-    /// committed contract fixture, decoded one row at a time as `tests/round_trip.rs` decodes
+    /// committed contract fixture, decoded one row at a time as `crates/tcr-status-wire/tests/round_trip.rs` decodes
     /// every row. This crate has no other way to build a whole row.
     fn committed_anthropic_row() -> AccountStatusRow {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

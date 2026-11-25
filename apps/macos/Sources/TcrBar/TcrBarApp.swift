@@ -275,7 +275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The URL contract with the `tcr` CLI: `tcrbar://check-for-updates` runs the
     /// same user-initiated check the panel's button runs.
     ///
-    /// The scheme is declared in `CFBundleURLTypes` by `scripts/build-tcrbar.sh`;
+    /// The scheme is declared in `CFBundleURLTypes` by `apps/macos/scripts/build-tcrbar.sh`;
     /// a bundle built any other way is not registered with LaunchServices and no
     /// URL will ever reach here. `LSUIElement` does not change that — an accessory
     /// app is a perfectly ordinary URL handler.

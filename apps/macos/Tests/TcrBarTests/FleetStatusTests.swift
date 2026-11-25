@@ -186,7 +186,7 @@ final class FleetStatusTests: XCTestCase {
 
     /// Round 2: `requests`/`inputTokens`/`outputTokens`/`cacheReadTokens`/
     /// `streamErrorCount` are now `null` on the wire whenever `source ==
-    /// "offline"` (`src/cli.rs:1194-1263`) — `fetch_live_status` falls back to
+    /// "offline"` (`src/verbs/cli/status.rs`) — `fetch_live_status` falls back to
     /// offline on `NoAnswer`/`Unusable` too, not just `NoServer`, so this is an
     /// ordinary state, not a rare one. Before these five fields became
     /// `Int?`, a synthesized `Decodable` threw `valueNotFound` on the first
@@ -308,7 +308,7 @@ final class FleetStatusTests: XCTestCase {
     // (`tcr#232`, `crates/tcr-status-wire/src/lib.rs`): the wire's
     // `SessionRow`/`StatusPayload.sessions` live on the proxy's own
     // `/_tcr/status` HTTP response, gated by the proxy's api-key
-    // (`fetch_live_status`, `src/cli.rs`), and `tcr status --json` discards
+    // (`fetch_live_status`, `src/proxy/live_client.rs`), and `tcr status --json` discards
     // them before printing. This app never touches that endpoint or that key
     // from Swift (`CLAUDE.md` "No credentials, ever"), so ``Fleet/sessions``
     // is a plain stored field with no live producer yet — these tests
@@ -1646,7 +1646,7 @@ final class AccountCommandTests: XCTestCase {
     }
 
     func testTheNameIsNeverTruncatedOrFlagged() {
-        // `query` resolves by exact name (`src/identity.rs`, `match_accounts`) —
+        // `query` resolves by exact name (`src/base/identity.rs`, `match_accounts`) —
         // an abbreviated name matches nothing at all. Pass it whole; the row
         // already knows the exact value.
         let name = "alice+tag@example.com"
@@ -1672,7 +1672,7 @@ final class AccountCommandTests: XCTestCase {
 
     /// This test used to assert the opposite — "exit code decides, not stderr
     /// chatter" — and that sentence was the bug. `tcr` reports a park it could not
-    /// persist by exiting 0 and warning on stderr (`src/cli.rs`), so exit 0 with
+    /// persist by exiting 0 and warning on stderr (`src/verbs/cli/accounts.rs`), so exit 0 with
     /// output means *accepted, with something still to do*, and dropping the text
     /// here stamped `parked ✓` on a change that would not survive a restart.
     ///
@@ -1887,7 +1887,7 @@ final class ServerControllerTests: XCTestCase {
     ///
     /// Without `--headless`, `tcr server` runs its ratatui TUI
     /// (`src/main.rs:615`) which calls `enable_raw_mode()?` on stdout
-    /// (`src/tui.rs:47`). A GUI spawns with a `Pipe`, so there is no terminal, raw
+    /// (`src/verbs/tui/terminal.rs`). A GUI spawns with a `Pipe`, so there is no terminal, raw
     /// mode fails and the child exits at once — the server appeared for an instant
     /// and vanished.
     ///

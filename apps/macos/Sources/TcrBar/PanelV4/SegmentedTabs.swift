@@ -104,7 +104,7 @@ struct SegmentedTabs: View {
     /// 2026-11-23). The icon's box and the gap after it are the only room on
     /// the label's line, and `99+` fits there with about a point to the pill's
     /// edge on "Sessions"; `SegmentedTabsFitTests` and
-    /// `scripts/check-tab-strip-still.swift` fail if it stops fitting.
+    /// `apps/macos/scripts/check-tab-strip-still.swift` fail if it stops fitting.
     /// ``TabStripFit/badgeText(_:)`` caps it at `99+`, so the widest badge is
     /// known.
     ///

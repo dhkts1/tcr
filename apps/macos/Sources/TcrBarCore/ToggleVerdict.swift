@@ -20,7 +20,7 @@ import Foundation
 /// the *process* boundary rather than the poll boundary. `tcr` can exit 0 and
 /// still tell you the change is only half done — the park applied to the live
 /// rotation but no config entry matched it, so it comes back on restart
-/// (`src/cli.rs`, `SetDisabledOutcome`'s `warning`), or the running proxy was too
+/// (`src/verbs/cli/accounts.rs`, `SetDisabledOutcome`'s `warning`), or the running proxy was too
 /// old for the control route and only the file changed. Both are printed to
 /// stderr with exit 0. The read-back cannot see either: `disabled` DID flip, so
 /// the comparison below confirms, and the row used to stamp `parked ✓` on a

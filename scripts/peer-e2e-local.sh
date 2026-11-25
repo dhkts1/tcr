@@ -2,7 +2,7 @@
 # peer-e2e-local.sh: run the two-process peer end-to-end on this machine and
 # print one line per step.
 #
-# The path itself lives in `tests/peer_e2e.rs`, which spawns the `tcr` this
+# The path itself lives in `tests/peer/peer_e2e.rs`, which spawns the `tcr` this
 # build produced twice (`CARGO_BIN_EXE_tcr`) against two scratch HOMEs and
 # drives it through the CLI and the peer port only. This script is the operator
 # front door to that test: it builds the binary the test will spawn, runs the
@@ -99,7 +99,7 @@ fi
 
 # `--test-threads=1` so the STEP lines of the tests do not interleave, and
 # `--nocapture` because those lines are the point of running this by hand.
-# `tests/peer_e2e.rs` is the `peer_e2e` module of the shared `it` test crate.
+# `tests/peer/peer_e2e.rs` is the `peer_e2e` module of the shared `it` test crate.
 CARGO_ARGS=(test --manifest-path "$MANIFEST" --test it)
 
 run_suite() {
@@ -116,7 +116,7 @@ run_suite() {
     done < <(cargo "${CARGO_ARGS[@]}" -- --list peer_e2e:: | sed -n 's/^\(peer_e2e::.*\): test$/\1/p' |
       grep -F -- "$filter")
     if [ "${#names[@]}" -eq 0 ]; then
-      echo "no test in tests/peer_e2e.rs has '$filter' in its name" >&2
+      echo "no test in tests/peer/peer_e2e.rs has '$filter' in its name" >&2
       return 1
     fi
     test_args=(--include-ignored --exact "${names[@]}" --nocapture --test-threads=1)
