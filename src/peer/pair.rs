@@ -1290,7 +1290,7 @@ impl JoinInput {
         // the wrong one is told which verb reads it rather than left to read
         // "neither of these" about a string that plainly starts `tcr://peer/`.
         // Nothing about it is parsed here, and no part of the paste is printed.
-        if raw.starts_with(crate::peer::moved::MOVED_LINK_PREFIX) {
+        if raw.starts_with(crate::peer::config::drop::moved::MOVED_LINK_PREFIX) {
             bail!(
                 "peer join: that is a moved link, which says where a Mac you already trust \
                  is now. `tcr peer moved open --stdin` is what reads one; it joins nothing \

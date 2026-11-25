@@ -1918,7 +1918,7 @@ const PORT_INFO: &[u8] = b"tcr peer reach derived-port v1";
 /// handshake type belongs to `snow`, which by this module tree's own rule is
 /// named in `src/peer/noise.rs` and nowhere else.
 pub fn port_secret(handshake_hash: &[u8]) -> [u8; 32] {
-    use crate::peer::drop::hmac_sha256;
+    use crate::peer::config::drop::hmac_sha256;
 
     // RFC 5869 § 2.2: with no salt, the salt is HashLen zero bytes.
     let pseudorandom_key = hmac_sha256(&[0_u8; 32], handshake_hash);

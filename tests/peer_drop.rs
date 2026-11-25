@@ -25,10 +25,11 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
-use tcr::peer::drop::{
+use tcr::peer::config::drop::{
     self, DROP_SLOT_SECONDS, DeadDropStore, DropKeys, DropName, DropRecord, HttpsTemplateStore,
     MAX_RECORD_AGE, RecordRefusal, current_slot, seal,
 };
+use tcr::peer::reach::drop_exchange;
 use tcr_peer_wire::PeerId;
 
 /// A peer id that is plainly not a real one: 32 copies of one byte.
@@ -528,7 +529,7 @@ async fn a_record_from_a_revoked_peer_is_refused() {
     revoked.peers.clear();
     tcr::peer::config::save(&path, &revoked).expect("the revocation writes");
 
-    let fetched = drop::fetch_for(&store, &path, &friend, 1_758_240_000)
+    let fetched = drop_exchange::fetch_for(&store, &path, &friend, 1_758_240_000)
         .await
         .expect("a revoked peer is not an error, it is nothing to fetch");
     assert!(fetched.is_empty(), "a revoked peer's drop writes nothing");
@@ -572,7 +573,7 @@ fn own_endpoints_publishes_only_ports_this_mac_actually_accepts_on() {
     );
     tcr::peer::reach::remember_observed_self(listening_peer, listening_observed);
 
-    let ephemeral_result = drop::own_endpoints(listen, &ephemeral_peer);
+    let ephemeral_result = drop_exchange::own_endpoints(listen, &ephemeral_peer);
     assert!(
         !ephemeral_result.contains(&ephemeral_observed),
         "an observed self address on an ephemeral port, {ephemeral_observed}, must not be \
@@ -580,7 +581,7 @@ fn own_endpoints_publishes_only_ports_this_mac_actually_accepts_on() {
          budget on an address that cannot answer: {ephemeral_result:?}"
     );
 
-    let listening_result = drop::own_endpoints(listen, &listening_peer);
+    let listening_result = drop_exchange::own_endpoints(listen, &listening_peer);
     assert!(
         listening_result.contains(&listening_observed),
         "an observed self address on this Mac's own listening port, {listening_observed}, \

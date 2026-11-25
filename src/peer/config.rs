@@ -50,7 +50,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{LendScope, PeerId, Window};
 
-use crate::peer::drop::hmac_sha256;
+use crate::peer::config::drop::hmac_sha256;
 
 /// The join key an operator pastes: [`join_key::JoinToken`] and the addresses
 /// it carries. It renders a [`PendingInvite`]'s secret, which is why it is a
@@ -60,6 +60,10 @@ pub mod join_key;
 /// One codec for a list of dial addresses, shared by the v3 join key and the
 /// sealed reply so the same list is never spelled into bytes twice.
 pub mod dialaddrs;
+
+/// Where two Macs that both moved leave each other an address: the per-pair
+/// name and the sealed record. Crypto and naming only, called by nothing yet.
+pub mod drop;
 
 /// `tcr-peers.json` in the config directory, mode 0600.
 pub fn default_path() -> PathBuf {
@@ -1003,7 +1007,7 @@ pub enum EndpointSource {
     /// see [`crate::peer::probe::order_endpoints`] for where that is enforced.
     Drop,
     /// Off a sealed link one friend sent another after changing networks, read
-    /// by [`crate::peer::moved::open_link`] and written only when the operator
+    /// by [`crate::peer::config::drop::moved::open_link`] and written only when the operator
     /// said `--yes`.
     ///
     /// **[`Self::Drop`]'s band and not its member.** It ranks the same, for the
@@ -1795,27 +1799,22 @@ impl DeadDropConfig {
         self == &Self::default()
     }
 
-    /// Build the configured backend, or [`crate::peer::drop::StoreRefusal::NotConfigured`].
+    /// Build the configured backend, or [`crate::peer::config::drop::StoreRefusal::NotConfigured`].
     ///
     /// [`StoreConfig::Gist`] answers the same refusal as no store at all: it
     /// does not ship here, and a backend this build cannot build is no
     /// different from one nobody named. A template with no `{name}`
     /// placeholder folds into the same refusal, for want of a variant of its
-    /// own: [`crate::peer::drop::StoreRefusal`] has none for a malformed
+    /// own: [`crate::peer::config::drop::StoreRefusal`] has none for a malformed
     /// template, because the CLI verb that writes this field is the one that
     /// should have refused it first.
-    pub fn open_store(
-        &self,
-    ) -> std::result::Result<crate::peer::drop::HttpsTemplateStore, crate::peer::drop::StoreRefusal>
-    {
+    pub fn open_store(&self) -> std::result::Result<drop::HttpsTemplateStore, drop::StoreRefusal> {
         match &self.store {
             Some(StoreConfig::Https { url, token }) => {
-                crate::peer::drop::HttpsTemplateStore::new(url, token.as_deref())
-                    .map_err(|_| crate::peer::drop::StoreRefusal::NotConfigured)
+                drop::HttpsTemplateStore::new(url, token.as_deref())
+                    .map_err(|_| drop::StoreRefusal::NotConfigured)
             }
-            Some(StoreConfig::Gist { .. }) | None => {
-                Err(crate::peer::drop::StoreRefusal::NotConfigured)
-            }
+            Some(StoreConfig::Gist { .. }) | None => Err(drop::StoreRefusal::NotConfigured),
         }
     }
 }

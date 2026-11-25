@@ -84,7 +84,7 @@ pub const TOKEN_PREFIX_V2: &str = "tcr-join:v2:";
 pub const TOKEN_PREFIX_V3: &str = "tcr-join:v3:";
 
 /// The four magic bytes in front of a v3 key's version byte, a sibling of
-/// [`crate::peer::moved::MOVED_LINK_PREFIX`]'s own magic.
+/// [`crate::peer::config::drop::moved::MOVED_LINK_PREFIX`]'s own magic.
 const TOKEN_V3_MAGIC: [u8; 4] = *b"TCRK";
 
 /// The only v3 format version there is yet.

@@ -19,12 +19,12 @@
 
 use std::net::SocketAddr;
 
-use tcr::peer::config::{Allow, Endpoint, EndpointSource, MAX_ENDPOINTS_PER_PEER, PeerRow};
-use tcr::peer::discovery::{MAX_MOVED_ENDPOINTS_PER_PEER, admissible_moved_endpoints};
-use tcr::peer::moved::{
+use tcr::peer::config::drop::moved::{
     MAX_MOVED_AGE, MOVED_VERSION, MintRefusal, MovedKeys, MovedRecord, MovedRefusal, open_link,
     open_link_field, seal_link, seal_link_field,
 };
+use tcr::peer::config::{Allow, Endpoint, EndpointSource, MAX_ENDPOINTS_PER_PEER, PeerRow};
+use tcr::peer::discovery::{MAX_MOVED_ENDPOINTS_PER_PEER, admissible_moved_endpoints};
 use tcr_peer_wire::{Crockford, PeerId};
 
 /// A peer id that is plainly not a real one: 32 copies of one byte.
@@ -1283,7 +1283,7 @@ fn minting_on_a_listener_with_no_port_refuses_and_names_the_remedy() {
 #[test]
 fn a_link_carrying_only_undialable_addresses_says_so_and_not_that_the_row_is_gone() {
     let sender = peer_id(0x44);
-    let link = tcr::peer::moved::mint_link(
+    let link = tcr::peer::config::drop::moved::mint_link(
         &keys_for(&counting_secret()),
         &sender,
         &MovedRecord {

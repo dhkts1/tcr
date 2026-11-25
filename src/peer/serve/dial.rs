@@ -364,7 +364,7 @@ async fn run_direct_race(
 ///
 /// A named function and not an inline loop so a test can prove it clears
 /// exactly `written`'s own locators and nothing else: `written` came from
-/// [`crate::peer::drop::fetch_for`], which is the one place that knows which
+/// [`crate::peer::reach::drop_exchange::fetch_for`], which is the one place that knows which
 /// locators actually landed on the row, so a blanket clear here would be a
 /// second, looser answer to a question that function already answered
 /// precisely.
@@ -501,12 +501,17 @@ pub async fn dial_peer_reaching_within(
     let dead_drop_file = store.file();
     if dead_drop_file.dead_drop.is_live() && row.allow.control.drop {
         let now_s = now_unix_seconds();
-        let drop_slot = crate::peer::drop::current_slot(now_s);
-        if !crate::peer::drop::fetched_this_slot(&row.node, drop_slot) {
+        let drop_slot = crate::peer::config::drop::current_slot(now_s);
+        if !crate::peer::reach::drop_exchange::fetched_this_slot(&row.node, drop_slot) {
             match dead_drop_file.dead_drop.open_store() {
                 Ok(drop_store) => {
-                    match crate::peer::drop::fetch_for(&drop_store, store.path(), &row.node, now_s)
-                        .await
+                    match crate::peer::reach::drop_exchange::fetch_for(
+                        &drop_store,
+                        store.path(),
+                        &row.node,
+                        now_s,
+                    )
+                    .await
                     {
                         Ok(written) if !written.is_empty() => {
                             clear_cooldowns_for_fetch(row.node, &written);

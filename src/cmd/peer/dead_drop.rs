@@ -106,7 +106,7 @@ pub(super) fn run_peer_drop_store(a: peer_cli::PeerDropStoreArgs) -> anyhow::Res
             // own doc says this verb should have refused it first, and
             // building the real client here is one value read by every
             // consumer rather than a second, divergent check.
-            peer::drop::HttpsTemplateStore::new(&value, token.as_deref())
+            peer::config::drop::HttpsTemplateStore::new(&value, token.as_deref())
                 .map_err(|err| anyhow::anyhow!("peer drop-store set: {err}"))?;
             file.dead_drop.store = Some(peer::config::StoreConfig::Https {
                 url: value.clone(),

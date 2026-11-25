@@ -223,7 +223,7 @@ async fn a_keyed_knock_at_a_keyless_node_is_refused() {
 /// it, where the key width is the one the RFC vector needs.
 #[test]
 fn hmac_sha256_matches_rfc_4231_case_2() {
-    let digest = tcr::peer::drop::hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+    let digest = config::drop::hmac_sha256(b"Jefe", b"what do ya want for nothing?");
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
         hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",

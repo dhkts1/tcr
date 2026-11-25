@@ -882,6 +882,9 @@ const fn is_lan_scope_v6(addr: Ipv6Addr) -> bool {
     segments[0] & 0xfe00 == 0xfc00
 }
 
+/// The dead drop's exchange: what this Mac publishes for each friend and
+/// fetches from each friend's drop.
+pub mod drop_exchange;
 mod mapping;
 mod observed;
 mod port;

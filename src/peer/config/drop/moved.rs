@@ -17,15 +17,15 @@
 //!
 //! # Why it is not a dead drop record
 //!
-//! [`crate::peer::drop`] is the same shape and a different clock. A drop record
+//! [`crate::peer::config::drop`] is the same shape and a different clock. A drop record
 //! lives at a name that is a MAC over an hour-long slot, because a slot costs
 //! one write to somebody else's surface per friend, so the slot count is a
 //! write budget. A link costs no writes at all and is read when the friend next
 //! looks at their phone, so its clock is a person's. Inheriting the slot would
 //! make a link read as a forgery when the truth is that the friend was asleep.
 //!
-//! So this module shares that one's AEAD body ([`crate::peer::drop::seal_payload`])
-//! and its key ladder ([`crate::peer::drop::expand`]), and shares none of its
+//! So this module shares that one's AEAD body ([`crate::peer::config::drop::seal_payload`])
+//! and its key ladder ([`crate::peer::config::drop::expand`]), and shares none of its
 //! policy: its own magic, its own versioned domain strings, its own age
 //! ceiling, and refusals written for a person who pasted something.
 //!
@@ -33,7 +33,7 @@
 //!
 //! The seal, the link's two wire forms, and the refusals. No peers-file access,
 //! no I/O of any kind, and no clock of its own: `now_s` arrives as a parameter,
-//! the way [`crate::peer::drop::open`] takes one. `tcr peer moved` owns the
+//! the way [`crate::peer::config::drop::open`] takes one. `tcr peer moved` owns the
 //! file, the addresses and the operator's `--yes`, and neither side reaches
 //! into the other. Nothing here runs at boot.
 //!
@@ -51,7 +51,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{Crockford, PeerId};
 
-use crate::peer::drop::{
+use crate::peer::config::drop::{
     MAX_CLOCK_SKEW, MAX_RECORD_ENDPOINTS, NONCE_BYTES, OpenFailure, SealFailure, TAG_BYTES, expand,
     open_payload, seal_payload,
 };
@@ -121,9 +121,9 @@ const MIN_LINK_BYTES: usize = FRAME_BYTES + NONCE_BYTES + TAG_BYTES + 1;
 pub const MAX_MOVED_AGE: Duration = Duration::from_hours(24);
 
 // Two more ceilings apply and are deliberately NOT spelled again here: how far
-// ahead a publisher's clock may run ([`crate::peer::drop::MAX_CLOCK_SKEW`]) and
+// ahead a publisher's clock may run ([`crate::peer::config::drop::MAX_CLOCK_SKEW`]) and
 // how many addresses one sealed record may carry
-// ([`crate::peer::drop::MAX_RECORD_ENDPOINTS`]). Both are the same question
+// ([`crate::peer::config::drop::MAX_RECORD_ENDPOINTS`]). Both are the same question
 // asked of a sealed record, and one question with two spellings is two values
 // that drift. They are used below under their own names.
 
@@ -138,7 +138,7 @@ pub const MAX_MOVED_AGE: Duration = Duration::from_hours(24);
 /// `{:?}` in a log line is how a shared secret ends up in a file. There is no
 /// accessor and it is serialized nowhere.
 ///
-/// One key and not two, unlike [`crate::peer::drop::DropKeys`]: a drop has a
+/// One key and not two, unlike [`crate::peer::config::drop::DropKeys`]: a drop has a
 /// LOCATION and therefore needs a name key. A link is handed over directly and
 /// has no location, so a name key would be a capability with nothing to name.
 pub struct MovedKeys {
@@ -189,7 +189,7 @@ impl MovedKeys {
 /// # There is no publisher field and no label
 ///
 /// This is the one place the record deliberately differs from
-/// [`crate::peer::drop::DropRecord`]. A drop record is fetched from a name the
+/// [`crate::peer::config::drop::DropRecord`]. A drop record is fetched from a name the
 /// reader derived for one specific peer, so a publisher field inside it is a
 /// cross-check. A link is tried against every row this Mac has pinned, so the
 /// row whose key worked IS the answer and a field claiming one could never
@@ -208,7 +208,7 @@ pub struct MovedRecord {
     /// The publisher's unix seconds.
     pub at: u64,
     /// Where the publisher believes it is reachable, at most
-    /// [`crate::peer::drop::MAX_RECORD_ENDPOINTS`] of them.
+    /// [`crate::peer::config::drop::MAX_RECORD_ENDPOINTS`] of them.
     pub eps: Vec<SocketAddr>,
 }
 
@@ -256,7 +256,7 @@ pub enum MintRefusal {
 /// person's own and each has a different fix: a link meant for somebody else,
 /// one that sat too long, one a chat app cut in half, and one from a build that
 /// is not this one. A refusal that answers one word for all of them is one
-/// nobody can act on, which is [`crate::peer::drop::RecordRefusal`]'s own
+/// nobody can act on, which is [`crate::peer::config::drop::RecordRefusal`]'s own
 /// argument applied to a different reader.
 ///
 /// # No variant names anything
@@ -265,7 +265,7 @@ pub enum MintRefusal {
 /// into the wrong group chat must teach its reader nothing about whose Mac it
 /// was for or whether this Mac was close to a match. That is why there is no
 /// `found` field beside the magic, which is the one place this differs from
-/// [`crate::peer::drop::RecordRefusal::NotARecord`]: a drop's bytes came off a
+/// [`crate::peer::config::drop::RecordRefusal::NotARecord`]: a drop's bytes came off a
 /// surface an operator owns and printing them helps; a link's bytes came out of
 /// somebody's chat window.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -303,7 +303,7 @@ pub enum MovedRefusal {
     #[error("moved link: that link opened but this build cannot read what is inside it")]
     Unreadable,
     /// It opened, and is dated further ahead than
-    /// [`crate::peer::drop::MAX_CLOCK_SKEW`] allows.
+    /// [`crate::peer::config::drop::MAX_CLOCK_SKEW`] allows.
     #[error(
         "moved link: that link is dated {ahead_s}s in the future; check the clock on both Macs"
     )]
@@ -418,7 +418,7 @@ pub fn open_link(
     // [`MIN_LINK_BYTES`].
     //
     // Before the magic and not after it, which is the opposite of
-    // [`crate::peer::drop::open`]'s order, because the two readers get short
+    // [`crate::peer::config::drop::open`]'s order, because the two readers get short
     // input from different places. A drop's short answer came off a surface
     // that might be serving an error document, so reading the magic first is
     // what tells a document apart from a record. A link's short input came out

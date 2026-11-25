@@ -127,14 +127,15 @@ pub(super) fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()
     // wrote something leaves on disk: nothing local records a publish, that
     // write lands on the store and never on this file, so no publish time is
     // printed rather than one invented.
-    let drop_slot = peer::drop::current_slot(now_unix_secs());
+    let drop_slot = peer::config::drop::current_slot(now_unix_secs());
     let drop_rows: Vec<(String, tcr_peer_wire::PeerId, String, Option<i64>)> = rows
         .iter()
         .filter(|row| row.allow.control.drop)
         .filter_map(|row| {
             let secret = row.rendezvous_secret?;
-            let keys = peer::drop::DropKeys::derive(&secret);
-            let name = peer::drop::DropName::for_slot(&keys, &row.node, drop_slot).to_wire();
+            let keys = peer::config::drop::DropKeys::derive(&secret);
+            let name =
+                peer::config::drop::DropName::for_slot(&keys, &row.node, drop_slot).to_wire();
             let last_fetched_ms = row
                 .endpoints
                 .iter()

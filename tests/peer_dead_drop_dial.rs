@@ -44,7 +44,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use tcr::peer::config as peer_config;
-use tcr::peer::drop::{
+use tcr::peer::config::drop::{
     self, DeadDropStore, DropKeys, DropName, DropRecord, HttpsTemplateStore, seal,
 };
 use tcr::peer::serve;

@@ -437,7 +437,7 @@ open(p, "w").write(s)
 '
 
 mutate 'the HMAC inner/outer pads swapped, so it agrees with nobody' \
-  'src/peer/drop.rs' peer_pairing hmac_sha256_matches_rfc_4231_case_2 '
+  'src/peer/config/drop/mod.rs' peer_pairing hmac_sha256_matches_rfc_4231_case_2 '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()

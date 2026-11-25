@@ -60,7 +60,7 @@ pub const fn current_slot(unix_seconds: u64) -> u64 {
 /// the two ends disagree the moment their loop counts differed, so the bias is
 /// taken deliberately.
 pub fn derived_port(secret: &[u8; 32], slot: u64) -> u16 {
-    use crate::peer::drop::hmac_sha256;
+    use crate::peer::config::drop::hmac_sha256;
 
     let mut message = [0_u8; 12];
     message[..4].copy_from_slice(b"slot");

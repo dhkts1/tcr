@@ -14,7 +14,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use crate::peer::drop::MAX_RECORD_ENDPOINTS;
+use crate::peer::config::drop::MAX_RECORD_ENDPOINTS;
 
 /// The IPv4 family byte on the wire.
 const FAMILY_V4: u8 = 4;
@@ -59,7 +59,7 @@ pub enum DecodeRefusal {
     CutShort,
     /// A family byte this build does not know. Refused rather than skipped:
     /// half of what the sender meant is worse than none of it, the rule
-    /// [`crate::peer::moved`]'s `MovedRefusal::UnknownField` states.
+    /// [`crate::peer::config::drop::moved`]'s `MovedRefusal::UnknownField` states.
     UnknownFamily { byte: u8 },
 }
 
