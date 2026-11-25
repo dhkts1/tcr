@@ -119,8 +119,8 @@ pub use frame::{
 };
 pub use hello::{NodeFacts, hello_for_peer, say_hello};
 pub use lender::{
-    NoFleetUtilization, SERVED_LINE, ScopeRestriction, WindowUtilization, handle_serve_on,
-    utilization_rise,
+    LeaseServing, NoFleetUtilization, SERVED_LINE, ScopeRestriction, WindowUtilization,
+    handle_serve_on, utilization_rise,
 };
 pub use policy::{
     CLIENT_CREDENTIAL_HEADERS, LENDER_FORWARDED_HEADERS, SERVE_METHOD, lender_forwards_header,

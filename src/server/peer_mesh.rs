@@ -103,7 +103,8 @@ pub(super) async fn boot_peer_listener(
     shutdown: &watch::Sender<bool>,
     background: &mut Vec<JoinHandle<()>>,
 ) -> Option<SocketAddr> {
-    use crate::peer::listener::{self, LeaseServing, SessionContext};
+    use crate::peer::listener::{self, SessionContext};
+    use crate::peer::serve::LeaseServing;
 
     let file = match crate::peer::config::read_or_default(peers_path) {
         Ok(file) => file,

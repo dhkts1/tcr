@@ -58,7 +58,8 @@ async fn owner_lending_expiring(
 ) -> Owner {
     use tcr::peer::config::PeerStore;
     use tcr::peer::id::NodeKey;
-    use tcr::peer::listener::{self, LeaseServing, SessionContext};
+    use tcr::peer::listener::{self, SessionContext};
+    use tcr::peer::serve::LeaseServing;
 
     let home = tempfile::tempdir().expect("a temp home");
     let peers = home.path().join("tcr-peers.json");

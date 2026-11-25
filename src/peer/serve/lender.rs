@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -241,6 +242,34 @@ async fn handle_serve(peer: &PeerId, store: &PeerStore) -> Result<()> {
     Ok(())
 }
 
+/// What the LENDER's half of a SERVE needs, which the listener holds and does not
+/// decide.
+///
+/// Three things, and each one is a thing a listener cannot derive: the ledger
+/// that funds a relayed request (process state, persisted by the lender),
+/// this node's OWN proxy base (the whole of "own picker, own Bearer, own
+/// bucket", see [`crate::peer::serve::handle_serve_on`]), and a reader for
+/// this node's own quota so the debit is the measured rise rather than
+/// `MIN_DEBIT`.
+///
+/// `None` on [`SessionContext`](crate::peer::listener::SessionContext) is a build with no lease serving wired, and the
+/// dispatch arm then REFUSES a SERVE rather than accepting a stream it cannot
+/// answer. That is the same shape as every other ungranted kind: a refusal,
+/// never a silent accept.
+#[derive(Clone)]
+pub struct LeaseServing {
+    /// The lender's ledger, shared with whatever else reads it (`tcr peer ls`,
+    /// the panel row).
+    pub ledger: Arc<std::sync::Mutex<Ledger>>,
+    /// This node's own proxy base, e.g. `http://127.0.0.1:3456`.
+    pub upstream: String,
+    /// This node's own quota, read either side of the relay.
+    pub utilization: Arc<dyn WindowUtilization>,
+    /// The owner's manager, for `handoff_bearer`. A hand-mode grant is the one
+    /// path on which the lender reads its own access token for another Mac.
+    pub manager: Arc<crate::manager::Manager>,
+}
+
 /// The lender's half, on the stream the request arrived on.
 ///
 /// `upstream` is where the relayed request is sent, and it is **this node's own
@@ -282,7 +311,7 @@ pub async fn handle_serve_on<S>(
     stream: &mut S,
     session: &mut noise::PeerSession,
     store: &PeerStore,
-    serving: &crate::peer::listener::LeaseServing,
+    serving: &LeaseServing,
     header_request_id: u128,
     now_ms: i64,
     from: SocketAddr,

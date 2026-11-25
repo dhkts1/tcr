@@ -78,7 +78,7 @@ use crate::peer::id::NodeKey;
 use crate::peer::lease::Ledger;
 use crate::peer::noise::{self, Handshake};
 use crate::peer::reach::is_lan_scope;
-use crate::peer::serve::{self, WindowUtilization};
+use crate::peer::serve::{self, LeaseServing};
 use crate::peer::state::knock_address;
 
 mod admission;
@@ -440,34 +440,6 @@ impl ConnectionFailure {
             error,
         }
     }
-}
-
-/// What the LENDER's half of a SERVE needs, which this file holds and does not
-/// decide.
-///
-/// Three things, and each one is a thing a listener cannot derive: the ledger
-/// that funds a relayed request (process state, persisted by the lender),
-/// this node's OWN proxy base (the whole of "own picker, own Bearer, own
-/// bucket", see [`crate::peer::serve::handle_serve_on`]), and a reader for
-/// this node's own quota so the debit is the measured rise rather than
-/// `MIN_DEBIT`.
-///
-/// `None` on [`SessionContext`] is a build with no lease serving wired, and the
-/// dispatch arm then REFUSES a SERVE rather than accepting a stream it cannot
-/// answer. That is the same shape as every other ungranted kind: a refusal,
-/// never a silent accept.
-#[derive(Clone)]
-pub struct LeaseServing {
-    /// The lender's ledger, shared with whatever else reads it (`tcr peer ls`,
-    /// the panel row).
-    pub ledger: Arc<Mutex<Ledger>>,
-    /// This node's own proxy base, e.g. `http://127.0.0.1:3456`.
-    pub upstream: String,
-    /// This node's own quota, read either side of the relay.
-    pub utilization: Arc<dyn WindowUtilization>,
-    /// The owner's manager, for `handoff_bearer`. A hand-mode grant is the one
-    /// path on which the lender reads its own access token for another Mac.
-    pub manager: Arc<crate::manager::Manager>,
 }
 
 /// What one connection needs from this node, owned so the task can outlive the
