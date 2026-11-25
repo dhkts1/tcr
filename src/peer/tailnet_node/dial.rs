@@ -100,8 +100,8 @@ pub fn server_slot() -> &'static DialSlot {
 /// `fd7a:115c:a1e0::/48`, the ranges Tailscale numbers a tailnet out of.
 pub fn is_tailnet_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => crate::peer::listener::is_carrier_grade_nat(v4),
-        IpAddr::V6(v6) => crate::peer::listener::is_tailscale_v6(v6),
+        IpAddr::V4(v4) => crate::peer::reach::is_carrier_grade_nat(v4),
+        IpAddr::V6(v6) => crate::peer::reach::is_tailscale_v6(v6),
     }
 }
 

@@ -163,7 +163,7 @@ fn lan_scope_is_the_allow_list_row_14_names() {
     ] {
         let addr: IpAddr = lan.parse().expect("an address");
         assert!(
-            listener::is_lan_scope(addr),
+            reach::is_lan_scope(addr),
             "{lan} is on decision row 14's list and must read as LAN scope"
         );
     }
@@ -195,7 +195,7 @@ fn lan_scope_is_the_allow_list_row_14_names() {
     ] {
         let addr: IpAddr = internet.parse().expect("an address");
         assert!(
-            !listener::is_lan_scope(addr),
+            !reach::is_lan_scope(addr),
             "{internet} is not on decision row 14's list and must read as off-LAN"
         );
     }

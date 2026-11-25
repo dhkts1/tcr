@@ -181,7 +181,7 @@ impl std::error::Error for PunchFailure {}
 /// Three rules and nothing else: only a locator this node can dial itself
 /// ([`crate::peer::config::Endpoint::direct_addr`]), a preference for one
 /// whose IP is not LAN scope over one that is
-/// ([`crate::peer::listener::is_lan_scope`] reads a tailnet address as
+/// ([`is_lan_scope`] reads a tailnet address as
 /// internet scope, which is correct here: a tailnet address is directly
 /// dialable), and otherwise the row's own order, which is newest observation
 /// first. Every direct locator on the row qualifies whatever its band: each
@@ -193,7 +193,7 @@ pub fn aimable_address(endpoints: &[crate::peer::config::Endpoint]) -> Option<So
         .collect();
     dialable
         .iter()
-        .find(|addr| !crate::peer::listener::is_lan_scope(addr.ip()))
+        .find(|addr| !is_lan_scope(addr.ip()))
         .or_else(|| dialable.first())
         .copied()
 }

@@ -77,6 +77,7 @@ use crate::peer::id::KEY_BYTES;
 use crate::peer::id::NodeKey;
 use crate::peer::lease::Ledger;
 use crate::peer::noise::{self, Handshake};
+use crate::peer::reach::is_lan_scope;
 use crate::peer::serve::{self, WindowUtilization};
 use crate::peer::state::knock_address;
 
@@ -102,8 +103,7 @@ pub use gate::{
 };
 pub use hello::{NodeFacts, hello_for_peer};
 pub use scope::{
-    InternetAdmission, internet_admission, is_carrier_grade_nat, is_lan_scope, is_tailscale_v6,
-    own_mac_admission, shares_a_global_v6_prefix,
+    InternetAdmission, internet_admission, own_mac_admission, shares_a_global_v6_prefix,
 };
 
 use admission::lock_admission;

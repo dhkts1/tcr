@@ -24,7 +24,7 @@
 //! `src/peer/listener.rs::internet_admission` refuses a knock or a first
 //! pairing (`NN`/`XX`) from any source outside LAN scope, by design: a
 //! tailnet address is deliberately not LAN scope
-//! (`listener::is_lan_scope_v4`'s own doc). Only `Return`/`Enrol` (`IK`,
+//! (`reach::is_lan_scope_v4`'s own doc). Only `Return`/`Enrol` (`IK`,
 //! `IKpsk1`, a key this node minted or already pinned) is answered off-LAN.
 //! So a reply that only taught an address would still fail at the knock that
 //! used to follow it, for exactly the friend mode B exists for: one who is

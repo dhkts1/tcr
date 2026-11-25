@@ -77,7 +77,7 @@ impl DialAddress {
 ///
 /// The name is carried because the address alone cannot answer the one question
 /// the rank order turns on: `100.64.0.0/10` is both a tailnet and the range a
-/// mobile hotspot hands out (`crate::peer::listener::is_lan_scope`'s own doc
+/// mobile hotspot hands out (`crate::peer::reach::is_lan_scope`'s own doc
 /// says so), and putting a hotspot address first would put the slowest path
 /// first for everybody on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,15 +97,15 @@ pub struct HostAddress {
 /// by nothing outside that hotspot; ranking one of those first would put the
 /// deadest address at the top of every key minted on a tethered Mac.
 ///
-/// The range check is [`crate::peer::listener::is_carrier_grade_nat`], the one
-/// exported predicate `crate::peer::listener::is_lan_scope_v4` sits beside; an
+/// The range check is [`crate::peer::reach::is_carrier_grade_nat`], the one
+/// exported predicate `crate::peer::reach::is_lan_scope_v4` sits beside; an
 /// IPv6 address is never a tailnet one here because `is_tailnet` only ever
 /// sees the range's own /10, which is IPv4.
 fn is_tailnet(host: &HostAddress) -> bool {
     let IpAddr::V4(v4) = host.addr else {
         return false;
     };
-    host.interface.starts_with("utun") && crate::peer::listener::is_carrier_grade_nat(v4)
+    host.interface.starts_with("utun") && crate::peer::reach::is_carrier_grade_nat(v4)
 }
 
 /// Every address a friend could dial this Mac at, best first.
