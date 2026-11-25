@@ -14,8 +14,34 @@ impl Config {
     /// The one row of [`Self::accounts`] that `probe` names, by
     /// [`crate::identity::resolve`]: a tie it cannot break is
     /// [`Resolved::Many`], and every caller refuses on it rather than guess.
-    pub fn resolve_identity(&self, probe: &Account) -> Resolved {
+    fn resolve_identity(&self, probe: &Account) -> Resolved {
         crate::identity::resolve(self.accounts.iter().enumerate(), probe)
+    }
+
+    /// The one row `probe` names ([`Self::resolve_identity`]); `None` when no
+    /// row does, and when two tie, which every caller refuses rather than guess.
+    pub fn identity_row(&self, probe: &Account) -> Option<&Account> {
+        match self.resolve_identity(probe) {
+            Resolved::One(index) => self.accounts.get(index),
+            Resolved::None | Resolved::Many => None,
+        }
+    }
+
+    /// Apply `update` to the one row `probe` names ([`Self::resolve_identity`]),
+    /// and say how it resolved: on [`Resolved::None`] and [`Resolved::Many`]
+    /// nothing is touched, and the caller decides.
+    pub fn update_identity_row(
+        &mut self,
+        probe: &Account,
+        update: impl FnOnce(&mut Account),
+    ) -> Resolved {
+        let resolved = self.resolve_identity(probe);
+        if let Resolved::One(index) = resolved
+            && let Some(account) = self.accounts.get_mut(index)
+        {
+            update(account);
+        }
+        resolved
     }
 
     /// Bench or un-bench the one row `target` resolves to
@@ -24,11 +50,9 @@ impl Config {
     /// [`super::save_disabled`] refuses one too, so memory never drifts onto a
     /// record the file was not allowed to touch.
     pub fn set_disabled_by_identity(&mut self, target: &Account, disabled: bool) {
-        if let Resolved::One(position) = self.resolve_identity(target)
-            && let Some(account) = self.accounts.get_mut(position)
-        {
+        self.update_identity_row(target, |account| {
             account.disabled = if disabled { Some(true) } else { None };
-        }
+        });
     }
 
     /// Stamp a rotated credential onto the one row `probe` resolves to, and say
@@ -49,10 +73,7 @@ impl Config {
         expires_at_ms: i64,
         sync_pending: Option<Value>,
     ) -> Resolved {
-        let placement = self.resolve_identity(probe);
-        if let Resolved::One(position) = placement
-            && let Some(account) = self.accounts.get_mut(position)
-        {
+        self.update_identity_row(probe, |account| {
             access_token.clone_into(&mut account.access_token);
             // THE TRAP: same invariant as `apply_refresh` in
             // `manager/freshness/refresh.rs` — `refresh_token` must be
@@ -72,8 +93,7 @@ impl Config {
                     }
                 },
             }
-        }
-        placement
+        })
     }
 
     /// Set or clear the Codex publication marker ([`CODEX_SYNC_PENDING_KEY`])
@@ -86,48 +106,43 @@ impl Config {
         refresh: &str,
         pending: Option<&Value>,
     ) {
-        if let Resolved::One(index) = self.resolve_identity(target)
-            && self.accounts[index].refresh_token.as_deref() == Some(refresh)
-        {
+        self.update_identity_row(target, |account| {
+            if account.refresh_token.as_deref() != Some(refresh) {
+                return;
+            }
             match pending {
                 Some(record) => {
-                    self.accounts[index]
+                    account
                         .extra
                         .insert(CODEX_SYNC_PENDING_KEY.to_string(), record.clone());
                 }
                 None => {
-                    self.accounts[index].extra.remove(CODEX_SYNC_PENDING_KEY);
+                    account.extra.remove(CODEX_SYNC_PENDING_KEY);
                 }
             }
-        }
+        });
     }
 
     /// The exit lock of the one row `target` resolves to, or no lock when no
     /// row or more than one does.
     pub fn egress_pin_of(&self, target: &Account) -> EgressPin {
-        match self.resolve_identity(target) {
-            Resolved::One(position) => self
-                .accounts
-                .get(position)
-                .map_or_default(Account::egress_pin),
-            Resolved::Many | Resolved::None => EgressPin::default(),
-        }
+        self.identity_row(target)
+            .map_or_default(Account::egress_pin)
     }
 
     /// Carry replaced credentials (`for_disk`, already written to the file) onto
     /// the in-memory row `target` resolves to: tokens, expiry, Codex folder, and
     /// the Codex publication marker dropped.
     pub fn adopt_replaced_credentials(&mut self, target: &Account, for_disk: &Account) {
-        match self.resolve_identity(target) {
-            Resolved::One(position) => {
-                if let Some(entry) = self.accounts.get_mut(position) {
-                    entry.access_token.clone_from(&for_disk.access_token);
-                    entry.refresh_token.clone_from(&for_disk.refresh_token);
-                    entry.expires_at = for_disk.expires_at;
-                    entry.codex_home.clone_from(&for_disk.codex_home);
-                    entry.extra.remove(CODEX_SYNC_PENDING_KEY);
-                }
-            }
+        let resolved = self.update_identity_row(target, |entry| {
+            entry.access_token.clone_from(&for_disk.access_token);
+            entry.refresh_token.clone_from(&for_disk.refresh_token);
+            entry.expires_at = for_disk.expires_at;
+            entry.codex_home.clone_from(&for_disk.codex_home);
+            entry.extra.remove(CODEX_SYNC_PENDING_KEY);
+        });
+        match resolved {
+            Resolved::One(_) => {}
             // No in-memory entry carries this identity either — the disk
             // row `save_account` just appended has no counterpart here.
             // Mirror the append so a later persist can still find it.

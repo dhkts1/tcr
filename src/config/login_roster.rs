@@ -4,38 +4,11 @@
 use std::collections::HashSet;
 
 use super::{Account, Config};
-use crate::identity::Resolved;
 
 impl Config {
-    /// The one row `probe` names ([`Self::resolve_identity`]); `None` when no
-    /// row does, and when two tie, which every caller refuses rather than guess.
-    pub fn identity_row(&self, probe: &Account) -> Option<&Account> {
-        match self.resolve_identity(probe) {
-            Resolved::One(index) => self.accounts.get(index),
-            Resolved::None | Resolved::Many => None,
-        }
-    }
-
-    /// Apply `update` to the one row `probe` names ([`Self::resolve_identity`]),
-    /// and say how it resolved: on [`Resolved::None`] and [`Resolved::Many`]
-    /// nothing is touched, and the caller decides.
-    pub fn update_identity_row(
-        &mut self,
-        probe: &Account,
-        update: impl FnOnce(&mut Account),
-    ) -> Resolved {
-        let resolved = self.resolve_identity(probe);
-        if let Resolved::One(index) = resolved
-            && let Some(account) = self.accounts.get_mut(index)
-        {
-            update(account);
-        }
-        resolved
-    }
-
     /// The names of every row [`crate::identity::same_identity`] calls the
     /// same account as `probe`, in config order: the candidates a
-    /// [`Resolved::Many`] could not choose between.
+    /// [`Resolved::Many`](crate::identity::Resolved::Many) could not choose between.
     pub fn same_identity_names(&self, probe: &Account) -> Vec<String> {
         self.accounts
             .iter()
