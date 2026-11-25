@@ -328,7 +328,7 @@ impl Manager {
                     // entry holds whatever tokens it held, and the next refresh decides.
                     account.codex_home.clone_from(&matched.codex_home);
                     changed.push(format!("{}: back in the config", account.name));
-                    if fresh.is_control_account(&account.name) {
+                    if fresh.control_account_name() == Some(account.name.as_str()) {
                         let mut control = self
                             .control_idx
                             .write()

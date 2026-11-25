@@ -75,8 +75,8 @@ impl Manager {
         let reset_urgency_tier_ms =
             i64::from(config.reset_urgency_tier_hours).saturating_mul(3_600_000);
 
-        let control_idx = config.match_control_account(&accounts[..]).and_then(|(name, found)| {
-            match found {
+        let control_idx = config.control_account_name().and_then(|name| {
+            match crate::identity::match_one(&accounts[..], name) {
                 crate::identity::Match::One(idx) => Some(idx),
                 crate::identity::Match::None => {
                     let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
