@@ -1611,28 +1611,14 @@ fn client_bearer_of(headers: &HeaderMap) -> Option<&str> {
 /// debug and the request is served.
 async fn refuse_foreign_client(manager: &Manager, bearer: &str) -> Option<Response> {
     use crate::config::ControlIdentityMode;
-    use crate::control_identity::{Verdict, verdict};
 
     let mode = manager.control_identity();
     if mode == ControlIdentityMode::Off {
         return None;
     }
-    let control = manager.control_identity_target()?;
-    let profile_url = format!("{}/api/oauth/profile", manager.upstream());
-    let Some(client) = manager
-        .client_identities()
-        .resolve(&profile_url, bearer)
-        .await
-    else {
-        tracing::debug!("control identity: client bearer did not resolve to an identity; serving");
-        return None;
-    };
-    let Verdict::Mismatch(client) = verdict(&control, &client) else {
-        return None;
-    };
-    let control_email = crate::identity::email_of(&control.name).to_string();
-    let client_shown = client.display();
-    if manager.client_identities().first_warning(bearer).await {
+    let foreign = manager.foreign_client(bearer).await?;
+    let (control_email, client_shown) = (foreign.control_email, foreign.client_shown);
+    if foreign.first_warning {
         tracing::warn!(
             client = %client_shown,
             control_account = %control_email,
@@ -1894,7 +1880,7 @@ async fn status_handler(
     }
 
     let now = OffsetDateTime::now_utc();
-    let mut payload = crate::status::StatusPayload::from_snapshot(
+    let payload = crate::status::StatusPayload::from_snapshot(
         &manager.snapshot(now),
         &manager.thresholds(),
         manager.http1_only(),
@@ -1921,39 +1907,26 @@ async fn status_handler(
     // evening to a panel rendering a config the server had not re-read. A
     // reader who wants this cheaper should make the panel poll less often
     // rather than make the answer older than the question.
-    (payload.peers, payload.peers_error) = crate::status::peers_block_with_error(
-        &crate::peer::egress::peers_path(),
-        (now.unix_timestamp_nanos() / 1_000_000) as i64,
-    );
-    // ALWAYS `Some`, MITM off included: on the wire, a missing key is what
-    // marks a server older than this field (see `StatusPayload::mitm`).
-    payload.mitm = Some(manager.mitm_status());
-    // Always `Some` too, for the same reason: absent marks a server older than the counts.
-    payload.codex_traffic =
-        Some(manager.codex_traffic((now.unix_timestamp_nanos() / 1_000_000) as i64));
-    // Named only when it is not the default, so a reader is told only of an upstream they did
-    // not expect.
-    let codex_upstream = manager.upstream_for(Provider::Codex);
-    payload.codex_upstream = config::non_default_codex_upstream(codex_upstream);
-    // Present only while the server holds a key: its presence is what a launcher
-    // reads as "this server understands keys" (see `StatusPayload::request_key_mode`).
-    if let Some(mode) = manager.request_key_mode() {
-        let (connects, requests) = manager.unkeyed().wire();
-        payload.request_key_mode = Some(mode.as_str().to_string());
-        payload.unkeyed_connects = Some(connects);
-        payload.unkeyed_requests = Some(requests);
-    }
-    // Read on the blocking pool and kept for two seconds (`crate::heat`), so a
-    // burst of status requests costs one SMC read and none of it runs on this
-    // worker. Absent where there is no AppleSMC.
-    payload.heat = crate::heat::current()
-        .await
-        .map(crate::status::HeatField::Reading);
-    // A copy of the controller's last published state: no SMC read, no lock
-    // held past the copy.
-    payload.fan_control = manager
-        .fan()
-        .map(|fan| crate::status::FanControlField::Reading(fan.row()));
+    let payload = payload.with_serving_facts(crate::status::ServingFacts {
+        peers: crate::peer::status::rows::peers_block_with_error(
+            &crate::peer::egress::peers_path(),
+            (now.unix_timestamp_nanos() / 1_000_000) as i64,
+        ),
+        mitm: manager.mitm_status(),
+        codex_traffic: manager.codex_traffic((now.unix_timestamp_nanos() / 1_000_000) as i64),
+        codex_upstream: manager.upstream_for(Provider::Codex),
+        request_key: manager.request_key_mode().map(|mode| {
+            let (connects, requests) = manager.unkeyed_wire();
+            (mode, connects, requests)
+        }),
+        // Read on the blocking pool and kept for two seconds (`crate::heat`), so a
+        // burst of status requests costs one SMC read and none of it runs on this
+        // worker. Absent where there is no AppleSMC.
+        heat: crate::heat::current().await,
+        // A copy of the controller's last published state: no SMC read, no lock
+        // held past the copy.
+        fan_control: manager.fan().map(|fan| fan.row()),
+    });
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a
         // proxy never panics on a client request — surface it as a 500 instead.
@@ -3789,7 +3762,7 @@ async fn handle_request(
     if let crate::request_key::RequestKeying::Unkeyed(user_agent) =
         request_keying(&parts.extensions, &req_headers, manager.request_key())
     {
-        manager.unkeyed().record(
+        manager.record_unkeyed(
             crate::request_key::Unkeyed::Request(crate::request_key::PathClass::of(&path)),
             user_agent,
             parts

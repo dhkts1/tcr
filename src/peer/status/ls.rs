@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::network_fact;
-use super::peer_rows::masked_label;
+use super::rows::masked_label;
+use crate::peer::network_fact;
 
 // ---------------------------------------------------------------------------
 // The `tcr peer ls --json` document

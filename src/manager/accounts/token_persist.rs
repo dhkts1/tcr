@@ -113,7 +113,7 @@ impl Manager {
                             && a.org_uuid == probe.org_uuid
                     })
                     .and_then(|a| a.pending_codex_writeback.as_ref())
-                    .map(freshness::refresh::PendingCodexWriteback::record)
+                    .map(PendingCodexWriteback::record)
             }
         };
 

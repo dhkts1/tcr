@@ -51,7 +51,7 @@ pub(super) async fn render_list_v1(
         Ok(config) => config,
         Err(e) => {
             return (
-                ErrorV1::new(ErrorKind::ConfigUnreadable, format!("{e:#}")).render(),
+                ErrorV1::line(ErrorKind::ConfigUnreadable, format!("{e:#}")),
                 1,
             );
         }
@@ -115,10 +115,7 @@ pub(super) async fn render_list_v1(
 
     match serde_json::to_string_pretty(&cswap_v1::from_rows(&rows)) {
         Ok(document) => (document, 0),
-        Err(e) => (
-            ErrorV1::new(ErrorKind::RenderFailed, e.to_string()).render(),
-            1,
-        ),
+        Err(e) => (ErrorV1::line(ErrorKind::RenderFailed, e.to_string()), 1),
     }
 }
 

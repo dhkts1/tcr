@@ -18,7 +18,7 @@ use std::path::Path;
 
 use tcr::peer::config::{PeerFile, PeerRow, PeerStore};
 use tcr::peer::state::{BorrowedRow, LeaseRow, PeerState};
-use tcr::status::{PathKind, PeerStatusRow, peer_status_rows};
+use tcr::peer::status::rows::{PathKind, PeerStatusRow, peer_status_rows};
 use tcr_peer_wire::{Lease, LeaseUnit, PeerId, Window};
 
 /// Five minutes of milliseconds, the unit almost every fixture below counts in.
@@ -471,8 +471,11 @@ fn a_payload_from_a_server_with_no_peers_block_still_parses() {
     });
     let payload: tcr::status::StatusPayload =
         serde_json::from_value(old).expect("an old server's payload still parses");
+    // Read back through the wire, where an empty mesh is no key or an empty list.
+    let wire = serde_json::to_value(&payload).expect("the payload re-serializes");
     assert!(
-        payload.peers.is_empty(),
+        wire.get("peers")
+            .is_none_or(|peers| peers == &serde_json::json!([])),
         "absent reads as an empty mesh, never as a fabricated one"
     );
     assert_eq!(
@@ -504,9 +507,10 @@ fn the_peers_block_round_trips_through_the_status_payload() {
     });
     let text = serde_json::to_string(&payload).expect("the payload serializes");
     let back: tcr::status::StatusPayload = serde_json::from_str(&text).expect("and parses back");
-    assert_eq!(back.peers.len(), 1);
+    let back = serde_json::to_value(&back).expect("re-serializes");
+    assert_eq!(back["peers"].as_array().map(Vec::len), Some(1));
     assert_eq!(
-        serde_json::to_value(&back.peers).expect("re-serializes"),
+        back["peers"],
         serde_json::to_value(&derived).expect("re-serializes"),
         "byte-for-byte the same block after a full round trip"
     );
@@ -607,7 +611,7 @@ fn peers_fixture_rows() -> Vec<PeerStatusRow> {
         ended: false,
         lend: Vec::new(),
         paths: vec![
-            tcr::status::PathStatus {
+            tcr::peer::status::rows::PathStatus {
                 endpoint: "127.0.0.1:7751".to_string(),
                 kind: PathKind::Direct,
                 rtt_ms: Some(18.5),
@@ -616,7 +620,7 @@ fn peers_fixture_rows() -> Vec<PeerStatusRow> {
                 tokens_per_hour: Some(90_000),
                 last_ok_ms: Some(now_ms - 2_000),
             },
-            tcr::status::PathStatus {
+            tcr::peer::status::rows::PathStatus {
                 // The wire id, not `display()`: `PeerStatusRow::id` is the
                 // wire form and the panel resolves a via/reverse endpoint's
                 // name by looking `PathStatus::endpoint` up in that map.
@@ -737,7 +741,7 @@ fn the_committed_peers_fixture_covers_the_absent_and_the_measured_row() {
 // validator that only ever sees a valid document proves nothing about what it
 // would catch, which is the whole defect the peers block existed to fix.
 
-use tcr::status::{PEER_GRAPH_KIND, PeerGraph, peer_graph};
+use tcr::peer::status::graph::{PEER_GRAPH_KIND, PeerGraph, peer_graph};
 
 /// What a JSON value is allowed to be, in the schema below.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1008,7 +1012,12 @@ fn a_lease_edge_points_from_the_lender_to_the_borrower() {
     let lent: Vec<(&str, &str)> = graph
         .edges
         .iter()
-        .filter(|edge| matches!(edge.detail, tcr::status::GraphEdgeDetail::Lease { .. }))
+        .filter(|edge| {
+            matches!(
+                edge.detail,
+                tcr::peer::status::graph::GraphEdgeDetail::Lease { .. }
+            )
+        })
         .map(|edge| (edge.from.as_str(), edge.to.as_str()))
         .collect();
     assert_eq!(
@@ -1045,10 +1054,10 @@ fn an_expired_lease_is_not_an_edge() {
     };
     let graph = peer_graph(&node(1), "this-mac", &rows, &state, now_ms);
     assert!(
-        graph
-            .edges
-            .iter()
-            .all(|edge| matches!(edge.detail, tcr::status::GraphEdgeDetail::Path { .. })),
+        graph.edges.iter().all(|edge| matches!(
+            edge.detail,
+            tcr::peer::status::graph::GraphEdgeDetail::Path { .. }
+        )),
         "only the path edge survives an expired lease: {:#?}",
         graph.edges
     );
@@ -1115,7 +1124,7 @@ fn the_serving_process_block_reads_both_files_off_disk() {
     };
     tcr::peer::state::save(&state_path, &state).expect("the state file writes");
 
-    let block = tcr::status::peers_block(&peers_path, now_ms);
+    let block = tcr::peer::status::rows::peers_block(&peers_path, now_ms);
     assert_eq!(block.len(), 1, "one pinned row in the file, one row out");
     assert_eq!(block[0].name, "studio-mac");
     assert_eq!(
@@ -1137,7 +1146,10 @@ fn the_serving_process_block_reads_both_files_off_disk() {
 #[test]
 fn a_mac_with_no_peers_file_reports_an_empty_block() {
     let dir = tempfile::tempdir().expect("a temp dir");
-    let block = tcr::status::peers_block(&dir.path().join("never-written.json"), 1_700_000_000_000);
+    let block = tcr::peer::status::rows::peers_block(
+        &dir.path().join("never-written.json"),
+        1_700_000_000_000,
+    );
     assert!(block.is_empty(), "no peers file, no peers: {block:#?}");
 }
 
@@ -1158,7 +1170,8 @@ fn an_unparseable_peers_file_names_its_own_parse_error() {
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(&peers_path, perms).expect("set mode 0600");
 
-    let (block, error) = tcr::status::peers_block_with_error(&peers_path, 1_700_000_000_000);
+    let (block, error) =
+        tcr::peer::status::rows::peers_block_with_error(&peers_path, 1_700_000_000_000);
 
     assert!(block.is_empty(), "a broken file still reports zero peers");
     let error = error.expect("a file that exists but will not parse must name why");
@@ -1226,7 +1239,7 @@ const LIVE_UNTIL_S: u64 = 4_102_444_800;
 /// An end already in the past, for the greyed row. Fixed for the same reason.
 const ENDED_UNTIL_S: u64 = 1_600_000_000;
 
-fn peer_ls_fixture_document() -> tcr::status::PeerLsJson {
+fn peer_ls_fixture_document() -> tcr::peer::status::ls::PeerLsJson {
     use tcr::peer::config::{LendGrant, LendMode};
     use tcr::peer::state::{Ban, BanReason, Knock, Mute};
 
@@ -1285,19 +1298,19 @@ fn peer_ls_fixture_document() -> tcr::status::PeerLsJson {
     // so the fixture states them: what is pinned here is the SHAPE the panel
     // decodes, and the derivation has its own tests.
     let peers = vec![
-        tcr::status::PeerLsPeer::Trusted(tcr::status::PeerLsRow::from_row(
+        tcr::peer::status::ls::PeerLsPeer::Trusted(tcr::peer::status::ls::PeerLsRow::from_row(
             rows[0].clone(),
             Some(LIVE_UNTIL_S),
             false,
         )),
-        tcr::status::PeerLsPeer::Trusted(tcr::status::PeerLsRow::from_row(
+        tcr::peer::status::ls::PeerLsPeer::Trusted(tcr::peer::status::ls::PeerLsRow::from_row(
             rows[1].clone(),
             Some(ENDED_UNTIL_S),
             true,
         )),
     ];
 
-    tcr::status::PeerLsJson {
+    tcr::peer::status::ls::PeerLsJson {
         supported: true,
         peers,
         // `addr` carries the port, because that is what the command renders:
@@ -1328,7 +1341,7 @@ fn peer_ls_fixture_document() -> tcr::status::PeerLsJson {
         }],
         muted_count: 1,
         limited: 0,
-        caps: tcr::status::PeerCapsJson {
+        caps: tcr::peer::status::ls::PeerCapsJson {
             found_rows: tcr::peer::discovery::MAX_FOUND_ROWS,
             found_per_address: tcr::peer::discovery::MAX_FOUND_PER_ADDRESS,
             pending: tcr::peer::state::MAX_PENDING_KNOCKS,
@@ -1341,7 +1354,7 @@ fn peer_ls_fixture_document() -> tcr::status::PeerLsJson {
         network: true,
         exits: std::iter::once((
             "alice".to_string(),
-            tcr::status::PeerExitJson {
+            tcr::peer::status::ls::PeerExitJson {
                 // The wire id, matching `Egress`'s own `Display` impl
                 // (`config.rs`: `write!(f, "{}{}", VIA_PREFIX, peer.to_wire())`).
                 // The fixture pinned the display form, which no code path

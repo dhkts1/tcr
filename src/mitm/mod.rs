@@ -1031,7 +1031,7 @@ async fn handle_connect(
     // and then served exactly as before, intercepted or blind.
     let credential = ProxyCredential::from_connect_head(&head, manager.request_key());
     if manager.request_key().is_some() && !credential.key_ok {
-        manager.unkeyed().record(
+        manager.record_unkeyed(
             Unkeyed::Connect(ConnectClass::of(&host)),
             credential.user_agent,
             peer.port(),

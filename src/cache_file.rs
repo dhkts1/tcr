@@ -64,11 +64,6 @@ impl SavedFile {
         self.wake.notified().await;
     }
 
-    /// Consume the dirty flag: `true` when something changed since the last call.
-    pub(crate) fn take(&self) -> bool {
-        self.dirty.swap(false, Ordering::Relaxed)
-    }
-
     /// Whether the dirty flag is up, without consuming it.
     #[cfg(test)]
     pub(crate) fn is_dirty(&self) -> bool {
@@ -88,21 +83,42 @@ impl SavedFile {
         Ok(count)
     }
 
-    /// The flusher's save: `write` only when the content differs from the last write, by the
-    /// rule [`crate::save_gate`] states, and record it.
-    pub(crate) fn save_if_changed(
+    /// The flusher's save: clear the dirty flag, take the snapshot, and `write` it only when
+    /// it differs from the last write, by the rule [`crate::save_gate`] states, and record it.
+    ///
+    /// The flag is cleared FIRST, before `snapshot` runs, so a change that lands while the
+    /// write runs leaves the flag up for the next save to see. `snapshot` returns the
+    /// (shape, content) hashes of what `write` will put on disk, and the value `write` takes.
+    pub(crate) fn save_if_changed<T>(
         &self,
-        hashes: (u64, u64),
-        write: impl FnOnce() -> Result<usize, ConfigError>,
+        snapshot: impl FnOnce() -> Result<((u64, u64), T), ConfigError>,
+        write: impl FnOnce(T) -> Result<usize, ConfigError>,
     ) -> Result<SaveOutcome, ConfigError> {
-        let (shape, content) = hashes;
+        self.dirty.store(false, Ordering::Relaxed);
+        let ((shape, content), value) = snapshot()?;
         let now = Instant::now();
         if let Some(skipped) = self.gate.skip(shape, content, now) {
             return Ok(skipped);
         }
-        let count = write()?;
+        let count = write(value)?;
         self.gate.wrote(shape, content, now);
         Ok(SaveOutcome::Wrote(count))
+    }
+
+    /// The shutdown save of a cache whose every change matters: [`Self::save`] when the
+    /// cache changed since the last save cleared the flag, `Ok(None)` for a clean cache,
+    /// which takes no snapshot and writes nothing. Clears the flag before the snapshot, as
+    /// [`Self::save_if_changed`] does.
+    pub(crate) fn save_if_dirty<T>(
+        &self,
+        snapshot: impl FnOnce() -> Result<((u64, u64), T), ConfigError>,
+        write: impl FnOnce(T) -> Result<usize, ConfigError>,
+    ) -> Result<Option<usize>, ConfigError> {
+        if !self.dirty.swap(false, Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let (hashes, value) = snapshot()?;
+        self.save(hashes, || write(value)).map(Some)
     }
 }
 
@@ -253,14 +269,82 @@ mod tests {
         ));
     }
 
+    /// A snapshot with these hashes and nothing to carry to the write.
+    fn hashed(hashes: (u64, u64)) -> impl FnOnce() -> Result<((u64, u64), ()), ConfigError> {
+        move || Ok((hashes, ()))
+    }
+
     #[test]
-    fn a_mark_is_consumed_by_one_take() {
+    fn a_mark_is_cleared_by_the_flusher_save() {
         let file = SavedFile::new(Duration::ZERO);
-        assert!(!file.take());
+        assert!(!file.is_dirty());
         file.mark();
         assert!(file.is_dirty());
-        assert!(file.take());
-        assert!(!file.take());
+        file.save_if_changed(hashed((1, 10)), |()| Ok(1))
+            .expect("save");
+        assert!(!file.is_dirty());
+    }
+
+    /// The flag is cleared before the snapshot, so a change that lands while the save runs
+    /// is still flagged for the next one. Cleared after, that change would never be written.
+    #[test]
+    fn a_change_during_the_save_leaves_the_flag_up() {
+        let file = SavedFile::new(Duration::ZERO);
+        file.mark();
+        file.save_if_changed(
+            || {
+                file.mark();
+                Ok(((1, 10), ()))
+            },
+            |()| Ok(1),
+        )
+        .expect("save");
+        assert!(file.is_dirty(), "the change made during the save was lost");
+        assert_eq!(
+            file.save_if_dirty(
+                || {
+                    file.mark();
+                    Ok(((2, 11), ()))
+                },
+                |()| Ok(2)
+            )
+            .expect("save"),
+            Some(2)
+        );
+        assert!(file.is_dirty(), "the change made during the save was lost");
+    }
+
+    /// The shutdown save of a clean cache takes no snapshot and writes nothing; a dirty one
+    /// writes even content the last save already wrote, and clears the flag.
+    #[test]
+    fn a_save_if_dirty_writes_only_a_changed_cache() {
+        let file = SavedFile::new(Duration::from_secs(60));
+        let clean = file
+            .save_if_dirty(
+                || -> Result<((u64, u64), ()), ConfigError> {
+                    panic!("a clean cache must not be snapshotted")
+                },
+                |()| panic!("a clean cache must not be written"),
+            )
+            .expect("clean");
+        assert_eq!(clean, None);
+        assert_eq!(
+            file.save_if_changed(hashed((1, 10)), |()| Ok(1))
+                .expect("save"),
+            SaveOutcome::Wrote(1)
+        );
+        file.mark();
+        assert_eq!(
+            file.save_if_dirty(hashed((1, 10)), |()| Ok(3))
+                .expect("dirty"),
+            Some(3)
+        );
+        assert!(!file.is_dirty());
+        assert_eq!(
+            file.save_if_dirty(hashed((1, 10)), |()| Ok(4))
+                .expect("clean again"),
+            None
+        );
     }
 
     #[test]
@@ -268,22 +352,27 @@ mod tests {
         let file = SavedFile::new(Duration::from_secs(60));
         assert_eq!(file.save((1, 10), || Ok(3)).expect("save"), 3);
         let outcome = file
-            .save_if_changed((1, 10), || panic!("the same content must not be written"))
+            .save_if_changed(hashed((1, 10)), |()| {
+                panic!("the same content must not be written")
+            })
             .expect("skip");
         assert_eq!(outcome, SaveOutcome::Unchanged);
-        let outcome = file.save_if_changed((2, 11), || Ok(4)).expect("write");
+        let outcome = file
+            .save_if_changed(hashed((2, 11)), |()| Ok(4))
+            .expect("write");
         assert_eq!(outcome, SaveOutcome::Wrote(4));
     }
 
     #[test]
     fn a_failed_write_records_nothing() {
         let file = SavedFile::new(Duration::from_secs(60));
-        let failed = file.save_if_changed((1, 10), || {
+        let failed = file.save_if_changed(hashed((1, 10)), |()| {
             Err(ConfigError::Io(std::io::Error::other("disk full")))
         });
         assert!(failed.is_err());
         assert_eq!(
-            file.save_if_changed((1, 10), || Ok(1)).expect("retry"),
+            file.save_if_changed(hashed((1, 10)), |()| Ok(1))
+                .expect("retry"),
             SaveOutcome::Wrote(1),
             "a failed write must be retried, not remembered as on disk"
         );

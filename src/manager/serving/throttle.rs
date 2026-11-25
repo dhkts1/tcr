@@ -1,6 +1,5 @@
 //! `Manager` throttle methods, split verbatim from `mod.rs`.
 
-use crate::manager::select::{RequestClass, classify_request};
 use crate::manager::*;
 
 /// Whether a [`RequestClass`] is exempt from the PER-ORG GCRA when

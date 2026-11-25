@@ -127,19 +127,15 @@ async fn live_fan(
     let payload = fetch_live_status(config)
         .await
         .map_err(|e| anyhow::anyhow!(live_status_why(&e, config.proxy.port)))?;
-    let heat = payload
-        .heat
-        .as_ref()
-        .and_then(crate::status::HeatField::reading)
-        .cloned();
-    match payload.fan_control {
-        Some(crate::status::FanControlField::Reading(row)) => Ok((row, heat)),
-        Some(crate::status::FanControlField::Unreadable(why)) => bail!(
+    let heat = payload.heat_reading().ok().cloned();
+    match payload.fan_control_reading() {
+        Ok(row) => Ok((row.clone(), heat)),
+        Err(crate::status::Unread::Unparsed(why)) => bail!(
             "the tcr on 127.0.0.1:{} answered with a fanControl object this tcr cannot read \
              ({why}); a server of another build answers this way, so restart it on this build",
             config.proxy.port
         ),
-        None => bail!(
+        Err(crate::status::Unread::NotSent) => bail!(
             "the tcr on 127.0.0.1:{} runs no fan controller (an older tcr, or one not started as the server)",
             config.proxy.port
         ),

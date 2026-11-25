@@ -353,43 +353,6 @@ pub fn port_holder(port: u16) -> Option<PortHolder> {
     Some(holder_from(pid, &name, &argv))
 }
 
-/// Requests this proxy served in the last `minutes` wall-clock minutes, summed
-/// over every live Claude session's per-minute sparkline
-/// ([`tcr_status_wire::SessionRow::req_per_minute`], 30 entries, oldest first).
-///
-/// The sparkline rather than [`crate::status::AccountStatus::requests`]: that
-/// counter is cumulative since the server booted, so it answers "has this proxy
-/// ever served anything", and a route that broke an hour ago would still read
-/// as healthy.
-///
-/// A Codex session (`provider` set) is left out, because its traffic says nothing
-/// about Claude's route and counting it would read a broken route as healthy.
-pub fn requests_in_window(payload: &StatusPayload, minutes: usize) -> u64 {
-    payload
-        .sessions
-        .iter()
-        .filter(|session| session.provider.is_none())
-        .map(|session| session_requests_in_window(session, minutes))
-        .sum()
-}
-
-/// One session's requests in the newest `minutes` of its sparkline
-/// ([`tcr_status_wire::SessionRow::req_per_minute`]); a sparkline shorter than
-/// the window counts what it has.
-pub(crate) fn session_requests_in_window(
-    session: &tcr_status_wire::SessionRow,
-    minutes: usize,
-) -> u64 {
-    let minutes = session.req_per_minute.len().min(minutes);
-    session
-        .req_per_minute
-        .iter()
-        .rev()
-        .take(minutes)
-        .map(|&requests| u64::from(requests))
-        .sum::<u64>()
-}
-
 /// Everything `tcr doctor` prints, decided.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1038,17 +1001,6 @@ impl CodexReport {
     }
 }
 
-/// Codex requests this proxy served in the last `minutes` minutes: [`requests_in_window`]'s
-/// sum, over the Codex sessions it leaves out.
-pub fn codex_requests_in_window(payload: &StatusPayload, minutes: usize) -> u64 {
-    payload
-        .sessions
-        .iter()
-        .filter(|session| session.provider.as_deref() == Some("codex"))
-        .map(|session| session_requests_in_window(session, minutes))
-        .sum()
-}
-
 /// Everything `tcr doctor` prints, in the fleet's shape: Claude's report, and the Codex block
 /// when the fleet holds a Codex account or `--codex` asked for it.
 ///
@@ -1137,29 +1089,29 @@ fn codex_rows(
     live: Result<&StatusPayload, &crate::cli::LiveStatusError>,
     config: &crate::config::Config,
 ) -> Vec<CodexRow> {
-    match live {
-        Ok(payload) if payload.mitm.is_some() => payload
-            .accounts
-            .iter()
-            .filter(|row| row.provider == crate::provider::Provider::Codex)
+    if let Some(rows) = live
+        .ok()
+        .and_then(|payload| payload.current_accounts_of(crate::provider::Provider::Codex))
+    {
+        return rows
             .map(|row| CodexRow {
                 name: row.name.clone(),
                 gate: Some(row.gate),
                 reserved_groups: row.reserved_groups.clone(),
                 limit_reached_type: row.limit_reached_type.clone(),
             })
-            .collect(),
-        Ok(_) | Err(_) => config
-            .codex_reserved_groups()
-            .into_iter()
-            .map(|(name, reserved_groups)| CodexRow {
-                name: name.to_string(),
-                gate: None,
-                reserved_groups,
-                limit_reached_type: None,
-            })
-            .collect(),
+            .collect();
     }
+    config
+        .codex_reserved_groups()
+        .into_iter()
+        .map(|(name, reserved_groups)| CodexRow {
+            name: name.to_string(),
+            gate: None,
+            reserved_groups,
+            limit_reached_type: None,
+        })
+        .collect()
 }
 
 /// The Codex block's I/O half, beside [`inspect`]: build the report for the proxy on `port`
@@ -1206,7 +1158,10 @@ pub fn inspect_codex(
     let login_exists = crate::codex_local::login_file_exists(&login);
     let (requests_10m, traffic) = match live {
         Ok(payload) => (
-            Some(codex_requests_in_window(payload, REQUEST_WINDOW_MINUTES)),
+            Some(
+                payload
+                    .requests_in_window(crate::provider::Provider::Codex, REQUEST_WINDOW_MINUTES),
+            ),
             payload.codex_traffic.clone(),
         ),
         Err(_) => (None, None),

@@ -44,10 +44,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-
-use time::OffsetDateTime;
 
 use crate::bound_tokens::{
     self, BOUND_TOKEN_CAP, BOUND_TOKEN_TTL_MS, BoundTokenKind, LoadReport, StoredAccount,
@@ -326,11 +323,6 @@ impl Manager {
         self.bound_tokens_file.changed().await;
     }
 
-    /// Consume the dirty flag: `true` when something changed since the last call.
-    pub fn take_bound_tokens_dirty(&self) -> bool {
-        self.bound_tokens_file.take()
-    }
-
     /// Remember that the account at `account_idx` minted these tokens.
     ///
     /// Called from both response paths in `proxy.rs`: the response is the only place a token
@@ -477,54 +469,6 @@ impl Manager {
             .map(|(index, kind, _)| (index, kind))
     }
 
-    /// Whether the account at `idx` can still hold a conversation whose history is bound to it:
-    /// the one question that decides between holding the request there and releasing it to the
-    /// fleet.
-    ///
-    /// Yes while the account is alive for every model class ([`Self::account_hard_ok`], which
-    /// passes a hold that clears while the cache is warm) and for THIS request's class
-    /// ([`Self::model_blocked`]). A short hold is waited out, or answered with that hold's own
-    /// `retry-after`. The soft quota threshold is not consulted: an account over it still serves
-    /// until the upstream says otherwise.
-    ///
-    /// No once the account is terminally gated (`disabled`, a dead login, a `rejected` unified
-    /// status), parked, reserved away from this request, held for longer than the cache lives,
-    /// or out of this model class's weekly bucket. None of those clears soon, and the client
-    /// recovers from the one rejection a sibling gives (see this module's doc). An index that
-    /// names no account is a no too: there is nothing to hold the request to.
-    pub fn bound_account_holds(
-        &self,
-        idx: usize,
-        now: OffsetDateTime,
-        is_fable: bool,
-        group: Option<&str>,
-        warm: WarmWindow,
-    ) -> bool {
-        let now_ms = crate::manager::odt_to_ms(now);
-        let reserved = self.reserved_groups();
-        let parked = self.parked_groups();
-        let accounts = self
-            .accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        accounts.get(idx).is_some_and(|account| {
-            Self::account_hard_ok(account, now_ms, group, &reserved, &parked, warm)
-                // "Holds" means this account answers the next request itself and every
-                // other account is benched for it, so a rejection that merely clears
-                // while the cache is warm (which `account_hard_ok` lets through to keep a
-                // PIN) must still answer no here: holding a conversation on a rejected
-                // account is the 429-every-turn incident this module's doc describes.
-                && Self::account_terminal_gate(account).is_none()
-                && !Self::model_blocked(
-                    account,
-                    self.global_threshold,
-                    self.fable_weekly_threshold,
-                    now,
-                    is_fable,
-                )
-        })
-    }
-
     /// Whether a conversation bound by `tokens` has gone cold: its newest sign of life is older
     /// than `warm`, so no account holds a warm prompt cache for it.
     ///
@@ -557,92 +501,6 @@ impl Manager {
             .chain(newest_mint)
             .max()
             .is_some_and(|last| now_ms.saturating_sub(last) >= warm.ms())
-    }
-
-    /// Serve a held request on the account its history is bound to, over the soft threshold if
-    /// need be: `Some(idx)` when that account can answer this request now.
-    ///
-    /// [`Self::bound_account_holds`] keeps a conversation on its account without consulting the
-    /// soft threshold, so the serve side has to agree with it. It did not: a held request on an
-    /// account over the threshold fell through to [`Self::select_revalidation`], whose fallback
-    /// lets one request through per 2 s across the whole fleet, and the turn that lost that race
-    /// got an exhausted 429 naming the account's 5-hour window. Claude Code renders that as
-    /// "You've hit your session limit" (2026-09-24: 3 of 3 such 429s came 0.05-1.4 s after
-    /// another turn on the same account, while four other accounts sat at 0%).
-    ///
-    /// Served the way `select_revalidation` serves a session's pin: the hard gates for THIS
-    /// request ([`Self::hard_ok`] with the request's own group, so a live hold of any length
-    /// still refuses), no revalidation window, and the session's pin left alone. `None` when the
-    /// account already failed this request (`tried`), cannot serve it now, or sits outside the
-    /// group this request asked for strictly: a strict group never serves from outside itself,
-    /// held history included.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the per-request selection inputs `select_with_group` also takes"
-    )]
-    pub fn select_bound(
-        &self,
-        idx: usize,
-        tried: &HashSet<usize>,
-        now: OffsetDateTime,
-        is_fable: bool,
-        group: Option<&str>,
-        strict_group: Option<&str>,
-        warm: WarmWindow,
-    ) -> Option<usize> {
-        if tried.contains(&idx) {
-            return None;
-        }
-        let provider = self
-            .accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(idx)?
-            .provider;
-        let unsupported_exit = match provider {
-            crate::provider::Provider::Anthropic => false,
-            crate::provider::Provider::Codex => {
-                self.codex_accounts_with_unsupported_exit().contains(&idx)
-            }
-        };
-        if unsupported_exit {
-            return None;
-        }
-        let now_ms = crate::manager::odt_to_ms(now);
-        let reserved = self.reserved_groups();
-        let parked = self.parked_groups();
-        let mut accounts = self
-            .accounts
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let account = accounts.get_mut(idx)?;
-        let outside_strict_group =
-            strict_group.is_some_and(|g| !account.groups.iter().any(|carried| carried == g));
-        if outside_strict_group
-            || !Self::hard_ok(
-                account,
-                self.global_threshold,
-                self.fable_weekly_threshold,
-                now,
-                now_ms,
-                is_fable,
-                group,
-                &reserved,
-                &parked,
-                warm,
-            )
-        {
-            return None;
-        }
-        let utilization = account.quota.max_utilization(now, is_fable);
-        account.last_selected_seq = self.select_seq.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(
-            account = %account.name,
-            utilization,
-            is_fable,
-            "revalidation-serve (bound-honor): serving the account this conversation's history is bound to"
-        );
-        Some(idx)
     }
 
     /// Every account index that is NOT a same-organization sibling of `idx`: `idx` itself, and
@@ -811,22 +669,41 @@ impl Manager {
     /// traffic exactly as it did before the file existed, and pays the rejected turns it was
     /// buying back.
     pub fn flush_bound_tokens(&self, path: &Path) -> Result<usize, ConfigError> {
+        let (hashes, prepared) = self.bound_tokens_to_save()?;
+        self.bound_tokens_file
+            .save(hashes, || prepared.write(path, crate::now_ms()))
+    }
+
+    /// The map as the cache file holds it, with the (shape, content) hashes the save gate
+    /// compares. Every change here is one a restart needs, so the shape is the content.
+    fn bound_tokens_to_save(&self) -> Result<((u64, u64), bound_tokens::Prepared), ConfigError> {
         let prepared = bound_tokens::prepare(self.bound_token_snapshot())?;
         let content = prepared.content_hash()?;
-        self.bound_tokens_file
-            .save((content, content), || prepared.write(path, crate::now_ms()))
+        Ok(((content, content), prepared))
     }
 
     /// The flusher's save: [`Self::flush_bound_tokens`] unless the map is what the last write
     /// put on disk. Every change here is one a restart needs, so nothing is deferred.
+    ///
+    /// Clears the dirty flag FIRST, as [`Self::flush_affinity_if_changed`] does, so a record
+    /// that lands after it is what [`Self::flush_bound_tokens_if_dirty`] writes at shutdown.
     pub fn flush_bound_tokens_if_changed(
         &self,
         path: &Path,
     ) -> Result<crate::save_gate::SaveOutcome, ConfigError> {
-        let prepared = bound_tokens::prepare(self.bound_token_snapshot())?;
-        let content = prepared.content_hash()?;
-        self.bound_tokens_file
-            .save_if_changed((content, content), || prepared.write(path, crate::now_ms()))
+        self.bound_tokens_file.save_if_changed(
+            || self.bound_tokens_to_save(),
+            |prepared| prepared.write(path, crate::now_ms()),
+        )
+    }
+
+    /// The shutdown save: [`Self::flush_bound_tokens`] when the map changed since the last
+    /// save cleared the dirty flag, `Ok(None)` for a clean map, which writes nothing.
+    pub fn flush_bound_tokens_if_dirty(&self, path: &Path) -> Result<Option<usize>, ConfigError> {
+        self.bound_tokens_file.save_if_dirty(
+            || self.bound_tokens_to_save(),
+            |prepared| prepared.write(path, crate::now_ms()),
+        )
     }
 
     /// Restore the map from `path`, resolving each stored identity against the accounts loaded
@@ -847,6 +724,9 @@ impl Manager {
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use time::OffsetDateTime;
 
     use super::*;
     use crate::config::Account;
@@ -1262,12 +1142,27 @@ mod tests {
     }
 
     #[test]
-    fn the_dirty_flag_is_raised_by_a_record_and_consumed_by_one_take() {
+    fn the_dirty_flag_is_raised_by_a_record_and_cleared_by_one_save() {
+        let path = tmp("dirty-flag");
         let manager = manager_over(&[account("a@example.com", "uuid-a")]);
-        assert!(!manager.take_bound_tokens_dirty());
+        assert_eq!(
+            manager.flush_bound_tokens_if_dirty(&path).expect("clean"),
+            None
+        );
+        assert!(!path.exists(), "a clean map wrote the file");
         manager.record_bound_tokens(&sig("sig_fake_1"), 0, crate::now_ms());
-        assert!(manager.take_bound_tokens_dirty());
-        assert!(!manager.take_bound_tokens_dirty());
+        assert!(manager.bound_tokens_file.is_dirty());
+        assert_eq!(
+            manager.flush_bound_tokens_if_dirty(&path).expect("dirty"),
+            Some(1)
+        );
+        assert!(!manager.bound_tokens_file.is_dirty());
+        assert_eq!(
+            manager
+                .flush_bound_tokens_if_dirty(&path)
+                .expect("clean again"),
+            None
+        );
     }
 
     /// A 5h rejection that rolls while the cache is warm keeps a PIN
@@ -1360,7 +1255,7 @@ mod tests {
             "the signature names the serving account, kind intact"
         );
         assert!(!manager.bound_tokens_disagree(&history));
-        assert!(manager.take_bound_tokens_dirty(), "a move is saved");
+        assert!(manager.bound_tokens_file.is_dirty(), "a move is saved");
     }
 
     /// Sonnet 5.5 dropped the block on an account in another organization and still answered
@@ -1379,7 +1274,12 @@ mod tests {
             0,
             now - 60_000,
         );
-        assert!(manager.take_bound_tokens_dirty());
+        assert!(
+            manager
+                .flush_bound_tokens_if_dirty(&tmp("dropped"))
+                .expect("save")
+                .is_some()
+        );
         assert_eq!(
             manager.rebind_served_history(
                 &tokens(&["sig_fake_1", "msg_fake_1"]),
@@ -1399,7 +1299,7 @@ mod tests {
             manager.bound_token_account(&tokens(&["msg_fake_1"])),
             Some((2, BoundTokenKind::MessageId))
         );
-        assert!(manager.take_bound_tokens_dirty(), "a drop is saved");
+        assert!(manager.bound_tokens_file.is_dirty(), "a drop is saved");
     }
 
     /// A redacted thinking block is thinking too: served across organizations by an org-bound
@@ -1518,7 +1418,12 @@ mod tests {
         let manager = two_orgs();
         let now = crate::now_ms();
         manager.record_bound_tokens(&sig("sig_fake_1"), 1, now - 60_000);
-        assert!(manager.take_bound_tokens_dirty());
+        assert!(
+            manager
+                .flush_bound_tokens_if_dirty(&tmp("untouched"))
+                .expect("save")
+                .is_some()
+        );
         assert_eq!(
             manager.rebind_served_history(
                 &tokens(&["sig_fake_1"]),
@@ -1529,7 +1434,7 @@ mod tests {
             0
         );
         assert!(
-            !manager.take_bound_tokens_dirty(),
+            !manager.bound_tokens_file.is_dirty(),
             "nothing moved, nothing to save"
         );
         let minted_at = manager

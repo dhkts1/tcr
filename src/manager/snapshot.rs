@@ -88,19 +88,6 @@ impl Manager {
             .collect()
     }
 
-    /// Whether this server's accounts are forced onto HTTP/1.1 — see
-    /// [`config::Config::http1_only`]. Server-wide, not per-account, and
-    /// exposed for the same reason `thresholds` is: a client must not
-    /// re-derive this from `~/.config/tcr.json`, which may have been
-    /// edited (or the process not yet restarted to pick it up) since the
-    /// server actually booted its clients.
-    pub fn http1_only(&self) -> bool {
-        self.config
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .http1_only
-    }
-
     /// The port this server listens on, as its config holds it: `server::serve` writes a
     /// `--port` override into the config before it builds the manager. The dashboard passes it
     /// to the in-process Codex route, whose reasons name the port.
@@ -208,8 +195,8 @@ impl Manager {
             .enumerate()
             .filter(|(_, a)| !a.removed)
             .map(|(idx, a)| {
-                let five_hour = a.quota.five_hour.map(|w| w.effective(now));
-                let seven_day = a.quota.seven_day.map(|w| w.effective(now));
+                let five_hour = a.quota.effective(crate::quota::QuotaBucket::FiveHour, now);
+                let seven_day = a.quota.effective(crate::quota::QuotaBucket::SevenDay, now);
                 // Honest quota state vs this account's OWN threshold (same gating
                 // dims `eligible` uses): the most-spent of the 5-hour and weekly
                 // windows decides near-limit vs exhausted. Status stays "active" —
@@ -259,8 +246,7 @@ impl Manager {
                     crate::provider::Provider::Anthropic => None,
                     crate::provider::Provider::Codex => a
                         .quota
-                        .seven_day
-                        .and_then(|w| w.live_reset(now))
+                        .live_reset(crate::quota::QuotaBucket::SevenDay, now)
                         .map(|reset| {
                             let length_ms = codex
                                 .seven_day_window_minutes
@@ -303,12 +289,16 @@ impl Manager {
                     },
                     disabled: a.disabled,
                     five_hour,
-                    five_hour_reset: a.quota.five_hour.and_then(|w| w.live_reset(now)),
+                    five_hour_reset: a.quota.live_reset(crate::quota::QuotaBucket::FiveHour, now),
                     five_hour_absent_on_plan: a.quota.five_hour_absent_on_plan,
                     seven_day,
-                    seven_day_reset: a.quota.seven_day.and_then(|w| w.live_reset(now)),
-                    seven_day_oi: a.quota.seven_day_oi.map(|w| w.effective(now)),
-                    seven_day_oi_reset: a.quota.seven_day_oi.and_then(|w| w.live_reset(now)),
+                    seven_day_reset: a.quota.live_reset(crate::quota::QuotaBucket::SevenDay, now),
+                    seven_day_oi: a
+                        .quota
+                        .effective(crate::quota::QuotaBucket::SevenDayOi, now),
+                    seven_day_oi_reset: a
+                        .quota
+                        .live_reset(crate::quota::QuotaBucket::SevenDayOi, now),
                     requests: a.requests,
                     input_tokens: a.input_tokens,
                     output_tokens: a.output_tokens,
@@ -353,8 +343,7 @@ impl Manager {
                             idx,
                             now_ms,
                             a.quota
-                                .five_hour
-                                .and_then(|w| w.live_reset(now))
+                                .live_reset(crate::quota::QuotaBucket::FiveHour, now)
                                 .map(odt_to_ms),
                             seven_day_span,
                         ),
@@ -434,33 +423,15 @@ impl Manager {
 ///
 /// An Anthropic row keeps the defaults, whatever its quota holds, so its wire row gains no key.
 fn codex_snapshot_facts(a: &AccountRuntime) -> crate::stats::CodexFacts {
+    let quota_facts = a.quota.wire_facts(a.provider);
     match a.provider {
-        crate::provider::Provider::Anthropic => {
-            return crate::stats::CodexFacts {
-                banked_resets: a
-                    .quota
-                    .claude_resets
-                    .as_ref()
-                    .map(crate::claude_resets::ClaudeResetBank::wire),
-                ..crate::stats::CodexFacts::default()
-            };
-        }
-        crate::provider::Provider::Codex => {}
-    }
-    let windows = a.quota.codex.windows();
-    crate::stats::CodexFacts {
-        quota_windows: windows.map(|w| w.wire_names()),
-        five_hour_window_minutes: windows.and_then(|w| w.five_hour).and_then(|w| w.minutes),
-        seven_day_window_minutes: windows.and_then(|w| w.seven_day).and_then(|w| w.minutes),
-        limit_reached_type: a.quota.codex_limit_reached_type().map(str::to_string),
-        spend_control_reached: a.quota.codex.spend_control_reached,
-        credits: a.quota.codex.credits.clone(),
-        reset_credits: a.quota.codex.reset_credits.clone(),
-        banked_resets: None,
-        auto_reset: None,
-        login_error: a.login_error.clone(),
-        codex_home: a.codex_home.clone(),
-        token_sync_pending: a.pending_codex_writeback.is_some(),
+        crate::provider::Provider::Anthropic => quota_facts,
+        crate::provider::Provider::Codex => crate::stats::CodexFacts {
+            login_error: a.login_error.clone(),
+            codex_home: a.codex_home.clone(),
+            token_sync_pending: a.pending_codex_writeback.is_some(),
+            ..quota_facts
+        },
     }
 }
 

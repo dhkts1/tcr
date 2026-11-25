@@ -5,7 +5,9 @@ use std::path::Path;
 use anyhow::Context as _;
 use tcr::config;
 use tcr::peer;
-use tcr::status;
+use tcr::peer::status::ls::{
+    PeerCapsJson, PeerExitJson, PeerFoundRow, PeerLsJson, PeerLsPeer, PeerLsRow,
+};
 
 use super::peer_cli;
 use super::{masked_label, peer_state_path, pending_row_for_readers};
@@ -60,7 +62,7 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
     let peers_path = a.peers.path();
     // A peers file that exists but does not parse is reported IN the
     // JSON document (`peers_error`) rather than as a command failure:
-    // the same reasoning `status::peers_block` gives for why an
+    // the same reasoning `peer::status::rows::peers_block` gives for why an
     // unreadable file is an empty block and not a refusal applies
     // here too, and `--json` is what the panel and scripts parse.
     // The human-readable branch keeps refusing outright, since there
@@ -68,7 +70,7 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
     let store = match peer::config::PeerStore::open(&peers_path) {
         Ok(store) => store,
         Err(err) if a.json => {
-            let out = status::PeerLsJson::unreadable(err.to_string());
+            let out = PeerLsJson::unreadable(err.to_string());
             println!("{}", serde_json::to_string(&out)?);
             return Ok(());
         }
@@ -156,7 +158,7 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
             })
             .collect();
         let lent_to = peer::lease::lent_to(&store, &accounts);
-        let masked: Vec<status::PeerLsRow> = rows
+        let masked: Vec<PeerLsRow> = rows
             .into_iter()
             .map(|mut row| {
                 // Derived per grant and never read off the file, the
@@ -167,23 +169,23 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
                         peer_ls_handed_key_until(grant, &config_accounts, now_s);
                 }
                 let (until, ended) = peer_ls_ends(&row, &state.leases, &state.borrowed, now_s);
-                status::PeerLsRow::from_row(row, until, ended)
+                PeerLsRow::from_row(row, until, ended)
             })
             .collect();
         // Trusted rows first, found rows after, newest first within
         // the found group: `visible_found` returns them in the order
         // `discovery::FoundList` already sorts in, and no rewriting
         // happens here.
-        let found_rows: Vec<status::PeerFoundRow> = state
+        let found_rows: Vec<PeerFoundRow> = state
             .visible_found()
             .iter()
             .map(found_row_for_readers)
             .collect();
-        let peers: Vec<status::PeerLsPeer> = masked
+        let peers: Vec<PeerLsPeer> = masked
             .iter()
             .cloned()
-            .map(status::PeerLsPeer::Trusted)
-            .chain(found_rows.iter().cloned().map(status::PeerLsPeer::Found))
+            .map(PeerLsPeer::Trusted)
+            .chain(found_rows.iter().cloned().map(PeerLsPeer::Found))
             .collect();
         let file = store.file();
         let exits = peer_ls_exits(
@@ -192,12 +194,12 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
             &state.last_seen,
             peer::pair::now_ms(),
         );
-        let out = status::PeerLsJson {
+        let out = PeerLsJson {
             supported: true,
             peers,
             lent_to,
             internet: file.internet,
-            network: status::network_fact::network_present(),
+            network: peer::network_fact::network_present(),
             exits,
             pending_count: pending.len(),
             pending,
@@ -206,7 +208,7 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
             muted_count: state.muted.len(),
             muted: state.muted.clone(),
             limited: state.found_not_shown,
-            caps: status::PeerCapsJson {
+            caps: PeerCapsJson {
                 found_rows: peer::discovery::MAX_FOUND_ROWS,
                 found_per_address: peer::discovery::MAX_FOUND_PER_ADDRESS,
                 pending: peer::state::MAX_PENDING_KNOCKS,
@@ -341,7 +343,7 @@ fn peer_ls_exits(
     peers: &[peer::config::PeerRow],
     last_seen: &[(tcr_peer_wire::PeerId, i64)],
     now_ms: i64,
-) -> std::collections::BTreeMap<String, status::PeerExitJson> {
+) -> std::collections::BTreeMap<String, PeerExitJson> {
     let mut out = std::collections::BTreeMap::new();
     for account in accounts {
         let pin = account.egress_pin();
@@ -371,7 +373,7 @@ fn peer_ls_exits(
         };
         out.insert(
             label,
-            status::PeerExitJson {
+            PeerExitJson {
                 egress: pin.egress.to_string(),
                 egress_strict: pin.strict,
                 peer_down,
@@ -457,8 +459,8 @@ fn peer_ls_ends(
 /// and the announced name is masked again for the same reason: it is text a
 /// stranger's Mac chose, already whitelisted on arrival, and this repository
 /// is public.
-fn found_row_for_readers(row: &peer::state::Found) -> status::PeerFoundRow {
-    status::PeerFoundRow {
+fn found_row_for_readers(row: &peer::state::Found) -> PeerFoundRow {
+    PeerFoundRow {
         name: row.announced_name.as_deref().map(masked_label),
         address: row.dial_address(),
         trusted: false,

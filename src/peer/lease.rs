@@ -457,7 +457,7 @@ pub const MIN_DEBIT: f64 = 0.002;
 /// program joins on. The line carried only the label, which is the operator's
 /// own display string: two Macs may be labelled the same, a label is renamed
 /// whenever its owner feels like it, and every other cross-surface join in this
-/// tree moved to the wire id ([`crate::status::PeerStatusRow::id`]), so a panel
+/// tree moved to the wire id ([`crate::peer::status::rows::PeerStatusRow::id`]), so a panel
 /// merging this line with a peer row had nothing to merge on.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]

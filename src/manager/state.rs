@@ -71,12 +71,17 @@ impl Manager {
             .divert_budget()
     }
 
-    /// The keep-warm wake signal. The warm loop `select!`s over its own ticker and
-    /// `warm_wake().notified()`, so the first sweep after boot happens as soon as
-    /// the probe has read some quota rather than a full `warmupSeconds` later. See
-    /// the field docs on [`Manager`] for why a lost wake is impossible here.
-    pub const fn warm_wake(&self) -> &Notify {
-        &self.warm_wake
+    /// Whether this server's accounts are forced onto HTTP/1.1 — see
+    /// [`config::Config::http1_only`]. Server-wide, not per-account, and
+    /// exposed for the same reason `thresholds` is: a client must not
+    /// re-derive this from `~/.config/tcr.json`, which may have been
+    /// edited (or the process not yet restarted to pick it up) since the
+    /// server actually booted its clients.
+    pub fn http1_only(&self) -> bool {
+        self.config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .http1_only
     }
 
     /// Mint the next session key: a strictly-increasing, unique `u64` starting at
@@ -156,21 +161,6 @@ impl Manager {
         }
     }
 
-    /// The Anthropic origin. A request's own origin, which depends on its provider, is
-    /// [`Self::upstream_for`].
-    pub fn upstream(&self) -> &str {
-        &self.upstream
-    }
-
-    /// The origin a request for `provider` is rewritten to. `upstream()` stays the Anthropic
-    /// accessor its existing callers (profile fetch, control identity) mean.
-    pub fn upstream_for(&self, provider: crate::provider::Provider) -> &str {
-        match provider {
-            crate::provider::Provider::Anthropic => &self.upstream,
-            crate::provider::Provider::Codex => &self.codex_upstream,
-        }
-    }
-
     pub fn proxy_api_key(&self) -> Option<&str> {
         self.proxy_api_key.as_deref()
     }
@@ -196,21 +186,27 @@ impl Manager {
             .map(|_| crate::request_key::RequestKeyMode::Log)
     }
 
-    /// The unkeyed-caller counters `GET /_tcr/status` reports.
-    pub const fn unkeyed(&self) -> &crate::request_key::UnkeyedCounters {
-        &self.unkeyed
+    /// Count one arrival that lacked the request key (log mode: counted, never
+    /// refused). See [`crate::request_key::UnkeyedCounters::record`] for the one
+    /// INFO line the first of each kind writes.
+    pub fn record_unkeyed(
+        &self,
+        what: crate::request_key::Unkeyed,
+        user_agent: crate::request_key::UaFamily,
+        peer_port: u16,
+    ) {
+        self.unkeyed.record(what, user_agent, peer_port);
     }
 
-    /// `f` applied to account row `idx`, under a short read of the accounts
-    /// lock. `None` is the one answer for an index past the end, so no reader
-    /// decides on its own what a missing row means. `f` runs with the lock
-    /// held: it must not take `affinity` or any lock ordered before accounts.
-    pub(super) fn account<R>(&self, idx: usize, f: impl FnOnce(&AccountRuntime) -> R) -> Option<R> {
-        self.accounts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(idx)
-            .map(f)
+    /// The `unkeyedConnects` and `unkeyedRequests` rows `GET /_tcr/status`
+    /// reports, in that order.
+    pub fn unkeyed_wire(
+        &self,
+    ) -> (
+        Vec<crate::status::UnkeyedCount>,
+        Vec<crate::status::UnkeyedCount>,
+    ) {
+        self.unkeyed.wire()
     }
 
     /// Account `idx`'s OWN upstream-forwarding client — see

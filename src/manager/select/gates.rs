@@ -71,28 +71,6 @@ impl Manager {
             .is_some_and(|remaining_ms| remaining_ms < warm.ms())
     }
 
-    /// When a `rejected` unified status will clear on its own, if that can be
-    /// known: the 5-hour window's reset instant, when the 5-hour window is the one
-    /// carrying the rejection (its utilization is at least the weekly's). `None`
-    /// when the account is not rejected, the weekly window is the fuller one (its
-    /// reset is days away, never inside a cache window), or no reset was reported.
-    ///
-    /// Why this is knowable at all: `rejected` is upstream's verdict on a WINDOW, and
-    /// [`crate::quota::Quota`] drops it when that window rolls (the next probe reads
-    /// a utilization that fell). So a 5h rejection is a timer with a deadline the
-    /// headers already gave us, even though it carries no `retry-after`.
-    pub(in crate::manager) fn rejection_reset_ms(account: &AccountRuntime) -> Option<i64> {
-        if account.quota.status.as_deref() != Some("rejected") {
-            return None;
-        }
-        let five_hour = account.quota.five_hour?;
-        let weekly_util = account.quota.seven_day.map_or(0.0, |w| w.utilization);
-        if five_hour.utilization < weekly_util {
-            return None;
-        }
-        five_hour.reset.map(odt_to_ms)
-    }
-
     /// Whether a `rejected` status clears while this session's prompt cache is still
     /// warm: the 5h window carries it and its reset falls inside `warm`. The same
     /// shape as [`Self::hold_clears_while_warm`], for the one terminal gate that is
@@ -110,10 +88,14 @@ impl Manager {
         now_ms: i64,
         warm: WarmWindow,
     ) -> bool {
-        Self::rejection_reset_ms(account).is_some_and(|reset_ms| {
-            let remaining_ms = reset_ms - now_ms;
-            remaining_ms > 0 && remaining_ms < warm.ms()
-        })
+        account
+            .quota
+            .five_hour_rejection_reset()
+            .map(odt_to_ms)
+            .is_some_and(|reset_ms| {
+                let remaining_ms = reset_ms - now_ms;
+                remaining_ms > 0 && remaining_ms < warm.ms()
+            })
     }
 
     /// The TERMINAL account-level gates — the blocks that are a fact about the
@@ -710,29 +692,12 @@ impl Manager {
                 gates.push((GateReason::FableWeekly, window.live_reset(now)));
             }
         }
-        // Standard (API-key) token/request limits — mirror `Quota::is_near`
-        // (quota.rs) so account_gate agrees with eligible(): a standard-limited
-        // account is gated, not "soon-servable". free_at = standard_reset (the
-        // upstream refresh instant); None when unknown ("cannot promise a time").
-        // OAuth accounts have all standard fields None → this never fires →
-        // account_gate byte-identical for them. Once standard_reset has passed the
-        // upstream limit has refreshed, so a spent count must NOT keep gating.
-        let standard_expired = account.quota.standard_reset.is_some_and(|r| now >= r);
-        if !standard_expired {
-            let near = |limit: Option<i64>, remaining: Option<i64>| {
-                matches!(
-                    (limit, remaining),
-                    (Some(l), Some(r)) if l > 0 && 1.0 - (r as f64 / l as f64) >= threshold
-                )
-            };
-            if near(account.quota.tokens_limit, account.quota.tokens_remaining)
-                || near(
-                    account.quota.requests_limit,
-                    account.quota.requests_remaining,
-                )
-            {
-                gates.push((GateReason::Standard, account.quota.standard_reset));
-            }
+        // Standard (API-key) token/request limits: the same check `Quota::is_near`
+        // makes, so account_gate agrees with eligible(): a standard-limited account
+        // is gated, not "soon-servable". free_at = standard_reset (the upstream
+        // refresh instant); None when unknown ("cannot promise a time").
+        if account.quota.standard_limited(threshold, now) {
+            gates.push((GateReason::Standard, account.quota.standard_reset));
         }
 
         // The latest-clearing gate binds. `gate_clear_key` sorts an unknown reset

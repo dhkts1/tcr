@@ -95,26 +95,20 @@ pub fn codex_route(
         Ok(payload) => payload,
     };
     let upstream = payload.codex_upstream.clone();
-    let Some(mitm) = &payload.mitm else {
-        return not_pooled(
-            PREDATES,
-            format!(
-                "the proxy on :{port} (build {}) predates Codex interception — restart it on \
-                 this build at a quiet moment",
-                payload.build.sha
-            ),
-            upstream,
-        );
+    let (mitm, build) = match payload.codex_interception() {
+        Ok(interception) => interception,
+        Err(build) => {
+            return not_pooled(
+                PREDATES,
+                format!(
+                    "the proxy on :{port} (build {build}) predates Codex interception — restart \
+                     it on this build at a quiet moment"
+                ),
+                upstream,
+            );
+        }
     };
-    decide(
-        mitm,
-        port,
-        ca,
-        ca_readable,
-        codex_accounts,
-        &payload.build.sha,
-        upstream,
-    )
+    decide(mitm, port, ca, ca_readable, codex_accounts, build, upstream)
 }
 
 /// [`codex_route`] inside the serving process, which reads its own listener (`mitm`,
@@ -211,9 +205,7 @@ fn decide(
 /// ([`crate::manager::Manager::provider_account_count`]).
 pub fn listed_codex_accounts(payload: &StatusPayload) -> usize {
     payload
-        .accounts
-        .iter()
-        .filter(|row| row.provider == crate::provider::Provider::Codex)
+        .accounts_of(crate::provider::Provider::Codex)
         .count()
 }
 

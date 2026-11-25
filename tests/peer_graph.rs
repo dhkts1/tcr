@@ -1,6 +1,6 @@
 //! `tcr peer graph`, through the shipped binary.
 //!
-//! `status::peer_graph` and its schema are already covered end to end in
+//! `peer::status::graph::peer_graph` and its schema are already covered end to end in
 //! `tests/peer_status.rs` (the flattened-edge shape, the masking, the
 //! lease-direction rule, the expired-lease drop): that file owns
 //! `src/status.rs`'s derivation. This file owns the CLI SEAM: the verb that
@@ -107,7 +107,7 @@ fn tcr_peer_graph_json_runs_against_a_fixture_and_parses() {
 
     assert_eq!(
         parsed["kind"], "tcr.peer.graph.v1",
-        "the CLI's own kind must be the one `status::peer_graph` mints: {parsed}"
+        "the CLI's own kind must be the one `peer::status::graph::peer_graph` mints: {parsed}"
     );
     let nodes = parsed["nodes"].as_array().expect("nodes is an array");
     assert_eq!(

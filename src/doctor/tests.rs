@@ -243,13 +243,19 @@ fn the_window_counts_only_the_newest_ten_minutes() {
 
     let payload = payload_with(vec![session(old_traffic), session(recent)]);
 
-    assert_eq!(requests_in_window(&payload, REQUEST_WINDOW_MINUTES), 5);
+    assert_eq!(
+        payload.requests_in_window(crate::provider::Provider::Anthropic, REQUEST_WINDOW_MINUTES),
+        5
+    );
 }
 
 #[test]
 fn a_short_or_absent_sparkline_counts_what_it_has() {
     let payload = payload_with(vec![session(vec![1, 2]), session(Vec::new())]);
-    assert_eq!(requests_in_window(&payload, REQUEST_WINDOW_MINUTES), 3);
+    assert_eq!(
+        payload.requests_in_window(crate::provider::Provider::Anthropic, REQUEST_WINDOW_MINUTES),
+        3
+    );
 }
 
 /// `requests10m` answers "is Claude Code reaching this proxy", so it counts Claude sessions
@@ -264,7 +270,10 @@ fn requests_in_the_window_count_claude_sessions_only() {
     let mut codex = session(codex_traffic);
     codex.provider = Some("codex".to_string());
     let payload = payload_with(vec![session(claude), codex]);
-    assert_eq!(requests_in_window(&payload, REQUEST_WINDOW_MINUTES), 5);
+    assert_eq!(
+        payload.requests_in_window(crate::provider::Provider::Anthropic, REQUEST_WINDOW_MINUTES),
+        5
+    );
 }
 
 fn report_for(url: &str, source: BaseUrlSource, requests: Option<u64>) -> Report {
@@ -1443,8 +1452,11 @@ fn codex_requests_in_the_window_count_codex_sessions_only() {
     codex.provider = Some("codex".to_string());
     let payload = payload_with(vec![session(claude), codex]);
     assert_eq!(
-        codex_requests_in_window(&payload, REQUEST_WINDOW_MINUTES),
+        payload.requests_in_window(crate::provider::Provider::Codex, REQUEST_WINDOW_MINUTES),
         7
     );
-    assert_eq!(requests_in_window(&payload, REQUEST_WINDOW_MINUTES), 5);
+    assert_eq!(
+        payload.requests_in_window(crate::provider::Provider::Anthropic, REQUEST_WINDOW_MINUTES),
+        5
+    );
 }

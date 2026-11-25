@@ -69,8 +69,10 @@ const fn inside(ends_at_ms: i64, now_ms: i64) -> bool {
 
 /// The resets one row should spend at `now_ms`: for a Claude row, of each kind held, the
 /// grant whose use-by comes first, when that use-by is inside the window and the grant is
-/// neither paused nor spent; for a Codex row, its one earliest credit. Nothing for an
-/// ineligible or unread bank.
+/// neither paused nor spent; for a Codex row, its one earliest credit. `claude` is the bank
+/// the row may spend ([`crate::quota::Quota::eligible_claude_resets`]) and `codex` the
+/// credits it holds ([`crate::quota::Quota::spendable_codex_reset_credits`]); nothing when
+/// either is `None`.
 pub fn due_in(
     idx: usize,
     provider: Provider,
@@ -80,7 +82,7 @@ pub fn due_in(
 ) -> Vec<Due> {
     match provider {
         Provider::Anthropic => {
-            let Some(bank) = claude.filter(|bank| bank.eligible) else {
+            let Some(bank) = claude else {
                 return Vec::new();
             };
             let mut first: Vec<Due> = Vec::new();
@@ -107,7 +109,6 @@ pub fn due_in(
             first
         }
         Provider::Codex => codex
-            .filter(|credits| credits.available_count > 0)
             .and_then(|credits| credits.earliest_expiry_ms)
             .filter(|&ends_at_ms| inside(ends_at_ms, now_ms))
             .map(|ends_at_ms| Due {
@@ -186,8 +187,8 @@ impl Manager {
                     due_in(
                         idx,
                         row.provider,
-                        row.quota.claude_resets.as_ref(),
-                        row.quota.codex.reset_credits.as_ref(),
+                        row.quota.eligible_claude_resets(),
+                        row.quota.spendable_codex_reset_credits(),
                         now_ms,
                     )
                 })
@@ -345,11 +346,23 @@ mod tests {
             .map(|d| d.kind)
             .collect();
         assert_eq!(kinds, vec![ResetKind::Weekly]);
-        let ineligible = ClaudeResetBank {
-            eligible: false,
-            ..held
+        let ineligible = Quota {
+            claude_resets: Some(ClaudeResetBank {
+                eligible: false,
+                ..held
+            }),
+            ..Quota::default()
         };
-        assert_eq!(claude(&ineligible, ENDS - 60_000), vec![]);
+        assert_eq!(
+            due_in(
+                3,
+                Provider::Anthropic,
+                ineligible.eligible_claude_resets(),
+                None,
+                ENDS - 60_000
+            ),
+            vec![]
+        );
         assert_eq!(
             due_in(3, Provider::Anthropic, None, None, ENDS - 60_000),
             vec![]
@@ -373,8 +386,16 @@ mod tests {
                 ends_at_ms: ENDS
             }]
         );
+        let mut spent = Quota::default();
+        spent.codex.reset_credits = Some(credits(0));
         assert_eq!(
-            due_in(5, Provider::Codex, None, Some(&credits(0)), ENDS - 60_000),
+            due_in(
+                5,
+                Provider::Codex,
+                None,
+                spent.spendable_codex_reset_credits(),
+                ENDS - 60_000
+            ),
             vec![]
         );
         assert_eq!(
