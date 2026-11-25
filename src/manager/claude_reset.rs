@@ -706,31 +706,24 @@ mod tests {
         }
     }
 
+    /// A dispatcher registered for the life of the test process, so the capture below is
+    /// never the only one. While exactly one is registered, tracing-core 0.1.36
+    /// (`callsite.rs`, `has_just_one`) computes a newly hit callsite's interest from the
+    /// hitting thread's default alone, so a sibling test that reaches `claude reset attempt
+    /// finished` first caches it as `never` and the capture loses that line. A warm-up
+    /// cannot register the callsites first: until some subscriber is registered the global
+    /// max level is OFF (`metadata.rs`, `MAX_LEVEL`), so `info!` returns before it touches
+    /// its callsite. With two registered, every callsite combines both and each event asks
+    /// its own thread's subscriber. `src/proxy/tests/mod.rs` keeps the same static.
+    static SECOND_DISPATCHER: std::sync::LazyLock<tracing::Dispatch> =
+        std::sync::LazyLock::new(|| {
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new())
+        });
+
     /// One INFO line per attempt, naming the index and never the account, the key or the grant.
     #[tokio::test(flavor = "current_thread")]
     async fn each_attempt_logs_one_line_with_no_identity() {
-        // Register both of the attempt's log callsites before capturing: a callsite first
-        // reached by another thread with no subscriber is cached as never enabled, and a
-        // rebuild only repairs callsites already registered (server.rs's boot-line test).
-        let warm = Anthropic::new("reset", true, 1);
-        let warm_manager = warm.manager();
-        warm_manager.probe_account(0).await;
-        assert!(
-            warm_manager
-                .reset_claude(
-                    "alice@example.com",
-                    Some(ResetKind::Weekly),
-                    "warm-up-attempt"
-                )
-                .await
-                .is_ok()
-        );
-        assert!(
-            warm_manager
-                .reset_claude("nobody@example.com", None, "warm-up-attempt")
-                .await
-                .is_err()
-        );
+        std::sync::LazyLock::force(&SECOND_DISPATCHER);
         let logs = crate::test_support::log_capture::SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -738,7 +731,6 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
         tracing::info!("claude reset privacy positive control");
         let anthropic = Anthropic::new("reset", true, 1);
         let manager = anthropic.manager();
