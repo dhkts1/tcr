@@ -61,7 +61,7 @@ use crate::manager::{
 };
 use crate::provider::Provider;
 use crate::quota::{UnifiedRejectionKind, quota_rejections};
-use crate::request_key::key_matches;
+use crate::request_key::{ProxySecrets, key_matches};
 use crate::stats::{GateReason, SessionKind};
 
 mod client_error;
@@ -708,33 +708,6 @@ fn request_keying(
         RequestKeying::Keyed
     } else {
         RequestKeying::Unkeyed(credential.user_agent)
-    }
-}
-
-/// The two proxy secrets a client may send this proxy: `proxy.apiKey` and the request key.
-/// Neither is a client identity (so [`stable_session_key`] skips an `x-api-key` equal to
-/// either) nor a credential for any other host (so [`build_passthrough_headers`] strips it).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ProxySecrets<'a> {
-    pub api_key: Option<&'a str>,
-    pub request_key: Option<&'a str>,
-}
-
-impl ProxySecrets<'_> {
-    /// No secret configured.
-    pub const NONE: ProxySecrets<'static> = ProxySecrets {
-        api_key: None,
-        request_key: None,
-    };
-
-    /// Is `value` one of these secrets? Constant-time per secret ([`key_matches`]); an
-    /// empty secret matches nothing.
-    pub fn contains(&self, value: Option<&str>) -> bool {
-        [self.api_key, self.request_key]
-            .into_iter()
-            .flatten()
-            .filter(|secret| !secret.is_empty())
-            .any(|secret| key_matches(value, secret))
     }
 }
 

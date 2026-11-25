@@ -80,6 +80,33 @@ pub const CODEX_PROXY_USERNAME: &str = "tcr-codex";
 /// Basic encoding of `tcr-codex:` sent by both Codex transports, including an empty password.
 pub const CODEX_PROXY_AUTHORIZATION: &str = "Basic dGNyLWNvZGV4Og==";
 
+/// The two proxy secrets a client may send this proxy: `proxy.apiKey` and the request key.
+/// Neither is a client identity (so `proxy::stable_session_key` skips an `x-api-key` equal to
+/// either) nor a credential for any other host (so `proxy::build_passthrough_headers` strips it).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProxySecrets<'a> {
+    pub api_key: Option<&'a str>,
+    pub request_key: Option<&'a str>,
+}
+
+impl ProxySecrets<'_> {
+    /// No secret configured.
+    pub const NONE: ProxySecrets<'static> = ProxySecrets {
+        api_key: None,
+        request_key: None,
+    };
+
+    /// Is `value` one of these secrets? Constant-time per secret ([`key_matches`]); an
+    /// empty secret matches nothing.
+    pub fn contains(&self, value: Option<&str>) -> bool {
+        [self.api_key, self.request_key]
+            .into_iter()
+            .flatten()
+            .filter(|secret| !secret.is_empty())
+            .any(|secret| key_matches(value, secret))
+    }
+}
+
 /// What a caller presented, built ONCE at the edge: per `CONNECT` head in
 /// `mitm::handle_connect`, per plain request in `proxy::handle_request`. Every
 /// consumer reads this value; nothing re-parses the headers.
