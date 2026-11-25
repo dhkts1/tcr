@@ -787,7 +787,7 @@ pub struct Manager {
     /// The upstream errors and served model ids this boot has seen, per provider, for the
     /// routing document ([`crate::routing`]). Observability only: no selection reads it.
     /// A leaf lock, never held while another is taken.
-    routing: Mutex<crate::routing::Observations>,
+    routing: Mutex<crate::observations::Observations>,
 }
 
 const fn odt_to_ms(now: OffsetDateTime) -> i64 {

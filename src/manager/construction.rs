@@ -195,7 +195,7 @@ impl Manager {
             control_identity,
             client_identities: crate::control_identity::ClientIdentityCache::new(),
             reset_urgency_tier_ms,
-            routing: Mutex::new(crate::routing::Observations::default()),
+            routing: Mutex::new(crate::observations::Observations::default()),
         });
         // Hand the manager its own `Arc` (weakly) now that one exists — see the
         // `me` field. Infallible: this is the only write, on a just-built value.

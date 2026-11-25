@@ -414,7 +414,7 @@ fn codex_launch(
 
 /// The line `tcr run --codex` prints before its banner when the running proxy pools codex but
 /// no Codex account in its pool can serve right now: why each is out, worded as tcr's own 429
-/// lists its gates but in Codex words ([`proxy::describe_codex_gates`]), and when the first one
+/// lists its gates but in Codex words ([`tcr::stats::describe_codex_gates`]), and when the first one
 /// frees ([`proxy::at_utc`]), or that none reports when. `None` when a Codex account is in
 /// rotation, or when the pool holds none (the launch already said so).
 ///
@@ -460,7 +460,7 @@ fn codex_pool_preflight(
     };
     Some(format!(
         "[tcr] no Codex account can serve right now{} — {tail}",
-        proxy::describe_codex_gates(&tally)
+        tcr::stats::describe_codex_gates(&tally)
     ))
 }
 

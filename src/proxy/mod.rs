@@ -59,10 +59,11 @@ use crate::manager::{
     AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, ExhaustionHint,
     InFlightGuard, Manager, MintedToken, SetControlOutcome, SetDisabledOutcome, SetPriorityOutcome,
 };
+use crate::observations::TRUNCATED_STREAM_ERROR_KIND;
 use crate::provider::Provider;
 use crate::quota::{UnifiedRejectionKind, quota_rejections};
 use crate::request_key::{ProxySecrets, key_matches};
-use crate::stats::{GateReason, SessionKind};
+use crate::stats::{GateReason, SessionKind, describe_gates, gate_phrase};
 
 mod client_error;
 mod ladder;
@@ -144,14 +145,6 @@ pub const RELAYED_HEADER_NAME: &str = "x-tcr-relayed";
 /// the parser (usage counting becomes best-effort) rather than letting the buffer
 /// grow without bound or gating the client passthrough on the parser.
 const SSE_TEE_CAPACITY: usize = 256;
-/// The fixed `stream_error` kind [`parse_sse_usage`] synthesizes when a stream
-/// ends without Anthropic's `message_stop` terminator and no more specific
-/// in-band `error` event already explained why. Named so the proxy handler's
-/// classifier can tell "we witnessed an explicit error" (always trustworthy)
-/// apart from "we never saw the terminator" (trustworthy only when we also
-/// know we saw everything there was to see — see the handler's use of this).
-/// `pub(crate)` so [`crate::routing::ErrorKind::of_stream`] reads this spelling, not a copy.
-pub(crate) const TRUNCATED_STREAM_ERROR_KIND: &str = "truncated";
 /// The content-block type Anthropic uses for a tool IT runs — `--advisor` today, `web_search`
 /// next. Its result block travels with an `encrypted_content` that only the minting
 /// organization can decrypt, which is why the id has to be remembered at all: see
@@ -4909,7 +4902,8 @@ async fn handle_request(
                     // attribute it to; `is_connect` / `is_timeout` separate "never
                     // reached the host" from "the host went quiet mid-request".
                     ladder.transport_failed();
-                    manager.record_upstream_error(provider, crate::routing::ErrorKind::Transport);
+                    manager
+                        .record_upstream_error(provider, crate::observations::ErrorKind::Transport);
                     // **Blind peer egress, the one offer per request.**
                     //
                     // Four conjuncts, and the first two are what stop a carry
@@ -5189,7 +5183,7 @@ async fn handle_request(
                 );
                 // The kind a status alone names, once per attempt, for the routing document.
                 // Observation only: the arms below keep every retry, hold and rotation.
-                if let Some(kind) = crate::routing::ErrorKind::of_status(status.as_u16()) {
+                if let Some(kind) = crate::observations::ErrorKind::of_status(status.as_u16()) {
                     manager.record_upstream_error(provider, kind);
                 }
             }
@@ -6082,7 +6076,7 @@ async fn handle_request(
         let bytes = match read_capped_body(upstream_body, MAX_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(BodyReadError::Transport) => {
-                manager.record_upstream_error(provider, crate::routing::ErrorKind::Transport);
+                manager.record_upstream_error(provider, crate::observations::ErrorKind::Transport);
                 return ClientError::new(
                     StatusCode::BAD_GATEWAY,
                     ErrorKind::Proxy,
@@ -6107,7 +6101,8 @@ async fn handle_request(
                 {
                     log_upstream_error_body(idx, account_name.as_deref(), status, &bytes);
                     // Capacity: this account cannot serve the model now, which is not overload.
-                    manager.record_upstream_error(provider, crate::routing::ErrorKind::Capacity);
+                    manager
+                        .record_upstream_error(provider, crate::observations::ErrorKind::Capacity);
                     ladder.model_refused(account_name.clone(), detail);
                     ladder.bench(idx);
                     continue;
@@ -8651,63 +8646,6 @@ fn switch_warning(
         .retry_after(SWITCH_WARNING_RETRY_AFTER_SECS)
         .respond(provider),
     )
-}
-
-/// What a gate means, in words a person reads after an account count or after "out".
-const fn gate_phrase(reason: GateReason) -> &'static str {
-    match reason {
-        GateReason::Ok => "in rotation",
-        GateReason::Hold => "on an upstream hold",
-        GateReason::Refused => "refused upstream (403)",
-        GateReason::FiveHour => "in the 5-hour window",
-        GateReason::SevenDay => "in the weekly window",
-        GateReason::FableWeekly => "in the Fable weekly window",
-        GateReason::Standard => "at a token limit",
-        GateReason::Login => "needing re-login",
-        GateReason::Rejected => "rejected upstream",
-        GateReason::Disabled => "disabled",
-        GateReason::Reserved => "reserved for another group",
-        GateReason::Parked => "in a parked group",
-    }
-}
-
-/// `: 3 in the 5-hour window, 1 on an upstream hold` — or empty when nothing is
-/// gated, so the message never ends in a dangling colon.
-pub fn describe_gates(gated: &std::collections::BTreeMap<GateReason, usize>) -> String {
-    describe_gates_with(gated, gate_phrase)
-}
-
-fn describe_gates_with(
-    gated: &std::collections::BTreeMap<GateReason, usize>,
-    phrase: fn(GateReason) -> &'static str,
-) -> String {
-    let parts: Vec<String> = gated
-        .iter()
-        .map(|(reason, n)| format!("{n} {}", phrase(*reason)))
-        .collect();
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!(": {}", parts.join(", "))
-    }
-}
-
-/// What a gate means for a Codex account: [`gate_phrase`]'s words, except where a Codex
-/// account's gate means something else. ChatGPT's own refusal is no Claude "rejected", and a
-/// Codex account in a reserved group is unreachable, because a Codex request carries no group
-/// that could reach it.
-const fn codex_gate_phrase(reason: GateReason) -> &'static str {
-    match reason {
-        GateReason::Rejected => "refused by ChatGPT",
-        GateReason::Reserved => "unreachable in a reserved group",
-        other => gate_phrase(other),
-    }
-}
-
-/// [`describe_gates`] in [`codex_gate_phrase`]'s words, for a tally of Codex accounts:
-/// `: 1 in the weekly window, 1 needing re-login`, or empty when nothing is gated.
-pub fn describe_codex_gates(gated: &std::collections::BTreeMap<GateReason, usize>) -> String {
-    describe_gates_with(gated, codex_gate_phrase)
 }
 
 /// `HH:MM:SS UTC` for a message a human reads next to a seconds count, with the date in front

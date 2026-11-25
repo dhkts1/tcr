@@ -216,7 +216,7 @@ async fn schema_one() {
     assert_eq!(document["schema"], 1, "the document names schema 1");
 }
 
-use crate::routing::ErrorKind;
+use crate::observations::ErrorKind;
 use crate::test_support::stub_upstream as stub;
 use time::format_description::well_known::Rfc3339;
 

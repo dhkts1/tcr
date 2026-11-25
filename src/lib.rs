@@ -47,6 +47,7 @@ pub mod mint;
 pub mod mitm;
 pub mod model;
 pub mod oauth;
+pub mod observations;
 pub mod paths;
 pub mod peer;
 pub mod pricing;

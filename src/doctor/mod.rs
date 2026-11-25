@@ -681,7 +681,7 @@ pub struct CodexReport {
 
 impl CodexReport {
     /// `codexAccounts`: the rows counted by gate, in `GateReason` order and in the words tcr's
-    /// own 429 uses for a Codex account ([`crate::proxy::describe_codex_gates`]). A row held by
+    /// own 429 uses for a Codex account ([`crate::stats::describe_codex_gates`]). A row held by
     /// an upstream hold or 403 while it carries ChatGPT's own refusal counts as refused by
     /// ChatGPT, as TcrBar counts it: that refusal outlasts the hold. With no proxy answering
     /// the rows have no gate, and with no row it is `0`.
@@ -703,7 +703,7 @@ impl CodexReport {
             };
             *tally.entry(gate).or_default() += 1;
         }
-        let phrases = crate::proxy::describe_codex_gates(&tally);
+        let phrases = crate::stats::describe_codex_gates(&tally);
         format!(
             "{total} ({})",
             phrases.strip_prefix(": ").unwrap_or(&phrases)
