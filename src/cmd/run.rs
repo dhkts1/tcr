@@ -149,7 +149,7 @@ pub(crate) async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         }
         // The same read decides the request key: sent only to a server that
         // reports `requestKeyMode`.
-        let launch_key = LaunchKey::decide(config.proxy.request_key.as_deref(), &live);
+        let launch_key = LaunchKey::decide(config.usable_request_key(), &live);
         for line in apply_codex_launch(
             &mut cmd,
             port,
@@ -227,9 +227,9 @@ pub(crate) async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         {
             eprintln!("{warning}");
         }
-        let launch_key = LaunchKey::decide(config.proxy.request_key.as_deref(), &live);
+        let launch_key = LaunchKey::decide(config.usable_request_key(), &live);
         if let Some(notice) = withheld_api_key_notice(
-            config.proxy.api_key.is_some(),
+            config.loopback_api_key().is_some(),
             std::env::var_os("ANTHROPIC_API_KEY").is_some(),
         ) {
             eprintln!("{notice}");

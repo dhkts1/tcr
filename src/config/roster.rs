@@ -189,6 +189,15 @@ impl Config {
         Ok(())
     }
 
+    /// The `proxy.requestKey` a launcher may present to this config's server:
+    /// `None` when the file holds none, or an empty one.
+    pub fn usable_request_key(&self) -> Option<&str> {
+        self.proxy
+            .request_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+    }
+
     /// The name `controlAccount` names, in either of its shapes; `None` when unset.
     pub fn control_account_name(&self) -> Option<&str> {
         self.control_account
