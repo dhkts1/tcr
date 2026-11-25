@@ -400,11 +400,6 @@ impl Manager {
         self.wire_sessions_file.changed().await;
     }
 
-    /// Consume the dirty flag: `true` when something changed since the last call.
-    fn take_wire_sessions_dirty(&self) -> bool {
-        self.wire_sessions_file.take()
-    }
-
     /// Write the wire-session table to `path`, atomically. Returns how many sessions
     /// landed. Never called on the request hot path — see `server.rs`'s debounced
     /// flusher, spawned only when a path was configured — and the caller logs the
@@ -429,13 +424,17 @@ impl Manager {
         &self,
         path: &Path,
     ) -> Result<crate::save_gate::SaveOutcome, config::ConfigError> {
-        self.take_wire_sessions_dirty();
-        let now_ms = crate::now_ms();
-        let sessions = self.wire_sessions_to_save(now_ms);
-        self.wire_sessions_file
-            .save_if_changed(session_wire_persist::save_hashes(&sessions)?, || {
-                session_wire_persist::save(path, &sessions, now_ms)
-            })
+        self.wire_sessions_file.save_if_changed(
+            || {
+                let now_ms = crate::now_ms();
+                let sessions = self.wire_sessions_to_save(now_ms);
+                Ok((
+                    session_wire_persist::save_hashes(&sessions)?,
+                    (sessions, now_ms),
+                ))
+            },
+            |(sessions, now_ms)| session_wire_persist::save(path, &sessions, now_ms),
+        )
     }
 
     /// The live table as the cache file holds it: a copy taken under the lock, written
@@ -967,12 +966,13 @@ mod tests {
     }
 
     /// The dirty flag: unset on a fresh manager, set by a call that mutates the wire
-    /// session table, and cleared by consuming it — the same debounce contract the
+    /// session table, and cleared by the flusher's save — the same debounce contract the
     /// flusher task in `server.rs` runs on.
     #[test]
-    fn wire_sessions_dirty_flag_tracks_mutation_and_clears_on_take() {
+    fn wire_sessions_dirty_flag_tracks_mutation_and_clears_on_save() {
+        let path = tmp_wire_sessions_path("dirty-flag");
         let manager = Manager::from_runtimes(vec![]);
-        assert!(!manager.take_wire_sessions_dirty());
+        assert!(!manager.wire_sessions_file.is_dirty());
 
         manager.record_wire_session(
             Some("sess-dirty"),
@@ -982,10 +982,11 @@ mod tests {
             &[],
             &[],
         );
-        assert!(manager.take_wire_sessions_dirty());
+        assert!(manager.wire_sessions_file.is_dirty());
+        manager.flush_wire_sessions_if_changed(&path).expect("save");
         assert!(
-            !manager.take_wire_sessions_dirty(),
-            "a second read without an intervening write finds nothing new"
+            !manager.wire_sessions_file.is_dirty(),
+            "a save without an intervening change leaves nothing new"
         );
     }
 

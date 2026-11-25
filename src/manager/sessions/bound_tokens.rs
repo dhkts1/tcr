@@ -323,11 +323,6 @@ impl Manager {
         self.bound_tokens_file.changed().await;
     }
 
-    /// Consume the dirty flag: `true` when something changed since the last call.
-    fn take_bound_tokens_dirty(&self) -> bool {
-        self.bound_tokens_file.take()
-    }
-
     /// Remember that the account at `account_idx` minted these tokens.
     ///
     /// Called from both response paths in `proxy.rs`: the response is the only place a token
@@ -674,10 +669,17 @@ impl Manager {
     /// traffic exactly as it did before the file existed, and pays the rejected turns it was
     /// buying back.
     pub fn flush_bound_tokens(&self, path: &Path) -> Result<usize, ConfigError> {
+        let (hashes, prepared) = self.bound_tokens_to_save()?;
+        self.bound_tokens_file
+            .save(hashes, || prepared.write(path, crate::now_ms()))
+    }
+
+    /// The map as the cache file holds it, with the (shape, content) hashes the save gate
+    /// compares. Every change here is one a restart needs, so the shape is the content.
+    fn bound_tokens_to_save(&self) -> Result<((u64, u64), bound_tokens::Prepared), ConfigError> {
         let prepared = bound_tokens::prepare(self.bound_token_snapshot())?;
         let content = prepared.content_hash()?;
-        self.bound_tokens_file
-            .save((content, content), || prepared.write(path, crate::now_ms()))
+        Ok(((content, content), prepared))
     }
 
     /// The flusher's save: [`Self::flush_bound_tokens`] unless the map is what the last write
@@ -689,20 +691,19 @@ impl Manager {
         &self,
         path: &Path,
     ) -> Result<crate::save_gate::SaveOutcome, ConfigError> {
-        self.take_bound_tokens_dirty();
-        let prepared = bound_tokens::prepare(self.bound_token_snapshot())?;
-        let content = prepared.content_hash()?;
-        self.bound_tokens_file
-            .save_if_changed((content, content), || prepared.write(path, crate::now_ms()))
+        self.bound_tokens_file.save_if_changed(
+            || self.bound_tokens_to_save(),
+            |prepared| prepared.write(path, crate::now_ms()),
+        )
     }
 
     /// The shutdown save: [`Self::flush_bound_tokens`] when the map changed since the last
-    /// save took the dirty flag, `Ok(None)` for a clean map, which writes nothing.
+    /// save cleared the dirty flag, `Ok(None)` for a clean map, which writes nothing.
     pub fn flush_bound_tokens_if_dirty(&self, path: &Path) -> Result<Option<usize>, ConfigError> {
-        if !self.take_bound_tokens_dirty() {
-            return Ok(None);
-        }
-        self.flush_bound_tokens(path).map(Some)
+        self.bound_tokens_file.save_if_dirty(
+            || self.bound_tokens_to_save(),
+            |prepared| prepared.write(path, crate::now_ms()),
+        )
     }
 
     /// Restore the map from `path`, resolving each stored identity against the accounts loaded
@@ -1141,12 +1142,27 @@ mod tests {
     }
 
     #[test]
-    fn the_dirty_flag_is_raised_by_a_record_and_consumed_by_one_take() {
+    fn the_dirty_flag_is_raised_by_a_record_and_cleared_by_one_save() {
+        let path = tmp("dirty-flag");
         let manager = manager_over(&[account("a@example.com", "uuid-a")]);
-        assert!(!manager.take_bound_tokens_dirty());
+        assert_eq!(
+            manager.flush_bound_tokens_if_dirty(&path).expect("clean"),
+            None
+        );
+        assert!(!path.exists(), "a clean map wrote the file");
         manager.record_bound_tokens(&sig("sig_fake_1"), 0, crate::now_ms());
-        assert!(manager.take_bound_tokens_dirty());
-        assert!(!manager.take_bound_tokens_dirty());
+        assert!(manager.bound_tokens_file.is_dirty());
+        assert_eq!(
+            manager.flush_bound_tokens_if_dirty(&path).expect("dirty"),
+            Some(1)
+        );
+        assert!(!manager.bound_tokens_file.is_dirty());
+        assert_eq!(
+            manager
+                .flush_bound_tokens_if_dirty(&path)
+                .expect("clean again"),
+            None
+        );
     }
 
     /// A 5h rejection that rolls while the cache is warm keeps a PIN
@@ -1239,7 +1255,7 @@ mod tests {
             "the signature names the serving account, kind intact"
         );
         assert!(!manager.bound_tokens_disagree(&history));
-        assert!(manager.take_bound_tokens_dirty(), "a move is saved");
+        assert!(manager.bound_tokens_file.is_dirty(), "a move is saved");
     }
 
     /// Sonnet 5.5 dropped the block on an account in another organization and still answered
@@ -1258,7 +1274,12 @@ mod tests {
             0,
             now - 60_000,
         );
-        assert!(manager.take_bound_tokens_dirty());
+        assert!(
+            manager
+                .flush_bound_tokens_if_dirty(&tmp("dropped"))
+                .expect("save")
+                .is_some()
+        );
         assert_eq!(
             manager.rebind_served_history(
                 &tokens(&["sig_fake_1", "msg_fake_1"]),
@@ -1278,7 +1299,7 @@ mod tests {
             manager.bound_token_account(&tokens(&["msg_fake_1"])),
             Some((2, BoundTokenKind::MessageId))
         );
-        assert!(manager.take_bound_tokens_dirty(), "a drop is saved");
+        assert!(manager.bound_tokens_file.is_dirty(), "a drop is saved");
     }
 
     /// A redacted thinking block is thinking too: served across organizations by an org-bound
@@ -1397,7 +1418,12 @@ mod tests {
         let manager = two_orgs();
         let now = crate::now_ms();
         manager.record_bound_tokens(&sig("sig_fake_1"), 1, now - 60_000);
-        assert!(manager.take_bound_tokens_dirty());
+        assert!(
+            manager
+                .flush_bound_tokens_if_dirty(&tmp("untouched"))
+                .expect("save")
+                .is_some()
+        );
         assert_eq!(
             manager.rebind_served_history(
                 &tokens(&["sig_fake_1"]),
@@ -1408,7 +1434,7 @@ mod tests {
             0
         );
         assert!(
-            !manager.take_bound_tokens_dirty(),
+            !manager.bound_tokens_file.is_dirty(),
             "nothing moved, nothing to save"
         );
         let minted_at = manager
