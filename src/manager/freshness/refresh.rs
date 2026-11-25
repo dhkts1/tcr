@@ -3,8 +3,6 @@
 use crate::log_err::LogErr as _;
 use crate::manager::*;
 
-use crate::config::CODEX_SYNC_PENDING_KEY;
-
 impl Manager {
     /// Refresh account `idx`'s token if it is hard-expired OR within the proactive
     /// [`oauth::EXPIRING_SOON_MS`] buffer of expiry, coalescing concurrent callers
@@ -699,6 +697,7 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CODEX_SYNC_PENDING_KEY;
     use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
