@@ -5,7 +5,7 @@
 //! Locally, a host that is not on the policy list gets blind-tunnelled, and
 //! that is correct there: the surface is loopback and `tunnel()`'s own doc says
 //! so. **The same default on a peer socket is an open proxy on the LAN.** So
-//! this path gets its own constant, [`PEER_EGRESS_HOSTS`], deny by default, and
+//! this path gets its own constant, [`PEER_EGRESS_HOSTS`](crate::peer::egress::PEER_EGRESS_HOSTS), deny by default, and
 //! a test that proves the refusal.
 //!
 //! The list keeps the two Anthropic hosts carried before local Codex pooling:
@@ -58,7 +58,7 @@
 //! `unknown_outcome_transport_failure == false`.
 //!
 //! Both are the SAME predicate read at two places, "nothing this request sent
-//! ever left this box", so [`retry_through_peer`] is called from ONE hunk, the
+//! ever left this box", so [`retry_through_peer`](crate::peer::egress::retry_through_peer) is called from ONE hunk, the
 //! top of `handle`'s transport-failure arm, under
 //! `err.is_connect() || is_offline_error(&err)`. `is_connect()` is exactly the
 //! condition that leaves `unknown_outcome_transport_failure` false (it is set
@@ -77,11 +77,11 @@
 //!
 //! # A second hunk, which is about an account and not about a failure
 //!
-//! The paragraph above is the whole story for [`retry_through_peer`], and it is
+//! The paragraph above is the whole story for [`retry_through_peer`](crate::peer::egress::retry_through_peer), and it is
 //! no longer the whole story for this module. The exit lock of decisions row 15
 //! ("we need to be able to lock where accounts go out from which server
 //! sometimes it might be important for saving the same ip") adds
-//! [`pinned_egress`], called from one more hunk in `proxy.rs`, ABOVE the direct
+//! [`pinned_egress`](crate::peer::egress::pinned_egress), called from one more hunk in `proxy.rs`, ABOVE the direct
 //! attempt rather than inside its failure arm. It reads one account's pin and
 //! never asks whether a transport failed, because on that path nothing has been
 //! attempted yet. The two hunks cannot
@@ -98,43 +98,19 @@ use axum::response::IntoResponse as _;
 use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
 use tokio::net::TcpListener;
 
-use crate::peer::config::{PeerFile, PeerRow};
+use crate::peer::config::{CARRY_SETUP_TIMEOUT, PeerFile, PeerRow, ViaSetting};
 use crate::peer::id::KEY_BYTES;
 use crate::peer::id::NodeKey;
-use crate::peer::noise::{self, Handshake};
-use crate::peer::tunnel::{self, NoiseStream};
+use crate::peer::noise::{self, Handshake, NoiseStream};
+use crate::peer::tunnel;
+use crate::peer::tunnel::PEER_EGRESS_PORT;
 
 /// The ONLY origins a gateway will carry. Deny by default: a host absent from
 /// this list is refused, not tunnelled.
 ///
-/// Independent of [`crate::mitm::ALLOWED_HOSTS`]: a local interception capability
+/// Independent of [`crate::tls::ALLOWED_HOSTS`]: a local interception capability
 /// must not grant a peer gateway permission to dial another origin.
 pub const PEER_EGRESS_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com"];
-
-/// The only port those origins are carried on.
-///
-/// Part of the allow-list decision rather than a free field, for the reason
-/// [`TunnelTarget::Origin`] gives: host-and-port is the whole of what a blind
-/// hop can enforce, so leaving the port open would hand a granted peer every
-/// service on the same name.
-pub const PEER_EGRESS_PORT: u16 = 443;
-
-/// How long a peer carry may take (dial, handshake AND the origin's reply)
-/// before it is abandoned.
-///
-/// One bound over the whole act, not one per hop: from the waiting client's
-/// side a carry is a single answer, and a per-hop bound of five seconds is a
-/// ten-second wait on a request that has already failed its direct attempt.
-/// [`retry_through_peer`] turns it into a deadline the moment a candidate is
-/// picked.
-///
-/// Small on purpose. This path runs when the direct one has just failed, so the
-/// request has already paid a connect timeout; a gateway that does not answer
-/// promptly is worth less than the 503 the caller already has in hand.
-///
-/// It does NOT bound the response BODY. `send` resolves on the head, so an SSE
-/// answer streams for as long as it streams. See [`axum_response_from`].
-pub const CARRY_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Whether `host` and `port` are carried at all.
 pub fn host_allowed(host: &str, port: u16) -> bool {
@@ -147,200 +123,6 @@ pub fn host_allowed(host: &str, port: u16) -> bool {
 // ---------------------------------------------------------------------------
 // Which way out
 // ---------------------------------------------------------------------------
-
-/// The operator's answer to "how does this Mac reach the internet", plus the
-/// one number they may tune about it.
-///
-/// `tcr peer via auto|off|<peer> [--setup-timeout-ms <n>]`, stored as the single
-/// `via` key in `tcr-peers.json`.
-///
-/// # Why one field and not two
-///
-/// The peers file gains exactly ONE key for this whole feature, so the route
-/// and the operator's timeout live in the same value, and the serde
-/// representation is the string when there is nothing to tune and an object
-/// when there is:
-///
-/// ```json
-/// "via": "auto"
-/// "via": { "via": "off" }
-/// "via": { "via": "auto", "setupTimeoutMs": 1500 }
-/// ```
-///
-/// A file written by a build with no timeout set round-trips as the bare word,
-/// so the common file stays readable by eye.
-///
-/// # Lower, never higher
-///
-/// [`Self::with_setup_timeout_ms`] refuses anything above
-/// [`CARRY_SETUP_TIMEOUT`]. A carry only ever runs after the direct path has
-/// already failed, the request has already paid a connect timeout, so a
-/// longer wait here is strictly worse than the 503 the caller already has in
-/// hand. The knob exists to make a carry give up SOONER, which is the choice an
-/// operator on a slow LAN actually needs.
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(try_from = "ViaJson", into = "ViaJson")]
-pub struct ViaSetting {
-    /// Which way out.
-    pub route: ViaRoute,
-    /// The operator's own setup bound in milliseconds, when they set one.
-    /// `None` is [`CARRY_SETUP_TIMEOUT`].
-    setup_timeout_ms: Option<u64>,
-}
-
-/// The serde shape of [`ViaSetting`]: a bare word, or a word with the one
-/// tunable beside it.
-///
-/// `untagged` with the string arm FIRST, so `"auto"` is read as a word and
-/// never as a malformed object.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
-enum ViaJson {
-    /// `"auto"`, `"off"`, or a peer id.
-    Word(String),
-    /// The same word, plus the operator's setup bound.
-    Tuned {
-        /// `auto`, `off`, or a peer id.
-        via: String,
-        /// The setup bound in milliseconds.
-        #[serde(rename = "setupTimeoutMs", skip_serializing_if = "Option::is_none")]
-        setup_timeout_ms: Option<u64>,
-    },
-}
-
-impl TryFrom<ViaJson> for ViaSetting {
-    type Error = anyhow::Error;
-
-    fn try_from(json: ViaJson) -> Result<Self> {
-        match json {
-            ViaJson::Word(word) => Self::parse(&word),
-            ViaJson::Tuned {
-                via,
-                setup_timeout_ms: None,
-            } => Self::parse(&via),
-            ViaJson::Tuned {
-                via,
-                setup_timeout_ms: Some(ms),
-            } => Self::parse(&via)?.with_setup_timeout_ms(ms),
-        }
-    }
-}
-
-impl From<ViaSetting> for ViaJson {
-    fn from(setting: ViaSetting) -> Self {
-        match setting.setup_timeout_ms {
-            None => Self::Word(setting.to_spec()),
-            Some(ms) => Self::Tuned {
-                via: setting.to_spec(),
-                setup_timeout_ms: Some(ms),
-            },
-        }
-    }
-}
-
-/// Which way out, with no tuning attached.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum ViaRoute {
-    /// Use a trusted Mac whenever the direct path is dead. The default, and it
-    /// is not a disclosure decision: a carry is blind, and the Mac that carries
-    /// is the one that has to have granted it (`allow.gateway` in ITS file, and
-    /// its listener refuses without it). So the consent that matters is the
-    /// carrier's, and an operator who wants this Mac never to ask says so with
-    /// `off`.
-    #[default]
-    Auto,
-    /// Never route out through a peer. Byte-identical to the behaviour before
-    /// this feature existed.
-    Off,
-    /// Always ask this one Mac.
-    Pinned(PeerId),
-}
-
-impl ViaSetting {
-    /// The default: ask a trusted Mac once the direct path is dead.
-    pub const fn auto() -> Self {
-        Self::from_route(ViaRoute::Auto)
-    }
-
-    /// Never route out through a peer.
-    pub const fn off() -> Self {
-        Self::from_route(ViaRoute::Off)
-    }
-
-    /// Always ask this one Mac, and never another.
-    pub const fn pinned(peer: PeerId) -> Self {
-        Self::from_route(ViaRoute::Pinned(peer))
-    }
-
-    /// A route with no operator tuning attached.
-    const fn from_route(route: ViaRoute) -> Self {
-        Self {
-            route,
-            setup_timeout_ms: None,
-        }
-    }
-
-    /// Parse the CLI's third word: `auto`, `off`, or a peer id.
-    pub fn parse(spec: &str) -> Result<Self> {
-        let route = match spec.trim() {
-            "auto" => ViaRoute::Auto,
-            "off" => ViaRoute::Off,
-            other => PeerId::parse(other)
-                .map(ViaRoute::Pinned)
-                .with_context(|| {
-                    format!(
-                        "peer via: `{other}` is neither `auto`, `off`, nor a peer id \
-                         (`tcr peer ls` prints the ids this Mac has pinned)"
-                    )
-                })?,
-        };
-        Ok(Self::from_route(route))
-    }
-
-    /// The same setting with the operator's own setup bound, which may only be
-    /// LOWER than [`CARRY_SETUP_TIMEOUT`]. See the type's docs for why a
-    /// higher one is refused rather than accepted and clamped.
-    pub fn with_setup_timeout_ms(mut self, ms: u64) -> Result<Self> {
-        let ceiling = u64::try_from(CARRY_SETUP_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
-        if ms == 0 {
-            return Err(anyhow!(
-                "peer via: a setup timeout of 0ms would refuse every carry before it was \
-                 dialled; use `off` to mean that"
-            ));
-        }
-        if ms > ceiling {
-            return Err(anyhow!(
-                "peer via: {ms}ms is above the {ceiling}ms a carry already waits, and this \
-                 knob only lowers it, a carry runs after the direct path has failed, so \
-                 waiting longer than the default is worse for the caller than the answer it \
-                 already has"
-            ));
-        }
-        self.setup_timeout_ms = Some(ms);
-        Ok(self)
-    }
-
-    /// How long this setting gives one gateway for a whole carry: the dial, the
-    /// handshake and the origin's reply, under one deadline.
-    pub fn setup_timeout(&self) -> Duration {
-        self.setup_timeout_ms
-            .map_or(CARRY_SETUP_TIMEOUT, Duration::from_millis)
-    }
-
-    /// Whether this Mac refuses to route out through a peer at all.
-    pub fn is_off(&self) -> bool {
-        self.route == ViaRoute::Off
-    }
-
-    /// The word the CLI prints and the config stores.
-    pub fn to_spec(&self) -> String {
-        match &self.route {
-            ViaRoute::Auto => "auto".to_string(),
-            ViaRoute::Off => "off".to_string(),
-            ViaRoute::Pinned(peer) => peer.to_wire(),
-        }
-    }
-}
 
 /// One Mac this node could ask to carry, and what is known about it locally.
 #[derive(Debug, Clone)]
@@ -372,15 +154,11 @@ pub struct GatewayCandidate {
 /// fall back to a Mac the operator did not choose. A silent fallback here would
 /// be a request leaving by a route the operator refused.
 pub fn resolve_via(setting: &ViaSetting, candidates: &[GatewayCandidate]) -> Vec<GatewayCandidate> {
-    let mut chosen: Vec<GatewayCandidate> = match &setting.route {
-        ViaRoute::Off => return Vec::new(),
-        ViaRoute::Pinned(peer) => candidates
-            .iter()
-            .filter(|candidate| candidate.row.node == *peer)
-            .cloned()
-            .collect(),
-        ViaRoute::Auto => candidates.to_vec(),
-    };
+    let mut chosen: Vec<GatewayCandidate> = candidates
+        .iter()
+        .filter(|candidate| setting.admits(&candidate.row.node))
+        .cloned()
+        .collect();
     chosen.retain(|candidate| candidate.row.has_endpoint());
     chosen.sort_by_key(|candidate| {
         crate::peer::probe::carrier_key_installed(&candidate.row.node, candidate.last_seen_ms)
@@ -417,9 +195,8 @@ pub fn resolve_via(setting: &ViaSetting, candidates: &[GatewayCandidate]) -> Vec
 /// is the separate grant that fixes it: this filter reads that field, and the
 /// CLI (`tcr peer allow <peer> carry`) is the act that sets it.
 pub fn candidates_from(file: &PeerFile, last_seen: &[(PeerId, i64)]) -> Vec<GatewayCandidate> {
-    file.peers
-        .iter()
-        .filter(|row| row.allow.carry)
+    file.carriers()
+        .into_iter()
         .map(|row| GatewayCandidate {
             row: row.clone(),
             last_seen_ms: last_seen
@@ -497,14 +274,12 @@ pub async fn accept_once_splice(
         ));
     }
 
-    let mut stream = crate::peer::serve::dial_peer(gateway)
-        .await
-        .ok_or_else(|| {
-            anyhow!(
-                "peer egress: none of {}'s addresses answered",
-                gateway.label
-            )
-        })?;
+    let mut stream = tunnel::dial::dial_peer(gateway).await.ok_or_else(|| {
+        anyhow!(
+            "peer egress: none of {}'s addresses answered",
+            gateway.label
+        )
+    })?;
     let mut session = noise::dial_handshake(
         &mut stream,
         node_secret,
@@ -1437,9 +1212,7 @@ async fn pinned_carry(
     let file = crate::peer::config::read_or_default(attempt.peers_path)
         .map_err(|_| unreachable(PinnedPeerGap::NotPinned))?;
     let row = file
-        .peers
-        .iter()
-        .find(|row| row.node == peer)
+        .row(&peer)
         .ok_or_else(|| unreachable(PinnedPeerGap::NotPinned))?;
     if !row.allow.carry {
         return Err(unreachable(PinnedPeerGap::NoCarryGrant));
@@ -1649,7 +1422,7 @@ async fn record_the_hold_the_ladder_would(
         return;
     }
     let rejections = crate::quota::quota_rejections(headers);
-    let retry_after_raw = crate::proxy::parse_retry_after(headers);
+    let retry_after_raw = crate::http_client::parse_retry_after(headers);
     let retry_after = retry_after_raw.unwrap_or(60);
     if rejections.is_empty() {
         // No unified rejection: a transient limit, and the hold is the one the
@@ -1881,10 +1654,11 @@ pub fn peers_path() -> std::path::PathBuf {
 
 /// The operator's `via` choice, out of the file they wrote it into.
 ///
-/// One function rather than a field read at four call sites, so the CLI's
-/// "unchanged" comparison, the request path and the tests all read the setting
-/// the same way. A file with no `via` key at all is [`ViaRoute::Auto`]. See
-/// [`ViaSetting`] for why that default is not a disclosure decision.
+/// One function rather than a field read at several call sites, so the request
+/// path and the tests all read the setting the same way (the CLI's "unchanged"
+/// comparison is [`PeerFile::choose_via`]). A file with no `via` key at all is
+/// [`crate::peer::config::ViaRoute::Auto`]. See [`ViaSetting`] for why that
+/// default is not a disclosure decision.
 pub fn via_setting(file: &PeerFile) -> ViaSetting {
     file.via.clone()
 }

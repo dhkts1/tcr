@@ -6,9 +6,10 @@
 # and refuses to exit 0 unless each break turns the matching test RED with the
 # message that names it:
 #
-#   1. src/server.rs           the peer-lease fallback install at boot
+#   1. src/server/mod.rs       the peer-lease fallback install at boot
 #      -> a_borrowed_request_... fails: the borrower's boot installs no provider
-#   2. src/peer/listener.rs    the six digits the RESPONDER shows its operator
+#   2. src/peer/listener/connection.rs
+#                              the six digits the RESPONDER shows its operator
 #      -> two_macs_..._pair_on_six_digits fails: no digits to compare against
 #
 # The file being mutated is copied BYTE FOR BYTE to a backup first and restored
@@ -39,6 +40,9 @@ fi
 ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 MANIFEST="$ROOT/Cargo.toml"
 [ -f "$MANIFEST" ] || { echo "FAIL: no Cargo.toml at $MANIFEST" >&2; exit 2; }
+# `test_module_path`: where a test lives inside its test file, read from the source.
+# shellcheck source=tests/tools/peer-test-path.sh
+source "$ROOT/tests/tools/peer-test-path.sh"
 LOGDIR="${TMPDIR:-/tmp}/peer-e2e-mutation-$$"
 mkdir -p "$LOGDIR"
 echo "logs: $LOGDIR"
@@ -83,8 +87,12 @@ PY
 
 # expect_red <test-name> <expected-text-in-the-failure> <log-name>
 expect_red() {
-  local test_name="$1" expected="$2" log="$LOGDIR/$3"
-  cargo test --manifest-path "$MANIFEST" --test it "peer_e2e::$test_name" \
+  local test_name="$1" expected="$2" log="$LOGDIR/$3" inner
+  # The child module between `peer_e2e::` and the test is read from the source; a name
+  # defined in zero or two places stops the run rather than matching nothing.
+  inner="$(test_module_path peer_e2e "$test_name")" \
+    || { echo "FAIL: $test_name did not resolve to exactly one fn under tests/peer_e2e" >&2; exit 9; }
+  cargo test --manifest-path "$MANIFEST" --test it "peer_e2e::$inner" \
     -- --nocapture --test-threads=1 > "$log" 2>&1
   local status=$?
   if [ "$status" -eq 0 ]; then
@@ -110,7 +118,7 @@ expect_green() {
 }
 
 # --- mutation 1: the borrower's boot installs no peer-lease provider ---------
-mutate "$ROOT/src/server.rs" \
+mutate "$ROOT/src/server/mod.rs" \
   'match crate::fallback::install_peer_lease_provider(&peers_path) {' \
   'match Ok::<_, anyhow::Error>(crate::fallback::Installed::NothingToBorrowFrom) {'
 expect_red a_borrowed_request_reaches_the_lender_and_never_carries_the_borrowers_credential \
@@ -118,7 +126,7 @@ expect_red a_borrowed_request_reaches_the_lender_and_never_carries_the_borrowers
 restore
 
 # --- mutation 2: the responder never shows its operator the six digits ------
-mutate "$ROOT/src/peer/listener.rs" \
+mutate "$ROOT/src/peer/listener/connection.rs" \
   '            code = %session.session.code,
 ' \
   ''

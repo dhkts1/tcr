@@ -2,7 +2,7 @@
 //!
 //! tcr runs `codex login` with `CODEX_HOME` pointed at a throwaway folder under tcr's config
 //! directory, reads the `auth.json` codex leaves there, deletes the folder, and imports the login
-//! through the same path `tcr login --from-codex` takes ([`crate::oauth::import_codex_login_as`]).
+//! through the same path `tcr login --from-codex` takes ([`crate::login::import_codex_login_as`]).
 //! codex does the OAuth, so tcr builds no auth of its own, and the login is tcr's alone: the
 //! codex CLI keeps the login it has, and the two never spend each other's single-use refresh
 //! token.
@@ -62,7 +62,7 @@ use anyhow::Context as _;
 
 use crate::config::Account;
 use crate::log_err::LogErr as _;
-use crate::oauth::{self, LoginEvent, LoginRefusal, LoginUi};
+use crate::login::{self, LoginEvent, LoginRefusal, LoginUi};
 
 /// Whether `codex login` opens the browser itself, which makes the `browser` event carry
 /// `opened: true` so the caller opens nothing.
@@ -77,7 +77,7 @@ use crate::oauth::{self, LoginEvent, LoginRefusal, LoginUi};
 pub const CODEX_OPENS_ITS_BROWSER: bool = true;
 
 /// How codex's authorize URL starts: its issuer is `auth.openai.com`, the host of
-/// [`crate::codex_oauth::TOKEN_ENDPOINT`].
+/// [`crate::oauth::codex::TOKEN_ENDPOINT`].
 const AUTHORIZE_URL_PREFIX: &str = "https://auth.openai.com/oauth/authorize";
 
 /// How long a signalled `codex login` and its children get to end before they are killed.
@@ -118,8 +118,8 @@ pub fn codex_login_failed_refusal(status: &str, said: Option<&str>) -> LoginRefu
 /// `tcr login --codex`. Returns the name the account was saved under.
 ///
 /// In order, and nothing is written and nothing is spawned before the folder is made:
-/// the UI; `--account`'s row ([`oauth::codex_relogin_target`]); the route, as every login checks
-/// it, refused before codex runs ([`oauth::codex_login_route_check`]); `codex` itself
+/// the UI; `--account`'s row ([`login::codex_relogin_target`]); the route, as every login checks
+/// it, refused before codex runs ([`login::codex_login_route_check`]); `codex` itself
 /// ([`crate::codex_local::find_codex`]); the signal handlers; the folder; `codex login`; the
 /// login it left; the identity check; the import; the notices.
 pub async fn login(
@@ -132,13 +132,12 @@ pub async fn login(
     ui.install();
     let target = match account {
         Some(query) => {
-            let config = oauth::load_or_default(config_path)?;
-            let idx = oauth::codex_relogin_target(&config, query)?;
-            Some(config.accounts[idx].clone())
+            let config = login::load_or_default(config_path)?;
+            Some(login::codex_relogin_target(&config, query)?.clone())
         }
         None => None,
     };
-    oauth::codex_login_route_check(config_path, force).await?;
+    login::codex_login_route_check(config_path, force).await?;
     let codex = crate::codex_local::find_codex().map_err(|miss| LoginRefusal {
         code: LoginRefusal::CODEX_MISSING,
         reason: miss.refusal(),
@@ -217,10 +216,10 @@ async fn sign_in(
     if let Some(row) = &target {
         refuse_another_identity(row, &login)?;
     }
-    let first = oauth::holds_no_codex_row(config_path)?;
+    let first = login::holds_no_codex_row(config_path)?;
     let plan = tcr_status_wire::codex_plan_label(login.plan_type.as_deref());
-    let saved = oauth::import_codex_login_as(
-        oauth::LoginCommand::Codex,
+    let saved = login::import_codex_login_as(
+        login::LoginCommand::Codex,
         config_path,
         force,
         name,
@@ -230,14 +229,14 @@ async fn sign_in(
     )
     .await?;
     let first_account = if first {
-        Some(oauth::read_first_codex_account_notice(config_path).await)
+        Some(login::read_first_codex_account_notice(config_path).await)
     } else {
         None
     };
     let notices = crate::codex_local::codex_notices(first_account);
     match ui {
         LoginUi::Machine => {
-            oauth::say_codex_notices(ui, &notices);
+            login::say_codex_notices(ui, &notices);
             ui.emit(LoginEvent::SavedCodex {
                 account: &saved,
                 plan: plan.as_deref(),
@@ -245,7 +244,7 @@ async fn sign_in(
         }
         LoginUi::Terminal => {
             eprintln!("{}", codex_login_saved_line(&saved, plan.as_deref()));
-            oauth::say_codex_notices(ui, &notices);
+            login::say_codex_notices(ui, &notices);
         }
     }
     Ok(saved)
@@ -259,14 +258,14 @@ fn refuse_another_identity(
     login: &crate::codex_login::CodexLogin,
 ) -> anyhow::Result<()> {
     let names_both = login.user_id.is_some() && login.account_id.is_some();
-    if names_both && oauth::codex_login_is_row(row, login) {
+    if names_both && login::codex_login_is_row(row, login) {
         return Ok(());
     }
     let same_user = login.user_id.is_some()
         && crate::identity::uuid_key_of(login.user_id.as_deref())
             == crate::identity::uuid_key_of(row.account_uuid.as_deref());
     let refusal = match (&login.account_id, &row.org_uuid) {
-        (Some(got), Some(want)) if same_user => oauth::codex_relogin_workspace_refusal(
+        (Some(got), Some(want)) if same_user => login::codex_relogin_workspace_refusal(
             login.email.as_deref(),
             got,
             login.plan_type.as_deref(),
@@ -274,7 +273,7 @@ fn refuse_another_identity(
             want,
             row.organization_type.as_deref(),
         ),
-        _ => oauth::codex_identity_refusal(
+        _ => login::codex_identity_refusal(
             login.email.as_deref().unwrap_or("a login with no email"),
             &row.name,
         ),

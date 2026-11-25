@@ -21,9 +21,7 @@ pub(super) fn run_peer_name(a: peer_cli::PeerNameArgs) -> anyhow::Result<()> {
     match a.name {
         None => println!("{}", file.display_name()),
         Some(name) => {
-            let sanitized = tcr_peer_wire::sanitize_label(&name)
-                .with_context(|| format!("refusing name {name:?}"))?;
-            file.name = Some(sanitized.clone());
+            let sanitized = file.rename(&name)?;
             tcr::peer::config::save(&peers_path, &file)?;
             println!("{sanitized}");
         }
@@ -186,14 +184,14 @@ pub(super) async fn run_peer_invite(a: peer_cli::PeerInviteArgs) -> anyhow::Resu
     }
     if a.sealed {
         let (secret, public) = tcr::peer::noise::generate_static()?;
-        let now_ms = tcr::peer::pair::now_ms();
+        let now_ms = tcr::peer::state::now_ms();
         let until_ms = now_ms.saturating_add(600_000);
-        let id_bytes = tcr::peer::noise::random_secret()?;
+        let id_bytes = tcr::peer::id::random_secret()?;
         let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = id_bytes;
         let id = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
         tcr::peer::state::add_ask(
             &peer_state_path(&path),
-            tcr::peer::state::PendingAsk {
+            tcr::peer::ask::PendingAsk {
                 id,
                 public,
                 private: secret,
@@ -224,7 +222,7 @@ pub(super) async fn run_peer_invite(a: peer_cli::PeerInviteArgs) -> anyhow::Resu
                 tcr::peer::ask::REPLY_PREFIX
             );
         }
-        let now_ms = tcr::peer::pair::now_ms();
+        let now_ms = tcr::peer::state::now_ms();
         let opened =
             tcr::peer::state::open_and_spend_ask(&peer_state_path(&path), line.trim(), now_ms)?;
         let tcr::peer::ask::Opened::Key(token) = opened;
@@ -248,7 +246,7 @@ pub(super) async fn run_peer_invite(a: peer_cli::PeerInviteArgs) -> anyhow::Resu
     // sitting in `reach::external_socket`; it is read off the state
     // file a serving process wrote, the same reader `peer moved mint`
     // uses (`peer::reach::recorded_external_socket`).
-    let now_ms = tcr::peer::pair::now_ms();
+    let now_ms = tcr::peer::state::now_ms();
     let (external, reason) =
         tcr::peer::reach::recorded_external_socket(&peer_state_path(&path), now_ms);
     if let Some(reason) = reason {
@@ -282,7 +280,7 @@ pub(super) async fn run_peer_invite(a: peer_cli::PeerInviteArgs) -> anyhow::Resu
     if !token
         .addrs
         .iter()
-        .any(|entry| entry.kind == tcr::peer::pair::DialAddressKind::Internet)
+        .any(|entry| entry.kind == tcr::peer::config::join_key::DialAddressKind::Internet)
     {
         println!(
             "peer invite: this key carries no internet address, so a friend who is not \
@@ -321,7 +319,7 @@ pub(super) async fn run_peer_join(a: peer_cli::PeerJoinArgs) -> anyhow::Result<(
     let input = tcr::peer::pair::read_join_input(source)?;
 
     if let tcr::peer::pair::JoinInput::Ask(ask) = &input {
-        let now_ms = tcr::peer::pair::now_ms();
+        let now_ms = tcr::peer::state::now_ms();
         let (external, reason) =
             tcr::peer::reach::recorded_external_socket(&peer_state_path(&path), now_ms);
         if let Some(reason) = reason {
@@ -366,28 +364,28 @@ pub(super) async fn run_peer_join(a: peer_cli::PeerJoinArgs) -> anyhow::Result<(
     if let Some(network_key) = input.network_key() {
         let _lock = tcr::peer::config::FileLock::acquire(&path)?;
         let mut file = tcr::peer::config::read_or_default(&path)?;
-        let replaced = file.network_key.is_some();
         // The same refusal `tcr peer network-key join` gives, in the
         // same words. This arm used to overwrite in silence, which made
         // one clicked link enough to cut a Mac off from the mesh it was
         // already on, and the documented promise that the key is not
         // replaced without asking was true of one command out of two.
-        if replaced && !a.replace {
-            network_key_refusal = Some(format!(
-                "peer join: a network key is already set on this Mac, and this link \
-                 carries another. Taking it cuts this Mac off from every Mac still \
-                 holding the old one, {} pinned peer(s) here. Pass --replace to mean \
-                 it, or `tcr peer network-key clear` first",
-                file.peers.len()
-            ));
-        } else {
-            file.network_key = Some(network_key);
-            tcr::peer::config::save(&path, &file)?;
-            println!(
-                "peer join: network key {} file={}",
-                if replaced { "replaced" } else { "set" },
-                path.display()
-            );
+        match file.set_network_key(network_key, a.replace) {
+            Err(pinned) => {
+                network_key_refusal = Some(format!(
+                    "peer join: a network key is already set on this Mac, and this link \
+                     carries another. Taking it cuts this Mac off from every Mac still \
+                     holding the old one, {pinned} pinned peer(s) here. Pass --replace to mean \
+                     it, or `tcr peer network-key clear` first"
+                ));
+            }
+            Ok(replaced) => {
+                tcr::peer::config::save(&path, &file)?;
+                println!(
+                    "peer join: network key {} file={}",
+                    if replaced { "replaced" } else { "set" },
+                    path.display()
+                );
+            }
         }
     }
 
@@ -435,7 +433,7 @@ pub(super) fn run_peer_forget(a: peer_cli::PeerForgetArgs) -> anyhow::Result<()>
          live session with it closes within one frame"
     );
     let file = tcr::peer::config::read_or_default(&path)?;
-    let relays = tcr::peer::pair::peers_still_holding_relay(&file);
+    let relays = file.relay_holders();
     if !relays.is_empty() {
         println!(
             "peer forget: WARNING this does NOT revoke egress still reachable through \

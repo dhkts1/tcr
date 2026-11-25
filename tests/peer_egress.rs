@@ -45,8 +45,8 @@ use axum::http::{Request, StatusCode};
 use tcr::config::{Account, Config};
 use tcr::manager::Manager;
 use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
-use tcr::peer::config::{Allow, Endpoint, EndpointSource, PeerFile, PeerRow};
-use tcr::peer::egress::{self, GatewayCandidate, ViaSetting};
+use tcr::peer::config::{Allow, Endpoint, EndpointSource, PeerFile, PeerRow, ViaSetting};
+use tcr::peer::egress::{self, GatewayCandidate};
 use tcr::peer::listener;
 use tcr::peer::noise;
 use tcr::peer::tunnel::{self, Admission, Carry, OriginRoute, TunnelBudget};
@@ -444,9 +444,9 @@ fn carried_client(origin: &Origin, splice_port: u16) -> reqwest::Client {
 /// gateway grant off (we do not carry for it).
 fn write_carrying_gateway(peers: &std::path::Path, gateway: &PeerId, addr: &str) {
     let mut file = PeerFile::default();
-    file.peers
-        .push(row(gateway, "gateway", vec![addr.to_string()], false));
-    file.peers[0].allow.carry = true;
+    let mut carrying = row(gateway, "gateway", vec![addr.to_string()], false);
+    carrying.allow.carry = true;
+    file.pin(carrying);
     tcr::peer::config::save(peers, &file).expect("write the peers file");
 }
 
@@ -491,8 +491,7 @@ async fn real_gateway_pinning(
     let gateway_key = tcr::peer::id::NodeKey::load_or_mint(dir).expect("the gateway's node key");
     let peers = dir.join("tcr-peers.json");
     let mut file = PeerFile::default();
-    file.peers
-        .push(row(&requester.id, "requester", Vec::new(), true));
+    file.pin(row(&requester.id, "requester", Vec::new(), true));
     tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let listening = loopback().await;

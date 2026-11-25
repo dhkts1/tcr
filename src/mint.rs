@@ -3,14 +3,14 @@
 //! on the clipboard. Nothing is written to the config file: this command
 //! exports, it never stores (`docs/design/long-lived-tokens.md`).
 //!
-//! Deliberately separate from [`crate::oauth`]'s login flow rather than a new
+//! Deliberately separate from [`crate::login`]'s login flow rather than a new
 //! branch inside it: the authorize host (`claude.com/cai/oauth/authorize`,
-//! not [`oauth::AUTHORIZE_URL`]) and redirect target (an out-of-band paste
+//! not [`login::AUTHORIZE_URL`]) and redirect target (an out-of-band paste
 //! page, not a local callback server) both differ, and `login_hint` here is
 //! load-bearing ergonomics for a KNOWN row rather than the add-a-new-account
-//! convenience it is in [`oauth::login`]. What IS shared — [`oauth::CLIENT_ID`],
-//! [`oauth::TOKEN_ENDPOINT`], [`oauth::OAUTH_SCOPES`],
-//! [`oauth::LOGIN_TOKEN_LIFETIME_SECS`] and the two headers the endpoint
+//! convenience it is in [`login::login`]. What IS shared — [`oauth::CLIENT_ID`],
+//! [`oauth::TOKEN_ENDPOINT`], [`login::OAUTH_SCOPES`],
+//! [`login::LOGIN_TOKEN_LIFETIME_SECS`] and the two headers the endpoint
 //! requires to avoid a bogus 429 — is reused by name, never re-typed.
 
 use std::io::IsTerminal as _;
@@ -26,11 +26,12 @@ use serde::Deserialize;
 use crate::config::{self, Account};
 use crate::identity;
 use crate::log_err::LogErr as _;
+use crate::login;
 use crate::oauth;
 use crate::provider_guard::{self, ClaudeOnlyVerb};
 
 /// Authorize endpoint used by `tcr mint`. Measured against the live endpoint
-/// (`docs/design/long-lived-tokens.md`) — distinct from [`oauth::AUTHORIZE_URL`],
+/// (`docs/design/long-lived-tokens.md`) — distinct from [`login::AUTHORIZE_URL`],
 /// which the browser-login flow uses.
 pub const MINT_AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
 
@@ -66,7 +67,7 @@ fn build_mint_flow(login_hint: &str) -> anyhow::Result<MintFlow> {
 
     let (auth_url, csrf) = client
         .authorize_url(|| CsrfToken::new_random_len(32))
-        .add_scope(Scope::new(oauth::OAUTH_SCOPES.to_string()))
+        .add_scope(Scope::new(login::OAUTH_SCOPES.to_string()))
         .set_pkce_challenge(challenge)
         .add_extra_param("code", "true")
         .add_extra_param("login_hint", login_hint)
@@ -91,7 +92,7 @@ fn mint_exchange_request_body(code: &str, verifier: &str, state: &str) -> serde_
         "client_id": oauth::CLIENT_ID,
         "redirect_uri": MINT_REDIRECT_URI,
         "code_verifier": verifier,
-        "expires_in": oauth::LOGIN_TOKEN_LIFETIME_SECS,
+        "expires_in": login::LOGIN_TOKEN_LIFETIME_SECS,
     })
 }
 
@@ -123,7 +124,7 @@ struct MintOrg {
 }
 
 /// Exchange the pasted authorization code for a long-lived token. A
-/// `.no_proxy()` client, exactly like [`oauth::exchange_code`]: an ambient
+/// `.no_proxy()` client, exactly like [`login::exchange_code`]: an ambient
 /// `HTTPS_PROXY` points at tcr itself, and routing this exchange through it
 /// would loop back into the very proxy this token is meant to feed.
 async fn exchange_mint_code(
@@ -222,7 +223,7 @@ fn evaluate_mint_response(requested_email: &str, response: MintExchangeResponse)
         };
     }
 
-    let requested_secs = oauth::LOGIN_TOKEN_LIFETIME_SECS as i64;
+    let requested_secs = login::LOGIN_TOKEN_LIFETIME_SECS as i64;
     let granted_secs = response.expires_in.unwrap_or(0);
     if granted_secs != requested_secs {
         return MintOutcome::LifetimeMismatch {
@@ -243,18 +244,12 @@ fn evaluate_mint_response(requested_email: &str, response: MintExchangeResponse)
 }
 
 /// Split a pasted `code#state` on `#`, keeping the part before it — exactly as
-/// [`oauth::login_with_token`] reads a bare line, per the bridge brief. Falls
+/// [`login::login_with_token`] reads a bare line, per the bridge brief. Falls
 /// back to the whole trimmed string when no `#` is present rather than
 /// erroring: a caller that pasted a bare code (no state) should not be
 /// refused a value [`exchange_mint_code`] can still try.
 fn parse_pasted_code(pasted: &str) -> &str {
     pasted.split_once('#').map_or(pasted, |(code, _state)| code)
-}
-
-/// Every account in `accounts` carrying `group` — exactly
-/// [`Account::in_group`], never a looser substring or prefix match.
-fn select_group_accounts<'a>(accounts: &'a [Account], group: &str) -> Vec<&'a Account> {
-    accounts.iter().filter(|a| a.in_group(group)).collect()
 }
 
 /// Which accounts a `tcr mint` run targets, and what it does with each, before
@@ -263,26 +258,27 @@ fn select_group_accounts<'a>(accounts: &'a [Account], group: &str) -> Vec<&'a Ac
 /// Pure, so the provider rules are testable without a URL or a paste:
 /// - `--account` naming a Codex row is refused outright, with
 ///   [`provider_guard::provider_guard`]'s sentence, before any URL;
-/// - `--group` keeps every member, in config order, and marks a Codex member
-///   [`MintTarget::SkipCodex`], so the report names it rather than dropping it.
+/// - `--group` keeps every member ([`config::Config::group_members`], exactly
+///   [`Account::in_group`], never a looser substring or prefix match), in config
+///   order, and marks a Codex member [`MintTarget::SkipCodex`], so the report
+///   names it rather than dropping it.
 ///
 /// The selection and its two refusals (a group no account carries, and both or
 /// neither flag) are exactly what they were before Codex accounts existed.
 fn plan_mint<'a>(
-    accounts: &'a [Account],
+    config: &'a config::Config,
     account: Option<&str>,
-    group: Option<&str>,
+    group: Option<&'a str>,
 ) -> anyhow::Result<Vec<MintTarget<'a>>> {
     match (account, group) {
         (Some(query), None) => {
-            let idx = crate::cli::resolve_account(accounts, query)?;
-            let row = &accounts[idx];
+            let row = config.resolve_account(query)?;
             provider_guard::provider_guard(row, ClaudeOnlyVerb::Mint)
                 .map_err(anyhow::Error::msg)?;
             Ok(vec![MintTarget::Mint(row)])
         }
         (None, Some(group)) => {
-            let matches = select_group_accounts(accounts, group);
+            let matches: Vec<&Account> = config.group_members(group).collect();
             if matches.is_empty() {
                 anyhow::bail!("no account carries group '{group}'");
             }
@@ -492,7 +488,7 @@ pub async fn run_mint(
 ) -> anyhow::Result<bool> {
     let (cfg, _created) = config::load_or_init(config_path).context("load config for mint")?;
 
-    let targets = plan_mint(&cfg.accounts, account, group)?;
+    let targets = plan_mint(&cfg, account, group)?;
 
     let mut results = Vec::with_capacity(targets.len());
     for target in targets {
@@ -580,7 +576,7 @@ mod tests {
             .find(|(k, _)| k == "scope")
             .map(|(_, v)| v.into_owned())
             .expect("scope param present");
-        assert_eq!(scope, oauth::OAUTH_SCOPES);
+        assert_eq!(scope, login::OAUTH_SCOPES);
     }
 
     // --- exchange body ---------------------------------------------------
@@ -588,7 +584,7 @@ mod tests {
     #[test]
     fn mint_exchange_body_requests_the_long_lived_lifetime() {
         let body = mint_exchange_request_body("code123", "verifier", "state");
-        assert_eq!(body["expires_in"], oauth::LOGIN_TOKEN_LIFETIME_SECS);
+        assert_eq!(body["expires_in"], login::LOGIN_TOKEN_LIFETIME_SECS);
         assert_eq!(body["grant_type"], "authorization_code");
         assert_eq!(body["redirect_uri"], MINT_REDIRECT_URI);
     }
@@ -614,7 +610,7 @@ mod tests {
             "alice@example.com",
             response(
                 Some("alice@example.com"),
-                Some(oauth::LOGIN_TOKEN_LIFETIME_SECS as i64),
+                Some(login::LOGIN_TOKEN_LIFETIME_SECS as i64),
             ),
         );
         assert!(matches!(outcome, MintOutcome::Minted { .. }));
@@ -626,7 +622,7 @@ mod tests {
             "alice@example.com",
             response(
                 Some("mallory@example.com"),
-                Some(oauth::LOGIN_TOKEN_LIFETIME_SECS as i64),
+                Some(login::LOGIN_TOKEN_LIFETIME_SECS as i64),
             ),
         );
         assert!(matches!(outcome, MintOutcome::IdentityMismatch { .. }));
@@ -664,7 +660,7 @@ mod tests {
             outcome: MintOutcome::Minted {
                 token: "secret-token".to_string(),
                 org: "acme-corp".to_string(),
-                granted_secs: oauth::LOGIN_TOKEN_LIFETIME_SECS as i64,
+                granted_secs: login::LOGIN_TOKEN_LIFETIME_SECS as i64,
             },
         }];
         assert_eq!(
@@ -699,6 +695,13 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
+    /// A config holding exactly `accounts`.
+    fn config_of(accounts: Vec<Account>) -> config::Config {
+        let mut config: config::Config = serde_json::from_str("{}").unwrap();
+        config.accounts = accounts;
+        config
+    }
+
     #[test]
     fn group_selects_exactly_the_members_and_account_selects_one() {
         let accounts = vec![
@@ -707,23 +710,24 @@ mod tests {
             account("carol@example.com", &["team-b"]),
         ];
 
-        let team_a = select_group_accounts(&accounts, "team-a");
+        let config = config_of(accounts);
+        let team_a: Vec<&Account> = config.group_members("team-a").collect();
         assert_eq!(
             team_a.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
             vec!["alice@example.com", "bob@example.com"]
         );
 
-        let team_b = select_group_accounts(&accounts, "team-b");
+        let team_b: Vec<&Account> = config.group_members("team-b").collect();
         assert_eq!(
             team_b.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
             vec!["bob@example.com", "carol@example.com"]
         );
 
-        let none = select_group_accounts(&accounts, "no-such-group");
+        let none: Vec<&Account> = config.group_members("no-such-group").collect();
         assert!(none.is_empty());
 
-        let idx = crate::cli::resolve_account(&accounts, "carol@example.com").unwrap();
-        assert_eq!(accounts[idx].name, "carol@example.com");
+        let carol = config.resolve_account("carol@example.com").unwrap();
+        assert_eq!(carol.name, "carol@example.com");
     }
 
     // --- Codex accounts ------------------------------------------------
@@ -779,12 +783,13 @@ mod tests {
             codex_account("bob@example.com/codex", &[]),
         ];
 
-        let err = plan_mint(&accounts, Some("bob@example.com/codex"), None)
+        let config = config_of(accounts);
+        let err = plan_mint(&config, Some("bob@example.com/codex"), None)
             .expect_err("a Codex row has no long-lived token to mint");
         assert_eq!(err.to_string(), refusal);
 
-        let plan = plan_mint(&accounts, Some("alice@example.com"), None)
-            .expect("a Claude row still mints");
+        let plan =
+            plan_mint(&config, Some("alice@example.com"), None).expect("a Claude row still mints");
         assert_eq!(shape(&plan), vec![("mint", "alice@example.com")]);
 
         // The same refusal through the verb itself, on a real file. The Codex row
@@ -826,7 +831,8 @@ mod tests {
             codex_account("bob@example.com/codex", &["team"]),
             account("carol@example.com", &["team"]),
         ];
-        let plan = plan_mint(&accounts, None, Some("team")).expect("the group has members");
+        let config = config_of(accounts);
+        let plan = plan_mint(&config, None, Some("team")).expect("the group has members");
         assert_eq!(
             shape(&plan),
             vec![

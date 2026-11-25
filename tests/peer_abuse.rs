@@ -45,12 +45,12 @@ use std::time::Duration;
 use tcr::log_err::LogErr as _;
 
 use tcr::peer::config::{self, Allow, Endpoint, EndpointSource, PeerFile, PeerRow};
-use tcr::peer::discovery::{self, Discovered, FoundList, FoundSource};
+use tcr::peer::discovery::{self, Discovered, FoundList};
 use tcr::peer::id::NodeKey;
 use tcr::peer::listener::{self, Admission, SessionContext};
 use tcr::peer::noise;
 use tcr::peer::pair;
-use tcr::peer::state::{self, PeerState};
+use tcr::peer::state::{self, FoundSource, PeerState};
 use tcr_peer_wire::{INSTANCE_ID_BYTES, InstanceId, Knock, PROTO_VERSION, PeerId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
@@ -220,11 +220,11 @@ fn the_caps_are_still_the_numbers_the_plan_shipped() {
         discovery::MAX_FOUND_PER_ADDRESS
     );
     assert_eq!(
-        discovery::FOUND_TTL_MS,
+        state::FOUND_TTL_MS,
         plan::FOUND_TTL_MS,
         "the found-row TTL shipped as {}ms and the code enforces {}ms",
         plan::FOUND_TTL_MS,
-        discovery::FOUND_TTL_MS
+        state::FOUND_TTL_MS
     );
     assert_eq!(
         state::MUTE_MS,

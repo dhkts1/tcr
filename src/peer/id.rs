@@ -9,7 +9,7 @@
 //!
 //! A re-mint evicts every peer that pinned this node, their next handshake
 //! fails the pin check, correctly, because the key really did change. So
-//! [`NodeKey::load_or_mint`] mints on FIRST use only, and a re-mint is an
+//! [`NodeKey::load_or_mint`](crate::peer::id::NodeKey::load_or_mint) mints on FIRST use only, and a re-mint is an
 //! explicit operator act with its own confirmation, never a repair a boot
 //! sequence performs on its own.
 //!
@@ -376,7 +376,7 @@ pub fn random_secret() -> Result<[u8; KEY_BYTES]> {
 
 /// 128 opaque bits, from the platform CSPRNG.
 ///
-/// `getrandom` directly rather than `noise::random_secret`: a lease id is not
+/// `getrandom` directly rather than `id::random_secret`: a lease id is not
 /// Noise material, and routing it through the one file that may name `snow::`
 /// would make a handshake module the source of a number that has nothing to do
 /// with a handshake. It is a DIRECT dependency, already

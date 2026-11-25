@@ -39,11 +39,6 @@ impl Manager {
         self.affinity_file.changed().await;
     }
 
-    /// Consume the dirty flag: `true` when something changed since the last call.
-    pub fn take_affinity_dirty(&self) -> bool {
-        self.affinity_file.take()
-    }
-
     /// Record whether `key`'s most recent request asked Anthropic's cache for
     /// the extended `"ttl":"1h"` window (see [`crate::cache_ttl`]). Called from
     /// the request path once per request, before `select()`, which reads it
@@ -174,12 +169,17 @@ impl Manager {
     /// write put on disk, by the rule [`crate::save_gate`] states. A save that would write the
     /// same pins writes nothing, and one that would only move touch times waits until
     /// [`crate::manager::AFFINITY_TOUCH_REFRESH`] has passed since the last write.
+    ///
+    /// Clears the dirty flag FIRST, before the snapshot, so a change that lands while the
+    /// write runs leaves the flag up for the next save to see.
     pub fn flush_affinity_if_changed(&self, path: &Path) -> Result<SaveOutcome, ConfigError> {
-        let pins = self.affinity_pin_snapshot();
-        self.affinity_file
-            .save_if_changed(affinity::save_hashes(&pins)?, || {
-                affinity::save(path, &pins, crate::now_ms())
-            })
+        self.affinity_file.save_if_changed(
+            || {
+                let pins = self.affinity_pin_snapshot();
+                Ok((affinity::save_hashes(&pins)?, pins))
+            },
+            |pins| affinity::save(path, &pins, crate::now_ms()),
+        )
     }
 
     /// Restore pins from `path` into the live map, resolving each stored identity
@@ -501,23 +501,24 @@ mod tests {
         assert!(pins_of(&manager).is_empty());
     }
 
-    /// The debounce contract the flusher task runs on: a change raises the flag,
-    /// one take consumes it, and a second take reports nothing more to write. Were
-    /// the take not consuming, an idle proxy would rewrite the file every interval
-    /// forever.
+    /// The debounce contract the flusher task runs on: a change raises the flag, and
+    /// the flusher's save clears it. Were the save not clearing it, an idle proxy
+    /// would wake to save the file every interval forever.
     #[test]
-    fn the_dirty_flag_is_raised_by_a_change_and_consumed_by_one_take() {
+    fn the_dirty_flag_is_raised_by_a_change_and_cleared_by_the_flusher_save() {
+        let path = tmp("dirty-flag");
         let manager = manager_over(&[account("a@example.com", "uuid-a")]);
         assert!(
-            !manager.take_affinity_dirty(),
+            !manager.affinity_file.is_dirty(),
             "a fresh map has nothing to flush"
         );
         manager.mark_affinity_dirty();
-        assert!(manager.take_affinity_dirty(), "a change must be observed");
         assert!(
-            !manager.take_affinity_dirty(),
-            "and consumed by that observation"
+            manager.affinity_file.is_dirty(),
+            "a change must be observed"
         );
+        manager.flush_affinity_if_changed(&path).expect("save");
+        assert!(!manager.affinity_file.is_dirty(), "and cleared by the save");
     }
 
     /// The flusher's save writes nothing when the pins are what it last wrote. The file is

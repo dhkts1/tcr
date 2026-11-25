@@ -79,8 +79,8 @@ fn both_ends_of_a_pairing_derive_one_port_per_slot() {
         "both sides must have completed the handshake before a hash is read off it"
     );
 
-    let dialling_secret = reach::port_secret(dialling.get_handshake_hash());
-    let accepting_secret = reach::port_secret(accepting.get_handshake_hash());
+    let dialling_secret = noise::port_secret(dialling.get_handshake_hash());
+    let accepting_secret = noise::port_secret(accepting.get_handshake_hash());
     assert_eq!(
         dialling_secret, accepting_secret,
         "the two ends of one handshake must derive one port secret; if this differs, no \
@@ -324,13 +324,13 @@ async fn a_dead_recorded_port_falls_through_to_the_pairs_rendezvous_port() {
     // secret is chosen so that port is free here, and held until the dial.
     let (secret, listening, port) =
         a_stand_in_whose_port_binds(|step| stepped::<32>(0x5a, step), current_port).await;
-    reach::remember_port_secret(node, secret);
+    noise::remember_port_secret(node, secret);
 
     let accepting = tokio::spawn(async move { listening.accept().await.map(|(_, from)| from) });
 
     let dead = a_closed_loopback_port().await;
     let row = row_at(node, dead);
-    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::tunnel::dial::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
 
@@ -365,13 +365,13 @@ async fn one_slot_of_skew_still_meets() {
         |secret, slot| reach::derived_port(secret, slot - 1),
     )
     .await;
-    reach::remember_port_secret(node, secret);
+    noise::remember_port_secret(node, secret);
 
     let accepting = tokio::spawn(async move { listening.accept().await.map(|(_, from)| from) });
 
     let dead = a_closed_loopback_port().await;
     let row = row_at(node, dead);
-    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::tunnel::dial::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
 
@@ -410,7 +410,7 @@ async fn with_no_secret_for_the_pair_nothing_but_the_recorded_endpoint_is_tried(
 
     let dead = a_closed_loopback_port().await;
     let row = row_at(node, dead);
-    let reached = tcr::peer::serve::dial_peer_within(&row, 900)
+    let reached = tcr::peer::tunnel::dial::dial_peer_within(&row, 900)
         .await
         .map(|(addr, _stream)| addr);
 
@@ -465,7 +465,7 @@ async fn two_blackholing_endpoints_leave_a_later_step_time_to_run() {
     // recorded port, and the leading race concludes in well under a second
     // regardless of its bound, proving nothing about the bound at all.
     let secret = [0x59_u8; 32];
-    reach::remember_port_secret(node, secret);
+    noise::remember_port_secret(node, secret);
 
     let mut row = peer_config::PeerRow {
         node,
@@ -500,7 +500,8 @@ async fn two_blackholing_endpoints_leave_a_later_step_time_to_run() {
 
     let deadline_ms: u64 = 10_000;
     let start = Instant::now();
-    let reached = tcr::peer::serve::dial_peer_reaching_within(&dial_row, &store, deadline_ms).await;
+    let reached =
+        tcr::peer::tunnel::dial::dial_peer_reaching_within(&dial_row, &store, deadline_ms).await;
     let elapsed = start.elapsed();
 
     assert!(
@@ -560,7 +561,7 @@ async fn a_dial_that_fails_one_endpoint_cools_it_and_the_next_order_drops_it() {
         peer_config::EndpointSource::Paired,
     ));
 
-    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::tunnel::dial::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
     assert_eq!(
@@ -574,7 +575,7 @@ async fn a_dial_that_fails_one_endpoint_cools_it_and_the_next_order_drops_it() {
         .expect("the accept task")
         .expect("the listener accepted the dial");
 
-    let order = tcr::peer::serve::dial_order(&row);
+    let order = tcr::peer::tunnel::dial::dial_order(&row);
     let remaining: Vec<SocketAddr> = order
         .iter()
         .filter_map(peer_config::Endpoint::direct_addr)
@@ -627,7 +628,7 @@ async fn a_dial_that_races_two_live_endpoints_does_not_cool_the_one_it_did_not_u
         peer_config::EndpointSource::Paired,
     ));
 
-    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::tunnel::dial::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
     assert!(
@@ -635,7 +636,7 @@ async fn a_dial_that_races_two_live_endpoints_does_not_cool_the_one_it_did_not_u
         "one of the two live listeners must answer the race: {reached:?}"
     );
 
-    let order = tcr::peer::serve::dial_order(&row);
+    let order = tcr::peer::tunnel::dial::dial_order(&row);
     let remaining: Vec<SocketAddr> = order
         .iter()
         .filter_map(peer_config::Endpoint::direct_addr)
@@ -743,15 +744,15 @@ async fn a_restart_reaches_a_peer_on_the_derived_port_from_the_peers_file() {
     // dial: see `a_stand_in_whose_port_binds`.
     let (handshake_hash, listening, port) = a_stand_in_whose_port_binds(
         |step| stepped::<48>(0x7e, step),
-        |hash, slot| current_port(&reach::port_secret(hash), slot),
+        |hash, slot| current_port(&noise::port_secret(hash), slot),
     )
     .await;
-    let secret = reach::port_secret(&handshake_hash);
+    let secret = noise::port_secret(&handshake_hash);
     let hash_hex: String = handshake_hash.iter().map(|b| format!("{b:02x}")).collect();
     let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
 
     assert!(
-        reach::port_secret_for(&node).is_none(),
+        noise::port_secret_for(&node).is_none(),
         "the control: this process has completed no session with that key, which is the \
          state a restart leaves behind"
     );
@@ -801,7 +802,7 @@ async fn a_restart_reaches_a_peer_on_the_derived_port_from_the_peers_file() {
         "a boot restores the one row that carries a secret"
     );
     assert_eq!(
-        reach::port_secret_for(&node),
+        noise::port_secret_for(&node),
         Some(secret),
         "and the register holds exactly what the file did, byte for byte"
     );
@@ -810,7 +811,7 @@ async fn a_restart_reaches_a_peer_on_the_derived_port_from_the_peers_file() {
 
     let dead = a_closed_loopback_port().await;
     let row = row_at(node, dead);
-    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::tunnel::dial::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
 
@@ -850,7 +851,7 @@ fn forgetting_a_peer_clears_its_rendezvous_secret() {
     use tcr::peer::config;
 
     let node = tcr_peer_wire::PeerId([0x66; 32]);
-    let secret = reach::port_secret(&[0x1d_u8; 48]);
+    let secret = noise::port_secret(&[0x1d_u8; 48]);
 
     let dir = scratch("forget-rendezvous");
     let peers = dir.join("tcr-peers.json");
@@ -873,10 +874,10 @@ fn forgetting_a_peer_clears_its_rendezvous_secret() {
             .expect("0600 on the peers file");
     }
     config::observe_rendezvous_secret(&peers, &node, secret).expect("the write runs");
-    reach::remember_port_secret(node, secret);
+    noise::remember_port_secret(node, secret);
 
     assert_eq!(
-        reach::port_secret_for(&node),
+        noise::port_secret_for(&node),
         Some(secret),
         "the control: this process holds the pair's secret before the forget, so what \
          follows is the forget and not an empty register"
@@ -889,7 +890,7 @@ fn forgetting_a_peer_clears_its_rendezvous_secret() {
     );
 
     assert_eq!(
-        reach::port_secret_for(&node),
+        noise::port_secret_for(&node),
         None,
         "a forgotten Mac leaves no way to compute its rendezvous ports, or `forget` \
          means only the ways that were written down"
@@ -1016,7 +1017,7 @@ fn a_punch_that_cannot_start_names_what_is_missing() {
         "an address without a secret is a port the two cannot compute"
     );
 
-    reach::remember_port_secret(node, [0x5c; 32]);
+    noise::remember_port_secret(node, [0x5c; 32]);
     let (addr, secret) = reach::punch_target(&node, &[]).expect("both halves are held now");
     assert_eq!(
         addr,
@@ -1055,7 +1056,7 @@ fn aim_off_the_row() {
         tcr::peer::config::EndpointSource::Moved,
     )];
 
-    reach::remember_port_secret(node, [0x5d; 32]);
+    noise::remember_port_secret(node, [0x5d; 32]);
     let (addr, secret) = reach::punch_target(&node, &endpoints).expect(
         "punch_target refused with PeerAddressUnknown while the row held \
          198.51.100.7:7755 from a moved link",

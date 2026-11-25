@@ -7,8 +7,8 @@
 //!
 //! Never the node id, never the static public key, never a fingerprint of
 //! either, and no other Noise material. That is a decision, not a default, and
-//! it is why [`advertise`] does not take a `PeerId` at all and why
-//! [`Discovered`] does not carry one: a signature that cannot express the
+//! it is why [`advertise`](crate::peer::discovery::advertise) does not take a `PeerId` at all and why
+//! [`Discovered`](crate::peer::discovery::Discovered) does not carry one: a signature that cannot express the
 //! forbidden thing is stronger than a comment asking nobody to add it.
 //!
 //! The consequence, stated so nobody re-derives it wrongly: **identity is
@@ -23,7 +23,7 @@
 //!
 //! # Two functions, on purpose
 //!
-//! [`advertise`] and [`browse`] are the entire surface. The implementation
+//! [`advertise`](crate::peer::discovery::advertise) and [`browse`](crate::peer::discovery::browse) are the entire surface. The implementation
 //! behind them, `mdns-sd` today, a small UDP beacon in the recorded
 //! alternative, can be swapped without touching trust, because **discovery
 //! grants nothing**: a beacon is a hint about where to dial, identity is proved
@@ -43,7 +43,7 @@
 //! one that matters: a name in an inbound TXT record is text a stranger on
 //! this network chose, and it lands in a panel row, a `tcr peer ls` line and a
 //! log line. [`browse_once`] runs every name it resolves through
-//! [`sanitize_name`], so a control character, an ANSI escape, a newline or a
+//! [`sanitize_name`](crate::peer::discovery::sanitize_name), so a control character, an ANSI escape, a newline or a
 //! Unicode direction override never reaches any of the three.
 //!
 //! # Off by default
@@ -58,9 +58,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use serde::{Deserialize, Serialize};
 
 use crate::peer::config::{Endpoint, EndpointSource, PeerRow, PeerStore};
+use crate::peer::state::{FOUND_TTL_MS, FoundSource};
 
 /// The DNS-SD service type this node registers and browses.
 pub const SERVICE_TYPE: &str = "_tcr-peer._tcp.local.";
@@ -100,10 +100,6 @@ pub const MAX_FOUND_ROWS: usize = 12;
 /// How many found rows one source address may hold. Two: a Mac with two
 /// interfaces on the same LAN is real, and 254 rows from one address is not.
 pub const MAX_FOUND_PER_ADDRESS: usize = 2;
-
-/// How long a row survives after its last announcement.
-/// `abuse-resistance.md`: "a row that stops announcing leaves after 60 s".
-pub const FOUND_TTL_MS: i64 = 60_000;
 
 /// How long one [`browse`] call listens before returning what it has seen.
 /// Short on purpose: a caller polls this repeatedly rather than holding a
@@ -840,55 +836,11 @@ pub fn observe_beacons(
 // Neighbour briefs: what a trusted peer's `Hello.briefs` may teach this node
 // ---------------------------------------------------------------------------
 
-/// Reduce this node's own trusted rows to what a `NeighborBrief` may ever say
-/// about them: the key and its endpoint locators, nothing this node was told
-/// in confidence.
-///
-/// The rule, verbatim: "friends through friends are not supported
-/// unless you both support the same friend." A brief is useful only for a Mac
-/// BOTH sides already trust, so this function's whole job is producing one
-/// side of that: it reads `trusted`, which is by construction the set of keys
-/// this node already pinned, and there is no argument here through which an
-/// unpinned or merely-discovered row could arrive.
-///
-/// `exclude` is the peer this brief set is about to be sent TO. A brief
-/// telling B about B is a line B already knows better than this node does, so
-/// it is dropped here, the way `Hello.briefs`' own doc comment describes
-/// split horizon: never back a fact out the link it would be re-advertised
-/// on.
-///
-/// `Caps::default()` on every entry, by decision and not by gap. A brief is an
-/// address hint for a mutual friend, nothing more: the receiver's own honest
-/// view of what that friend can do comes from connecting to the friend
-/// directly and reading its `Hello`, which is the one place caps are actually
-/// current. This node's own peers file records where a trusted peer answers,
-/// not what it can do right now, so `neighbor_briefs` has nothing true to fill
-/// caps from, and inventing a value here would be a guess dressed as a fact
-/// forwarded on a chain of trust the wire never promised to keep fresh.
-pub fn neighbor_briefs(
-    trusted: &[PeerRow],
-    exclude: tcr_peer_wire::PeerId,
-) -> Vec<tcr_peer_wire::NeighborBrief> {
-    trusted
-        .iter()
-        .filter(|row| row.node != exclude)
-        .map(|row| tcr_peer_wire::NeighborBrief {
-            node: row.node,
-            caps: tcr_peer_wire::Caps::default(),
-            addrs: row
-                .endpoints
-                .iter()
-                .filter_map(Endpoint::direct_addr)
-                .map(|addr| addr.to_string())
-                .collect(),
-        })
-        .collect()
-}
-
 /// The endpoints one incoming `Hello.briefs` teaches this node, about peers it
 /// already pinned, and nothing about anyone else.
 ///
-/// This is the enforcement half of that rule. The filter is the whole
+/// This is the enforcement half of the rule
+/// [`crate::peer::config::PeerFile::neighbor_briefs`] quotes. The filter is the whole
 /// of the rule, and it runs before a brief entry is anything but a local
 /// variable: `pinned.iter().any(...)` is checked first, so a brief naming a
 /// key this node has not pinned never reaches a socket address, a log line
@@ -1461,20 +1413,6 @@ impl Discovered {
             sources: self.sources.clone(),
         }
     }
-}
-
-/// Where a found row was heard.
-///
-/// Ordered `Lan` before `Tailnet` so a sorted list of sources reads the way
-/// `tcr peer ls --json` writes it: `["lan", "tailnet"]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FoundSource {
-    /// An mDNS beacon on this LAN.
-    Lan,
-    /// A beacon datagram over the tailnet, from one of the operator's own
-    /// Macs as the Tailscale app on this Mac names them.
-    Tailnet,
 }
 
 #[cfg(test)]

@@ -70,6 +70,11 @@ impl Node {
         config::save(&self.peers, file).expect("the peers file writes");
     }
 
+    /// Point this node's listener at `addr` by hand, as an operator does.
+    pub(super) fn listen_on(&self, addr: SocketAddr) {
+        crate::peer_support::hand_edit_listen(&self.peers, addr);
+    }
+
     pub(super) fn state(&self) -> PeerState {
         state::load(&self.state, 0).expect("the state file reads")
     }

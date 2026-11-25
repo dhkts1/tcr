@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use anyhow::bail;
 
-use super::live_client::{
-    ControlRoute, LiveControlError, LiveStatusError, call_route, fetch_live_status,
-};
 use super::load_config_with_creation;
 use crate::config::Config;
+use crate::live_client::{
+    ControlRoute, LiveControlError, LiveStatusError, call_route, fetch_live_status,
+};
 
 /// [`crate::proxy::FAN_PATH`]. 400 is a refused mode, 503 a server with no fan controller.
 const FAN_ROUTE: ControlRoute = ControlRoute {
@@ -127,19 +127,15 @@ async fn live_fan(
     let payload = fetch_live_status(config)
         .await
         .map_err(|e| anyhow::anyhow!(live_status_why(&e, config.proxy.port)))?;
-    let heat = payload
-        .heat
-        .as_ref()
-        .and_then(crate::status::HeatField::reading)
-        .cloned();
-    match payload.fan_control {
-        Some(crate::status::FanControlField::Reading(row)) => Ok((row, heat)),
-        Some(crate::status::FanControlField::Unreadable(why)) => bail!(
+    let heat = payload.heat_reading().ok().cloned();
+    match payload.fan_control_reading() {
+        Ok(row) => Ok((row.clone(), heat)),
+        Err(crate::status::Unread::Unparsed(why)) => bail!(
             "the tcr on 127.0.0.1:{} answered with a fanControl object this tcr cannot read \
              ({why}); a server of another build answers this way, so restart it on this build",
             config.proxy.port
         ),
-        None => bail!(
+        Err(crate::status::Unread::NotSent) => bail!(
             "the tcr on 127.0.0.1:{} runs no fan controller (an older tcr, or one not started as the server)",
             config.proxy.port
         ),

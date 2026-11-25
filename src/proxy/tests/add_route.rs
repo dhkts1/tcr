@@ -549,7 +549,7 @@ async fn add_endpoint_refuses_other_methods_locally() {
 }
 
 /// Every answer the account-add route STAMPS also names the providers this
-/// server can store — the blank-probe 400 `oauth::probe_add_route` reads it
+/// server can store — the blank-probe 400 `login::probe_add_route` reads it
 /// from, a 405, a 409 and a 200 — and the gate's unstamped refusal names
 /// neither, so a caller that failed the gate learns nothing about the route.
 /// The stamp's own value is pinned literally: every older CLI recognises the
@@ -652,7 +652,7 @@ async fn the_add_route_names_its_providers_on_every_stamped_answer() {
 /// The 200's `provider` is the stored row's, read back from the live rotation, on
 /// both of the route's arms: a Codex add comes back `codex`, an Anthropic one
 /// `anthropic`, and so does an update of an existing row. This is what
-/// `oauth::finish_login_account` checks a Codex import against.
+/// `login::finish_login_account` checks a Codex import against.
 #[tokio::test]
 async fn the_add_route_echoes_the_provider_it_stored() {
     let (manager, path) = control_manager("add-echo", None);
@@ -696,10 +696,10 @@ async fn the_add_route_echoes_the_provider_it_stored() {
     std::fs::remove_file(&path).ok();
 }
 
-/// SEAM TEST. `oauth::probe_add_route` (unit 3)
+/// SEAM TEST. `login::probe_add_route` (unit 3)
 /// decides whether `tcr login` takes the LIVE route by `POSTing` this exact
 /// deliberately-blank body to `ADD_ACCOUNT_PATH` via
-/// `cli::post_add_account` and reading whether the reply is a STAMPED
+/// `live_client::post_add_account` and reading whether the reply is a STAMPED
 /// 400. An unstamped answer, or a different (non-400) status, reads as
 /// `AddCapability::Unusable` — `login_route` now REFUSES outright rather
 /// than falling back to the whole-file `config::save` path (bridge item
@@ -731,7 +731,7 @@ async fn probe_add_capabilitys_blank_body_is_a_stamped_400_and_mutates_nothing()
     tokio::spawn(async move { crate::mitm::serve(listener, serving, None).await });
 
     let client = crate::test_support::loopback::client();
-    // The EXACT `Account` `oauth::probe_add_route` builds:
+    // The EXACT `Account` `login::probe_add_route` builds:
     // a blank name, a blank access token, everything else absent.
     // DERIVED, not a restated literal — a future edit to the probe's body
     // (oauth.rs, out of this route's reach) changes this test's request

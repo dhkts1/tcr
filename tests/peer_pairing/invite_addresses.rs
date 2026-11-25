@@ -22,9 +22,7 @@ use super::*;
 #[test]
 fn a_mint_on_a_wide_listener_carries_no_bind_address() {
     let node = Node::new("wide-listener");
-    let mut file = node.file();
-    file.listen = Some("0.0.0.0:7755".parse().expect("a wide bind address"));
-    node.write_file(&file);
+    node.listen_on("0.0.0.0:7755".parse().expect("a wide bind address"));
     let store = config::PeerStore::open(&node.peers).expect("open the store");
 
     match pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1, None) {
@@ -37,7 +35,7 @@ fn a_mint_on_a_wide_listener_carries_no_bind_address() {
                 token.sockets().collect::<Vec<_>>()
             );
             assert!(
-                token.to_token().starts_with(pair::TOKEN_PREFIX_V2),
+                token.to_token().starts_with(join_key::TOKEN_PREFIX_V2),
                 "a key minted today carries a list"
             );
         }
@@ -59,9 +57,7 @@ fn a_mint_on_a_wide_listener_carries_no_bind_address() {
 #[test]
 fn a_mint_on_a_pinned_listener_carries_exactly_that_address() {
     let node = Node::new("pinned-listener");
-    let mut file = node.file();
-    file.listen = Some("127.0.0.1:9600".parse().expect("a loopback address"));
-    node.write_file(&file);
+    node.listen_on("127.0.0.1:9600".parse().expect("a loopback address"));
     let store = config::PeerStore::open(&node.peers).expect("open the store");
 
     let (_invite, token) = pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1, None)
@@ -86,7 +82,7 @@ fn a_mint_on_a_pinned_listener_carries_exactly_that_address() {
 /// break `dialaddrs::decode` and this fails on the round trip itself.
 #[test]
 fn a_v3_key_round_trips_every_address_family() {
-    let token = pair::JoinToken::new(
+    let token = join_key::JoinToken::new(
         vec![
             "192.0.2.10:7755".parse().expect("a test address"),
             "[2001:db8::1]:7755".parse().expect("a test address"),
@@ -97,22 +93,22 @@ fn a_v3_key_round_trips_every_address_family() {
     );
     let rendered = token.to_token_v3();
     assert!(
-        rendered.starts_with(pair::TOKEN_PREFIX_V3),
+        rendered.starts_with(join_key::TOKEN_PREFIX_V3),
         "a v3 key is minted with its own prefix: {rendered}"
     );
     assert_eq!(
-        pair::JoinToken::parse(&rendered).expect("a v3 key parses"),
+        join_key::JoinToken::parse(&rendered).expect("a v3 key parses"),
         token,
         "every address family must survive the round trip"
     );
     assert_eq!(
-        pair::JoinToken::parse(&format!("  {rendered}\n")).expect("a pasted v3 key parses"),
+        join_key::JoinToken::parse(&format!("  {rendered}\n")).expect("a pasted v3 key parses"),
         token,
         "a paste carries whitespace"
     );
 
     let body = rendered
-        .strip_prefix(pair::TOKEN_PREFIX_V3)
+        .strip_prefix(join_key::TOKEN_PREFIX_V3)
         .expect("the prefix was just asserted");
     assert!(
         !body.contains('.') && !body.contains(':'),
@@ -132,9 +128,7 @@ fn a_v3_key_round_trips_every_address_family() {
 #[test]
 fn tcr_peer_invite_names_every_address_and_the_internet_gap() {
     let node = Node::new("invite-cli");
-    let mut file = node.file();
-    file.listen = Some("127.0.0.1:9600".parse().expect("a loopback address"));
-    node.write_file(&file);
+    node.listen_on("127.0.0.1:9600".parse().expect("a loopback address"));
 
     // `HOME` points at this test's own scratch directory, because `tcr peer
     // invite` loads this node's keypair from the config directory and a test
@@ -150,11 +144,11 @@ fn tcr_peer_invite_names_every_address_and_the_internet_gap() {
     assert!(output.status.success(), "the mint failed: {out}{err}");
 
     assert!(
-        out.contains(&format!("\n{}", pair::TOKEN_PREFIX_V3)),
+        out.contains(&format!("\n{}", join_key::TOKEN_PREFIX_V3)),
         "the key printed by default is opaque now: {out}"
     );
     assert!(
-        !out.contains(pair::TOKEN_PREFIX_V2),
+        !out.contains(join_key::TOKEN_PREFIX_V2),
         "a v2 key is not printed unless --plain asked for it: {out}"
     );
     assert!(
@@ -189,15 +183,11 @@ fn tcr_peer_invite_names_every_address_and_the_internet_gap() {
 #[test]
 fn the_sealed_exchange_works_end_to_end_at_the_command_line() {
     let inviter = Node::new("sealed-inviter");
-    let mut inviter_file = inviter.file();
-    inviter_file.listen = Some("127.0.0.1:9700".parse().expect("a loopback address"));
-    inviter.write_file(&inviter_file);
+    inviter.listen_on("127.0.0.1:9700".parse().expect("a loopback address"));
     let inviter_home = scratch("sealed-inviter-home");
 
     let friend = Node::new("sealed-friend");
-    let mut friend_file = friend.file();
-    friend_file.listen = Some("127.0.0.1:9701".parse().expect("a loopback address"));
-    friend.write_file(&friend_file);
+    friend.listen_on("127.0.0.1:9701".parse().expect("a loopback address"));
     let friend_home = scratch("sealed-friend-home");
 
     let mint = tcr_command(&inviter_home)
@@ -297,9 +287,7 @@ fn the_sealed_exchange_works_end_to_end_at_the_command_line() {
 #[test]
 fn tcr_peer_invite_plain_mints_the_readable_key() {
     let node = Node::new("invite-cli-plain");
-    let mut file = node.file();
-    file.listen = Some("127.0.0.1:9600".parse().expect("a loopback address"));
-    node.write_file(&file);
+    node.listen_on("127.0.0.1:9600".parse().expect("a loopback address"));
 
     let home = scratch("invite-cli-plain-home");
     let output = tcr_command(&home)
@@ -312,11 +300,11 @@ fn tcr_peer_invite_plain_mints_the_readable_key() {
     assert!(output.status.success(), "the mint failed: {out}{err}");
 
     assert!(
-        out.contains(&format!("\n{}", pair::TOKEN_PREFIX_V2)),
+        out.contains(&format!("\n{}", join_key::TOKEN_PREFIX_V2)),
         "--plain still mints the readable key: {out}"
     );
     assert!(
-        !out.contains(pair::TOKEN_PREFIX_V3),
+        !out.contains(join_key::TOKEN_PREFIX_V3),
         "--plain does not also mint the opaque one: {out}"
     );
     assert!(

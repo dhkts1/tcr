@@ -99,25 +99,6 @@ async fn codex_error_responses_keep_status_content_type_and_retry_after() {
     }
 }
 
-#[test]
-fn gate_descriptions_keep_empty_and_provider_specific_phrases() {
-    let empty = std::collections::BTreeMap::new();
-    assert_eq!(describe_gates(&empty), "");
-    assert_eq!(describe_codex_gates(&empty), "");
-    let rejected = std::collections::BTreeMap::from([(GateReason::Rejected, 2)]);
-    assert_eq!(describe_gates(&rejected), ": 2 rejected upstream");
-    assert_eq!(describe_codex_gates(&rejected), ": 2 refused by ChatGPT");
-    let reserved = std::collections::BTreeMap::from([(GateReason::Reserved, 1)]);
-    assert_eq!(describe_gates(&reserved), ": 1 reserved for another group");
-    assert_eq!(
-        describe_codex_gates(&reserved),
-        ": 1 unreachable in a reserved group"
-    );
-    let common = std::collections::BTreeMap::from([(GateReason::Hold, 3)]);
-    assert_eq!(describe_gates(&common), ": 3 on an upstream hold");
-    assert_eq!(describe_codex_gates(&common), ": 3 on an upstream hold");
-}
-
 /// **Every refusal tcr sends a Codex request itself is counted, under its body's type**, so
 /// `tcr status` can say codex was refused while the panel looks healthy: no Codex account
 /// at all, an unusable pool (disabled), a pool held temporarily by an upstream

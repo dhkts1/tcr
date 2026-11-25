@@ -8,7 +8,7 @@
 # WireGuard, no key exchange, no MagicDNS, no ACLs. It models a tailnet, not
 # a second LAN: its subnet sits inside 100.64.0.0/10 and each overlay node's
 # entrypoint renames the interface holding that address to `utun0`, because
-# `pair::is_tailnet` only ranks an address first when both of those are true.
+# `pair::addresses::is_tailnet` only ranks an address first when both of those are true.
 #
 # Steps
 #   1. up both routers, then both overlay nodes
@@ -24,8 +24,8 @@
 #     six-digit compare and no second command
 #   - the joiner's row for node-a1 carries the overlay address
 #
-# `pair::dial_addresses` ranks a tailnet address ahead of a LAN one by
-# `pair::is_tailnet`, not by which interface `if-addrs` happens to walk to
+# `pair::addresses::dial_addresses` ranks a tailnet address ahead of a LAN one by
+# `pair::addresses::is_tailnet`, not by which interface `if-addrs` happens to walk to
 # first. This scenario measures whether that ranking holds for real; if the
 # harness's overlay address does not come first, this is the scenario that
 # says so.

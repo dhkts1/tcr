@@ -153,7 +153,13 @@ pub struct ErrorV1 {
 }
 
 impl ErrorV1 {
-    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+    /// The envelope for `kind` and `message`, as the one line `tcr list --json`
+    /// prints in place of the document.
+    pub fn line(kind: ErrorKind, message: impl Into<String>) -> String {
+        Self::new(kind, message).render()
+    }
+
+    fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -162,7 +168,7 @@ impl ErrorV1 {
 
     /// One line of JSON. Built as a `serde_json::Value`, whose `Display` cannot
     /// fail, so the error path itself has no error path.
-    pub fn render(&self) -> String {
+    fn render(&self) -> String {
         serde_json::json!({
             "schemaVersion": SCHEMA_VERSION,
             "error": { "type": self.kind.as_str(), "message": self.message },
@@ -370,11 +376,16 @@ mod tests {
 
     #[test]
     fn the_error_envelope_is_one_schema_v1_object() {
-        let line = ErrorV1::new(ErrorKind::ConfigUnreadable, "bad json").render();
+        let line = ErrorV1::line(ErrorKind::ConfigUnreadable, "bad json");
         let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
         assert_eq!(value["schemaVersion"], 1);
         assert_eq!(value["error"]["type"], "config_unreadable");
         assert_eq!(value["error"]["message"], "bad json");
         assert!(!line.contains('\n'), "one line");
+        // Byte for byte, because CodexBar parses this line.
+        assert_eq!(
+            line,
+            r#"{"error":{"message":"bad json","type":"config_unreadable"},"schemaVersion":1}"#
+        );
     }
 }

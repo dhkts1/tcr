@@ -40,12 +40,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-pub mod network_fact;
-mod peer_graph;
-mod peer_ls;
-mod peer_rows;
-
 use crate::build_info::BuildInfo;
+use crate::peer::status::rows::PeerStatusRow;
 use crate::probe::ProbeStatus;
 use crate::stats::{AccountSnapshot, CodexFacts, GateReason, QuotaState, StatsSnapshot};
 
@@ -180,7 +176,7 @@ pub struct StatusPayload {
     #[serde(default)]
     pub sessions_summary: tcr_status_wire::SessionsSummary,
     /// One row per pinned Mac, in the vocabulary the panel already decodes,
-    /// see [`PeerStatusRow`], and [`peer_status_rows`] for the derivation.
+    /// see [`PeerStatusRow`], and [`crate::peer::status::rows::peer_status_rows`] for the derivation.
     ///
     /// # Why the peers ride the STATUS payload at all
     ///
@@ -336,11 +332,36 @@ pub enum Lenient<T> {
     Unreadable(String),
 }
 
+/// One session's requests in the newest `minutes` of its sparkline
+/// ([`tcr_status_wire::SessionRow::req_per_minute`]); a sparkline shorter than
+/// the window counts what it has.
+fn session_requests_in_window(session: &tcr_status_wire::SessionRow, minutes: usize) -> u64 {
+    let minutes = session.req_per_minute.len().min(minutes);
+    session
+        .req_per_minute
+        .iter()
+        .rev()
+        .take(minutes)
+        .map(|&requests| u64::from(requests))
+        .sum::<u64>()
+}
+
+/// Why a [`Lenient`] status field holds no reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread<'a> {
+    /// The server sent no such object: one older than the key, or one with nothing to report.
+    NotSent,
+    /// The server sent one this build could not read; the parser's own words.
+    Unparsed(&'a str),
+}
+
 impl<T> Lenient<T> {
-    pub const fn reading(&self) -> Option<&T> {
-        match self {
-            Self::Reading(row) => Some(row),
-            Self::Unreadable(_) => None,
+    /// `field`'s reading, or why it holds none.
+    const fn read(field: Option<&Self>) -> Result<&T, Unread<'_>> {
+        match field {
+            Some(Self::Reading(row)) => Ok(row),
+            Some(Self::Unreadable(why)) => Err(Unread::Unparsed(why.as_str())),
+            None => Err(Unread::NotSent),
         }
     }
 }
@@ -393,9 +414,9 @@ pub struct UnkeyedCount {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MitmStatus {
-    /// The hosts the listener can terminate, [`crate::mitm::ALLOWED_HOSTS`]
+    /// The hosts the listener can terminate, [`crate::tls::ALLOWED_HOSTS`]
     /// intersected with the loaded leaf's coverage
-    /// ([`crate::mitm::TlsAssets::intercepted_hosts`]). Empty when MITM is off.
+    /// ([`crate::tls::TlsAssets::intercepted_hosts`]). Empty when MITM is off.
     /// `chatgpt.com` here says the leaf allows it, not that it is terminated:
     /// the listener does that only while the pool holds a Codex account, counted
     /// on every CONNECT, and the payload's account rows say whether it does.
@@ -411,7 +432,7 @@ pub struct MitmStatus {
 }
 
 impl MitmStatus {
-    /// A leaf tcr minted under `tcr-ca.pem` ([`crate::mitm::minted_ca_path`]).
+    /// A leaf tcr minted under `tcr-ca.pem` ([`crate::tls::minted_ca_path`]).
     pub const LEAF_MINTED: &'static str = "minted";
     /// No TLS material loaded: the boot-time load failed, or this process
     /// never loaded any. MITM is off and every `CONNECT` is blind-tunnelled.
@@ -419,7 +440,7 @@ impl MitmStatus {
 
     /// The status of a listener that loaded `assets`, or of one that loaded
     /// nothing (`None`).
-    pub fn of(assets: Option<&crate::mitm::TlsAssets>) -> Self {
+    pub fn of(assets: Option<&crate::tls::TlsAssets>) -> Self {
         let Some(assets) = assets else {
             return Self {
                 intercepted_hosts: Vec::new(),
@@ -688,6 +709,31 @@ fn from_ms(ms: i64) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
 }
 
+/// What only the serving process knows, gathered by the status route on every request: none
+/// of it is in a [`StatsSnapshot`], so [`StatusPayload::from_snapshot`] leaves each of its keys
+/// empty and [`StatusPayload::with_serving_facts`] writes them, each by its own wire rule.
+pub struct ServingFacts<'a> {
+    /// The peers block and why it is empty, as [`crate::peer::status::rows::peers_block_with_error`] read them.
+    pub peers: (Vec<PeerStatusRow>, Option<String>),
+    /// What the MITM listener's policy and loaded leaf allow, MITM off included.
+    pub mitm: MitmStatus,
+    /// The Codex traffic counts of the last ten minutes.
+    pub codex_traffic: tcr_status_wire::CodexTraffic,
+    /// Where Codex requests go, the default included.
+    pub codex_upstream: &'a str,
+    /// The request-key mode with the unkeyed `CONNECT` and request counts, in that order;
+    /// `None` while the server holds no key.
+    pub request_key: Option<(
+        crate::request_key::RequestKeyMode,
+        Vec<UnkeyedCount>,
+        Vec<UnkeyedCount>,
+    )>,
+    /// The machine's heat; `None` where there is no AppleSMC.
+    pub heat: Option<tcr_status_wire::HeatRow>,
+    /// The fan controller's last published state; `None` where none runs.
+    pub fan_control: Option<tcr_status_wire::FanControlRow>,
+}
+
 impl StatusPayload {
     /// Does the serving proxy present a leaf tcr minted that lets it terminate
     /// `host`? `false` when the payload reports no MITM status at all (an older
@@ -697,6 +743,85 @@ impl StatusPayload {
         self.mitm
             .as_ref()
             .is_some_and(|mitm| mitm.leaf == MitmStatus::LEAF_MINTED && mitm.intercepts(host))
+    }
+
+    /// What the serving MITM listener can terminate ([`Self::mitm`]) and the sha of the build
+    /// the server runs, the two facts a Codex route decision names. `Err` with that sha from a
+    /// server older than the `mitm` key: it predates Codex interception, and the route it needs
+    /// is a restart on a current build.
+    pub fn codex_interception(&self) -> Result<(&MitmStatus, &str), &str> {
+        let sha = self.build.sha.as_str();
+        self.mitm.as_ref().map(|mitm| (mitm, sha)).ok_or(sha)
+    }
+
+    /// The account rows of `provider` this payload lists, in any state.
+    pub fn accounts_of(
+        &self,
+        provider: crate::provider::Provider,
+    ) -> impl Iterator<Item = &AccountStatus> {
+        self.accounts
+            .iter()
+            .filter(move |row| row.provider == provider)
+    }
+
+    /// Does this payload list an account of `provider`, in any state?
+    pub fn holds_provider(&self, provider: crate::provider::Provider) -> bool {
+        self.accounts_of(provider).next().is_some()
+    }
+
+    /// Does this payload list an account named `name`, in any state (a disabled row too)?
+    pub fn lists_account(&self, name: &str) -> bool {
+        self.accounts.iter().any(|row| row.name == name)
+    }
+
+    /// [`Self::accounts_of`], or `None` from a server older than the [`Self::mitm`] key. Such a
+    /// server predates Codex pooling: its rows carry no `provider`, so every one reads as
+    /// Anthropic, and the caller answers from its config instead.
+    pub fn current_accounts_of(
+        &self,
+        provider: crate::provider::Provider,
+    ) -> Option<impl Iterator<Item = &AccountStatus>> {
+        self.mitm.as_ref().map(|_| self.accounts_of(provider))
+    }
+
+    /// Requests the serving proxy answered for `provider`'s sessions in the last `minutes`
+    /// wall-clock minutes, summed over each session's per-minute sparkline
+    /// ([`tcr_status_wire::SessionRow::req_per_minute`], 30 entries, oldest first).
+    ///
+    /// The sparkline rather than [`AccountStatus::requests`]: that counter is cumulative since
+    /// the server booted, so it answers "has this proxy ever served anything", and a route that
+    /// broke an hour ago would still read as healthy.
+    ///
+    /// One provider at a time, because a Codex session's traffic says nothing about Claude's
+    /// route, and counting it would read a broken Claude route as healthy. A session names its
+    /// provider only when it is not Anthropic ([`tcr_status_wire::SessionRow::provider`]).
+    pub fn requests_in_window(&self, provider: crate::provider::Provider, minutes: usize) -> u64 {
+        let wire = match provider {
+            crate::provider::Provider::Anthropic => None,
+            crate::provider::Provider::Codex => Some(provider.as_str()),
+        };
+        self.sessions
+            .iter()
+            .filter(|session| session.provider.as_deref() == wire)
+            .map(|session| session_requests_in_window(session, minutes))
+            .sum()
+    }
+
+    /// Does the serving process understand request keys? Its [`Self::request_key_mode`] is
+    /// sent whenever it holds one, and that PRESENCE is the contract a launcher reads before
+    /// it adds the key to a launch. `false` from a server that holds no key or predates them.
+    pub const fn understands_request_keys(&self) -> bool {
+        self.request_key_mode.is_some()
+    }
+
+    /// The server's heat reading ([`Self::heat`]), or why there is none.
+    pub const fn heat_reading(&self) -> Result<&tcr_status_wire::HeatRow, Unread<'_>> {
+        Lenient::read(self.heat.as_ref())
+    }
+
+    /// The server's fan-control reading ([`Self::fan_control`]), or why there is none.
+    pub const fn fan_control_reading(&self) -> Result<&tcr_status_wire::FanControlRow, Unread<'_>> {
+        Lenient::read(self.fan_control.as_ref())
     }
 
     /// Project a live snapshot onto the wire. `thresholds` is the server's own
@@ -785,8 +910,8 @@ impl StatusPayload {
             // [`StatsSnapshot`], which is the accounts view and nothing else.
             // Deriving them here would mean this function reading two files off
             // disk on every status request, and it takes no paths. The serving
-            // process assigns [`Self::peers`] from [`peer_status_rows`] after
-            // this call; an empty list is the honest answer for every other
+            // process assigns [`Self::peers`] from [`crate::peer::status::rows::peer_status_rows`] after
+            // this call, through [`Self::with_serving_facts`]; an empty list is the honest answer for every other
             // caller (the CLI's own round-trip tests, `into_snapshot`).
             peers: Vec::new(),
             peers_error: None,
@@ -809,6 +934,39 @@ impl StatusPayload {
             // So is the fan controller, which only the serving process runs.
             fan_control: None,
         }
+    }
+
+    /// This payload with what only the serving process knows written on: the keys
+    /// [`Self::from_snapshot`] leaves empty. Each key's wire rule lives here, beside it.
+    pub fn with_serving_facts(mut self, facts: ServingFacts<'_>) -> Self {
+        let ServingFacts {
+            peers,
+            mitm,
+            codex_traffic,
+            codex_upstream,
+            request_key,
+            heat,
+            fan_control,
+        } = facts;
+        (self.peers, self.peers_error) = peers;
+        // ALWAYS `Some`, MITM off included: on the wire, a missing key is what
+        // marks a server older than this field (see `StatusPayload::mitm`).
+        self.mitm = Some(mitm);
+        // Always `Some` too, for the same reason: absent marks a server older than the counts.
+        self.codex_traffic = Some(codex_traffic);
+        // Named only when it is not the default, so a reader is told only of an upstream they did
+        // not expect.
+        self.codex_upstream = crate::config::non_default_codex_upstream(codex_upstream);
+        // Present only while the server holds a key: its presence is what a launcher
+        // reads as "this server understands keys" (see `StatusPayload::request_key_mode`).
+        if let Some((mode, connects, requests)) = request_key {
+            self.request_key_mode = Some(mode.as_str().to_string());
+            self.unkeyed_connects = Some(connects);
+            self.unkeyed_requests = Some(requests);
+        }
+        self.heat = heat.map(HeatField::Reading);
+        self.fan_control = fan_control.map(FanControlField::Reading);
+        self
     }
 
     /// Rebuild the snapshot the CLI renderers take, plus the server's thresholds.
@@ -972,16 +1130,6 @@ impl QuotaPayload {
         }
     }
 }
-
-pub use peer_graph::{
-    GraphEdge, GraphEdgeDetail, GraphNode, GraphRole, PEER_GRAPH_KIND, PeerGraph, peer_graph,
-    peer_graph_block,
-};
-pub use peer_ls::{PeerCapsJson, PeerExitJson, PeerFoundRow, PeerLsJson, PeerLsPeer, PeerLsRow};
-pub use peer_rows::{
-    PathKind, PathStatus, PeerStatusRow, PeerTailnetStatus, masked_label, peer_status_rows,
-    peers_block, peers_block_with_error,
-};
 
 #[cfg(test)]
 mod tests;

@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use tcr::cli;
 use tcr::config::{self, Config, ConfigError};
-use tcr::{affinity, build_info, config_keys, oauth, server, singleton, tui};
+use tcr::live_client;
+use tcr::{affinity, build_info, config_keys, login, server, singleton, tui};
 
 use super::ConfigFile;
 
@@ -75,10 +75,10 @@ const EXIT_STOOD_DOWN_NOT_ANSWERING: i32 = 4;
 /// serving at all — and because a proxy that would not answer also could not
 /// report a build, so its build verdict is `Unknown` by construction.
 const fn stand_down_exit_code(
-    liveness: &cli::Liveness,
+    liveness: &live_client::Liveness,
     verdict: build_info::StandDownBuild,
 ) -> i32 {
-    if matches!(liveness, cli::Liveness::Silent { .. }) {
+    if matches!(liveness, live_client::Liveness::Silent { .. }) {
         return EXIT_STOOD_DOWN_NOT_ANSWERING;
     }
     match verdict {
@@ -129,8 +129,8 @@ pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     // that already has accounts (see `auto_import_claude_code_login`), and
     // never fatal: the failure paths all warn and boot with zero accounts,
     // exactly as this line did before.
-    let config = if config.accounts.is_empty() && !config.refuses_claude_code_import() {
-        match oauth::auto_import_claude_code_login(&config_path).await {
+    let config = if config.holds_no_accounts() && !config.refuses_claude_code_import() {
+        match login::auto_import_claude_code_login(&config_path).await {
             // Re-read: the import wrote the file, and re-reading is what makes
             // the running fleet the one on disk.
             Some(_) => load_config(&config_path).map_or(config, |(fresh, _)| fresh),
@@ -506,7 +506,7 @@ fn stand_down_exit(stand_down: &server::StandDown, file_log: Option<tcr::file_lo
     // `cargo build && tcr` exits 0 with the OLD build still serving — say which
     // build actually holds the port before we go.
     eprintln!("{}", stand_down.report.line);
-    if let cli::Liveness::Silent { why } = &stand_down.probe.liveness {
+    if let live_client::Liveness::Silent { why } = &stand_down.probe.liveness {
         let port = stand_down.port;
         let pid = stand_down.pid;
         let recovery = wedged_incumbent_recovery(stand_down.kind);
@@ -540,7 +540,7 @@ fn migration_persist_target<'a>(
     config: &Config,
     persist_path: &'a Option<PathBuf>,
 ) -> Option<&'a Path> {
-    if config.migrated_legacy_throttle && config.quarantined_accounts.is_empty() {
+    if config.should_save_throttle_migration() {
         persist_path.as_deref()
     } else {
         None

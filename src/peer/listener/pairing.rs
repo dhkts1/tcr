@@ -2,7 +2,6 @@ use anyhow::{Result, bail};
 use tcr_peer_wire::PeerId;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::peer::config::PeerRow;
 use crate::peer::id::KEY_BYTES;
 use crate::peer::noise::{self, Handshake, PeerSession, PinRefusal};
 use crate::peer::state::PeerState;
@@ -30,7 +29,7 @@ pub(super) struct AcceptedSession {
 /// Run the responder's half for a first pairing, a return visit or an
 /// enrolment, from the message 1 the caller already holds.
 ///
-/// Knocks do not come here: they are [`serve_knock`], which shares no code with
+/// Knocks do not come here: they are [`serve_knock`](crate::peer::listener::knock::serve_knock), which shares no code with
 /// this function because it shares no decision either, a knock has no static
 /// key, no pin, no grant and no stream.
 ///
@@ -76,7 +75,7 @@ pub(super) async fn accept_pairing_or_return<S>(
     addr: &str,
     pattern: Handshake,
     message_1: &[u8],
-    rows: &[PeerRow],
+    pinned: &[PeerId],
     psks: &[[u8; KEY_BYTES]],
     peer_state: &PeerState,
     now_ms: i64,
@@ -125,11 +124,11 @@ where
     let returning = noise::read_message_1(secret, Handshake::Return, &[], message_1, &mut scratch);
     match returning {
         Ok(state) => {
-            let rows = rows.to_vec();
+            let pinned_ids = pinned.to_vec();
             let banned = peer_state.banned.clone();
             let session =
                 noise::finish_responder(stream, state, Handshake::Return, move |remote| {
-                    let pinned = noise::pin_check_rows(remote, &rows)?;
+                    let pinned = noise::pin_check_ids(remote, &pinned_ids)?;
                     // A pinned peer whose KEY is banned is refused, and the refusal
                     // is here rather than after the handshake for the same reason
                     // the pin check is: nothing has been written yet.

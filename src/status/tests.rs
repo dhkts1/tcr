@@ -1147,3 +1147,148 @@ fn payload_carries_the_kind_discriminator() {
         "payload names its kind: {wire}"
     );
 }
+
+/// A server older than the `mitm` key lists no provider on its rows, so its account list is
+/// no answer to "does it hold a Codex account", and `current_accounts_of` says so with `None`.
+/// The positive control first: the same rows from a current server do answer, and list the
+/// Codex row.
+#[test]
+fn only_a_current_server_answers_which_accounts_it_holds() {
+    let mut payload = StatusPayload::from_snapshot(
+        &snapshot_with_counters(),
+        &[0.9],
+        false,
+        None,
+        Default::default(),
+    );
+    let mut codex = payload.accounts[0].clone();
+    codex.name = "bob@example.com/codex".to_string();
+    codex.provider = crate::provider::Provider::Codex;
+    payload.accounts.push(codex);
+    payload.mitm = Some(MitmStatus {
+        intercepted_hosts: Vec::new(),
+        leaf: MitmStatus::LEAF_NONE.to_string(),
+    });
+
+    let names = |payload: &StatusPayload| {
+        payload
+            .current_accounts_of(crate::provider::Provider::Codex)
+            .map(|rows| rows.map(|row| row.name.clone()).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        names(&payload),
+        Some(vec!["bob@example.com/codex".to_string()])
+    );
+    assert!(payload.holds_provider(crate::provider::Provider::Anthropic));
+    assert!(payload.lists_account("alice@example.com"));
+    assert!(!payload.lists_account("carol@example.com"));
+
+    payload.mitm = None;
+    assert_eq!(
+        names(&payload),
+        None,
+        "an older server's rows are not the answer"
+    );
+}
+
+/// An empty accounts view, so the pinned documents below hold only what the serving process adds.
+fn empty_snapshot() -> StatsSnapshot {
+    StatsSnapshot {
+        accounts: Vec::new(),
+        current: None,
+        current_by_provider: crate::stats::CurrentByProvider::default(),
+        recent: Vec::new(),
+        sessions: Vec::new(),
+        wire_sessions: Vec::new(),
+        wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
+    }
+}
+
+/// The status document the serving process writes, byte for byte, for one set of live facts:
+/// with a request key and a non-default Codex upstream, and without either. TcrBar's Swift
+/// decoder reads this document, so a change to its keys, their order or their skip rules
+/// fails here.
+#[test]
+fn the_serving_facts_write_the_pinned_status_document() {
+    let fan: tcr_status_wire::FanControlRow = serde_json::from_str(
+        r#"{"desired":{"mode":"auto"},"state":"off","reason":null,"hotGuard":false,
+            "targets":[],"detail":null,"command":7}"#,
+    )
+    .expect("a fan row");
+    let unkeyed = |class: &str| UnkeyedCount {
+        class: class.to_string(),
+        user_agent: "curl".to_string(),
+        count: 2,
+    };
+    let document = |upstream: &str, keyed: bool| {
+        let mut payload = StatusPayload::from_snapshot(
+            &empty_snapshot(),
+            &[],
+            true,
+            Some("ctl@example.com".to_string()),
+            std::collections::BTreeMap::from([("work".to_string(), "#112233".to_string())]),
+        )
+        .with_serving_facts(ServingFacts {
+            peers: (Vec::new(), Some("bad peers file".to_string())),
+            mitm: MitmStatus::of(None),
+            codex_traffic: tcr_status_wire::CodexTraffic {
+                refused_10m: 3,
+                last_refusal: None,
+                last_refusal_at_ms: Some(1_760_000_000_000),
+                unpooled_10m: 1,
+            },
+            codex_upstream: upstream,
+            request_key: keyed.then(|| {
+                (
+                    crate::request_key::RequestKeyMode::Log,
+                    vec![unkeyed("other")],
+                    vec![unkeyed("messages")],
+                )
+            }),
+            heat: Some(tcr_status_wire::HeatRow::default()),
+            fan_control: Some(fan.clone()),
+        });
+        // The serving binary's own build, which differs between two builds of this test.
+        payload.build = BuildInfo::default();
+        serde_json::to_string(&payload).expect("serialize")
+    };
+    assert_eq!(
+        document("https://codex.example.com", true),
+        concat!(
+            r#"{"kind":"tcr.status.v1","accounts":[],"#,
+            r#""build":{"sha":"unknown","dirty":null,"builtAt":"unknown"},"#,
+            r#""http1_only":true,"control":"ctl@example.com","#,
+            r##""group_colors":{"work":"#112233"},"sessions":[],"##,
+            r#""sessions_summary":{"calls":0,"overOneMinute":0,"timeouts":0,"#,
+            r#""timeoutsByClass":{},"byTool":[],"costUsd":0.0},"#,
+            r#""peers_error":"bad peers file","#,
+            r#""mitm":{"interceptedHosts":[],"leaf":"none"},"#,
+            r#""codex_traffic":{"refused10m":3,"lastRefusalAtMs":1760000000000,"unpooled10m":1},"#,
+            r#""codex_upstream":"https://codex.example.com","#,
+            r#""requestKeyMode":"log","#,
+            r#""unkeyedConnects":[{"class":"other","userAgent":"curl","count":2}],"#,
+            r#""unkeyedRequests":[{"class":"messages","userAgent":"curl","count":2}],"#,
+            r#""heat":{"fans":[]},"#,
+            r#""fanControl":{"desired":{"mode":"auto"},"state":"off","reason":null,"#,
+            r#""hotGuard":false,"targets":[],"detail":null,"command":7}}"#,
+        )
+    );
+    // No key and the default upstream: the four keys that ride only with them are absent.
+    assert_eq!(
+        document(crate::provider::CODEX_UPSTREAM, false),
+        concat!(
+            r#"{"kind":"tcr.status.v1","accounts":[],"#,
+            r#""build":{"sha":"unknown","dirty":null,"builtAt":"unknown"},"#,
+            r#""http1_only":true,"control":"ctl@example.com","#,
+            r##""group_colors":{"work":"#112233"},"sessions":[],"##,
+            r#""sessions_summary":{"calls":0,"overOneMinute":0,"timeouts":0,"#,
+            r#""timeoutsByClass":{},"byTool":[],"costUsd":0.0},"#,
+            r#""peers_error":"bad peers file","#,
+            r#""mitm":{"interceptedHosts":[],"leaf":"none"},"#,
+            r#""codex_traffic":{"refused10m":3,"lastRefusalAtMs":1760000000000,"unpooled10m":1},"#,
+            r#""heat":{"fans":[]},"#,
+            r#""fanControl":{"desired":{"mode":"auto"},"state":"off","reason":null,"#,
+            r#""hotGuard":false,"targets":[],"detail":null,"command":7}}"#,
+        )
+    );
+}

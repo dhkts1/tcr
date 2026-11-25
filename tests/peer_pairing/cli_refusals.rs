@@ -73,7 +73,7 @@ fn a_join_link_does_not_replace_a_network_key_without_replace() {
         .status
         .success()
     );
-    let before = mine.file().network_key.expect("this Mac has a key");
+    let before = *mine.file().network_psk().expect("this Mac has a key");
 
     let refused = tcr(&[
         "peer",
@@ -93,7 +93,7 @@ fn a_join_link_does_not_replace_a_network_key_without_replace() {
         "the refusal names the flag that means it: {text}"
     );
     assert_eq!(
-        mine.file().network_key.expect("the key is still there"),
+        *mine.file().network_psk().expect("the key is still there"),
         before,
         "a refusal changes nothing on disk"
     );
@@ -113,7 +113,7 @@ fn a_join_link_does_not_replace_a_network_key_without_replace() {
         String::from_utf8_lossy(&taken.stderr)
     );
     assert_ne!(
-        mine.file().network_key.expect("a key is set"),
+        *mine.file().network_psk().expect("a key is set"),
         before,
         "the link's key replaced this Mac's own"
     );
@@ -144,9 +144,9 @@ fn a_join_link_with_both_keys_still_reads_the_join_token_when_the_network_key_is
     // This Mac already has a network key.
     let (_out, _err, ok) = run_tcr(&peers, &["network-key", "set"]);
     assert!(ok, "this Mac mints its own key first");
-    let before = config::read_or_default(&peers)
+    let before = *config::read_or_default(&peers)
         .expect("the peers file reads")
-        .network_key
+        .network_psk()
         .expect("this Mac has a key");
 
     // A link from elsewhere, carrying a DIFFERENT network key and a join
@@ -154,7 +154,7 @@ fn a_join_link_with_both_keys_still_reads_the_join_token_when_the_network_key_is
     let other_key = NetworkKey::from_bytes([0x77; 32]);
     let link = pair::ShareLink {
         network_key: other_key,
-        join: Some(pair::JoinToken::new(
+        join: Some(join_key::JoinToken::new(
             vec!["127.0.0.1:1".parse().expect("a loopback address")],
             PeerId([0xAB; 32]),
             [0xCD; 32],
@@ -179,8 +179,8 @@ fn a_join_link_with_both_keys_still_reads_the_join_token_when_the_network_key_is
 
     let file = config::read_or_default(&peers).expect("the peers file reads");
     assert_eq!(
-        file.network_key,
-        Some(before),
+        file.network_psk(),
+        Some(&before),
         "a refused network key must not land on disk"
     );
 }
@@ -207,8 +207,7 @@ fn share_on_keeps_the_mode_and_the_window_of_the_grant_it_replaces() {
     granted.until = Some(4_102_444_800);
     granted.between = Some("09:00-18:00".parse().expect("a daily window"));
     granted.ensure_id().expect("an id");
-    file.peers
-        .push(pinned_row(PeerId([0x31; 32]), "studio-mac", granted));
+    file.pin(pinned_row(PeerId([0x31; 32]), "studio-mac", granted));
     mac.write_file(&file);
 
     let shared = tcr(&[
@@ -229,7 +228,9 @@ fn share_on_keeps_the_mode_and_the_window_of_the_grant_it_replaces() {
     );
 
     let after = mac.file();
-    let grant = after.peers[0]
+    let grant = after
+        .row(&PeerId([0x31; 32]))
+        .expect("the studio-mac row")
         .lend
         .first()
         .expect("the row still has its grant")
@@ -271,9 +272,16 @@ fn share_on_keeps_the_mode_and_the_window_of_the_grant_it_replaces() {
         String::from_utf8_lossy(&removed.stderr)
     );
     assert!(
-        mac.file().peers[0].lend.is_empty(),
+        mac.file()
+            .row(&PeerId([0x31; 32]))
+            .expect("the studio-mac row")
+            .lend
+            .is_empty(),
         "--fraction 0 removes the grant rather than lending nothing: {:?}",
-        mac.file().peers[0].lend
+        mac.file()
+            .row(&PeerId([0x31; 32]))
+            .expect("the studio-mac row")
+            .lend
     );
 }
 
@@ -321,7 +329,7 @@ fn block_and_ignore_refuse_a_target_that_is_neither_a_request_nor_an_address() {
     }
     let state = mac.state();
     assert!(
-        state.banned.is_empty() && state.muted.is_empty(),
+        state.blocked_count() == 0 && state.muted_count() == 0,
         "a refusal writes nothing: {state:?}"
     );
 
@@ -334,10 +342,7 @@ fn block_and_ignore_refuse_a_target_that_is_neither_a_request_nor_an_address() {
         String::from_utf8_lossy(&accepted.stderr)
     );
     assert!(
-        mac.state()
-            .banned
-            .iter()
-            .any(|ban| ban.addr == "192.0.2.51"),
+        mac.state().is_address_banned("192.0.2.51"),
         "and it lands under the address the listener compares"
     );
 }
@@ -441,8 +446,7 @@ fn a_learned_key_survives_the_window_it_was_learned_in() {
     );
     assert!(
         state.is_key_banned(&learned),
-        "so the block bans the key as well as the address: {:?}",
-        state.banned
+        "so the block bans the key as well as the address: {state:?}"
     );
 }
 
@@ -535,9 +539,7 @@ fn a_concurrent_revoke_and_enrolment_never_resurrect_or_drop_a_row() {
 
     for trial in 0..TRIALS {
         let node = Node::new(&format!("revoke-race-{trial}"));
-        let mut file = node.file();
-        file.listen = Some("127.0.0.1:9600".parse().expect("a loopback address"));
-        node.write_file(&file);
+        node.listen_on("127.0.0.1:9600".parse().expect("a loopback address"));
 
         let store = config::PeerStore::open(&node.peers).expect("open the store");
         let (invite, token) = pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1, None)
@@ -591,7 +593,7 @@ fn a_concurrent_revoke_and_enrolment_never_resurrect_or_drop_a_row() {
 
         if let Ok(row) = &enrolled {
             assert!(
-                after.peers.iter().any(|existing| existing.node == row.node),
+                after.row(&row.node).is_some(),
                 "trial {trial}: accept_enrolment said Ok but the pinned row for {:?} is gone \
                  from disk after the race with revoke_invite (revoked={revoked:?})",
                 row.node

@@ -6,8 +6,8 @@ use anyhow::Context as _;
 use tcr::cli;
 use tcr::config;
 use tcr::peer;
+use tcr::peer::status::graph::{GraphEdgeDetail, GraphRole, peer_graph_block};
 use tcr::proxy;
-use tcr::status;
 
 use super::peer_cli;
 
@@ -61,7 +61,7 @@ pub(super) async fn run_peer_status(args: peer_cli::PeerStatusArgs) -> anyhow::R
 }
 
 /// `tcr peer graph`: one node per Mac, one edge per way to reach one, one edge
-/// per live lease, as [`tcr::status::peer_graph_block`] derives it
+/// per live lease, as [`peer_graph_block`] derives it
 /// off the peers file and the runtime-state file beside it.
 ///
 /// Read-only and local, the same contract `tcr peer reach` already gives:
@@ -80,7 +80,7 @@ pub(super) async fn run_peer_graph(args: peer_cli::PeerGraphArgs) -> anyhow::Res
         return serve_peer_graph(peers_path, this, this_label, &args.addr).await;
     }
 
-    let graph = status::peer_graph_block(&peers_path, &this, &this_label, now_unix_ms());
+    let graph = peer_graph_block(&peers_path, &this, &this_label, now_unix_ms());
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&graph)?);
@@ -98,14 +98,14 @@ pub(super) async fn run_peer_graph(args: peer_cli::PeerGraphArgs) -> anyhow::Res
             node.id,
             node.name,
             match node.role {
-                status::GraphRole::ThisMac => "self",
-                status::GraphRole::Peer => "peer",
+                GraphRole::ThisMac => "self",
+                GraphRole::Peer => "peer",
             }
         );
     }
     for edge in &graph.edges {
         match &edge.detail {
-            status::GraphEdgeDetail::Path {
+            GraphEdgeDetail::Path {
                 endpoint,
                 path_kind,
                 rtt_ms,
@@ -120,7 +120,7 @@ pub(super) async fn run_peer_graph(args: peer_cli::PeerGraphArgs) -> anyhow::Res
                 rtt_ms.map_or("unmeasured".to_string(), |v| v.to_string()),
                 loss_pct.map_or("unmeasured".to_string(), |v| v.to_string()),
             ),
-            status::GraphEdgeDetail::Lease {
+            GraphEdgeDetail::Lease {
                 lease_id, spent, ..
             } => println!(
                 "peer graph: edge lease from={} to={} lease_id={} spent={:.2}",
@@ -222,7 +222,7 @@ async fn serve_peer_graph(
     }
 
     async fn graph_json(State(state): State<GraphState>) -> impl IntoResponse {
-        let graph = status::peer_graph_block(
+        let graph = peer_graph_block(
             &state.peers_path,
             &state.this,
             &state.this_label,

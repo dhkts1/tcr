@@ -71,7 +71,7 @@ pub struct CodexLogin {
     /// the access token's.
     pub account_id: Option<String>,
     /// The ChatGPT user: the id token's `chatgpt_user_id` (else its `user_id`), else the access
-    /// token's ([`crate::codex_oauth::IdClaims::chatgpt_user_id`]). With [`Self::account_id`] it
+    /// token's ([`crate::oauth::codex::IdClaims::chatgpt_user_id`]). With [`Self::account_id`] it
     /// is the login's identity: one person in two workspaces, and two seats of one workspace,
     /// are two accounts.
     pub user_id: Option<String>,
@@ -82,8 +82,8 @@ pub struct CodexLogin {
     /// `config::Account::expires_at`.
     pub expires_at_ms: Option<i64>,
     /// The login belongs to a FedRAMP workspace: its id token, or else its access token, carries
-    /// `chatgpt_account_is_fedramp: true` ([`crate::codex_oauth::IdClaims`]). tcr refuses to
-    /// import such a login (`oauth::import_codex_login`).
+    /// `chatgpt_account_is_fedramp: true` ([`crate::oauth::codex::IdClaims`]). tcr refuses to
+    /// import such a login (`login::import_codex_login`).
     pub is_fedramp: bool,
 }
 
@@ -223,7 +223,7 @@ fn read_auth_file(path: &Path) -> anyhow::Result<Option<CodexLogin>> {
 /// A document of the wrong shape is an `Err` carrying serde's error class and position, never
 /// serde's own message: that message quotes the value it could not use, and the values in this
 /// document are tokens (a `tokens` that is a string rather than an object would be echoed whole).
-/// The same rule `codex_oauth::refresh_access_token_at` applies to a refresh response.
+/// The same rule `oauth::codex::refresh_access_token_at` applies to a refresh response.
 pub fn parse_auth_json(text: &str) -> anyhow::Result<Option<CodexLogin>> {
     let doc: AuthDotJson = serde_json::from_str(text).map_err(|err| {
         anyhow::anyhow!(
@@ -267,12 +267,12 @@ pub(crate) fn login_from_tokens(
     account_id: Option<String>,
 ) -> CodexLogin {
     let id = id_token
-        .and_then(crate::codex_oauth::id_claims)
+        .and_then(crate::oauth::codex::id_claims)
         .unwrap_or_default();
-    let access = crate::codex_oauth::id_claims(&access_token).unwrap_or_default();
+    let access = crate::oauth::codex::id_claims(&access_token).unwrap_or_default();
     let is_fedramp = id.chatgpt_account_is_fedramp || access.chatgpt_account_is_fedramp;
     CodexLogin {
-        expires_at_ms: crate::codex_oauth::jwt_exp_ms(&access_token),
+        expires_at_ms: crate::oauth::codex::jwt_exp_ms(&access_token),
         account_id: account_id
             .filter(|a| !a.is_empty())
             .or(id.chatgpt_account_id)

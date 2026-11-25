@@ -2,71 +2,6 @@
 
 use crate::log_err::LogErr as _;
 use crate::manager::*;
-use serde_json::Value;
-
-#[derive(Clone)]
-pub(crate) struct PendingCodexWriteback {
-    expected_refresh: String,
-    tokens: Tokens,
-    retry_after_ms: i64,
-    failures: u8,
-}
-
-impl std::fmt::Debug for PendingCodexWriteback {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PendingCodexWriteback")
-            .field("expected_refresh", &"<redacted>")
-            .field("tokens", &"<redacted>")
-            .finish()
-    }
-}
-
-use crate::config::CODEX_SYNC_PENDING_KEY;
-
-impl PendingCodexWriteback {
-    pub(in crate::manager) fn from_config(account: &config::Account) -> Option<Self> {
-        match account.provider {
-            crate::provider::Provider::Anthropic => return None,
-            crate::provider::Provider::Codex => {}
-        }
-        account.codex_home.as_ref()?;
-        let record = account.extra.get(CODEX_SYNC_PENDING_KEY)?;
-        let expected_refresh = record.get("expectedRefreshSha256")?.as_str()?;
-        if expected_refresh.len() != 64 || !expected_refresh.bytes().all(|c| c.is_ascii_hexdigit())
-        {
-            return None;
-        }
-        Some(Self {
-            expected_refresh: expected_refresh.to_string(),
-            tokens: Tokens {
-                id_token: record
-                    .get("idToken")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                access_token: account.access_token.clone(),
-                refresh_token: account.refresh_token.clone(),
-                expires_at_ms: account.expires_at.map_or(0, oauth::normalize_expires_at),
-            },
-            retry_after_ms: 0,
-            failures: 0,
-        })
-    }
-
-    pub(in crate::manager) fn record(&self) -> Value {
-        let mut record = serde_json::json!({"expectedRefreshSha256": self.expected_refresh});
-        if let Some(id) = &self.tokens.id_token {
-            record["idToken"] = id.clone().into();
-        }
-        record
-    }
-
-    fn back_off(&mut self) {
-        self.failures = self.failures.saturating_add(1);
-        let seconds = (5_i64 << self.failures.saturating_sub(1).min(6)).min(300);
-        self.retry_after_ms = crate::now_ms().saturating_add(seconds * 1000);
-    }
-}
 
 impl Manager {
     /// Refresh account `idx`'s token if it is hard-expired OR within the proactive
@@ -207,24 +142,10 @@ impl Manager {
             .config_write
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        {
-            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
-            if let crate::identity::Resolved::One(index) =
-                crate::identity::resolve(config.accounts.iter().enumerate(), &target)
-                && config.accounts[index].refresh_token.as_deref() == Some(refresh.as_str())
-            {
-                match &pending {
-                    Some(record) => {
-                        config.accounts[index]
-                            .extra
-                            .insert(CODEX_SYNC_PENDING_KEY.to_string(), record.clone());
-                    }
-                    None => {
-                        config.accounts[index].extra.remove(CODEX_SYNC_PENDING_KEY);
-                    }
-                }
-            }
-        }
+        self.config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .mark_codex_sync_pending(&target, &refresh, pending.as_ref());
         if config::save_codex_token_sync_pending(path, &target, &refresh, pending.as_ref()).is_err()
         {
             tracing::warn!("could not persist Codex token publication metadata");
@@ -771,34 +692,12 @@ impl Manager {
             account.login_error = None;
         }
     }
-
-    /// Arm (or double) the recovery backoff for an errored row. First rejection
-    /// arms [`ERROR_REPROBE_BASE_MS`]; each subsequent one doubles up to
-    /// [`ERROR_REPROBE_CAP_MS`], so a permanently dead credential is retried at most
-    /// ~twice an hour instead of hammering the OAuth endpoint (which would risk
-    /// rate-limiting the whole fleet).
-    pub(in crate::manager) fn grow_error_backoff(&self, idx: usize) {
-        let mut accounts = self
-            .accounts
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(account) = accounts.get_mut(idx) {
-            account.error_backoff_ms = if account.error_backoff_ms == 0 {
-                ERROR_REPROBE_BASE_MS
-            } else {
-                account
-                    .error_backoff_ms
-                    .saturating_mul(2)
-                    .min(ERROR_REPROBE_CAP_MS)
-            };
-            account.error_retry_after_ms = Some(crate::now_ms() + account.error_backoff_ms);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CODEX_SYNC_PENDING_KEY;
     use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};

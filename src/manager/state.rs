@@ -3,31 +3,20 @@
 use super::*;
 
 impl Manager {
-    /// Configured probe cadence in seconds, read from the config's unmodelled
-    /// `quotaProbeSeconds` (default [`crate::probe::DEFAULT_PROBE_SECONDS`]). A
-    /// value `<= 0` disables probing.
+    /// See [`crate::config::Config::probe_interval_seconds`].
     pub fn probe_interval_seconds(&self) -> u64 {
         self.config
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .extra
-            .get("quotaProbeSeconds")
-            .and_then(serde_json::Value::as_i64)
-            .map_or(crate::probe::DEFAULT_PROBE_SECONDS, |v| v.max(0) as u64)
+            .probe_interval_seconds()
     }
 
-    /// Configured keep-warm cadence in seconds, read from the config's unmodelled
-    /// `warmupSeconds`. **Default 0 = OFF** (unlike the probe's 75) — keep-warm
-    /// spends real quota, so it ships dark and is only ever running when explicitly
-    /// enabled. A value `<= 0` disables it (no warm task is spawned).
+    /// See [`crate::config::Config::warmup_interval_seconds`].
     pub fn warmup_interval_seconds(&self) -> u64 {
         self.config
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .extra
-            .get("warmupSeconds")
-            .and_then(serde_json::Value::as_i64)
-            .map_or(0, |v| v.max(0) as u64)
+            .warmup_interval_seconds()
     }
 
     /// Whether session affinity is enabled, read from the config's unmodelled
@@ -50,102 +39,49 @@ impl Manager {
             .session_affinity_enabled()
     }
 
-    /// Over-threshold revalidation-serve is ON by default; set top-level
-    /// `"revalidationServe": false` in the config to disable it (pure fall-through
-    /// to a synthesized 429 when the whole fleet reads over the soft threshold).
-    /// Same read pattern as [`Self::session_affinity_enabled`]. See
-    /// [`Manager::select_revalidation`].
+    /// See [`crate::config::Config::revalidation_serve_enabled`].
     pub fn revalidation_serve_enabled(&self) -> bool {
         self.config
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .extra
-            .get("revalidationServe")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true)
+            .revalidation_serve_enabled()
     }
 
-    /// Whether load-balancing migration is enabled, read from the config's
-    /// unmodelled top-level `loadBalanceMigration` (**default `false` — OFF**).
-    /// Same read pattern as [`Self::session_affinity_enabled`].
-    ///
-    /// It ships OFF because that migration moves an ALREADY-WARM session to a
-    /// cooler account purely to even out pinned-session counts, and Anthropic's
-    /// prompt cache is per-account: every such move costs a full prompt-cache
-    /// re-creation of the whole conversation prefix on the target. A session's
-    /// account is chosen at START, or when its pin fails an ACCOUNT-level HARD gate
-    /// ([`Manager::account_hard_ok`]) — never merely to balance load. Set
-    /// `"loadBalanceMigration": true` to restore the balancing behaviour.
+    /// See [`crate::config::Config::load_balance_migration_enabled`].
     pub fn load_balance_migration_enabled(&self) -> bool {
         self.config
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .extra
-            .get("loadBalanceMigration")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+            .load_balance_migration_enabled()
     }
 
-    /// Whether every request's `cache_control` breakpoints are rewritten to the
-    /// 1-hour window before forwarding (see [`crate::cache_ttl::extend_all_ttls`]),
-    /// read from the config's unmodelled top-level `cacheTtlRewrite`. Same read
-    /// pattern as [`Self::session_affinity_enabled`].
-    ///
-    /// **Default: on when every account is OAuth, off when any is an API key.**
-    /// Measured 2026-10-06, a 1h write costs a subscription's 5-hour window exactly
-    /// what a 5m write does and a read costs it nothing visible, so for OAuth
-    /// accounts the longer window is free and saves the full re-write after every
-    /// 5-60 minute idle gap. An API-key row never reaches this list
-    /// (`config::load` quarantines it and live-add refuses it), so the only
-    /// row that turns the default off is one whose `type` is some other string
-    /// ([`crate::config::AccountType::Unrecognized`]): a static key tcr cannot
-    /// classify, which may be billed per token at the published rates, where a
-    /// 1h write is 2x input against 1.25x for 5m. There the rewrite would raise
-    /// the bill 60% on every write, so a fleet with one such row forwards
-    /// bodies as sent unless the operator says otherwise.
-    /// The rewrite runs before an account is picked, so it cannot decide per
-    /// account; the fleet's composition is the finest grain it has. An explicit
-    /// `"cacheTtlRewrite": true` or `false` overrides the default either way.
+    /// See [`crate::config::Config::cache_ttl_rewrite_enabled`].
     pub fn cache_ttl_rewrite_enabled(&self) -> bool {
-        let config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
-        match config
-            .extra
-            .get("cacheTtlRewrite")
-            .and_then(serde_json::Value::as_bool)
-        {
-            Some(explicit) => explicit,
-            None => config.accounts.iter().all(|a| a.account_type.is_oauth()),
-        }
+        self.config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cache_ttl_rewrite_enabled()
     }
 
-    /// Max DISTINCT destination accounts one session may be diverted to inside a
-    /// single hold episode, read from the config's unmodelled top-level
-    /// `divertBudget`. Same read pattern as [`Self::session_affinity_enabled`].
-    ///
-    /// **Default `0` = unlimited = today's behaviour byte-for-byte.** This is
-    /// the kill switch: an unbounded budget never blocks a divert, so shipping
-    /// it means every existing divert path is untouched until someone opts in
-    /// with `"divertBudget": N`. It stays `0` rather than a small nonzero
-    /// default because flipping it is a production-traffic decision (a nonzero
-    /// budget can turn a would-have-served divert into a `None`, which is new
-    /// client-visible behaviour) that must follow the live measurement, not
-    /// accompany it — see the divert-budget design notes §4.6.
+    /// See [`crate::config::Config::divert_budget`].
     pub fn divert_budget(&self) -> u32 {
         self.config
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .extra
-            .get("divertBudget")
-            .and_then(serde_json::Value::as_u64)
-            .map_or(0, |v| v.min(u64::from(u32::MAX)) as u32)
+            .divert_budget()
     }
 
-    /// The keep-warm wake signal. The warm loop `select!`s over its own ticker and
-    /// `warm_wake().notified()`, so the first sweep after boot happens as soon as
-    /// the probe has read some quota rather than a full `warmupSeconds` later. See
-    /// the field docs on [`Manager`] for why a lost wake is impossible here.
-    pub const fn warm_wake(&self) -> &Notify {
-        &self.warm_wake
+    /// Whether this server's accounts are forced onto HTTP/1.1 — see
+    /// [`config::Config::http1_only`]. Server-wide, not per-account, and
+    /// exposed for the same reason `thresholds` is: a client must not
+    /// re-derive this from `~/.config/tcr.json`, which may have been
+    /// edited (or the process not yet restarted to pick it up) since the
+    /// server actually booted its clients.
+    pub fn http1_only(&self) -> bool {
+        self.config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .http1_only
     }
 
     /// Mint the next session key: a strictly-increasing, unique `u64` starting at
@@ -225,21 +161,6 @@ impl Manager {
         }
     }
 
-    /// The Anthropic origin. A request's own origin, which depends on its provider, is
-    /// [`Self::upstream_for`].
-    pub fn upstream(&self) -> &str {
-        &self.upstream
-    }
-
-    /// The origin a request for `provider` is rewritten to. `upstream()` stays the Anthropic
-    /// accessor its existing callers (profile fetch, control identity) mean.
-    pub fn upstream_for(&self, provider: crate::provider::Provider) -> &str {
-        match provider {
-            crate::provider::Provider::Anthropic => &self.upstream,
-            crate::provider::Provider::Codex => &self.codex_upstream,
-        }
-    }
-
     pub fn proxy_api_key(&self) -> Option<&str> {
         self.proxy_api_key.as_deref()
     }
@@ -251,8 +172,8 @@ impl Manager {
 
     /// The two proxy secrets a client may present, neither of which is a client
     /// identity or a credential for any host but this one.
-    pub fn proxy_secrets(&self) -> crate::proxy::ProxySecrets<'_> {
-        crate::proxy::ProxySecrets {
+    pub fn proxy_secrets(&self) -> crate::request_key::ProxySecrets<'_> {
+        crate::request_key::ProxySecrets {
             api_key: self.proxy_api_key(),
             request_key: self.request_key(),
         }
@@ -265,21 +186,27 @@ impl Manager {
             .map(|_| crate::request_key::RequestKeyMode::Log)
     }
 
-    /// The unkeyed-caller counters `GET /_tcr/status` reports.
-    pub const fn unkeyed(&self) -> &crate::request_key::UnkeyedCounters {
-        &self.unkeyed
+    /// Count one arrival that lacked the request key (log mode: counted, never
+    /// refused). See [`crate::request_key::UnkeyedCounters::record`] for the one
+    /// INFO line the first of each kind writes.
+    pub fn record_unkeyed(
+        &self,
+        what: crate::request_key::Unkeyed,
+        user_agent: crate::request_key::UaFamily,
+        peer_port: u16,
+    ) {
+        self.unkeyed.record(what, user_agent, peer_port);
     }
 
-    /// `f` applied to account row `idx`, under a short read of the accounts
-    /// lock. `None` is the one answer for an index past the end, so no reader
-    /// decides on its own what a missing row means. `f` runs with the lock
-    /// held: it must not take `affinity` or any lock ordered before accounts.
-    pub(super) fn account<R>(&self, idx: usize, f: impl FnOnce(&AccountRuntime) -> R) -> Option<R> {
-        self.accounts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(idx)
-            .map(f)
+    /// The `unkeyedConnects` and `unkeyedRequests` rows `GET /_tcr/status`
+    /// reports, in that order.
+    pub fn unkeyed_wire(
+        &self,
+    ) -> (
+        Vec<crate::status::UnkeyedCount>,
+        Vec<crate::status::UnkeyedCount>,
+    ) {
+        self.unkeyed.wire()
     }
 
     /// Account `idx`'s OWN upstream-forwarding client — see
@@ -324,9 +251,7 @@ impl Manager {
         self.config
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .accounts
-            .get(idx)
-            .map(config::Account::egress_pin)
+            .egress_pin_at(idx)
     }
 
     /// The pooled `account_uuid` to inject for account `idx` (a clone — the

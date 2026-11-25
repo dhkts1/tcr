@@ -118,10 +118,10 @@ impl Manager {
             accounts.push(runtime);
             accounts.len() - 1
         };
-        {
-            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
-            config.accounts.push(account);
-        }
+        self.config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .append_account(account);
         idx
     }
 
@@ -134,7 +134,7 @@ impl Manager {
     ///
     /// Resolution uses [`crate::identity::resolve`]/[`crate::identity::same_identity`]
     /// — the SAME rule the durable half ([`config::save_account`]) and `tcr
-    /// login` (`oauth::upsert_account`) already run — never
+    /// login` (`login::upsert_account`) already run — never
     /// [`crate::identity::match_one`]. `match_one` goes through
     /// [`crate::identity::Queryable`], which exposes only the name: it
     /// cannot compare `account_uuid`, so it was structurally unable to tell two
@@ -351,7 +351,7 @@ impl Manager {
                         // `refresh_plan` silently never refreshes it again.
                         // Identity fields are BACKFILLED — filled in only where
                         // the row does not already carry a value — mirroring
-                        // `oauth::upsert_account`. Backfilling (rather than
+                        // `login::upsert_account`. Backfilling (rather than
                         // ignoring) is what permanently closes the split-brain
                         // trigger: once a legacy no-org row's org is filled in,
                         // it stops being loosely matched by every org variant of
@@ -401,20 +401,11 @@ impl Manager {
                         // by `idx`, because `idx` here is a `self.accounts`
                         // (runtime) index and is not guaranteed to line up with
                         // `self.config.accounts`.
-                        let existing_pin = {
-                            let config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
-                            match crate::identity::resolve(
-                                config.accounts.iter().enumerate(),
-                                &target,
-                            ) {
-                                crate::identity::Resolved::One(position) => config
-                                    .accounts
-                                    .get(position)
-                                    .map_or_default(config::Account::egress_pin),
-                                crate::identity::Resolved::Many
-                                | crate::identity::Resolved::None => config::EgressPin::default(),
-                            }
-                        };
+                        let existing_pin = self
+                            .config
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .egress_pin_of(&target);
                         let target = config::Account {
                             name: row.name.clone(),
                             account_type: row.account_type.clone(),
@@ -539,10 +530,10 @@ impl Manager {
                     // `config_write` (held since this attempt's start, see the N2
                     // doc-comment above), which is what makes this whole arm
                     // atomic with respect to another concurrent call.
-                    {
-                        let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
-                        config.accounts.push(account.clone());
-                    }
+                    self.config
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .append_account(account.clone());
                     let name = account.name.clone();
                     let persist = self.persist_added(&account);
                     return AddAccountOutcome::Added { idx, name, persist };
@@ -661,25 +652,10 @@ impl Manager {
             outcome,
             Ok(config::AccountWrite::Updated | config::AccountWrite::Added)
         ) {
-            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
-            match crate::identity::resolve(config.accounts.iter().enumerate(), target) {
-                crate::identity::Resolved::One(position) => {
-                    if let Some(entry) = config.accounts.get_mut(position) {
-                        entry.access_token.clone_from(&for_disk.access_token);
-                        entry.refresh_token.clone_from(&for_disk.refresh_token);
-                        entry.expires_at = for_disk.expires_at;
-                        entry.codex_home.clone_from(&for_disk.codex_home);
-                        entry.extra.remove(config::CODEX_SYNC_PENDING_KEY);
-                    }
-                }
-                // No in-memory entry carries this identity either — the disk
-                // row `save_account` just appended has no counterpart here.
-                // Mirror the append so a later persist can still find it.
-                crate::identity::Resolved::None => config.accounts.push(for_disk.clone()),
-                // A tie the in-memory snapshot cannot break either; leave it
-                // alone rather than guess which entry to overwrite.
-                crate::identity::Resolved::Many => {}
-            }
+            self.config
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .adopt_replaced_credentials(target, &for_disk);
         }
 
         match outcome {

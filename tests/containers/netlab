@@ -75,7 +75,7 @@ attach_host() {
 }
 
 # True when $1 is a dotted address in 100.64.0.0/10, the tailnet-shaped range
-# `pair::is_tailnet` (src/peer/pair.rs) reads. Read as two fields rather than
+# `pair::addresses::is_tailnet` (src/peer/pair/addresses.rs) reads. Read as two fields rather than
 # matched against a case glob, because a glob covering 64-127 in the second
 # octet is the kind of pattern nobody rereads correctly a year later.
 is_overlay_addr() {
@@ -89,7 +89,7 @@ is_overlay_addr() {
 # Numbered eth1, eth2, ... because eth0 is the primary attach_host gave it,
 # UNLESS the address is in the tailnet-shaped overlay range: `node-entrypoint.sh`
 # (the compose harness) attaches that wire as an ordinary bridge interface and
-# then renames it to utun0, because `pair::is_tailnet` ranks an address first
+# then renames it to utun0, because `pair::addresses::is_tailnet` ranks an address first
 # only when the interface holding it is also named that. A namespace lab
 # creates the wire after `next_wire`, so it can give it the right name up
 # front and skip the rename dance entirely.

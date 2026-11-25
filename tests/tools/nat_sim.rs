@@ -53,8 +53,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tcr::peer::noise::PeerStream;
 use tcr::peer::reach::PunchNet;
-use tcr::peer::serve::PeerStream;
 use tokio::sync::mpsc;
 
 /// How many bytes one direction of a simulated connection buffers.

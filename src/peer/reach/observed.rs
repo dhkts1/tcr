@@ -16,7 +16,7 @@ use super::*;
 /// on. Writing it as an endpoint would put an address nothing accepts on into
 /// the dial order, where it would cost a connect timeout on every dial.
 ///
-/// It is the reflexive fact [`crate::peer::listener::NodeFacts::listening`]
+/// It is the reflexive fact [`crate::peer::serve::NodeFacts::listening`]
 /// says it does not carry, learned without a STUN server: the other end of an
 /// authenticated session is the third party, and it already knows the answer.
 ///

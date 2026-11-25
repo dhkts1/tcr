@@ -173,12 +173,7 @@ impl Manager {
                 // provider. An unbreakable tie writes nothing: `save_disabled` refuses
                 // one too, and memory must not drift onto a record the file was not
                 // allowed to touch.
-                if let crate::identity::Resolved::One(position) =
-                    crate::identity::resolve(config.accounts.iter().enumerate(), target)
-                    && let Some(account) = config.accounts.get_mut(position)
-                {
-                    account.disabled = if disabled { Some(true) } else { None };
-                }
+                config.set_disabled_by_identity(target, disabled);
             },
         );
         match outcome {
@@ -244,6 +239,29 @@ impl Manager {
             }
         }
         self.grow_error_backoff(idx);
+    }
+
+    /// Arm (or double) the recovery backoff for an errored row. First rejection
+    /// arms [`ERROR_REPROBE_BASE_MS`]; each subsequent one doubles up to
+    /// [`ERROR_REPROBE_CAP_MS`], so a permanently dead credential is retried at most
+    /// ~twice an hour instead of hammering the OAuth endpoint (which would risk
+    /// rate-limiting the whole fleet).
+    pub(in crate::manager) fn grow_error_backoff(&self, idx: usize) {
+        let mut accounts = self
+            .accounts
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(account) = accounts.get_mut(idx) {
+            account.error_backoff_ms = if account.error_backoff_ms == 0 {
+                ERROR_REPROBE_BASE_MS
+            } else {
+                account
+                    .error_backoff_ms
+                    .saturating_mul(2)
+                    .min(ERROR_REPROBE_CAP_MS)
+            };
+            account.error_retry_after_ms = Some(crate::now_ms() + account.error_backoff_ms);
+        }
     }
 
     /// Enable/disable account `idx`. Re-enabling clears a stuck error/hold.

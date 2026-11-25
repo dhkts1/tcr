@@ -84,7 +84,7 @@ pub(super) fn peers_file_beside_config(persist_path: Option<&std::path::Path>) -
 ///
 /// # What is wired, and the one thing that is not
 ///
-/// The accept loop gets a [`crate::peer::listener::LeaseServing`]: a fresh
+/// The accept loop gets a [`crate::peer::serve::LeaseServing`]: a fresh
 /// ledger, THIS process's own proxy base (the whole of "own picker, own Bearer,
 /// own bucket", see `crate::peer::serve::handle_serve_on`) and the manager as
 /// the quota reader. It also gets the owner's headroom noted per window, on a
@@ -103,7 +103,8 @@ pub(super) async fn boot_peer_listener(
     shutdown: &watch::Sender<bool>,
     background: &mut Vec<JoinHandle<()>>,
 ) -> Option<SocketAddr> {
-    use crate::peer::listener::{self, LeaseServing, SessionContext};
+    use crate::peer::listener::{self, SessionContext};
+    use crate::peer::serve::LeaseServing;
 
     let file = match crate::peer::config::read_or_default(peers_path) {
         Ok(file) => file,
@@ -196,8 +197,8 @@ pub(super) async fn boot_peer_listener(
     // The state file that belongs with THIS peers file, not the one in the
     // operator's own cache directory: a `--config` pointing at a temp profile
     // must not write the real machine's pairing window, knock queue, mutes or
-    // bans. See `serve::peer_state_path`.
-    let state_path = crate::peer::serve::peer_state_path(peers_path);
+    // bans. See `state::peer_state_path`.
+    let state_path = crate::peer::state::peer_state_path(peers_path);
 
     // The path table's boot install: this peers file's `paths` policy, plus
     // whatever this state file already carries from a probe before this boot.
@@ -309,7 +310,7 @@ pub(super) async fn boot_peer_listener(
     // in its own module; a build without the `tailnet-node` feature only
     // records `nodeUnsupported` there.
     {
-        let node = crate::peer::tailnet_node::run_in_server(
+        let node = listener::run_in_server(
             peers_path.to_path_buf(),
             state_path.clone(),
             local.port(),
@@ -331,8 +332,8 @@ pub(super) async fn boot_peer_listener(
     // boot decision and `keep_drops_published`'s own re-read make, so a Mac
     // that flips the switch off mid-boot stops publishing at the next tick
     // without needing a second gate here.
-    if file.dead_drop.is_live() {
-        match file.dead_drop.open_store() {
+    if file.drop_is_live() {
+        match file.open_drop_store() {
             Ok(store) => {
                 spawn_dead_drop_publisher(peers_path, store, key.id(), local, shutdown, background);
             }
@@ -517,11 +518,11 @@ fn spawn_beacon(
 /// and the `find` flag re-read off the peers file each wake rather than taken
 /// from the boot snapshot, the same reason [`spawn_beacon`] gives.
 ///
-/// Holds a [`discovery::FoundList`] across wakes: the caps and the ageing
+/// Holds a [`discovery::FoundList`](crate::peer::discovery::FoundList) across wakes: the caps and the ageing
 /// live there, in memory, and this task's whole job after each browse is
 /// dropping this node's own beacon (never by address, only by instance id;
-/// see the module's own refusal) and writing [`discovery::FoundList::shown`]
-/// and [`discovery::FoundList::not_shown`] into `peer-state.json`.
+/// see the module's own refusal) and writing [`discovery::FoundList::shown`](crate::peer::discovery::FoundList::shown)
+/// and [`discovery::FoundList::not_shown`](crate::peer::discovery::FoundList::not_shown) into `peer-state.json`.
 ///
 /// A peers file, or a state file, that does not read or write for a moment
 /// is not the same fact as `find` being off: logged and left as it is until
@@ -546,7 +547,8 @@ fn spawn_browse(
     background: &mut Vec<JoinHandle<()>>,
 ) {
     use crate::peer::config::TailnetMode;
-    use crate::peer::discovery::{self, FoundSource};
+    use crate::peer::discovery;
+    use crate::peer::state::FoundSource;
     use crate::peer::tailnet_find::{self, BeaconIntake, BeaconSocket};
 
     let peers_path = peers_path.to_path_buf();
@@ -621,7 +623,7 @@ fn spawn_browse(
                 // process under a deadline, so it goes to a blocking thread,
                 // and it refreshes the reading the peer listener decides an
                 // own-Mac knock on.
-                let mode = file.tailnet.effective();
+                let mode = file.tailnet_mode();
                 let app = match mode {
                     TailnetMode::App => Some(
                         tailnet_find::OWN_MAC_READINGS
@@ -661,7 +663,7 @@ fn spawn_browse(
                             discovery::tailnet_beacon(port, name.as_deref(), network_key.as_ref());
                         socket.send(&own_macs, &beacon).await;
                         scan.extend(intake.take(&own_macs));
-                        tailnet_peers = tailnet_find::pinned_peers(status, &file.peers);
+                        tailnet_peers = tailnet_find::pinned_peers(status, &file.direct_addrs());
                     }
                 } else {
                     // Off, node, or a read that failed: no reading to trust,
@@ -864,10 +866,10 @@ fn path_traffic_rows_match(
 /// How often the dead-drop publisher wakes and, for every friend it is
 /// allowed to, writes this Mac's current address.
 ///
-/// [`crate::peer::drop::publish_for`] has no floor of its own: it writes
+/// [`crate::peer::reach::drop_exchange::publish_for`] has no floor of its own: it writes
 /// every time it is called and allowed to, so this interval is the entire
 /// cadence. Five minutes, well above the store round trip and well under
-/// [`crate::peer::drop::MAX_RECORD_AGE`] (two slots, two hours), so a record
+/// [`crate::peer::config::drop::MAX_RECORD_AGE`] (two slots, two hours), so a record
 /// this Mac holds is refreshed several times before the slot it published
 /// into stops being accepted.
 const DEAD_DROP_PUBLISH_INTERVAL: Duration = Duration::from_secs(300);
@@ -875,14 +877,14 @@ const DEAD_DROP_PUBLISH_INTERVAL: Duration = Duration::from_secs(300);
 /// Keep this Mac's dead drop current, for every friend `allow.control.drop`
 /// covers, until shutdown.
 ///
-/// The loop is [`crate::peer::drop::keep_drops_published`]; what is here is
+/// The loop is [`crate::peer::reach::drop_exchange::keep_drops_published`]; what is here is
 /// the wiring, [`spawn_internet_keeper`]'s shape. The boot-time gate on
 /// [`crate::peer::config::DeadDropConfig::is_live`] is the caller's, not
 /// this function's, so a Mac that never turned the drop on never calls this
 /// at all.
 fn spawn_dead_drop_publisher(
     peers_path: &std::path::Path,
-    store: crate::peer::drop::HttpsTemplateStore,
+    store: crate::peer::config::drop::HttpsTemplateStore,
     us: tcr_peer_wire::PeerId,
     local: SocketAddr,
     shutdown: &watch::Sender<bool>,
@@ -891,7 +893,7 @@ fn spawn_dead_drop_publisher(
     let peers_path = peers_path.to_path_buf();
     let mut stop = shutdown.subscribe();
     background.push(tokio::spawn(supervise("peer-dead-drop", async move {
-        let publishing = crate::peer::drop::keep_drops_published(
+        let publishing = crate::peer::reach::drop_exchange::keep_drops_published(
             store,
             peers_path,
             us,

@@ -30,7 +30,10 @@ pub enum RequestKeyWrite {
 /// writers touch only their own fields, and the whole-file fallbacks serialize
 /// [`ProxyConfig::request_key`] from memory, which the server sets from this
 /// call's answer.
-pub fn save_request_key(path: &Path, candidate: &str) -> Result<RequestKeyWrite, ConfigError> {
+pub(super) fn save_request_key(
+    path: &Path,
+    candidate: &str,
+) -> Result<RequestKeyWrite, ConfigError> {
     let mut doc = read_document(path)?;
     let proxy = doc
         .entry("proxy".to_string())
@@ -58,6 +61,26 @@ pub fn save_request_key(path: &Path, candidate: &str) -> Result<RequestKeyWrite,
     );
     write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
     Ok(RequestKeyWrite::Written(candidate.to_string()))
+}
+
+impl super::Config {
+    /// Write `candidate` to the file at `path` as the request key
+    /// ([`save_request_key`]) and hold whatever key the file then carries:
+    /// `candidate` when it was written, the file's own when another writer got
+    /// there first. A failed write holds nothing new.
+    pub fn persist_request_key(
+        &mut self,
+        path: &Path,
+        candidate: &str,
+    ) -> Result<RequestKeyWrite, ConfigError> {
+        let outcome = save_request_key(path, candidate)?;
+        match &outcome {
+            RequestKeyWrite::Written(key) | RequestKeyWrite::AlreadyPresent(key) => {
+                self.proxy.request_key = Some(key.clone());
+            }
+        }
+        Ok(outcome)
+    }
 }
 
 /// The `proxy.requestKey` in the file at `path`, read without loading the rest
@@ -691,8 +714,8 @@ pub(super) fn provider_of_entry(entry: &Map<String, Value>) -> Option<crate::pro
 /// [`EntryRefusal`] explaining why there is no single entry to write.
 ///
 /// Matching reuses the [`DiskIdentity`] probe + [`crate::identity::resolve`]
-/// pairing that [`merge_tokens`] uses, so a rotated credential and a disabled flag
-/// can never land on two different entries.
+/// pairing that [`super::Config::merge_tokens`] uses, so a rotated credential
+/// and a disabled flag can never land on two different entries.
 ///
 /// An AMBIGUOUS identity is refused, not resolved to the first match. The old
 /// first-match-wins rested on "the CLI already refuses an ambiguous query", but

@@ -1181,7 +1181,7 @@ fn group_color_accepts_short_hex_form() {
 
 /// Setting a color on a group no account carries is an error listing the
 /// configured groups — matching `add_to_group`'s unknown-account message
-/// shape (via `find_account_by_name`).
+/// shape (via `Config::find_account_by_name`).
 #[test]
 fn group_color_on_unknown_group_lists_configured_groups() {
     let path = write_config("color-unknown-group", GROUPED_ACCOUNTS);

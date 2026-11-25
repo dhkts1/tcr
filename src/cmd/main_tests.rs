@@ -194,7 +194,7 @@ fn from_codex_parses_alone_and_with_codex_home_name_and_account() {
 /// error.
 #[test]
 fn restart_hint_names_only_commands_that_parse() {
-    let commands: Vec<&str> = cli::RESTART_HINT
+    let commands: Vec<&str> = tcr::live_client::RESTART_HINT
         .split('`')
         .skip(1)
         .step_by(2)
@@ -203,7 +203,7 @@ fn restart_hint_names_only_commands_that_parse() {
     assert!(
         !commands.is_empty(),
         "the hint must name a tcr command to run: {}",
-        cli::RESTART_HINT
+        tcr::live_client::RESTART_HINT
     );
     for command in commands {
         let argv: Vec<&str> = command.split_whitespace().collect();
@@ -221,7 +221,7 @@ fn restart_hint_names_only_commands_that_parse() {
 /// Watched red: one flag misspelled in one production string panics naming that span.
 #[test]
 fn codex_remedies_name_only_commands_that_parse() {
-    let workspace = oauth::codex_relogin_workspace_refusal(
+    let workspace = login::codex_relogin_workspace_refusal(
         Some("erin@example.com"),
         "99999999-9999-4999-8999-999999999999",
         Some("business"),
@@ -230,17 +230,17 @@ fn codex_remedies_name_only_commands_that_parse() {
         Some("pro"),
     );
     let strings = [
-        oauth::codex_account_login_refusal("bob@example.com/codex"),
-        oauth::claude_account_codex_login_refusal("alice@example.com"),
-        oauth::claude_account_codex_import_refusal("alice@example.com"),
-        oauth::codex_identity_refusal("carol@example.com", "erin@example.com/codex").reason,
+        login::codex_account_login_refusal("bob@example.com/codex"),
+        login::claude_account_codex_login_refusal("alice@example.com"),
+        login::claude_account_codex_import_refusal("alice@example.com"),
+        login::codex_identity_refusal("carol@example.com", "erin@example.com/codex").reason,
         workspace.reason,
         no_codex_account_reason(3999, "chatgpt.com"),
-        oauth::NO_REFRESH_CODEX_MESSAGE.to_string(),
-        oauth::no_codex_login_message(Path::new("/Users/example/.codex/auth.json")),
+        tcr::oauth::NO_REFRESH_CODEX_MESSAGE.to_string(),
+        login::no_codex_login_message(Path::new("/Users/example/.codex/auth.json")),
         tcr::codex_cli_login::codex_login_saved_line("bob@example.com", Some("ChatGPT Pro")),
-        oauth::CODEX_IMPORT_RUN_LINE.to_string(),
-        oauth::CODEX_FIRST_ACCOUNT_NOTICE.to_string(),
+        login::CODEX_IMPORT_RUN_LINE.to_string(),
+        login::CODEX_FIRST_ACCOUNT_NOTICE.to_string(),
     ];
     let mut commands: Vec<String> = Vec::new();
     for text in &strings {
@@ -255,11 +255,11 @@ fn codex_remedies_name_only_commands_that_parse() {
     }
     commands.extend(
         [
-            oauth::LOGIN_COMMAND,
-            oauth::LOGIN_FROM_CODEX_COMMAND,
-            oauth::LOGIN_FROM_CLAUDE_CODE_COMMAND,
-            oauth::LOGIN_CODEX_COMMAND,
-            oauth::IMPORT_COMMAND,
+            login::LOGIN_COMMAND,
+            login::LOGIN_FROM_CODEX_COMMAND,
+            login::LOGIN_FROM_CLAUDE_CODE_COMMAND,
+            login::LOGIN_CODEX_COMMAND,
+            login::IMPORT_COMMAND,
         ]
         .map(str::to_string),
     );

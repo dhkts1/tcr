@@ -337,7 +337,7 @@ impl Manager {
     pub fn record_upstream_error(
         &self,
         provider: crate::provider::Provider,
-        kind: crate::routing::ErrorKind,
+        kind: crate::observations::ErrorKind,
     ) {
         self.record_upstream_error_at(provider, kind, OffsetDateTime::now_utc());
     }
@@ -346,7 +346,7 @@ impl Manager {
     pub fn record_upstream_error_at(
         &self,
         provider: crate::provider::Provider,
-        kind: crate::routing::ErrorKind,
+        kind: crate::observations::ErrorKind,
         now: OffsetDateTime,
     ) {
         self.routing
@@ -363,7 +363,7 @@ impl Manager {
         provider: crate::provider::Provider,
         now_ms: i64,
     ) -> (
-        Option<(crate::routing::ErrorKind, i64, u32)>,
+        Option<(crate::observations::ErrorKind, i64, u32)>,
         std::collections::BTreeSet<String>,
     ) {
         let seen = self.routing.lock().unwrap_or_else(PoisonError::into_inner);
@@ -666,15 +666,14 @@ impl Manager {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
-            let hold = account
-                .quota
-                .codex
-                .refusal_reset
-                .filter(|reset| *reset > now)
-                .map_or_else(
-                    || seconds.clamp(1, MAX_RATE_LIMIT_HOLD_SECONDS),
-                    |reset| reset.unix_timestamp().saturating_sub(now.unix_timestamp()),
-                );
+            let hold = match account.quota.codex_refusal_deadline(now) {
+                crate::quota::RefusalDeadline::Ahead(reset) => {
+                    reset.unix_timestamp().saturating_sub(now.unix_timestamp())
+                }
+                crate::quota::RefusalDeadline::Unnamed | crate::quota::RefusalDeadline::Passed => {
+                    seconds.clamp(1, MAX_RATE_LIMIT_HOLD_SECONDS)
+                }
+            };
             account.status = AccountStatus::Throttled;
             account.rate_limited_until_ms =
                 Some(odt_to_ms(now).saturating_add(hold.saturating_mul(1000)));
@@ -711,7 +710,7 @@ impl Manager {
             );
             account.provider
         };
-        self.record_upstream_error_at(provider, crate::routing::ErrorKind::Auth, now);
+        self.record_upstream_error_at(provider, crate::observations::ErrorKind::Auth, now);
     }
 
     /// Clear a hold after live proof it no longer binds (any non-429): a
@@ -745,7 +744,7 @@ impl Manager {
     /// `select.rs`'s `eligible`/`hard_ok`/`account_terminal_gate` reads the
     /// counter this writes — wiring it into routing is a separate, later,
     /// premortem'd change. The kind it names, if any
-    /// ([`crate::routing::ErrorKind::of_stream`]), becomes the provider's last error in the
+    /// ([`crate::observations::ErrorKind::of_stream`]), becomes the provider's last error in the
     /// routing document, which is observability too.
     pub fn record_stream_error(&self, idx: usize, kind: &str) {
         self.record_stream_error_at(idx, kind, OffsetDateTime::now_utc());
@@ -773,7 +772,7 @@ impl Manager {
             account.last_stream_error = Some(kind.to_string());
             account.provider
         };
-        if let Some(error) = crate::routing::ErrorKind::of_stream(kind) {
+        if let Some(error) = crate::observations::ErrorKind::of_stream(kind) {
             self.record_upstream_error_at(provider, error, now);
         }
     }
@@ -859,8 +858,8 @@ mod routing_observation_tests {
     //! a failed stream and a refused credential are already recorded.
     use super::*;
     use crate::config::Account;
+    use crate::observations::ErrorKind;
     use crate::provider::Provider;
-    use crate::routing::ErrorKind;
     use std::collections::BTreeSet;
 
     /// One `anthropic` account (slot 0) and one `codex` account (slot 1).

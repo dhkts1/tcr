@@ -3,7 +3,7 @@
 //!
 //! # What this is and what it is not
 //!
-//! An [`Ask`] is a one-time public key, pasted into a chat, that names no
+//! An [`Ask`](crate::peer::ask::Ask) is a one-time public key, pasted into a chat, that names no
 //! address and grants nothing. Whoever holds it mints a one-use, ten-minute
 //! join key of their own (the same [`crate::peer::pair::mint_invite`] the
 //! `invite` verb runs) and seals it to the ask; this Mac then joins with that
@@ -11,7 +11,7 @@
 //! peers file, and it is not counted against
 //! [`crate::peer::pair::MAX_OUTSTANDING_INVITES`].
 //!
-//! A [`Reply`] is what comes back: one Mac's freshly minted `JoinToken`
+//! A [`Reply`](crate::peer::ask::Reply) is what comes back: one Mac's freshly minted `JoinToken`
 //! (v3's three fields), sealed under Noise `N`
 //! ([`crate::peer::noise::PATTERN_SEAL`]) to one ask's public key. It opens
 //! against exactly one live row, once. Opening it runs the join on the spot,
@@ -24,7 +24,7 @@
 //! `src/peer/listener.rs::internet_admission` refuses a knock or a first
 //! pairing (`NN`/`XX`) from any source outside LAN scope, by design: a
 //! tailnet address is deliberately not LAN scope
-//! (`listener::is_lan_scope_v4`'s own doc). Only `Return`/`Enrol` (`IK`,
+//! (`reach::is_lan_scope_v4`'s own doc). Only `Return`/`Enrol` (`IK`,
 //! `IKpsk1`, a key this node minted or already pinned) is answered off-LAN.
 //! So a reply that only taught an address would still fail at the knock that
 //! used to follow it, for exactly the friend mode B exists for: one who is
@@ -41,18 +41,18 @@
 //!
 //! # Framing
 //!
-//! Both wire forms frame exactly like [`crate::peer::moved`]: four magic
+//! Both wire forms frame exactly like [`crate::peer::config::moved`]: four magic
 //! bytes outside the seal, then a version byte, then the payload. The length
 //! is checked before any AEAD runs, so a chat client that truncated a paste
 //! is told it was cut short rather than called a forgery
 //! (`src/peer/moved.rs:106`, `:430`).
 
+use serde::{Deserialize, Serialize};
 use tcr_peer_wire::Crockford;
 
+use crate::peer::config::join_key::JoinToken;
 use crate::peer::id::KEY_BYTES;
 use crate::peer::noise;
-use crate::peer::pair::JoinToken;
-use crate::peer::state::PendingAsk;
 
 /// What every ask starts with.
 pub const ASK_PREFIX: &str = "tcr-invite:v1:";
@@ -188,7 +188,7 @@ pub struct Reply {
 
 /// The fewest bytes a reply can be and still hold something that could open:
 /// the frame, a 32-byte ephemeral public key, a tag, and at least one byte
-/// under the tag. [`crate::peer::moved::MIN_LINK_BYTES`]'s own shape.
+/// under the tag. [`crate::peer::config::moved::MIN_LINK_BYTES`]'s own shape.
 const MIN_REPLY_BYTES: usize = REPLY_MAGIC.len() + 1 + 32 + 16 + 1;
 
 impl Reply {
@@ -288,6 +288,38 @@ impl std::fmt::Display for ReplyRefusal {
 }
 
 impl std::error::Error for ReplyRefusal {}
+
+/// One outstanding ask: a one-time keypair minted for a sealed exchange, with
+/// the clock that sweeps it. Lives in the state file, never the peers file:
+/// it is transient, it has a deadline, and losing it costs one re-minted ask,
+/// where losing the peers file costs every pin.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingAsk {
+    /// This row's id, so `spend_ask` can remove exactly the row that opened,
+    /// even when two rows are live at once.
+    pub id: u64,
+    /// The public half, printed as the ask a friend pastes into a chat.
+    pub public: [u8; 32],
+    /// The private half. Never logged, never printed: see [`Debug`] below.
+    pub private: [u8; 32],
+    /// The absolute deadline, swept by [`PeerState::expire`](crate::peer::state::PeerState::expire) like every other
+    /// transient row with a clock.
+    pub until_ms: i64,
+}
+
+impl std::fmt::Debug for PendingAsk {
+    /// The private key is deliberately not printed, [`MovedKeys`](crate::peer::config::moved::MovedKeys)'s own move
+    /// (`src/peer/moved.rs:148-153`) for the same reason: a `{:?}` in a log
+    /// line is how a secret reaches a file that keeps scrollback.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingAsk")
+            .field("id", &self.id)
+            .field("public", &"[32 bytes]")
+            .field("private", &"(withheld)")
+            .field("until_ms", &self.until_ms)
+            .finish()
+    }
+}
 
 /// Try `pasted` against every row in `rows` that is still live at `now_ms`,
 /// and on the first one whose private key opens it, decode the plaintext and

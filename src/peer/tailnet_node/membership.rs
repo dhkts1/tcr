@@ -48,7 +48,7 @@ pub async fn join_with<F: DeviceFactory>(
     }
     let file = crate::peer::config::read_or_default(peers_path)?;
     let existing = read_key_file(key_path)?;
-    if file.tailnet.effective() == TailnetMode::Node && existing.is_some() {
+    if file.tailnet_mode() == TailnetMode::Node && existing.is_some() {
         bail!(
             "peer tailnet: this Mac is already a node on a tailnet; run `tcr peer tailnet leave` \
              first to join again"
@@ -121,10 +121,7 @@ pub async fn join_with<F: DeviceFactory>(
         ));
     }
 
-    let _lock = crate::peer::config::FileLock::acquire(peers_path)?;
-    let mut file = crate::peer::config::read_or_default(peers_path)?;
-    file.tailnet = TailnetMode::Node.into();
-    crate::peer::config::save(peers_path, &file)?;
+    crate::peer::config::PeerFile::save_tailnet(peers_path, TailnetMode::Node)?;
     Ok(me)
 }
 
@@ -168,12 +165,7 @@ pub async fn leave_with(
     let holds_a_node = held_at(asked_ms)?.is_some_and(|record| {
         record.mode.effective() == TailnetMode::Node && !record.is_stale(asked_ms)
     });
-    {
-        let _lock = crate::peer::config::FileLock::acquire(peers_path)?;
-        let mut file = crate::peer::config::read_or_default(peers_path)?;
-        file.tailnet = TailnetMode::Off.into();
-        crate::peer::config::save(peers_path, &file)?;
-    }
+    crate::peer::config::PeerFile::save_tailnet(peers_path, TailnetMode::Off)?;
 
     let until = tokio::time::Instant::now() + wait;
     if holds_a_node {

@@ -214,8 +214,10 @@ impl Fleet {
     }
 
     fn from_config(config: Config) -> Self {
-        let account_names = config.accounts.iter().map(|a| a.name.clone()).collect();
         let manager = manager_over(config);
+        let account_names = (0..manager.account_count())
+            .filter_map(|idx| manager.account_name(idx))
+            .collect();
         let mut fleet = Self {
             manager,
             account_names,
@@ -1262,7 +1264,7 @@ fn replay_clock_controls_quota_and_holds() {
     assert!(quota.update_from_headers_at(&headers, now));
     assert_eq!(quota.updated_at, Some(now));
     assert_eq!(
-        quota.five_hour.unwrap().reset,
+        quota.live_reset(tcr::quota::QuotaBucket::FiveHour, now),
         Some(now + Duration::hours(5))
     );
     quota.apply_usage_at(
@@ -1276,12 +1278,12 @@ fn replay_clock_controls_quota_and_holds() {
         now,
     );
     assert_eq!(
-        quota.seven_day.unwrap().reset,
+        quota.live_reset(tcr::quota::QuotaBucket::SevenDay, now),
         Some(now + Duration::days(7))
     );
     quota.reject_model_weekly_at(&reqwest::header::HeaderMap::new(), now);
     assert_eq!(
-        quota.seven_day_oi.unwrap().reset,
+        quota.live_reset(tcr::quota::QuotaBucket::SevenDayOi, now),
         Some(now + Duration::days(7))
     );
 

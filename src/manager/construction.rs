@@ -13,11 +13,7 @@ impl Manager {
         warmer: Arc<dyn AccountWarmer>,
         config_path: Option<PathBuf>,
     ) -> Arc<Self> {
-        let accounts: Vec<AccountRuntime> = config
-            .accounts
-            .iter()
-            .map(|a| AccountRuntime::from_config(a, config.http1_only))
-            .collect();
+        let accounts: Vec<AccountRuntime> = config.build_per_account(AccountRuntime::from_config);
         Self::assemble(config, refresher, prober, warmer, config_path, accounts)
     }
 
@@ -79,13 +75,13 @@ impl Manager {
         let reset_urgency_tier_ms =
             i64::from(config.reset_urgency_tier_hours).saturating_mul(3_600_000);
 
-        let control_idx = config.control_account.as_ref().and_then(|identity| {
-            match crate::identity::match_one(&accounts[..], identity.name()) {
+        let control_idx = config.control_account_name().and_then(|name| {
+            match crate::identity::match_one(&accounts[..], name) {
                 crate::identity::Match::One(idx) => Some(idx),
                 crate::identity::Match::None => {
                     let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
                     tracing::error!(
-                        control_account = %identity.name(), available = ?names,
+                        control_account = %name, available = ?names,
                         "controlAccount did not match any account — running with NO control account"
                     );
                     None
@@ -97,7 +93,7 @@ impl Manager {
                 // while the account that resolved it live stays unpinned.
                 crate::identity::Match::Ambiguous(candidates) => {
                     tracing::error!(
-                        control_account = %identity.name(), candidates = ?candidates,
+                        control_account = %name, candidates = ?candidates,
                         "controlAccount matches more than one account — refusing to guess, running with NO control account"
                     );
                     None
@@ -122,10 +118,7 @@ impl Manager {
             })
         });
 
-        let usage = crate::usage::UsageTracker::new(
-            accounts.len(),
-            crate::pricing::PricingTable::new(config.pricing.clone().into_iter().collect()),
-        );
+        let usage = crate::usage::UsageTracker::new(accounts.len(), config.pricing_table());
 
         let manager = Arc::new(Self {
             me: std::sync::OnceLock::new(),
@@ -195,7 +188,7 @@ impl Manager {
             control_identity,
             client_identities: crate::control_identity::ClientIdentityCache::new(),
             reset_urgency_tier_ms,
-            routing: Mutex::new(crate::routing::Observations::default()),
+            routing: Mutex::new(crate::observations::Observations::default()),
         });
         // Hand the manager its own `Arc` (weakly) now that one exists — see the
         // `me` field. Infallible: this is the only write, on a just-built value.

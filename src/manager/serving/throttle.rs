@@ -1,6 +1,5 @@
 //! `Manager` throttle methods, split verbatim from `mod.rs`.
 
-use crate::manager::select::{RequestClass, classify_request};
 use crate::manager::*;
 
 /// Whether a [`RequestClass`] is exempt from the PER-ORG GCRA when
@@ -43,37 +42,12 @@ fn bucket_key_for(org_uuid: Option<&str>, org_name: Option<&str>, idx: usize) ->
 }
 
 impl Manager {
-    /// Whether `Noise`-classified traffic (`/api/event_logging*`,
-    /// `/mcp-registry*` — see [`classify_request`]) skips the PER-ORG GCRA, read
-    /// from the config's unmodelled top-level `throttleExemptNoise`. **Default
-    /// `false`** — every account-served request pays a slot. Same read pattern as
-    /// [`Manager::session_affinity_enabled`].
-    ///
-    /// Note this exempts ONE of the two buckets. Exempt traffic still pays the
-    /// fleet ceiling, so it is never entirely unpaced.
-    ///
-    /// Ships OFF deliberately, but the reasoning changed when the throttle was
-    /// split in two. The original argument was that freeing telemetry's ~32% of
-    /// slots does not reduce upstream pressure, it *reallocates* it onto
-    /// `/v1/messages` — true when ONE bucket was all there was, because every slot
-    /// telemetry gave up was a slot inference immediately took.
-    ///
-    /// With a per-org bucket plus a fleet ceiling that is no longer the trade.
-    /// Exempt traffic now skips only the PER-ORG bucket and still pays the fleet
-    /// ceiling (see [`Manager::throttle_send`]), so total egress stays bounded
-    /// while telemetry stops consuming an organization's burst budget — which is
-    /// the budget an interactive turn is actually waiting on.
-    ///
-    /// The code default stays `false` regardless: this repo is public and other
-    /// fleets may not have the account count to absorb it.
+    /// See [`crate::config::Config::throttle_exempt_noise_enabled`].
     pub fn throttle_exempt_noise_enabled(&self) -> bool {
         self.config
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .extra
-            .get("throttleExemptNoise")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+            .throttle_exempt_noise_enabled()
     }
 
     /// The GCRA bucket key for account `idx`: its provider and ORGANIZATION when

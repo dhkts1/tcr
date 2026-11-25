@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::manager::Manager;
-use crate::{affinity, build_info, cli, mitm, session_wire_persist, singleton};
+use crate::{affinity, build_info, live_client, mitm, session_wire_persist, singleton, tls};
 
 mod peer_mesh;
 use peer_mesh::{boot_peer_listener, peers_file_beside_config};
@@ -299,7 +299,7 @@ pub struct StandDown {
     pub kind: singleton::ProxyKind,
     /// ONE probe of the incumbent: which build it runs, and whether it answers
     /// at all. Both halves are needed to pick an exit code.
-    pub probe: cli::IncumbentProbe,
+    pub probe: live_client::IncumbentProbe,
     /// The build comparison, verdict + human line produced together.
     pub report: build_info::StandDownReport,
 }
@@ -843,18 +843,9 @@ impl SavedCache {
         path: &std::path::Path,
     ) -> Result<crate::save_gate::SaveOutcome, crate::config::ConfigError> {
         match self {
-            Self::Affinity => {
-                manager.take_affinity_dirty();
-                manager.flush_affinity_if_changed(path)
-            }
-            Self::BoundTokens => {
-                manager.take_bound_tokens_dirty();
-                manager.flush_bound_tokens_if_changed(path)
-            }
-            Self::WireSessions => {
-                manager.take_wire_sessions_dirty();
-                manager.flush_wire_sessions_if_changed(path)
-            }
+            Self::Affinity => manager.flush_affinity_if_changed(path),
+            Self::BoundTokens => manager.flush_bound_tokens_if_changed(path),
+            Self::WireSessions => manager.flush_wire_sessions_if_changed(path),
         }
     }
 
@@ -891,8 +882,7 @@ impl SavedCache {
         match self {
             Self::Affinity if !manager.session_affinity_enabled() => Ok(None),
             Self::Affinity => manager.flush_affinity(path).map(Some),
-            Self::BoundTokens if !manager.take_bound_tokens_dirty() => Ok(None),
-            Self::BoundTokens => manager.flush_bound_tokens(path).map(Some),
+            Self::BoundTokens => manager.flush_bound_tokens_if_dirty(path),
             Self::WireSessions => manager.flush_wire_sessions(path).map(Some),
         }
     }
@@ -1071,7 +1061,7 @@ async fn predecessor_closed(channel: std::os::unix::net::UnixStream) -> std::io:
 
 /// Give the server a request key ([`crate::request_key`]) when its config has none:
 /// generate one and write it to the config file through the targeted writer
-/// ([`crate::config::save_request_key`]), then hold whatever the file now says.
+/// ([`Config::persist_request_key`]), then hold whatever the file now says.
 ///
 /// Only with a file to write. A key the server held and the file did not would
 /// be one `tcr request-key` cannot print, so a launcher could never present it;
@@ -1081,12 +1071,7 @@ async fn predecessor_closed(channel: std::os::unix::net::UnixStream) -> std::io:
 ///
 /// One boot line says a key was written or adopted. It never carries the key.
 pub(crate) fn ensure_request_key(config: &mut Config, persist_path: Option<&std::path::Path>) {
-    if config
-        .proxy
-        .request_key
-        .as_deref()
-        .is_some_and(|key| !key.is_empty())
-    {
+    if config.usable_request_key().is_some() {
         return;
     }
     let Some(path) = persist_path else {
@@ -1099,20 +1084,18 @@ pub(crate) fn ensure_request_key(config: &mut Config, persist_path: Option<&std:
             return;
         }
     };
-    match crate::config::save_request_key(path, &candidate) {
-        Ok(crate::config::RequestKeyWrite::Written(key)) => {
+    match config.persist_request_key(path, &candidate) {
+        Ok(crate::config::RequestKeyWrite::Written(_)) => {
             tracing::info!(
                 path = %path.display(),
                 "request key: generated one and saved it to the config (`tcr request-key` prints it)"
             );
-            config.proxy.request_key = Some(key);
         }
-        Ok(crate::config::RequestKeyWrite::AlreadyPresent(key)) => {
+        Ok(crate::config::RequestKeyWrite::AlreadyPresent(_)) => {
             tracing::info!(
                 path = %path.display(),
                 "request key: the config gained one since it was loaded; using that"
             );
-            config.proxy.request_key = Some(key);
         }
         Err(err) => tracing::warn!(
             path = %path.display(),
@@ -1166,21 +1149,14 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         handover,
     } = options;
 
-    if let Some(port) = port_override {
-        config.proxy.port = port;
-    }
-    let port = config.proxy.port;
+    let port = config.apply_port_override(port_override);
 
     // `config::load` may have just renamed accounts to restore unique names. The
     // pin file is keyed by name, so carry it across before anything reads it —
     // otherwise every pin on a renamed account resolves to nothing and those
     // sessions cold-start their prompt cache, which is the most expensive event
     // in this system.
-    let renames: Vec<(String, String)> = config
-        .renamed_accounts
-        .iter()
-        .map(|rename| (rename.from.clone(), rename.to.clone()))
-        .collect();
+    let renames: Vec<(String, String)> = config.rename_pairs();
     if let Some(path) = &affinity_path {
         let rewritten = affinity::rename_pins(path, &renames);
         if rewritten > 0 {
@@ -1220,7 +1196,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     if let singleton::Takeover::IncumbentPresent(incumbent) = takeover {
         // ONE probe of the incumbent, answering two questions: which build it is
         // executing, and whether it is executing anything at all.
-        let probe = cli::probe_incumbent(&config).await;
+        let probe = live_client::probe_incumbent(&config).await;
         // Read the checkout LIVE. The build stamps alone cannot see an edit made
         // since the last commit (build.rs re-runs only when a git ref moves), so
         // comparing two stamps would print "build in sync" for a proxy that
@@ -1585,12 +1561,12 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // name `CODEX_CA_CERTIFICATE` too, the variable codex trusts a CA from.
     let holds_codex = manager.provider_account_count(crate::provider::Provider::Codex) > 0;
     let tls = match tls {
-        TlsSetup::Load => match mitm::load_tls(holds_codex) {
+        TlsSetup::Load => match tls::load_tls(holds_codex) {
             Ok(assets) => {
                 tracing::info!(
                     ca = %assets.ca_path.display(),
                     "{}",
-                    mitm::advertise_note(holds_codex)
+                    tls::advertise_note(holds_codex)
                 );
                 manager.record_mitm_status(crate::status::MitmStatus::of(Some(&assets)));
                 Some(Arc::new(assets.acceptor))

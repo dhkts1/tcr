@@ -14,13 +14,13 @@
 //! config gains no new key and no new exception.
 //!
 //! **The split inside this file is the design: the SOCKET is boot-time, the
-//! POLICY is hot.** [`PeerFile::listen`] and [`PeerFile::max_hops`] are read
+//! POLICY is hot.** [`PeerFile::listen`](crate::peer::config::PeerFile::listen) and [`PeerFile::max_hops`](crate::peer::config::PeerFile::max_hops) are read
 //! once at boot, turning a listener on is a restart-worthy act and saying so
-//! is honest. [`PeerFile::discovery`] is not one of them: the server's
+//! is honest. [`PeerFile::discovery`](crate::peer::config::PeerFile::discovery) is not one of them: the server's
 //! announce and browse tasks re-read this file on every 20-second wake
 //! (`spawn_beacon` and `spawn_browse` in `src/server.rs`), so `tcr peer
 //! find on|off` reaches a running server with no restart. Everything under
-//! [`PeerRow::allow`] and [`PeerRow::lend`] is re-read whenever this file's
+//! [`PeerRow::allow`](crate::peer::config::PeerRow::allow) and [`PeerRow::lend`](crate::peer::config::PeerRow::lend) is re-read whenever this file's
 //! mtime moves, exactly the way `Manager::reload_groups_if_changed`
 //! (`src/manager/mod.rs:1990`) already does it for groups. One mechanism, not a
 //! second spelling of it.
@@ -32,7 +32,7 @@
 //!
 //! # Mode 0600, and what an outstanding invite really is
 //!
-//! [`PendingInvite::secret`] is PSK material the registrar must hold to
+//! [`PendingInvite::secret`](crate::peer::config::PendingInvite::secret) is PSK material the registrar must hold to
 //! complete a handshake, so an outstanding invite is join-capable by anything
 //! that can read this file. A stored hash cannot be both unusable by an
 //! attacker and usable by the registrar; pretending otherwise would be the
@@ -44,13 +44,31 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{LendScope, PeerId, Window};
 
-use crate::peer::drop::hmac_sha256;
+use crate::peer::config::drop::hmac_sha256;
+
+/// The join key an operator pastes: [`join_key::JoinToken`] and the addresses
+/// it carries. It renders a [`PendingInvite`]'s secret, which is why it is a
+/// child of this module.
+pub mod join_key;
+
+/// One codec for a list of dial addresses, shared by the v3 join key and the
+/// sealed reply so the same list is never spelled into bytes twice.
+pub mod dialaddrs;
+
+/// Where two Macs that both moved leave each other an address: the per-pair
+/// name and the sealed record. Crypto and naming only, called by nothing yet.
+pub mod drop;
+
+/// What one Mac sends one friend after it changed networks: a sealed record
+/// saying where it is now. The seal and the refusals only, called by nothing
+/// yet.
+pub mod moved;
 
 /// `tcr-peers.json` in the config directory, mode 0600.
 pub fn default_path() -> PathBuf {
@@ -177,15 +195,15 @@ pub struct PeerFile {
     /// transport-failure arm, so turning a carry off takes effect without a
     /// restart, the same rule every other policy field here follows.
     ///
-    /// The default is [`crate::peer::egress::ViaRoute::Auto`], and
-    /// [`crate::peer::egress::ViaSetting`]'s own docs carry the reason that is
+    /// The default is [`ViaRoute::Auto`], and
+    /// [`ViaSetting`]'s own docs carry the reason that is
     /// not a disclosure decision: a carry is blind, and the Mac that carries is
     /// the one whose grant admits it.
     #[serde(default)]
-    pub via: crate::peer::egress::ViaSetting,
+    pub via: ViaSetting,
     /// How long a borrow through [`crate::peer::serve::open_serve`] may take
     /// before the client is released, the operator's setting for
-    /// [`crate::peer::serve::BORROW_TIMEOUT`], which is now only this field's
+    /// [`crate::peer::tunnel::dial::BORROW_TIMEOUT`], which is now only this field's
     /// default. Hot: `open_serve` reads it per call through the
     /// [`PeerStore`] it is already handed, so lowering it takes effect
     /// without a restart, the same rule every other policy field here
@@ -193,10 +211,10 @@ pub struct PeerFile {
     #[serde(default = "default_borrow_timeout_ms")]
     pub borrow_timeout_ms: u64,
     /// Which path to a peer is tried first, and what counts as too lossy to
-    /// try early. The type is [`crate::peer::probe::PathsConfig`], which is
+    /// try early. The type is [`PathsConfig`], which is
     /// where the sort it feeds lives. Hot: read per dial.
     #[serde(default)]
-    pub paths: crate::peer::probe::PathsConfig,
+    pub paths: PathsConfig,
     /// One row per pinned peer. Hot.
     #[serde(default)]
     pub peers: Vec<PeerRow>,
@@ -283,7 +301,7 @@ const fn default_max_hops() -> u8 {
     1
 }
 
-/// Mirrors [`crate::peer::serve::BORROW_TIMEOUT`]: a fresh install behaves
+/// Mirrors [`crate::peer::tunnel::dial::BORROW_TIMEOUT`]: a fresh install behaves
 /// exactly as it did before this field existed.
 const fn default_borrow_timeout_ms() -> u64 {
     10_000
@@ -305,9 +323,9 @@ impl Default for PeerFile {
             internet: false,
             network_key: None,
             max_hops: default_max_hops(),
-            via: crate::peer::egress::ViaSetting::default(),
+            via: ViaSetting::default(),
             borrow_timeout_ms: default_borrow_timeout_ms(),
-            paths: crate::peer::probe::PathsConfig::default(),
+            paths: PathsConfig::default(),
             peers: Vec::new(),
             pending_invites: Vec::new(),
             default_lend: None,
@@ -388,6 +406,14 @@ impl TailnetSetting {
         }
     }
 
+    /// The word as written, when it is one this build does not know.
+    pub fn unknown_word(&self) -> Option<&str> {
+        match self {
+            Self::Known(_) => None,
+            Self::Unknown(word) => Some(word),
+        }
+    }
+
     /// Whether a save leaves the key out: only for a known `off`, the
     /// default. An unknown word is always written back.
     pub fn is_unwritten(&self) -> bool {
@@ -423,6 +449,292 @@ impl<'de> Deserialize<'de> for TailnetSetting {
             "node" => Self::Known(TailnetMode::Node),
             _ => Self::Unknown(word),
         })
+    }
+}
+
+/// How long a peer carry may take (dial, handshake AND the origin's reply)
+/// before it is abandoned.
+///
+/// One bound over the whole act, not one per hop: from the waiting client's
+/// side a carry is a single answer, and a per-hop bound of five seconds is a
+/// ten-second wait on a request that has already failed its direct attempt.
+/// [`retry_through_peer`](crate::peer::egress::retry_through_peer) turns it into a deadline the moment a candidate is
+/// picked.
+///
+/// Small on purpose. This path runs when the direct one has just failed, so the
+/// request has already paid a connect timeout; a gateway that does not answer
+/// promptly is worth less than the 503 the caller already has in hand.
+///
+/// It does NOT bound the response BODY. `send` resolves on the head, so an SSE
+/// answer streams for as long as it streams. See [`axum_response_from`](crate::peer::egress::axum_response_from).
+pub const CARRY_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The operator's answer to "how does this Mac reach the internet", plus the
+/// one number they may tune about it.
+///
+/// `tcr peer via auto|off|<peer> [--setup-timeout-ms <n>]`, stored as the single
+/// `via` key in `tcr-peers.json`.
+///
+/// # Why one field and not two
+///
+/// The peers file gains exactly ONE key for this whole feature, so the route
+/// and the operator's timeout live in the same value, and the serde
+/// representation is the string when there is nothing to tune and an object
+/// when there is:
+///
+/// ```json
+/// "via": "auto"
+/// "via": { "via": "off" }
+/// "via": { "via": "auto", "setupTimeoutMs": 1500 }
+/// ```
+///
+/// A file written by a build with no timeout set round-trips as the bare word,
+/// so the common file stays readable by eye.
+///
+/// # Lower, never higher
+///
+/// [`Self::with_setup_timeout_ms`] refuses anything above
+/// [`CARRY_SETUP_TIMEOUT`]. A carry only ever runs after the direct path has
+/// already failed, the request has already paid a connect timeout, so a
+/// longer wait here is strictly worse than the 503 the caller already has in
+/// hand. The knob exists to make a carry give up SOONER, which is the choice an
+/// operator on a slow LAN actually needs.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "ViaJson", into = "ViaJson")]
+pub struct ViaSetting {
+    /// Which way out.
+    route: ViaRoute,
+    /// The operator's own setup bound in milliseconds, when they set one.
+    /// `None` is [`CARRY_SETUP_TIMEOUT`].
+    setup_timeout_ms: Option<u64>,
+}
+
+/// The serde shape of [`ViaSetting`]: a bare word, or a word with the one
+/// tunable beside it.
+///
+/// `untagged` with the string arm FIRST, so `"auto"` is read as a word and
+/// never as a malformed object.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum ViaJson {
+    /// `"auto"`, `"off"`, or a peer id.
+    Word(String),
+    /// The same word, plus the operator's setup bound.
+    Tuned {
+        /// `auto`, `off`, or a peer id.
+        via: String,
+        /// The setup bound in milliseconds.
+        #[serde(rename = "setupTimeoutMs", skip_serializing_if = "Option::is_none")]
+        setup_timeout_ms: Option<u64>,
+    },
+}
+
+impl TryFrom<ViaJson> for ViaSetting {
+    type Error = anyhow::Error;
+
+    fn try_from(json: ViaJson) -> Result<Self> {
+        match json {
+            ViaJson::Word(word) => Self::parse(&word),
+            ViaJson::Tuned {
+                via,
+                setup_timeout_ms: None,
+            } => Self::parse(&via),
+            ViaJson::Tuned {
+                via,
+                setup_timeout_ms: Some(ms),
+            } => Self::parse(&via)?.with_setup_timeout_ms(ms),
+        }
+    }
+}
+
+impl From<ViaSetting> for ViaJson {
+    fn from(setting: ViaSetting) -> Self {
+        match setting.setup_timeout_ms {
+            None => Self::Word(setting.to_spec()),
+            Some(ms) => Self::Tuned {
+                via: setting.to_spec(),
+                setup_timeout_ms: Some(ms),
+            },
+        }
+    }
+}
+
+/// Which way out, with no tuning attached.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ViaRoute {
+    /// Use a trusted Mac whenever the direct path is dead. The default, and it
+    /// is not a disclosure decision: a carry is blind, and the Mac that carries
+    /// is the one that has to have granted it (`allow.gateway` in ITS file, and
+    /// its listener refuses without it). So the consent that matters is the
+    /// carrier's, and an operator who wants this Mac never to ask says so with
+    /// `off`.
+    #[default]
+    Auto,
+    /// Never route out through a peer. Byte-identical to the behaviour before
+    /// this feature existed.
+    Off,
+    /// Always ask this one Mac.
+    Pinned(PeerId),
+}
+
+impl ViaSetting {
+    /// The default: ask a trusted Mac once the direct path is dead.
+    pub const fn auto() -> Self {
+        Self::from_route(ViaRoute::Auto)
+    }
+
+    /// Never route out through a peer.
+    pub const fn off() -> Self {
+        Self::from_route(ViaRoute::Off)
+    }
+
+    /// Always ask this one Mac, and never another.
+    pub const fn pinned(peer: PeerId) -> Self {
+        Self::from_route(ViaRoute::Pinned(peer))
+    }
+
+    /// A route with no operator tuning attached.
+    const fn from_route(route: ViaRoute) -> Self {
+        Self {
+            route,
+            setup_timeout_ms: None,
+        }
+    }
+
+    /// Parse the CLI's third word: `auto`, `off`, or a peer id.
+    pub fn parse(spec: &str) -> Result<Self> {
+        let route = match spec.trim() {
+            "auto" => ViaRoute::Auto,
+            "off" => ViaRoute::Off,
+            other => PeerId::parse(other)
+                .map(ViaRoute::Pinned)
+                .with_context(|| {
+                    format!(
+                        "peer via: `{other}` is neither `auto`, `off`, nor a peer id \
+                         (`tcr peer ls` prints the ids this Mac has pinned)"
+                    )
+                })?,
+        };
+        Ok(Self::from_route(route))
+    }
+
+    /// The same setting with the operator's own setup bound, which may only be
+    /// LOWER than [`CARRY_SETUP_TIMEOUT`]. See the type's docs for why a
+    /// higher one is refused rather than accepted and clamped.
+    pub fn with_setup_timeout_ms(mut self, ms: u64) -> Result<Self> {
+        let ceiling = u64::try_from(CARRY_SETUP_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        if ms == 0 {
+            return Err(anyhow!(
+                "peer via: a setup timeout of 0ms would refuse every carry before it was \
+                 dialled; use `off` to mean that"
+            ));
+        }
+        if ms > ceiling {
+            return Err(anyhow!(
+                "peer via: {ms}ms is above the {ceiling}ms a carry already waits, and this \
+                 knob only lowers it, a carry runs after the direct path has failed, so \
+                 waiting longer than the default is worse for the caller than the answer it \
+                 already has"
+            ));
+        }
+        self.setup_timeout_ms = Some(ms);
+        Ok(self)
+    }
+
+    /// How long this setting gives one gateway for a whole carry: the dial, the
+    /// handshake and the origin's reply, under one deadline.
+    pub fn setup_timeout(&self) -> Duration {
+        self.setup_timeout_ms
+            .map_or(CARRY_SETUP_TIMEOUT, Duration::from_millis)
+    }
+
+    /// Whether this Mac refuses to route out through a peer at all.
+    pub fn is_off(&self) -> bool {
+        self.route == ViaRoute::Off
+    }
+
+    /// The one Mac this setting pins, when it pins one.
+    pub const fn pinned_peer(&self) -> Option<&PeerId> {
+        match &self.route {
+            ViaRoute::Pinned(peer) => Some(peer),
+            ViaRoute::Auto | ViaRoute::Off => None,
+        }
+    }
+
+    /// Whether this setting lets `node` carry a request: every Mac under
+    /// `auto`, none under `off`, and only the pinned one under a pin.
+    pub fn admits(&self, node: &PeerId) -> bool {
+        match &self.route {
+            ViaRoute::Auto => true,
+            ViaRoute::Off => false,
+            ViaRoute::Pinned(peer) => peer == node,
+        }
+    }
+
+    /// The word the CLI prints and the config stores.
+    pub fn to_spec(&self) -> String {
+        match &self.route {
+            ViaRoute::Auto => "auto".to_string(),
+            ViaRoute::Off => "off".to_string(),
+            ViaRoute::Pinned(peer) => peer.to_wire(),
+        }
+    }
+}
+
+/// The default loss ceiling, in percent, above which a path is dialled after
+/// the paths that are under it.
+pub const DEFAULT_MAX_LOSS_PCT: u8 = 5;
+
+// ---------------------------------------------------------------------------
+// The operator's policy: the `paths` section of the peers file
+// ---------------------------------------------------------------------------
+
+/// Which kind of path the operator wants tried first.
+///
+/// A typed enum and not a string, so the peers file, the dial order and a
+/// future panel row cannot disagree about what `"direct"` meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PathPolicy {
+    /// A socket this Mac opens itself, first. The default, because a forwarded
+    /// hop spends a third machine's bytes and needs its consent.
+    #[default]
+    Direct,
+    /// A forwarded hop first. For the Mac whose direct path is the one that
+    /// keeps failing (a hotel network, a carrier NAT), where trying it first
+    /// buys nothing but a connect timeout per request.
+    Via,
+}
+
+/// The `paths` section of the peers file ([`crate::peer::config::PeerFile`]).
+///
+/// Every field has a default that reproduces the behaviour of a build with no
+/// `paths` section at all, which is what lets the field arrive without a
+/// migration: `Direct` first, five percent, and an empty allow list that allows
+/// every forwarder the row already carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PathsConfig {
+    /// Which kind of path is tried first.
+    pub prefer: PathPolicy,
+    /// The loss ceiling in percent. A path measured above it is tried after
+    /// every path under it. **After, and never dropped**: a lossy path that is
+    /// the only path is still the way home.
+    pub max_loss_pct: u8,
+    /// The forwarders this Mac is willing to be carried by. **Empty means every
+    /// forwarder already on the row**, not "none": the row's own `Via`
+    /// endpoints are written by the pinning code, so an empty list here is the
+    /// absence of a further restriction rather than a refusal.
+    pub via_allow: Vec<PeerId>,
+}
+
+impl Default for PathsConfig {
+    fn default() -> Self {
+        Self {
+            prefer: PathPolicy::Direct,
+            max_loss_pct: DEFAULT_MAX_LOSS_PCT,
+            via_allow: Vec::new(),
+        }
     }
 }
 
@@ -576,6 +888,11 @@ impl TryFrom<String> for NetworkKey {
     }
 }
 
+/// What a completed session left on one pinned row
+/// ([`PeerFile::session_memory`]): its key, its rendezvous secret, and the
+/// address it last said it sees this Mac at, as written.
+pub type SessionMemory<'a> = (PeerId, Option<[u8; 32]>, Option<&'a str>);
+
 impl PeerFile {
     /// The display name to announce and to enrol under: the operator's own, or
     /// the host name when they have not set one.
@@ -588,11 +905,185 @@ impl PeerFile {
         tcr_peer_wire::sanitize_label(&raw).unwrap_or_else(|_| "peer".to_string())
     }
 
+    /// Set the operator's display name for this Mac (`tcr peer name <name>`),
+    /// sanitized the way every label that reaches another machine is, and
+    /// answer the name as stored. A name that does not sanitize is refused and
+    /// nothing changes.
+    pub fn rename(&mut self, name: &str) -> Result<String> {
+        let sanitized = tcr_peer_wire::sanitize_label(name)
+            .with_context(|| format!("refusing name {name:?}"))?;
+        self.name = Some(sanitized.clone());
+        Ok(sanitized)
+    }
+
+    /// Turn finding on or off (`tcr peer find on|off`), and with it the
+    /// announce-name preference when the operator gave one. Answers the peer
+    /// port written when turning finding on needed one (see
+    /// [`Self::ensure_listen_for_opt_in`]).
+    ///
+    /// The preference is set on BOTH arms. It used to be read only inside the
+    /// `on` arm, so `tcr peer find off --announce-name on` accepted the flag,
+    /// wrote the file without it and still exited 0, a silently ignored
+    /// preference, which is worse than a refusal.
+    pub fn switch_find(&mut self, on: bool, announce_name: Option<bool>) -> Option<SocketAddr> {
+        if let Some(announce_name) = announce_name {
+            self.announce_name = announce_name;
+        }
+        self.discovery = on;
+        if on {
+            self.ensure_listen_for_opt_in()
+        } else {
+            None
+        }
+    }
+
+    /// Give this Mac a peer port when the operator turns one of the features
+    /// that need one on and there is none yet. Returns the address written, or
+    /// `None` when `listen` was already set, which this never touches.
+    ///
+    /// The caller writes the file and then prints the CLI's
+    /// `print_listen_written`: the verbs that call this already hold the
+    /// peers-file lock and already have a save of their own, and a second write
+    /// here would be a second writer for one key.
+    ///
+    /// It is called on the ON arm only. Turning something OFF, or removing a
+    /// grant, is not an opt-in and must not open a port.
+    pub fn ensure_listen_for_opt_in(&mut self) -> Option<SocketAddr> {
+        if self.listen.is_some() {
+            return None;
+        }
+        let chosen = default_listen();
+        self.listen = Some(chosen);
+        Some(chosen)
+    }
+
     /// Turn `peer.internet` on or off, and answer the port a router mapping
     /// for it is keyed on: the listener's, or `None` when this node has no
     /// listener to map.
     pub fn switch_internet(&mut self, on: bool) -> Option<u16> {
         self.internet = on;
+        self.listen_port()
+    }
+
+    /// The office network key's raw bytes, the Noise `psk0` a knock and an
+    /// enrolment mix in, or `None` when this Mac has no key set.
+    pub fn network_psk(&self) -> Option<&[u8; 32]> {
+        self.network_key.as_ref().map(NetworkKey::as_bytes)
+    }
+
+    /// Take `key` as this Mac's network key (`tcr peer network-key set|join`,
+    /// a join link). A key already here is not overwritten unless the operator
+    /// passed `--replace`, because every Mac still holding it goes dark to this
+    /// one: the refusal answers how many pinned peers that is, for the verb's
+    /// own words. Answers whether a key was replaced.
+    pub const fn set_network_key(&mut self, key: NetworkKey, replace: bool) -> Result<bool, usize> {
+        let replaced = self.network_key.is_some();
+        if replaced && !replace {
+            return Err(self.peers.len());
+        }
+        self.network_key = Some(key);
+        Ok(replaced)
+    }
+
+    /// `tcr peer network-key set`: [`Self::set_network_key`] with a freshly
+    /// minted key. The refusal is decided BEFORE the mint, so a refused `set`
+    /// draws nothing from the CSPRNG and a mint failure never hides a refusal.
+    /// The outer error is the mint's; the inner is the refusal's pinned count.
+    /// Answers whether a key was replaced, and the key now held.
+    pub fn mint_network_key(&mut self, replace: bool) -> Result<Result<(bool, NetworkKey), usize>> {
+        let replaced = self.network_key.is_some();
+        if replaced && !replace {
+            return Ok(Err(self.peers.len()));
+        }
+        let key = NetworkKey::mint()?;
+        self.network_key = Some(key);
+        Ok(Ok((replaced, key)))
+    }
+
+    /// Drop this Mac's network key (`tcr peer network-key clear`). Answers
+    /// whether there was one to drop.
+    pub const fn clear_network_key(&mut self) -> bool {
+        self.network_key.take().is_some()
+    }
+
+    /// The tailnet mode this Mac acts on. See [`TailnetSetting::effective`].
+    pub const fn tailnet_mode(&self) -> TailnetMode {
+        self.tailnet.effective()
+    }
+
+    /// The tailnet word as written, when this build does not know it. See
+    /// [`TailnetSetting::unknown_word`].
+    pub fn unknown_tailnet_word(&self) -> Option<&str> {
+        self.tailnet.unknown_word()
+    }
+
+    /// Set the tailnet mode (`tcr peer tailnet app|node|off`), and answer the
+    /// peer port written when the mode needed one: app and node are opt-ins
+    /// that need a port, because the server's browse task, which reads the app
+    /// and sends the beacon, runs only beside a peer listener. Off is not an
+    /// opt-in, so it never writes `listen` and never removes one.
+    pub fn switch_tailnet(&mut self, mode: TailnetMode) -> Option<SocketAddr> {
+        self.tailnet = mode.into();
+        match mode {
+            TailnetMode::App | TailnetMode::Node => self.ensure_listen_for_opt_in(),
+            TailnetMode::Off => None,
+        }
+    }
+
+    /// Write `mode` into the peers file at `path`, under the file's lock, and
+    /// nothing else: what joining tcr's own tailnet node and leaving it record.
+    pub fn save_tailnet(path: &Path, mode: TailnetMode) -> Result<()> {
+        let _lock = FileLock::acquire(path)?;
+        let mut file = read_or_default(path)?;
+        file.tailnet = mode.into();
+        save(path, &file)
+    }
+
+    /// Whether this Mac's dead drop publishes and fetches at all. See
+    /// [`DeadDropConfig::is_live`].
+    pub const fn drop_is_live(&self) -> bool {
+        self.dead_drop.is_live()
+    }
+
+    /// Build the dead drop's configured backend. See
+    /// [`DeadDropConfig::open_store`].
+    pub fn open_drop_store(
+        &self,
+    ) -> std::result::Result<drop::HttpsTemplateStore, drop::StoreRefusal> {
+        self.dead_drop.open_store()
+    }
+
+    /// How long one drop name is valid on this Mac, in seconds.
+    pub const fn drop_slot_seconds(&self) -> u64 {
+        self.dead_drop.slot_seconds
+    }
+
+    /// Turn the dead drop on or off. See [`DeadDropConfig::switch`].
+    pub const fn switch_drop(&mut self, on: bool) -> bool {
+        self.dead_drop.switch(on)
+    }
+
+    /// The dead drop's surface, as `tcr peer drop-store show` prints it. See
+    /// [`DeadDropConfig::store_line`].
+    pub fn drop_store_line(&self) -> String {
+        self.dead_drop.store_line()
+    }
+
+    /// Forget the dead drop's surface. See [`DeadDropConfig::clear_store`].
+    pub fn clear_drop_store(&mut self) -> bool {
+        self.dead_drop.clear_store()
+    }
+
+    /// Point the dead drop at an HTTPS template. See
+    /// [`DeadDropConfig::point_at_https`].
+    pub fn point_drop_at_https(&mut self, url: &str, token: Option<String>) -> Result<bool> {
+        self.dead_drop.point_at_https(url, token)
+    }
+
+    /// The port this Mac's peer listener binds, or `None` when the feature is
+    /// off: the honest answer rather than the default port, because a Mac with
+    /// the feature off is not listening on it.
+    pub fn listen_port(&self) -> Option<u16> {
         self.listen.map(|addr| addr.port())
     }
 
@@ -656,6 +1147,339 @@ impl PeerFile {
     /// The invite minted under `id`, while it is still on disk.
     pub fn invite(&self, id: u64) -> Option<&PendingInvite> {
         self.pending_invites.iter().find(|invite| invite.id == id)
+    }
+
+    /// Choose how this Mac reaches the internet (`tcr peer via`). A pin that
+    /// names a Mac this one has never trusted is refused, so `via <peer>`
+    /// cannot route through a stranger. Answers whether the setting changed.
+    pub fn choose_via(&mut self, asked: &ViaSetting) -> Result<bool> {
+        if let Some(peer_id) = asked.pinned_peer() {
+            let known = self.peers.iter().any(|row| row.node == *peer_id);
+            if !known {
+                anyhow::bail!(
+                    "peer via: {} is not a Mac this one has pinned, so there is nothing \
+                     to route through (`tcr peer ls` prints the pinned ones)",
+                    peer_id.display()
+                );
+            }
+        }
+        if *asked == self.via {
+            return Ok(false);
+        }
+        self.via = asked.clone();
+        Ok(true)
+    }
+
+    /// The pinned row for `node`, or `None` when this Mac does not pin it,
+    /// which is the same answer as "not authorized for anything".
+    pub fn row(&self, node: &PeerId) -> Option<&PeerRow> {
+        self.peers.iter().find(|row| &row.node == node)
+    }
+
+    /// The pinned row for `node`, to edit in place, or `None` when this Mac
+    /// does not pin it.
+    pub fn row_mut(&mut self, node: &PeerId) -> Option<&mut PeerRow> {
+        self.peers.iter_mut().find(|row| &row.node == node)
+    }
+
+    /// Pin `row`. A re-pin of a key already pinned replaces the row rather
+    /// than adding a second one: two rows for one key would make "is this peer
+    /// pinned" answerable two ways.
+    pub fn pin(&mut self, row: PeerRow) {
+        self.peers.retain(|existing| existing.node != row.node);
+        self.peers.push(row);
+    }
+
+    /// Drop the row for `node` (`tcr peer forget`). Answers whether there was
+    /// one.
+    pub fn forget(&mut self, node: &PeerId) -> bool {
+        let before = self.peers.len();
+        self.peers.retain(|row| row.node != *node);
+        self.peers.len() != before
+    }
+
+    /// How many Macs this one pins.
+    pub const fn pinned_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// The key of every pinned Mac, in file order: what a returning
+    /// handshake's pin check admits.
+    pub fn pinned_ids(&self) -> Vec<PeerId> {
+        self.peers.iter().map(|row| row.node).collect()
+    }
+
+    /// Every pinned Mac this one may ask to carry it (`allow.carry`), in file
+    /// order. `allow.gateway` is the other direction and is not read here.
+    pub fn carriers(&self) -> Vec<&PeerRow> {
+        self.peers.iter().filter(|row| row.allow.carry).collect()
+    }
+
+    /// Every pinned Mac that still holds `relay`, which is what `forget` does
+    /// NOT revoke. A surface that offers `forget` has to say this when the list
+    /// is not empty.
+    pub fn relay_holders(&self) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter(|row| row.allow.relay)
+            .map(|row| row.node)
+            .collect()
+    }
+
+    /// Every pinned Mac granted `control-drop`: the friends a dead drop
+    /// publishes for and fetches from.
+    pub fn drop_friends(&self) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter(|row| row.allow.control.drop)
+            .map(|row| row.node)
+            .collect()
+    }
+
+    /// What completed sessions left on each pinned row, in file order: its
+    /// key, its rendezvous secret, and the address it last said it sees this
+    /// Mac at, as written. A row may carry either, both, or neither.
+    pub fn session_memory(&self) -> Vec<SessionMemory<'_>> {
+        self.peers
+            .iter()
+            .map(|row| {
+                (
+                    row.node,
+                    row.rendezvous_secret,
+                    row.sees_us_at.as_ref().map(|(seen, _)| seen.as_str()),
+                )
+            })
+            .collect()
+    }
+
+    /// Every direct address on every pinned row, in file order.
+    pub fn direct_addrs(&self) -> Vec<SocketAddr> {
+        self.peers
+            .iter()
+            .flat_map(|row| row.endpoints.iter())
+            .filter_map(Endpoint::direct_addr)
+            .collect()
+    }
+
+    /// The largest `max_inflight` any grant on any pinned row allows, or 0
+    /// with none.
+    pub fn largest_grant_inflight(&self) -> usize {
+        self.peers
+            .iter()
+            .flat_map(|row| row.lend.iter())
+            .map(|grant| usize::from(grant.max_inflight))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Reduce this node's own trusted rows to what a `NeighborBrief` may ever
+    /// say about them: the key and its endpoint locators, nothing this node
+    /// was told in confidence.
+    ///
+    /// The rule, verbatim: "friends through friends are not supported
+    /// unless you both support the same friend." A brief is useful only for a
+    /// Mac BOTH sides already trust, so this function's whole job is producing
+    /// one side of that: it reads the pinned rows, which are by construction
+    /// the set of keys this node already pinned, and there is no argument here
+    /// through which an unpinned or merely-discovered row could arrive.
+    ///
+    /// `exclude` is the peer this brief set is about to be sent TO. A brief
+    /// telling B about B is a line B already knows better than this node does,
+    /// so it is dropped here, the way `Hello.briefs`' own doc comment describes
+    /// split horizon: never back a fact out the link it would be re-advertised
+    /// on.
+    ///
+    /// `Caps::default()` on every entry, by decision and not by gap. A brief is
+    /// an address hint for a mutual friend, nothing more: the receiver's own
+    /// honest view of what that friend can do comes from connecting to the
+    /// friend directly and reading its `Hello`, which is the one place caps
+    /// are actually current. This node's own peers file records where a
+    /// trusted peer answers, not what it can do right now, so this has nothing
+    /// true to fill caps from, and inventing a value here would be a guess
+    /// dressed as a fact forwarded on a chain of trust the wire never promised
+    /// to keep fresh.
+    pub fn neighbor_briefs(&self, exclude: PeerId) -> Vec<tcr_peer_wire::NeighborBrief> {
+        self.peers
+            .iter()
+            .filter(|row| row.node != exclude)
+            .map(|row| tcr_peer_wire::NeighborBrief {
+                node: row.node,
+                caps: tcr_peer_wire::Caps::default(),
+                addrs: row
+                    .endpoints
+                    .iter()
+                    .filter_map(Endpoint::direct_addr)
+                    .map(|addr| addr.to_string())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Open a `tcr peer moved` link's sealed field with whichever pinned row's
+    /// key opens it, and answer that row and the record.
+    ///
+    /// A row with no shared secret has no key to try, and that is not an
+    /// error: its own doc says absent means no session has completed since the
+    /// key existed. Everything except "this key did not open it" was decided
+    /// either before any key was tried, which makes it the same for every row,
+    /// or after one opened the bytes, which makes it that row's own diagnosis.
+    /// Either way it outranks the quiet refusal and stops the walk.
+    pub fn open_moved_link(
+        &self,
+        field: &str,
+        now_s: u64,
+    ) -> std::result::Result<(&PeerRow, moved::MovedRecord), moved::MovedRefusal> {
+        let mut past_the_seal = None;
+        for row in &self.peers {
+            let Ok(keys) = moved::MovedKeys::for_row(row.rendezvous_secret.as_ref()) else {
+                continue;
+            };
+            match moved::open_link_field(&keys, &row.node, field, now_s) {
+                Ok(record) => return Ok((row, record)),
+                Err(moved::MovedRefusal::NotForThisMac) => continue,
+                Err(refusal) => {
+                    past_the_seal = Some(refusal);
+                    break;
+                }
+            }
+        }
+        Err(past_the_seal.unwrap_or(moved::MovedRefusal::NotForThisMac))
+    }
+
+    /// Take away every pinned row's lease on `window` and `scope`, and the
+    /// Sharing defaults record when it is for the same pair (`tcr peer share
+    /// on --fraction 0`). Answers how many leases went. `inspect` is left
+    /// exactly as it was, since removing a grant is not the moment to grant a
+    /// disclosure.
+    pub fn remove_share(&mut self, window: Window, scope: &LendScope) -> usize {
+        let mut removed = 0_usize;
+        for row in &mut self.peers {
+            let before = row.lend.len();
+            row.lend
+                .retain(|existing| !(existing.window == window && existing.scope == *scope));
+            removed += before - row.lend.len();
+        }
+        if self
+            .default_lend
+            .as_ref()
+            .is_some_and(|default| default.window == window && default.scope == *scope)
+        {
+            self.default_lend = None;
+        }
+        removed
+    }
+
+    /// The display id of every pinned Mac whose lease on `window` and `scope`
+    /// has already ended at `now_s`: the end `tcr peer share on` would keep,
+    /// and so refuses to.
+    pub fn ended_shares(&self, window: Window, scope: &LendScope, now_s: u64) -> Vec<String> {
+        self.peers
+            .iter()
+            .filter(|row| {
+                row.lend.iter().any(|existing| {
+                    existing.window == window
+                        && existing.scope == *scope
+                        && existing.has_ended(now_s)
+                })
+            })
+            .map(|row| row.node.display())
+            .collect()
+    }
+
+    /// Share with every pinned Mac (`tcr peer share on`): grant `inspect`, and
+    /// put `grant` in place of each row's lease on `window` and `scope`, then
+    /// record `grant` as the Sharing defaults.
+    ///
+    /// A hand grant, an end date and a daily window are decisions the operator
+    /// took per peer, so the lease being replaced keeps its mode, end and
+    /// schedule; `peer lend` carries the same rule. By (window, SCOPE): a Mac
+    /// may hold one lease per scope and turning sharing on with a scope must
+    /// not delete the others. A fresh id per row: a lease id is the handle for
+    /// ONE peer's lease, and two peers sharing one id would make `--revoke`
+    /// ambiguous.
+    ///
+    /// The defaults are a RECORD of what the Sharing defaults sheet shows,
+    /// never a second enforcement point. See [`Self::default_lend`].
+    pub fn share_with_all(
+        &mut self,
+        window: Window,
+        scope: &LendScope,
+        grant: &LendGrant,
+    ) -> Result<()> {
+        for row in &mut self.peers {
+            row.allow.inspect = true;
+            // What this row already granted on the same (window, scope), read
+            // BEFORE the retain below drops it.
+            let replacing = row
+                .lend
+                .iter()
+                .find(|existing| existing.window == window && existing.scope == *scope)
+                .map(|existing| {
+                    (
+                        existing.mode,
+                        existing.until,
+                        existing.between,
+                        existing.days.clone(),
+                    )
+                });
+            row.lend
+                .retain(|existing| !(existing.window == window && existing.scope == *scope));
+            let mut per_peer = grant.clone();
+            if let Some((mode, until, between, days)) = replacing {
+                per_peer.mode = mode;
+                per_peer.until = until;
+                per_peer.between = between;
+                per_peer.days = days;
+            }
+            per_peer.id = 0;
+            per_peer.ensure_id()?;
+            row.lend.push(per_peer);
+        }
+        let mut default = grant.clone();
+        default.id = 0;
+        self.default_lend = Some(default);
+        Ok(())
+    }
+
+    /// Stop sharing with every pinned Mac (`tcr peer share off`): no
+    /// `inspect`, and no lease.
+    pub fn stop_sharing(&mut self) {
+        for row in &mut self.peers {
+            row.allow.inspect = false;
+            row.lend.clear();
+        }
+    }
+
+    /// Derive every grant's [`LendGrant::ended`] against `now_s`.
+    fn derive_ends(&mut self, now_s: u64) {
+        for row in &mut self.peers {
+            for grant in &mut row.lend {
+                grant.ended = grant.has_ended(now_s);
+            }
+        }
+    }
+
+    /// A copy of every pinned row, with every grant's [`LendGrant::ended`]
+    /// derived against `now_s`.
+    fn rows_at(&self, now_s: u64) -> Vec<PeerRow> {
+        self.peers
+            .iter()
+            .cloned()
+            .map(|row| row.with_derived_ends(now_s))
+            .collect()
+    }
+
+    /// Give every grant on its way to disk an id if it has none. See [`save`].
+    fn ensure_lease_ids(&mut self) -> Result<()> {
+        for row in &mut self.peers {
+            for grant in &mut row.lend {
+                grant.ensure_id()?;
+            }
+        }
+        if let Some(default) = self.default_lend.as_mut() {
+            default.ensure_id()?;
+        }
+        Ok(())
     }
 }
 
@@ -726,7 +1550,7 @@ pub enum EndpointSource {
     /// see [`crate::peer::probe::order_endpoints`] for where that is enforced.
     Drop,
     /// Off a sealed link one friend sent another after changing networks, read
-    /// by [`crate::peer::moved::open_link`] and written only when the operator
+    /// by [`crate::peer::config::moved::open_link`] and written only when the operator
     /// said `--yes`.
     ///
     /// **[`Self::Drop`]'s band and not its member.** It ranks the same, for the
@@ -837,7 +1661,7 @@ pub struct PeerRow {
     /// peer on a port neither end ever names.
     ///
     /// **Not the handshake hash, and one keyed hash away from it.** This is
-    /// [`crate::peer::reach::port_secret`]'s output: HKDF-SHA256 over the
+    /// [`crate::peer::noise::port_secret`]'s output: HKDF-SHA256 over the
     /// pair's completed handshake hash under its own domain string, which is
     /// the same value both ends already derive independently and the same one
     /// the process-local register holds. The hash itself is what the six-digit
@@ -1011,7 +1835,7 @@ pub fn observe_endpoints(path: &Path, peer: &PeerId, endpoints: &[Endpoint]) -> 
     }
     let _lock = FileLock::acquire(path)?;
     let mut file = read_or_default(path)?;
-    let Some(row) = file.peers.iter_mut().find(|row| &row.node == peer) else {
+    let Some(row) = file.row_mut(peer) else {
         return Ok(Observed::NoRow);
     };
     let added = endpoints.len();
@@ -1125,7 +1949,7 @@ fn announced_port(addrs: &[String]) -> Option<u16> {
 pub fn observe_rendezvous_secret(path: &Path, peer: &PeerId, secret: [u8; 32]) -> Result<bool> {
     let _lock = FileLock::acquire(path)?;
     let mut file = read_or_default(path)?;
-    let Some(row) = file.peers.iter_mut().find(|row| &row.node == peer) else {
+    let Some(row) = file.row_mut(peer) else {
         return Ok(false);
     };
     if row.rendezvous_secret == Some(secret) {
@@ -1169,7 +1993,7 @@ pub fn observe_seen_address(
     }
     let _lock = FileLock::acquire(path)?;
     let mut file = read_or_default(path)?;
-    let Some(row) = file.peers.iter_mut().find(|row| &row.node == peer) else {
+    let Some(row) = file.row_mut(peer) else {
         return Ok(false);
     };
     let seen = addr.to_string();
@@ -1518,28 +2342,74 @@ impl DeadDropConfig {
         self == &Self::default()
     }
 
-    /// Build the configured backend, or [`crate::peer::drop::StoreRefusal::NotConfigured`].
+    /// Build the configured backend, or [`crate::peer::config::drop::StoreRefusal::NotConfigured`].
     ///
     /// [`StoreConfig::Gist`] answers the same refusal as no store at all: it
     /// does not ship here, and a backend this build cannot build is no
     /// different from one nobody named. A template with no `{name}`
     /// placeholder folds into the same refusal, for want of a variant of its
-    /// own: [`crate::peer::drop::StoreRefusal`] has none for a malformed
+    /// own: [`crate::peer::config::drop::StoreRefusal`] has none for a malformed
     /// template, because the CLI verb that writes this field is the one that
     /// should have refused it first.
-    pub fn open_store(
-        &self,
-    ) -> std::result::Result<crate::peer::drop::HttpsTemplateStore, crate::peer::drop::StoreRefusal>
-    {
+    pub fn open_store(&self) -> std::result::Result<drop::HttpsTemplateStore, drop::StoreRefusal> {
         match &self.store {
             Some(StoreConfig::Https { url, token }) => {
-                crate::peer::drop::HttpsTemplateStore::new(url, token.as_deref())
-                    .map_err(|_| crate::peer::drop::StoreRefusal::NotConfigured)
+                drop::HttpsTemplateStore::new(url, token.as_deref())
+                    .map_err(|_| drop::StoreRefusal::NotConfigured)
             }
-            Some(StoreConfig::Gist { .. }) | None => {
-                Err(crate::peer::drop::StoreRefusal::NotConfigured)
-            }
+            Some(StoreConfig::Gist { .. }) | None => Err(drop::StoreRefusal::NotConfigured),
         }
+    }
+
+    /// Turn the switch (`tcr peer drop on|off`). Turning it on with no store
+    /// configured is refused and changes nothing, rather than writing a switch
+    /// that starts no task because [`Self::is_live`] needs a store too.
+    /// Answers whether the switch was written.
+    pub const fn switch(&mut self, on: bool) -> bool {
+        if on && self.store.is_none() {
+            return false;
+        }
+        self.enabled = on;
+        true
+    }
+
+    /// What `tcr peer drop-store show` prints: the surface, and whether a token
+    /// is set, never the token.
+    pub fn store_line(&self) -> String {
+        match &self.store {
+            Some(StoreConfig::Https { url, token }) => format!(
+                "peer drop-store: https {url} token={}",
+                if token.is_some() { "set" } else { "not-set" }
+            ),
+            Some(StoreConfig::Gist { gist_id, .. }) => format!(
+                "peer drop-store: gist {gist_id} (this build does not ship a gist \
+                 backend; `tcr peer drop on` refuses with not-configured)"
+            ),
+            None => "peer drop-store: not-set".to_string(),
+        }
+    }
+
+    /// Forget the surface (`tcr peer drop-store clear`). Answers whether there
+    /// was one.
+    pub fn clear_store(&mut self) -> bool {
+        self.store.take().is_some()
+    }
+
+    /// Point the dead drop at an HTTPS template (`tcr peer drop-store set`),
+    /// and answer whether the switch is already on.
+    ///
+    /// Building the real client is the refusal for a template with no `{name}`
+    /// placeholder: [`Self::open_store`]'s own doc says this verb should have
+    /// refused it first, and building it here is one value read by every
+    /// consumer rather than a second, divergent check. A refused template
+    /// changes nothing.
+    pub fn point_at_https(&mut self, url: &str, token: Option<String>) -> Result<bool> {
+        drop::HttpsTemplateStore::new(url, token.as_deref())?;
+        self.store = Some(StoreConfig::Https {
+            url: url.to_string(),
+            token,
+        });
+        Ok(self.enabled)
     }
 }
 
@@ -2037,11 +2907,7 @@ impl PeerStore {
         self.file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .peers
-            .iter()
-            .cloned()
-            .map(|row| row.with_derived_ends(now_s))
-            .collect()
+            .rows_at(now_s)
     }
 
     /// The row for one peer, or `None` when it is not pinned, which is the
@@ -2051,9 +2917,7 @@ impl PeerStore {
         self.file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .peers
-            .iter()
-            .find(|row| &row.node == node)
+            .row(node)
             .cloned()
             .map(|row| row.with_derived_ends(now_s))
     }
@@ -2084,11 +2948,7 @@ impl PeerStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        file.peers = file
-            .peers
-            .into_iter()
-            .map(|row| row.with_derived_ends(now_s))
-            .collect();
+        file.derive_ends(now_s);
         file
     }
 
@@ -2120,12 +2980,7 @@ pub fn read_or_default(path: &Path) -> Result<PeerFile> {
             // every surface reads one answer to "has this lease ended", and a
             // CLI that read `ended` off the file would read whatever was last
             // written there.
-            let now_s = now_unix_secs();
-            for row in &mut file.peers {
-                for grant in &mut row.lend {
-                    grant.ended = grant.has_ended(now_s);
-                }
-            }
+            file.derive_ends(now_unix_secs());
             Ok(file)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(PeerFile::default()),
@@ -2227,7 +3082,7 @@ impl FileLock {
                     LOCK_WAIT_MS
                 );
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 }
@@ -2257,14 +3112,7 @@ impl Drop for FileLock {
 /// hand out a different id per read, which is the same as no handle at all.
 pub fn save(path: &Path, file: &PeerFile) -> Result<()> {
     let mut file = file.clone();
-    for row in &mut file.peers {
-        for grant in &mut row.lend {
-            grant.ensure_id()?;
-        }
-    }
-    if let Some(default) = file.default_lend.as_mut() {
-        default.ensure_id()?;
-    }
+    file.ensure_lease_ids()?;
     let json = serde_json::to_string_pretty(&file)?;
     crate::config::write_atomic(path, &json)?;
     Ok(())
@@ -2367,7 +3215,7 @@ impl PeerRow {
     /// The answer comes from the caller because it is a fact about the
     /// LENDER'S FLEET and this file knows nothing about accounts. Its one
     /// production source is
-    /// [`crate::peer::serve::WindowUtilization::scope_restriction`], the same
+    /// [`crate::peer::lease::WindowUtilization::scope_restriction`], the same
     /// function the serving leg asks, so a grant skipped here and a request
     /// refused there can never disagree.
     pub fn grant_for(
@@ -2949,5 +3797,119 @@ mod tests {
             written.get("tailnet").is_none(),
             "off is the default: {written}"
         );
+    }
+
+    /// The dead drop's verbs, through the owner: on with no store is refused,
+    /// a template with no `{name}` is refused, and `show` names the surface
+    /// and whether a token is set, never the token.
+    #[test]
+    fn the_dead_drop_refuses_a_switch_with_no_store_and_never_prints_its_token() {
+        let mut drop = DeadDropConfig::default();
+        assert_eq!(drop.store_line(), "peer drop-store: not-set");
+        assert!(!drop.switch(true), "on with no store is refused");
+        assert!(!drop.is_live());
+        assert!(
+            drop.point_at_https("https://paste.example/fixed", None)
+                .is_err(),
+            "a template with no placeholder is refused"
+        );
+        assert_eq!(drop.store_line(), "peer drop-store: not-set");
+
+        let already_on = drop
+            .point_at_https("https://paste.example/{name}", Some("s3cret".to_string()))
+            .expect("a template with a placeholder is taken");
+        assert!(!already_on);
+        assert_eq!(
+            drop.store_line(),
+            "peer drop-store: https https://paste.example/{name} token=set"
+        );
+        assert!(drop.switch(true), "on with a store is written");
+        assert!(drop.is_live());
+
+        drop.store = Some(StoreConfig::Gist {
+            gist_id: "abc123".to_string(),
+            token: "s3cret".to_string(),
+        });
+        assert_eq!(
+            drop.store_line(),
+            "peer drop-store: gist abc123 (this build does not ship a gist backend; `tcr peer \
+             drop on` refuses with not-configured)"
+        );
+        assert!(drop.clear_store());
+        assert!(!drop.clear_store(), "a second clear finds nothing");
+        assert!(!drop.is_live());
+    }
+
+    fn bare_row(node: u8, addr: &str) -> PeerRow {
+        PeerRow {
+            node: PeerId([node; 32]),
+            label: format!("mac-{node}"),
+            endpoints: vec![Endpoint::direct(
+                addr.parse().expect("a literal address"),
+                0,
+                EndpointSource::Paired,
+            )],
+            added_at: 0,
+            allow: Allow::default(),
+            lend: Vec::new(),
+            rendezvous_secret: None,
+            sees_us_at: None,
+        }
+    }
+
+    /// The row operations select the rows their grant names and no other: a
+    /// carrier is the row with `carry`, a relay holder the one with `relay`, a
+    /// drop friend the one with `control-drop`, and a re-pin replaces rather
+    /// than adds.
+    #[test]
+    fn the_row_operations_select_by_the_grant_they_name() {
+        let mut file = PeerFile::default();
+        let mut carrier = bare_row(1, "192.0.2.1:7755");
+        carrier.allow.carry = true;
+        let mut relay = bare_row(2, "192.0.2.2:7755");
+        relay.allow.relay = true;
+        relay.rendezvous_secret = Some([9; 32]);
+        let mut friend = bare_row(3, "192.0.2.3:7755");
+        friend.allow.control.drop = true;
+        friend.lend = vec![LendGrant::new(Window::FiveHour, 0.1, 300, 6)];
+        file.pin(carrier.clone());
+        file.pin(relay);
+        file.pin(friend);
+
+        let carriers: Vec<PeerId> = file.carriers().iter().map(|row| row.node).collect();
+        assert_eq!(carriers, vec![PeerId([1; 32])]);
+        assert_eq!(file.relay_holders(), vec![PeerId([2; 32])]);
+        assert_eq!(file.drop_friends(), vec![PeerId([3; 32])]);
+        assert_eq!(file.largest_grant_inflight(), 6);
+        assert_eq!(
+            file.session_memory()
+                .into_iter()
+                .filter_map(|(node, secret, _)| secret.map(|_| node))
+                .collect::<Vec<_>>(),
+            vec![PeerId([2; 32])]
+        );
+        assert_eq!(file.direct_addrs().len(), 3);
+        let briefs = file.neighbor_briefs(PeerId([1; 32]));
+        assert_eq!(
+            briefs.iter().map(|brief| brief.node).collect::<Vec<_>>(),
+            vec![PeerId([2; 32]), PeerId([3; 32])],
+            "a brief set never names the Mac it is sent to"
+        );
+
+        let mut relabelled = carrier;
+        relabelled.label = "renamed".to_string();
+        file.pin(relabelled);
+        assert_eq!(file.pinned_count(), 3, "a re-pin replaces the row");
+        assert_eq!(
+            file.row(&PeerId([1; 32])).map(|row| row.label.as_str()),
+            Some("renamed")
+        );
+        assert!(file.forget(&PeerId([1; 32])));
+        assert!(
+            !file.forget(&PeerId([1; 32])),
+            "a second forget finds nothing"
+        );
+        assert!(file.carriers().is_empty());
+        assert_eq!(file.pinned_ids(), vec![PeerId([2; 32]), PeerId([3; 32])]);
     }
 }

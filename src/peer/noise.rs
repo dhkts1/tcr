@@ -27,11 +27,11 @@
 //! and the six digits are what bind that answer to the machine in front of
 //! the operator.
 //!
-//! - [`PATTERN_PAIR`], `XX`, for a first pairing: neither side knows the
+//! - [`PATTERN_PAIR`](crate::peer::noise::PATTERN_PAIR), `XX`, for a first pairing: neither side knows the
 //!   other's key, both learn it inside the handshake, and the operator compares
 //!   six digits on two screens. This is the default path and the one the
 //!   simple surface's Trust button runs.
-//! - [`PATTERN_RETURN`], `IK`, for every returning connection to a PINNED key.
+//! - [`PATTERN_RETURN`](crate::peer::noise::PATTERN_RETURN), `IK`, for every returning connection to a PINNED key.
 //!   Not `KK`: a `KK` responder must be handed the remote public key BEFORE it
 //!   can process message 1, and a multi-peer listener does not know who is
 //!   calling yet, so `KK` forces either a cleartext peer hint on the wire or
@@ -40,7 +40,7 @@
 //!   LAN observer learns no identity, and the responder reads it with
 //!   `get_remote_static()` after message 1, which is exactly where the pin
 //!   check belongs. Two messages, one LAN round trip.
-//! - [`PATTERN_ENROL`], `IKpsk1`, for the ONE case that does begin with a key:
+//! - [`PATTERN_ENROL`](crate::peer::noise::PATTERN_ENROL), `IKpsk1`, for the ONE case that does begin with a key:
 //!   a pasted join token. The token itself carries the registrar's static (the
 //!   `IK` half) and a 32-byte secret proved as the PSK mixed into message 1
 //!   (the `psk1` half), so **a wrong secret fails while the responder is still
@@ -56,7 +56,7 @@
 //! # Enrolment is accepted BEFORE a pinned row exists, and that is the order
 //!
 //! The one ordering question in this design, decided here so nobody
-//! re-derives it: **an [`Handshake::Enrol`] session may send exactly one
+//! re-derives it: **an [`Handshake::Enrol`](crate::peer::noise::Handshake::Enrol) session may send exactly one
 //! `Control::Enroll` and be pinned by it, with no pinned row required
 //! beforehand**, and nothing else. Stated as the rule the listener enforces:
 //!
@@ -103,8 +103,8 @@
 //! # Where the bytes are, and why the two drivers are in this file
 //!
 //! `snow` is a frame API over byte slices: it never touches a socket. So the
-//! two functions that move a handshake over a stream, [`accept_handshake`] and
-//! [`dial_handshake`], live here beside the patterns rather than in
+//! two functions that move a handshake over a stream, [`accept_handshake`](crate::peer::noise::accept_handshake) and
+//! [`dial_handshake`](crate::peer::noise::dial_handshake), live here beside the patterns rather than in
 //! [`crate::peer::listener`]. That placement is the property the whole design
 //! rests on: **the responder's only write happens after the authorization
 //! callback has answered**, and keeping the read, the check and the write in
@@ -116,16 +116,22 @@
 //! is how "zero bytes written after a refusal" is asserted on the socket rather
 //! than on a log line.
 
-use anyhow::{Context, Result, anyhow, bail};
+use std::collections::HashMap;
+use std::io;
+use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
+use std::task::{Context, Poll};
+
+use anyhow::{Context as _, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 use snow::{Builder, HandshakeState, TransportState};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::sync::mpsc;
 
 use tcr_peer_wire::{MAX_FRAME_BYTES, PeerId, decode_frame, encode_frame};
 
 use crate::peer::config::{PeerRow, PeerStore};
-use crate::peer::id::{KEY_BYTES, NodeKey};
-// Compat for `src/main.rs` (it names `noise::random_secret`); wave 2 repoints it to `id`.
-pub use crate::peer::id::random_secret;
+use crate::peer::id::{KEY_BYTES, NodeKey, random_secret};
 
 /// `XX`, a FIRST pairing, where neither side knows the other's key. The
 /// default path: a discovered row carries no key, so there is nothing else to
@@ -638,13 +644,30 @@ pub fn pin_check(remote_static: &[u8], store: &PeerStore) -> Result<PeerId, PinR
 /// real file. [`pin_check`] is this function plus one read, and there is one
 /// implementation of the comparison.
 pub fn pin_check_rows(remote_static: &[u8], rows: &[PeerRow]) -> Result<PeerId, PinRefusal> {
+    pin_check_by(remote_static, |offered| {
+        rows.iter().any(|row| row.node == *offered)
+    })
+}
+
+/// [`pin_check_rows`] against the pinned keys alone
+/// ([`crate::peer::config::PeerFile::pinned_ids`]), for a check that runs
+/// after the file it read them from is gone.
+pub fn pin_check_ids(remote_static: &[u8], pinned: &[PeerId]) -> Result<PeerId, PinRefusal> {
+    pin_check_by(remote_static, |offered| pinned.contains(offered))
+}
+
+/// The one comparison both pin checks make: a 32-byte static, and pinned.
+fn pin_check_by(
+    remote_static: &[u8],
+    pinned: impl Fn(&PeerId) -> bool,
+) -> Result<PeerId, PinRefusal> {
     let Ok(key) = <[u8; KEY_BYTES]>::try_from(remote_static) else {
         return Err(PinRefusal::Malformed {
             len: remote_static.len(),
         });
     };
     let offered = PeerId(key);
-    if rows.iter().any(|row| row.node == offered) {
+    if pinned(&offered) {
         Ok(offered)
     } else {
         Err(PinRefusal::NotPinned {
@@ -789,7 +812,7 @@ pub struct PeerSession {
     pub code: String,
     /// The handshake hash this session ended on.
     ///
-    /// Kept because it is the one input `crate::peer::reach::port_secret`
+    /// Kept because it is the one input `port_secret`
     /// takes, and `snow` exposes `get_handshake_hash` on `HandshakeState`
     /// only: once `into_transport` has run, the value is gone and a dialler
     /// has no way to compute the pair's rendezvous ports.
@@ -979,6 +1002,350 @@ pub async fn recv_encrypted<R: AsyncRead + Unpin>(
         .context("peer stream: this frame did not decrypt under the session key")?;
     plaintext.truncate(len);
     Ok(plaintext)
+}
+
+/// Everything a stream to a peer has to be, as ONE name.
+///
+/// `Box<dyn AsyncRead + AsyncWrite + Unpin + Send>` is what this wants to say
+/// and Rust cannot spell it: a trait object takes one non-auto trait plus auto
+/// traits, and `AsyncRead` and `AsyncWrite` are two. So the pair gets a name,
+/// with a blanket impl so every existing stream type already satisfies it and
+/// nothing has to be registered. Reported to the lead as the one place the
+/// brief's literal signature is not expressible.
+pub trait PeerTransport: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> PeerTransport for T {}
+
+/// One stream to a peer, whatever opened it.
+///
+/// **The transport seam.** Every handler below a dial already works on
+/// `AsyncRead + AsyncWrite + Unpin` and none of them names a socket, so this
+/// alias is the one place a second way of reaching a peer, a relay, a
+/// forwarded carry, a different protocol, arrives without touching a single
+/// handler. `Send` because a TUNNEL hands its stream to a pump that outlives
+/// the frame that dialled it, and boxed because two transports are two types
+/// and a caller choosing between them at runtime cannot be generic over both.
+pub type PeerStream = Box<dyn PeerTransport>;
+
+/// Write one frame of this stream: `serde_json`, then the Noise transport.
+///
+/// One framing for every stream kind and every frame on it, because a second
+/// spelling of "write a frame" is where a length check goes missing. `pub` so a
+/// test can stand in for the listener's dispatch arm, which is the one line of
+/// this feature that lives outside this file.
+pub async fn send_control<S, T>(stream: &mut S, session: &mut PeerSession, value: &T) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    send_json(stream, session, value).await
+}
+
+/// One JSON frame, decrypted. See [`send_control`].
+pub async fn recv_control<S, T>(stream: &mut S, session: &mut PeerSession) -> Result<T>
+where
+    S: AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    recv_json(stream, session).await
+}
+
+/// One JSON frame, encrypted.
+pub(crate) async fn send_json<S, T>(
+    stream: &mut S,
+    session: &mut PeerSession,
+    value: &T,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let bytes = serde_json::to_vec(value).context("peer serve: a frame did not serialize")?;
+    send_encrypted(stream, &mut session.transport, &bytes).await
+}
+
+/// One JSON frame, decrypted.
+pub(crate) async fn recv_json<S, T>(stream: &mut S, session: &mut PeerSession) -> Result<T>
+where
+    S: AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    let bytes = recv_encrypted(stream, &mut session.transport).await?;
+    serde_json::from_slice(&bytes).context("peer serve: a frame did not parse")
+}
+
+/// Plaintext chunk size for a splice: well under the frame ceiling, so one
+/// large body cannot monopolise the stream.
+pub const CHUNK_BYTES: usize = 16 * 1024;
+
+/// How long the peer's direction is still pumped after the local end has
+/// closed its own.
+///
+/// A request whose client has read what it wanted and gone away is the ordinary
+/// case, and the reply the far end is still writing was being thrown away: the
+/// pump ended on the FIRST direction to finish. Half-closing instead means the
+/// other direction has to end on something, and a peer that never closes is the
+/// same task-holding shape [`FIRST_RECORD_TIMEOUT`](crate::peer::tunnel::FIRST_RECORD_TIMEOUT) exists for, so it ends on
+/// this.
+pub const HALF_CLOSE_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+// ---------------------------------------------------------------------------
+// The Noise session as a byte stream
+// ---------------------------------------------------------------------------
+
+/// A Noise session as an `AsyncRead + AsyncWrite` stream.
+///
+/// The adapter named in [`crate::peer::tunnel`]'s module docs. It exists so the splice can be ONE
+/// function over two generic halves instead of one function per pairing of
+/// concrete socket types.
+///
+/// Reading yields the plaintext the peer sent; writing encrypts and frames.
+/// A write shorter than [`CHUNK_BYTES`] is one frame, there is no coalescing,
+/// because a splice that waited for a full chunk would stall a TLS handshake
+/// that is a few hundred bytes long and then silent.
+pub struct NoiseStream {
+    /// This side of the plaintext duplex. The pump owns the other side.
+    plaintext: DuplexStream,
+    /// The pump, so its error can be collected by [`Self::finish`] rather than
+    /// dropped on the floor.
+    pump: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl NoiseStream {
+    /// Start pumping `session` over `socket` and return the plaintext side.
+    ///
+    /// Two tasks, for the cancel-safety reason in [`crate::peer::tunnel`]'s module docs: a framer
+    /// that reads whole frames off the socket's read half and nothing else, and
+    /// a mixer that owns the session and is therefore the only thing that
+    /// touches the cipher.
+    pub fn start<S>(socket: S, mut session: PeerSession) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mine, theirs) = tokio::io::duplex(CHUNK_BYTES * 4);
+        let pump = tokio::spawn(async move {
+            let (mut read_half, mut write_half) = tokio::io::split(socket);
+            // One frame in flight plus one queued: enough that the framer is
+            // never the bottleneck, bounded so a fast peer cannot make this
+            // node buffer its stream in memory.
+            let (frames_tx, mut frames_rx) = mpsc::channel::<Vec<u8>>(2);
+            let framer = tokio::spawn(async move {
+                loop {
+                    match read_frame(&mut read_half).await {
+                        Ok(frame) => {
+                            if frames_tx.send(frame).await.is_err() {
+                                return;
+                            }
+                        }
+                        // EOF and a torn frame are the same fact here, the
+                        // session is over. The mixer reports it, because the
+                        // mixer is the half with the context.
+                        Err(_) => return,
+                    }
+                }
+            });
+
+            let mut plain = theirs;
+            let mut from_local = vec![0_u8; CHUNK_BYTES];
+            // Set when the LOCAL end closes its half. From then on the local
+            // read arm is off and what is still coming back from the peer is
+            // pumped until the peer closes too or this deadline passes.
+            let mut draining_until: Option<tokio::time::Instant> = None;
+            // Whether this side has sent its end-of-stream frame yet.
+            let mut sent_end = false;
+            let outcome = loop {
+                tokio::select! {
+                    frame = frames_rx.recv() => {
+                        let Some(frame) = frame else { break Ok(()) };
+                        let mut out = vec![0_u8; MAX_FRAME_BYTES];
+                        let len = match session.transport.read_message(&frame, &mut out) {
+                            Ok(len) => len,
+                            Err(err) => break Err(anyhow!(
+                                "peer tunnel: a carried frame did not decrypt under the \
+                                 session key: {err}"
+                            )),
+                        };
+                        // The peer's end-of-stream frame: the same fact as its
+                        // FIN, said inside the session (see
+                        // [`send_end_of_stream`]).
+                        if len == 0 {
+                            break Ok(());
+                        }
+                        out.truncate(len);
+                        if plain.write_all(&out).await.is_err() {
+                            // The local end went away. Not an error: it is how
+                            // a finished request looks.
+                            break Ok(());
+                        }
+                    }
+                    read = plain.read(&mut from_local), if draining_until.is_none() => {
+                        match read {
+                            // **Half-close, not close.** The local end going
+                            // away says nothing about the other direction, and
+                            // ending the whole pump here dropped whatever the
+                            // peer was still sending: on a gateway carry that
+                            // is the origin's reply, thrown away because the
+                            // client hung up a moment early.
+                            Ok(0) => {
+                                // A local end that is GONE, rather than one
+                                // that closed its write half, has nobody left
+                                // to hand the drained bytes to: an empty write
+                                // is how that is asked, and it is what keeps
+                                // `NoiseStream::finish` returning at once.
+                                if plain.write(&[]).await.is_err() {
+                                    break Ok(());
+                                }
+                                // Every data byte is already delivered, so a
+                                // frame that cannot be written (the far end
+                                // reset as this end finished) is not a failed
+                                // carry: the drain below still runs, as it did
+                                // when only the half-close could fail.
+                                if let Err(err) =
+                                    send_end_of_stream(&mut write_half, &mut session).await
+                                {
+                                    tracing::debug!(
+                                        error = %err,
+                                        "peer tunnel: the end-of-stream frame was not written; \
+                                         draining what the far end still sends"
+                                    );
+                                }
+                                sent_end = true;
+                                let _shutdown = write_half.shutdown().await;
+                                draining_until =
+                                    Some(tokio::time::Instant::now() + HALF_CLOSE_DRAIN);
+                            }
+                            Ok(n) => {
+                                if let Err(err) = send_encrypted(
+                                    &mut write_half,
+                                    &mut session.transport,
+                                    &from_local[..n],
+                                )
+                                .await
+                                {
+                                    break Err(err.context(
+                                        "peer tunnel: the carried stream could not be written",
+                                    ));
+                                }
+                            }
+                            Err(err) => break Err(anyhow::Error::new(err)
+                                .context("peer tunnel: the local end of the carry failed")),
+                        }
+                    }
+                    () = sleep_or_never(draining_until) => {
+                        break Ok(());
+                    }
+                }
+            };
+            // Say the end of the stream, inside the session and then as a
+            // half-close, so the far end sees it rather than a hang, then stop
+            // the framer. The frame is best-effort here: the pump is ending
+            // whatever happens, often because the far end already went.
+            if !sent_end && let Err(err) = send_end_of_stream(&mut write_half, &mut session).await {
+                tracing::debug!(
+                    error = %err,
+                    "peer tunnel: the end-of-stream frame was not written; the far end learns \
+                     from the socket closing instead"
+                );
+            }
+            let _shutdown = write_half.shutdown().await;
+            framer.abort();
+            outcome
+        });
+        Self {
+            plaintext: mine,
+            pump,
+        }
+    }
+
+    /// Wait for the pump to stop and surface whatever ended it.
+    ///
+    /// The one place a carried stream's failure becomes visible. A caller that
+    /// drops a [`NoiseStream`] instead sees a clean end of stream, because the
+    /// splice copies the PLAINTEXT half: a frame that did not decrypt under
+    /// the session key, and a write to the peer that failed, both end the pump
+    /// and leave the splice's own count looking like an ordinary finish.
+    ///
+    /// # It had no production caller, and the doc here used to claim it did
+    ///
+    /// Two tests called it and nothing in `src/` did, so a carry that died
+    /// inside the pump was logged as "carried". Kept and wired rather than
+    /// removed: the fact it reports exists nowhere else, and a gateway's log
+    /// line is the whole record of a stream nobody may read. Both splice
+    /// callers in this module now await it before they claim anything.
+    /// [`crate::peer::egress`]'s requester-side splice still drops its stream
+    /// and is the remaining site.
+    pub async fn finish(self) -> Result<()> {
+        // Dropping our half first is what tells the pump to stop; without it a
+        // pump whose peer is silent would be joined forever.
+        drop(self.plaintext);
+        self.pump
+            .await
+            .context("peer tunnel: the carry task did not finish cleanly")?
+    }
+}
+
+impl AsyncRead for NoiseStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.plaintext).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for NoiseStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.plaintext).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.plaintext).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.plaintext).poll_shutdown(cx)
+    }
+}
+
+/// Send this side's end of a carried stream: one encrypted frame with an
+/// empty payload.
+///
+/// # Why a frame and not only a FIN
+///
+/// The pump used to say "done" by shutting its socket's write half and
+/// nothing else. A transport with no half-close loses that: tcr's own tailnet
+/// node is one, the `tailscale` crate's `poll_shutdown` does nothing at
+/// 0.6.1, and the close it sends on drop can be lost (upstream #446). The far
+/// pump then never learns the stream ended: it waits out its own drain, or
+/// forever. Said inside the session it reaches the far pump over any
+/// transport, and the half-close still follows for every transport that has
+/// one.
+///
+/// It needs no version bump. A payload is never empty otherwise (a local read
+/// of 0 bytes is the end, not a frame), and a pump from before this change
+/// writes the empty payload to its local end as zero bytes, a no-op, then
+/// sees the FIN as it always did.
+async fn send_end_of_stream<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    session: &mut PeerSession,
+) -> Result<()> {
+    send_encrypted(writer, &mut session.transport, &[]).await
+}
+
+/// Sleep until `at`, or never when there is nothing to wait for.
+///
+/// The half-close drain's timer, written as one future so the pump's `select!`
+/// has an arm that is simply never ready while both directions are open.
+async fn sleep_or_never(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// A frame reader that keeps the bytes it has already taken off the socket.
@@ -1221,7 +1588,7 @@ where
         (Some(ours), Some(theirs)) => pairing_code(&handshake_hash, theirs, ours),
         _ => six_digit_code(&state),
     };
-    crate::peer::reach::remember_pair_hash(peer, &handshake_hash);
+    remember_pair_hash(peer, &handshake_hash);
     let mut transport = into_transport(state)?;
 
     // The reveal, and the reason it is a transport frame rather than a fourth
@@ -1495,7 +1862,7 @@ where
     // Read before `into_transport` consumes the handshake state, which is the
     // only thing that can answer for this hash.
     let handshake_hash = state.get_handshake_hash().to_vec();
-    crate::peer::reach::remember_pair_hash(peer, &handshake_hash);
+    remember_pair_hash(peer, &handshake_hash);
     let mut transport = into_transport(state)?;
 
     // The responder's reveal. Checked against the commitment that arrived in
@@ -1534,6 +1901,112 @@ where
         handshake_hash,
         transport,
     })
+}
+
+/// The label that separates this derivation from every other use of the same
+/// handshake hash.
+///
+/// HKDF's `info` field, and the reason it is not empty: the six-digit pairing
+/// code (`noise::six_digit_code`) is also derived from the handshake hash, and
+/// two derivations from one secret with no domain separator are one derivation
+/// whose outputs are related. The version suffix is here so a change to the
+/// scheme changes every port rather than half of them.
+const PORT_INFO: &[u8] = b"tcr peer reach derived-port v1";
+
+/// The per-pair secret the port derivation runs on, from the pair's completed
+/// Noise handshake hash.
+///
+/// HKDF-SHA256 (RFC 5869) over the tree's own `hmac_sha256`
+/// (`src/peer/config.rs`), which is checked against RFC 4231 rather than
+/// against itself. Extract with an all-zero salt, as the RFC says to when
+/// there is none, then one expand round, because 32 bytes is one block and the
+/// counter never reaches two.
+///
+/// # Why a derivation and not the hash itself
+///
+/// The handshake hash is the input to the six-digit compare an operator reads
+/// off two screens. A port computed as a slice of that same hash would leak a
+/// little of a value the operators speak out loud; more importantly it would
+/// tie two unrelated schemes together, so changing either one changes both.
+/// This is the Noise handshake's own key material, re-derived: it is **not** a
+/// second key exchange, and no new one may be invented here.
+///
+/// Takes the hash as bytes rather than a handshake object on purpose: the
+/// handshake type belongs to `snow`, which by this module tree's own rule is
+/// named in `src/peer/noise.rs` and nowhere else.
+pub fn port_secret(handshake_hash: &[u8]) -> [u8; 32] {
+    use crate::peer::config::drop::hmac_sha256;
+
+    // RFC 5869 § 2.2: with no salt, the salt is HashLen zero bytes.
+    let pseudorandom_key = hmac_sha256(&[0_u8; 32], handshake_hash);
+
+    // RFC 5869 § 2.3, one round: T(1) = HMAC(PRK, info | 0x01).
+    let mut block = Vec::with_capacity(PORT_INFO.len() + 1);
+    block.extend_from_slice(PORT_INFO);
+    block.push(0x01);
+    hmac_sha256(&pseudorandom_key, &block)
+}
+
+/// The port secrets this process has learned, one per pair.
+///
+/// # What is in memory, what is on disk, and what is on neither
+///
+/// The secret is the pair's completed Noise handshake hash run through
+/// [`port_secret`], so it exists only where a handshake has completed. This
+/// register is the hot copy, filled by every session as it completes.
+///
+/// It is ALSO written to `tcr-peers.json`, as
+/// [`crate::peer::config::PeerRow::rendezvous_secret`], and
+/// [`restore_from_peers`](crate::peer::reach::restore_from_peers) reads it back at boot. A decision of 2026-09-18
+/// took that decision and drew the line where this doc used to refuse the file
+/// outright: what the row holds is this derived value and never the handshake
+/// hash it came from. One keyed hash separates them, under `PORT_INFO`'s own
+/// domain string, and the hash is what the six-digit pairing compare is built
+/// from, so it stays in memory only.
+///
+/// Two places it still is not. The wire, because both ends compute it and
+/// telling each other a port is the thing a derived port replaces. And any row
+/// this node does not pin, because a secret for a peer with no row has nothing
+/// to be for.
+///
+/// Before row 17 a restarted node had no secret for any pair until the next
+/// completed session, and a dialler had the recorded endpoints and nothing
+/// else, which is exactly the case a peer that MOVED is not covered by.
+pub(crate) fn port_secrets() -> &'static Mutex<HashMap<PeerId, [u8; 32]>> {
+    static SECRETS: OnceLock<Mutex<HashMap<PeerId, [u8; 32]>>> = OnceLock::new();
+    SECRETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record the port secret a completed handshake with `peer` derived.
+///
+/// Takes the SECRET and not the handshake hash, so the one derivation lives in
+/// [`port_secret`] and a caller cannot accidentally register the hash itself,
+/// which is the value the six-digit compare is also built from.
+pub fn remember_port_secret(peer: PeerId, secret: [u8; 32]) {
+    let mut held = match port_secrets().lock() {
+        Ok(held) => held,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    held.insert(peer, secret);
+}
+
+/// Derive and record the port secret for a completed handshake with `peer`.
+///
+/// The entry point a session driver calls: it takes the handshake hash the
+/// session ended with and runs the one derivation, so no caller outside this
+/// module handles the hash as if it were the secret.
+pub fn remember_pair_hash(peer: PeerId, handshake_hash: &[u8]) {
+    remember_port_secret(peer, port_secret(handshake_hash));
+}
+
+/// The port secret this process holds for `peer`, or [`None`] when no session
+/// with it has completed since boot and the peers file held none either.
+pub fn port_secret_for(peer: &PeerId) -> Option<[u8; 32]> {
+    let held = match port_secrets().lock() {
+        Ok(held) => held,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    held.get(peer).copied()
 }
 
 // ---------------------------------------------------------------------------

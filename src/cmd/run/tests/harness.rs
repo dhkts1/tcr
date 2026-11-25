@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use tcr::cli::validate_group_label_chars;
-use tcr::{config, mitm};
+use tcr::{config, tls};
 
 use crate::cmd::run::launch_env::{LaunchKey, apply_nested_claude_ca, see_through_ca_notice};
 use crate::cmd::run::{
@@ -325,7 +325,7 @@ fn run_group_refuses_a_codex_only_group_even_when_it_spills_to_the_pool() {
             ..Default::default()
         },
     );
-    assert!(config.group_allows_spill("lab") && !config.is_group_reserved("lab"));
+    assert!(config.spill_group_names().contains("lab") && !config.is_group_reserved("lab"));
     let err =
         validate_group(&config, "lab").expect_err("spilling does not give lab a Claude account");
     assert_eq!(
@@ -350,7 +350,7 @@ fn persisted_tls_files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 #[test]
 fn see_through_ca_keeps_a_running_legacy_proxys_chain_unchanged() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = mitm::load_tls_in(dir.path()).unwrap().ca_path;
+    let ca = tls::load_tls_in(dir.path()).unwrap().ca_path;
     std::fs::remove_file(dir.path().join("tcr-ca.key")).unwrap();
     std::fs::write(
         dir.path().join("tcr-leaf.sans"),
@@ -379,7 +379,7 @@ fn see_through_ca_does_not_create_certificate_material() {
 #[test]
 fn see_through_ca_reuses_a_fresh_servers_ca() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = mitm::load_tls_in(dir.path()).unwrap().ca_path;
+    let ca = tls::load_tls_in(dir.path()).unwrap().ca_path;
     let before = persisted_tls_files(dir.path());
     assert_eq!(see_through_ca_in(dir.path()), Some(ca));
     assert_eq!(persisted_tls_files(dir.path()), before);

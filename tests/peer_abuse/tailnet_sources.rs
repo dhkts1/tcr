@@ -2,6 +2,7 @@
 //! and the operator's own Macs may knock over it in app mode.
 
 use super::*;
+use tcr::peer::reach;
 
 // ---------------------------------------------------------------------------
 // A tailnet is not this LAN
@@ -10,7 +11,7 @@ use super::*;
 /// **A node on a tailnet reaches the knock path on no setting, and neither
 /// does a link-local address.**
 ///
-/// `listener::is_lan_scope` used to count `100.64.0.0/10` (RFC 6598, which is
+/// `reach::is_lan_scope` used to count `100.64.0.0/10` (RFC 6598, which is
 /// what Tailscale numbers a tailnet out of) and `169.254.0.0/16` (RFC 3927
 /// link-local) as LAN, and `internet_admission` tests the SOURCE before it
 /// looks at anything else. So a listener bound `0.0.0.0` with
@@ -115,12 +116,12 @@ fn a_tailnet_ipv6_source_never_reaches_the_knock_path_either() {
             );
         }
     }
-    assert!(listener::is_tailscale_v6(
+    assert!(reach::is_tailscale_v6(
         "fd7a:115c:a1e0::5"
             .parse()
             .expect("a literal address parses")
     ));
-    assert!(!listener::is_tailscale_v6(
+    assert!(!reach::is_tailscale_v6(
         "fd00::5".parse().expect("a literal address parses")
     ));
 }

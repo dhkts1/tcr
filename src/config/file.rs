@@ -7,7 +7,6 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 
-use super::credential_version::with_codex_credential_versions;
 use super::{Config, ConfigError};
 
 /// Persist `config` to `path` atomically (temp file in the same dir + rename),
@@ -17,12 +16,12 @@ use super::{Config, ConfigError};
 /// filesystem); a crash mid-write leaves the original intact.
 ///
 /// A Codex account is written at `CODEX_CREDENTIAL_VERSION` even when the
-/// snapshot carries no version for it (`with_codex_credential_versions`); an
+/// snapshot carries no version for it (`Config::with_codex_credential_versions`); an
 /// Anthropic-only config serializes exactly as it always has.
 pub fn save(path: &Path, config: &Config) -> Result<(), ConfigError> {
     write_atomic(
         path,
-        &serde_json::to_string_pretty(with_codex_credential_versions(config).as_ref())?,
+        &serde_json::to_string_pretty(config.with_codex_credential_versions().as_ref())?,
     )
 }
 

@@ -132,7 +132,7 @@ fn the_baseline_moves_forward_only_and_survives_a_re_ask() {
 ///
 /// The reader holds a `biased` `select!` between the hint channel and the
 /// stream, so a hint queued while a `Handoff` is half read DROPS the read.
-/// `serve::recv_control` is not cancel safe: the bytes it had already taken
+/// `noise::recv_control` is not cancel safe: the bytes it had already taken
 /// off the socket went with the dropped future, the next read met the tail
 /// of one frame as a length prefix, the Noise stream desynced, and this
 /// borrower forgot its bearer for the rest of the lease.
@@ -144,7 +144,7 @@ fn the_baseline_moves_forward_only_and_survives_a_re_ask() {
 /// halves, because the claim is about a cancellation that only happens when
 /// those two land in that order.
 ///
-/// Watch it fail by putting `frame = serve::recv_control(&mut stream, &mut
+/// Watch it fail by putting `frame = noise::recv_control(&mut stream, &mut
 /// session) => frame` back in `read_handed_bearers`'s `select!`: the second
 /// bearer never arrives and this times out on the first one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1075,7 +1075,7 @@ fn a_grant_reads_the_peers_file_and_records_what_it_minted() {
 /// LENDS, and must not turn the borrowing seam on, which is the confusion this
 /// test exists to pin.
 ///
-/// Reads through a `PeerStore` since the filter became `serve::has_a_way_back`:
+/// Reads through a `PeerStore` since the filter became `dial::has_a_way_back`:
 /// answering "is there a Mac that could carry to this lender" needs the other
 /// rows, not just this one.
 #[test]
@@ -1098,21 +1098,26 @@ fn the_provider_is_configured_by_a_disclose_grant_and_an_address() {
     );
 
     // `inspect` is the LENDING direction and does not configure this seam.
-    file.peers[0].allow.inspect = true;
-    file.peers[0].observe_endpoint(Endpoint::direct(
-        "127.0.0.1:1"
-            .parse()
-            .expect("a fixture address is a socket address"),
-        0,
-        EndpointSource::Paired,
-    ));
+    file.row_mut(&lender).expect("the lender row").allow.inspect = true;
+    file.row_mut(&lender)
+        .expect("the lender row")
+        .observe_endpoint(Endpoint::direct(
+            "127.0.0.1:1"
+                .parse()
+                .expect("a fixture address is a socket address"),
+            0,
+            EndpointSource::Paired,
+        ));
     assert!(
         fallback::peer_lease_provider(&store_of(&file)).is_none(),
         "lending to a peer is not permission to disclose to it"
     );
 
     // With `disclose` and an address there is something to borrow from.
-    file.peers[0].allow.allow_disclose = true;
+    file.row_mut(&lender)
+        .expect("the lender row")
+        .allow
+        .allow_disclose = true;
     assert!(fallback::peer_lease_provider(&store_of(&file)).is_some());
 
     // A WAY BACK is part of it: a row with nothing to dial and no Mac that
@@ -1120,7 +1125,10 @@ fn the_provider_is_configured_by_a_disclose_grant_and_an_address() {
     // walk it on every dry-fleet request forever. An address is one way back;
     // `a_lender_with_no_address_still_installs_the_provider_through_a_carrier`
     // (`tests/peer_forward.rs`) holds the other.
-    file.peers[0].endpoints.clear();
+    file.row_mut(&lender)
+        .expect("the lender row")
+        .endpoints
+        .clear();
     assert!(fallback::peer_lease_provider(&store_of(&file)).is_none());
 }
 

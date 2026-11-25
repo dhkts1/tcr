@@ -32,11 +32,71 @@
 //! file, on tcr's one key) and are undone byte for byte by the matching
 //! `--remove`.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::doctor::{BASE_URL_VAR, routes_to_port};
+/// The environment variable Claude Code reads its base URL from, and the one
+/// `tcr run` exports onto its child.
+pub const BASE_URL_VAR: &str = "ANTHROPIC_BASE_URL";
+
+/// The host and port of an `http[s]://…` URL, without a URL parser.
+///
+/// Hand-rolled deliberately: this crate has no `url` dependency and adding one
+/// for two fields would be a new dependency for nothing. Scope is exactly what
+/// the caller needs: scheme, optional userinfo, host (bracketed IPv6
+/// included), optional port. Anything else returns `None` rather than a
+/// half-parsed guess.
+pub fn authority(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|part| !part.is_empty())?;
+    // Userinfo, if any, is everything before the LAST `@`.
+    let authority = match authority.rsplit_once('@') {
+        Some((_, after)) => after,
+        None => authority,
+    };
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        let port = match after.strip_prefix(':') {
+            Some(digits) => digits.parse().ok()?,
+            None => default_port,
+        };
+        return Some((host.to_string(), port));
+    }
+    match authority.split_once(':') {
+        Some((host, digits)) => Some((host.to_string(), digits.parse().ok()?)),
+        None => Some((authority.to_string(), default_port)),
+    }
+}
+
+/// Is this URL one that reaches a proxy on THIS machine's `port`?
+///
+/// Loopback by address, not by spelling: `127.0.0.1`, `127.0.0.2`, `localhost`
+/// and `[::1]` all reach the same listener, and an operator who wrote any of
+/// them has a working route. A non-loopback host is another machine's proxy
+/// (or Anthropic), whatever port it names.
+pub fn routes_to_port(url: &str, port: u16) -> bool {
+    let Some((host, url_port)) = authority(url) else {
+        return false;
+    };
+    if url_port != port {
+        return false;
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
 
 /// The first line of tcr's block, matched as a line PREFIX so the hint after
 /// it can change without stranding blocks written by an older build.
@@ -1521,6 +1581,43 @@ pub fn describe_changes(changes: &[FileChange]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authority_reads_host_and_port_including_ipv6_and_userinfo() {
+        assert_eq!(
+            authority("http://127.0.0.1:3456"),
+            Some(("127.0.0.1".to_string(), 3456))
+        );
+        assert_eq!(
+            authority("https://api.anthropic.com"),
+            Some(("api.anthropic.com".to_string(), 443))
+        );
+        assert_eq!(
+            authority("http://localhost/v1/messages?x=1"),
+            Some(("localhost".to_string(), 80))
+        );
+        assert_eq!(
+            authority("http://[::1]:3456/v1"),
+            Some(("::1".to_string(), 3456))
+        );
+        assert_eq!(
+            authority("http://user:pw@127.0.0.1:3456"),
+            Some(("127.0.0.1".to_string(), 3456))
+        );
+        assert_eq!(authority("api.anthropic.com"), None);
+        assert_eq!(authority("ftp://127.0.0.1:3456"), None);
+    }
+
+    #[test]
+    fn routing_is_loopback_plus_the_configured_port() {
+        assert!(routes_to_port("http://127.0.0.1:3456", 3456));
+        assert!(routes_to_port("http://localhost:3456", 3456));
+        assert!(routes_to_port("http://[::1]:3456", 3456));
+        assert!(!routes_to_port("http://127.0.0.1:3457", 3456));
+        assert!(!routes_to_port("https://api.anthropic.com", 3456));
+        // Another machine's tcr on the same port is still not this proxy.
+        assert!(!routes_to_port("http://192.168.1.9:3456", 3456));
+    }
 
     fn homes(dir: &Path) -> Homes {
         Homes {

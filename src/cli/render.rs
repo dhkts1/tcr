@@ -69,17 +69,6 @@ fn gating_quota(a: &AccountSnapshot) -> Option<f64> {
         .reduce(f64::max)
 }
 
-/// Per-account gating threshold — the account's `switchThreshold`, else the global
-/// one — collected in config order (which is the snapshot's account order), so the
-/// held-window display gates on exactly the threshold `Manager::eligible` routes on.
-pub(super) fn resolve_thresholds(config: &Config) -> Vec<f64> {
-    config
-        .accounts
-        .iter()
-        .map(|a| a.switch_threshold.unwrap_or(config.switch_threshold))
-        .collect()
-}
-
 /// A gating window (5h or 7d) currently holding an account out of rotation: its
 /// effective utilization is at/over the account's threshold and it still resets in
 /// the future. Mirrors `Quota::is_near`'s dimensions (5h + 7d; the model-scoped

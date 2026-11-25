@@ -74,6 +74,7 @@ mod construction;
 mod freshness;
 mod serving;
 mod sessions;
+mod upstream_client;
 pub(crate) use accounts::account_runtime::ResetTarget;
 use accounts::account_runtime::match_listed;
 pub use accounts::account_runtime::{AccountRuntime, AccountStatus};
@@ -88,11 +89,11 @@ use serving::codex_traffic::{CodexRefusals, MinuteRing};
 pub use serving::exhaustion_hint::ExhaustionHint;
 pub use serving::in_flight::InFlightGuard;
 use serving::in_flight::WarmInFlightGuard;
-pub(crate) use serving::serving_client::build_serving_client;
-#[cfg(test)]
-pub(crate) use serving::serving_client::fail_next_client_build;
 use serving::serving_client::{MAX_SERVES_PER_CONNECTION, RecycleReason};
 use sessions::capped_map::{CappedMap, CappedSet};
+pub(crate) use upstream_client::build_serving_client;
+#[cfg(test)]
+pub(crate) use upstream_client::fail_next_client_build;
 // The one TYPE that module owns and `proxy.rs` names: one minted token as the response path
 // hands it over, so a kind can never be paired with another token's string.
 pub use sessions::bound_tokens::MintedToken;
@@ -100,9 +101,7 @@ pub use sessions::bound_tokens::MintedToken;
 // Re-exported so unit F's replay harness (`tests/`) can call the SAME
 // production predicate rather than a reimplementation — see
 // the divert-budget design notes §6. Import path: `tcr::manager::{divert_verdict, DivertVerdict}`.
-pub use select::{
-    DivertVerdict, PoolPass, RoutingCandidates, divert_verdict, effective_fable_threshold,
-};
+pub use select::{DivertVerdict, PoolPass, RoutingCandidates, divert_verdict};
 
 /// How long the session-affinity flusher waits after a change before it saves, so a burst of
 /// changes is one write. It is also the most of a new or moved pin a SIGKILL can lose: a
@@ -396,6 +395,127 @@ pub struct DivertEpisode {
     pub sticky: usize,
 }
 
+/// A Codex token rotation not yet written back to the imported Codex login it came from.
+/// The account row carries it ([`AccountRuntime::pending_codex_writeback`]), the token flush
+/// persists it, and the refresh path publishes it and backs it off. It sits in this parent
+/// module, below all three, so the row's own field does not name the refresh code.
+#[derive(Clone)]
+pub(crate) struct PendingCodexWriteback {
+    expected_refresh: String,
+    tokens: Tokens,
+    retry_after_ms: i64,
+    failures: u8,
+}
+
+impl std::fmt::Debug for PendingCodexWriteback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingCodexWriteback")
+            .field("expected_refresh", &"<redacted>")
+            .field("tokens", &"<redacted>")
+            .finish()
+    }
+}
+
+impl PendingCodexWriteback {
+    pub(in crate::manager) fn from_config(account: &config::Account) -> Option<Self> {
+        match account.provider {
+            crate::provider::Provider::Anthropic => return None,
+            crate::provider::Provider::Codex => {}
+        }
+        account.codex_home.as_ref()?;
+        let record = account.extra.get(config::CODEX_SYNC_PENDING_KEY)?;
+        let expected_refresh = record.get("expectedRefreshSha256")?.as_str()?;
+        if expected_refresh.len() != 64 || !expected_refresh.bytes().all(|c| c.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some(Self {
+            expected_refresh: expected_refresh.to_string(),
+            tokens: Tokens {
+                id_token: record
+                    .get("idToken")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                access_token: account.access_token.clone(),
+                refresh_token: account.refresh_token.clone(),
+                expires_at_ms: account.expires_at.map_or(0, oauth::normalize_expires_at),
+            },
+            retry_after_ms: 0,
+            failures: 0,
+        })
+    }
+
+    pub(in crate::manager) fn record(&self) -> serde_json::Value {
+        let mut record = serde_json::json!({"expectedRefreshSha256": self.expected_refresh});
+        if let Some(id) = &self.tokens.id_token {
+            record["idToken"] = id.clone().into();
+        }
+        record
+    }
+
+    fn back_off(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+        let seconds = (5_i64 << self.failures.saturating_sub(1).min(6)).min(300);
+        self.retry_after_ms = crate::now_ms().saturating_add(seconds * 1000);
+    }
+}
+
+/// The three-way split of an UNPINNED request (control account, part 2 — see
+/// the module doc and `docs/plans/control-routing-bridge-coder.md`). Classified
+/// from `path` alone (the caller's already query-stripped request path), never
+/// from a session/affinity key — see [`classify_request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::manager) enum RequestClass {
+    /// `/v1/messages`, `/v1/messages/count_tokens` and Codex's
+    /// `/backend-api/codex/responses` — pool only. **Never** the control
+    /// account, even when `controlAccount` names an ENABLED (pooled) account —
+    /// see [`Manager::select`]'s pool-pick exclusion.
+    ///
+    /// Two opt-ins lift that, both off by default, and both leave
+    /// [`Manager::pool_pick_respects_control_reserve`]'s floor in force:
+    /// `groupSettings.<g>.allowControlAccount` for one explicit `--group g` ask,
+    /// and [`crate::config::Config::control_pooled`] for the whole pool.
+    Inference,
+    /// `/api/event_logging*`, `/mcp-registry*` — high-volume noise. Follows the
+    /// requesting connection ([`Manager::conn_affinity`]) rather than the
+    /// control account, so it never burns the one account being kept clean.
+    Noise,
+    /// Everything else — the identity/control plane. Prefers the control
+    /// account (bypassing its `disabled` gate — see
+    /// [`Manager::control_eligible`]) when it is genuinely usable; degrades to
+    /// normal rotation otherwise. The classification **fails safe**: an unknown
+    /// path defaults here rather than to the pool, the opposite of
+    /// `CLIENT_CREDENTIAL_PREFIXES`'s fail-unsafe growth.
+    ControlPreferred,
+}
+
+// Only a request WITHOUT a client bearer reaches this classifier on a `Noise`
+// or `ControlPreferred` path: with one, `proxy::relay_mode` relays every
+// non-inference path under the client's own credential first, and the
+// `controlIdentity` check (`crate::control_identity`) has already confirmed
+// that credential IS the control account. So the control-preferred pick below
+// is the bearer-less fallback, not the identity plane's main road.
+
+/// Classify an unpinned request's path into the three-way split. Inference is
+/// whatever the path's own provider calls inference
+/// ([`crate::provider::Provider::is_inference_path`]): exact matches only,
+/// which keeps `stable_session_key`'s `/v1/messages/count_tokens must NOT
+/// prefix-match /v1/messages` guard, read from the one list in
+/// `crate::provider` rather than a copy here that could drift from it. Prefix
+/// match for the two noise paths, matching the bridge's own examples
+/// (`/api/event_logging/v2/batch`, and any `/mcp-registry...` route).
+pub(in crate::manager) fn classify_request(path: &str) -> RequestClass {
+    let provider = crate::provider::Provider::of_path(path);
+    if provider.is_inference_path(path) {
+        RequestClass::Inference
+    } else if path.starts_with("/api/event_logging") || path.starts_with("/mcp-registry") {
+        RequestClass::Noise
+    } else {
+        RequestClass::ControlPreferred
+    }
+}
+
 /// Owns all rotation state and the machinery to refresh tokens and reach upstream.
 pub struct Manager {
     /// This manager's own `Arc`, so a method holding `&self` can hand work to a
@@ -519,7 +639,7 @@ pub struct Manager {
     /// Override for the Fable weekly bucket alone — see
     /// [`crate::config::Config::fable_weekly_threshold`]. `None` means "use
     /// whatever threshold the site would apply anyway", resolved by
-    /// [`crate::manager::select::effective_fable_threshold`] at the two call
+    /// [`crate::config::effective_fable_threshold`] at the two call
     /// sites ([`Self::model_blocked`], [`Self::account_gate`]'s `FableWeekly`
     /// push). Snapshotted at construction, same restart-to-take-effect contract
     /// as `global_threshold` above.
@@ -720,7 +840,7 @@ pub struct Manager {
     /// Codex has its own revalidation budget; a Claude fallback never spends it.
     next_codex_revalidation_at_ms: std::sync::atomic::AtomicI64,
     /// Connection-scoped affinity for NOISE traffic (`/api/event_logging`,
-    /// `/mcp-registry` — see [`select::classify_request`]): connection key
+    /// `/mcp-registry` — see [`classify_request`]): connection key
     /// ([`crate::proxy::SessionKey`]'s wrapped `u64`, minted per-connection by
     /// [`Manager::next_session_key`]) → `(account index, last-touch ms)`.
     ///
@@ -789,7 +909,7 @@ pub struct Manager {
     /// The upstream errors and served model ids this boot has seen, per provider, for the
     /// routing document ([`crate::routing`]). Observability only: no selection reads it.
     /// A leaf lock, never held while another is taken.
-    routing: Mutex<crate::routing::Observations>,
+    routing: Mutex<crate::observations::Observations>,
 }
 
 const fn odt_to_ms(now: OffsetDateTime) -> i64 {
@@ -827,6 +947,37 @@ fn cooldown_elapsed(deadline_ms: Option<i64>, now_ms: i64) -> bool {
 }
 
 impl Manager {
+    /// `f` applied to account row `idx`, under a short read of the accounts
+    /// lock. `None` is the one answer for an index past the end, so no reader
+    /// decides on its own what a missing row means. `f` runs with the lock
+    /// held: it must not take `affinity` or any lock ordered before accounts.
+    pub(in crate::manager) fn account<R>(
+        &self,
+        idx: usize,
+        f: impl FnOnce(&AccountRuntime) -> R,
+    ) -> Option<R> {
+        self.accounts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(idx)
+            .map(f)
+    }
+
+    /// The Anthropic origin. A request's own origin, which depends on its provider, is
+    /// [`Self::upstream_for`].
+    pub fn upstream(&self) -> &str {
+        &self.upstream
+    }
+
+    /// The origin a request for `provider` is rewritten to. `upstream()` stays the Anthropic
+    /// accessor its existing callers (profile fetch, control identity) mean.
+    pub fn upstream_for(&self, provider: crate::provider::Provider) -> &str {
+        match provider {
+            crate::provider::Provider::Anthropic => &self.upstream,
+            crate::provider::Provider::Codex => &self.codex_upstream,
+        }
+    }
+
     /// Hard state of account `idx` — lets the proxy skip an account that a
     /// refresh just proved dead (`Error`) without wasting an upstream round-trip.
     pub fn account_status(&self, idx: usize) -> Option<AccountStatus> {

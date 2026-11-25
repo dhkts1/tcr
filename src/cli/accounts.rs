@@ -5,14 +5,13 @@ use std::path::Path;
 
 use anyhow::{Context as _, bail};
 
-use super::account_query::resolve_account;
-use super::live_client::{RESTART_HINT, fetch_live_status};
 use super::live_edit::{
     CONTROL_WORDS, ENABLE_WORDS, Live, LiveSite, PRIORITY_WORDS, REMOVE_WORDS, post_set_control,
     post_set_disabled, post_set_priority,
 };
 use super::{edit_account, load_config, load_for_edit};
 use crate::config::{self, Config};
+use crate::live_client::{RESTART_HINT, fetch_live_status};
 use crate::provider::Provider;
 
 /// How to set an account's priority: an explicit integer, or a relative
@@ -64,8 +63,7 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
             config_path.display()
         );
     }
-    let idx = resolve_account(&config.accounts, query)?;
-    let target = config.accounts[idx].clone();
+    let target = config.resolve_account(query)?.clone();
     let name = target.name.clone();
 
     let site = LiveSite {
@@ -119,7 +117,7 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
     // shows on the row, rather than leaving the row listed with no reason.
     if parked_live
         && let Ok(payload) = fetch_live_status(&config).await
-        && payload.accounts.iter().any(|a| a.name == name)
+        && payload.lists_account(&name)
     {
         eprintln!(
             "[tcr] the proxy running on :{} stopped routing to '{name}', but it predates live removal and keeps listing it as disabled until it restarts. {}",
@@ -142,12 +140,7 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
 /// so a Codex account's priority says nothing about where a Claude account sits.
 /// In a fleet with no Codex account that is every account, as it always was.
 pub(super) fn priority_value(config: &Config, provider: Provider, priority: PriorityArg) -> i64 {
-    let existing = config
-        .accounts
-        .iter()
-        .filter(|a| a.provider == provider)
-        .filter_map(|a| a.priority)
-        .chain(std::iter::once(0));
+    let existing = config.priorities_of(provider).chain(std::iter::once(0));
     match priority {
         PriorityArg::N(n) => n,
         PriorityArg::First => existing.min().unwrap_or(0) - 1,
@@ -196,8 +189,7 @@ pub async fn set_priority(
     priority: PriorityArg,
 ) -> anyhow::Result<()> {
     let config = load_for_edit(config_path)?;
-    let idx = resolve_account(&config.accounts, query)?;
-    let provider = config.accounts[idx].provider;
+    let provider = config.resolve_account(query)?.provider;
     let value = priority_value(&config, provider, priority);
 
     let site = LiveSite {
@@ -232,9 +224,9 @@ pub async fn set_priority(
 /// The file half of `tcr priority`: resolve, set, save, return the resolved
 /// name.
 fn write_priority(config_path: &Path, query: &str, value: i64) -> anyhow::Result<String> {
-    edit_account(config_path, query, |config, idx| {
-        config.accounts[idx].priority = Some(value);
-        config.accounts[idx].name.clone()
+    edit_account(config_path, query, |account| {
+        account.priority = Some(value);
+        account.name.clone()
     })
 }
 
@@ -264,8 +256,7 @@ pub fn request_key(config_path: &Path) -> anyhow::Result<String> {
 
 pub fn print_access_token(config_path: &Path, query: &str) -> anyhow::Result<()> {
     let config = load_config(config_path)?;
-    let idx = resolve_account(&config.accounts, query)?;
-    println!("{}", config.accounts[idx].access_token);
+    println!("{}", config.resolve_account(query)?.access_token);
     Ok(())
 }
 
@@ -335,9 +326,9 @@ pub async fn set_enabled(config_path: &Path, query: &str, disabled: bool) -> any
 /// resolved name. Exactly what `set_enabled` did before it learned to ask the
 /// server.
 fn write_disabled_flag(config_path: &Path, query: &str, disabled: bool) -> anyhow::Result<String> {
-    edit_account(config_path, query, |config, idx| {
-        config.accounts[idx].disabled = if disabled { Some(true) } else { None };
-        config.accounts[idx].name.clone()
+    edit_account(config_path, query, |account| {
+        account.disabled = if disabled { Some(true) } else { None };
+        account.name.clone()
     })
 }
 
@@ -354,7 +345,7 @@ pub(super) fn write_control_account(
     let config = load_for_edit(config_path)?;
     let target = match query {
         None => None,
-        Some(q) => Some(config.accounts[resolve_account(&config.accounts, q)?].clone()),
+        Some(q) => Some(config.resolve_account(q)?.clone()),
     };
     // The live route's refusal, offline: boot ignores a `controlAccount` naming a Codex
     // account, so writing one would persist a setting the next start throws away.
@@ -426,25 +417,22 @@ pub fn set_account_egress(
     let pins_away = matches!(egress, Some(config::Egress::Via(_))) || strict == Some(true);
     if pins_away
         && let Ok(config) = load_config(config_path)
-        && let Ok(idx) = resolve_account(&config.accounts, query)
+        && let Ok(account) = config.resolve_account(query)
     {
         crate::provider_guard::provider_guard(
-            &config.accounts[idx],
+            account,
             crate::provider_guard::ClaudeOnlyVerb::ExitFromPeer,
         )
         .map_err(anyhow::Error::msg)?;
     }
-    edit_account(config_path, query, |config, idx| {
+    edit_account(config_path, query, |account| {
         if let Some(egress) = egress {
-            config.accounts[idx].egress = egress;
+            account.egress = egress;
         }
         if let Some(strict) = strict {
-            config.accounts[idx].egress_strict = strict;
+            account.egress_strict = strict;
         }
-        (
-            config.accounts[idx].name.clone(),
-            config.accounts[idx].egress_pin(),
-        )
+        (account.name.clone(), account.egress_pin())
     })
 }
 
@@ -498,10 +486,7 @@ pub async fn show_control(config_path: &Path) -> anyhow::Result<()> {
     let config = load_config(config_path)?;
     let control = match fetch_live_status(&config).await {
         Ok(payload) => payload.control,
-        Err(_) => config
-            .control_account
-            .as_ref()
-            .map(|c| c.name().to_string()),
+        Err(_) => config.control_account_name().map(str::to_string),
     };
     match control {
         Some(name) => println!("{name}"),

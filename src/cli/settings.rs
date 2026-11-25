@@ -4,10 +4,10 @@ use std::path::Path;
 
 use anyhow::Context as _;
 
-use super::live_client::LiveControlError;
 use super::live_edit::{CONFIG_SET_WORDS, Live, LiveSite, fetch_running_settings, post_set_config};
 use super::load_config;
 use crate::config;
+use crate::live_client::LiveControlError;
 
 /// `tcr config show [--json]`: the rotation and limit settings this file
 /// gives a server, defaults applied, through the same loader as
@@ -33,7 +33,7 @@ pub async fn config_show_document(
     config_path: &Path,
 ) -> anyhow::Result<crate::config_show::ConfigShow> {
     let config = load_config(config_path)?;
-    let saved = crate::config_show::ConfigSettings::from_config(&config, config_path);
+    let saved = config.settings(config_path);
     let running = match fetch_running_settings(&config).await {
         Ok(running) => Some(running),
         Err(LiveControlError::NoServer) => None,

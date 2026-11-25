@@ -256,17 +256,18 @@ impl Manager {
         now: OffsetDateTime,
     ) -> Option<i64> {
         let now_ms = odt_to_ms(now);
-        account
-            .quota
-            .codex
-            .refusal_reset
-            .map(odt_to_ms)
-            .or_else(|| {
+        // A deadline the refusal named and that has passed promises nothing; only a refusal
+        // that named none falls back to its window and its hold.
+        match account.quota.codex_refusal_deadline(now) {
+            crate::quota::RefusalDeadline::Ahead(reset) => Some(odt_to_ms(reset)),
+            crate::quota::RefusalDeadline::Passed => None,
+            crate::quota::RefusalDeadline::Unnamed => {
                 Self::rejected_codex_window(account, threshold, now)
                     .map(|(_, reset)| odt_to_ms(reset))
-            })
-            .or(account.rate_limited_until_ms)
-            .filter(|&at| at > now_ms)
+                    .or(account.rate_limited_until_ms)
+            }
+        }
+        .filter(|&at| at > now_ms)
     }
 
     /// The window that is holding a `rejected` CODEX account out, and when it rolls: among its

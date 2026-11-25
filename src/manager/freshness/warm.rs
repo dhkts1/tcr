@@ -122,7 +122,7 @@ impl Manager {
                         || a.quota_known
                         || a.consecutive_probe_failures >= PROBE_FAILURES_BEFORE_WARMING_UNPROBED)
                     // A live future 5h reset means the session window is already running.
-                    && a.quota.five_hour.and_then(|w| w.live_reset(now)).is_none()
+                    && a.quota.live_reset(crate::quota::QuotaBucket::FiveHour, now).is_none()
                     // A plan with no 5h window has nothing to start; a warm would only spend weekly quota.
                     && !a.quota.five_hour_absent_on_plan
                     // Warming an at/over-threshold account is wasted spend.
@@ -295,6 +295,25 @@ impl Manager {
             self.warm_account(idx).await;
             if i < last {
                 tokio::time::sleep(crate::probe::PROBE_SPACING).await;
+            }
+        }
+    }
+
+    /// The keep-warm loop's wait: sleep `wait`, or wake early on the `warm_wake`
+    /// signal and run the one-shot [`Self::warm_all`] sweep. `true` means the
+    /// sweep ran, so the caller re-draws every phase. The wake lets the first
+    /// sweep after boot happen as soon as the probe has read some quota rather
+    /// than a full `warmupSeconds` later; see the field docs on [`Manager`] for
+    /// why a lost wake is impossible here.
+    ///
+    /// The sweep runs AFTER the race is decided, never inside it: once the wake
+    /// wins, the sleep cannot cancel a sweep halfway through.
+    pub async fn sleep_or_warm_on_wake(&self, wait: std::time::Duration) -> bool {
+        tokio::select! {
+            () = tokio::time::sleep(wait) => false,
+            () = self.warm_wake.notified() => {
+                self.warm_all().await;
+                true
             }
         }
     }

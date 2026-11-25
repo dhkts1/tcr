@@ -117,7 +117,7 @@ pub async fn fetch_usage(
         retry_after_secs: None,
     })?;
     let status = response.status().as_u16();
-    let retry_after_secs = crate::proxy::parse_retry_after(response.headers())
+    let retry_after_secs = crate::http_client::parse_retry_after(response.headers())
         .and_then(|seconds| u64::try_from(seconds).ok());
     let body = response.bytes().await.map_err(|e| ProbeError {
         status: Some(status),

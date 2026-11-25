@@ -143,6 +143,7 @@ use crate::pricing::{PricingTable, cost_nanos};
 use crate::provider::Provider;
 
 mod day_files;
+pub(crate) mod demand_history;
 mod writer;
 
 pub(crate) use day_files::{
@@ -607,7 +608,7 @@ pub struct UsageTracker {
     /// shared, so records never wait on each other here; a rebuild holds it
     /// exclusively, so no record is half done while it flushes and replays.
     rebuild_gate: RwLock<()>,
-    forecast_history: Mutex<crate::forecast::History>,
+    forecast_history: Mutex<demand_history::History>,
 }
 
 impl UsageTracker {
@@ -625,7 +626,7 @@ impl UsageTracker {
             dropped: Arc::new(AtomicU64::new(0)),
             dir: Mutex::new(None),
             rebuild_gate: RwLock::new(()),
-            forecast_history: Mutex::new(crate::forecast::History::default()),
+            forecast_history: Mutex::new(demand_history::History::default()),
         }
     }
 
@@ -945,7 +946,7 @@ impl UsageTracker {
             .record(record);
     }
 
-    pub(crate) fn forecast_estimates(&self, now_ms: i64) -> Vec<crate::forecast::ProviderEstimate> {
+    pub(crate) fn forecast_estimates(&self, now_ms: i64) -> Vec<demand_history::ProviderEstimate> {
         let mut history = self
             .forecast_history
             .lock()
@@ -989,7 +990,7 @@ impl UsageTracker {
         let holds_codex = holds_codex(accounts);
         // The one time the 29-day forecast history is read. A handoff rebuild never
         // re-reads it: `record` has fed the history ever since.
-        let mut history = crate::forecast::History::new(now_ms);
+        let mut history = demand_history::History::new(now_ms);
         self.replay_window(&dir, accounts, now_ms, &mut report, Some(&mut history));
         *self
             .forecast_history
@@ -1145,7 +1146,7 @@ impl UsageTracker {
         accounts: &[LedgerAccount],
         now_ms: i64,
         report: &mut ReplayReport,
-        mut history: Option<&mut crate::forecast::History>,
+        mut history: Option<&mut demand_history::History>,
     ) {
         let days_back: i64 = if holds_codex(accounts) { 7 } else { 1 };
         let oldest_back = if history.is_some() { 28 } else { days_back };

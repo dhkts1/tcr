@@ -218,7 +218,10 @@ impl Manager {
             if !self.pool_candidate(PoolPass::FableLastResort, idx, account, ask) {
                 continue;
             }
-            let seven_day_oi = account.quota.seven_day_oi.map_or(0.0, |w| w.effective(now));
+            let seven_day_oi = account
+                .quota
+                .effective(crate::quota::QuotaBucket::SevenDayOi, now)
+                .unwrap_or(0.0);
             let oi_bucket = (seven_day_oi.max(0.0) * 1_000_000.0) as u64;
             let reset = account
                 .quota

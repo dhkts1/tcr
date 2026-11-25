@@ -19,7 +19,6 @@ use super::admission::{
 use super::gate::{
     RequestDedup, handoff_is_permitted, peer_stream_gate_hop, peer_stream_gate_rows,
 };
-use super::hello::{NodeFacts, hello_for_peer};
 use super::knock::{KnockClock, record_pairing_key, serve_knock};
 use super::pairing::{AcceptedSession, accept_pairing_or_return};
 use super::scope::{InternetAdmission, admission_for_this_host};
@@ -27,6 +26,7 @@ use super::{
     ConnectionFailure, HANDSHAKE_TIMEOUT, SessionContext, now_ms, on_blocking_thread,
     outstanding_secrets,
 };
+use crate::peer::serve::{NodeFacts, hello_for_peer};
 
 /// Handshake, gate, and then serve one stream until it closes.
 ///
@@ -40,7 +40,7 @@ use super::{
 ///    [`crate::peer::noise::MAX_MESSAGE_1_BYTES`] **before the allocation**;
 /// 4. which pattern it is, decided by length in one place
 ///    ([`Handshake::from_message_1_len`]);
-/// 5. the internet gate ([`internet_admission`]), which is the only check
+/// 5. the internet gate ([`internet_admission`](crate::peer::listener::internet_admission)), which is the only check
 ///    here that reads the SOURCE address: a knock or a first pairing from
 ///    outside LAN scope, arriving on a listener bound to a globally routable
 ///    address, ends here, whatever `peer.internet` says;
@@ -217,7 +217,7 @@ where
             &addr,
             pattern,
             &message_1,
-            &file.peers,
+            &file.pinned_ids(),
             &psks,
             &peer_state,
             now,
@@ -291,7 +291,7 @@ where
 /// its own logging, which is why the loop still calls [`serve_connection`]
 /// directly.
 ///
-/// `bind` is the socket [`internet_admission`] gates on, the same way the
+/// `bind` is the socket [`internet_admission`](crate::peer::listener::internet_admission) gates on, the same way the
 /// accept loop reads it off the real `TcpListener`: a caller here can name
 /// `0.0.0.0:7755` without actually binding it, which is how the globally
 /// routable case is exercised without opening a socket this box does not own.
@@ -318,7 +318,7 @@ where
 /// standard shape for recursive async and the only reason this function is not
 /// one line at the call site.
 fn serve_punched(
-    stream: serve::PeerStream,
+    stream: noise::PeerStream,
     context: SessionContext,
     from: SocketAddr,
     bind: SocketAddr,
@@ -554,7 +554,7 @@ where
     // connection opens the file once (the review's L2).
     store.reload_if_changed();
     let file = store.file();
-    let row = file.peers.iter().find(|row| row.node == session.peer);
+    let row = file.row(&session.peer);
     peer_stream_gate_rows(&header, row).map_err(anyhow::Error::new)?;
     peer_stream_gate_hop(&context.node, &header, &mut dedup, now_ms())
         .map_err(anyhow::Error::new)?;
@@ -795,7 +795,7 @@ where
     .await?;
 
     let mut facts = NodeFacts::listening(context.node, store.file().listen);
-    facts.briefs = crate::peer::discovery::neighbor_briefs(&store.file().peers, session.peer);
+    facts.briefs = store.file().neighbor_briefs(session.peer);
     let hello = hello_for_peer(&facts, &row.allow.control);
     let bytes = serde_json::to_vec(&Control::Hello(hello))
         .context("peer enrol: the acknowledging Hello did not serialize")?;
@@ -891,7 +891,7 @@ where
 
     store.reload_if_changed();
     let file = store.file();
-    let Some(row) = file.peers.iter().find(|row| row.node == session.peer) else {
+    let Some(row) = file.row(&session.peer) else {
         // Forgotten mid-session. The next frame closes the stream; this one
         // just does not renew, which IS the revoke.
         return Ok(());
@@ -918,7 +918,7 @@ where
             u64::try_from(now / 1_000).unwrap_or_default(),
             &|scope| {
                 serving.utilization.scope_restriction(scope)
-                    != serve::ScopeRestriction::Unenforceable
+                    != crate::peer::lease::ScopeRestriction::Unenforceable
             },
         ) else {
             continue;
@@ -1027,7 +1027,7 @@ where
         // not change (the review's L2).
         store.reload_if_changed();
         let file = store.file();
-        let Some(row) = file.peers.iter().find(|row| row.node == session.peer) else {
+        let Some(row) = file.row(&session.peer) else {
             bail!(
                 "peer control: this peer is no longer pinned; closing the live session \
                  (`tcr peer forget` takes effect within one frame)"
@@ -1123,7 +1123,7 @@ where
                 let written = on_blocking_thread({
                     let peers_path = context.peers_path.clone();
                     let peer = session.peer;
-                    let secret = crate::peer::reach::port_secret(&session.handshake_hash);
+                    let secret = noise::port_secret(&session.handshake_hash);
                     let briefs = incoming.briefs.clone();
                     move || {
                         Ok(HelloWrites {
@@ -1179,8 +1179,7 @@ where
                     ),
                 }
                 let mut facts = NodeFacts::listening(context.node, store.file().listen);
-                facts.briefs =
-                    crate::peer::discovery::neighbor_briefs(&store.file().peers, session.peer);
+                facts.briefs = store.file().neighbor_briefs(session.peer);
                 facts.observed_peer_at = origin.observed_socket();
                 if facts.observed_peer_at.is_none() {
                     tracing::debug!(

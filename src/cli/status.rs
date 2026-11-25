@@ -6,16 +6,15 @@ use std::sync::Arc;
 
 use time::OffsetDateTime;
 
-use super::live_client::{LiveStatusError, fetch_live_status};
 use super::render::{
-    StatusSource, account_status_rows_at, render_accounts, resolve_thresholds, snapshot_offline,
-    status_rows_json,
+    StatusSource, account_status_rows_at, render_accounts, snapshot_offline, status_rows_json,
 };
 use super::{
     import_claude_code_login_if_empty, load_config, load_config_with_creation, warn_if_no_accounts,
 };
 use crate::build_info::{self, BuildInfo};
 use crate::config::Config;
+use crate::live_client::{LiveStatusError, fetch_live_status};
 use crate::oauth::NoRefresh;
 use crate::probe::{LiveUsageProber, ProbeStatus};
 use crate::provider::Provider;
@@ -96,7 +95,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
     // Read-only verb: plain load, no clobber-warning (we never save).
     let (config, created) = load_config_with_creation(config_path)?;
     let config = import_claude_code_login_if_empty(config_path, config).await;
-    let first_empty_config = created && config.accounts.is_empty();
+    let first_empty_config = created && config.holds_no_accounts();
     warn_if_no_accounts(&config);
 
     // Read before the match: the offline arm CONSUMES `config`, and the route
@@ -119,7 +118,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
         fetch_live_status(&config).await
     };
     let holds_codex = status_holds_provider(&live_read, &config, Provider::Codex);
-    let ca = crate::mitm::minted_ca_path();
+    let ca = crate::tls::minted_ca_path();
     let ca_readable = ca.is_file();
     let codex_route = crate::codex_route::codex_route(
         live_read.as_ref(),
@@ -135,8 +134,8 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
     let (source, server_build, snapshot, thresholds, http1_only, control, group_colors) =
         match live_read {
             Ok(payload) => {
-                served_recently = Some(crate::doctor::requests_in_window(
-                    &payload,
+                served_recently = Some(payload.requests_in_window(
+                    Provider::Anthropic,
                     crate::doctor::REQUEST_WINDOW_MINUTES,
                 ));
                 let build = payload.build.clone();
@@ -164,7 +163,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                         config.proxy.port
                     );
                 }
-                let thresholds = resolve_thresholds(&config);
+                let thresholds = config.switch_thresholds();
                 // `config` is consumed by `snapshot_offline` below, so read
                 // `http1_only`/`control_account`/`group_colors` off it first —
                 // this is the config FILE's value, not a running server's
@@ -173,10 +172,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                 // way, so this is the same reading a live server would derive
                 // at boot.
                 let http1_only = config.http1_only;
-                let control = config
-                    .control_account
-                    .as_ref()
-                    .map(|c| c.name().to_string());
+                let control = config.control_account_name().map(str::to_string);
                 let group_colors = config.group_colors();
                 let prober = LiveUsageProber::new().with_codex_base(config.codex_upstream.clone());
                 let snapshot =
@@ -269,14 +265,13 @@ pub(super) fn status_holds_provider(
     config: &Config,
     provider: Provider,
 ) -> bool {
-    match live {
-        Ok(payload) if payload.mitm.is_some() => {
-            payload.accounts.iter().any(|row| row.provider == provider)
-        }
-        Ok(_) | Err(_) => config
-            .accounts
-            .iter()
-            .any(|account| account.provider == provider),
+    match live
+        .as_ref()
+        .ok()
+        .and_then(|payload| payload.current_accounts_of(provider))
+    {
+        Some(mut rows) => rows.next().is_some(),
+        None => config.holds_provider(provider),
     }
 }
 
@@ -495,10 +490,9 @@ pub async fn doctor(config_path: &Path, json: bool, codex_only: bool) -> anyhow:
     let config = load_config(config_path)?;
     let live = fetch_live_status(&config).await;
     let served_recently = match &live {
-        Ok(payload) => Some(crate::doctor::requests_in_window(
-            payload,
-            crate::doctor::REQUEST_WINDOW_MINUTES,
-        )),
+        Ok(payload) => Some(
+            payload.requests_in_window(Provider::Anthropic, crate::doctor::REQUEST_WINDOW_MINUTES),
+        ),
         Err(LiveStatusError::NoServer) => None,
         Err(reason) => {
             eprintln!(

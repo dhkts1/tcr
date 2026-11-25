@@ -110,35 +110,37 @@ pub(super) fn stamp_credential_version(
     }
 }
 
-/// `config` with every Codex account's `credentialVersion` stamped (see
-/// [`stamp_credential_version`]), for the two writers that serialize the whole
-/// snapshot, [`save`] and [`save_settings`]. Borrowed unchanged when no Codex
-/// account needs a stamp, which is every Anthropic-only config: an Anthropic row
-/// written from memory keeps whatever its `extra` held, as before.
-///
-/// The merge writers stamp the rows they touch; these two serialize accounts
-/// straight from memory, where a Codex row can carry no version at all — one the
-/// server added live through `POST /_tcr/accounts`, or the single row of a
-/// first login's fresh file. Unstamped, that row reaches disk in a shape every
-/// older proxy loads as a Claude account: through the server's whole-file
-/// fallback ([`save_tokens_for`] on a file it cannot read), or a first import.
-pub(super) fn with_codex_credential_versions(config: &Config) -> std::borrow::Cow<'_, Config> {
-    let quarantined =
-        |account: &Account| credential_version_for(account.provider) > CREDENTIAL_VERSION;
-    if !config.accounts.iter().any(|account| {
-        quarantined(account) && needs_credential_stamp(&account.extra, account.provider)
-    }) {
-        return std::borrow::Cow::Borrowed(config);
+impl Config {
+    /// This config with every Codex account's `credentialVersion` stamped (see
+    /// [`stamp_credential_version`]), for the two writers that serialize the whole
+    /// snapshot, [`save`] and [`save_settings`]. Borrowed unchanged when no Codex
+    /// account needs a stamp, which is every Anthropic-only config: an Anthropic row
+    /// written from memory keeps whatever its `extra` held, as before.
+    ///
+    /// The merge writers stamp the rows they touch; these two serialize accounts
+    /// straight from memory, where a Codex row can carry no version at all — one the
+    /// server added live through `POST /_tcr/accounts`, or the single row of a
+    /// first login's fresh file. Unstamped, that row reaches disk in a shape every
+    /// older proxy loads as a Claude account: through the server's whole-file
+    /// fallback ([`save_tokens_for`] on a file it cannot read), or a first import.
+    pub(super) fn with_codex_credential_versions(&self) -> std::borrow::Cow<'_, Self> {
+        let quarantined =
+            |account: &Account| credential_version_for(account.provider) > CREDENTIAL_VERSION;
+        if !self.accounts.iter().any(|account| {
+            quarantined(account) && needs_credential_stamp(&account.extra, account.provider)
+        }) {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut stamped = self.clone();
+        for account in stamped
+            .accounts
+            .iter_mut()
+            .filter(|account| quarantined(account))
+        {
+            stamp_credential_version(&mut account.extra, account.provider);
+        }
+        std::borrow::Cow::Owned(stamped)
     }
-    let mut stamped = config.clone();
-    for account in stamped
-        .accounts
-        .iter_mut()
-        .filter(|account| quarantined(account))
-    {
-        stamp_credential_version(&mut account.extra, account.provider);
-    }
-    std::borrow::Cow::Owned(stamped)
 }
 
 #[cfg(test)]

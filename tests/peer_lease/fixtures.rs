@@ -22,17 +22,17 @@ pub(super) const REQUEST: u128 = 0x2222_2222_2222_2222_2222_2222_2222_2222;
 /// premise those tests share.
 pub(super) struct AnyScope;
 
-impl serve::WindowUtilization for AnyScope {
+impl lease::WindowUtilization for AnyScope {
     fn read(&self, _window: Window) -> Vec<Option<f64>> {
         Vec::new()
     }
 
-    fn scope_restriction(&self, scope: &tcr_peer_wire::LendScope) -> serve::ScopeRestriction {
+    fn scope_restriction(&self, scope: &tcr_peer_wire::LendScope) -> lease::ScopeRestriction {
         match scope {
-            tcr_peer_wire::LendScope::All => serve::ScopeRestriction::Unrestricted,
-            tcr_peer_wire::LendScope::Group(name) => serve::ScopeRestriction::Group(name.clone()),
+            tcr_peer_wire::LendScope::All => lease::ScopeRestriction::Unrestricted,
+            tcr_peer_wire::LendScope::Group(name) => lease::ScopeRestriction::Group(name.clone()),
             tcr_peer_wire::LendScope::Accounts(labels) => {
-                serve::ScopeRestriction::Accounts(labels.clone())
+                lease::ScopeRestriction::Accounts(labels.clone())
             }
         }
     }
@@ -518,17 +518,17 @@ pub(super) async fn hostile_serve(
         hops_remaining: 1,
         request_id: request.request_id,
     };
-    serve::send_control(&mut stream, &mut session, &header)
+    tcr::peer::noise::send_control(&mut stream, &mut session, &header)
         .await
         .expect("the header is written");
-    serve::send_control(&mut stream, &mut session, &request)
+    tcr::peer::noise::send_control(&mut stream, &mut session, &request)
         .await
         .expect("the frame is written");
     // THE ACK, read exactly where a borrower reads it. A refusal here is a
     // refusal before the body, so it is reported in the same word the caller
     // already reads; a lender that closed the stream instead answers `Err`,
     // which is what every `bail!` in `handle_serve_on` does.
-    let ack: serve::ServeAck = serve::recv_control(&mut stream, &mut session).await?;
+    let ack: serve::ServeAck = tcr::peer::noise::recv_control(&mut stream, &mut session).await?;
     if let serve::ServeAck::Refused { refusal } = ack {
         return Ok(serve::ServeReply::Refused { refusal });
     }
@@ -542,7 +542,7 @@ pub(super) async fn hostile_serve(
         .await
         .expect("the body terminator is written");
 
-    serve::recv_control(&mut stream, &mut session).await
+    tcr::peer::noise::recv_control(&mut stream, &mut session).await
 }
 
 /// Write a peers file BY HAND, at mode 0600, so a test can assert what a shape
@@ -583,7 +583,8 @@ pub(super) fn assert_the_list_shape_reads(dir: &Path, node: &str) {
         ),
     );
     let file = tcr::peer::config::read_or_default(&path).expect("the list shape reads");
-    assert_eq!(file.peers[0].lend.len(), 2);
+    let id = PeerId::parse(node).expect("the fixture node is a wire id");
+    assert_eq!(file.row(&id).expect("the one row").lend.len(), 2);
 }
 
 /// The built `tcr` with its `HOME` the directory holding `file`, so every call on one fixture

@@ -178,7 +178,7 @@ impl<F: DeviceFactory> Supervisor<F> {
     }
 
     /// Publish the running device's dialler in `slot` (the server passes
-    /// [`server_slot`]), so the process's peer dials and the CLI's dial route
+    /// [`server_slot`](crate::peer::tailnet_node::server_slot)), so the process's peer dials and the CLI's dial route
     /// reach the tailnet through it.
     pub fn with_dial_slot(mut self, slot: DialSlot) -> Self {
         self.dial_slot = Some(slot);
@@ -335,7 +335,7 @@ impl<F: DeviceFactory> Supervisor<F> {
         // is not the same fact as the mode being off, so whatever runs is
         // left as it is until the next wake.
         let mode = match crate::peer::config::read_or_default(&self.paths.peers) {
-            Ok(file) => file.tailnet.effective(),
+            Ok(file) => file.tailnet_mode(),
             Err(err) => {
                 tracing::warn!(
                     path = %self.paths.peers.display(),
@@ -664,7 +664,7 @@ impl<F: DeviceFactory> Supervisor<F> {
     }
 
     /// Record a failure and back off: `first` for the first failure in a
-    /// row, doubling to [`RETRY_CAP`].
+    /// row, doubling to [`RETRY_CAP`](crate::peer::tailnet_node::RETRY_CAP).
     fn fail(&mut self, first: Duration, state: TailnetState, detail: String, now_ms: i64) {
         self.failures = self.failures.saturating_add(1);
         let wait = retry_wait(first, self.failures);

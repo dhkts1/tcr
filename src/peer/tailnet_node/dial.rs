@@ -28,14 +28,14 @@ pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 pub type DialFn = Arc<
     dyn Fn(
             SocketAddr,
-        ) -> Pin<Box<dyn Future<Output = Result<crate::peer::serve::PeerStream>> + Send>>
+        ) -> Pin<Box<dyn Future<Output = Result<crate::peer::noise::PeerStream>> + Send>>
         + Send
         + Sync,
 >;
 
 /// Where a running node's dialler is published for the rest of the process.
 ///
-/// Set by the [`Supervisor`] when a device is on the tailnet and cleared
+/// Set by the [`Supervisor`](crate::peer::tailnet_node::Supervisor) when a device is on the tailnet and cleared
 /// before it is shut down. The dialler holds the device weakly, so a
 /// published dialler never keeps a device alive past its shutdown.
 #[derive(Clone, Default)]
@@ -83,13 +83,13 @@ impl DialSlot {
 }
 
 /// The socket this process's node listens on, for the `Hello`
-/// (`crate::peer::listener::NodeFacts::listening`): `None` when this process
+/// (`crate::peer::serve::NodeFacts::listening`): `None` when this process
 /// runs no node.
 pub fn advertised_listen() -> Option<SocketAddr> {
     server_slot().listen()
 }
 
-/// The serving process's slot: the one [`run_in_server`] hands its
+/// The serving process's slot: the one [`run_in_server`](crate::peer::listener::run_in_server) hands its
 /// supervisor, and the one [`dial_through_node`] reads.
 pub fn server_slot() -> &'static DialSlot {
     static SLOT: std::sync::OnceLock<DialSlot> = std::sync::OnceLock::new();
@@ -100,8 +100,8 @@ pub fn server_slot() -> &'static DialSlot {
 /// `fd7a:115c:a1e0::/48`, the ranges Tailscale numbers a tailnet out of.
 pub fn is_tailnet_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => crate::peer::listener::is_carrier_grade_nat(v4),
-        IpAddr::V6(v6) => crate::peer::listener::is_tailscale_v6(v6),
+        IpAddr::V4(v4) => crate::peer::reach::is_carrier_grade_nat(v4),
+        IpAddr::V6(v6) => crate::peer::reach::is_tailscale_v6(v6),
     }
 }
 
@@ -180,7 +180,7 @@ pub(super) fn dialler<D: TailnetDevice>(
                 inner: stream,
                 _live: live.enter(addr.ip()),
             };
-            Ok(Box::new(counted) as crate::peer::serve::PeerStream)
+            Ok(Box::new(counted) as crate::peer::noise::PeerStream)
         })
     })
 }
@@ -195,7 +195,7 @@ pub(super) fn dialler<D: TailnetDevice>(
 pub async fn dial_through_node(
     addr: SocketAddr,
     within: Duration,
-) -> Option<Result<crate::peer::serve::PeerStream>> {
+) -> Option<Result<crate::peer::noise::PeerStream>> {
     dial_in_slot(server_slot(), addr, within).await
 }
 
@@ -204,7 +204,7 @@ pub async fn dial_in_slot(
     slot: &DialSlot,
     addr: SocketAddr,
     within: Duration,
-) -> Option<Result<crate::peer::serve::PeerStream>> {
+) -> Option<Result<crate::peer::noise::PeerStream>> {
     if !is_tailnet_ip(addr.ip()) {
         return None;
     }
@@ -232,12 +232,8 @@ pub fn allowed_dial_ports(file: &crate::peer::config::PeerFile) -> std::collecti
     if let Some(listen) = file.listen {
         ports.insert(listen.port());
     }
-    for row in &file.peers {
-        for endpoint in &row.endpoints {
-            if let Some(addr) = endpoint.direct_addr() {
-                ports.insert(addr.port());
-            }
-        }
+    for addr in file.direct_addrs() {
+        ports.insert(addr.port());
     }
     ports
 }
@@ -254,7 +250,7 @@ pub enum RouteDial {
     /// The dial was tried and failed.
     Failed(anyhow::Error),
     /// The stream to the target.
-    Dialled(crate::peer::serve::PeerStream),
+    Dialled(crate::peer::noise::PeerStream),
 }
 
 /// The dial route's dial: through this process's node, to a tailnet address
@@ -443,19 +439,16 @@ pub async fn dial_through_server(
 pub async fn dial_for_cli(
     peers_path: &Path,
     addr: SocketAddr,
-) -> Result<crate::peer::serve::PeerStream> {
+) -> Result<crate::peer::noise::PeerStream> {
     if is_tailnet_ip(addr.ip())
-        && crate::peer::config::read_or_default(peers_path)?
-            .tailnet
-            .effective()
-            == TailnetMode::Node
+        && crate::peer::config::read_or_default(peers_path)?.tailnet_mode() == TailnetMode::Node
     {
         let config_path = crate::config::default_path();
         let config = crate::config::load(&config_path)
             .with_context(|| format!("reading {}", config_path.display()))?;
         let stream = dial_through_server(
             config.proxy.port,
-            config.proxy.api_key.as_deref(),
+            config.loopback_api_key(),
             addr,
             DIAL_TIMEOUT,
         )

@@ -251,8 +251,8 @@ pub enum MappingStep {
 /// Named here rather than written at each call site so `tcr peer reach` and the
 /// mapping keeper cannot end up searching two different ways and reporting two
 /// different answers about one router.
-pub const fn upnp_discoverer() -> crate::peer::reach_upnp::Discoverer {
-    crate::peer::reach_upnp::Discoverer::multicast()
+pub const fn upnp_discoverer() -> upnp::Discoverer {
+    upnp::Discoverer::multicast()
 }
 
 /// What a UPnP mapping this node asked for is called in a router's own table.
@@ -267,7 +267,7 @@ const UPNP_MAPPING_DESCRIPTION: &str = "tcr peer internet (upnp)";
 /// A process-local register rather than a parameter, and the reason is the
 /// shape of the two sides: the keeper runs on its own thread for the life of
 /// the listener, and `Hello.addrs` is assembled per connection in
-/// `crate::peer::listener::NodeFacts::listening`, three call sites away with
+/// `crate::peer::serve::NodeFacts::listening`, three call sites away with
 /// no channel between them. Threading it through would put an
 /// `Option<SocketAddr>` in every signature between the accept loop and the
 /// handshake, which is a wider change than the fact deserves.
@@ -372,17 +372,12 @@ pub fn recorded_external_socket(
 /// The label says which protocol answered, because a router that answers
 /// only one of the two is exactly the case an operator runs this verb to
 /// find out about.
-pub fn external_address_report(
-    client: &NatPmp,
-    discoverer: &crate::peer::reach_upnp::Discoverer,
-) -> String {
+pub fn external_address_report(client: &NatPmp, discoverer: &upnp::Discoverer) -> String {
     let nat_pmp_err = match client.external_address() {
         Ok(found) => return format!("{} (nat-pmp)", found.addr),
         Err(err) => err,
     };
-    match crate::peer::reach_upnp::UpnpClient::discover(discoverer)
-        .and_then(|upnp| upnp.get_external_address())
-    {
+    match upnp::UpnpClient::discover(discoverer).and_then(|upnp| upnp.get_external_address()) {
         Ok(addr) => format!("{addr} (upnp)"),
         Err(upnp_err) => format!("unavailable: {nat_pmp_err} (nat-pmp), {upnp_err} (upnp)"),
     }
@@ -447,14 +442,14 @@ pub struct MappingKeeper {
     /// Injected rather than built here so the suite can point it at a fake on
     /// loopback: the alternative is a multicast search in a test, which is the
     /// one thing this whole module is arranged to avoid.
-    upnp: Option<crate::peer::reach_upnp::Discoverer>,
+    upnp: Option<upnp::Discoverer>,
     /// The UPnP client that granted the held mapping, kept for the renewal and
     /// the delete.
     ///
     /// Held rather than rediscovered, because a second search could land on a
     /// different device and then the renewal would extend a mapping on one
     /// router while the delete took one away on another.
-    upnp_client: Option<crate::peer::reach_upnp::UpnpClient>,
+    upnp_client: Option<upnp::UpnpClient>,
 }
 
 /// Which protocol granted the mapping a [`MappingKeeper`] holds.
@@ -503,7 +498,7 @@ impl MappingKeeper {
     /// or refuses the packet outright, is one that may not speak NAT-PMP at
     /// all, which is the case UPnP exists for here.
     #[must_use]
-    pub const fn with_upnp(mut self, discoverer: crate::peer::reach_upnp::Discoverer) -> Self {
+    pub const fn with_upnp(mut self, discoverer: upnp::Discoverer) -> Self {
         self.upnp = Some(discoverer);
         self
     }
@@ -541,13 +536,13 @@ impl MappingKeeper {
     /// about, and record the external address it names.
     ///
     /// Every refusal keeps its own name on the way out
-    /// ([`crate::peer::reach_upnp::UpnpError`] is `Display`), because the three
+    /// ([`upnp::UpnpError`] is `Display`), because the three
     /// this client invents rather than reads off the wire,
     /// `UntrustedLocation`, `ControlUrlElsewhere` and `Redirected`, are the
     /// ones an operator cannot diagnose from "no mapping": each says a device
     /// answered and was refused BY THIS NODE, and for a reason worth reading.
     fn map_over_upnp(&mut self) -> Result<Mapping, ReachError> {
-        use crate::peer::reach_upnp::UpnpClient;
+        use upnp::UpnpClient;
 
         let discoverer = self
             .upnp
@@ -561,10 +556,8 @@ impl MappingKeeper {
         // `Redirected` included, because each of those says a device answered
         // and THIS NODE refused it.
         let gateway = discoverer.destination();
-        let named = move |err: crate::peer::reach_upnp::UpnpError| match err {
-            crate::peer::reach_upnp::UpnpError::Silent { .. } => {
-                ReachError::Silent { gateway, tries: 1 }
-            }
+        let named = move |err: upnp::UpnpError| match err {
+            upnp::UpnpError::Silent { .. } => ReachError::Silent { gateway, tries: 1 },
             other => ReachError::Malformed(other.to_string()),
         };
 
@@ -702,6 +695,23 @@ impl MappingKeeper {
         Ok(Some(confirmed))
     }
 
+    /// [`Self::delete`] as a keeper's last act, then the steps it took.
+    ///
+    /// A delete the router does not confirm is logged and not returned: the
+    /// mapping expires on its own within the lifetime it was granted, and the
+    /// caller is shutting the keeper down either way.
+    fn finish(mut self) -> Vec<MappingStep> {
+        if let Err(err) = self.delete() {
+            tracing::warn!(
+                error = %err,
+                "peer internet: the router did not confirm the mapping was deleted; it expires \
+                 on its own within {}s",
+                self.lifetime_secs
+            );
+        }
+        self.steps
+    }
+
     /// Re-issue the UPnP `AddPortMapping` that granted the held mapping.
     ///
     /// Split out so [`Self::renew`] reads as the routing decision it is. The
@@ -710,7 +720,7 @@ impl MappingKeeper {
     /// (remote host, external port, protocol), and all three are unchanged.
     fn renew_over_upnp(
         &mut self,
-        client: &crate::peer::reach_upnp::UpnpClient,
+        client: &upnp::UpnpClient,
         held: Mapping,
     ) -> Result<Mapping, ReachError> {
         let internal = self.client.internal_address().map_err(|err| {
@@ -785,7 +795,7 @@ pub fn run_mapping(
 /// call unchanged and cannot accidentally acquire a multicast search.
 pub fn run_mapping_with_upnp(
     client: NatPmp,
-    upnp: Option<crate::peer::reach_upnp::Discoverer>,
+    upnp: Option<upnp::Discoverer>,
     internal_port: u16,
     lifetime_secs: u32,
     renew_every: Duration,
@@ -825,7 +835,7 @@ pub fn run_mapping_with_upnp(
 /// [`MAPPING_RENEW_INTERVAL`].
 pub fn run_mapping_while(
     client: NatPmp,
-    upnp: Option<crate::peer::reach_upnp::Discoverer>,
+    upnp: Option<upnp::Discoverer>,
     internal_port: u16,
     lifetime_secs: u32,
     renew_every: Duration,
@@ -893,14 +903,7 @@ pub fn run_mapping_while(
     // has been failing: leaving a mapping behind is a port on the router that
     // forwards to a listener this node has just stopped running.
     publish_external(None, None);
-    if let Err(err) = keeper.delete() {
-        tracing::warn!(
-            error = %err,
-            "peer internet: the router did not confirm the mapping was deleted; it expires \
-             on its own within {lifetime_secs}s"
-        );
-    }
-    Ok(keeper.steps().to_vec())
+    Ok(keeper.finish())
 }
 
 /// Sleep `wait` in [`MAPPING_STOP_POLL`] ticks, answering whether the full

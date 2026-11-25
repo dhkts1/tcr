@@ -120,8 +120,8 @@ impl ImportedAuth {
             return None;
         }
         match (
-            crate::codex_oauth::jwt_iat_ms(previous_access),
-            crate::codex_oauth::jwt_iat_ms(&self.login.access_token),
+            crate::oauth::codex::jwt_iat_ms(previous_access),
+            crate::oauth::codex::jwt_iat_ms(&self.login.access_token),
         ) {
             (Some(previous), Some(candidate)) if candidate < previous => return None,
             (Some(previous), Some(candidate)) if candidate > previous => {}
@@ -140,7 +140,7 @@ impl ImportedAuth {
                 .and_then(Value::as_str),
         ] {
             if token
-                .and_then(crate::codex_oauth::id_claims)
+                .and_then(crate::oauth::codex::id_claims)
                 .and_then(|claims| claims.chatgpt_account_id)
                 .is_some_and(|account| account != expected_account)
             {

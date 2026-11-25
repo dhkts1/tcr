@@ -446,12 +446,8 @@ pub async fn run(manager: Arc<Manager>, job: Job, cadence_secs: u64) {
             // `warmupSeconds`. A wake means the fleet's eligibility just changed
             // wholesale, so it runs the ONE-SHOT sweep and re-draws every phase.
             Job::Warm => {
-                tokio::select! {
-                    () = tokio::time::sleep(wait) => {}
-                    () = manager.warm_wake().notified() => {
-                        manager.warm_all().await;
-                        schedule.reschedule_all(crate::now_ms(), cadence_secs, &mut rng);
-                    }
+                if manager.sleep_or_warm_on_wake(wait).await {
+                    schedule.reschedule_all(crate::now_ms(), cadence_secs, &mut rng);
                 }
             }
         }

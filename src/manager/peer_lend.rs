@@ -221,10 +221,7 @@ impl Manager {
             .config
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .accounts
-            .iter()
-            .map(config::Account::egress_pin)
-            .collect();
+            .egress_pins();
         let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
         accounts
             .iter()
@@ -490,7 +487,7 @@ pub struct HandedCredential {
 /// Both reads of one relay therefore see the wall clock they happened at, which
 /// is what makes a window that reset between them read as a reset rather than
 /// as a rise.
-impl crate::peer::serve::WindowUtilization for Manager {
+impl crate::peer::lease::WindowUtilization for Manager {
     fn read(&self, window: tcr_peer_wire::Window) -> Vec<Option<f64>> {
         self.window_utilizations(window, OffsetDateTime::now_utc())
     }
@@ -605,8 +602,8 @@ impl crate::peer::serve::WindowUtilization for Manager {
     fn scope_restriction(
         &self,
         scope: &tcr_peer_wire::LendScope,
-    ) -> crate::peer::serve::ScopeRestriction {
-        use crate::peer::serve::ScopeRestriction;
+    ) -> crate::peer::lease::ScopeRestriction {
+        use crate::peer::lease::ScopeRestriction;
 
         match scope {
             tcr_peer_wire::LendScope::All => ScopeRestriction::Unrestricted,
@@ -925,7 +922,7 @@ mod tests {
     /// account's room.
     #[test]
     fn a_codex_account_lends_nothing() {
-        use crate::peer::serve::WindowUtilization as _;
+        use crate::peer::lease::WindowUtilization as _;
         let now = OffsetDateTime::now_utc();
 
         let mut codex = account("alice-fake");
@@ -1084,7 +1081,7 @@ mod tests {
     /// term: the reserved-and-spill arm then comes back unenforceable.
     #[test]
     fn a_scope_is_a_group_header_only_when_the_picker_would_hold_it() {
-        use crate::peer::serve::{ScopeRestriction, WindowUtilization as _};
+        use crate::peer::lease::{ScopeRestriction, WindowUtilization as _};
 
         // `work` has a member and no spill; `loose` has a member and spills;
         // `empty` has neither. No real email, no org uuid: this repo is public.
