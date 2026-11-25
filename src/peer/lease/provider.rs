@@ -5,8 +5,8 @@ use anyhow::{Context as _, Result};
 use tcr_peer_wire::{Control, Lease, LeaseRequest, PeerId, StreamHeader, StreamKind};
 
 use super::hand::read_handed_bearers;
+use crate::peer::config::id::random_id;
 use crate::peer::config::{PeerRow, PeerStore};
-use crate::peer::id::random_id;
 use crate::peer::tunnel::dial;
 
 /// Ask one lender for a lease, over a CONTROL stream.
@@ -41,8 +41,9 @@ pub async fn request_lease(
     let Some(mut stream) = dial::dial_peer_reaching(&row, store).await else {
         return Ok(None);
     };
-    let key = crate::peer::id::NodeKey::load_or_mint(&crate::peer::config::node_key_dir(store))
-        .context("peer lease: this node has no keypair to ask for a lease with")?;
+    let key =
+        crate::peer::config::id::NodeKey::load_or_mint(&crate::peer::config::node_key_dir(store))
+            .context("peer lease: this node has no keypair to ask for a lease with")?;
     let mut session = crate::peer::noise::dial_handshake(
         &mut stream,
         key.secret_bytes(),

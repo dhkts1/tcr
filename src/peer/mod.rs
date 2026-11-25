@@ -77,7 +77,7 @@
 //!
 //! # Phase order
 //!
-//! 1. wire crate and the node key: [`id`], `tcr_peer_wire`
+//! 1. wire crate and the node key: [`config::id`], `tcr_peer_wire`
 //! 2. Noise, enrolment, the pin check: [`noise`], [`listener`], [`pair`]
 //! 3. discovery: [`discovery`]
 //! 4. the lease and SERVE: [`lease`], [`serve`], `crate::fallback`
@@ -90,15 +90,12 @@
 //! marker that the phase filling it deleted, so that the workspace lint table's
 //! `todo` then held the file to the same standard as the rest of the tree.
 //!
-//! **All eleven are gone, which is what a filled phase looks like.** [`id`],
+//! **All eleven are gone, which is what a filled phase looks like.** [`config::id`],
 //! [`config`], [`noise`], [`listener`], [`pair`], [`discovery`], [`state`],
 //! [`lease`], [`serve`], [`tunnel`] and [`tunnel::egress`] carry no `todo!()` body any
 //! more. The last two outlived their stubs until the markers became
 //! `#[expect]`, which reported them unfulfilled: a suppression that outlives
 //! its reason is a suppression the next reader trusts.
-
-/// Phase 1: the node key, `tcr-node.key` in the config directory.
-pub mod id;
 
 /// Phase 1: operator intent on disk, `tcr-peers.json` in the config directory.
 pub mod config;
@@ -117,9 +114,6 @@ pub mod discovery;
 
 /// Phase 4: the lease ledger and the guard band.
 pub mod lease;
-
-/// Phase 4: when a lend grant is open for borrowing.
-pub mod schedule;
 
 /// Phase 4: the SERVE stream, both halves of it.
 pub mod serve;

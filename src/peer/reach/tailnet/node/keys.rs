@@ -16,11 +16,10 @@ pub fn key_path(config_dir: &Path) -> PathBuf {
 /// The key file that goes with a peers file: in the same directory, the way
 /// the server finds `tcr-node.key`.
 pub fn key_path_for_peers(peers_path: &Path) -> PathBuf {
-    key_path(
-        &peers_path
-            .parent()
-            .map_or_else(crate::peer::id::default_config_dir, Path::to_path_buf),
-    )
+    key_path(&peers_path.parent().map_or_else(
+        crate::peer::config::id::default_config_dir,
+        Path::to_path_buf,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -86,7 +85,7 @@ impl std::fmt::Debug for NodeKeyFile {
 /// Read the key file at `path`, or `None` when there is none.
 ///
 /// Refuses a file with a mode other than 0600, the rule `tcr-node.key` follows
-/// (`crate::peer::id::PRIVATE_KEY_MODE`): a wider mode means something other
+/// (`crate::peer::config::id::PRIVATE_KEY_MODE`): a wider mode means something other
 /// than tcr wrote it, and the file IS the node's identity on the tailnet.
 pub fn read_key_file(path: &Path) -> Result<Option<NodeKeyFile>> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -104,12 +103,12 @@ pub fn read_key_file(path: &Path) -> Result<Option<NodeKeyFile>> {
         );
     }
     let mode = meta.permissions().mode() & 0o777;
-    if mode != crate::peer::id::PRIVATE_KEY_MODE {
+    if mode != crate::peer::config::id::PRIVATE_KEY_MODE {
         bail!(
             "{} has mode {mode:o}, expected {:o}: refusing to trust a tailnet key file this \
              program did not write",
             path.display(),
-            crate::peer::id::PRIVATE_KEY_MODE
+            crate::peer::config::id::PRIVATE_KEY_MODE
         );
     }
     let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -128,7 +127,7 @@ pub fn write_key_file(path: &Path, file: &NodeKeyFile) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let bytes = serde_json::to_vec(file).context("serializing the tailnet key file")?;
-    crate::peer::id::write_key_file(path, &bytes, crate::peer::id::PRIVATE_KEY_MODE)
+    crate::peer::config::id::write_key_file(path, &bytes, crate::peer::config::id::PRIVATE_KEY_MODE)
 }
 
 /// Delete the key file at `path`. Reports whether there was one.

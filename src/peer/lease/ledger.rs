@@ -10,8 +10,8 @@ use super::{
     Granted, MIN_DEBIT, RelayRefusal, clamp_to_grant, fraction_budget, schedule_closes_at_ms,
     schedule_refusal, seconds_of,
 };
+use crate::peer::config::id::random_id;
 use crate::peer::config::{LendGrant, PeerStore};
-use crate::peer::id::random_id;
 
 /// How many served request ids are remembered, per connection in the listener, and, by
 /// [`SERVED_CAPACITY`], per process in the ledger.

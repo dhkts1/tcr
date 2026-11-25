@@ -163,10 +163,10 @@ pub(super) async fn boot_peer_listener(
     };
 
     let node_dir = peers_path.parent().map_or_else(
-        crate::peer::id::default_config_dir,
+        crate::peer::config::id::default_config_dir,
         std::path::Path::to_path_buf,
     );
-    let key = match crate::peer::id::NodeKey::load_or_mint(&node_dir) {
+    let key = match crate::peer::config::id::NodeKey::load_or_mint(&node_dir) {
         Ok(key) => key,
         Err(err) => {
             tracing::warn!(
@@ -268,7 +268,7 @@ pub(super) async fn boot_peer_listener(
         peers_file = %peers_path.display(),
         state_file = %state_path.display(),
         // The SAME per-boot instance id the beacon announces and every knock
-        // this node sends names: one `OnceLock` in `crate::peer::id`
+        // this node sends names: one `OnceLock` in `crate::peer::config::id`
         // (`boot_instance_id`), read by `SessionContext::new` here and by
         // `discovery::build_beacon_info` there. Logged so the two can be
         // compared in a log rather than taken on trust.
@@ -388,7 +388,7 @@ pub(super) async fn boot_peer_listener(
 /// shared daemon empty, and no serving process ever announced anything. The
 /// payload made it worse than a missing row. A beacon carries the announcing
 /// process's per-boot instance id
-/// ([`crate::peer::id::boot_instance_id`]), and the knock a neighbour sends
+/// ([`crate::peer::config::id::boot_instance_id`]), and the knock a neighbour sends
 /// after seeing it names the id it saw: announced from the CLI, that id
 /// belonged to a process that had already exited, so it could never match the
 /// server's own.
@@ -700,7 +700,7 @@ fn spawn_browse(
                     // containers share a host. The instance id is the only
                     // sound key for "this is my own beacon", over either
                     // source.
-                    let this_instance = crate::peer::id::boot_instance_id();
+                    let this_instance = crate::peer::config::id::boot_instance_id();
                     scan.retain(|row| row.instance_id != this_instance);
                     found.observe(scan, now_ms);
                     let rows: Vec<crate::peer::state::Found> = found
@@ -968,7 +968,7 @@ fn spawn_internet_keeper(
 /// for exactly that reason).
 fn spawn_reverse_carriers(
     peers_path: &std::path::Path,
-    key: &crate::peer::id::NodeKey,
+    key: &crate::peer::config::id::NodeKey,
     context: &crate::peer::listener::SessionContext,
     shutdown: &watch::Sender<bool>,
     background: &mut Vec<JoinHandle<()>>,

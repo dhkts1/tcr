@@ -64,13 +64,13 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use tcr_peer_wire::{Control, Enroll, PeerId, StreamHeader, StreamKind, sanitize_label};
 
+use crate::peer::config::id::KEY_BYTES;
+use crate::peer::config::id::{NodeKey, default_config_dir};
 use crate::peer::config::join_key::{JoinToken, KEY_PREFIX};
 use crate::peer::config::{
     ControlGrants, Endpoint, EndpointSource, PeerRow, PeerStore, PendingInvite, read_or_default,
     save,
 };
-use crate::peer::id::KEY_BYTES;
-use crate::peer::id::{NodeKey, default_config_dir};
 use crate::peer::noise::{self, Handshake};
 use crate::peer::serve::{NodeFacts, hello_for_peer};
 use crate::peer::state::now_ms;
@@ -209,7 +209,7 @@ pub fn mint_invite_as(
         );
     }
 
-    let secret = crate::peer::id::random_secret()?;
+    let secret = crate::peer::config::id::random_secret()?;
     let invite = PendingInvite {
         id: random_id()?,
         label,
@@ -624,7 +624,7 @@ pub async fn knock(store: &PeerStore, addr: SocketAddr, proposed_name: &str) -> 
     noise::send_knock(
         &mut stream,
         &tcr_peer_wire::Knock {
-            instance_id: crate::peer::id::boot_instance_id(),
+            instance_id: crate::peer::config::id::boot_instance_id(),
             proposed_name: name,
             wire_version: tcr_peer_wire::PROTO_VERSION,
             // This Mac's own listening port, so the Accept at the other end
@@ -755,7 +755,7 @@ impl PairEvent {
 pub async fn pair(store: &PeerStore, addr: SocketAddr) -> Result<PendingPair> {
     let node = NodeKey::load_or_mint(&default_config_dir())
         .context("peer pair: this node has no keypair to pair with")?;
-    let instance = crate::peer::id::boot_instance_id();
+    let instance = crate::peer::config::id::boot_instance_id();
     let deadline = std::time::Instant::now() + PAIR_WAIT;
 
     loop {
@@ -1030,7 +1030,7 @@ pub fn pairing_window(state_path: &Path, now_ms: i64) -> Result<PairingWindow> {
 /// enrolments from the same machine must not collide, and a counter would
 /// restart at the same value on every process.
 fn random_request_id() -> Result<u128> {
-    let bytes = crate::peer::id::random_secret()?;
+    let bytes = crate::peer::config::id::random_secret()?;
     let mut head = [0_u8; 16];
     head.copy_from_slice(&bytes[..16]);
     Ok(u128::from_be_bytes(head))
@@ -1039,7 +1039,7 @@ fn random_request_id() -> Result<u128> {
 /// A random invite id. Random rather than sequential so an id does not leak how
 /// many invites this node has ever minted.
 fn random_id() -> Result<u64> {
-    let bytes = crate::peer::id::random_secret()?;
+    let bytes = crate::peer::config::id::random_secret()?;
     let mut head = [0_u8; 8];
     head.copy_from_slice(&bytes[..8]);
     Ok(u64::from_be_bytes(head))

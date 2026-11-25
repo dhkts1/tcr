@@ -224,7 +224,7 @@ async fn a_pinned_request_leaves_through_its_peer_on_every_request() {
     // The requester's key is the one `pinned_egress` will mint in this scratch
     // directory, so the gateway has to pin THAT id rather than one the test
     // chose: minting it here first is what makes the two agree.
-    let requester = tcr::peer::id::NodeKey::load_or_mint(&dir)
+    let requester = tcr::peer::config::id::NodeKey::load_or_mint(&dir)
         .expect("mint this node's keypair in the scratch dir");
     let gateway = node();
 
@@ -358,7 +358,7 @@ async fn a_down_peer_refuses_by_name_when_the_account_is_strict() {
 async fn a_carry_that_was_taken_and_failed_is_not_sent_again_from_this_mac() {
     let dir = scratch("pinned-delivered");
     let peers = dir.join("tcr-peers.json");
-    let requester = tcr::peer::id::NodeKey::load_or_mint(&dir)
+    let requester = tcr::peer::config::id::NodeKey::load_or_mint(&dir)
         .expect("mint this node's keypair in the scratch dir");
     let gateway = node();
 
@@ -693,7 +693,7 @@ fn peer_egress_keeps_anthropic_hosts_and_never_carries_chatgpt() {
 async fn codex_pinned_account_is_never_carried() {
     let dir = scratch("pinned-codex");
     let peers = dir.join("tcr-peers.json");
-    let requester = tcr::peer::id::NodeKey::load_or_mint(&dir)
+    let requester = tcr::peer::config::id::NodeKey::load_or_mint(&dir)
         .expect("mint this node's keypair in the scratch dir");
     let gateway = node();
 

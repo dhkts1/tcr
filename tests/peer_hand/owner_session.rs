@@ -57,7 +57,7 @@ async fn owner_lending_expiring(
     expires_at_ms: i64,
 ) -> Owner {
     use tcr::peer::config::PeerStore;
-    use tcr::peer::id::NodeKey;
+    use tcr::peer::config::id::NodeKey;
     use tcr::peer::listener::{self, SessionContext};
     use tcr::peer::serve::LeaseServing;
 
@@ -201,7 +201,7 @@ struct HandBorrower {
 async fn hand_borrower(mode: &str) -> HandBorrower {
     let home = tempfile::tempdir().expect("the borrower's temp home");
     let borrower_peers = home.path().join("tcr-peers.json");
-    let borrower = tcr::peer::id::NodeKey::load_or_mint(home.path())
+    let borrower = tcr::peer::config::id::NodeKey::load_or_mint(home.path())
         .expect("the borrower's node key")
         .id();
     let owner = owner_serving(borrower, mode).await;
@@ -272,7 +272,7 @@ async fn ask_owner_for_a_lease(
         target: None,
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: tcr::peer::id::random_id().expect("a request id"),
+        request_id: tcr::peer::config::id::random_id().expect("a request id"),
     };
     tcr::peer::noise::send_control(&mut stream, &mut session, &header)
         .await

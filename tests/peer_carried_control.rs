@@ -29,7 +29,7 @@ use std::time::Duration;
 use tcr::log_err::LogErr as _;
 
 use crate::peer_support::DuplexTarget as Target;
-use tcr::peer::id::NodeKey;
+use tcr::peer::config::id::NodeKey;
 use tcr::peer::listener;
 use tcr::peer::noise::{self, Handshake};
 use tcr::peer::reach;

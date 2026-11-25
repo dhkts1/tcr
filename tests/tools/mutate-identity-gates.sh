@@ -37,7 +37,7 @@ mkdir -p "$BACKUP_DIR" "$LOG_DIR"
 FILES=(
   "src/peer/state.rs"
   "src/peer/pair.rs"
-  "src/peer/id.rs"
+  "src/peer/config/id.rs"
   "src/peer/config/mod.rs"
   "src/peer/config/join_key.rs"
   "src/peer/discovery.rs"

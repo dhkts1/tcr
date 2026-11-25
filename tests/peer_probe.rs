@@ -30,10 +30,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tcr::log_err::LogErr as _;
 
+use tcr::peer::config::id::NodeKey;
 use tcr::peer::config::{
     Allow, Endpoint, EndpointSource, Locator, PathPolicy, PathsConfig, PeerFile, PeerRow, PeerStore,
 };
-use tcr::peer::id::NodeKey;
 use tcr::peer::listener::{self, SessionContext};
 use tcr::peer::noise::{self, Handshake, PeerSession};
 use tcr::peer::reach::probe::{self, PathTable, ProbeOutcome, ProbeStop};

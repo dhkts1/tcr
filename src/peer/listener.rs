@@ -72,9 +72,9 @@ use tcr_peer_wire::{InstanceId, PeerId, StreamHeader, StreamKind};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 
+use crate::peer::config::id::KEY_BYTES;
+use crate::peer::config::id::NodeKey;
 use crate::peer::config::{PeerFile, PeerRow, PeerStore};
-use crate::peer::id::KEY_BYTES;
-use crate::peer::id::NodeKey;
 use crate::peer::lease::Ledger;
 use crate::peer::noise::{self, Handshake};
 use crate::peer::reach::is_lan_scope;
@@ -534,7 +534,7 @@ impl SessionContext {
             node: node.id(),
             peers_path: peers_path.to_path_buf(),
             state_path: state_path.to_path_buf(),
-            instance_id: crate::peer::id::boot_instance_id(),
+            instance_id: crate::peer::config::id::boot_instance_id(),
             admission: Arc::new(Mutex::new(Admission::new())),
             tunnels: Arc::new(Mutex::new(crate::peer::tunnel::TunnelBudget::new())),
             serving: None,
@@ -644,7 +644,7 @@ pub async fn park_one_carrier(friend: &PeerRow, context: &SessionContext) -> Res
         target: None,
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: crate::peer::id::random_id()
+        request_id: crate::peer::config::id::random_id()
             .context("peer reverse: no request id for the carrier")?,
     };
     let bytes =

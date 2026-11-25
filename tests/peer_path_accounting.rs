@@ -618,7 +618,7 @@ fn tokens_are_charged_only_when_the_unit_and_the_path_are_both_known() {
 /// charge deleted.
 ///
 /// The keeper's key is MINTED here rather than passed in, because the file
-/// format of a node key is `peer::id`'s business and a test that wrote one by
+/// format of a node key is `peer::config::id`'s business and a test that wrote one by
 /// hand would be a second spelling of it. The caller pins the returned id.
 async fn listener_on(
     key_dir: &std::path::Path,
@@ -626,7 +626,7 @@ async fn listener_on(
 ) -> (std::net::SocketAddr, PeerId) {
     let listening = loopback().await;
     let addr = listening.local_addr().expect("the listener address");
-    let key = tcr::peer::id::NodeKey::load_or_mint(key_dir).expect("a node key");
+    let key = config::id::NodeKey::load_or_mint(key_dir).expect("a node key");
     let id = key.id();
     let store = PeerStore::open(peers_path).expect("open the peers file");
     let context =

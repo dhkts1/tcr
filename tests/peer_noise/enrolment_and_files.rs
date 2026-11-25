@@ -578,8 +578,8 @@ fn peers_file_with_listener(path: &std::path::Path, listen: std::net::SocketAddr
 /// bug, seen from the joiner's side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
+    use tcr::peer::config::id::NodeKey;
     use tcr::peer::config::{self as peer_config, PeerStore};
-    use tcr::peer::id::NodeKey;
     use tcr::peer::listener::outstanding_secrets;
     use tcr_peer_wire::Control;
 
@@ -731,8 +731,8 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
 /// the operator minted for one machine.
 #[test]
 fn a_one_use_invite_refuses_its_second_joiner() {
+    use tcr::peer::config::id::NodeKey;
     use tcr::peer::config::{self as peer_config, PeerStore};
-    use tcr::peer::id::NodeKey;
     use tcr::peer::listener::outstanding_secrets;
     use tcr_peer_wire::Enroll;
 
@@ -789,8 +789,8 @@ fn a_one_use_invite_refuses_its_second_joiner() {
 /// to burn an operator's one-use key.
 #[test]
 fn a_hostile_enrolment_label_is_refused_and_spends_nothing() {
+    use tcr::peer::config::id::NodeKey;
     use tcr::peer::config::{self as peer_config, PeerStore};
-    use tcr::peer::id::NodeKey;
     use tcr_peer_wire::Enroll;
 
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -882,12 +882,12 @@ fn the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused() {
 fn a_planted_symlink_does_not_capture_the_node_key() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let captured = dir.path().join("captured.key");
-    let key_path = tcr::peer::id::private_key_path(dir.path());
+    let key_path = tcr::peer::config::id::private_key_path(dir.path());
     std::os::unix::fs::symlink(&captured, &key_path).expect("plant the link");
 
     // `NodeKey` has no `Debug` on purpose (it holds the secret), so the
     // refusal is read off the `Err` arm rather than through `expect_err`.
-    let refusal = match tcr::peer::id::NodeKey::load_or_mint(dir.path()) {
+    let refusal = match tcr::peer::config::id::NodeKey::load_or_mint(dir.path()) {
         Ok(_) => String::from("load_or_mint returned a key"),
         Err(err) => format!("{err:#}"),
     };
@@ -1097,8 +1097,8 @@ fn a_pin_takes_the_file_lock_and_an_enrolment_still_completes() {
     // not go through `pin_row`, so it still completes: the deadlock this
     // could have introduced.
     let joiner = PeerId([67_u8; 32]);
-    let node =
-        tcr::peer::id::NodeKey::load_or_mint(dir.path()).expect("a node key for the registrar");
+    let node = tcr::peer::config::id::NodeKey::load_or_mint(dir.path())
+        .expect("a node key for the registrar");
     let (invite, _token) = pair::mint_invite_as(&store, &node, "attic-nuc", 600, 1, None)
         .expect("an invite is minted");
     let row = pair::accept_enrolment(

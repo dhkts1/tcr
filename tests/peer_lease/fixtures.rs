@@ -204,10 +204,10 @@ pub(super) fn lease_pair(grant: LendGrant) -> LeasePair {
     let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
-    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::config::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::config::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
     write_peers(
@@ -323,7 +323,7 @@ pub(super) async fn spawn_lender_in_its_own_home(
 ) -> (tempfile::TempDir, PeerRow) {
     let home = tempfile::tempdir().expect("a lender's temp home");
     let peers = home.path().join("tcr-peers.json");
-    let id = tcr::peer::id::NodeKey::load_or_mint(home.path())
+    let id = tcr::peer::config::id::NodeKey::load_or_mint(home.path())
         .expect("the lender's key")
         .id();
     write_peers(&peers, vec![row]);
@@ -429,8 +429,8 @@ pub(super) fn borrower_credentials() -> HeaderMap {
 /// The temp dirs are carried in the struct because they must outlive the
 /// listener: dropping one deletes the lender's node key under a live socket.
 pub(super) struct HostilePair {
-    pub(super) lender_key: tcr::peer::id::NodeKey,
-    pub(super) borrower_key: tcr::peer::id::NodeKey,
+    pub(super) lender_key: tcr::peer::config::id::NodeKey,
+    pub(super) borrower_key: tcr::peer::config::id::NodeKey,
     pub(super) key_dir: PathBuf,
     pub(super) peers_path: PathBuf,
     pub(super) ledger: Arc<std::sync::Mutex<Ledger>>,
@@ -440,9 +440,9 @@ pub(super) struct HostilePair {
 pub(super) fn hostile_pair() -> HostilePair {
     let pair = lease_pair(LendGrant::new(Window::SevenDay, 0.50, 300, 5));
     // The keys `lease_pair` minted, loaded back from the homes it minted them in.
-    let lender_key =
-        tcr::peer::id::NodeKey::load_or_mint(pair.lender_home.path()).expect("the lender's key");
-    let borrower_key = tcr::peer::id::NodeKey::load_or_mint(pair.borrower_home.path())
+    let lender_key = tcr::peer::config::id::NodeKey::load_or_mint(pair.lender_home.path())
+        .expect("the lender's key");
+    let borrower_key = tcr::peer::config::id::NodeKey::load_or_mint(pair.borrower_home.path())
         .expect("the borrower's key");
     let ledger = shared_ledger(Some((live_lease(0.50, 5), pair.borrower_id)));
 
@@ -494,8 +494,8 @@ pub(super) fn hostile_request(method: &str, path: &str) -> serve::ServeRequest {
 /// whose frame should not have existed.
 pub(super) async fn hostile_serve(
     peer_addr: std::net::SocketAddr,
-    lender: &tcr::peer::id::NodeKey,
-    borrower: &tcr::peer::id::NodeKey,
+    lender: &tcr::peer::config::id::NodeKey,
+    borrower: &tcr::peer::config::id::NodeKey,
     request: serve::ServeRequest,
 ) -> anyhow::Result<serve::ServeReply> {
     let mut stream = tokio::net::TcpStream::connect(peer_addr)

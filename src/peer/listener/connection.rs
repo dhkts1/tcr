@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail};
 use tcr_peer_wire::{Control, PeerId, StreamHeader, StreamKind, TunnelTarget};
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::peer::config::id::KEY_BYTES;
 use crate::peer::config::{self as config, PeerStore};
-use crate::peer::id::KEY_BYTES;
 use crate::peer::noise::{self, Handshake, PeerSession};
 use crate::peer::serve;
 use crate::peer::state::knock_address;

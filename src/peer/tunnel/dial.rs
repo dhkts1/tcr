@@ -7,8 +7,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use tcr_peer_wire::{Control, PeerId, StreamHeader, StreamKind, TunnelTarget};
 
+use crate::peer::config::id::NodeKey;
 use crate::peer::config::{Endpoint, Locator, PeerRow, PeerStore};
-use crate::peer::id::NodeKey;
 use crate::peer::noise::{self, Handshake, NoiseStream, PeerStream, recv_control, send_control};
 
 use crate::peer::config::node_key_dir;
@@ -1060,7 +1060,7 @@ async fn ask_through_a_friend(
                 continue;
             }
         };
-        let request_id = match crate::peer::id::random_id() {
+        let request_id = match crate::peer::config::id::random_id() {
             Ok(id) => id,
             Err(err) => {
                 tracing::warn!(
@@ -1298,7 +1298,7 @@ pub const CLIENT_FORWARD_HOPS: u8 = 1;
 /// [`handle_forward_on`]: super::handle_forward_on
 pub async fn open_forward_to(
     forwarder: &PeerRow,
-    node_secret: &[u8; crate::peer::id::KEY_BYTES],
+    node_secret: &[u8; crate::peer::config::id::KEY_BYTES],
     target: &PeerId,
     via: &[PeerId],
     borrow_timeout_ms: u64,
@@ -1335,7 +1335,7 @@ pub async fn open_forward_to(
         target: Some(TunnelTarget::Peer { node: *target }),
         via: via.to_vec(),
         hops_remaining: CLIENT_FORWARD_HOPS,
-        request_id: crate::peer::id::random_id()?,
+        request_id: crate::peer::config::id::random_id()?,
     };
     let bytes = serde_json::to_vec(&header)
         .context("peer forward: the forwarding header did not serialize")?;

@@ -6,8 +6,8 @@ use tcr_peer_wire::{
     StreamHeader, StreamKind,
 };
 
+use crate::peer::config::id::NodeKey;
 use crate::peer::config::{ControlGrants, Locator, PeerStore};
-use crate::peer::id::NodeKey;
 use crate::peer::noise::{self, Handshake, recv_control, send_control};
 use crate::peer::reach::probe;
 
@@ -80,7 +80,7 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
         target: None,
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: crate::peer::id::random_id()?,
+        request_id: crate::peer::config::id::random_id()?,
     };
     send_control(&mut stream, &mut session, &header).await?;
 

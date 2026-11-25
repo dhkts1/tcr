@@ -454,7 +454,7 @@ async fn a_borrowed_request_is_served_on_the_lenders_account() {
     // the scrub's effect is visible.
     let capture_home = tempfile::tempdir().expect("the capturing lender's temp home");
     let capture_peers = capture_home.path().join("tcr-peers.json");
-    let capture_id = tcr::peer::id::NodeKey::load_or_mint(capture_home.path())
+    let capture_id = tcr::peer::config::id::NodeKey::load_or_mint(capture_home.path())
         .expect("the capturing lender's key")
         .id();
     write_peers(

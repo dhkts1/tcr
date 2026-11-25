@@ -98,9 +98,9 @@ use axum::response::IntoResponse as _;
 use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
 use tokio::net::TcpListener;
 
+use crate::peer::config::id::KEY_BYTES;
+use crate::peer::config::id::NodeKey;
 use crate::peer::config::{CARRY_SETUP_TIMEOUT, PeerFile, PeerRow, ViaSetting};
-use crate::peer::id::KEY_BYTES;
-use crate::peer::id::NodeKey;
 use crate::peer::noise::{self, Handshake, NoiseStream};
 use crate::peer::tunnel;
 use crate::peer::tunnel::PEER_EGRESS_PORT;
@@ -301,7 +301,7 @@ pub async fn accept_once_splice(
         }),
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: crate::peer::id::random_id()?,
+        request_id: crate::peer::config::id::random_id()?,
     };
     let bytes = serde_json::to_vec(&header).context("peer egress: the header did not serialize")?;
     noise::send_encrypted(&mut stream, &mut session.transport, &bytes)
@@ -1690,7 +1690,8 @@ fn last_seen_from_state(peers_path: &Path) -> Vec<(PeerId, i64)> {
 /// The same derivation `tcr peer id` uses, so a test pointing `--peers` at a
 /// temp directory points this at the same one.
 fn node_key_dir(peers_path: &Path) -> std::path::PathBuf {
-    peers_path
-        .parent()
-        .map_or_else(crate::peer::id::default_config_dir, Path::to_path_buf)
+    peers_path.parent().map_or_else(
+        crate::peer::config::id::default_config_dir,
+        Path::to_path_buf,
+    )
 }

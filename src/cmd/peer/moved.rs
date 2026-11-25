@@ -167,8 +167,8 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
 
     let config_dir = peers_path
         .parent()
-        .map_or_else(peer::id::default_config_dir, Path::to_path_buf);
-    let this = peer::id::NodeKey::load_or_mint(&config_dir)?.id();
+        .map_or_else(peer::config::id::default_config_dir, Path::to_path_buf);
+    let this = peer::config::id::NodeKey::load_or_mint(&config_dir)?.id();
 
     let record = peer::config::moved::MovedRecord {
         v: peer::config::moved::MOVED_VERSION,

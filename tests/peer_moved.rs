@@ -774,7 +774,7 @@ fn receiver_peers(dir: &std::path::Path, sender: &PeerId) -> std::path::PathBuf 
 /// The id `mint` minted for the Mac that moved, read off the public half it
 /// wrote beside the peers file.
 fn sender_id(dir: &std::path::Path) -> PeerId {
-    let raw = std::fs::read(tcr::peer::id::public_key_path(dir))
+    let raw = std::fs::read(tcr::peer::config::id::public_key_path(dir))
         .expect("mint wrote this Mac's public key beside the peers file");
     let bytes: [u8; 32] = raw
         .try_into()

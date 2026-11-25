@@ -487,8 +487,9 @@ fn tunnel_to_origin(host: &str, request_id: u128) -> StreamHeader {
 async fn real_gateway_pinning(
     dir: &std::path::Path,
     requester: &Node,
-) -> (tcr::peer::id::NodeKey, SocketAddr) {
-    let gateway_key = tcr::peer::id::NodeKey::load_or_mint(dir).expect("the gateway's node key");
+) -> (tcr::peer::config::id::NodeKey, SocketAddr) {
+    let gateway_key =
+        tcr::peer::config::id::NodeKey::load_or_mint(dir).expect("the gateway's node key");
     let peers = dir.join("tcr-peers.json");
     let mut file = PeerFile::default();
     file.pin(row(&requester.id, "requester", Vec::new(), true));

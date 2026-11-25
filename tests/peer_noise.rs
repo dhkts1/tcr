@@ -1268,7 +1268,7 @@ fn a_node_key_file_is_never_visible_before_its_bytes() {
 
     for _ in 0..MINTS {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let key_path = tcr::peer::id::private_key_path(dir.path());
+        let key_path = tcr::peer::config::id::private_key_path(dir.path());
         let start = Arc::new(std::sync::Barrier::new(2));
         let watcher_start = Arc::clone(&start);
         let watched = key_path.clone();
@@ -1286,7 +1286,7 @@ fn a_node_key_file_is_never_visible_before_its_bytes() {
         });
 
         start.wait();
-        tcr::peer::id::NodeKey::load_or_mint(dir.path()).expect("a keypair is minted");
+        tcr::peer::config::id::NodeKey::load_or_mint(dir.path()).expect("a keypair is minted");
         if let Some(first) = watcher.join().expect("the watching thread finishes") {
             sampled += 1;
             if first != 32 {
@@ -1321,7 +1321,7 @@ fn a_node_key_file_is_never_visible_before_its_bytes() {
 #[test]
 fn minting_leaves_only_the_two_key_files() {
     let dir = tempfile::tempdir().expect("a temp dir");
-    tcr::peer::id::NodeKey::load_or_mint(dir.path()).expect("a keypair is minted");
+    tcr::peer::config::id::NodeKey::load_or_mint(dir.path()).expect("a keypair is minted");
 
     let mut names: Vec<String> = std::fs::read_dir(dir.path())
         .expect("the config dir reads")

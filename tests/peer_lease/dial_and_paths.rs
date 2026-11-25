@@ -581,7 +581,7 @@ async fn a_relay_outside_the_grants_hours_is_refused_rather_than_served() {
     .collect();
     let mut closed_now = LendGrant::new(Window::SevenDay, 0.20, 300, 2);
     closed_now.days = Some(
-        tcr::peer::schedule::Days::try_from(every_other_day.join(","))
+        tcr::peer::config::schedule::Days::try_from(every_other_day.join(","))
             .expect("a day list this test built"),
     );
 

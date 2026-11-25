@@ -17,7 +17,7 @@ use anyhow::{Context as _, Result};
 /// - a duration: `30s`, `90m`, `2h`, `3d`, which is `--for`;
 /// - a wall clock: `18:00` or `18:00:30`, which is `--until`, resolved in the
 ///   OPERATOR's local offset (`UtcOffset::local_offset_at`, the same
-///   fallback-to-UTC pattern [`crate::peer::schedule::Schedule::contains`]
+///   fallback-to-UTC pattern [`crate::peer::config::schedule::Schedule::contains`]
 ///   uses, since the lookup refuses in a multithreaded process). A clock that
 ///   has already passed today is REFUSED, never rolled to tomorrow: rolling
 ///   silently is what let a lease edited through the panel at 18:00 for
@@ -38,7 +38,7 @@ pub fn parse_lend_end(spec: &str, now: time::OffsetDateTime) -> Result<Option<u6
 /// [`parse_lend_end`]'s decision, given `local_now` already resolved to the
 /// operator's own offset.
 ///
-/// Split out for the reason [`crate::peer::schedule::Schedule::contains_at_local`]
+/// Split out for the reason [`crate::peer::config::schedule::Schedule::contains_at_local`]
 /// is: this is what the unit tests below exercise directly, so they assert
 /// this function's arithmetic and never the host machine's timezone, and
 /// `local_offset_at` is not called a second time somewhere that would refuse
