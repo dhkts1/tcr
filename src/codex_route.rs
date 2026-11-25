@@ -35,7 +35,7 @@ pub fn codex_ca_for_launch(
     for variable in ["CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"] {
         if let Some(bundle) = inherited(variable).filter(|value| !value.is_empty()) {
             let bundle = std::path::PathBuf::from(bundle);
-            return if crate::mitm::ca_bundle_contains(&bundle, ca) {
+            return if crate::tls::ca_bundle_contains(&bundle, ca) {
                 Ok(bundle)
             } else {
                 Err(format!(

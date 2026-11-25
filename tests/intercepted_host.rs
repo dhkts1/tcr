@@ -170,7 +170,7 @@ struct Tcr {
 /// connected to a local byte-echo stub, including when a regression chooses it incorrectly.
 async fn start() -> Tcr {
     let leaf_dir = tempfile::tempdir().expect("a temp dir for the leaf");
-    let assets = tcr::mitm::load_tls_in(leaf_dir.path()).expect("mint a leaf");
+    let assets = tcr::tls::load_tls_in(leaf_dir.path()).expect("mint a leaf");
     for host in ["chatgpt.com", "api.anthropic.com"] {
         assert!(
             assets

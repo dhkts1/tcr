@@ -176,7 +176,7 @@ fn a_supervised_sigterm_drains_before_the_process_exits() {
 
     // The helper's `HOME` isolates config, the MITM cert dir, and the affinity/owner-file cache
     // dir all at once: every one of them resolves off `HOME` (`config::default_path`,
-    // `mitm::config_dir`, `affinity::default_path`). Its Claude Code login is a file that does
+    // `tls::config_dir`, `affinity::default_path`). Its Claude Code login is a file that does
     // not exist, so the first boot on an empty fleet imports nothing from the Keychain.
     let mut child = KillOnDrop::spawn(
         crate::tcr_env::tcr(home.path())

@@ -119,7 +119,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
         fetch_live_status(&config).await
     };
     let holds_codex = status_holds_provider(&live_read, &config, Provider::Codex);
-    let ca = crate::mitm::minted_ca_path();
+    let ca = crate::tls::minted_ca_path();
     let ca_readable = ca.is_file();
     let codex_route = crate::codex_route::codex_route(
         live_read.as_ref(),

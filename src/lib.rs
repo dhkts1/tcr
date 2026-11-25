@@ -69,6 +69,7 @@ pub mod stats;
 pub mod status;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+pub mod tls;
 pub mod tui;
 pub mod update;
 pub mod usage;

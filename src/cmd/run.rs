@@ -8,7 +8,7 @@ use tcr::cli::{self, validate_group_label_chars};
 use tcr::config::Config;
 use tcr::doctor::{no_proxy_entry_exempts, points_at_tcr};
 use tcr::proxy::{self, GROUP_HEADER_NAME};
-use tcr::{codex_route, mitm, status};
+use tcr::{codex_route, status, tls};
 
 use super::ConfigFile;
 use super::server::load_config;
@@ -136,7 +136,7 @@ pub(crate) async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // it intercept chatgpt.com", so the two cannot disagree. The CA is named,
         // never loaded: loading it here could re-mint a leaf the proxy never reads.
         let live = cli::fetch_live_status(&config).await;
-        let ca = mitm::minted_ca_path();
+        let ca = tls::minted_ca_path();
         let launch = codex_launch(&args, port, &live, &ca, ca.is_file(), &|var| {
             std::env::var(var).ok()
         })?;
@@ -350,7 +350,7 @@ impl CodexLaunch {
 /// # The running proxy decides
 ///
 /// The proxy loads its MITM leaf once, at boot, and nothing reloads it. This
-/// used to be decided by a load in THIS process instead (`mitm::load_tls`),
+/// used to be decided by a load in THIS process instead (`tls::load_tls`),
 /// which re-mints a stale leaf on disk and reports coverage the running proxy
 /// does not have. So with an older proxy running, or a current one whose TLS
 /// load failed at boot, it printed the see-through banner over a session
@@ -747,12 +747,12 @@ fn mark_run_active(cmd: &mut std::process::Command) {
 /// migration at startup; a client must never replace the CA while that server still
 /// presents the leaf it loaded at boot. Missing or unusable material selects base-URL mode.
 fn see_through_ca() -> Option<PathBuf> {
-    let ca = mitm::minted_ca_path();
+    let ca = tls::minted_ca_path();
     see_through_ca_in(ca.parent().unwrap_or_else(|| Path::new(".")))
 }
 
 fn see_through_ca_in(dir: &Path) -> Option<PathBuf> {
-    match mitm::existing_ca_path_in(dir) {
+    match tls::existing_ca_path_in(dir) {
         Ok(ca_path) => match ca_path {
             Some(ca) if ca.is_file() => Some(ca),
             // A path we cannot read is not a CA we can hand to claude.

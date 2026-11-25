@@ -184,7 +184,7 @@ pub(crate) async fn read_first_codex_account_notice(config_path: &Path) -> Strin
         return CODEX_FIRST_ACCOUNT_NOTICE.to_string();
     };
     let live = crate::cli::fetch_live_status(&config).await;
-    let ca = crate::mitm::minted_ca_path();
+    let ca = crate::tls::minted_ca_path();
     first_codex_account_notice(&live, config.proxy.port, &ca, ca.is_file())
 }
 

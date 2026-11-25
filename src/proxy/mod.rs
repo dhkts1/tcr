@@ -1391,7 +1391,7 @@ pub fn host_is_loopback(host: &str) -> bool {
 }
 
 /// The provider whose requests each host tcr intercepts carries: every host on
-/// [`crate::mitm::ALLOWED_HOSTS`], and no other (`every_intercepted_host_names_its_provider`
+/// [`crate::tls::ALLOWED_HOSTS`], and no other (`every_intercepted_host_names_its_provider`
 /// pins both directions). `platform.claude.com` is Anthropic's: Claude Code refreshes its own
 /// login there.
 const INTERCEPTED_HOST_PROVIDERS: [(&str, Provider); 3] = [
@@ -1401,7 +1401,7 @@ const INTERCEPTED_HOST_PROVIDERS: [(&str, Provider); 3] = [
 ];
 
 /// The provider an intercepted `host` (no port) belongs to, compared as
-/// [`crate::mitm::host_allowed`] compares it; `None` for any other host, loopback included.
+/// [`crate::tls::host_allowed`] compares it; `None` for any other host, loopback included.
 fn intercepted_host_provider(host: &str) -> Option<Provider> {
     INTERCEPTED_HOST_PROVIDERS
         .iter()
@@ -3845,7 +3845,7 @@ async fn handle_request(
         // primitive the client-peer check uses above, and the same derivation the
         // local-endpoint gate runs — one answer to "which host did the client
         // mean", on both paths.
-        if !host_is_loopback(host) && !crate::mitm::host_allowed(host) {
+        if !host_is_loopback(host) && !crate::tls::host_allowed(host) {
             tracing::debug!(target_host = %host, "rejected misrouted forward-proxy request");
             return ClientError::new(
                 StatusCode::MISDIRECTED_REQUEST,

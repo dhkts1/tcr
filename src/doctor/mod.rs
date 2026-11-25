@@ -633,7 +633,7 @@ impl CodexEnv {
         self.codex_ca_certificate
             .as_deref()
             .or(self.ssl_cert_file.as_deref())
-            .is_some_and(|file| crate::mitm::ca_bundle_contains(Path::new(file), ca))
+            .is_some_and(|file| crate::tls::ca_bundle_contains(Path::new(file), ca))
     }
 }
 
@@ -1132,7 +1132,7 @@ pub fn inspect_codex(
     config: &crate::config::Config,
 ) -> CodexReport {
     let rows = codex_rows(live, config);
-    let ca = crate::mitm::minted_ca_path();
+    let ca = crate::tls::minted_ca_path();
     let ca_readable = ca.is_file();
     let mut route = crate::codex_route::codex_route(live, port, &ca, ca_readable, rows.len());
     if route.pooled

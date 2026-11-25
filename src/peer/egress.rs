@@ -107,7 +107,7 @@ use crate::peer::tunnel::{self, NoiseStream};
 /// The ONLY origins a gateway will carry. Deny by default: a host absent from
 /// this list is refused, not tunnelled.
 ///
-/// Independent of [`crate::mitm::ALLOWED_HOSTS`]: a local interception capability
+/// Independent of [`crate::tls::ALLOWED_HOSTS`]: a local interception capability
 /// must not grant a peer gateway permission to dial another origin.
 pub const PEER_EGRESS_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com"];
 

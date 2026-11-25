@@ -687,7 +687,7 @@ async fn codex_non_inference_paths_relay_the_clients_own_bearer() {
 }
 
 /// Every host tcr intercepts names the provider whose requests it carries, and no
-/// other host does. A host added to [`crate::mitm::ALLOWED_HOSTS`] without a provider
+/// other host does. A host added to [`crate::tls::ALLOWED_HOSTS`] without a provider
 /// here would be refused outright by `handle`'s host-and-path check (it fails closed),
 /// so this fails first, at the table. Loopback names no provider: base-URL mode keeps
 /// the path's.
@@ -696,7 +696,7 @@ async fn codex_non_inference_paths_relay_the_clients_own_bearer() {
 #[test]
 fn every_intercepted_host_names_its_provider() {
     use crate::provider::Provider;
-    for host in crate::mitm::ALLOWED_HOSTS {
+    for host in crate::tls::ALLOWED_HOSTS {
         assert!(
             intercepted_host_provider(host).is_some(),
             "{host} is intercepted but names no provider"
@@ -704,7 +704,7 @@ fn every_intercepted_host_names_its_provider() {
     }
     for (host, _) in INTERCEPTED_HOST_PROVIDERS {
         assert!(
-            crate::mitm::host_allowed(host),
+            crate::tls::host_allowed(host),
             "{host} names a provider but is not intercepted"
         );
     }

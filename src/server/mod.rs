@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::manager::Manager;
-use crate::{affinity, build_info, cli, mitm, session_wire_persist, singleton};
+use crate::{affinity, build_info, cli, mitm, session_wire_persist, singleton, tls};
 
 mod peer_mesh;
 use peer_mesh::{boot_peer_listener, peers_file_beside_config};
@@ -1585,12 +1585,12 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // name `CODEX_CA_CERTIFICATE` too, the variable codex trusts a CA from.
     let holds_codex = manager.provider_account_count(crate::provider::Provider::Codex) > 0;
     let tls = match tls {
-        TlsSetup::Load => match mitm::load_tls(holds_codex) {
+        TlsSetup::Load => match tls::load_tls(holds_codex) {
             Ok(assets) => {
                 tracing::info!(
                     ca = %assets.ca_path.display(),
                     "{}",
-                    mitm::advertise_note(holds_codex)
+                    tls::advertise_note(holds_codex)
                 );
                 manager.record_mitm_status(crate::status::MitmStatus::of(Some(&assets)));
                 Some(Arc::new(assets.acceptor))

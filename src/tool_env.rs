@@ -51,7 +51,7 @@ impl Host<'static> {
     pub(crate) fn current() -> Self {
         Self {
             env: &process_env,
-            own_ca: tcr::mitm::minted_ca_path(),
+            own_ca: tcr::tls::minted_ca_path(),
         }
     }
 }
