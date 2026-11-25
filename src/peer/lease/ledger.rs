@@ -14,17 +14,29 @@ use crate::peer::config::{LendGrant, PeerStore};
 use crate::peer::id::random_id;
 use crate::peer::serve;
 
+/// How many served request ids are remembered, per connection in the listener, and, by
+/// [`SERVED_CAPACITY`], per process in the ledger.
+///
+/// Sized from the design's own figure: the accounting backstop has to outlive a
+/// burst rather than a session. The ledger's cache is the one that actually
+/// catches a replayed debit ([`crate::peer::listener::RequestDedup`] says why); this figure is named
+/// through to it so the two layers cannot disagree about what a burst is.
+pub const REQUEST_DEDUP_CAPACITY: usize = 4096;
+
+/// How long a served request id is remembered.
+pub const REQUEST_DEDUP_TTL_MS: i64 = 600_000;
+
 /// How many `(lease_id, request_id)` pairs one ledger remembers.
 ///
-/// The same figure [`crate::peer::listener::REQUEST_DEDUP_CAPACITY`] uses, and
+/// The same figure [`REQUEST_DEDUP_CAPACITY`] uses, and
 /// named through it rather than re-typed: the two caches answer the same
 /// question at two layers (the stream gate per connection, this one per
 /// process) and two spellings of one bound is how they come to disagree about
 /// what a burst is.
-pub const SERVED_CAPACITY: usize = crate::peer::listener::REQUEST_DEDUP_CAPACITY;
+pub const SERVED_CAPACITY: usize = REQUEST_DEDUP_CAPACITY;
 
 /// How long a served pair is remembered. Same figure, same reason.
-pub const SERVED_TTL_MS: i64 = crate::peer::listener::REQUEST_DEDUP_TTL_MS;
+pub const SERVED_TTL_MS: i64 = REQUEST_DEDUP_TTL_MS;
 
 /// How many request ids are remembered **per lease**.
 ///

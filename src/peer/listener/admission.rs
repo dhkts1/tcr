@@ -164,18 +164,6 @@ pub const MAX_KNOCK_FRAME_BYTES: usize = 512;
 /// CLI and the listener come to disagree about whether a window is open.
 pub const ACCEPTED_WINDOW_SECS: i64 = crate::peer::pair::PAIRING_WINDOW_SECS;
 
-/// How many served request ids are remembered, per connection here, and, by
-/// [`crate::peer::lease::SERVED_CAPACITY`], per process in the ledger.
-///
-/// Sized from the design's own figure: the accounting backstop has to outlive a
-/// burst rather than a session. The ledger's cache is the one that actually
-/// catches a replayed debit ([`RequestDedup`] says why); this figure is named
-/// through to it so the two layers cannot disagree about what a burst is.
-pub const REQUEST_DEDUP_CAPACITY: usize = 4096;
-
-/// How long a served request id is remembered.
-pub const REQUEST_DEDUP_TTL_MS: i64 = 600_000;
-
 /// How long the listener stays silent, **per address**, after logging one
 /// refusal.
 ///

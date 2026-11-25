@@ -92,8 +92,7 @@ pub use admission::{
     ACCEPTED_WINDOW_SECS, Admission, HeaderlessSession, KNOCK_BURST, KNOCK_INTERVAL_MS,
     MAX_HEADERLESS_PER_PEER, MAX_KNOCK_FRAME_BYTES, MAX_UNAUTHENTICATED_PER_ADDRESS,
     MAX_UNAUTHENTICATED_SOCKETS, MESSAGE_1_TIMEOUT, PunchInFlight, REFUSAL_LOG_ADDRESSES,
-    REFUSAL_LOG_QUIET_MS, REQUEST_DEDUP_CAPACITY, REQUEST_DEDUP_TTL_MS, RefusalLog,
-    STREAM_HEADER_TIMEOUT, unauthenticated_allowance,
+    REFUSAL_LOG_QUIET_MS, RefusalLog, STREAM_HEADER_TIMEOUT, unauthenticated_allowance,
 };
 pub use connection::serve_accepted;
 pub use gate::{
