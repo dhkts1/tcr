@@ -251,38 +251,33 @@ fn parse_pasted_code(pasted: &str) -> &str {
     pasted.split_once('#').map_or(pasted, |(code, _state)| code)
 }
 
-/// Every account in `accounts` carrying `group` — exactly
-/// [`Account::in_group`], never a looser substring or prefix match.
-fn select_group_accounts<'a>(accounts: &'a [Account], group: &str) -> Vec<&'a Account> {
-    accounts.iter().filter(|a| a.in_group(group)).collect()
-}
-
 /// Which accounts a `tcr mint` run targets, and what it does with each, before
 /// anything is printed or read from stdin.
 ///
 /// Pure, so the provider rules are testable without a URL or a paste:
 /// - `--account` naming a Codex row is refused outright, with
 ///   [`provider_guard::provider_guard`]'s sentence, before any URL;
-/// - `--group` keeps every member, in config order, and marks a Codex member
-///   [`MintTarget::SkipCodex`], so the report names it rather than dropping it.
+/// - `--group` keeps every member ([`config::Config::group_members`], exactly
+///   [`Account::in_group`], never a looser substring or prefix match), in config
+///   order, and marks a Codex member [`MintTarget::SkipCodex`], so the report
+///   names it rather than dropping it.
 ///
 /// The selection and its two refusals (a group no account carries, and both or
 /// neither flag) are exactly what they were before Codex accounts existed.
 fn plan_mint<'a>(
-    accounts: &'a [Account],
+    config: &'a config::Config,
     account: Option<&str>,
-    group: Option<&str>,
+    group: Option<&'a str>,
 ) -> anyhow::Result<Vec<MintTarget<'a>>> {
     match (account, group) {
         (Some(query), None) => {
-            let idx = config::resolve_account(accounts, query)?;
-            let row = &accounts[idx];
+            let row = config.resolve_account(query)?;
             provider_guard::provider_guard(row, ClaudeOnlyVerb::Mint)
                 .map_err(anyhow::Error::msg)?;
             Ok(vec![MintTarget::Mint(row)])
         }
         (None, Some(group)) => {
-            let matches = select_group_accounts(accounts, group);
+            let matches: Vec<&Account> = config.group_members(group).collect();
             if matches.is_empty() {
                 anyhow::bail!("no account carries group '{group}'");
             }
@@ -492,7 +487,7 @@ pub async fn run_mint(
 ) -> anyhow::Result<bool> {
     let (cfg, _created) = config::load_or_init(config_path).context("load config for mint")?;
 
-    let targets = plan_mint(&cfg.accounts, account, group)?;
+    let targets = plan_mint(&cfg, account, group)?;
 
     let mut results = Vec::with_capacity(targets.len());
     for target in targets {
@@ -699,6 +694,13 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
+    /// A config holding exactly `accounts`.
+    fn config_of(accounts: Vec<Account>) -> config::Config {
+        let mut config: config::Config = serde_json::from_str("{}").unwrap();
+        config.accounts = accounts;
+        config
+    }
+
     #[test]
     fn group_selects_exactly_the_members_and_account_selects_one() {
         let accounts = vec![
@@ -707,19 +709,20 @@ mod tests {
             account("carol@example.com", &["team-b"]),
         ];
 
-        let team_a = select_group_accounts(&accounts, "team-a");
+        let config = config_of(accounts.clone());
+        let team_a: Vec<&Account> = config.group_members("team-a").collect();
         assert_eq!(
             team_a.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
             vec!["alice@example.com", "bob@example.com"]
         );
 
-        let team_b = select_group_accounts(&accounts, "team-b");
+        let team_b: Vec<&Account> = config.group_members("team-b").collect();
         assert_eq!(
             team_b.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
             vec!["bob@example.com", "carol@example.com"]
         );
 
-        let none = select_group_accounts(&accounts, "no-such-group");
+        let none: Vec<&Account> = config.group_members("no-such-group").collect();
         assert!(none.is_empty());
 
         let idx = config::resolve_account(&accounts, "carol@example.com").unwrap();
@@ -779,12 +782,13 @@ mod tests {
             codex_account("bob@example.com/codex", &[]),
         ];
 
-        let err = plan_mint(&accounts, Some("bob@example.com/codex"), None)
+        let config = config_of(accounts);
+        let err = plan_mint(&config, Some("bob@example.com/codex"), None)
             .expect_err("a Codex row has no long-lived token to mint");
         assert_eq!(err.to_string(), refusal);
 
-        let plan = plan_mint(&accounts, Some("alice@example.com"), None)
-            .expect("a Claude row still mints");
+        let plan =
+            plan_mint(&config, Some("alice@example.com"), None).expect("a Claude row still mints");
         assert_eq!(shape(&plan), vec![("mint", "alice@example.com")]);
 
         // The same refusal through the verb itself, on a real file. The Codex row
@@ -826,7 +830,8 @@ mod tests {
             codex_account("bob@example.com/codex", &["team"]),
             account("carol@example.com", &["team"]),
         ];
-        let plan = plan_mint(&accounts, None, Some("team")).expect("the group has members");
+        let config = config_of(accounts);
+        let plan = plan_mint(&config, None, Some("team")).expect("the group has members");
         assert_eq!(
             shape(&plan),
             vec![
