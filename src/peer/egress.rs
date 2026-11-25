@@ -98,7 +98,7 @@ use axum::response::IntoResponse as _;
 use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
 use tokio::net::TcpListener;
 
-use crate::peer::config::{CARRY_SETUP_TIMEOUT, PeerFile, PeerRow, ViaRoute, ViaSetting};
+use crate::peer::config::{CARRY_SETUP_TIMEOUT, PeerFile, PeerRow, ViaSetting};
 use crate::peer::id::KEY_BYTES;
 use crate::peer::id::NodeKey;
 use crate::peer::noise::{self, Handshake, NoiseStream};
@@ -154,15 +154,11 @@ pub struct GatewayCandidate {
 /// fall back to a Mac the operator did not choose. A silent fallback here would
 /// be a request leaving by a route the operator refused.
 pub fn resolve_via(setting: &ViaSetting, candidates: &[GatewayCandidate]) -> Vec<GatewayCandidate> {
-    let mut chosen: Vec<GatewayCandidate> = match &setting.route {
-        ViaRoute::Off => return Vec::new(),
-        ViaRoute::Pinned(peer) => candidates
-            .iter()
-            .filter(|candidate| candidate.row.node == *peer)
-            .cloned()
-            .collect(),
-        ViaRoute::Auto => candidates.to_vec(),
-    };
+    let mut chosen: Vec<GatewayCandidate> = candidates
+        .iter()
+        .filter(|candidate| setting.admits(&candidate.row.node))
+        .cloned()
+        .collect();
     chosen.retain(|candidate| candidate.row.has_endpoint());
     chosen.sort_by_key(|candidate| {
         crate::peer::probe::carrier_key_installed(&candidate.row.node, candidate.last_seen_ms)
@@ -1661,10 +1657,11 @@ pub fn peers_path() -> std::path::PathBuf {
 
 /// The operator's `via` choice, out of the file they wrote it into.
 ///
-/// One function rather than a field read at four call sites, so the CLI's
-/// "unchanged" comparison, the request path and the tests all read the setting
-/// the same way. A file with no `via` key at all is [`ViaRoute::Auto`]. See
-/// [`ViaSetting`] for why that default is not a disclosure decision.
+/// One function rather than a field read at several call sites, so the request
+/// path and the tests all read the setting the same way (the CLI's "unchanged"
+/// comparison is [`PeerFile::choose_via`]). A file with no `via` key at all is
+/// [`crate::peer::config::ViaRoute::Auto`]. See [`ViaSetting`] for why that
+/// default is not a disclosure decision.
 pub fn via_setting(file: &PeerFile) -> ViaSetting {
     file.via.clone()
 }

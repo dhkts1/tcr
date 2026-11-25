@@ -200,26 +200,6 @@ fn pending_row_for_readers(mut knock: peer::state::Knock) -> peer::state::Knock 
     knock
 }
 
-/// Give this Mac a peer port when the operator turns one of the features that need one
-/// on and there is none yet. Returns the address written, or `None` when
-/// `listen` was already set, which this never touches.
-///
-/// The caller writes the file and then prints [`print_listen_written`]: the
-/// verbs that call this already hold the peers-file lock and already have
-/// a save of their own, and a second write here would be a second writer for
-/// one key.
-///
-/// It is called on the ON arm only. Turning something OFF, or removing a grant,
-/// is not an opt-in and must not open a port.
-fn ensure_listen_for_opt_in(file: &mut peer::config::PeerFile) -> Option<std::net::SocketAddr> {
-    if file.listen.is_some() {
-        return None;
-    }
-    let chosen = peer::config::default_listen();
-    file.listen = Some(chosen);
-    Some(chosen)
-}
-
 /// What every verb that just wrote a peer port says, in one place so they
 /// all say the same thing.
 ///

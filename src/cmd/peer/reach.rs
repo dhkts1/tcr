@@ -3,10 +3,7 @@
 use tcr::peer;
 
 use super::peer_cli;
-use super::{
-    ensure_listen_for_opt_in, lock_peers_file, masked_label, now_unix_secs, peer_state_path,
-    print_listen_written,
-};
+use super::{lock_peers_file, masked_label, now_unix_secs, peer_state_path, print_listen_written};
 
 /// `tcr peer reach`: the three ways a Mac off this LAN could reach this one.
 ///
@@ -117,7 +114,7 @@ pub(super) fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()
     reach::restore_from_peers(&file);
 
     let v6 = reach::global_v6_addresses();
-    let internal_port = file.listen.map(|listen| listen.port());
+    let internal_port = file.listen_port();
     let slot = reach::current_slot(now_unix_secs());
 
     // The dead drop's own readout: no `drop-status` verb (the design rules
@@ -387,7 +384,7 @@ pub(super) fn run_peer_internet(a: peer_cli::PeerInternetArgs) -> anyhow::Result
     if on {
         let written = {
             let (_lock, mut file) = lock_peers_file(&peers_path)?;
-            match ensure_listen_for_opt_in(&mut file) {
+            match file.ensure_listen_for_opt_in() {
                 Some(chosen) => {
                     peer::config::save(&peers_path, &file)?;
                     Some(chosen)

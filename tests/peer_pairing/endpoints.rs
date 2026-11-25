@@ -165,9 +165,7 @@ fn every_pin_writer_records_the_address_it_was_reached_over() {
     // An invite needs a listen address to hand out, so the file names one; the
     // port is never bound here because this half drives `accept_enrolment`
     // directly rather than over a socket.
-    let mut file = node.file();
-    file.listen = Some("127.0.0.1:9600".parse().expect("the literal parses"));
-    node.write_file(&file);
+    node.listen_on("127.0.0.1:9600".parse().expect("the literal parses"));
     let store = config::PeerStore::open(&node.peers).expect("re-open after the listen edit");
     let (invite, _token) = pair::mint_invite_as(&store, &node.key, "attic-nuc", 600, 1, None)
         .expect("mint a one-use invite");
@@ -267,9 +265,7 @@ async fn a_peer_that_moved_announces_its_new_port_and_is_reached_there() {
     pair::confirm(&b_store, &a.key.id(), "222222", Some(a_addr)).expect("B pins A");
 
     // B announces the port it really listens on.
-    let mut b_file = b.file();
-    b_file.listen = Some(b_addr);
-    b.write_file(&b_file);
+    b.listen_on(b_addr);
 
     // ---- control: before the Hello, A cannot reach B at all.
     let stale_row = a

@@ -21,9 +21,7 @@ pub(super) fn run_peer_name(a: peer_cli::PeerNameArgs) -> anyhow::Result<()> {
     match a.name {
         None => println!("{}", file.display_name()),
         Some(name) => {
-            let sanitized = tcr_peer_wire::sanitize_label(&name)
-                .with_context(|| format!("refusing name {name:?}"))?;
-            file.name = Some(sanitized.clone());
+            let sanitized = file.rename(&name)?;
             tcr::peer::config::save(&peers_path, &file)?;
             println!("{sanitized}");
         }

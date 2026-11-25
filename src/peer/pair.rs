@@ -636,7 +636,7 @@ pub async fn knock(store: &PeerStore, addr: SocketAddr, proposed_name: &str) -> 
             // from at boot, and `None` when this Mac has no listener at all,
             // which is the honest answer rather than the default port: a Mac
             // with the feature off is not listening on it.
-            listen_port: file.listen.map(|listen| listen.port()),
+            listen_port: file.listen_port(),
         },
         file.network_key
             .as_ref()

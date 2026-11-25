@@ -495,7 +495,7 @@ pub const CARRY_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[serde(try_from = "ViaJson", into = "ViaJson")]
 pub struct ViaSetting {
     /// Which way out.
-    pub route: ViaRoute,
+    route: ViaRoute,
     /// The operator's own setup bound in milliseconds, when they set one.
     /// `None` is [`CARRY_SETUP_TIMEOUT`].
     setup_timeout_ms: Option<u64>,
@@ -643,6 +643,24 @@ impl ViaSetting {
     /// Whether this Mac refuses to route out through a peer at all.
     pub fn is_off(&self) -> bool {
         self.route == ViaRoute::Off
+    }
+
+    /// The one Mac this setting pins, when it pins one.
+    pub fn pinned_peer(&self) -> Option<&PeerId> {
+        match &self.route {
+            ViaRoute::Pinned(peer) => Some(peer),
+            ViaRoute::Auto | ViaRoute::Off => None,
+        }
+    }
+
+    /// Whether this setting lets `node` carry a request: every Mac under
+    /// `auto`, none under `off`, and only the pinned one under a pin.
+    pub fn admits(&self, node: &PeerId) -> bool {
+        match &self.route {
+            ViaRoute::Auto => true,
+            ViaRoute::Off => false,
+            ViaRoute::Pinned(peer) => peer == node,
+        }
     }
 
     /// The word the CLI prints and the config stores.
@@ -874,11 +892,70 @@ impl PeerFile {
         tcr_peer_wire::sanitize_label(&raw).unwrap_or_else(|_| "peer".to_string())
     }
 
+    /// Set the operator's display name for this Mac (`tcr peer name <name>`),
+    /// sanitized the way every label that reaches another machine is, and
+    /// answer the name as stored. A name that does not sanitize is refused and
+    /// nothing changes.
+    pub fn rename(&mut self, name: &str) -> Result<String> {
+        let sanitized = tcr_peer_wire::sanitize_label(name)
+            .with_context(|| format!("refusing name {name:?}"))?;
+        self.name = Some(sanitized.clone());
+        Ok(sanitized)
+    }
+
+    /// Turn finding on or off (`tcr peer find on|off`), and with it the
+    /// announce-name preference when the operator gave one. Answers the peer
+    /// port written when turning finding on needed one (see
+    /// [`Self::ensure_listen_for_opt_in`]).
+    ///
+    /// The preference is set on BOTH arms. It used to be read only inside the
+    /// `on` arm, so `tcr peer find off --announce-name on` accepted the flag,
+    /// wrote the file without it and still exited 0, a silently ignored
+    /// preference, which is worse than a refusal.
+    pub fn switch_find(&mut self, on: bool, announce_name: Option<bool>) -> Option<SocketAddr> {
+        if let Some(announce_name) = announce_name {
+            self.announce_name = announce_name;
+        }
+        self.discovery = on;
+        if on {
+            self.ensure_listen_for_opt_in()
+        } else {
+            None
+        }
+    }
+
+    /// Give this Mac a peer port when the operator turns one of the features
+    /// that need one on and there is none yet. Returns the address written, or
+    /// `None` when `listen` was already set, which this never touches.
+    ///
+    /// The caller writes the file and then prints the CLI's
+    /// `print_listen_written`: the verbs that call this already hold the
+    /// peers-file lock and already have a save of their own, and a second write
+    /// here would be a second writer for one key.
+    ///
+    /// It is called on the ON arm only. Turning something OFF, or removing a
+    /// grant, is not an opt-in and must not open a port.
+    pub fn ensure_listen_for_opt_in(&mut self) -> Option<SocketAddr> {
+        if self.listen.is_some() {
+            return None;
+        }
+        let chosen = default_listen();
+        self.listen = Some(chosen);
+        Some(chosen)
+    }
+
     /// Turn `peer.internet` on or off, and answer the port a router mapping
     /// for it is keyed on: the listener's, or `None` when this node has no
     /// listener to map.
     pub fn switch_internet(&mut self, on: bool) -> Option<u16> {
         self.internet = on;
+        self.listen_port()
+    }
+
+    /// The port this Mac's peer listener binds, or `None` when the feature is
+    /// off: the honest answer rather than the default port, because a Mac with
+    /// the feature off is not listening on it.
+    pub fn listen_port(&self) -> Option<u16> {
         self.listen.map(|addr| addr.port())
     }
 
@@ -942,6 +1019,27 @@ impl PeerFile {
     /// The invite minted under `id`, while it is still on disk.
     pub fn invite(&self, id: u64) -> Option<&PendingInvite> {
         self.pending_invites.iter().find(|invite| invite.id == id)
+    }
+
+    /// Choose how this Mac reaches the internet (`tcr peer via`). A pin that
+    /// names a Mac this one has never trusted is refused, so `via <peer>`
+    /// cannot route through a stranger. Answers whether the setting changed.
+    pub fn choose_via(&mut self, asked: &ViaSetting) -> Result<bool> {
+        if let Some(peer_id) = asked.pinned_peer() {
+            let known = self.peers.iter().any(|row| row.node == *peer_id);
+            if !known {
+                anyhow::bail!(
+                    "peer via: {} is not a Mac this one has pinned, so there is nothing \
+                     to route through (`tcr peer ls` prints the pinned ones)",
+                    peer_id.display()
+                );
+            }
+        }
+        if *asked == self.via {
+            return Ok(false);
+        }
+        self.via = asked.clone();
+        Ok(true)
     }
 }
 

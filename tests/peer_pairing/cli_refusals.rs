@@ -531,9 +531,7 @@ fn a_concurrent_revoke_and_enrolment_never_resurrect_or_drop_a_row() {
 
     for trial in 0..TRIALS {
         let node = Node::new(&format!("revoke-race-{trial}"));
-        let mut file = node.file();
-        file.listen = Some("127.0.0.1:9600".parse().expect("a loopback address"));
-        node.write_file(&file);
+        node.listen_on("127.0.0.1:9600".parse().expect("a loopback address"));
 
         let store = config::PeerStore::open(&node.peers).expect("open the store");
         let (invite, token) = pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1, None)

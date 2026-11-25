@@ -7,10 +7,7 @@ use tcr::config;
 use tcr::peer;
 
 use super::peer_cli;
-use super::{
-    ensure_listen_for_opt_in, lock_peers_file, parse_peer_arg, peer_window_name,
-    print_listen_written,
-};
+use super::{lock_peers_file, parse_peer_arg, peer_window_name, print_listen_written};
 
 /// `tcr peer share`: let trusted Macs serve requests with this Mac's accounts, or stop.
 pub(super) fn run_peer_share(a: peer_cli::PeerSwitchArgs) -> anyhow::Result<()> {
@@ -161,7 +158,7 @@ pub(super) fn run_peer_share(a: peer_cli::PeerSwitchArgs) -> anyhow::Result<()> 
             // Sharing means those Macs reach this one, which needs a
             // port. On this arm only: the removal above and the `off`
             // arm below are not opt-ins and must open nothing.
-            let listen_written = ensure_listen_for_opt_in(&mut file);
+            let listen_written = file.ensure_listen_for_opt_in();
             peer::config::save(&peers_path, &file)?;
             if let Some(chosen) = listen_written {
                 print_listen_written(chosen, &peers_path);

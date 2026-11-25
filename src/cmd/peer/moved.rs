@@ -134,14 +134,15 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
         .into_iter()
         .map(|(interface, addr)| peer::pair::HostAddress { interface, addr })
         .collect();
-    let ranked = file.listen.map_or_default(|listen| {
-        peer::pair::dial_addresses(
+    let ranked = match file.listen {
+        Some(listen) => peer::pair::dial_addresses(
             listen,
             &host,
             external,
             peer::tailnet_node::recorded_node_address(&peer_state_path(peers_path), now_ms),
-        )
-    });
+        ),
+        None => Vec::new(),
+    };
 
     let mut carried: Vec<std::net::SocketAddr> = Vec::new();
     let mut carry = |addr: std::net::SocketAddr| {

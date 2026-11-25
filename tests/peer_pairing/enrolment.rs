@@ -33,9 +33,7 @@ async fn a_two_process_join_leaves_a_pinned_row_on_both_sides() {
     // The registrar needs a listen address in its file before it can mint an
     // invite: a token with no address to dial is not a token.
     let addr = serve(registrar.context()).await;
-    let mut file = registrar.file();
-    file.listen = Some(addr);
-    registrar.write_file(&file);
+    registrar.listen_on(addr);
 
     let store = config::PeerStore::open(&registrar.peers).expect("open the registrar's store");
     let (invite, token) = pair::mint_invite_as(&store, &registrar.key, "laptop-2", 600, 1, None)
@@ -116,18 +114,14 @@ async fn a_headless_join_teaches_the_registrar_the_joiners_listening_port() {
     let joiner = Node::new("enrol-port-joiner");
 
     let registrar_addr = serve(registrar.context()).await;
-    let mut file = registrar.file();
-    file.listen = Some(registrar_addr);
-    registrar.write_file(&file);
+    registrar.listen_on(registrar_addr);
 
     // The joiner also runs the shipped accept loop on its own kernel-chosen
     // port and records it, the same way the registrar's own listen address is
     // set above: this is the port a dial back has to reach, and it is not the
     // port the joiner's outbound connection to the registrar happens to use.
     let joiner_addr = serve(joiner.context()).await;
-    let mut joiner_file = joiner.file();
-    joiner_file.listen = Some(joiner_addr);
-    joiner.write_file(&joiner_file);
+    joiner.listen_on(joiner_addr);
 
     let store = config::PeerStore::open(&registrar.peers).expect("open the registrar's store");
     let (_invite, token) = pair::mint_invite_as(&store, &registrar.key, "laptop-3", 600, 1, None)
@@ -196,9 +190,7 @@ fn two_concurrent_joiners_on_one_use_invite_leave_exactly_one_ok() {
 
     for trial in 0..TRIALS {
         let node = Node::new(&format!("atomic-{trial}"));
-        let mut file = node.file();
-        file.listen = Some("127.0.0.1:9600".parse().expect("a loopback address"));
-        node.write_file(&file);
+        node.listen_on("127.0.0.1:9600".parse().expect("a loopback address"));
 
         let store = config::PeerStore::open(&node.peers).expect("open the store");
         let (invite, token) = pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1, None)

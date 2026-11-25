@@ -22,9 +22,7 @@ use super::*;
 #[test]
 fn a_mint_on_a_wide_listener_carries_no_bind_address() {
     let node = Node::new("wide-listener");
-    let mut file = node.file();
-    file.listen = Some("0.0.0.0:7755".parse().expect("a wide bind address"));
-    node.write_file(&file);
+    node.listen_on("0.0.0.0:7755".parse().expect("a wide bind address"));
     let store = config::PeerStore::open(&node.peers).expect("open the store");
 
     match pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1, None) {
@@ -59,9 +57,7 @@ fn a_mint_on_a_wide_listener_carries_no_bind_address() {
 #[test]
 fn a_mint_on_a_pinned_listener_carries_exactly_that_address() {
     let node = Node::new("pinned-listener");
-    let mut file = node.file();
-    file.listen = Some("127.0.0.1:9600".parse().expect("a loopback address"));
-    node.write_file(&file);
+    node.listen_on("127.0.0.1:9600".parse().expect("a loopback address"));
     let store = config::PeerStore::open(&node.peers).expect("open the store");
 
     let (_invite, token) = pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1, None)
@@ -132,9 +128,7 @@ fn a_v3_key_round_trips_every_address_family() {
 #[test]
 fn tcr_peer_invite_names_every_address_and_the_internet_gap() {
     let node = Node::new("invite-cli");
-    let mut file = node.file();
-    file.listen = Some("127.0.0.1:9600".parse().expect("a loopback address"));
-    node.write_file(&file);
+    node.listen_on("127.0.0.1:9600".parse().expect("a loopback address"));
 
     // `HOME` points at this test's own scratch directory, because `tcr peer
     // invite` loads this node's keypair from the config directory and a test
@@ -189,15 +183,11 @@ fn tcr_peer_invite_names_every_address_and_the_internet_gap() {
 #[test]
 fn the_sealed_exchange_works_end_to_end_at_the_command_line() {
     let inviter = Node::new("sealed-inviter");
-    let mut inviter_file = inviter.file();
-    inviter_file.listen = Some("127.0.0.1:9700".parse().expect("a loopback address"));
-    inviter.write_file(&inviter_file);
+    inviter.listen_on("127.0.0.1:9700".parse().expect("a loopback address"));
     let inviter_home = scratch("sealed-inviter-home");
 
     let friend = Node::new("sealed-friend");
-    let mut friend_file = friend.file();
-    friend_file.listen = Some("127.0.0.1:9701".parse().expect("a loopback address"));
-    friend.write_file(&friend_file);
+    friend.listen_on("127.0.0.1:9701".parse().expect("a loopback address"));
     let friend_home = scratch("sealed-friend-home");
 
     let mint = tcr_command(&inviter_home)
@@ -297,9 +287,7 @@ fn the_sealed_exchange_works_end_to_end_at_the_command_line() {
 #[test]
 fn tcr_peer_invite_plain_mints_the_readable_key() {
     let node = Node::new("invite-cli-plain");
-    let mut file = node.file();
-    file.listen = Some("127.0.0.1:9600".parse().expect("a loopback address"));
-    node.write_file(&file);
+    node.listen_on("127.0.0.1:9600".parse().expect("a loopback address"));
 
     let home = scratch("invite-cli-plain-home");
     let output = tcr_command(&home)

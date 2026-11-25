@@ -6,10 +6,7 @@ use anyhow::Context as _;
 use tcr::peer;
 
 use super::peer_cli;
-use super::{
-    ensure_listen_for_opt_in, listen_written_lines, lock_peers_file, masked_label,
-    print_listen_written,
-};
+use super::{listen_written_lines, lock_peers_file, masked_label, print_listen_written};
 
 /// `tcr peer tailnet`: `leave` and a joining `node --auth-key -` are the two
 /// async verbs (they wait on the tailnet or on the running tcr); everything
@@ -137,7 +134,7 @@ fn run_peer_tailnet_with(
             // only beside a peer listener. Off is not an opt-in, so it never
             // writes `listen` and never removes one.
             let written = match mode {
-                TailnetMode::App | TailnetMode::Node => ensure_listen_for_opt_in(&mut file),
+                TailnetMode::App | TailnetMode::Node => file.ensure_listen_for_opt_in(),
                 TailnetMode::Off => None,
             };
             peer::config::save(&peers_path, &file)?;
