@@ -56,6 +56,19 @@ impl Config {
         Ok(&mut self.accounts[idx])
     }
 
+    /// The one row `query` names by exact name ([`identity::match_one`]),
+    /// `None` when no row does, and [`Config::resolve_account`]'s error when
+    /// more than one does.
+    pub fn resolve_account_or_none(&self, query: &str) -> anyhow::Result<Option<&Account>> {
+        match identity::match_one(&self.accounts, query) {
+            identity::Match::One(idx) => Ok(self.accounts.get(idx)),
+            identity::Match::None => Ok(None),
+            identity::Match::Ambiguous(names) => {
+                bail!("{}", ambiguous_query_message(query, &names))
+            }
+        }
+    }
+
     /// Whether the fleet is empty: no usable account row, so a quarantined row does not count.
     pub fn holds_no_accounts(&self) -> bool {
         self.accounts.is_empty()
