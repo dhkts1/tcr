@@ -89,7 +89,7 @@ pub fn advertised_listen() -> Option<SocketAddr> {
     server_slot().listen()
 }
 
-/// The serving process's slot: the one [`run_in_server`] hands its
+/// The serving process's slot: the one [`run_in_server`](crate::peer::listener::run_in_server) hands its
 /// supervisor, and the one [`dial_through_node`] reads.
 pub fn server_slot() -> &'static DialSlot {
     static SLOT: std::sync::OnceLock<DialSlot> = std::sync::OnceLock::new();

@@ -310,7 +310,7 @@ pub(super) async fn boot_peer_listener(
     // in its own module; a build without the `tailnet-node` feature only
     // records `nodeUnsupported` there.
     {
-        let node = crate::peer::tailnet_node::run_in_server(
+        let node = listener::run_in_server(
             peers_path.to_path_buf(),
             state_path.clone(),
             local.port(),

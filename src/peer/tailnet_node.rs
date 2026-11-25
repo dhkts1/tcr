@@ -51,8 +51,7 @@
 //! here runs under [`CONTROL_TIMEOUT`], and nothing asks for an address before
 //! [`TailnetDevice::authorization`] has said yes.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -211,45 +210,4 @@ pub async fn join(peers_path: &Path, name: Option<String>, auth_key: AuthKey) ->
         JOIN_DEADLINE,
     )
     .await
-}
-
-/// The server's supervisor, for the peers file at `peers_path`, serving
-/// accepted connections through `context` on `port`. Runs until `stop` flips.
-pub async fn run_in_server(
-    peers_path: PathBuf,
-    state_path: PathBuf,
-    port: u16,
-    context: crate::peer::listener::SessionContext,
-    stop: tokio::sync::watch::Receiver<bool>,
-) {
-    let serve: ServeFn<<<BuiltFactory as DeviceFactory>::Device as TailnetDevice>::Stream> =
-        Arc::new(move |accepted| {
-            let context = context.clone();
-            Box::pin(crate::peer::listener::serve_one(
-                accepted.stream,
-                context,
-                accepted.from,
-                accepted.bind,
-                // The node's socket is bound to the node's own address, so the
-                // address a connection was sent to is the bind itself.
-                Some(accepted.bind),
-            ))
-        });
-    let paths = NodePaths {
-        key: key_path_for_peers(&peers_path),
-        peers: peers_path,
-        state: state_path,
-    };
-    let gateway: GatewayFn = Arc::new(crate::peer::reach::default_gateway_ipv4);
-    // A build without the library only ever records `nodeUnsupported` when the
-    // mode is `node`, which needs no 10 s wake.
-    let every = if <BuiltFactory as DeviceFactory>::SUPPORTED {
-        TICK
-    } else {
-        TICK * 2
-    };
-    Supervisor::new(BuiltFactory::default(), paths, port, serve, gateway)
-        .with_dial_slot(server_slot().clone())
-        .run(every, stop)
-        .await;
 }
