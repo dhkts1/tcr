@@ -168,6 +168,27 @@ impl Config {
             .collect()
     }
 
+    /// Whether the loader set any account aside for holding no usable credential.
+    pub fn holds_quarantined_accounts(&self) -> bool {
+        !self.quarantined_accounts.is_empty()
+    }
+
+    /// Refuse a CLI load-edit-save of the file at `config_path` while any account
+    /// is quarantined: a whole-config save would drop the row the loader set aside.
+    pub fn refuse_edit_if_quarantined(&self, config_path: &std::path::Path) -> anyhow::Result<()> {
+        if self.holds_quarantined_accounts() {
+            bail!(
+                "config at {} has {} account(s) with no usable credential, so the CLI cannot safely \
+                 load-edit-save it: {}. Fix or remove the entry in the file by hand (the server \
+                 itself tolerates it and keeps running).",
+                config_path.display(),
+                self.quarantined_accounts.len(),
+                self.quarantined_accounts.join(", ")
+            );
+        }
+        Ok(())
+    }
+
     /// The name `controlAccount` names, in either of its shapes; `None` when unset.
     pub fn control_account_name(&self) -> Option<&str> {
         self.control_account

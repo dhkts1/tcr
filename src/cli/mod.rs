@@ -204,16 +204,7 @@ fn load_for_edit(config_path: &Path) -> anyhow::Result<Config> {
             config_path.display()
         );
     }
-    if !config.quarantined_accounts.is_empty() {
-        bail!(
-            "config at {} has {} account(s) with no usable credential, so the CLI cannot safely \
-             load-edit-save it: {}. Fix or remove the entry in the file by hand (the server \
-             itself tolerates it and keeps running).",
-            config_path.display(),
-            config.quarantined_accounts.len(),
-            config.quarantined_accounts.join(", ")
-        );
-    }
+    config.refuse_edit_if_quarantined(config_path)?;
     warn_if_server_running(&config);
     Ok(config)
 }

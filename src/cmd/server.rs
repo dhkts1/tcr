@@ -540,7 +540,7 @@ fn migration_persist_target<'a>(
     config: &Config,
     persist_path: &'a Option<PathBuf>,
 ) -> Option<&'a Path> {
-    if config.migrated_legacy_throttle && config.quarantined_accounts.is_empty() {
+    if config.migrated_legacy_throttle && !config.holds_quarantined_accounts() {
         persist_path.as_deref()
     } else {
         None
