@@ -709,7 +709,7 @@ mod tests {
             account("carol@example.com", &["team-b"]),
         ];
 
-        let config = config_of(accounts.clone());
+        let config = config_of(accounts);
         let team_a: Vec<&Account> = config.group_members("team-a").collect();
         assert_eq!(
             team_a.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),

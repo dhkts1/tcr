@@ -12,8 +12,8 @@ fn resolve_exact_name_wins() {
             ] }"#,
     );
     let row = config.resolve_account("user").unwrap();
-    assert!(
-        std::ptr::eq(row, &config.accounts[0]),
+    assert_eq!(
+        row.access_token, "at1",
         "exact name resolves to that account"
     );
 }
@@ -54,9 +54,9 @@ fn resolve_after_migration_gives_each_row_its_own_name() {
     assert_eq!(config.accounts[1].name, "me@example.com/org-b");
 
     let first = config.resolve_account("me@example.com").unwrap();
-    assert!(std::ptr::eq(first, &config.accounts[0]));
+    assert_eq!(first.org_uuid.as_deref(), Some("uuid-a"));
     let second = config.resolve_account("me@example.com/org-b").unwrap();
-    assert!(std::ptr::eq(second, &config.accounts[1]));
+    assert_eq!(second.org_uuid.as_deref(), Some("uuid-b"));
     assert!(config.resolve_account("org-b").is_err());
 }
 
