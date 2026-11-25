@@ -113,13 +113,7 @@ pub fn unauthenticated_allowance(file: &PeerFile) -> (usize, usize) {
     // (`tests/peer_lease.rs`) is the gate, with the bare constants it fails
     // with the lender closing the third connection with zero bytes, and it
     // stays green on the largest-grant form.
-    let largest: usize = file
-        .peers
-        .iter()
-        .flat_map(|row| row.lend.iter())
-        .map(|grant| usize::from(grant.max_inflight))
-        .max()
-        .unwrap_or(0);
+    let largest: usize = file.largest_grant_inflight();
     (
         MAX_UNAUTHENTICATED_SOCKETS.saturating_add(largest),
         MAX_UNAUTHENTICATED_PER_ADDRESS.saturating_add(largest),

@@ -1149,6 +1149,318 @@ impl PeerFile {
         self.via = asked.clone();
         Ok(true)
     }
+
+    /// The pinned row for `node`, or `None` when this Mac does not pin it,
+    /// which is the same answer as "not authorized for anything".
+    pub fn row(&self, node: &PeerId) -> Option<&PeerRow> {
+        self.peers.iter().find(|row| &row.node == node)
+    }
+
+    /// The pinned row for `node`, to edit in place, or `None` when this Mac
+    /// does not pin it.
+    pub fn row_mut(&mut self, node: &PeerId) -> Option<&mut PeerRow> {
+        self.peers.iter_mut().find(|row| &row.node == node)
+    }
+
+    /// Pin `row`. A re-pin of a key already pinned replaces the row rather
+    /// than adding a second one: two rows for one key would make "is this peer
+    /// pinned" answerable two ways.
+    pub fn pin(&mut self, row: PeerRow) {
+        self.peers.retain(|existing| existing.node != row.node);
+        self.peers.push(row);
+    }
+
+    /// Drop the row for `node` (`tcr peer forget`). Answers whether there was
+    /// one.
+    pub fn forget(&mut self, node: &PeerId) -> bool {
+        let before = self.peers.len();
+        self.peers.retain(|row| row.node != *node);
+        self.peers.len() != before
+    }
+
+    /// How many Macs this one pins.
+    pub fn pinned_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// The key of every pinned Mac, in file order: what a returning
+    /// handshake's pin check admits.
+    pub fn pinned_ids(&self) -> Vec<PeerId> {
+        self.peers.iter().map(|row| row.node).collect()
+    }
+
+    /// Every pinned Mac this one may ask to carry it (`allow.carry`), in file
+    /// order. `allow.gateway` is the other direction and is not read here.
+    pub fn carriers(&self) -> Vec<&PeerRow> {
+        self.peers.iter().filter(|row| row.allow.carry).collect()
+    }
+
+    /// Every pinned Mac that still holds `relay`, which is what `forget` does
+    /// NOT revoke. A surface that offers `forget` has to say this when the list
+    /// is not empty.
+    pub fn relay_holders(&self) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter(|row| row.allow.relay)
+            .map(|row| row.node)
+            .collect()
+    }
+
+    /// Every pinned Mac granted `control-drop`: the friends a dead drop
+    /// publishes for and fetches from.
+    pub fn drop_friends(&self) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter(|row| row.allow.control.drop)
+            .map(|row| row.node)
+            .collect()
+    }
+
+    /// What completed sessions left on each pinned row, in file order: its
+    /// key, its rendezvous secret, and the address it last said it sees this
+    /// Mac at, as written. A row may carry either, both, or neither.
+    pub fn session_memory(&self) -> Vec<(PeerId, Option<[u8; 32]>, Option<&str>)> {
+        self.peers
+            .iter()
+            .map(|row| {
+                (
+                    row.node,
+                    row.rendezvous_secret,
+                    row.sees_us_at.as_ref().map(|(seen, _)| seen.as_str()),
+                )
+            })
+            .collect()
+    }
+
+    /// Every direct address on every pinned row, in file order.
+    pub fn direct_addrs(&self) -> Vec<SocketAddr> {
+        self.peers
+            .iter()
+            .flat_map(|row| row.endpoints.iter())
+            .filter_map(Endpoint::direct_addr)
+            .collect()
+    }
+
+    /// The largest `max_inflight` any grant on any pinned row allows, or 0
+    /// with none.
+    pub fn largest_grant_inflight(&self) -> usize {
+        self.peers
+            .iter()
+            .flat_map(|row| row.lend.iter())
+            .map(|grant| usize::from(grant.max_inflight))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Reduce this node's own trusted rows to what a `NeighborBrief` may ever
+    /// say about them: the key and its endpoint locators, nothing this node
+    /// was told in confidence.
+    ///
+    /// The rule, verbatim: "friends through friends are not supported
+    /// unless you both support the same friend." A brief is useful only for a
+    /// Mac BOTH sides already trust, so this function's whole job is producing
+    /// one side of that: it reads the pinned rows, which are by construction
+    /// the set of keys this node already pinned, and there is no argument here
+    /// through which an unpinned or merely-discovered row could arrive.
+    ///
+    /// `exclude` is the peer this brief set is about to be sent TO. A brief
+    /// telling B about B is a line B already knows better than this node does,
+    /// so it is dropped here, the way `Hello.briefs`' own doc comment describes
+    /// split horizon: never back a fact out the link it would be re-advertised
+    /// on.
+    ///
+    /// `Caps::default()` on every entry, by decision and not by gap. A brief is
+    /// an address hint for a mutual friend, nothing more: the receiver's own
+    /// honest view of what that friend can do comes from connecting to the
+    /// friend directly and reading its `Hello`, which is the one place caps
+    /// are actually current. This node's own peers file records where a
+    /// trusted peer answers, not what it can do right now, so this has nothing
+    /// true to fill caps from, and inventing a value here would be a guess
+    /// dressed as a fact forwarded on a chain of trust the wire never promised
+    /// to keep fresh.
+    pub fn neighbor_briefs(&self, exclude: PeerId) -> Vec<tcr_peer_wire::NeighborBrief> {
+        self.peers
+            .iter()
+            .filter(|row| row.node != exclude)
+            .map(|row| tcr_peer_wire::NeighborBrief {
+                node: row.node,
+                caps: tcr_peer_wire::Caps::default(),
+                addrs: row
+                    .endpoints
+                    .iter()
+                    .filter_map(Endpoint::direct_addr)
+                    .map(|addr| addr.to_string())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Open a `tcr peer moved` link's sealed field with whichever pinned row's
+    /// key opens it, and answer that row and the record.
+    ///
+    /// A row with no shared secret has no key to try, and that is not an
+    /// error: its own doc says absent means no session has completed since the
+    /// key existed. Everything except "this key did not open it" was decided
+    /// either before any key was tried, which makes it the same for every row,
+    /// or after one opened the bytes, which makes it that row's own diagnosis.
+    /// Either way it outranks the quiet refusal and stops the walk.
+    pub fn open_moved_link(
+        &self,
+        field: &str,
+        now_s: u64,
+    ) -> std::result::Result<(&PeerRow, moved::MovedRecord), moved::MovedRefusal> {
+        let mut past_the_seal = None;
+        for row in &self.peers {
+            let Ok(keys) = moved::MovedKeys::for_row(row.rendezvous_secret.as_ref()) else {
+                continue;
+            };
+            match moved::open_link_field(&keys, &row.node, field, now_s) {
+                Ok(record) => return Ok((row, record)),
+                Err(moved::MovedRefusal::NotForThisMac) => continue,
+                Err(refusal) => {
+                    past_the_seal = Some(refusal);
+                    break;
+                }
+            }
+        }
+        Err(past_the_seal.unwrap_or(moved::MovedRefusal::NotForThisMac))
+    }
+
+    /// Take away every pinned row's lease on `window` and `scope`, and the
+    /// Sharing defaults record when it is for the same pair (`tcr peer share
+    /// on --fraction 0`). Answers how many leases went. `inspect` is left
+    /// exactly as it was, since removing a grant is not the moment to grant a
+    /// disclosure.
+    pub fn remove_share(&mut self, window: Window, scope: &LendScope) -> usize {
+        let mut removed = 0_usize;
+        for row in &mut self.peers {
+            let before = row.lend.len();
+            row.lend
+                .retain(|existing| !(existing.window == window && existing.scope == *scope));
+            removed += before - row.lend.len();
+        }
+        if self
+            .default_lend
+            .as_ref()
+            .is_some_and(|default| default.window == window && default.scope == *scope)
+        {
+            self.default_lend = None;
+        }
+        removed
+    }
+
+    /// The display id of every pinned Mac whose lease on `window` and `scope`
+    /// has already ended at `now_s`: the end `tcr peer share on` would keep,
+    /// and so refuses to.
+    pub fn ended_shares(&self, window: Window, scope: &LendScope, now_s: u64) -> Vec<String> {
+        self.peers
+            .iter()
+            .filter(|row| {
+                row.lend.iter().any(|existing| {
+                    existing.window == window
+                        && existing.scope == *scope
+                        && existing.has_ended(now_s)
+                })
+            })
+            .map(|row| row.node.display())
+            .collect()
+    }
+
+    /// Share with every pinned Mac (`tcr peer share on`): grant `inspect`, and
+    /// put `grant` in place of each row's lease on `window` and `scope`, then
+    /// record `grant` as the Sharing defaults.
+    ///
+    /// A hand grant, an end date and a daily window are decisions the operator
+    /// took per peer, so the lease being replaced keeps its mode, end and
+    /// schedule; `peer lend` carries the same rule. By (window, SCOPE): a Mac
+    /// may hold one lease per scope and turning sharing on with a scope must
+    /// not delete the others. A fresh id per row: a lease id is the handle for
+    /// ONE peer's lease, and two peers sharing one id would make `--revoke`
+    /// ambiguous.
+    ///
+    /// The defaults are a RECORD of what the Sharing defaults sheet shows,
+    /// never a second enforcement point. See [`Self::default_lend`].
+    pub fn share_with_all(
+        &mut self,
+        window: Window,
+        scope: &LendScope,
+        grant: &LendGrant,
+    ) -> Result<()> {
+        for row in &mut self.peers {
+            row.allow.inspect = true;
+            // What this row already granted on the same (window, scope), read
+            // BEFORE the retain below drops it.
+            let replacing = row
+                .lend
+                .iter()
+                .find(|existing| existing.window == window && existing.scope == *scope)
+                .map(|existing| {
+                    (
+                        existing.mode,
+                        existing.until,
+                        existing.between,
+                        existing.days.clone(),
+                    )
+                });
+            row.lend
+                .retain(|existing| !(existing.window == window && existing.scope == *scope));
+            let mut per_peer = grant.clone();
+            if let Some((mode, until, between, days)) = replacing {
+                per_peer.mode = mode;
+                per_peer.until = until;
+                per_peer.between = between;
+                per_peer.days = days;
+            }
+            per_peer.id = 0;
+            per_peer.ensure_id()?;
+            row.lend.push(per_peer);
+        }
+        let mut default = grant.clone();
+        default.id = 0;
+        self.default_lend = Some(default);
+        Ok(())
+    }
+
+    /// Stop sharing with every pinned Mac (`tcr peer share off`): no
+    /// `inspect`, and no lease.
+    pub fn stop_sharing(&mut self) {
+        for row in &mut self.peers {
+            row.allow.inspect = false;
+            row.lend.clear();
+        }
+    }
+
+    /// Derive every grant's [`LendGrant::ended`] against `now_s`.
+    fn derive_ends(&mut self, now_s: u64) {
+        for row in &mut self.peers {
+            for grant in &mut row.lend {
+                grant.ended = grant.has_ended(now_s);
+            }
+        }
+    }
+
+    /// A copy of every pinned row, with every grant's [`LendGrant::ended`]
+    /// derived against `now_s`.
+    fn rows_at(&self, now_s: u64) -> Vec<PeerRow> {
+        self.peers
+            .iter()
+            .cloned()
+            .map(|row| row.with_derived_ends(now_s))
+            .collect()
+    }
+
+    /// Give every grant on its way to disk an id if it has none. See [`save`].
+    fn ensure_lease_ids(&mut self) -> Result<()> {
+        for row in &mut self.peers {
+            for grant in &mut row.lend {
+                grant.ensure_id()?;
+            }
+        }
+        if let Some(default) = self.default_lend.as_mut() {
+            default.ensure_id()?;
+        }
+        Ok(())
+    }
 }
 
 /// How many endpoints one row keeps. Oldest are dropped first, so a peer that
@@ -1503,7 +1815,7 @@ pub fn observe_endpoints(path: &Path, peer: &PeerId, endpoints: &[Endpoint]) -> 
     }
     let _lock = FileLock::acquire(path)?;
     let mut file = read_or_default(path)?;
-    let Some(row) = file.peers.iter_mut().find(|row| &row.node == peer) else {
+    let Some(row) = file.row_mut(peer) else {
         return Ok(Observed::NoRow);
     };
     let added = endpoints.len();
@@ -1617,7 +1929,7 @@ fn announced_port(addrs: &[String]) -> Option<u16> {
 pub fn observe_rendezvous_secret(path: &Path, peer: &PeerId, secret: [u8; 32]) -> Result<bool> {
     let _lock = FileLock::acquire(path)?;
     let mut file = read_or_default(path)?;
-    let Some(row) = file.peers.iter_mut().find(|row| &row.node == peer) else {
+    let Some(row) = file.row_mut(peer) else {
         return Ok(false);
     };
     if row.rendezvous_secret == Some(secret) {
@@ -1661,7 +1973,7 @@ pub fn observe_seen_address(
     }
     let _lock = FileLock::acquire(path)?;
     let mut file = read_or_default(path)?;
-    let Some(row) = file.peers.iter_mut().find(|row| &row.node == peer) else {
+    let Some(row) = file.row_mut(peer) else {
         return Ok(false);
     };
     let seen = addr.to_string();
@@ -2575,11 +2887,7 @@ impl PeerStore {
         self.file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .peers
-            .iter()
-            .cloned()
-            .map(|row| row.with_derived_ends(now_s))
-            .collect()
+            .rows_at(now_s)
     }
 
     /// The row for one peer, or `None` when it is not pinned, which is the
@@ -2589,9 +2897,7 @@ impl PeerStore {
         self.file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .peers
-            .iter()
-            .find(|row| &row.node == node)
+            .row(node)
             .cloned()
             .map(|row| row.with_derived_ends(now_s))
     }
@@ -2622,11 +2928,7 @@ impl PeerStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        file.peers = file
-            .peers
-            .into_iter()
-            .map(|row| row.with_derived_ends(now_s))
-            .collect();
+        file.derive_ends(now_s);
         file
     }
 
@@ -2658,12 +2960,7 @@ pub fn read_or_default(path: &Path) -> Result<PeerFile> {
             // every surface reads one answer to "has this lease ended", and a
             // CLI that read `ended` off the file would read whatever was last
             // written there.
-            let now_s = now_unix_secs();
-            for row in &mut file.peers {
-                for grant in &mut row.lend {
-                    grant.ended = grant.has_ended(now_s);
-                }
-            }
+            file.derive_ends(now_unix_secs());
             Ok(file)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(PeerFile::default()),
@@ -2795,14 +3092,7 @@ impl Drop for FileLock {
 /// hand out a different id per read, which is the same as no handle at all.
 pub fn save(path: &Path, file: &PeerFile) -> Result<()> {
     let mut file = file.clone();
-    for row in &mut file.peers {
-        for grant in &mut row.lend {
-            grant.ensure_id()?;
-        }
-    }
-    if let Some(default) = file.default_lend.as_mut() {
-        default.ensure_id()?;
-    }
+    file.ensure_lease_ids()?;
     let json = serde_json::to_string_pretty(&file)?;
     crate::config::write_atomic(path, &json)?;
     Ok(())
@@ -3528,5 +3818,78 @@ mod tests {
         assert!(drop.clear_store());
         assert!(!drop.clear_store(), "a second clear finds nothing");
         assert!(!drop.is_live());
+    }
+
+    fn bare_row(node: u8, addr: &str) -> PeerRow {
+        PeerRow {
+            node: PeerId([node; 32]),
+            label: format!("mac-{node}"),
+            endpoints: vec![Endpoint::direct(
+                addr.parse().expect("a literal address"),
+                0,
+                EndpointSource::Paired,
+            )],
+            added_at: 0,
+            allow: Allow::default(),
+            lend: Vec::new(),
+            rendezvous_secret: None,
+            sees_us_at: None,
+        }
+    }
+
+    /// The row operations select the rows their grant names and no other: a
+    /// carrier is the row with `carry`, a relay holder the one with `relay`, a
+    /// drop friend the one with `control-drop`, and a re-pin replaces rather
+    /// than adds.
+    #[test]
+    fn the_row_operations_select_by_the_grant_they_name() {
+        let mut file = PeerFile::default();
+        let mut carrier = bare_row(1, "192.0.2.1:7755");
+        carrier.allow.carry = true;
+        let mut relay = bare_row(2, "192.0.2.2:7755");
+        relay.allow.relay = true;
+        relay.rendezvous_secret = Some([9; 32]);
+        let mut friend = bare_row(3, "192.0.2.3:7755");
+        friend.allow.control.drop = true;
+        friend.lend = vec![LendGrant::new(Window::FiveHour, 0.1, 300, 6)];
+        file.pin(carrier.clone());
+        file.pin(relay);
+        file.pin(friend);
+
+        let carriers: Vec<PeerId> = file.carriers().iter().map(|row| row.node).collect();
+        assert_eq!(carriers, vec![PeerId([1; 32])]);
+        assert_eq!(file.relay_holders(), vec![PeerId([2; 32])]);
+        assert_eq!(file.drop_friends(), vec![PeerId([3; 32])]);
+        assert_eq!(file.largest_grant_inflight(), 6);
+        assert_eq!(
+            file.session_memory()
+                .into_iter()
+                .filter_map(|(node, secret, _)| secret.map(|_| node))
+                .collect::<Vec<_>>(),
+            vec![PeerId([2; 32])]
+        );
+        assert_eq!(file.direct_addrs().len(), 3);
+        let briefs = file.neighbor_briefs(PeerId([1; 32]));
+        assert_eq!(
+            briefs.iter().map(|brief| brief.node).collect::<Vec<_>>(),
+            vec![PeerId([2; 32]), PeerId([3; 32])],
+            "a brief set never names the Mac it is sent to"
+        );
+
+        let mut relabelled = carrier;
+        relabelled.label = "renamed".to_string();
+        file.pin(relabelled);
+        assert_eq!(file.pinned_count(), 3, "a re-pin replaces the row");
+        assert_eq!(
+            file.row(&PeerId([1; 32])).map(|row| row.label.as_str()),
+            Some("renamed")
+        );
+        assert!(file.forget(&PeerId([1; 32])));
+        assert!(
+            !file.forget(&PeerId([1; 32])),
+            "a second forget finds nothing"
+        );
+        assert!(file.carriers().is_empty());
+        assert_eq!(file.pinned_ids(), vec![PeerId([2; 32]), PeerId([3; 32])]);
     }
 }

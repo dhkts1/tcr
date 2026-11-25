@@ -232,12 +232,8 @@ pub fn allowed_dial_ports(file: &crate::peer::config::PeerFile) -> std::collecti
     if let Some(listen) = file.listen {
         ports.insert(listen.port());
     }
-    for row in &file.peers {
-        for endpoint in &row.endpoints {
-            if let Some(addr) = endpoint.direct_addr() {
-                ports.insert(addr.port());
-            }
-        }
+    for addr in file.direct_addrs() {
+        ports.insert(addr.port());
     }
     ports
 }

@@ -101,7 +101,7 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
     let peer_id = parse_peer_arg("peer moved", target)?;
 
     let file = peer::config::read_or_default(peers_path)?;
-    let Some(row) = file.peers.iter().find(|row| row.node == peer_id) else {
+    let Some(row) = file.row(&peer_id) else {
         anyhow::bail!(
             "peer moved: that Mac is not pinned here, and a link for one this Mac does not \
              trust would have no key to be sealed under (`tcr peer ls` lists the pinned ones)"
@@ -244,41 +244,17 @@ fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
     let now_ms = peer::state::now_ms();
     let file = peer::config::read_or_default(peers_path)?;
 
-    let mut opened = None;
-    let mut past_the_seal = None;
-    for row in &file.peers {
-        // A row with no shared secret has no key to try, and that is not an
-        // error: its own doc says absent means no session has completed since
-        // the key existed.
-        let Ok(keys) = peer::config::moved::MovedKeys::for_row(row.rendezvous_secret.as_ref())
-        else {
-            continue;
-        };
-        match peer::config::moved::open_link_field(&keys, &row.node, field, now_s) {
-            Ok(record) => {
-                opened = Some((row, record));
-                break;
-            }
-            // Everything except "this key did not open it" was decided either
-            // before any key was tried, which makes it the same for every row,
-            // or after one opened the bytes, which makes it that row's own
-            // diagnosis. Either way it outranks the quiet refusal and stops the
-            // walk.
-            Err(peer::config::moved::MovedRefusal::NotForThisMac) => continue,
-            Err(refusal) => {
-                past_the_seal = Some(refusal);
-                break;
-            }
+    // Every pinned row's key is tried in turn; see `PeerFile::open_moved_link`
+    // for which refusal wins.
+    let (row, record) = match file.open_moved_link(field, now_s) {
+        Ok(opened) => opened,
+        Err(refusal) => {
+            println!(
+                "peer moved: nothing was written and no row was created; a link only ever \
+                 adds an address to a Mac this one already pins"
+            );
+            return Err(anyhow::anyhow!("{refusal}"));
         }
-    }
-
-    let Some((row, record)) = opened else {
-        let refusal = past_the_seal.unwrap_or(peer::config::moved::MovedRefusal::NotForThisMac);
-        println!(
-            "peer moved: nothing was written and no row was created; a link only ever adds \
-             an address to a Mac this one already pins"
-        );
-        return Err(anyhow::anyhow!("{refusal}"));
     };
 
     let label = masked_label(&row.label);

@@ -117,10 +117,10 @@ SPEC
 
 probe enrolment_writes_nothing --test=it \
   peer_noise::a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides src/peer/pair.rs <<'SPEC'
-    file.peers.push(row.clone());
+    file.pin(row.clone());
     save(peers_path, &file)?;
 @@@
-    file.peers.push(row.clone());
+    file.pin(row.clone());
 SPEC
 
 probe invite_not_spent --test=it \

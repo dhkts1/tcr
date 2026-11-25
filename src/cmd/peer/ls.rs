@@ -186,7 +186,7 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
             .chain(found_rows.iter().cloned().map(status::PeerLsPeer::Found))
             .collect();
         let file = store.file();
-        let exits = peer_ls_exits(&config_accounts, &file.peers, &state, peer::state::now_ms());
+        let exits = peer_ls_exits(&config_accounts, &file, &state, peer::state::now_ms());
         let out = status::PeerLsJson {
             supported: true,
             peers,
@@ -336,7 +336,7 @@ fn peer_ls_inert_exit_lines(accounts: &[config::Account]) -> Vec<String> {
 
 fn peer_ls_exits(
     accounts: &[config::Account],
-    peers: &[peer::config::PeerRow],
+    file: &peer::config::PeerFile,
     state: &peer::state::PeerState,
     now_ms: i64,
 ) -> std::collections::BTreeMap<String, status::PeerExitJson> {
@@ -356,9 +356,9 @@ fn peer_ls_exits(
         let (peer_down, waiting_seconds) = match pin.egress.peer() {
             None => (false, None),
             Some(peer) => {
-                let reachable = peers
-                    .iter()
-                    .any(|row| row.node == peer && row.has_endpoint());
+                let reachable = file
+                    .row(&peer)
+                    .is_some_and(peer::config::PeerRow::has_endpoint);
                 let waited = state
                     .last_seen_of(peer)
                     .and_then(|at| u64::try_from(now_ms.saturating_sub(at).max(0) / 1_000).ok());

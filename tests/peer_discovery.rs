@@ -654,7 +654,7 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
 // ---------------------------------------------------------------------------
 
 /// A share brief naming `node` at `addr`, the whole of what
-/// [`discovery::neighbor_briefs`] is allowed to put in one.
+/// [`tcr::peer::config::PeerFile::neighbor_briefs`] is allowed to put in one.
 fn brief(node: PeerId, addr: std::net::SocketAddr) -> tcr_peer_wire::NeighborBrief {
     tcr_peer_wire::NeighborBrief {
         node,

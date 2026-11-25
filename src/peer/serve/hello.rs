@@ -85,7 +85,7 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
 
     let file = store.file();
     let mut facts = NodeFacts::listening(key.id(), file.listen);
-    facts.briefs = crate::peer::discovery::neighbor_briefs(&file.peers, *peer);
+    facts.briefs = file.neighbor_briefs(*peer);
     // Deliberately NOT set on this side. `observed_you_at` means "the source
     // address your packets arrived from", which only the accepting end
     // observes; what a dialler holds is the address it CHOSE to dial, and

@@ -217,7 +217,7 @@ where
             &addr,
             pattern,
             &message_1,
-            &file.peers,
+            &file.pinned_ids(),
             &psks,
             &peer_state,
             now,
@@ -554,7 +554,7 @@ where
     // connection opens the file once (the review's L2).
     store.reload_if_changed();
     let file = store.file();
-    let row = file.peers.iter().find(|row| row.node == session.peer);
+    let row = file.row(&session.peer);
     peer_stream_gate_rows(&header, row).map_err(anyhow::Error::new)?;
     peer_stream_gate_hop(&context.node, &header, &mut dedup, now_ms())
         .map_err(anyhow::Error::new)?;
@@ -795,7 +795,7 @@ where
     .await?;
 
     let mut facts = NodeFacts::listening(context.node, store.file().listen);
-    facts.briefs = crate::peer::discovery::neighbor_briefs(&store.file().peers, session.peer);
+    facts.briefs = store.file().neighbor_briefs(session.peer);
     let hello = hello_for_peer(&facts, &row.allow.control);
     let bytes = serde_json::to_vec(&Control::Hello(hello))
         .context("peer enrol: the acknowledging Hello did not serialize")?;
@@ -891,7 +891,7 @@ where
 
     store.reload_if_changed();
     let file = store.file();
-    let Some(row) = file.peers.iter().find(|row| row.node == session.peer) else {
+    let Some(row) = file.row(&session.peer) else {
         // Forgotten mid-session. The next frame closes the stream; this one
         // just does not renew, which IS the revoke.
         return Ok(());
@@ -1027,7 +1027,7 @@ where
         // not change (the review's L2).
         store.reload_if_changed();
         let file = store.file();
-        let Some(row) = file.peers.iter().find(|row| row.node == session.peer) else {
+        let Some(row) = file.row(&session.peer) else {
             bail!(
                 "peer control: this peer is no longer pinned; closing the live session \
                  (`tcr peer forget` takes effect within one frame)"
@@ -1179,8 +1179,7 @@ where
                     ),
                 }
                 let mut facts = NodeFacts::listening(context.node, store.file().listen);
-                facts.briefs =
-                    crate::peer::discovery::neighbor_briefs(&store.file().peers, session.peer);
+                facts.briefs = store.file().neighbor_briefs(session.peer);
                 facts.observed_peer_at = origin.observed_socket();
                 if facts.observed_peer_at.is_none() {
                     tracing::debug!(

@@ -90,7 +90,7 @@ pub async fn publish_for<S: DeadDropStore + Sync>(
 ) -> Result<bool> {
     let file = crate::peer::config::read_or_default(peers_path)
         .context("dead drop: the peers file did not read, so nothing was published")?;
-    let Some(row) = file.peers.iter().find(|row| &row.node == friend) else {
+    let Some(row) = file.row(friend) else {
         return Ok(false);
     };
     if !row.allow.control.drop {
@@ -189,7 +189,7 @@ pub async fn fetch_for<S: DeadDropStore + Sync>(
 
     let file = crate::peer::config::read_or_default(peers_path)
         .context("dead drop: the peers file did not read, so nothing was fetched")?;
-    let Some(row) = file.peers.iter().find(|row| &row.node == friend) else {
+    let Some(row) = file.row(friend) else {
         return Ok(Vec::new());
     };
     let Some(secret) = row.rendezvous_secret else {
@@ -280,12 +280,7 @@ pub async fn keep_drops_published<S: DeadDropStore + Sync>(
 
         let now_ms = crate::now_ms().max(0);
         let now_s = u64::try_from(now_ms / 1_000).unwrap_or(0);
-        let friends: Vec<PeerId> = file
-            .peers
-            .iter()
-            .filter(|row| row.allow.control.drop)
-            .map(|row| row.node)
-            .collect();
+        let friends: Vec<PeerId> = file.drop_friends();
         for friend in friends {
             if let Err(err) = publish_for(&store, &peers_path, &us, &friend, listen, now_s).await {
                 tracing::warn!(

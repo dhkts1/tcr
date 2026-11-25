@@ -663,7 +663,7 @@ fn spawn_browse(
                             discovery::tailnet_beacon(port, name.as_deref(), network_key.as_ref());
                         socket.send(&own_macs, &beacon).await;
                         scan.extend(intake.take(&own_macs));
-                        tailnet_peers = tailnet_find::pinned_peers(status, &file.peers);
+                        tailnet_peers = tailnet_find::pinned_peers(status, &file.direct_addrs());
                     }
                 } else {
                     // Off, node, or a read that failed: no reading to trust,

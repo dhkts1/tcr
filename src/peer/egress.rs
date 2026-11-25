@@ -195,9 +195,8 @@ pub fn resolve_via(setting: &ViaSetting, candidates: &[GatewayCandidate]) -> Vec
 /// is the separate grant that fixes it: this filter reads that field, and the
 /// CLI (`tcr peer allow <peer> carry`) is the act that sets it.
 pub fn candidates_from(file: &PeerFile, last_seen: &[(PeerId, i64)]) -> Vec<GatewayCandidate> {
-    file.peers
-        .iter()
-        .filter(|row| row.allow.carry)
+    file.carriers()
+        .into_iter()
         .map(|row| GatewayCandidate {
             row: row.clone(),
             last_seen_ms: last_seen
@@ -1213,9 +1212,7 @@ async fn pinned_carry(
     let file = crate::peer::config::read_or_default(attempt.peers_path)
         .map_err(|_| unreachable(PinnedPeerGap::NotPinned))?;
     let row = file
-        .peers
-        .iter()
-        .find(|row| row.node == peer)
+        .row(&peer)
         .ok_or_else(|| unreachable(PinnedPeerGap::NotPinned))?;
     if !row.allow.carry {
         return Err(unreachable(PinnedPeerGap::NoCarryGrant));

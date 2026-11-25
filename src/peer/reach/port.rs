@@ -103,9 +103,9 @@ pub fn accepted_ports(secret: &[u8; 32], slot: u64) -> [u16; 3] {
 /// or nothing has completed a session with that peer yet.
 pub fn restore_from_peers(file: &crate::peer::config::PeerFile) -> usize {
     let mut restored = 0;
-    for row in &file.peers {
-        if let Some(secret) = row.rendezvous_secret {
-            remember_port_secret(row.node, secret);
+    for (node, secret, seen) in file.session_memory() {
+        if let Some(secret) = secret {
+            remember_port_secret(node, secret);
             restored += 1;
         }
         // The reflexive half, on the same pass and counted separately below by
@@ -113,11 +113,11 @@ pub fn restore_from_peers(file: &crate::peer::config::PeerFile) -> usize {
         // that restored one and not the other would report a number that is
         // true of neither. What the count means is "rows that had something to
         // restore", which is what the boot line says.
-        if let Some((seen, _)) = row.sees_us_at.as_ref() {
+        if let Some(seen) = seen {
             match seen.parse::<SocketAddr>() {
-                Ok(addr) => remember_observed_self(row.node, addr),
+                Ok(addr) => remember_observed_self(node, addr),
                 Err(err) => tracing::debug!(
-                    peer = %row.node.display(),
+                    peer = %node.display(),
                     seen = %seen,
                     error = %err,
                     "peer reach: the address on this row is not a socket address; ignoring it"

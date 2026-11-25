@@ -553,9 +553,7 @@ pub async fn dial_peer_reaching_within(
                             // may see nothing new.
                             match crate::peer::config::read_or_default(store.path()) {
                                 Ok(fresh_file) => {
-                                    if let Some(fresh) =
-                                        fresh_file.peers.iter().find(|r| r.node == row.node)
-                                    {
+                                    if let Some(fresh) = fresh_file.row(&row.node) {
                                         // The addresses the drop just taught are
                                         // dialled as their own ranked band among
                                         // the direct candidates, not as a second
@@ -746,9 +744,8 @@ pub fn forwarders_for(target: &PeerId, store: &PeerStore) -> Vec<PeerId> {
     let file = store.file();
     let last_seen = last_seen_by_peer(store);
     let mut chosen: Vec<&PeerRow> = file
-        .peers
-        .iter()
-        .filter(|row| row.allow.carry)
+        .carriers()
+        .into_iter()
         .filter(|row| row.node != *target)
         .filter(|row| row.endpoints.iter().any(|end| end.direct_addr().is_some()))
         .collect();

@@ -836,55 +836,11 @@ pub fn observe_beacons(
 // Neighbour briefs: what a trusted peer's `Hello.briefs` may teach this node
 // ---------------------------------------------------------------------------
 
-/// Reduce this node's own trusted rows to what a `NeighborBrief` may ever say
-/// about them: the key and its endpoint locators, nothing this node was told
-/// in confidence.
-///
-/// The rule, verbatim: "friends through friends are not supported
-/// unless you both support the same friend." A brief is useful only for a Mac
-/// BOTH sides already trust, so this function's whole job is producing one
-/// side of that: it reads `trusted`, which is by construction the set of keys
-/// this node already pinned, and there is no argument here through which an
-/// unpinned or merely-discovered row could arrive.
-///
-/// `exclude` is the peer this brief set is about to be sent TO. A brief
-/// telling B about B is a line B already knows better than this node does, so
-/// it is dropped here, the way `Hello.briefs`' own doc comment describes
-/// split horizon: never back a fact out the link it would be re-advertised
-/// on.
-///
-/// `Caps::default()` on every entry, by decision and not by gap. A brief is an
-/// address hint for a mutual friend, nothing more: the receiver's own honest
-/// view of what that friend can do comes from connecting to the friend
-/// directly and reading its `Hello`, which is the one place caps are actually
-/// current. This node's own peers file records where a trusted peer answers,
-/// not what it can do right now, so `neighbor_briefs` has nothing true to fill
-/// caps from, and inventing a value here would be a guess dressed as a fact
-/// forwarded on a chain of trust the wire never promised to keep fresh.
-pub fn neighbor_briefs(
-    trusted: &[PeerRow],
-    exclude: tcr_peer_wire::PeerId,
-) -> Vec<tcr_peer_wire::NeighborBrief> {
-    trusted
-        .iter()
-        .filter(|row| row.node != exclude)
-        .map(|row| tcr_peer_wire::NeighborBrief {
-            node: row.node,
-            caps: tcr_peer_wire::Caps::default(),
-            addrs: row
-                .endpoints
-                .iter()
-                .filter_map(Endpoint::direct_addr)
-                .map(|addr| addr.to_string())
-                .collect(),
-        })
-        .collect()
-}
-
 /// The endpoints one incoming `Hello.briefs` teaches this node, about peers it
 /// already pinned, and nothing about anyone else.
 ///
-/// This is the enforcement half of that rule. The filter is the whole
+/// This is the enforcement half of the rule
+/// [`crate::peer::config::PeerFile::neighbor_briefs`] quotes. The filter is the whole
 /// of the rule, and it runs before a brief entry is anything but a local
 /// variable: `pinned.iter().any(...)` is checked first, so a brief naming a
 /// key this node has not pinned never reaches a socket address, a log line

@@ -394,7 +394,7 @@ async fn a_completed_return_visit_registers_the_pairs_rendezvous_secret() {
 /// **A `Hello` carries a brief about a mutual friend, over the shipped accept
 /// loop, and the far side records it.**
 ///
-/// The unit gate for the brief wiring. `discovery::neighbor_briefs` and
+/// The unit gate for the brief wiring. `PeerFile::neighbor_briefs` and
 /// `observe_neighbor_briefs` have tests of their own, and those tests call
 /// both functions directly: they stay green with every call site deleted,
 /// which was the state of this tree before this fix, the field on the wire

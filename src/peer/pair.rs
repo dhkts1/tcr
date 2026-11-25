@@ -66,8 +66,8 @@ use tcr_peer_wire::{Control, Enroll, PeerId, StreamHeader, StreamKind, sanitize_
 
 use crate::peer::config::join_key::{JoinToken, KEY_PREFIX};
 use crate::peer::config::{
-    ControlGrants, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore, PendingInvite,
-    read_or_default, save,
+    ControlGrants, Endpoint, EndpointSource, PeerRow, PeerStore, PendingInvite, read_or_default,
+    save,
 };
 use crate::peer::id::KEY_BYTES;
 use crate::peer::id::{NodeKey, default_config_dir};
@@ -346,8 +346,7 @@ pub fn accept_enrolment(
     }
     // A re-enrolment of a key already pinned replaces the row rather than
     // adding a second one, for the reason `pin_row` documents.
-    file.peers.retain(|existing| existing.node != joiner);
-    file.peers.push(row.clone());
+    file.pin(row.clone());
     save(peers_path, &file)?;
 
     tracing::info!(
@@ -886,9 +885,7 @@ pub fn confirm(
 pub fn forget(store: &PeerStore, peer: &PeerId) -> Result<bool> {
     let _lock = crate::peer::config::FileLock::acquire(store.path())?;
     let mut file = read_or_default(store.path())?;
-    let before = file.peers.len();
-    file.peers.retain(|row| row.node != *peer);
-    let removed = file.peers.len() != before;
+    let removed = file.forget(peer);
     if removed {
         save(store.path(), &file)?;
         // The row is gone from the file; the process may still hold this pair's
@@ -903,17 +900,6 @@ pub fn forget(store: &PeerStore, peer: &PeerId) -> Result<bool> {
         );
     }
     Ok(removed)
-}
-
-/// Every peer that still holds `relay`, which is what `forget` does NOT
-/// revoke. A surface that offers `forget` has to say this when the list is not
-/// empty.
-pub fn peers_still_holding_relay(file: &PeerFile) -> Vec<PeerId> {
-    file.peers
-        .iter()
-        .filter(|row| row.allow.relay)
-        .map(|row| row.node)
-        .collect()
 }
 
 /// Write or replace one pinned row, leaving every grant at its default: a bare
@@ -949,8 +935,7 @@ fn pin_row(
     // A re-pin of the same key replaces the row rather than adding a second
     // one: two rows for one key would make "is this peer pinned" answerable
     // two ways.
-    file.peers.retain(|existing| existing.node != peer);
-    file.peers.push(row.clone());
+    file.pin(row.clone());
     save(store.path(), &file)?;
     Ok(row)
 }

@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
-use crate::peer::config::{Locator, PeerRow, TailnetMode};
+use crate::peer::config::TailnetMode;
 use crate::peer::discovery::{self, Discovered};
 use crate::peer::state::{TailnetPeer, TailnetRecord, TailnetRoute, TailnetState};
 use crate::peer::tailscale_app::{self, ReadError, Route, Status};
@@ -296,19 +296,13 @@ pub fn write_held(
     Ok(true)
 }
 
-/// The machines in `status` holding an address that some row in `rows` has
-/// as a direct endpoint, with how the app reaches each. Only those: the rest
+/// The machines in `status` holding an address that a pinned row has as a
+/// direct endpoint (`pinned`, [`crate::peer::config::PeerFile::direct_addrs`]),
+/// with how the app reaches each. Only those: the rest
 /// of a shared tailnet is other people's machines and has no business in
 /// this Mac's state file.
-pub fn pinned_peers(status: &Status, rows: &[PeerRow]) -> Vec<TailnetPeer> {
-    let hosts: Vec<IpAddr> = rows
-        .iter()
-        .flat_map(|row| row.endpoints.iter())
-        .filter_map(|endpoint| match endpoint.locator {
-            Locator::Direct { addr } => Some(addr.ip().to_canonical()),
-            Locator::Via { .. } | Locator::Reverse { .. } => None,
-        })
-        .collect();
+pub fn pinned_peers(status: &Status, pinned: &[SocketAddr]) -> Vec<TailnetPeer> {
+    let hosts: Vec<IpAddr> = pinned.iter().map(|addr| addr.ip().to_canonical()).collect();
     status
         .peers
         .iter()
@@ -397,7 +391,7 @@ impl BeaconSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::config::{Endpoint, EndpointSource};
+    use crate::peer::config::{Endpoint, EndpointSource, PeerFile, PeerRow};
     use crate::peer::state::FoundSource;
     use tcr_peer_wire::{INSTANCE_ID_BYTES, InstanceId};
 
@@ -649,7 +643,9 @@ mod tests {
                 EndpointSource::Hello,
             ),
         ];
-        let peers = pinned_peers(&status(), &[row]);
+        let mut file = PeerFile::default();
+        file.pin(row);
+        let peers = pinned_peers(&status(), &file.direct_addrs());
         assert_eq!(peers.len(), 1, "{peers:?}");
         assert_eq!(peers[0].route, Some(TailnetRoute::Direct));
         assert!(peers[0].addresses.contains(&ip("100.64.0.2")));

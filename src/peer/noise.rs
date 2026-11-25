@@ -644,13 +644,30 @@ pub fn pin_check(remote_static: &[u8], store: &PeerStore) -> Result<PeerId, PinR
 /// real file. [`pin_check`] is this function plus one read, and there is one
 /// implementation of the comparison.
 pub fn pin_check_rows(remote_static: &[u8], rows: &[PeerRow]) -> Result<PeerId, PinRefusal> {
+    pin_check_by(remote_static, |offered| {
+        rows.iter().any(|row| row.node == *offered)
+    })
+}
+
+/// [`pin_check_rows`] against the pinned keys alone
+/// ([`crate::peer::config::PeerFile::pinned_ids`]), for a check that runs
+/// after the file it read them from is gone.
+pub fn pin_check_ids(remote_static: &[u8], pinned: &[PeerId]) -> Result<PeerId, PinRefusal> {
+    pin_check_by(remote_static, |offered| pinned.contains(offered))
+}
+
+/// The one comparison both pin checks make: a 32-byte static, and pinned.
+fn pin_check_by(
+    remote_static: &[u8],
+    pinned: impl Fn(&PeerId) -> bool,
+) -> Result<PeerId, PinRefusal> {
     let Ok(key) = <[u8; KEY_BYTES]>::try_from(remote_static) else {
         return Err(PinRefusal::Malformed {
             len: remote_static.len(),
         });
     };
     let offered = PeerId(key);
-    if rows.iter().any(|row| row.node == offered) {
+    if pinned(&offered) {
         Ok(offered)
     } else {
         Err(PinRefusal::NotPinned {

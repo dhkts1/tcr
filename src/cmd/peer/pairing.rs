@@ -433,7 +433,7 @@ pub(super) fn run_peer_forget(a: peer_cli::PeerForgetArgs) -> anyhow::Result<()>
          live session with it closes within one frame"
     );
     let file = tcr::peer::config::read_or_default(&path)?;
-    let relays = tcr::peer::pair::peers_still_holding_relay(&file);
+    let relays = file.relay_holders();
     if !relays.is_empty() {
         println!(
             "peer forget: WARNING this does NOT revoke egress still reachable through \

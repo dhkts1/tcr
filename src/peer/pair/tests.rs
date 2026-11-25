@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use tcr_peer_wire::Crockford;
 
 use super::*;
+use crate::peer::config::PeerFile;
 use crate::peer::config::join_key::{
     DialAddress, DialAddressKind, TOKEN_PREFIX, TOKEN_PREFIX_V2, TOKEN_PREFIX_V3,
 };

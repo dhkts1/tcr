@@ -13,7 +13,7 @@ use super::{lock_peers_file, parse_peer_arg, peer_window_name, print_listen_writ
 pub(super) fn run_peer_share(a: peer_cli::PeerSwitchArgs) -> anyhow::Result<()> {
     let peers_path = a.peers.path();
     let (_lock, mut file) = lock_peers_file(&peers_path)?;
-    if file.peers.is_empty() {
+    if file.pinned_count() == 0 {
         println!(
             "peer share: no peers are pinned, so there is nobody to share with \
              (`tcr peer pair <host:port>` or `tcr peer invite` first)"
@@ -32,20 +32,7 @@ pub(super) fn run_peer_share(a: peer_cli::PeerSwitchArgs) -> anyhow::Result<()> 
             // capability. `inspect` is left exactly as it was, since
             // removing a grant is not the moment to grant a disclosure.
             if a.fraction <= 0.0 {
-                let mut removed = 0_usize;
-                for row in &mut file.peers {
-                    let before = row.lend.len();
-                    row.lend
-                        .retain(|existing| !(existing.window == window && existing.scope == scope));
-                    removed += before - row.lend.len();
-                }
-                if file
-                    .default_lend
-                    .as_ref()
-                    .is_some_and(|default| default.window == window && default.scope == scope)
-                {
-                    file.default_lend = None;
-                }
+                let removed = file.remove_share(window, &scope);
                 peer::config::save(&peers_path, &file)?;
                 println!(
                     "peer share: removed leases={removed} scope={scope} window={}",
@@ -80,18 +67,7 @@ pub(super) fn run_peer_share(a: peer_cli::PeerSwitchArgs) -> anyhow::Result<()> 
             // removes it lends past a deadline somebody meant.
             let now_s =
                 u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
-            let closed: Vec<String> = file
-                .peers
-                .iter()
-                .filter(|row| {
-                    row.lend.iter().any(|existing| {
-                        existing.window == window
-                            && existing.scope == scope
-                            && existing.has_ended(now_s)
-                    })
-                })
-                .map(|row| row.node.display())
-                .collect();
+            let closed: Vec<String> = file.ended_shares(window, &scope, now_s);
             if !closed.is_empty() {
                 anyhow::bail!(
                     "peer share: the grant this would keep the end of has already \
@@ -105,56 +81,11 @@ pub(super) fn run_peer_share(a: peer_cli::PeerSwitchArgs) -> anyhow::Result<()> 
             }
             let mut grant = peer_lend_grant(window, a.fraction, a.ttl, a.max_inflight)?;
             grant.scope = scope.clone();
-            for row in &mut file.peers {
-                row.allow.inspect = true;
-                // What this row already granted on the same (window,
-                // scope), read BEFORE the retain below drops it.
-                //
-                // A hand grant, an end date and a daily window are
-                // decisions the operator took per peer, and this verb
-                // used to overwrite all three with `LendGrant::new`'s
-                // defaults: mode serve, no end, no schedule. Turning a
-                // hand grant into a serve grant is a different
-                // disclosure than the one that was taken, and it
-                // happened silently. `peer lend` already carries the
-                // same rule and says why.
-                let replacing = row
-                    .lend
-                    .iter()
-                    .find(|existing| existing.window == window && existing.scope == scope)
-                    .map(|existing| {
-                        (
-                            existing.mode,
-                            existing.until,
-                            existing.between,
-                            existing.days.clone(),
-                        )
-                    });
-                // By (window, SCOPE), for the reason `peer lend` gives:
-                // a Mac may hold one lease per scope and turning
-                // sharing on with a scope must not delete the others.
-                row.lend
-                    .retain(|existing| !(existing.window == window && existing.scope == scope));
-                // A fresh id per row: a lease id is the handle for ONE
-                // peer's lease, and two peers sharing one id would make
-                // `--revoke` ambiguous.
-                let mut per_peer = grant.clone();
-                if let Some((mode, until, between, days)) = replacing {
-                    per_peer.mode = mode;
-                    per_peer.until = until;
-                    per_peer.between = between;
-                    per_peer.days = days;
-                }
-                per_peer.id = 0;
-                per_peer.ensure_id()?;
-                row.lend.push(per_peer);
-            }
-            // What the Sharing defaults sheet shows. A RECORD of the
-            // defaults, never a second enforcement point. See
-            // `PeerFile::default_lend`.
-            let mut default = grant.clone();
-            default.id = 0;
-            file.default_lend = Some(default);
+            // Each row's lease on (window, SCOPE) is replaced keeping the
+            // mode, end and schedule the operator set per peer, and the grant
+            // is recorded as the Sharing defaults (see
+            // `PeerFile::share_with_all`).
+            file.share_with_all(window, &scope, &grant)?;
             // Sharing means those Macs reach this one, which needs a
             // port. On this arm only: the removal above and the `off`
             // arm below are not opt-ins and must open nothing.
@@ -166,7 +97,7 @@ pub(super) fn run_peer_share(a: peer_cli::PeerSwitchArgs) -> anyhow::Result<()> 
             println!(
                 "peer share: on peers={} scope={} window={} fraction={} ttl_s={} \
                  max_inflight={}",
-                file.peers.len(),
+                file.pinned_count(),
                 grant.scope,
                 peer_window_name(window),
                 grant.fraction,
@@ -188,12 +119,9 @@ pub(super) fn run_peer_share(a: peer_cli::PeerSwitchArgs) -> anyhow::Result<()> 
             );
         }
         peer_cli::Switch::Off => {
-            for row in &mut file.peers {
-                row.allow.inspect = false;
-                row.lend.clear();
-            }
+            file.stop_sharing();
             peer::config::save(&peers_path, &file)?;
-            println!("peer share: off peers={}", file.peers.len());
+            println!("peer share: off peers={}", file.pinned_count());
             println!(
                 "peer share: a live borrowed request dies within one frame, the \
                  listener re-reads this file and re-runs the gate before each one"
@@ -210,7 +138,7 @@ pub(super) fn run_peer_allow(a: peer_cli::PeerAllowArgs) -> anyhow::Result<()> {
     let peer_id = parse_peer_arg("peer allow", &a.peer)?;
     let on = matches!(a.state, peer_cli::Switch::On);
 
-    let Some(row) = file.peers.iter_mut().find(|row| row.node == peer_id) else {
+    let Some(row) = file.row_mut(&peer_id) else {
         anyhow::bail!(
             "peer allow: {} is not pinned here, and a grant for an unpinned peer \
              would be a row nothing enforces (`tcr peer ls` lists the pinned ones)",
@@ -313,7 +241,7 @@ pub(super) fn run_peer_lend(a: peer_cli::PeerLendArgs) -> anyhow::Result<()> {
         None => None,
     };
 
-    let Some(row) = file.peers.iter_mut().find(|row| row.node == peer_id) else {
+    let Some(row) = file.row_mut(&peer_id) else {
         anyhow::bail!(
             "peer lend: {} is not pinned here, so a grant for it would be a row \
              nothing enforces (`tcr peer ls` lists the pinned ones)",
@@ -722,9 +650,8 @@ mod peer_grant_tests {
     fn read_back(peers_path: &Path) -> peer::config::PeerRow {
         peer::config::read_or_default(peers_path)
             .expect("the peers file reads back")
-            .peers
-            .into_iter()
-            .next()
+            .row(&tcr_peer_wire::PeerId(PINNED))
+            .cloned()
             .expect("the seeded row is still there")
     }
 
@@ -833,7 +760,9 @@ mod peer_grant_tests {
             let mut ended =
                 peer::config::LendGrant::new(tcr_peer_wire::Window::SevenDay, 0.05, 300, 2);
             ended.until = Some(now_s - 3_600);
-            file.peers[0].lend = vec![ended];
+            file.row_mut(&tcr_peer_wire::PeerId(PINNED))
+                .expect("the seeded row")
+                .lend = vec![ended];
             peer::config::save(&peers_path, &file).expect("the ended grant is seeded");
         }
 
@@ -882,7 +811,10 @@ mod peer_grant_tests {
         // control: without it this test passes on a verb that refuses always.
         {
             let mut file = peer::config::read_or_default(&peers_path).expect("the seeded file");
-            file.peers[0].lend[0].until = Some(now_s + 3_600);
+            file.row_mut(&tcr_peer_wire::PeerId(PINNED))
+                .expect("the seeded row")
+                .lend[0]
+                .until = Some(now_s + 3_600);
             peer::config::save(&peers_path, &file).expect("the live grant is seeded");
         }
         run_peer(share_on(peers_path.clone()))
