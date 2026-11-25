@@ -364,7 +364,7 @@ tempfile = "3.27"
 # pulls in on macOS); `system` itself still needs `objc2-core-foundation` and
 # `objc2-io-kit` there, which is expected, not a regression to chase.
 listeners = "0.6"
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 # Noise for the peer mesh (`tcr peer`, src/peer/noise.rs): `XX` plus a six-digit
 # compare for a first pairing (a discovered machine announces no key, so there is
 # nothing else to run), `IK` for a return visit to a pinned key (so no identity
