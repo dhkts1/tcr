@@ -88,19 +88,6 @@ impl Manager {
             .collect()
     }
 
-    /// Whether this server's accounts are forced onto HTTP/1.1 — see
-    /// [`config::Config::http1_only`]. Server-wide, not per-account, and
-    /// exposed for the same reason `thresholds` is: a client must not
-    /// re-derive this from `~/.config/tcr.json`, which may have been
-    /// edited (or the process not yet restarted to pick it up) since the
-    /// server actually booted its clients.
-    pub fn http1_only(&self) -> bool {
-        self.config
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .http1_only
-    }
-
     /// The port this server listens on, as its config holds it: `server::serve` writes a
     /// `--port` override into the config before it builds the manager. The dashboard passes it
     /// to the in-process Codex route, whose reasons name the port.
