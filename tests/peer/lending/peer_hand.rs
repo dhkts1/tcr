@@ -254,7 +254,7 @@ const fn lease(lease_id: u128, expires_at_ms: i64, until: Option<u64>) -> Lease 
 /// out over the owner's Mac through `peer::serve` instead.
 ///
 /// Watched red by returning `Some(build_upstream_headers(req_headers, ""))`
-/// unconditionally from `build_handed_bearer_headers` (`src/proxy.rs`), which
+/// unconditionally from `build_handed_bearer_headers` (`src/proxy/mod.rs`), which
 /// sends the request with an empty bearer: the body assertion on
 /// `OWNER_FAKE_BEARER` fails, naming what arrived.
 #[tokio::test]

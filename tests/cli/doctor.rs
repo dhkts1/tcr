@@ -1,6 +1,6 @@
 //! `tcr doctor` end to end, against a scratch HOME and a fake status endpoint.
 //!
-//! This tests the BUILT BINARY rather than the functions in `src/doctor.rs`
+//! This tests the BUILT BINARY rather than the functions in `src/verbs/doctor/mod.rs`
 //! (which carry their own unit tests) because the whole verb is its exit code
 //! and its printed lines: a script asks `tcr doctor >/dev/null || open the
 //! settings file`, and the panel will shell out to `tcr doctor --json`. Neither

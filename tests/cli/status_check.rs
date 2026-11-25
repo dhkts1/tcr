@@ -3,7 +3,7 @@
 //!
 //! The flag's whole contract is the process exit code, so this tests the BUILT
 //! BINARY: the rule that decides "failed" has unit tests beside it in
-//! `src/cli.rs`, but whether `main` actually hands that decision to the process
+//! `src/verbs/cli/status.rs`, but whether `main` actually hands that decision to the process
 //! (and leaves the default exit alone) exists only here.
 //!
 //! The payload the fake endpoint serves is not hand-written. It is the real

@@ -185,7 +185,7 @@ async fn a_borrow_that_was_delivered_is_never_offered_to_another_lender() {
 /// client its request may already have been paid for.
 ///
 /// What the arm now asks is this predicate, and it is the same pair of
-/// questions `src/proxy.rs` asks on the direct path (`is_connect`, plus the
+/// questions `src/proxy/mod.rs` asks on the direct path (`is_connect`, plus the
 /// resolver check). It is measured against REAL `reqwest` errors carrying the
 /// production context string, on both sides of the answer: the connect failure
 /// that must fall through to the next lender, and the timeout that must not. A

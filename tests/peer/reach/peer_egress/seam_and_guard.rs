@@ -193,7 +193,7 @@ async fn the_offline_path_still_logs_the_503_count_line() {
 /// have answered had its POST carried anyway.
 ///
 /// Watched red by deleting `&& rotation_is_spent` from the guard at
-/// `src/proxy.rs:2757`: the offer line then precedes every rotation line and
+/// `src/proxy/mod.rs`: the offer line then precedes every rotation line and
 /// this fails on the index comparison.
 #[tokio::test]
 async fn the_carry_is_offered_only_after_the_fleet_has_been_walked() {
@@ -511,7 +511,7 @@ async fn a_carried_rejection_holds_the_account_the_way_a_direct_one_does() {
 ///
 /// The review's finding: `record_the_hold_the_ladder_would` recorded the 429
 /// hold and nothing else, and no carried status ever ran `clear_rate_limited`.
-/// The direct path runs it on every non-429 (`src/proxy.rs`, "any non-429 is
+/// The direct path runs it on every non-429 (`src/proxy/mod.rs`, "any non-429 is
 /// live proof a rate-limit hold no longer binds"), and a pinned account's
 /// requests all leave this way, so an account Throttled by ONE carried 429
 /// never came back to Active: it dropped out of selection, out of keep-warm and

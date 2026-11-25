@@ -338,7 +338,7 @@ public enum ConfigSettingsCommand {
 
 /// The argv this app hands `tcr` to save one setting, and how to read what
 /// came back. `tcr config set` validates the value, and goes through the
-/// running proxy when there is one (`src/cli.rs`, `set_config`).
+/// running proxy when there is one (`src/verbs/cli/settings.rs`, `set_config`).
 public enum ConfigSetCommand {
     /// `tcr config set <key> <value>...`. `key` is the config file's own name
     /// (``fileKey(for:)``); a throttle passes two values.

@@ -14,7 +14,7 @@ use crate::plan::{Kind, Planned};
 use crate::stub::{Stub, TAG_HEADER};
 
 /// The placeholder key `tcr run` exports: on loopback it is not an identity, so the body's
-/// `user_id` keys the session (`stable_session_key`, `src/proxy.rs`).
+/// `user_id` keys the session (`stable_session_key`, `src/proxy/mod.rs`).
 const CLIENT_KEY: &str = "via-tcr";
 
 /// The `anthropic-beta` flags Claude Code sends on an OAuth session. In this order because

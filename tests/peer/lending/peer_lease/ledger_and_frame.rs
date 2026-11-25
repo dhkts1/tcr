@@ -40,7 +40,7 @@ fn relay_frame_carries_no_client_credential() {
 /// a relay at all: it falls through to this machine's own local path.
 ///
 /// Six of the seven are prefixes in `CLIENT_CREDENTIAL_PREFIXES`
-/// (`src/proxy.rs:820-827`). Falling through is the right answer, not an error:
+/// (`src/proxy/mod.rs`). Falling through is the right answer, not an error:
 /// the request is perfectly servable here.
 ///
 /// Watch it fail by emptying the refusal list.
@@ -71,7 +71,7 @@ fn a_client_credential_path_never_opens_a_relay() {
 /// miss.
 ///
 /// `/v1/oauth/token` lives in its own constant (`CLIENT_TOKEN_REFRESH_PATH`,
-/// `src/proxy.rs:839`), not in the six-element array, and its own doc records
+/// `src/proxy/mod.rs`), not in the six-element array, and its own doc records
 /// the live defect that omitting it caused: an exact compare let the
 /// trailing-slash spelling fall through to the pooled path, putting our Bearer
 /// on a client's token exchange. So both spellings are asserted here, and the
@@ -821,7 +821,7 @@ fn the_provider_declines_a_credential_path_without_consulting_a_lease() {
 ///
 /// `/_tcr/…` is not an upstream path at all: behind it sits this proxy's own
 /// control route, whose entire authorization is that the caller reached
-/// loopback (`local_endpoint_gate`, `src/proxy.rs:1137`): and one of its
+/// loopback (`local_endpoint_gate`, `src/proxy/mod.rs`): and one of its
 /// endpoints ADDS A LIVE CREDENTIAL. The lender serves a relayed request
 /// through its OWN proxy on loopback, so a borrower that put `/_tcr/accounts`
 /// in a frame would be handed that gate, having satisfied it by construction.
@@ -847,7 +847,7 @@ fn a_local_control_path_is_never_relayed() {
     }
     // The control, and it is the same matcher the proxy's own guard uses on
     // this prefix: `/_tcrother` is NOT under `/_tcr`, and the proxy forwards it
-    // upstream rather than answering it locally (`src/proxy.rs:2001`,
+    // upstream rather than answering it locally (`src/proxy/mod.rs`,
     // `path_is_under`). Refusing it here would make the two lists disagree
     // about what "local" means, which is the drift this file exists to avoid.
     assert!(serve::serve_is_allowed_for_path("/v1/messages"));
@@ -857,7 +857,7 @@ fn a_local_control_path_is_never_relayed() {
 /// **A built SERVE frame carries no credential of any shape** (hole A).
 ///
 /// The four credential names and every hop-by-hop request header are gone from
-/// the frame, and the hop-by-hop list is `src/proxy.rs`'s own
+/// the frame, and the hop-by-hop list is `src/proxy/mod.rs`'s own
 /// (`is_request_hop_by_hop`) rather than a second copy here.
 ///
 /// Asserted on the SERIALIZED frame as well as on the header list: a name that

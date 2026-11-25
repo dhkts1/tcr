@@ -5,7 +5,7 @@ import Foundation
 /// already runs before starting. A colleague's "Start server" was disabled
 /// with no reason at all; this names one.
 ///
-/// `takeover_port` (`src/singleton.rs`) prints one extra stderr line whenever
+/// `takeover_port` (`src/stores/singleton/mod.rs`) prints one extra stderr line whenever
 /// a NON-proxy process holds the port, ahead of the bind failure that
 /// follows it either way: `":{port} is held by a non-proxy process (pid
 /// {pid}): {cmd}"`. `ServerController.classifyExit` folds that stderr,

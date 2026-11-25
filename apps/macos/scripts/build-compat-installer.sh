@@ -5,7 +5,7 @@
 #   apps/macos/scripts/build-compat-installer.sh <tcr-installer.sh> <out>
 #
 # WHY THIS EXISTS. Until 1.2.0 the package was called `teamclaude-rs`, so a CLI
-# on v1.1.21 or older runs `tcr update` like this (src/update.rs at v1.1.21):
+# on v1.1.21 or older runs `tcr update` like this (the update code at v1.1.21):
 # it fetches `releases/download/<latest tag>/teamclaude-rs-installer.sh` from
 # dhkts1/teamclaude-rs (GitHub redirects that to dhkts1/tcr), scrubs the OLD
 # override names from the child's environment, sets
@@ -15,7 +15,7 @@
 # `tcr-installer.sh` instead, which reads only TCR_* names. Without this file an
 # old CLI's update is a 404. With the plain new installer under the old name it
 # would ignore TEAMCLAUDE_RS_UNMANAGED_INSTALL and install a SECOND copy
-# somewhere else, which is the failure src/update.rs exists to prevent.
+# somewhere else, which is the failure src/verbs/update/mod.rs exists to prevent.
 #
 # WHAT IT BUILDS. A short header, then the input installer byte for byte. The
 # old CLI already trusts whatever this asset holds, so nothing is fetched here
@@ -36,7 +36,7 @@
 #      they are the attack surface update.rs scrubs.
 #
 # So this file answers to the old installer's interface and installs the new
-# release's binary. The names are kept here rather than in src/legacy_names.rs
+# release's binary. The names are kept here rather than in Rust code
 # because no Rust code reads them.
 #
 # It can go once no v1.1.21-or-older CLI is expected to update (docs/RELEASING.md

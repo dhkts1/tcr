@@ -200,7 +200,7 @@ async fn a_borrower_on_the_older_serve_flow_is_refused_and_nothing_is_served() {
 /// CERTAIN already ran on the lender's account and was debited, and it was the
 /// one answer with no `x-should-retry` on it. Its siblings both set it
 /// (`lease.rs`'s `delivered_unknown_response`, `egress.rs`'s of the same name)
-/// and `src/proxy.rs` makes it the house rule for an answer that means "do not
+/// and `src/proxy/mod.rs` makes it the house rule for an answer that means "do not
 /// send this again". Without it the SDK behind the borrower retries a request
 /// that has already been paid for.
 ///

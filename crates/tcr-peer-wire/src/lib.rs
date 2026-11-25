@@ -32,7 +32,7 @@
 //! HANDLER refuses it (`src/peer/listener.rs`). Those are different decisions
 //! and this crate only makes the first. Degrading an unknown STREAM KIND to
 //! anything other than a refusal would be an open relay, which is the one place
-//! this differs from `ProxyHost::Unknown` (`src/singleton.rs:105-125`), where
+//! this differs from `ProxyHost::Unknown` (`src/stores/singleton/mod.rs`), where
 //! degrading to "a proxy is there, do not signal it" is strictly safer.
 //!
 //! # Nothing here identifies an account, an organization or a person
@@ -589,12 +589,12 @@ pub struct StreamHeader {
 /// Which rate-limit window a lease is against.
 ///
 /// **New on the wire, not a type this tree already has.** What exists in
-/// `src/quota.rs` is three separately named `Option<QuotaWindow>` fields
+/// `src/records/quota/mod.rs` is three separately named `Option<QuotaWindow>` fields
 /// (`five_hour` at `:75`, `seven_day` at `:77`, `seven_day_oi` at `:82`); this
 /// enum is the wire's name for those three plus a forward-compat arm.
 ///
 /// Only [`Self::SevenDayOi`] is model-scoped upstream
-/// (`Quota::model_weekly_exhausted`, `src/quota.rs:271`, whose single
+/// (`Quota::model_weekly_exhausted`, `src/records/quota/mod.rs`, whose single
 /// production caller sits behind `is_fable &&`), so a [`Self::FiveHour`] or
 /// [`Self::SevenDay`] lease is UNTIERED and every panel string that describes
 /// one has to say so. A design that advertised per-tier lending for opus would
@@ -638,10 +638,10 @@ pub enum Window {
 #[serde(from = "LeaseUnitWire", into = "LeaseUnitWire")]
 pub enum LeaseUnit {
     /// For OAuth accounts, whose only upstream measure is a utilization
-    /// fraction (`QuotaWindow::utilization`, `src/quota.rs:47`).
+    /// fraction (`QuotaWindow::utilization`, `src/records/quota/mod.rs`).
     Fraction(f64),
     /// For api-key accounts, which really do report exact counts
-    /// (`tokens_limit` / `tokens_remaining`, `src/quota.rs:86-87`). **Defined
+    /// (`tokens_limit` / `tokens_remaining`, `src/records/quota/mod.rs`). **Defined
     /// here and refused at runtime** until a fleet with such an account wants
     /// to lend one, so the refusal is typed rather than a surprise.
     Tokens(u64),
@@ -714,7 +714,7 @@ impl From<LeaseUnit> for LeaseUnitWire {
 #[serde(rename_all = "camelCase")]
 pub struct Lendable {
     /// The window. The blueprint's prose calls this a "tier" in §6 and a
-    /// "window" in §7; one name wins here, and it is the one `src/quota.rs`
+    /// "window" in §7; one name wins here, and it is the one `src/records/quota/mod.rs`
     /// already uses for the same three buckets.
     pub window: Window,
     pub unit: LeaseUnit,

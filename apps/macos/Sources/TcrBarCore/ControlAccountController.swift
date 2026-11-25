@@ -86,7 +86,7 @@ public enum ControlAccountCommand {
 
     /// Exit 0 has two meanings here too — `tcr` can apply the change to the
     /// file only and warn on stderr that the running proxy was too old for the
-    /// route (`src/cli.rs`'s `set_control`, the `NoRoute` arm) — so this stays a
+    /// route (`src/verbs/cli/accounts.rs`'s `set_control`, the `NoRoute` arm) — so this stays a
     /// three-arm outcome exactly like ``AccountCommand/Outcome``.
     public enum Outcome: Equatable, Sendable {
         case clean

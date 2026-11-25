@@ -14,7 +14,7 @@ import ServiceManagement
 /// Registration is also only durable if the bundle's code identity is stable.
 /// An ad-hoc signature changes its cdhash on every rebuild, which leaves a
 /// registered login item pointing at an identity that no longer matches — see
-/// `scripts/build-tcrbar.sh`, which signs with a real certificate when one is
+/// `apps/macos/scripts/build-tcrbar.sh`, which signs with a real certificate when one is
 /// available and warns loudly when it has to fall back.
 @MainActor
 public final class LoginItem: ObservableObject {

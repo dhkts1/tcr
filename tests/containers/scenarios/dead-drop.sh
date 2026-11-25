@@ -16,7 +16,7 @@
 # the drop's key ladder has, so that topology could never reach this
 # scenario's own first step.
 #
-# The publisher (`keep_drops_published`, `src/server.rs`) is boot-time gated
+# The publisher (`keep_drops_published`, `src/proxy/server/peer_mesh.rs`) is boot-time gated
 # on `DeadDropConfig::is_live()`: a Mac that turns the drop on after it has
 # already booted starts no publishing task until it boots again (the fetch
 # gate is hot, the publish gate is not, `src/peer/config/mod.rs`'s own doc on
@@ -64,7 +64,7 @@
 #      it can no longer reach
 #  11. restart node-b1-overlay (the account-disable and the peer-lease
 #      fallback provider are both boot-time)
-#  12. wait out `DEAD_DROP_PUBLISH_INTERVAL` (`src/server.rs`, 300s, fixed):
+#  12. wait out `DEAD_DROP_PUBLISH_INTERVAL` (`src/proxy/server/peer_mesh.rs`, 300s, fixed):
 #      node-a1-overlay's publisher fires its first tick the instant it boots,
 #      before its own internet keeper's UPnP round trip can possibly have
 #      finished, so that first publish carries no address at all. Its SECOND
@@ -308,7 +308,7 @@ fi
 pass "$B restarted with its own account disabled and the overlay down"
 
 # --- wait out node-a1-overlay's publish interval ----------------------------
-# `DEAD_DROP_PUBLISH_INTERVAL` (`src/server.rs`) is 300s, fixed, and not a
+# `DEAD_DROP_PUBLISH_INTERVAL` (`src/proxy/server/peer_mesh.rs`) is 300s, fixed, and not a
 # peers-file setting: the first tick fired the instant node-a1-overlay
 # rebooted, before its own internet keeper's UPnP round trip could finish, so
 # that first publish carried no address. The steps between the restart above

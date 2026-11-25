@@ -4,7 +4,7 @@
 //!
 //! End-to-end against the BUILT BINARY, because the defect this guards is not
 //! in any one function — it is in whether the verbs are WIRED to the import at
-//! all. Every unit test in `src/oauth.rs` stays green with the call site
+//! all. Every unit test in `src/verbs/login/browser.rs` stays green with the call site
 //! deleted from `cli::list_accounts`.
 //!
 //! # Isolation

@@ -1152,7 +1152,7 @@ fn mixed_model_session_keeps_one_home() {
 /// **11. A short hold is a DETOUR, not a move.** A 429 park is a TIMER on an
 /// account, and the timers this proxy arms are mostly short: a transient 429 with
 /// no `retry-after` parks 15s + jitter, and one with a hint is clamped to 300s
-/// (`src/proxy.rs`). Anthropic's default ephemeral prompt cache lives 5 minutes.
+/// (`src/proxy/mod.rs`). Anthropic's default ephemeral prompt cache lives 5 minutes.
 ///
 /// Counting any live hold as account death therefore threw away a prefix that
 /// would still have been warm 15 seconds later — and permanently, because a re-key

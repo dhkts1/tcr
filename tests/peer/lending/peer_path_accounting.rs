@@ -16,7 +16,7 @@
 //! cannot import each other; and the verb itself, because `tcr peer status`
 //! asks the RUNNING proxy and the only proxy on this box is serving real
 //! traffic. `peers_block` is the one function that fills `payload.peers`
-//! (`src/proxy.rs:1278`), so what is asserted here is the JSON the verb prints,
+//! (`src/proxy/mod.rs`), so what is asserted here is the JSON the verb prints,
 //! read one call earlier.
 //!
 //! # Two clocks, on purpose

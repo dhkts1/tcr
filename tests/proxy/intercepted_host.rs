@@ -13,7 +13,7 @@
 //! # Why this is its own test binary
 //!
 //! `handle_connect` terminates a `CONNECT` only for a host covered by the leaf this PROCESS
-//! loaded last, a process-wide value every leaf load replaces. Lib tests in `src/mitm.rs` load
+//! loaded last, a process-wide value every leaf load replaces. Lib tests in `src/proxy/mitm/mod.rs` load
 //! leaves of their own in parallel, so a `chatgpt.com` tunnel opened in the lib test binary could
 //! read the coverage another test just set. Every test here loads a leaf tcr mints, which covers
 //! every intercepted host, and [`start`] checks that it does before any tunnel is opened. A test

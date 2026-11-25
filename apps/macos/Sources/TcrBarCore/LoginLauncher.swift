@@ -9,7 +9,7 @@ import Foundation
 /// `tcr mint` is unchanged: it prints an authorize URL, waits for a pasted code
 /// on stdin once per account, and needs a terminal exactly as described below.
 ///
-/// `tcr login` no longer does. `--non-interactive` (`src/oauth.rs`'s `LoginUi`)
+/// `tcr login` no longer does. `--non-interactive` (`src/verbs/login/login_ui.rs`'s `LoginUi`)
 /// removed both prompts, and ``LoginSession`` runs the login as a child of this
 /// app with a sheet on the panel. This file is the LOGIN fallback for one case:
 /// a `tcr` on this machine that predates that flag, which
@@ -21,18 +21,18 @@ import Foundation
 ///     universal — refusing outright whenever a proxy held the port, no
 ///     exceptions — but `a385f0f` (2026-08-11, "feat: route tcr login
 ///     through a live proxy instead of refusing") added a live route:
-///     `login_route` (`src/oauth.rs:966-1010`) probes the running proxy and,
+///     `probe_add_route` (`src/verbs/login/admission.rs`) probes the running proxy and,
 ///     on `AddCapability::Present`, takes the login live through the server
 ///     instead of refusing. A modern proxy — the only kind this button needs
 ///     to assume — accepts a login while serving. An old one still refuses,
 ///     before any browser opens, and its message names the pid and the
 ///     stop-login-restart sequence — which is useful only if a human can
-///     read it. (Line numbers move; verified against `src/oauth.rs` as of
+///     read it. (Line numbers move; verified against `oauth.rs` (now under src/verbs/login/) as of
 ///     `9fc4fe8`, not carried forward from memory — re-check before trusting
 ///     them again.)
 ///  2. **It is interactive.** It prompts for an account name on stdin
-///     (`src/oauth.rs:645`) and can take a pasted authorization code
-///     (`src/oauth.rs:450`). With no TTY those prompts go nowhere and stdin hits
+///     (the old `oauth.rs`) and can take a pasted authorization code
+///     (the same file). With no TTY those prompts go nowhere and stdin hits
 ///     EOF immediately.
 ///
 /// So the button hands off rather than pretending. In a Terminal window the
@@ -43,7 +43,7 @@ import Foundation
 /// forcing past a guard the CLI put up is exactly the wrong use of a button.
 ///
 /// A re-login (``script(forExecutableAt:reloggingIn:)`` with a name) passes
-/// `--account <name>`, added by `src/main.rs` / `src/oauth.rs`'s `login_hint`.
+/// `--account <name>`, added by `src/main.rs` / `src/verbs/login/browser.rs`'s `login_hint`.
 /// This app used to describe `tcr login` as taking no account argument at
 /// all, upserting by whatever identity the browser handed back — true when
 /// this file said so, and false as of that change: an untargeted re-login can
@@ -75,7 +75,7 @@ public enum LoginLauncher {
     /// `reloggingIn` is an optional account-name hint, `nil` by default so the
     /// existing add-account call site is unchanged. When present, the script
     /// passes it as `--account <name>` (`src/main.rs`, `LoginArgs::account`;
-    /// `src/oauth.rs`, `login_hint`): `tcr` requests that specific identity and
+    /// `src/verbs/login/browser.rs`, `login_hint`): `tcr` requests that specific identity and
     /// refuses to write anything if the browser hands back a different one —
     /// measured live, not theoretical: a re-login meant for one account
     /// authenticated as a different one that happened to be signed into the
@@ -91,7 +91,7 @@ public enum LoginLauncher {
     /// injection.
     /// The name is the whole address `tcr login --account` needs: it resolves
     /// through the same `resolve_account` every other verb uses, which refuses
-    /// rather than guessing (`src/oauth.rs`, `assert_requested_identity`). That
+    /// rather than guessing (`src/verbs/login/browser.rs`, `assert_requested_identity`). That
     /// refusal used to be reachable — a re-login on either of two rows sharing
     /// an email failed outright — and unique names removed the tie itself.
     public static func script(

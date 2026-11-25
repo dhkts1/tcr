@@ -408,7 +408,7 @@ enum RenderStates {
             // alice's calm Bash ring and its ✕, `no Kill` in bob's slot, and the
             // Codex categories in BY TOOL. See ``toolsTabCodexFleet``.
             ("17c-tools-tab-codex", .loaded(toolsTabCodexFleet), false, nil),
-            // One fleet on every tab, so `scripts/check-tabs-one-height.swift`
+            // One fleet on every tab, so `apps/macos/scripts/check-tabs-one-height.swift`
             // can hold the four to one height and a still strip (Gil,
             // 2026-10-16: "can you make also it to not change the height?").
             // `sessionsTabFleet` because it fills all four: accounts, live
@@ -4481,7 +4481,7 @@ enum RenderStates {
                 todayCost: 540.12, windowCost: 540.12, windowOutputTokens: 1_500_000),
             plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111")
         // `near`, not `warn`: the wire's only three quota-state tokens are
-        // `ok`/`near`/`spent` (`src/cli.rs`'s `quota_state_token`), and the
+        // `ok`/`near`/`spent` (`src/verbs/cli/render.rs`'s `quota_state_token`), and the
         // composite is the most-spent of the two windows — so an account whose
         // 7d window sits at 98 % reports `near` on BOTH. The fixture used to
         // send `warn`, a token no `tcr` emits: it decoded to `.unknown`, which
@@ -5016,7 +5016,7 @@ enum RenderStates {
 
     /// PROOF fixture for the unmeasured-window overclaim: `sevenDay` is
     /// genuinely spent (1.0/"spent") while `fiveHour`/`fiveHourState` are
-    /// BOTH absent — the shape `src/quota.rs` produces whenever the 5h
+    /// BOTH absent — the shape `src/records/quota/mod.rs` produces whenever the 5h
     /// window has not reported yet but the 7d window already has (the two
     /// populate independently from separate response headers). The 5h bar
     /// must render as a NEUTRAL dashed outline (no reading), never inheriting

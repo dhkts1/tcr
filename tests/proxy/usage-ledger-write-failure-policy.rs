@@ -1,5 +1,5 @@
 //! Pins the write-failure policy `Ledger::append` implements
-//! (`src/usage.rs:602-630`): a failed write is reported once per TRANSITION,
+//! (`src/records/usage/mod.rs`): a failed write is reported once per TRANSITION,
 //! not once per line, a recovery is reported once, and the shared
 //! `dropped_lines` count is never perturbed by a write failure or its
 //! recovery — `append` only ever READS that counter to put it in the log

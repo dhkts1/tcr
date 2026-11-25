@@ -18,7 +18,7 @@
 //!
 //! # The credential assertions are the point of this file
 //!
-//! A SERVE is built at the picker's dry-fleet arm (`src/proxy.rs:2311`), and
+//! A SERVE is built at the picker's dry-fleet arm (`src/proxy/mod.rs`), and
 //! `build_upstream_headers`: the ONLY code in this tree that removes a
 //! client's own `authorization` and substitutes a pooled token, is 215 lines
 //! downstream of it (definition `:3455`, sole call site `:2526`). So a relay

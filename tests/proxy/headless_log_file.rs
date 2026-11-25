@@ -9,7 +9,7 @@
 //!   process runs. The test reads the port from the file and nowhere else, so a guard dropped
 //!   inside `init_tracing` fails it at boot;
 //! * the usage ledger's closing line, the last line a clean shutdown logs (`ServerHandle::
-//!   shutdown_within` in `src/server.rs`), is in the file once the process has exited after a
+//!   shutdown_within` in `src/proxy/server/mod.rs`), is in the file once the process has exited after a
 //!   SIGTERM.
 //!
 //! With stdout on the null device the proxy writes no second copy (`init_tracing`), so this is

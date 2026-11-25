@@ -37,7 +37,7 @@ use tcr::paths;
 use tcr::singleton::owner_path_in;
 
 /// `handle.shutdown()` is `shutdown_within(DEFAULT_SHUTDOWN_GRACE)` = 5s
-/// (`src/server.rs`). Give the process comfortably longer than that to exit
+/// (`src/proxy/server/mod.rs`). Give the process comfortably longer than that to exit
 /// on its own before this test gives up and force-kills it — a timeout here
 /// must mean "it hung", not "5s was too tight a margin".
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -134,7 +134,7 @@ fn wait_for_line(
 /// This does NOT weaken the assertion. The question is "did the process log
 /// this", and the answer is yes if EITHER source has it. A line the process
 /// never emitted is in neither, and the test still fails; deleting the SIGTERM
-/// arm still reddens it, which is what `scripts/watch-sigterm-line-fail.sh`
+/// arm still reddens it, which is what `scripts/watch-deflaked-log-assertions-fail.sh`
 /// proves.
 fn durable_log_has_line(home: &std::path::Path, predicate: impl Fn(&str) -> bool) -> bool {
     // A fresh HOME gets the new cache directory name (`src/base/paths.rs`).

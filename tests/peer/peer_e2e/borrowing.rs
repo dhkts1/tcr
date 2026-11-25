@@ -25,7 +25,7 @@ use super::*;
 /// at 429 in the failure message instead of served.
 ///
 /// Watched red: `tests/tools/e2e/watch-peer-e2e-fail.sh` deletes the
-/// `install_peer_lease_provider` block from `src/server.rs` and this fails at
+/// `install_peer_lease_provider` block from `src/proxy/server/mod.rs` and this fails at
 /// step 7 with no `peer-lease fallback` line at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_borrowed_request_reaches_the_lender_and_never_carries_the_borrowers_credential() {

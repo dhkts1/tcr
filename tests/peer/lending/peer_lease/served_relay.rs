@@ -103,7 +103,7 @@ async fn a_dry_fleet_reaches_the_configured_provider() {
     // provider that would have said yes to anything.
     //
     // This is the half of the defence that lives at the seam rather than in the
-    // provider (`src/proxy.rs:2352`). It was prose and a `.then()` with nothing
+    // provider (`src/proxy/mod.rs`). It was prose and a `.then()` with nothing
     // exercising it: the provider's OWN refusal
     // (`the_provider_declines_a_credential_path_without_consulting_a_lease`)
     // passes whether or not the seam refuses, because the provider refuses
@@ -114,7 +114,7 @@ async fn a_dry_fleet_reaches_the_configured_provider() {
     // # Which of these paths the seam is actually the ENFORCEMENT point for
     //
     // Measured, because a loop over seven paths reads as seven gates and is
-    // not: `relay_mode` (`src/proxy.rs:1052`) intercepts a request before
+    // not: `relay_mode` (`src/proxy/mod.rs`) intercepts a request before
     // rotation ever runs, so the six `CLIENT_CREDENTIAL_PREFIXES` never reach
     // the picker at all, whatever their method, and neither does a `POST
     // /v1/oauth/token`. For those, the seam's refusal is a backstop against
@@ -184,7 +184,7 @@ async fn a_dry_fleet_reaches_the_configured_provider() {
     // consulted. Not an error page invented for the occasion.
     //
     // Watch it fail by dropping `method == axum::http::Method::POST` from the
-    // `.then()` in `src/proxy.rs`: `asked` goes to 2 and the body is the
+    // `.then()` in `src/proxy/mod.rs`: `asked` goes to 2 and the body is the
     // provider's sentinel.
     // ---------------------------------------------------------------------
     let non_post = client
@@ -227,7 +227,7 @@ async fn a_dry_fleet_reaches_the_configured_provider() {
     // anything, so the only thing that can produce a 429 here is the lock.
     //
     // Watch it fail by removing the `locked` conjunct from
-    // `exhausted_or_fallback` (`src/proxy.rs`): the body is the sentinel, the
+    // `exhausted_or_fallback` (`src/proxy/mod.rs`): the body is the sentinel, the
     // status is 200 and `asked` goes to 2.
     // ---------------------------------------------------------------------
     let (rejecting, rejections) = fleet::spawn_rejecting_upstream().await;
@@ -280,7 +280,7 @@ async fn a_dry_fleet_reaches_the_configured_provider() {
     // install one.
     //
     // Watch it fail by dropping the `RELAYED_HEADER_NAME` conjunct from the
-    // `.then()` in `src/proxy.rs`: the body is the sentinel and `asked` goes
+    // `.then()` in `src/proxy/mod.rs`: the body is the sentinel and `asked` goes
     // to 2.
     // ---------------------------------------------------------------------
     let relayed = client
@@ -495,7 +495,7 @@ async fn a_borrowed_request_is_served_on_the_lenders_account() {
 /// on purpose.
 ///
 /// The lender replayed every borrower-supplied header onto the request it makes
-/// through its own proxy. `build_upstream_headers` (`src/proxy.rs:3502`) then
+/// through its own proxy. `build_upstream_headers` (`src/proxy/mod.rs`) then
 /// removes `authorization`, `x-api-key`, `accept-encoding` and the hop-by-hop
 /// names on the way upstream: and `cookie` is none of those, so a
 /// borrower-chosen session cookie went to Anthropic on the lender's own TLS

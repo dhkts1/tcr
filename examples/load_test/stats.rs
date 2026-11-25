@@ -204,7 +204,7 @@ fn rank(by_frame: HashMap<&str, u64>, total: u64, n: usize) -> Vec<Frame> {
 }
 
 /// `throttle_ms` of every `request usage` line in a slice of the proxy's log: the time each
-/// served request spent inside the proxy's own throttle (`RequestTiming` in `src/proxy.rs`).
+/// served request spent inside the proxy's own throttle (`RequestTiming` in `src/proxy/mod.rs`).
 pub(crate) fn throttle_waits(log: &str) -> Vec<u64> {
     log.lines()
         .filter(|line| line.contains("request usage"))

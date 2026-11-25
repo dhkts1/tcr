@@ -697,7 +697,7 @@ impl Drop for Mac {
 /// tests in this file panicked at the same assertion, every one of them
 /// `left: ""` against the port its peers file names, while the same code
 /// passed locally because a 50 ms poll never lands inside the write on an idle
-/// machine. The emitters are not at fault: both `src/server.rs` and
+/// machine. The emitters are not at fault: both `src/proxy/server/mod.rs` and
 /// `src/peer/listener.rs` carry `peer_listen` on that event, so a matched line
 /// without it was never a whole line. How the write came apart is not measured
 /// here: polling a live boot log on a fast machine caught no mid-line read in
@@ -910,7 +910,7 @@ fn join_with_stdin(mac: &Mac, key: &str) -> String {
 /// Like [`spawn_upstream`], but any request bearing `trip_credential` answers
 /// a DURABLE quota rejection (`anthropic-ratelimit-unified-status: rejected`
 /// plus a scoped `5h-status: rejected`, which is the ONE 429 arm
-/// `src/proxy.rs:3073-3091` parks the account on via `Manager::mark_rate_limited`,
+/// `src/proxy/mod.rs` parks the account on via `Manager::mark_rate_limited`,
 /// never the transient/no-guidance arm a few lines below it) the FIRST time
 /// the returned flag is armed, then reverts to the canned 200 for every other
 /// credential and every later hit. This is how the chained-borrow test forces

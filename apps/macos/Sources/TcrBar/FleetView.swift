@@ -4069,7 +4069,7 @@ struct FleetView: View {
             // Used to be disabled while a proxy served the port, enforcing a
             // `tcr login` refusal that stopped existing 2026-08-11 (`a385f0f`,
             // "feat: route tcr login through a live proxy instead of
-            // refusing"): `login_route` (src/oauth.rs:966-1010) now probes the
+            // refusing"): `probe_add_route` (src/verbs/login/admission.rs) now probes the
             // running proxy and, when it is a modern build, routes the
             // finished credential *through* the server instead of refusing.
             // Gil runs a modern proxy, so the gate this button enforced no
@@ -4145,7 +4145,7 @@ struct FleetView: View {
     ///
     /// This used to be a Terminal hand-off with no alternative, because
     /// `tcr login` prompted on stdin. `--non-interactive` removed the prompts
-    /// (`src/oauth.rs`'s `LoginUi`), so the panel runs the login itself and
+    /// (`src/verbs/login/login_ui.rs`'s `LoginUi`), so the panel runs the login itself and
     /// shows a sheet — see ``beginLogin(_:)`` for what happens when
     /// the `tcr` on this machine predates that flag. The ellipsis in the label
     /// is still doing real work: this opens a browser window.
@@ -4437,7 +4437,7 @@ struct FleetView: View {
     /// now, no answer for it: the bundle cannot be replaced while it runs, so
     /// an update that looks installed can leave the old app on screen — and the
     /// only way to find out was to quit and read About. ``AppBuild`` reads the
-    /// keys `scripts/build-tcrbar.sh` has always written.
+    /// keys `apps/macos/scripts/build-tcrbar.sh` has always written.
     ///
     /// It rides the danger row rather than adding a line of its own because
     /// that row is one right-aligned button with 250pt of empty space beside
@@ -4977,7 +4977,7 @@ struct AccountRow: View {
     /// state", so a naive call fell through to the COMPOSITE (7d-driven)
     /// state and painted an empty 5h bar red whenever the 7d window was
     /// spent — the exact overclaim two-window tinting exists to prevent, and
-    /// an ordinary state, not an exotic one (`src/quota.rs` populates the two
+    /// an ordinary state, not an exotic one (`src/records/quota/mod.rs` populates the two
     /// windows independently from separate response headers, so one sitting
     /// at `None` while its sibling accumulates happens routinely). Proven
     /// with the `01d-unmeasured-window-proof` golden scene before the fix
@@ -6602,7 +6602,7 @@ struct AccountRow: View {
     /// Runs `tcr login --account <name>` in the app, targeting THIS row's
     /// account. Drawn on a `.needsRelogin` row only, beside ``toggleButton``.
     ///
-    /// `--account` (`src/main.rs` / `src/oauth.rs`'s `login_hint`) requests
+    /// `--account` (`src/main.rs` / `src/verbs/login/browser.rs`'s `login_hint`) requests
     /// that specific identity and refuses to write anything if the browser
     /// hands back a different one — this app used to say `tcr login` could
     /// not be targeted at all, which stopped being true the moment that flag

@@ -153,7 +153,7 @@ async fn an_unpinned_account_leaves_from_this_mac() {
 /// and "and the operator was told why" are one promise.
 ///
 /// Watched red by commenting out the whole `pinned_egress` match in
-/// `src/proxy.rs` (the hunk immediately below `let Some(token) =
+/// `src/proxy/mod.rs` (the hunk immediately below `let Some(token) =
 /// manager.access_token(idx)`): the local exit sees 3 connections and the
 /// status is 200, failing on the counter.
 #[tokio::test]
@@ -440,7 +440,7 @@ async fn a_down_peer_falls_back_to_this_mac_with_one_line_when_it_is_not_strict(
             answer,
             egress::PinnedEgress::TakeTheDirectPath { paced: true }
         ),
-        "without `egressStrict` a pin that cannot be honoured is a preference, not a refusal,          and it says the pacing slot is already spent: this request waited on the account's          own bucket inside the exit lock, and `src/proxy.rs` reads this flag rather than          waiting on it a second time"
+        "without `egressStrict` a pin that cannot be honoured is a preference, not a refusal,          and it says the pacing slot is already spent: this request waited on the account's          own bucket inside the exit lock, and `src/proxy/mod.rs` reads this flag rather than          waiting on it a second time"
     );
 
     let lines = collector.matching("locked to leave from a peer that did not carry it");
@@ -616,7 +616,7 @@ fn an_unpinned_account_writes_no_egress_keys() {
 /// sentence coming back.
 ///
 /// Watched red: restore the "which is `None` today" clause to the doc block
-/// above `exhausted_or_fallback` in `src/proxy.rs`.
+/// above `exhausted_or_fallback` in `src/proxy/mod.rs`.
 #[test]
 fn the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead() {
     let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/proxy/mod.rs"))

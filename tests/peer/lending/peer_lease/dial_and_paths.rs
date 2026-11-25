@@ -634,7 +634,7 @@ async fn a_relay_outside_the_grants_hours_is_refused_rather_than_served() {
 /// 200 is the header having been ignored.
 ///
 /// Watched red: drop the `RELAYED_HEADER_NAME` filter from the account-set
-/// block in `src/proxy.rs` and this answers 429.
+/// block in `src/proxy/mod.rs` and this answers 429.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_account_set_header_is_ignored_on_a_request_that_crossed_no_mac() {
     let (upstream, hits, _served) = fleet::spawn_upstream().await;

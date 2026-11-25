@@ -32,7 +32,7 @@ import TcrBarCore
 ///    window's `sendEvent`: AppKit's dispatch and SwiftUI's hit test, but not
 ///    the window server's.
 ///  - It says nothing about a *bundled* run: no `LSUIElement`, no code signature,
-///    no login item. `scripts/build-tcrbar.sh` and a human's eyes still own that.
+///    no login item. `apps/macos/scripts/build-tcrbar.sh` and a human's eyes still own that.
 ///  - It does not exercise the **animated** dismissal. The probe sets
 ///    `popover.animates = false` before it closes anything, for the reason given
 ///    at that line, so the code path a human sees — the panel fading out — is

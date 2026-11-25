@@ -473,7 +473,7 @@ final class RealWorldDecodeTests: XCTestCase {
 
     /// The `unknown` variant, which the committed fixture cannot contain.
     ///
-    /// `quota_state_token` (src/cli.rs) emits exactly `ok` / `near` / `spent`,
+    /// `quota_state_token` (src/verbs/cli/render.rs) emits exactly `ok` / `near` / `spent`,
     /// so a genuine renderer output can never carry a fourth token — the whole
     /// point of ``QuotaState/unknown(_:)`` is to survive a token a *future* Rust
     /// build invents. That future is simulated by rewriting the committed

@@ -1,7 +1,7 @@
 import Foundation
 
 /// Reading one account's access token for the row's "Copy Access Token"
-/// action — `tcr token <query>` (`src/cli.rs`'s
+/// action — `tcr token <query>` (`src/verbs/cli/accounts.rs`'s
 /// `print_access_token`). A subprocess, like every other credential touch in
 /// this app: `~/.config/tcr.json` holds live OAuth tokens and this app
 /// never opens it directly.

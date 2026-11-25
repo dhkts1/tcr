@@ -18,7 +18,7 @@ Every ordinary request is recorded as one row: `{account, node, request_id,
 status, tokens, ms}`. `account` is the credential this request carried
 (`authorization` or `x-api-key`, whichever is set, the same value a lever is
 armed against), `node` is the `x-netlab-node` header the client sent (measured:
-`build_upstream_headers`, src/proxy.rs, forwards it, it is not in that
+`build_upstream_headers`, src/proxy/mod.rs, forwards it, it is not in that
 function's drop list, which is `x-api-key`, `authorization`,
 `accept-encoding`, hop-by-hop headers and the mesh's own routing marker), and
 `request_id` is the `x-netlab-request-id` header the client sent, or a counter

@@ -251,7 +251,7 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
 /// the strong count fall back to the one this test holds proves the prober and
 /// the flusher are gone too, not just the listener.
 ///
-/// The `Drop` impl itself is pinned by the unit tests in `src/server.rs`, which
+/// The `Drop` impl itself is pinned by the unit tests in `src/proxy/server/mod.rs`, which
 /// can hold a `Sender` clone (keeping the channel open) and so isolate `abort()`
 /// as the only thing that can stop a task. Deleting `impl Drop` turns those red;
 /// it cannot turn this one red, and pretending otherwise is what the first

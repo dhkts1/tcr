@@ -127,7 +127,7 @@ async fn a_carry_that_died_inside_the_peer_stream_is_not_logged_as_carried() {
 /// What a pooled account's answer carries that the local client must never see,
 /// and what it carries that must survive.
 ///
-/// The stripped set is `src/proxy.rs`'s own: the whole `anthropic-ratelimit-`
+/// The stripped set is `src/proxy/mod.rs`'s own: the whole `anthropic-ratelimit-`
 /// family (matched by prefix, so a member Anthropic has not invented yet is
 /// covered) plus `anthropic-organization-id`. `request-id` and
 /// `anthropic-organization` are the near-misses that prove the filter is not a
