@@ -725,8 +725,8 @@ mod tests {
         let none: Vec<&Account> = config.group_members("no-such-group").collect();
         assert!(none.is_empty());
 
-        let idx = config::resolve_account(&accounts, "carol@example.com").unwrap();
-        assert_eq!(accounts[idx].name, "carol@example.com");
+        let carol = config.resolve_account("carol@example.com").unwrap();
+        assert_eq!(carol.name, "carol@example.com");
     }
 
     // --- Codex accounts ------------------------------------------------

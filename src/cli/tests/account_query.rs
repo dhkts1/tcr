@@ -1,7 +1,6 @@
 //! Tests for resolving an account query to one row, in `config/roster.rs`.
 
 use super::*;
-use crate::config::resolve_account;
 #[test]
 fn resolve_exact_name_wins() {
     // An exact display-name match resolves outright; a distinct name is not
@@ -12,8 +11,11 @@ fn resolve_exact_name_wins() {
                 { "name": "user-two", "type": "oauth", "accessToken": "at2" }
             ] }"#,
     );
-    let idx = resolve_account(&config.accounts, "user").unwrap();
-    assert_eq!(idx, 0, "exact name resolves to that account");
+    let row = config.resolve_account("user").unwrap();
+    assert!(
+        std::ptr::eq(row, &config.accounts[0]),
+        "exact name resolves to that account"
+    );
 }
 
 /// Two accounts sharing the SAME email in different orgs — the shape the
@@ -31,8 +33,8 @@ const DUP_EMAIL_TWO_ORGS: &str = r#"{
 
 #[test]
 fn resolve_a_duplicated_name_errors_listing_candidates() {
-    let accounts = load_from(DUP_EMAIL_TWO_ORGS).accounts;
-    let err = resolve_account(&accounts, "me@example.com").unwrap_err();
+    let config = load_from(DUP_EMAIL_TWO_ORGS);
+    let err = config.resolve_account("me@example.com").unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("ambiguous"), "ambiguous error: {msg}");
     assert!(
@@ -47,16 +49,15 @@ fn resolve_a_duplicated_name_errors_listing_candidates() {
 #[test]
 fn resolve_after_migration_gives_each_row_its_own_name() {
     let path = write_config("resolve-migrated", DUP_EMAIL_TWO_ORGS);
-    let accounts = load(&path).accounts;
-    assert_eq!(accounts[0].name, "me@example.com");
-    assert_eq!(accounts[1].name, "me@example.com/org-b");
+    let config = load(&path);
+    assert_eq!(config.accounts[0].name, "me@example.com");
+    assert_eq!(config.accounts[1].name, "me@example.com/org-b");
 
-    assert_eq!(resolve_account(&accounts, "me@example.com").unwrap(), 0);
-    assert_eq!(
-        resolve_account(&accounts, "me@example.com/org-b").unwrap(),
-        1
-    );
-    assert!(resolve_account(&accounts, "org-b").is_err());
+    let first = config.resolve_account("me@example.com").unwrap();
+    assert!(std::ptr::eq(first, &config.accounts[0]));
+    let second = config.resolve_account("me@example.com/org-b").unwrap();
+    assert!(std::ptr::eq(second, &config.accounts[1]));
+    assert!(config.resolve_account("org-b").is_err());
 }
 
 // --- render_accounts ---------------------------------------------------

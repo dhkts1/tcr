@@ -118,7 +118,7 @@ async fn finish_login_checked_all_none_profile_refuses() {
 }
 
 /// An `--account` naming no row is an error, not a guess — the same
-/// zero/one/many rule `crate::config::resolve_account` enforces for every other
+/// zero/one/many rule `crate::config::Config::resolve_account` enforces for every other
 /// command, and the arm that survives now that a name can never match two
 /// rows. The query used here is the email PORTION of a migrated row's name,
 /// which is precisely what used to match both of them.

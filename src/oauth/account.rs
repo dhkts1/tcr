@@ -135,7 +135,7 @@ pub(super) async fn finish_login_checked(
 }
 
 /// The load-bearing half of `tcr login --account <query>`:
-/// resolve `query` against `config` via [`crate::config::resolve_account`]
+/// resolve `query` against `config` via [`crate::config::Config::resolve_account`]
 /// — the exact rule `tcr enable`/`tcr disable` and TcrBar's row buttons
 /// already rely on, not a second copy of it — then refuse to proceed unless
 /// the identity that came back from `fetch_profile` resolves, through

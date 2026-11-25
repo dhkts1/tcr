@@ -18,10 +18,7 @@ use crate::identity;
 ///
 /// A query matching more than one row therefore means the file was hand-edited
 /// behind the loader's back. That is still an error, never a first-match guess.
-pub fn resolve_account<T: identity::Queryable>(
-    accounts: &[T],
-    query: &str,
-) -> anyhow::Result<usize> {
+fn resolve_account<T: identity::Queryable>(accounts: &[T], query: &str) -> anyhow::Result<usize> {
     match identity::match_one(accounts, query) {
         identity::Match::One(only) => Ok(only),
         identity::Match::None => bail!("no account matches '{query}'"),
