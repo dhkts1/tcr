@@ -16,6 +16,19 @@ impl Config {
         }
     }
 
+    /// The one row `query` names by exact name ([`crate::identity::match_one`]),
+    /// `None` when no row does, and [`Config::resolve_account`]'s error when
+    /// more than one does.
+    pub fn resolve_account_or_none(&self, query: &str) -> anyhow::Result<Option<&Account>> {
+        match crate::identity::match_one(&self.accounts, query) {
+            crate::identity::Match::One(idx) => Ok(self.accounts.get(idx)),
+            crate::identity::Match::None => Ok(None),
+            crate::identity::Match::Ambiguous(names) => {
+                anyhow::bail!("{}", super::ambiguous_query_message(query, &names))
+            }
+        }
+    }
+
     /// The Claude row a stored login identity already is: by
     /// [`crate::identity::same_identity`] with the Anthropic `probe` when both
     /// it and the row carry an account UUID, else by `email` against the email

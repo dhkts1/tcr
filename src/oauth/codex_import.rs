@@ -293,24 +293,18 @@ pub(crate) async fn import_codex_login_as(
     }
     if let Some(wanted) = account {
         let config = load_or_default(config_path)?;
-        let is_this_login = match crate::identity::match_one(&config.accounts, wanted) {
-            crate::identity::Match::One(idx) => {
-                let row = &config.accounts[idx];
-                match row.provider {
-                    crate::provider::Provider::Anthropic => {
-                        return Err(LoginRefusal {
-                            code: LoginRefusal::ACCOUNT_IS_CLAUDE,
-                            reason: claude_account_codex_import_refusal(&row.name),
-                        }
-                        .into());
+        let is_this_login = match config.resolve_account_or_none(wanted)? {
+            Some(row) => match row.provider {
+                crate::provider::Provider::Anthropic => {
+                    return Err(LoginRefusal {
+                        code: LoginRefusal::ACCOUNT_IS_CLAUDE,
+                        reason: claude_account_codex_import_refusal(&row.name),
                     }
-                    crate::provider::Provider::Codex => codex_login_is_row(row, &login),
+                    .into());
                 }
-            }
-            crate::identity::Match::None => login.email.as_deref() == Some(wanted),
-            crate::identity::Match::Ambiguous(names) => {
-                bail!("{}", config::ambiguous_query_message(wanted, &names))
-            }
+                crate::provider::Provider::Codex => codex_login_is_row(row, &login),
+            },
+            None => login.email.as_deref() == Some(wanted),
         };
         if !is_this_login {
             bail!("the Codex login on this machine is not '{wanted}'; nothing was written.");
