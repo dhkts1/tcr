@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use tcr::log_err::LogErr as _;
 
+use tcr::peer::config::join_key;
 use tcr::peer::config::{Allow, ControlGrants, PeerRow};
 use tcr::peer::listener::{
     self, RequestDedup, StreamRefusal, peer_stream_gate_hop, peer_stream_gate_rows,

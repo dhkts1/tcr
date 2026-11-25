@@ -52,6 +52,15 @@ use tcr_peer_wire::{LendScope, PeerId, Window};
 
 use crate::peer::drop::hmac_sha256;
 
+/// The join key an operator pastes: [`join_key::JoinToken`] and the addresses
+/// it carries. It renders a [`PendingInvite`]'s secret, which is why it is a
+/// child of this module.
+pub mod join_key;
+
+/// One codec for a list of dial addresses, shared by the v3 join key and the
+/// sealed reply so the same list is never spelled into bytes twice.
+pub mod dialaddrs;
+
 /// `tcr-peers.json` in the config directory, mode 0600.
 pub fn default_path() -> PathBuf {
     crate::peer::id::default_config_dir().join("tcr-peers.json")

@@ -50,9 +50,9 @@
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::Crockford;
 
+use crate::peer::config::join_key::JoinToken;
 use crate::peer::id::KEY_BYTES;
 use crate::peer::noise;
-use crate::peer::pair::JoinToken;
 
 /// What every ask starts with.
 pub const ASK_PREFIX: &str = "tcr-invite:v1:";

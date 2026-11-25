@@ -227,23 +227,23 @@ fn a_state_file_this_writer_creates_carries_the_format_version() {
 #[test]
 fn a_join_token_round_trips() {
     for addr in ["127.0.0.1:9600", "[::1]:9600"] {
-        let token = pair::JoinToken::new(
+        let token = join_key::JoinToken::new(
             vec![addr.parse().expect("a test address")],
             PeerId([3_u8; 32]),
             [7_u8; 32],
         );
         let rendered = token.to_token();
         assert!(
-            rendered.starts_with(pair::KEY_PREFIX),
+            rendered.starts_with(join_key::KEY_PREFIX),
             "an operator has to be able to see what they are pasting: {rendered}"
         );
         assert_eq!(
-            pair::JoinToken::parse(&rendered).expect("the token parses"),
+            join_key::JoinToken::parse(&rendered).expect("the token parses"),
             token,
             "the address {addr} did not survive the round trip"
         );
         assert_eq!(
-            pair::JoinToken::parse(&format!("  {rendered}\n")).expect("a pasted token parses"),
+            join_key::JoinToken::parse(&format!("  {rendered}\n")).expect("a pasted token parses"),
             token,
             "a paste carries whitespace"
         );
@@ -259,7 +259,7 @@ fn a_join_token_round_trips() {
 /// version measures the version check.
 #[test]
 fn a_join_token_with_an_unknown_version_is_refused() {
-    let good = pair::JoinToken::new(
+    let good = join_key::JoinToken::new(
         vec!["127.0.0.1:9600".parse().expect("a test address")],
         PeerId([3_u8; 32]),
         [7_u8; 32],
@@ -274,7 +274,7 @@ fn a_join_token_with_an_unknown_version_is_refused() {
         good, unknown,
         "the fixture has to differ from the good token"
     );
-    let error = pair::JoinToken::parse(&unknown)
+    let error = join_key::JoinToken::parse(&unknown)
         .expect_err("a v4 token must be refused rather than read as one of the three known ones");
     assert!(
         format!("{error:#}").contains("not a join key"),
@@ -289,7 +289,7 @@ fn a_join_token_with_an_unknown_version_is_refused() {
         "tcr-join:v1:127.0.0.1:9600",
         "tcr-join:v1:not-an-address:0000000000000000000000000000000000000000000000000000:0000000000000000000000000000000000000000000000000000",
     ] {
-        let refused = pair::JoinToken::parse(bad);
+        let refused = join_key::JoinToken::parse(bad);
         assert!(
             refused.is_err(),
             "{bad:?} parsed into a token, which means `tcr peer join` would dial something \
@@ -913,7 +913,7 @@ fn a_planted_symlink_does_not_capture_the_node_key() {
 /// empty-input refusal, the first assertion fails.
 #[test]
 fn a_join_token_arrives_on_stdin_and_never_in_a_message() {
-    let token = pair::JoinToken::new(
+    let token = join_key::JoinToken::new(
         vec!["127.0.0.1:9600".parse().expect("a test address")],
         PeerId([3_u8; 32]),
         [7_u8; 32],
@@ -940,11 +940,11 @@ fn a_join_token_arrives_on_stdin_and_never_in_a_message() {
     let sentinel = "SENTINELSECRETVALUE0123456789ABCDEFGHJKMNPQRSTVWXYZ0";
     let malformed = format!(
         "{}{}:{}:{sentinel}",
-        pair::TOKEN_PREFIX,
+        join_key::TOKEN_PREFIX,
         "127.0.0.1:9600",
         PeerId([3_u8; 32]).to_wire()
     );
-    let refusal = pair::JoinToken::parse(&malformed)
+    let refusal = join_key::JoinToken::parse(&malformed)
         .expect_err("a 51-character secret field is not 32 bytes");
     let text = format!("{refusal:#}");
     assert!(

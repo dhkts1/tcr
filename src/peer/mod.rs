@@ -153,10 +153,6 @@ pub mod drop;
 /// yet.
 pub mod moved;
 
-/// One codec for a list of dial addresses, shared by the v3 join key and the
-/// sealed reply so the same list is never spelled into bytes twice.
-pub mod dialaddrs;
-
 /// The sealed exchange: an ask that names no address, and a reply sealed to
 /// it that names no address either.
 pub mod ask;

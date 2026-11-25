@@ -154,7 +154,7 @@ fn a_join_link_with_both_keys_still_reads_the_join_token_when_the_network_key_is
     let other_key = NetworkKey::from_bytes([0x77; 32]);
     let link = pair::ShareLink {
         network_key: other_key,
-        join: Some(pair::JoinToken::new(
+        join: Some(join_key::JoinToken::new(
             vec!["127.0.0.1:1".parse().expect("a loopback address")],
             PeerId([0xAB; 32]),
             [0xCD; 32],

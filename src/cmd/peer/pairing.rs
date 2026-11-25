@@ -282,7 +282,7 @@ pub(super) async fn run_peer_invite(a: peer_cli::PeerInviteArgs) -> anyhow::Resu
     if !token
         .addrs
         .iter()
-        .any(|entry| entry.kind == tcr::peer::pair::DialAddressKind::Internet)
+        .any(|entry| entry.kind == tcr::peer::config::join_key::DialAddressKind::Internet)
     {
         println!(
             "peer invite: this key carries no internet address, so a friend who is not \

@@ -1,6 +1,11 @@
 use std::net::{IpAddr, Ipv4Addr};
 
+use tcr_peer_wire::Crockford;
+
 use super::*;
+use crate::peer::config::join_key::{
+    DialAddress, DialAddressKind, TOKEN_PREFIX, TOKEN_PREFIX_V2, TOKEN_PREFIX_V3,
+};
 
 /// The listener's port in every case below. One number, so a rank that
 /// changed the port instead of the host would be visible.

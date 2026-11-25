@@ -8,8 +8,8 @@
 //! byte, the address bytes, and two port bytes big-endian.
 //!
 //! This module knows nothing about keys, seals or versions, and nothing about
-//! [`crate::peer::pair::DialAddressKind`]: a decoded address never carries a
-//! kind, the same honest answer [`crate::peer::pair::DialAddress::from_key`]
+//! [`crate::peer::config::join_key::DialAddressKind`]: a decoded address never carries a
+//! kind, the same honest answer [`crate::peer::config::join_key::DialAddress::from_key`]
 //! already gives for one read out of a pasted key.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

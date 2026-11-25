@@ -39,6 +39,7 @@ FILES=(
   "src/peer/pair.rs"
   "src/peer/id.rs"
   "src/peer/config.rs"
+  "src/peer/config/join_key.rs"
   "src/peer/discovery.rs"
   "tests/peer_noise/enrolment_and_files.rs"
 )
@@ -176,7 +177,7 @@ pub fn token_from_reader<R: std::io::BufRead>(mut reader: R) -> Result<JoinToken
 SPEC
 
 probe refusal_echoes_the_secret --test=it \
-  peer_noise::a_join_token_arrives_on_stdin_and_never_in_a_message src/peer/pair.rs <<'SPEC'
+  peer_noise::a_join_token_arrives_on_stdin_and_never_in_a_message src/peer/config/join_key.rs <<'SPEC'
             .context("peer join: the secret field is not 32 base32-encoded bytes")?;
 @@@
             .with_context(|| format!("peer join: the secret field {secret:?} is not 32 base32-encoded bytes"))?;

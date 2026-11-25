@@ -15,8 +15,8 @@
 
 use tcr::log_err::LogErr as _;
 use tcr::peer::ask::{self, Ask, PendingAsk};
+use tcr::peer::config::join_key::JoinToken;
 use tcr::peer::noise;
-use tcr::peer::pair::JoinToken;
 use tcr::peer::state::{self, PeerState};
 use tcr_peer_wire::PeerId;
 

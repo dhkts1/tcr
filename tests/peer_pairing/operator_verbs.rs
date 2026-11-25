@@ -9,7 +9,7 @@ use super::*;
 fn peer_commands_keep_their_node_keys_in_separate_fixture_homes() {
     let first = scratch("first-cli-home");
     let second = scratch("second-cli-home");
-    let token = pair::JoinToken::new(
+    let token = join_key::JoinToken::new(
         vec!["127.0.0.1:1".parse().expect("a loopback address")],
         PeerId([0x88; 32]),
         [0x99; 32],
@@ -272,7 +272,7 @@ fn a_link_with_a_dead_join_key_still_sets_the_network_key_through_the_cli() {
     let network_key = NetworkKey::from_bytes([0x9C; 32]);
     let link = pair::ShareLink {
         network_key,
-        join: Some(pair::JoinToken::new(
+        join: Some(join_key::JoinToken::new(
             vec!["127.0.0.1:1".parse().expect("a loopback address")],
             PeerId([0xAB; 32]),
             [0xCD; 32],
