@@ -272,7 +272,7 @@ pub(crate) async fn import_claude_login(
             profile.org_uuid.clone(),
             profile.org_name.clone(),
         );
-        if let Some(row) = identity.existing_row(&config.accounts) {
+        if let Some(row) = identity.existing_row(&config) {
             return Ok(ClaudeImported::AlreadyAs(row.name.clone()));
         }
     }

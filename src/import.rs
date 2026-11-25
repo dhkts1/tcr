@@ -183,7 +183,7 @@ pub fn verdict(found: &Found, config: &Config) -> Verdict {
         Holding::Skipped(why) => Verdict::Skipped(why.clone()),
         Holding::Present(name) => Verdict::Already(name.clone()),
         Holding::Claude { identity, .. } => {
-            if let Some(row) = identity.existing_row(&config.accounts) {
+            if let Some(row) = identity.existing_row(config) {
                 Verdict::Already(row.name.clone())
             } else if identity.account_uuid.is_none() && identity.email.is_none() {
                 Verdict::Unknown
@@ -547,7 +547,7 @@ fn claude_swap_slot(
             "the account active in Claude Code, which the Claude Code entry covers",
         );
     }
-    if let Some(row) = identity.existing_row(&config.accounts) {
+    if let Some(row) = identity.existing_row(config) {
         return Found {
             source,
             place,

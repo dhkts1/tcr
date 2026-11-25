@@ -16,6 +16,26 @@ impl Config {
         }
     }
 
+    /// The Claude row a stored login identity already is: by
+    /// [`crate::identity::same_identity`] with the Anthropic `probe` when both
+    /// it and the row carry an account UUID, else by `email` against the email
+    /// part of the row's name ([`crate::identity::email_of`]), ignoring case.
+    /// The first such row, in config order.
+    pub fn stored_claude_row(&self, probe: &Account, email: Option<&str>) -> Option<&Account> {
+        self.accounts
+            .iter()
+            .filter(|row| row.provider == crate::provider::Provider::Anthropic)
+            .find(|row| {
+                if probe.account_uuid.is_some() && row.account_uuid.is_some() {
+                    crate::identity::same_identity(row, probe)
+                } else {
+                    email.is_some_and(|email| {
+                        crate::identity::email_of(&row.name).eq_ignore_ascii_case(email)
+                    })
+                }
+            })
+    }
+
     /// Every row's name: the names a new login must not take.
     pub fn taken_names(&self) -> HashSet<String> {
         self.accounts.iter().map(|a| a.name.clone()).collect()
