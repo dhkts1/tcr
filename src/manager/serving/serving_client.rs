@@ -1,5 +1,5 @@
 //! Each account's upstream HTTP client: when it is retired and rebuilt. How one is built,
-//! [`build_serving_client`], sits with the account row that owns it.
+//! [`build_serving_client`], is in `manager::upstream_client`.
 
 use crate::manager::*;
 

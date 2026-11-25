@@ -74,10 +74,8 @@ mod construction;
 mod freshness;
 mod serving;
 mod sessions;
+mod upstream_client;
 pub(crate) use accounts::account_runtime::ResetTarget;
-pub(crate) use accounts::account_runtime::build_serving_client;
-#[cfg(test)]
-pub(crate) use accounts::account_runtime::fail_next_client_build;
 use accounts::account_runtime::match_listed;
 pub use accounts::account_runtime::{AccountRuntime, AccountStatus};
 pub use accounts::add_account::{AddAccountOutcome, AddPersist};
@@ -93,6 +91,9 @@ pub use serving::in_flight::InFlightGuard;
 use serving::in_flight::WarmInFlightGuard;
 use serving::serving_client::{MAX_SERVES_PER_CONNECTION, RecycleReason};
 use sessions::capped_map::{CappedMap, CappedSet};
+pub(crate) use upstream_client::build_serving_client;
+#[cfg(test)]
+pub(crate) use upstream_client::fail_next_client_build;
 // The one TYPE that module owns and `proxy.rs` names: one minted token as the response path
 // hands it over, so a kind can never be paired with another token's string.
 pub use sessions::bound_tokens::MintedToken;
