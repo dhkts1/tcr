@@ -277,7 +277,7 @@ fn load_config_refuses_to_boot_on_a_corrupt_config() {
 /// only statement after the match warns solely when tasks were aborted. A
 /// process that stopped down that path left no trace of having stopped.
 ///
-/// Distinctness matters as much as presence. `tests/headless_sigterm.rs`
+/// Distinctness matters as much as presence. `tests/proxy/headless_sigterm.rs`
 /// asserts on the SIGTERM text specifically, so two triggers sharing a line
 /// would make that assertion pass for the wrong trigger, which is a green
 /// test for a broken reason.
@@ -299,7 +299,7 @@ fn every_shutdown_trigger_logs_a_line() {
         assert!(
             !seen.contains(&line),
             "{trigger:?} shares its line with another trigger ({line:?}); \
-             the SIGTERM assertion in tests/headless_sigterm.rs would then \
+             the SIGTERM assertion in tests/proxy/headless_sigterm.rs would then \
              pass for the wrong reason"
         );
         seen.push(line);
@@ -307,7 +307,7 @@ fn every_shutdown_trigger_logs_a_line() {
     assert_eq!(
         ShutdownTrigger::Sigterm.shutdown_line(),
         "SIGTERM received; shutting down",
-        "tests/headless_sigterm.rs matches this exact text; changing it here \
+        "tests/proxy/headless_sigterm.rs matches this exact text; changing it here \
          without changing it there turns that test red for no real reason"
     );
 }

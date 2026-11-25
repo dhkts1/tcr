@@ -39,7 +39,7 @@
 //! `command_head` (capped to 120 chars; the per-tool shape is on
 //! [`ToolUseEvent::command_head`]) is held in this in-memory table and is never written to
 //! `~/.cache/tcr/logs` or any other log file — the same
-//! body-content-never-hits-disk rule `src/proxy.rs` states for the request log.
+//! body-content-never-hits-disk rule `src/proxy/mod.rs` states for the request log.
 //!
 //! It DOES reach one file: the affinity-style snapshot in
 //! [`crate::stores::session_wire_persist`], which round-trips [`WireSession`] to
@@ -353,7 +353,7 @@ const COMMAND_HEAD_MAX: usize = 120;
 pub(crate) const TAIL_SCAN_CAP: usize = 20;
 
 /// Parse `metadata.user_id`'s stringified JSON blob for its `session_id` — see
-/// `src/proxy.rs`'s `stable_session_key` doc-comment for the blob's shape and lineage
+/// `src/proxy/mod.rs`'s `stable_session_key` doc-comment for the blob's shape and lineage
 /// guarantees. `None` on absence or a parse failure; never a panic on a hand-shaped or
 /// truncated blob.
 pub fn extract_session_id(user_id_json: &str) -> Option<String> {
@@ -489,7 +489,7 @@ pub struct BoundHistory {
     pub carries_bound_history: bool,
     /// Whether the history carries state another account cannot read at all: an advisor
     /// result (`server_tool_use`) or server-side thread state (`previous_message_id`, folded in
-    /// by `src/proxy.rs`). A history bound only by `thinking` and `redacted_thinking` blocks
+    /// by `src/proxy/mod.rs`). A history bound only by `thinking` and `redacted_thinking` blocks
     /// leaves this `false`, and for a model whose thinking survives a move
     /// (`crate::base::model::thinking_is_org_bound` false) its hold buys nothing but a warm cache.
     pub carries_account_only_state: bool,
@@ -505,7 +505,7 @@ pub struct BoundHistory {
 /// - `redacted_thinking.data` — the same thing, already encrypted.
 ///
 /// (`previous_message_id` binds a conversation too, but it is a top-level body field rather
-/// than a content block, so `src/proxy.rs` reads it in the same peek and folds it in here.)
+/// than a content block, so `src/proxy/mod.rs` reads it in the same peek and folds it in here.)
 ///
 /// Deliberately NOT the bounded tail [`extract_tool_events`] walks: it is the OLD blocks that
 /// still bind the request, so a tail scan would find them on turn two and miss them forever

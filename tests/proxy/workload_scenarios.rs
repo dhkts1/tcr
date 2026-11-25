@@ -1015,7 +1015,7 @@ fn busy_neighbour_does_not_rekey_a_quiet_session() {
 /// The account was never gone; one request failed on it.
 ///
 /// This is the same invariant the soft-pacing fix established (`keep_pin` in
-/// `src/manager/select.rs`), reached through a different trigger: `tried` is a
+/// `src/manager/select/mod.rs`), reached through a different trigger: `tried` is a
 /// per-REQUEST fact, so like a soft gate it may divert a request, but it may not
 /// re-key a session.
 #[test]
@@ -1052,7 +1052,7 @@ fn transient_429_does_not_rekey_a_session() {
 }
 
 /// **9. Migration must never drag a session down a priority tier.** The
-/// load-balancing migration in `src/manager/select.rs` ranks candidates on
+/// load-balancing migration in `src/manager/select/mod.rs` ranks candidates on
 /// `cand_key = (pinned_count, in_flight, last_selected_seq)` — `priority` is
 /// absent — while `pick_eligible` sorts priority FIRST. So an account that
 /// normal selection would never choose while a priority-0 account is healthy can

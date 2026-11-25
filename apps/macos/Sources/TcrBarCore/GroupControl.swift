@@ -6,7 +6,7 @@ import Foundation
 ///
 /// **Mirrors a proxy rule and must not drift from it.** The authority is
 /// `Manager::classify_group_miss`'s `GroupMiss::OnlyControl` arm
-/// (`src/manager/select.rs`): an inference pick excludes the control account
+/// (`src/manager/select/mod.rs`): an inference pick excludes the control account
 /// unconditionally, so a group with no other member can never be selected, and
 /// every request asking for it is served from the whole pool instead. The `tcr`
 /// CLI computes the same fact for `tcr group ls`'s `routes=` field; this is the

@@ -195,7 +195,7 @@ proptest! {
 /// `lendable_fraction` itself is not clamped to it, it folds
 /// `(guard - utilization).max(0.0)` over eligible accounts, where
 /// `guard = (switch_threshold - control_reserve).max(0.0)`
-/// (`effective_threshold`, `src/manager/select.rs:248`): so with this test
+/// (`effective_threshold`, `src/manager/select/mod.rs`): so with this test
 /// fleet's `SWITCH_THRESHOLD = 0.9` and `CONTROL_RESERVE = 0.05`, `guard` is
 /// `0.85`, well above `0.5`. Asserting `f <= 0.5` against the real function
 /// would be a false failure, not a caught bug: confirmed by hand: a

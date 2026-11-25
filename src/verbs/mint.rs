@@ -83,7 +83,7 @@ fn build_mint_flow(login_hint: &str) -> anyhow::Result<MintFlow> {
 /// Build the JSON body for [`exchange_mint_code`]'s `POST {TOKEN_ENDPOINT}`, as
 /// a pure function so the request shape is assertable without the network —
 /// mirrors `warm_request_spec` in `src/clients/warmer.rs` and `exchange_request_body`
-/// in `src/oauth.rs`.
+/// in `src/clients/oauth/mod.rs`.
 fn mint_exchange_request_body(code: &str, verifier: &str, state: &str) -> serde_json::Value {
     serde_json::json!({
         "code": code,
@@ -526,7 +526,7 @@ pub async fn run_mint(
 /// per-account report vanish the instant the window closes. Mint stores
 /// nothing, so this report is the ONLY record of which rows were refused.
 ///
-/// Guarded on [`IsTerminal`] exactly like `read_setup_token` in `src/oauth.rs`
+/// Guarded on [`IsTerminal`] exactly like `read_setup_token` in `src/clients/oauth/mod.rs`
 /// decides whether to prompt: a piped or scripted invocation has no one to
 /// wait for and must exit immediately. That TTY branch itself has no
 /// existing test in this codebase (`read_setup_token`'s is untested too) —

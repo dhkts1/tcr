@@ -310,7 +310,7 @@ async fn borrow_once(
 /// Rebuild an HTTP response from what the lender answered.
 ///
 /// Hop-by-hop response headers are the lender's connection's business, not this
-/// one's, so they are dropped here the way `src/proxy.rs` drops them on the way
+/// one's, so they are dropped here the way `src/proxy/mod.rs` drops them on the way
 /// back from upstream.
 fn response_from(status: u16, headers: &[(String, String)], body: Vec<u8>) -> Result<Response> {
     let mut builder = Response::builder().status(

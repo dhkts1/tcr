@@ -3,7 +3,7 @@
 //! # Where it attaches, and why there
 //!
 //! The rotation loop asks `Manager::select_with_group` for an account; its
-//! `None` arm (`src/proxy.rs:2311`) is the point at which this machine's own
+//! `None` arm (`src/proxy/mod.rs`) is the point at which this machine's own
 //! fleet has nothing for this request. Today that arm rides out a transient
 //! park, tries a revalidation serve, and then synthesizes the honest exhausted
 //! 429. This trait slots in as the rung BETWEEN the revalidation serve and that
@@ -79,7 +79,7 @@ use crate::peer::serve::PeerLeaseProvider;
 pub struct Ask<'a> {
     /// The request path. A provider that relays MUST refuse the
     /// client-credential paths on this value before opening anything. See
-    /// `src/peer/serve.rs`.
+    /// `src/peer/serve/mod.rs`.
     pub path: &'a str,
     /// The request's query string, without its `?`, when it had one.
     ///

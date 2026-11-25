@@ -4,7 +4,7 @@
 //! skills, settings, the bootstrap — is bound to the client's OWN OAuth
 //! identity: the connector transport (`mcp-proxy.anthropic.com`) never passes
 //! through this proxy at all, and the bookkeeping paths are relayed with the
-//! client's own bearer (`src/proxy.rs`, `CLIENT_CREDENTIAL_PREFIXES` and the
+//! client's own bearer (`src/proxy/mod.rs`, `CLIENT_CREDENTIAL_PREFIXES` and the
 //! bearer rule in `relay_mode`). So "one account for MCP, many for quota" is
 //! not something the proxy can arrange by picking an account; it is something
 //! the CLIENT arranges by being logged in as that account, and the proxy can

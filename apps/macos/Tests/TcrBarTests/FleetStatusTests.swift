@@ -793,7 +793,7 @@ private func account(
 }
 
 /// A dead-credential account: `status:"error"`, never probed — the live shape
-/// (`src/manager/refresh.rs:93-101` rejects the refresh token and sets
+/// (`src/manager/freshness/refresh.rs` rejects the refresh token and sets
 /// `AccountStatus::Error`), not a hand-picked one. `quotaState` stays the
 /// Rust-side default `ok` and `quota` stays `nil`, exactly as `hasQuotaEvidence`
 /// expects for an account that has never been probed.
@@ -826,7 +826,7 @@ private func brokenAccount(_ name: String, disabled: Bool = false) -> Account {
 
 /// A credential that died AFTER being probed — the shape a review of the
 /// original fix found every existing test blind to. `probe_account`
-/// (`src/manager/probing.rs:128-139`) early-returns on an `Error` row instead
+/// (`src/manager/freshness/probing.rs`) early-returns on an `Error` row instead
 /// of clearing anything, and `refresh.rs:93-101` sets only `status` — so the
 /// LAST-LEARNED `quota`, `quotaState` and `probeStatus: .ok` stay exactly as
 /// they were the moment before the refresh token was rejected. `brokenAccount`

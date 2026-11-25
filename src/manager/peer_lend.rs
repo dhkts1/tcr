@@ -5,7 +5,7 @@
 //! The guard-band arithmetic a lease must respect is
 //! `effective_threshold(threshold, reserve, allow_reserve)`
 //! (`src/manager/select/mod.rs:238`), and it is **`pub(super)`**, so
-//! `src/peer/lease.rs` cannot call it, and cannot name its result either. The
+//! `src/peer/lease/mod.rs` cannot call it, and cannot name its result either. The
 //! two wrong answers are widening that function's visibility and copying its
 //! arithmetic; both put the fleet's guard band in two places, and the house
 //! pattern ten lines below it says why that is the failure to avoid: it calls
@@ -660,7 +660,7 @@ impl crate::peer::lease::WindowUtilization for Manager {
 /// no measurement of it.
 ///
 /// The three arms are the wire's name for the three separately named
-/// `Option<QuotaWindow>` fields in `src/quota.rs`, there is no enum on that
+/// `Option<QuotaWindow>` fields in `src/records/quota/mod.rs`, there is no enum on that
 /// side, which is why the mapping is written once, here, and not at each caller.
 /// [`QuotaWindow::effective`] is what reads it, so a window past its reset is a
 /// fresh window rather than the stale last value.
@@ -745,7 +745,7 @@ mod tests {
         );
     }
 
-    /// The figure the guard-band gate in `tests/peer_lease.rs` is written
+    /// The figure the guard-band gate in `tests/peer/lending/peer_lease.rs` is written
     /// against: at 0.89 against a 0.90 guard there is still something to lend,
     /// and one step over the guard there is exactly nothing.
     ///

@@ -1153,7 +1153,7 @@ const CONTROL_BODY_LIMIT: usize = 8 * 1024;
 /// catch-all, so a spelling that misses the prefix misses the routes too. Do not
 /// read this comment as "nothing unguarded gets past" — read it as "what gets past
 /// is a forwarded 404".
-/// `pub(crate)` so `src/peer/serve.rs` refuses THIS prefix rather than a second
+/// `pub(crate)` so `src/peer/serve/mod.rs` refuses THIS prefix rather than a second
 /// spelling of it: a relayed request that reached these routes would arrive at
 /// `local_endpoint_gate` having satisfied it by construction.
 pub(crate) const LOCAL_PREFIX: &str = "/_tcr";
@@ -1212,7 +1212,7 @@ pub(crate) const LOCAL_PREFIX: &str = "/_tcr";
 /// Both edges of a raw `starts_with` were live defects: `"/api/oauth/file_upload"`
 /// (no terminator) also relayed `/api/oauth/file_upload_v2`, and `"/v1/code/"`
 /// (with one) missed the bare `/v1/code`.
-/// `pub(crate)` so `src/peer/serve.rs` reads THIS list rather than a copy of it.
+/// `pub(crate)` so `src/peer/serve/mod.rs` reads THIS list rather than a copy of it.
 /// A borrower must refuse to open a SERVE for every path here, and a copy of a
 /// security list in two files is a fact in two places that will drift.
 ///
@@ -1240,7 +1240,7 @@ pub(crate) const CLIENT_CREDENTIAL_PREFIXES: [&str; 6] = [
 /// the paragraph above says must never happen. Relaying a hypothetical sub-path with
 /// no auth is the safe direction to be wrong in; a pooled Bearer is not.
 /// `pub(crate)` for the same reason as [`CLIENT_CREDENTIAL_PREFIXES`]: it is the
-/// SEVENTH path, it lives outside that array, and `src/peer/serve.rs` must
+/// SEVENTH path, it lives outside that array, and `src/peer/serve/mod.rs` must
 /// refuse it too.
 pub(crate) const CLIENT_TOKEN_REFRESH_PATH: &str = "/v1/oauth/token";
 
@@ -1514,7 +1514,7 @@ fn is_cross_site_request(headers: &HeaderMap) -> bool {
 /// and what am I allowed", and a pooled account answers that for the wrong
 /// person. The prefix list above stays for two reasons this rule does not cover:
 /// a client with no bearer at all, and the peer borrower's refusal
-/// (`src/peer/serve.rs`), which is path-only.
+/// (`src/peer/serve/mod.rs`), which is path-only.
 ///
 /// A Codex path (`crate::base::provider::Provider::of_path`) other than the one
 /// inference path is relayed with or without a bearer: Codex has no bookkeeping
@@ -5580,7 +5580,7 @@ async fn handle_request(
             // The failover mechanism is benching `idx` in `tried` (`Ladder::fail_over_529`), because
             // `select` already has the branch for it: a PINNED session whose pin is in
             // `tried` takes the documented "pin-tried" path, which diverts THIS REQUEST
-            // and KEEPS THE PIN (`src/manager/select.rs`). So the session comes home to
+            // and KEEPS THE PIN (`src/manager/select/mod.rs`). So the session comes home to
             // its warm account on its next request; nothing re-keys, and `tried` is
             // per-request so the 529'd account is fully eligible again immediately.
             // `mark_rate_limited` is still NEVER called here — an overloaded account is
@@ -6269,7 +6269,7 @@ where
 /// `{"type":"error","error":{"type":...,"message":...}}`), plus the body itself
 /// capped at [`ERROR_BODY_LOG_CAP`] for the shapes that don't parse (an upstream
 /// 5xx can arrive as an HTML error page, not JSON). Fixes the blind spot logged
-/// in `src/proxy.rs`'s "upstream response" line, which fires before this body
+/// in `src/proxy/mod.rs`'s "upstream response" line, which fires before this body
 /// is even read and so has never carried more than the bare status code — 64
 /// `status=400` lines on 2026-09-07 with no way to tell one 400 from another.
 ///
@@ -6997,7 +6997,7 @@ async fn relay_request(
 /// Hop-by-hop request headers that must not be forwarded. Header names from a
 /// [`HeaderMap`] are already lowercased.
 ///
-/// `pub(crate)` so `src/peer/serve.rs` asks THIS predicate rather than holding a
+/// `pub(crate)` so `src/peer/serve/mod.rs` asks THIS predicate rather than holding a
 /// second eleven-name list. A SERVE frame is a request leaving this host for
 /// another one, so every name here is wrong on it for exactly the reasons it is
 /// wrong upstream, and `proxy-authorization` is a credential as well as a
@@ -7023,7 +7023,7 @@ pub(crate) fn is_request_hop_by_hop(name: &str) -> bool {
 /// body and so are stripped from the response we return to the client.
 ///
 /// `pub(crate)` alongside [`is_request_hop_by_hop`], so a SERVE reply rebuilt in
-/// `src/peer/serve.rs` strips exactly what this handler strips. A relayed
+/// `src/peer/serve/mod.rs` strips exactly what this handler strips. A relayed
 /// response that kept its `content-length` would mis-frame the body the same way
 /// here as it does there.
 ///
@@ -8188,7 +8188,7 @@ fn quiet_error_response(
 }
 
 // The lint allow sits ABOVE the doc block, not between it and the signature:
-// `tests/peer_egress.rs` (`the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead`)
+// `tests/peer/reach/peer_egress/exit_lock.rs` (`the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead`)
 // reads the run of `///` lines directly above `async fn exhausted_or_fallback(`.
 #[expect(
     clippy::too_many_arguments,
@@ -8208,7 +8208,7 @@ fn quiet_error_response(
 /// whole terminal was the old exhaustion answer and nothing past it could run.
 /// The boot sequence installs one (`fallback::install_peer_lease_provider`,
 /// from the peers file, as soon as a row says this node may borrow) and
-/// `src/server.rs` then asks for it back and `expect`s it. So a dry fleet here
+/// `src/proxy/server/mod.rs` then asks for it back and `expect`s it. So a dry fleet here
 /// really does reach another Mac's account, and reasoning that treats the code
 /// below as dead reaches the wrong answer.
 ///

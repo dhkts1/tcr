@@ -1,7 +1,7 @@
 use axum::http::{HeaderMap, HeaderName};
 
 // ONE list, two readers. See the module docs: these are `pub(crate)` in
-// `src/proxy.rs` precisely so this file holds no list and no matcher of its own.
+// `src/proxy/mod.rs` precisely so this file holds no list and no matcher of its own.
 use crate::proxy::{
     CLIENT_CREDENTIAL_PREFIXES, CLIENT_TOKEN_REFRESH_PATH, is_request_hop_by_hop, path_is_under,
 };
@@ -12,7 +12,7 @@ use crate::proxy::{
 /// the request is perfectly servable here, just not there.
 ///
 /// Reads `CLIENT_CREDENTIAL_PREFIXES` and `CLIENT_TOKEN_REFRESH_PATH` from
-/// `src/proxy.rs` through `path_is_under`, and holds no list of its own.
+/// `src/proxy/mod.rs` through `path_is_under`, and holds no list of its own.
 ///
 /// Refuses every **Codex** path too, by the one classifier the request path
 /// uses (`crate::base::provider::Provider::of_path`). Codex is not lent over the mesh
@@ -42,11 +42,11 @@ pub fn serve_is_allowed_for_path(path: &str) -> bool {
     // all. Behind it sit the local `/_tcr/` endpoints, including the one
     // privileged mutation that ADDS A LIVE CREDENTIAL, whose entire
     // authorization is `local_endpoint_gate` plus a content type
-    // (`src/proxy.rs:1137`), that is, the fact that the caller reached
+    // (`src/proxy/mod.rs`), that is, the fact that the caller reached
     // loopback. Relaying it would mean another host's request arriving at this
     // gate having satisfied it by construction. Matched with `path_is_under`,
     // the SAME matcher the proxy's own guard uses on this prefix
-    // (`src/proxy.rs:2001`), so the two cannot disagree about what is local: a
+    // (`src/proxy/mod.rs`), so the two cannot disagree about what is local: a
     // spelling the proxy forwards upstream is a spelling this refuses to relay
     // for no reason, and a spelling the proxy answers locally is one a relay
     // must never reach.
@@ -107,7 +107,7 @@ pub fn refused_path_kind(path: &str) -> &'static str {
 /// userinfo. The third normalizes onto a `CLIENT_CREDENTIAL_PREFIXES` path.
 ///
 /// **This is not a new class of defect in this tree, it is the same one twice.**
-/// `src/proxy.rs` records it as measured in the same words and fixed it for the
+/// `src/proxy/mod.rs` records it as measured in the same words and fixed it for the
 /// local client with [`crate::proxy::path_is_ambiguous`], applied on the
 /// forwarding path. The SERVE path never called it. So this asks the SAME
 /// function rather than re-deriving the parser's rules here, one matcher, two
@@ -158,11 +158,11 @@ pub fn relay_path_is_routable(path: &str) -> bool {
 ///
 /// Removes every name in `CLIENT_CREDENTIAL_HEADERS` and every hop-by-hop
 /// request header the proxy already refuses to forward
-/// (`is_request_hop_by_hop`, `src/proxy.rs:3698`). Returns what it removed, so
+/// (`is_request_hop_by_hop`, `src/proxy/mod.rs`). Returns what it removed, so
 /// the caller can assert on it: the gate for this is a frame that contains none
 /// of them, watched red by deleting the scrub.
 ///
-/// The hop-by-hop half is asked of `src/proxy.rs` rather than re-listed here.
+/// The hop-by-hop half is asked of `src/proxy/mod.rs` rather than re-listed here.
 /// Two reasons, and the second is the load-bearing one: a SERVE frame is a
 /// request leaving this host, so every name that is wrong on the upstream hop is
 /// wrong here for the same reason; and `proxy-authorization` is **a credential**
@@ -192,7 +192,7 @@ pub fn scrub_client_credentials(headers: &mut HeaderMap) -> usize {
 
 /// The header names the borrower removes as CREDENTIALS, in one place because
 /// both the scrub and anything that asserts on the scrub must read the same
-/// list. The hop-by-hop names are not here: those come from `src/proxy.rs`, see
+/// list. The hop-by-hop names are not here: those come from `src/proxy/mod.rs`, see
 /// [`scrub_client_credentials`].
 ///
 /// - `x-api-key` because an api-key client authenticates with it alone, so

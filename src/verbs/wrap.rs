@@ -1,5 +1,5 @@
 //! `tcr wrap` — a weekly (or N-day) usage report, read straight off the usage
-//! ledger `src/usage.rs` writes.
+//! ledger `src/records/usage/mod.rs` writes.
 //!
 //! # Why this reads the ledger and not `tcr status`
 //!

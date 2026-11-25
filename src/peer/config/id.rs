@@ -15,7 +15,7 @@
 //!
 //! # A separate file pair from the MITM CA, deliberately
 //!
-//! The CA lives at its own paths (`MintedPaths::in_dir` in `src/mitm.rs`)
+//! The CA lives at its own paths (`MintedPaths::in_dir` in `src/proxy/mitm/mod.rs`)
 //! and regenerating it invalidates every leaf signed by the boot-time CA,
 //! which breaks `claude` processes running right now, a recorded incident.
 //! Keeping the peer keypair in its own files means a peer rotation can never

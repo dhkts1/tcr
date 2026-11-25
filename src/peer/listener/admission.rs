@@ -45,7 +45,7 @@ pub const KNOCK_BURST: u32 = 3;
 /// (`crate::peer::mod`), so concurrent streams from one peer are concurrent
 /// connections from one address, and a pre-auth cap of two is a concurrency cap
 /// of two. Caught by `borrowed_requests_are_paced_by_the_lenders_own_bucket`
-/// (`tests/peer_lease.rs`), which fires three at once.
+/// (`tests/peer/lending/peer_lease.rs`), which fires three at once.
 pub const MAX_UNAUTHENTICATED_SOCKETS: usize = 16;
 
 /// How many of those one address may hold, **before the operator's own grants
@@ -88,7 +88,7 @@ pub const MAX_UNAUTHENTICATED_PER_ADDRESS: usize = 2;
 ///
 /// Measured, not reasoned: with the fixed pair,
 /// `borrowed_requests_are_paced_by_the_lenders_own_bucket`
-/// (`tests/peer_lease.rs`) fails with the lender closing the third connection
+/// (`tests/peer/lending/peer_lease.rs`) fails with the lender closing the third connection
 /// with zero bytes and the borrower reporting "the handshake with the lender
 /// failed"; it stays green on the largest-grant form.
 pub fn unauthenticated_allowance(file: &PeerFile) -> (usize, usize) {
@@ -110,7 +110,7 @@ pub fn unauthenticated_allowance(file: &PeerFile) -> (usize, usize) {
     //
     // Measured, not reasoned, both before and after:
     // `borrowed_requests_are_paced_by_the_lenders_own_bucket`
-    // (`tests/peer_lease.rs`) is the gate, with the bare constants it fails
+    // (`tests/peer/lending/peer_lease.rs`) is the gate, with the bare constants it fails
     // with the lender closing the third connection with zero bytes, and it
     // stays green on the largest-grant form.
     let largest: usize = file.largest_grant_inflight();

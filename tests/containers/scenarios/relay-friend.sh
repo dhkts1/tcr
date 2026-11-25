@@ -29,7 +29,7 @@
 #   6. disable node-a1's own account and restart it, then drive one request
 #      through its own proxy (lease-borrow.sh:125-163 is the model)
 #   7. node-a1's boot log carries the dialler's own `via=` line
-#      (src/peer/serve.rs:2563-2567), naming node-c1 as the Mac that carried,
+#      (src/peer/serve/mod.rs), naming node-c1 as the Mac that carried,
 #      AND the lease request that rode that stream did not fail
 #
 # There is no `kind=Via` assertion here. Production never constructs
@@ -152,7 +152,7 @@ if [ -z "$c_id_from_a" ] || [ -z "$b_id_from_a" ] || [ -z "$a_id_from_b" ] || [ 
 fi
 pass "every pinned row resolved to exactly one id on each side"
 
-# --- the grant matrix, derived from src/peer/serve.rs:2658 and
+# --- the grant matrix, derived from src/peer/serve/mod.rs and
 #     src/peer/tunnel/mod.rs:1353 -------------------------------------------------
 nx node-a1 tcr peer allow "$c_id_from_a" carry on --peers "$PEERS" >/dev/null 2>&1 || true
 nx node-a1 tcr peer allow "$b_id_from_a" disclose on --peers "$PEERS" >/dev/null 2>&1 || true
@@ -248,7 +248,7 @@ echo "relay-friend: node-a1's borrow request: $borrow"
 # of dialling node-b1 with it. So the gate is the PAIR: `via=` on its own
 # would have passed the forced red below too.
 wait_for_log node-a1 'via=' 90 >/dev/null || true
-expect_log node-a1 'via=' "node-a1's log carries the dialler's own via= line, naming the Mac that carried (src/peer/serve.rs:2563-2567)"
+expect_log node-a1 'via=' "node-a1's log carries the dialler's own via= line, naming the Mac that carried (src/peer/serve/mod.rs)"
 refute_log node-a1 'peer lease: asking for a lease failed' "the lease request that rode that stream did not fail (a forwarder that refused the carry closes it instead of reaching node-b1, and the request fails right there)"
 
 finish

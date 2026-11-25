@@ -632,7 +632,7 @@ impl UsageTracker {
 
     /// The price for `model`, or `None` when the pricing table has no entry — see
     /// [`PricingTable::lookup`]. The one entry point for pricing a wire-session's per-model
-    /// token tally (`src/manager/wire_sessions.rs`) with the SAME table (config overrides
+    /// token tally (`src/manager/sessions/wire_sessions.rs`) with the SAME table (config overrides
     /// included) the account-level ledger prices with, so the two never disagree about what
     /// a model costs.
     pub(crate) fn price_for(&self, model: &str) -> Option<crate::base::pricing::ModelPrice> {

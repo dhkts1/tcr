@@ -371,7 +371,7 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
         //
         // Terminal does NOT mean "only a human clears it", which this comment
         // used to say. LOGIN and `disabled` do need a person. REJECTED does not:
-        // `Quota::drop_rejection_if_a_window_rolled` (`src/quota.rs`) drops it as
+        // `Quota::drop_rejection_if_a_window_rolled` (`src/records/quota/mod.rs`) drops it as
         // soon as a probe reads a shared window's utilization strictly below the
         // stored one, which is upstream reporting a new window. It is still
         // omitted here, because what that clears on is the next PROBE after the
@@ -960,7 +960,7 @@ pub(super) fn account_status_rows_at(
                 // two, and this comment used to flatten them into "only a human
                 // clears those". LOGIN and `disabled` do wait on a person. A
                 // rejection clears itself, in
-                // `Quota::drop_rejection_if_a_window_rolled` (`src/quota.rs`), on
+                // `Quota::drop_rejection_if_a_window_rolled` (`src/records/quota/mod.rs`), on
                 // the first probe that reads a shared window below its stored
                 // utilization. Null because that instant depends on the probe
                 // schedule rather than on the window's reset, so no field here

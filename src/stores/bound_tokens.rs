@@ -20,7 +20,7 @@
 //!
 //! This module is the file that carries the token → account map across a restart, which is
 //! when a live conversation is most likely to be re-keyed. [`crate::manager::Manager`] owns the
-//! live map; `src/proxy.rs` records from responses and enforces on requests.
+//! live map; `src/proxy/mod.rs` records from responses and enforces on requests.
 //!
 //! Three properties, each a way the naive version silently does the wrong thing:
 //!

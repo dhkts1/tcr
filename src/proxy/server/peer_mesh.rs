@@ -26,7 +26,7 @@ use crate::manager::Manager;
 /// to spell out. A `peers_path` field would read exactly the same way and is
 /// the shape to reach for when the option struct is next touched; it is not
 /// taken here because [`ServeOptions`] is built by struct literal in
-/// `src/main.rs` and in `tests/serve_library_path.rs` with no
+/// `src/main.rs` and in `tests/proxy/serve_library_path.rs` with no
 /// `..Default::default()`, so adding one field is a compile error in two other
 /// files.
 ///
@@ -94,7 +94,7 @@ pub(super) fn peers_file_beside_config(persist_path: Option<&std::path::Path>) -
 /// wired at all.
 ///
 /// The headroom is noted for `LendScope::All` only. Per-scope headroom needs
-/// the scope, which lives on `LendGrant` in `src/peer/config.rs`,
+/// the scope, which lives on `LendGrant` in `src/peer/config/mod.rs`,
 /// and nothing reads it here yet.
 pub(super) async fn boot_peer_listener(
     peers_path: &std::path::Path,

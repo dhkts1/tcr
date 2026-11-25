@@ -2,7 +2,7 @@
 //!
 //! # This socket does not reuse `local_endpoint_gate`, and that is deliberate
 //!
-//! `local_endpoint_gate` (`src/proxy.rs:1137`) authorizes the LOCAL `/_tcr/`
+//! `local_endpoint_gate` (`src/proxy/mod.rs`) authorizes the LOCAL `/_tcr/`
 //! endpoints, and its own doc-comment says the thing that matters here: bind
 //! scope is not authorization, because `127.0.0.1` is reachable by every
 //! process and every container on this host. Behind it sits the one privileged
@@ -15,7 +15,7 @@
 //! ([`peer_stream_gate`](crate::peer::listener::peer_stream_gate)). `local_endpoint_gate` is not relaxed by one
 //! character, and **neither arm of the existing listener is widened**, the
 //! serving socket has two origins, an inherited descriptor
-//! (`src/server.rs:1133-1143`) and the loopback bind below it, and a peer
+//! (`src/proxy/server/mod.rs`) and the loopback bind below it, and a peer
 //! listener bolted onto either would inherit a gate written for loopback.
 //!
 //! One implementation of the gate, for the same reason `local_endpoint_gate`'s
@@ -56,7 +56,7 @@
 //! listener cannot derive ([`LeaseServing`](crate::peer::serve::LeaseServing): the ledger, this node's own proxy
 //! base, a reader for its own quota). Every decision about the request, the
 //! path refusal, the method, the lease, the debit, which account serves, is in
-//! `src/peer/serve.rs`, and this file's only contribution is the gate that
+//! `src/peer/serve/mod.rs`, and this file's only contribution is the gate that
 //! already ran above.
 //!
 //! A build with no [`LeaseServing`](crate::peer::serve::LeaseServing) REFUSES a SERVE rather than accepting a

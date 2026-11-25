@@ -1,5 +1,5 @@
 //! Behavioural coverage for the `throttleExemptNoise` knob
-//! (`Manager::throttle_exempt_noise_enabled`, `src/manager/throttle.rs`).
+//! (`Manager::throttle_exempt_noise_enabled`, `src/manager/serving/throttle.rs`).
 //!
 //! A real `mitm::serve` listener in front of a real `Manager`, a fake
 //! upstream that counts hits AND records which account served each one, and a
@@ -26,7 +26,7 @@
 //! 2. Knob ON — the same concentrated burst skips the PER-ORG bucket. It still
 //!    pays the fleet ceiling; these tests set that ceiling loose enough not to
 //!    bind, so the timing attributes cleanly to the per-org bucket.
-//! 3. Knob ON, exempt-prefix boundary — `classify_request` (`src/manager/select.rs`)
+//! 3. Knob ON, exempt-prefix boundary — `classify_request` (`src/manager/select/mod.rs`)
 //!    matches `Noise` by PREFIX, so `/api/event_logging/v2/batch` (already
 //!    covered by case 2) and the shorter `/api/event_logging` root both
 //!    classify as `Noise` and skip the per-org GCRA the same way.

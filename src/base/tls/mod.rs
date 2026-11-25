@@ -28,7 +28,7 @@ use tokio_rustls::TlsAcceptor;
 /// (2.1.232-234) against the shipped binary, i.e. dead. `platform.claude.com`
 /// was added in their place: it is the host Claude Code's own OAuth refresh
 /// (`POST /v1/oauth/token`) targets — 2 occurrences in the same binary — and
-/// `src/proxy.rs`'s `RelayMode::Raw` handling for that path was unreachable in
+/// `src/proxy/mod.rs`'s `RelayMode::Raw` handling for that path was unreachable in
 /// MITM mode without it.
 ///
 /// `chatgpt.com` was added 2026-10 for Codex, whose inference and backend
@@ -80,7 +80,7 @@ const FALLBACK_LEAF_SANS: &[&str] = &[
 /// present, reads it here via [`host_covered_by_loaded_leaf`]. The lib tests
 /// read `TlsAssets::covered_hosts` off the returned value instead; a test that
 /// opens a tunnel does rely on this global, which is why
-/// `tests/intercepted_host.rs` is its own binary. Starts empty — "nothing
+/// `tests/proxy/intercepted_host.rs` is its own binary. Starts empty — "nothing
 /// loaded yet" — which is the safe default: under-claiming coverage means
 /// blind-tunnel, never a broken handshake.
 static COVERED_HOSTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -151,7 +151,7 @@ impl TlsAssets {
 /// [`host_covered_by_loaded_leaf`], because this function says nothing about
 /// whether the leaf loaded for this process can actually present a valid
 /// certificate for it. Kept as a standalone, TLS-independent check because
-/// `src/proxy.rs`'s base-URL-mode misroute guard also calls it, on a plain-HTTP
+/// `src/proxy/mod.rs`'s base-URL-mode misroute guard also calls it, on a plain-HTTP
 /// path where no TLS handshake — and therefore no SAN coverage question —
 /// exists at all.
 pub fn host_allowed(host: &str) -> bool {
@@ -306,7 +306,7 @@ pub fn load_tls(holds_codex: bool) -> anyhow::Result<TlsAssets> {
 /// Every successful call also replaces the process-wide coverage (`COVERED_HOSTS`) that
 /// `handle_connect` reads for every listener in this process, whatever acceptor that listener
 /// was given. A test that opens tunnels runs in its own binary (see
-/// `tests/intercepted_host.rs`).
+/// `tests/proxy/intercepted_host.rs`).
 ///
 /// Three branches, in order (B, C and D, the names this file's other comments
 /// use), and this is the function that makes the whole module SAN-truthful —

@@ -143,7 +143,7 @@ pub(crate) fn write_atomic_with(
             // covers the conjunction — a failed rename AND a process that never
             // reaches its shutdown flush. That conjunction is not hypothetical
             // here: `persist_now` is skipped on a SIGKILL and on the
-            // never-served/early-cancel paths (`src/server.rs:1025`, `:1063`), and
+            // never-served/early-cancel paths (`src/proxy/server/mod.rs`), and
             // this proxy is SIGKILLed as documented operational reality. The
             // `fs::rename` this replaced left exactly that artifact behind; the
             // migration removed it.
@@ -195,7 +195,7 @@ pub(crate) fn write_atomic_with(
     // function (5.0 → 9.5 ms/write, N=200, APFS), because a second `F_FULLFSYNC`
     // is a second barrier. That is affordable only because of the actual call
     // rates. The affinity flusher is the hot caller and is the one that would hurt
-    // — it does a blocking `std::fs` write inside async code (`src/server.rs:425`).
+    // — it does a blocking `std::fs` write inside async code (`src/proxy/server/mod.rs`).
     // This comment used to say its steady state is no writes at all. Measured on
     // 2026-10-15, that was false: with a few dozen live sessions the pins change on
     // every tick. So the affinity, session-wire and bound-token caches now write

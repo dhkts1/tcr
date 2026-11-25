@@ -22,7 +22,7 @@ use super::*;
 ///
 /// In memory only, and per boot, exactly as the port-secret register was
 /// before that gave it a file. Persisting it needs a field on
-/// `PeerRow` (`src/peer/config.rs`), and it has none.
+/// `PeerRow` (`src/peer/config/mod.rs`), and it has none.
 #[derive(Default)]
 struct Observations {
     /// Keyed by peer: the address that peer reported seeing this Mac at.

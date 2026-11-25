@@ -671,7 +671,7 @@ fn revalidation_fable_divert_keeps_the_pin() {
 
 /// A rate-limit hold is a TIMER, not a death — and the timers this proxy arms
 /// are mostly SHORT: a no-guidance transient 429 parks 15s + jitter, and a
-/// `retry-after` park is clamped to 300s (`src/proxy.rs`). Anthropic's default
+/// `retry-after` park is clamped to 300s (`src/proxy/mod.rs`). Anthropic's default
 /// ephemeral prompt cache lives 5 minutes, so re-keying on a 15-second park
 /// throws away a prefix that would still be warm 15 seconds later — and the
 /// session never returns to it, because a re-key is durable.

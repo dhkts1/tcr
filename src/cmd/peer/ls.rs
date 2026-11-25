@@ -313,7 +313,7 @@ fn peer_ls_handed_key_until(
 /// before it refused can still be on the row, though, and it does one of two
 /// things. A pin that is not strict is inert: the exit path warns and sends the
 /// request from here. A strict one is not inert at all: the exit path refuses
-/// every request routed to the account (`src/peer/egress.rs`, its Codex arm),
+/// every request routed to the account (`src/peer/tunnel/egress.rs`, its Codex arm),
 /// so its line says so and names the command that clears it.
 ///
 /// A Claude account's pin is a real one and is not listed here, and nothing is

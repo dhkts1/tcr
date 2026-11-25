@@ -24,7 +24,7 @@
 //! `codex_home_from`). The tests exercise those, so no test mutates this process's environment:
 //! the test harness runs tests on parallel threads that share it, and a test that sets a variable
 //! another test reads is a race. The binary's own reads are exercised end to end by
-//! `tests/codex_import.rs`, which sets them on the child process it spawns.
+//! `tests/codex/codex_import.rs`, which sets them on the child process it spawns.
 //!
 //! # Logins tcr will not pool
 //!

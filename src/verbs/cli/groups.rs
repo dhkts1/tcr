@@ -727,7 +727,7 @@ fn codex_member_count(config: &Config, members: &[&str]) -> usize {
 ///
 /// **This mirrors a runtime rule and must not drift from it.** The authority is
 /// `Manager::classify_group_miss`'s `GroupMiss::OnlyControl` arm
-/// (`src/manager/select.rs`): an inference pick excludes the control account
+/// (`src/manager/select/mod.rs`): an inference pick excludes the control account
 /// unconditionally, so a group with no other member can never be selected —
 /// UNLESS the group has opted in with `allowControlAccount`
 /// (`Config::group_allows_control`), which lifts the exclusion for that group's

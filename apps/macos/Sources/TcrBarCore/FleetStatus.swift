@@ -148,7 +148,7 @@ extension QuotaState: Decodable {
 /// [`Self/rejected`] is the one the panel could not see before this existed,
 /// and it is the reason the type does. Anthropic's own
 /// `anthropic-ratelimit-unified-status: rejected` takes an account out of
-/// selection (`src/manager/select.rs`) while `snapshot.rs` rewrites `status`
+/// selection (`src/manager/select/mod.rs`) while `snapshot.rs` rewrites `status`
 /// only for `Throttled` — so a rejected row still reported `status: "active"`
 /// and the panel drew it as eligible for traffic the router will never send it.
 /// An earlier comment in `FleetView` claimed `tcr status --json` emitted no gate
@@ -2462,13 +2462,13 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// nothing has ever verified.
     ///
     /// The fourth clause exists for a credential that dies AFTER being
-    /// probed, not before. `probe_account` (`src/manager/probing.rs:128-139`)
+    /// probed, not before. `probe_account` (`src/manager/freshness/probing.rs`)
     /// early-returns on an `Error` row instead of clearing anything, and
     /// `refresh.rs:93-101` only ever sets `status` — so a rejected refresh
     /// token leaves the LAST-LEARNED `quota` and `probeStatus: .ok` sitting
     /// there unchanged. Without this clause `hasQuotaEvidence` stays true,
     /// `quotaState` reads whatever it last measured (often `.ok`), and the
-    /// row reports READY for an account `src/manager/select.rs:931`
+    /// row reports READY for an account `src/manager/select/mod.rs`
     /// hard-excludes and will serve zero requests — the header could then
     /// read "1 of 1 ready · 1 need re-login" in the same frame, the panel
     /// contradicting itself.
@@ -4086,7 +4086,7 @@ public struct Fleet: Equatable, Sendable {
     }
 
     /// Enabled accounts whose refresh token was rejected — dead credentials,
-    /// hard-excluded from selection (`src/manager/select.rs:814`, `:931`).
+    /// hard-excluded from selection (`src/manager/select/mod.rs`).
     /// Reported on the same footing as `unmeasuredCount`: both are reasons an
     /// account is not ready, but they lead to different remedies.
     ///
@@ -4182,7 +4182,7 @@ public struct Fleet: Equatable, Sendable {
         // `health != .needsRelogin` is load-bearing here too, not just on
         // `isReady`: a credential that dies AFTER being probed keeps its
         // LAST-LEARNED `quotaState`, which can be `.near` — Rust never resets
-        // it, `probe_account` (`src/manager/probing.rs:128-139`) early-returns
+        // it, `probe_account` (`src/manager/freshness/probing.rs`) early-returns
         // on an `Error` row and `refresh.rs:93-101` only ever sets `status`.
         // Without the health check, a broken account that used to be close to
         // its threshold would amber the glyph for capacity that has since

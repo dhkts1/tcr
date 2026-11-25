@@ -5159,7 +5159,7 @@ enum RenderStates {
     /// way an account breaks — never probed, `quota: null`. This is the shape
     /// that actually happens in production: a credential that dies AFTER
     /// being probed keeps its last-learned `quota` and a real `probeStatus`
-    /// (`probe_account`, `src/manager/probing.rs:128-139`, early-returns on
+    /// (`probe_account`, `src/manager/freshness/probing.rs`, early-returns on
     /// an `Error` row instead of clearing anything; `refresh.rs:93-101` sets
     /// only `status`). `carol@example.com` here carries `status:"error"` WITH
     /// `quota:0.12` and `probeStatus:"ok"` — a real prior reading, not an

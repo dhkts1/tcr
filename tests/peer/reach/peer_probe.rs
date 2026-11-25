@@ -784,7 +784,7 @@ fn round_trip_orders_two_clean_paths_and_the_policy_orders_the_hop() {
 /// wiring assertion: with no measurements the answer is still via-last,
 /// newest-first, which is what every build before this one did.
 ///
-/// Watched red: in `src/peer/serve.rs`, replace the body with
+/// Watched red: in `src/peer/serve/mod.rs`, replace the body with
 /// `row.endpoints.clone()` and the hop is no longer last.
 #[test]
 fn the_shipped_dial_order_is_the_comparator_and_an_unmeasured_row_is_unchanged() {

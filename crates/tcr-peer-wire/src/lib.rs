@@ -771,7 +771,7 @@ mod id_hex {
 
 /// A granted lease: a budget with a deadline.
 ///
-/// It is not a rate limiter, the in-process GCRA (`src/manager/throttle.rs`)
+/// It is not a rate limiter, the in-process GCRA (`src/manager/serving/throttle.rs`)
 /// is untouched by all of this, and it is not a fixed-window limiter either.
 /// The lender's copy is authoritative; the borrower's is a cached hint and
 /// every surface that renders it says so.
@@ -1409,7 +1409,7 @@ pub enum Control {
     /// the party that benefits from under-reporting, so it can only ever raise
     /// `spent` and it is never the owner's only defence: `until`, the lease
     /// expiry and stopping renewal all hold without it. Reconciling it against
-    /// the owner's own usage probe (`src/manager/probing.rs`) is out of scope
+    /// the owner's own usage probe (`src/manager/freshness/probing.rs`) is out of scope
     /// here and is what would make it authoritative.
     #[serde(rename_all = "camelCase")]
     UsageHint {

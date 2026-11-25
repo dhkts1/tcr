@@ -31,7 +31,7 @@ impl Manager {
                 account.last_used_ms = Some(odt_to_ms(now));
                 // One line per forwarded request naming the account that served it. At
                 // DEBUG: the INFO record of a served request is its `request usage` line
-                // (`src/proxy.rs`), which names the same account, index and session, so
+                // (`src/proxy/mod.rs`), which names the same account, index and session, so
                 // the load spread stays observable in the default log without a second
                 // INFO line per request.
                 tracing::debug!(account = %account.name, index = idx, session = sid, "serving request");

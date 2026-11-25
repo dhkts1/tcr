@@ -18,7 +18,7 @@ mod divert_verdict_tests;
 /// These are full `Manager` integration tests, so the helpers below are
 /// deliberately minimal, standalone re-implementations of `mod.rs`'s
 /// `mod tests` fixtures (`account`/`config_with`/`build_manager`) rather than
-/// imports — this unit's brief is `src/manager/select.rs` ONLY, and those
+/// imports — this unit's brief is `src/manager/select/mod.rs` ONLY, and those
 /// helpers are private to `crate::manager::tests`, a sibling module this file
 /// cannot reach into. `LiveUsageProber`/`LiveWarmer`/`NoRefresh` are the real,
 /// non-test, already-`pub` production types: `select_revalidation` never

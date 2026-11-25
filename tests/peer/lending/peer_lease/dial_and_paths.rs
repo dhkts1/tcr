@@ -453,7 +453,7 @@ fn ask_with_query<'a>(path: &'a str, query: &'a str) -> Ask<'a> {
 /// on the URL the lender builds.
 ///
 /// Watched red: drop the `set_query` from `serve_on_own_account`
-/// (`src/peer/serve.rs`) and the upstream sees a bare `/v1/messages`.
+/// (`src/peer/serve/mod.rs`) and the upstream sees a bare `/v1/messages`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_borrowed_request_carries_its_query_string_to_the_lenders_upstream() {
     let (upstream, hits, served) = fleet::spawn_upstream().await;
@@ -551,7 +551,7 @@ async fn a_handed_request_carries_its_query_string_to_the_owners_upstream() {
 /// headroom noted, so a refusal here can only be the schedule.
 ///
 /// Watched red: delete the schedule block from `handle_serve_on`
-/// (`src/peer/serve.rs`) and the lender serves it.
+/// (`src/peer/serve/mod.rs`) and the lender serves it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_relay_outside_the_grants_hours_is_refused_rather_than_served() {
     let (upstream, hits, _served) = fleet::spawn_upstream().await;

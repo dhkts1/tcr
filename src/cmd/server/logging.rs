@@ -151,7 +151,7 @@ fn open_log_appender(
 /// colour on whenever `NO_COLOR` is unset and never asks whether the sink is a
 /// terminal, so a redirected `tcr --headless > run.log` fills the file with
 /// escape codes. That is a bug by itself (a log nobody can grep), and it broke
-/// `tests/peer_e2e.rs` on CI, where `NO_COLOR` is unset and the children's
+/// `tests/peer/peer_e2e.rs` on CI, where `NO_COLOR` is unset and the children's
 /// boot logs are files: every field name arrived as
 /// `\e[3mpeer_listen\e[0m\e[2m=\e[0m`.
 fn headless_subscriber<W>(

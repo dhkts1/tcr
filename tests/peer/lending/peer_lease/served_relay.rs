@@ -677,7 +677,7 @@ async fn a_non_post_relayed_request_is_refused() {
 /// exists on the lender's side.
 ///
 /// Watch it fail by deleting the `scrub_client_credentials(&mut scrubbed)` line
-/// in `serve_request_from` (`src/peer/serve.rs`): all four secrets are then in
+/// in `serve_request_from` (`src/peer/serve/mod.rs`): all four secrets are then in
 /// the captured frame. Measured red that way before this test was kept.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_relayed_frame_the_lender_receives_holds_no_credential() {

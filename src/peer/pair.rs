@@ -390,7 +390,7 @@ pub async fn join(store: &PeerStore, token: &JoinToken, label: &str) -> Result<J
 /// parameter, both halves of an enrolment run in one process against two temp
 /// directories, which is what
 /// `a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides`
-/// (`tests/peer_noise.rs`) does.
+/// (`tests/peer/pairing/peer_noise.rs`) does.
 pub async fn join_as(
     store: &PeerStore,
     node: &NodeKey,
@@ -676,7 +676,7 @@ pub const PAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// scraped those sentences would break on the next wording change with nothing
 /// to catch it. These lines are the contract instead: one JSON object per
 /// line on stdout, each naming its own `event`, pinned by
-/// `tests/peer_pairing.rs` so a rename is a failing test rather than a blank
+/// `tests/peer/pairing/peer_pairing.rs` so a rename is a failing test rather than a blank
 /// sheet.
 ///
 /// The ORDER is the pairing's own: `asking` once the knock is away, then

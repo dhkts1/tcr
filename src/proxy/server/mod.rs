@@ -1831,7 +1831,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
 
 /// Unit tests for what only in-crate access can pin: [`Drop for ServerHandle`].
 ///
-/// The integration test (`tests/serve_library_path.rs`) drops a real handle and
+/// The integration test (`tests/proxy/serve_library_path.rs`) drops a real handle and
 /// watches the port refuse — which proves the loop stopped, but NOT that `Drop`
 /// stopped it: the handle owns the `watch::Sender`, so dropping it closes the
 /// channel and every `stop.changed()` returns `Err` on its own. That test stayed

@@ -275,7 +275,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     loop {
         if args.headless {
             // Installed BEFORE the "listening" line below, not after: that line is
-            // what a caller (or `tests/headless_sigterm.rs`) waits on before it
+            // what a caller (or `tests/proxy/headless_sigterm.rs`) waits on before it
             // treats this process as ready to signal. A handler installed after
             // the print leaves a real window, small, but wide enough for a
             // heavily loaded box to hit it, where a SIGTERM sent the instant the
@@ -288,7 +288,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
             //
             // TcrBar always launches this process with `--headless` and stops it
             // with `process.terminate()` — a SIGTERM, not Ctrl-C
-            // (`apps/macos/.../ServerController.swift`). Mirror the TUI branch's
+            // (`apps/macos/Sources/TcrBarCore/ServerController.swift`). Mirror the TUI branch's
             // SIGTERM handling (below) so a supervised stop falls through to the
             // same shared cleanup instead of a hard kill.
             //
@@ -429,7 +429,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
 /// is NOT proven by a list living beside this enum: a hand-written list
 /// can drift from the `select!` arms with nothing to notice, which is
 /// exactly the shape of gate that cannot fail for the defect it exists to
-/// catch. It is proven by `tests/headless_sigterm.rs`, which spawns the
+/// catch. It is proven by `tests/proxy/headless_sigterm.rs`, which spawns the
 /// real binary, sends it a real SIGTERM, and asserts on the externally
 /// observable effects of a graceful shutdown (the log line and the
 /// port-owner claim being withdrawn) — deleting the SIGTERM arm here makes

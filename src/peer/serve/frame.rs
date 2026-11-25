@@ -171,7 +171,7 @@ pub fn serve_request_from(
     // the literal `SERVE_METHOD` into the frame whatever the client had sent,
     // which is how a `GET` came to be POSTed on somebody else's account. The
     // seam refuses a non-POST before it builds an `Ask` at all
-    // (`src/proxy.rs`), so this is the second half of that defence and the half
+    // (`src/proxy/mod.rs`), so this is the second half of that defence and the half
     // that holds for a caller written later: the only constructor of a
     // `ServeRequest` cannot produce one whose method the lender will refuse.
     if !ask.method.eq_ignore_ascii_case(SERVE_METHOD) {

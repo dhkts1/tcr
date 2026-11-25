@@ -34,7 +34,7 @@ pub enum KeyKind {
     /// A field of [`crate::base::config::Config`].
     Modelled,
     /// Not a `Config` field, but read by name out of `Config::extra`
-    /// (`src/manager/state.rs`, `src/manager/throttle.rs`).
+    /// (`src/manager/state.rs`, `src/manager/serving/throttle.rs`).
     ReadFromExtra,
     /// Carried by existing configs and kept verbatim, never read: reporting it
     /// would warn on every boot about a key that is harmless where it is.

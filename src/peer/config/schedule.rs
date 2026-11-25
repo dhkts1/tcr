@@ -17,7 +17,7 @@
 //! There is no `tz` field: the schedule is evaluated against the offset this
 //! *host* is in at the instant being checked, the same
 //! `UtcOffset::local_offset_at(..).unwrap_or(UtcOffset::UTC)` pattern
-//! `src/usage.rs`'s [`crate::records::usage::local_day`] already uses, DST-
+//! `src/records/usage/mod.rs`'s [`crate::records::usage::local_day`] already uses, DST-
 //! correct per instant, and this crate's multithreaded-soundness guard (which
 //! *can* make the lookup fail, depending on the platform and how many threads
 //! have already started) falls back to UTC rather than refusing every lease
@@ -29,7 +29,7 @@
 //! [`Schedule::contains`](crate::peer::config::schedule::Schedule::contains) itself is a thin offset-conversion wrapper around
 //! [`Schedule::contains_at_local`](crate::peer::config::schedule::Schedule::contains_at_local), which does the actual decision and takes
 //! an already-local reading, so every test below (and the property test in
-//! `tests/peer_props.rs`) asserts this module's own arithmetic, never
+//! `tests/peer/peer_props.rs`) asserts this module's own arithmetic, never
 //! whichever timezone the machine running the test happens to be in.
 
 use std::collections::HashSet;

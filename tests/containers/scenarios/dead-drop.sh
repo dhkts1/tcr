@@ -8,7 +8,7 @@
 # node-b1-overlay (borrower, behind router-b, upnp off), on
 # `two-homes-overlay-drop.json`, `two-homes-overlay.json` with one field
 # changed: router-a's `upnp` is `on`, so node-a1-overlay can hold a real
-# router mapping and `own_endpoints` (src/peer/drop.rs) has something to
+# router mapping and `own_endpoints` (src/peer/reach/drop_exchange.rs) has something to
 # publish. `two-homes-two-routers.json`, the topology the unit list first
 # named, cannot pair at all: `nat-no-mapping.sh` states its own expected
 # outcome as a failed join, and `pair_nodes` is never called on it. Pairing
@@ -24,9 +24,9 @@
 # configured and then restarted, the same kill-and-relaunch this harness
 # already uses in `lease-borrow.sh`.
 #
-# `dial_peer_reaching_within` (src/peer/serve.rs), where the drop fetch
+# `dial_peer_reaching_within` (src/peer/serve/mod.rs), where the drop fetch
 # lives, has exactly two production callers in this tree and both are the
-# peer-lease borrow path (`src/peer/lease/mod.rs`, `src/peer/serve.rs`): there is
+# peer-lease borrow path (`src/peer/lease/mod.rs`, `src/peer/serve/mod.rs`): there is
 # no lighter way to make a real dial happen. So this scenario is
 # `lease-borrow.sh`'s own cast and mechanism (lend, the inspect/disclose
 # pair, an account disabled and the borrower restarted) with the dead drop
@@ -216,7 +216,7 @@ case "$internet_out" in
 esac
 
 # The measurement the design calls for before any assertion below is
-# written: what `own_endpoints` (src/peer/drop.rs) actually has to publish
+# written: what `own_endpoints` (src/peer/reach/drop_exchange.rs) actually has to publish
 # for this Mac. `own_endpoints` reads `reach::external_socket()`, a
 # process-local register the SAME running process's own internet keeper
 # fills in (`nat-upnp-mapping.sh`'s own comment on why `reach --map`, a

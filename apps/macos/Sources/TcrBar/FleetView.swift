@@ -4942,7 +4942,7 @@ struct AccountRow: View {
     /// so `Tok.color(for: .ok)` would draw the SAME green a genuinely healthy
     /// row draws. Green in this palette means "you can work right now"; this
     /// account's apparent headroom is unreachable until re-login
-    /// (`src/manager/select.rs:931` sends it nothing), so drawing it green
+    /// (`src/manager/select/mod.rs` sends it nothing), so drawing it green
     /// overclaims exactly the way an unfilled bar overclaims for a nil
     /// reading — the same reason `QuotaBar`'s own doc-comment makes a nil
     /// draw DASHED rather than empty. Stale-versus-live is that distinction
@@ -5118,7 +5118,7 @@ struct AccountRow: View {
     /// traffic — and there are at least THREE independent ways for the
     /// answer to be no, and this build can now see all three:
     /// `disabled` (an operator's own choice), `account.health ==
-    /// .needsRelogin` (`src/manager/select.rs:931` hard-excludes an
+    /// .needsRelogin` (`src/manager/select/mod.rs` hard-excludes an
     /// `AccountStatus::Error` account from selection exactly like a disabled
     /// one, even though `disabled` itself reads false), and the third —
     /// `select.rs:809-822` also excludes an account whose `quota.status ==
@@ -5415,7 +5415,7 @@ struct AccountRow: View {
         // "rotating" nor "parked" — same reason `rotationPill` draws neither:
         // `disabled` reads false, so "parked" would claim an operator
         // decision that never happened, and "rotating" would claim traffic
-        // can land here, which `src/manager/select.rs:931` refuses exactly
+        // can land here, which `src/manager/select/mod.rs` refuses exactly
         // like a disabled account. The detail below already names the real
         // cause, so this element is not left silent either.
         if account.disabled {

@@ -294,7 +294,7 @@ impl Manager {
     /// `reserved || !spill` ([`GroupPolicy::is_strict`]), the same call
     /// [`Self::select_with_group`] makes for its own `strict_group`. A
     /// measurement found two readers outside the picker asking
-    /// [`Self::is_group_reserved`] ALONE, `src/proxy.rs`'s refusal arm and its
+    /// [`Self::is_group_reserved`] ALONE, `src/proxy/mod.rs`'s refusal arm and its
     /// mirror on the exhausted path, so for a group that is neither reserved
     /// nor a spill group the picker held the request strictly while those two
     /// scoped their answer to the whole fleet: the wait they sized, the

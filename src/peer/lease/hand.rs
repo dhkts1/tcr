@@ -50,8 +50,8 @@ impl HandedTokens {
     ///
     /// A test that drives the PATH therefore puts into [`handed_tokens`] and
     /// calls [`Self::forget`] on the way out, so the next test in the same
-    /// binary does not inherit the bearer; `tests/peer_hand.rs` and
-    /// `tests/peer_lease.rs` both do that. A test about the type itself builds
+    /// binary does not inherit the bearer; `tests/peer/lending/peer_hand.rs` and
+    /// `tests/peer/lending/peer_lease.rs` both do that. A test about the type itself builds
     /// one here.
     pub fn new() -> Self {
         Self::default()
@@ -237,7 +237,7 @@ pub(crate) fn report_handed_spend(lease_id: u128, utilization: Option<f64>) {
 /// The utilization one window's rate-limit header reported on a response, or
 /// `None` when this answer said nothing about that window.
 ///
-/// The header names are `src/quota.rs`'s own; read here rather than through
+/// The header names are `src/records/quota/mod.rs`'s own; read here rather than through
 /// `Quota::update_from_headers` because that merges into an account's quota,
 /// and a borrower has no account of the owner's to merge into. It is one
 /// figure, for one window, off one answer.

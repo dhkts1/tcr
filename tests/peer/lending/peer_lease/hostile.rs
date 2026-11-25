@@ -9,7 +9,7 @@ use super::fixtures::*;
 use super::*;
 
 /// **A borrowed request pays the LENDER's per-organization GCRA bucket**: the
-/// executable version of the claim `src/peer/serve.rs`'s module doc makes in
+/// executable version of the claim `src/peer/serve/mod.rs`'s module doc makes in
 /// prose.
 ///
 /// The lender's throttle is tightened to one instant slot then one per 350 ms,

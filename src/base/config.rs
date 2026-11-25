@@ -134,7 +134,7 @@ const fn default_usage_retention_days() -> u32 {
 /// `"minSpacingMs"`) to turn it back on, with exactly the behaviour it has today.
 ///
 /// This is NOT covered by the egress throttles ([`default_account_throttle`] /
-/// [`default_fleet_throttle`], `src/manager/throttle.rs`): those are RATE limiters
+/// [`default_fleet_throttle`], `src/manager/serving/throttle.rs`): those are RATE limiters
 /// (min-spacing + burst at the send site), not concurrency bounds, and they are
 /// deliberately not a substitute for one. Turning the cap off leaves per-account
 /// concurrency genuinely unbounded.
@@ -168,7 +168,7 @@ const fn default_pacing() -> PacingConfig {
 /// at the full 350ms rate for a minute (187 sends) with no 429. Whatever trips
 /// those 429s, it is not request count.
 ///
-/// `tests/throttle_exempt.rs::shipped_tuning_passes_an_agent_wave_untaxed` holds
+/// `tests/proxy/throttle_exempt.rs::shipped_tuning_passes_an_agent_wave_untaxed` holds
 /// the 24, and `shipped_tuning_still_paces_beyond_one_wave` proves the bucket
 /// still paces past it. Both read this function's values, not a copy.
 ///
@@ -203,7 +203,7 @@ const fn default_account_throttle() -> ThrottleConfig {
 /// headroom is unchanged and large: the fleet averaged 1.5 req/s over those five
 /// days, against this ceiling's 10 req/s.
 ///
-/// `tests/throttle_exempt.rs::shipped_fleet_ceiling_can_actually_fire` is the
+/// `tests/proxy/throttle_exempt.rs::shipped_fleet_ceiling_can_actually_fire` is the
 /// guard: it drives a 48-wide runaway and asserts the ceiling engages. A ceiling
 /// never observed firing is indistinguishable from an absent one.
 const fn default_fleet_throttle() -> ThrottleConfig {

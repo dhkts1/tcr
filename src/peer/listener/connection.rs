@@ -66,7 +66,7 @@ where
     // peers file asks this value ([`PeerStore::file`]), and the connection
     // reads the runtime state file once, here, so an accepted connection
     // opens each file once. It used to open the peers file twice, here, and
-    // again in `serve_stream` for the same bytes, which `tests/peer_lease.rs`
+    // again in `serve_stream` for the same bytes, which `tests/peer/lending/peer_lease.rs`
     // now counts through `config::peers_file_opens`.
     //
     // Before `SocketSlot::acquire`, because the ban list and the cap the slot
@@ -281,7 +281,7 @@ where
 /// this machine it is not the thing that can produce an interesting one:
 /// macOS puts only `127.0.0.1`, `::1` and one link-local address on `lo0`, so
 /// `10.0.0.7` and `2001:db8::1` cannot be dialled from here at all
-/// (`tests/peer_abuse.rs` measured it, and adding an alias needs root on a
+/// (`tests/peer/pairing/peer_abuse.rs` measured it, and adding an alias needs root on a
 /// machine that is also serving a live proxy). This takes the address as the
 /// value it already is inside [`serve_connection`], so the refusal a peer off
 /// the LAN gets can be observed as BYTES on a real stream rather than inferred
@@ -575,7 +575,7 @@ where
         // frame and the request frame, and one frame is the revocation latency
         // this file promises. It stays true through the connection's own store
         // because `handle_serve` opens with `store.reload_if_changed()`
-        // (`src/peer/serve.rs:675`): a re-read when the file moved, and no open
+        // (`src/peer/serve/mod.rs`): a re-read when the file moved, and no open
         // at all when it did not, which is the review's L2.
         StreamKind::Serve => {
             let Some(serving) = &context.serving else {
@@ -1132,7 +1132,7 @@ where
                             // on every accepted connection: a SERVE must still
                             // open the peers file exactly once
                             // (`an_accepted_connection_opens_the_peers_file_once`,
-                            // `tests/peer_lease.rs`), and a Hello is the
+                            // `tests/peer/lending/peer_lease.rs`), and a Hello is the
                             // exchange that exists to answer "where and how do
                             // we meet next time".
                             rendezvous: config::observe_rendezvous_secret(
@@ -1318,7 +1318,7 @@ where
             // refusal below. So a borrowed request reached the lender, was
             // refused here, and the borrower fell through to its own honest 429,
             // which from the outside is indistinguishable from a lender that
-            // was never wired at all. `tests/peer_e2e.rs` asserted exactly that
+            // was never wired at all. `tests/peer/peer_e2e.rs` asserted exactly that
             // gap.
             //
             // **Both opt-ins are checked, and neither is checked here.** The

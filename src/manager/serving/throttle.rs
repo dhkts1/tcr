@@ -17,7 +17,7 @@ use crate::manager::*;
 /// written down before this comment.
 ///
 /// The other reason this is named: `classify_request` now drives TWO
-/// independent policies — account selection (`src/manager/select.rs`) and
+/// independent policies — account selection (`src/manager/select/mod.rs`) and
 /// throttling (here). Changing its `Noise` arm for a selection reason (e.g.
 /// widening or narrowing the `/api/event_logging*` / `/mcp-registry*` prefix
 /// match) silently changes which traffic this predicate exempts too. There is

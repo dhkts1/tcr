@@ -59,7 +59,7 @@
 //!    probe this file used to gate behind `TCR_E2E_EXPECT_LEASE_ARM=1` is now
 //!    the assertion, unconditional): until LEASE-WIRE's arm lands in this
 //!    tree, this test is RED there, and the failure names the line above.
-//! 5. `serve::say_hello` (`src/peer/serve.rs:1339`) is the whole client half of
+//! 5. `serve::say_hello` (`src/peer/serve/mod.rs`) is the whole client half of
 //!    the moved-peer refresh: it dials a pinned peer, sends a `Control::Hello`,
 //!    and the listener's own answering half already records the caller's
 //!    address (`listener.rs:1734`, wired and green today). It had no caller

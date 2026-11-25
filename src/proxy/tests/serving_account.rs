@@ -491,7 +491,7 @@ async fn locked_account_stops_after_its_quota_rejection() {
 /// nothing said which client's requests kept drawing it.
 ///
 /// Runs the request up to three times for the reason written out on
-/// `src/server.rs`'s `boot_line_carries_every_new_knob_with_its_configured_value`:
+/// `src/proxy/server/tests.rs`'s `boot_line_carries_every_new_knob_with_its_configured_value`:
 /// other 429 tests in this binary reach these log callsites on threads with
 /// no subscriber, `tracing` caches `Interest::never` for them process-wide,
 /// and this sink then stays empty however long anything waits (measured

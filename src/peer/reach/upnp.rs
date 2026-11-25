@@ -11,7 +11,7 @@
 //!   [`Discoverer::discover`](crate::peer::reach::upnp::Discoverer::discover) drives a plain [`std::net::UdpSocket`] with a
 //!   read timeout; [`UpnpClient`](crate::peer::reach::upnp::UpnpClient)'s HTTP calls run on a DEDICATED thread with
 //!   its own current-thread `tokio` runtime, the same pattern as
-//!   `update::fetch_bytes` (`src/update.rs`), for the same reason: a caller
+//!   `update::fetch_bytes` (`src/verbs/update/mod.rs`), for the same reason: a caller
 //!   already inside `#[tokio::main]` cannot `block_on` on its own thread, and
 //!   a fresh thread has no runtime to collide with.
 //! - **The discovery destination is injectable**, exactly as
@@ -29,7 +29,7 @@
 //! is one page of UPnP IGD's own spec. [`parse_xml`](crate::peer::reach::upnp::parse_xml) is a few dozen lines and
 //! builds a plain tree; [`XmlNode::child`](crate::peer::reach::upnp::XmlNode::child) and [`XmlNode::find_all`](crate::peer::reach::upnp::XmlNode::find_all) are the
 //! entire reading API, and neither cares what order sibling elements arrive
-//! in: see the shuffled-order proptest in `tests/peer_reach_upnp.rs`.
+//! in: see the shuffled-order proptest in `tests/peer/reach/peer_reach_upnp.rs`.
 //!
 //! # The four calls, and the one invariant that binds them
 //!

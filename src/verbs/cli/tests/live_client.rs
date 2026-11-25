@@ -212,7 +212,7 @@ async fn post_add_account_ambiguous_identity_is_rejected_not_guessed() {
 /// So a lost port is retried on a fresh one, five times at most. The ceiling
 /// keeps the race visible: losing five in a row is a runner with no free
 /// ports, which is a defect to see rather than to retry past. The same
-/// shape, and the same reason, as `Mac::boot` in `tests/peer_e2e.rs`.
+/// shape, and the same reason, as `Mac::boot` in `tests/peer/peer_e2e.rs`.
 #[tokio::test]
 async fn live_status_falls_back_when_no_server_answers() {
     /// How many times this may lose the port before it is a failure.

@@ -251,7 +251,7 @@ final class ConfigSettingsTests: XCTestCase {
         XCTAssertEqual(
             ConfigSetCommand.fileKey(for: SettingsRowBadge.resetUrgencyTier), "resetUrgencyTierHours")
         XCTAssertEqual(
-            Set(keys.compactMap(\.1)).count, 11, "eleven distinct keys, as `src/config_set.rs` has")
+            Set(keys.compactMap(\.1)).count, 11, "eleven distinct keys, as `src/base/config_set.rs` has")
     }
 
     func testTheSetArgvIsTheVerbTheBinaryDefines() {

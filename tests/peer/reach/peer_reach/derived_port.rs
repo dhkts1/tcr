@@ -537,7 +537,7 @@ async fn two_blackholing_endpoints_leave_a_later_step_time_to_run() {
 /// read of `dial_order` against that same table can show the wiring works.
 ///
 /// Watched red: comment out the two `crate::peer::reach::probe::cool_down(...)`
-/// calls in `src/peer/serve.rs` and the dead endpoint is still in the second
+/// calls in `src/peer/serve/mod.rs` and the dead endpoint is still in the second
 /// order.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dial_that_fails_one_endpoint_cools_it_and_the_next_order_drops_it() {

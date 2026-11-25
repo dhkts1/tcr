@@ -133,7 +133,7 @@ pub trait WindowUtilization: Send + Sync {
 /// ([`handle_serve_on`](crate::peer::serve::handle_serve_on)), so the only thing that crosses into the picker is a
 /// header. The proxy reads two account-selection headers and both are STRICT:
 /// [`crate::proxy::GROUP_HEADER_NAME`], which `Manager::select_with_group`
-/// holds inside the named group (`strict_group`, `src/manager/select.rs:1139`,
+/// holds inside the named group (`strict_group`, `src/manager/select/mod.rs`,
 /// for every group that is reserved or not a spill group), and
 /// [`crate::proxy::ACCOUNTS_HEADER_NAME`], which holds the request inside a
 /// named SET of accounts by benching every account outside it before the
@@ -368,7 +368,7 @@ pub struct Ledger {
     /// message, and a scope never crosses it: the
     /// borrower never learns which of the lender's accounts paid. The gate that
     /// holds that is `every_wire_type_serializes_only_allowlisted_keys` in
-    /// `tests/peer_wire.rs`, not this comment.
+    /// `tests/peer/pairing/peer_wire.rs`, not this comment.
     ///
     /// A lease with no entry here is [`LendScope::All`], which is what every
     /// lease minted before scopes existed meant, including the ones a restore at
@@ -919,7 +919,7 @@ impl Ledger {
     ///
     /// Every `Ok` is paired with exactly one [`Self::leave_relay`]. The caller
     /// holds that pairing in a guard, the way the proxy's own in-flight
-    /// accounting does at `src/proxy.rs:2525`, so a rotate, a terminal return or
+    /// accounting does at `src/proxy/mod.rs`, so a rotate, a terminal return or
     /// a panic-unwind all release the slot.
     pub fn enter_relay(
         &mut self,
@@ -1334,7 +1334,7 @@ impl Ledger {
     /// choice to stop renewing all bind without any hint ever arriving.
     ///
     /// **Reconciliation against the owner's real usage probe
-    /// (`src/manager/probing.rs`) is OUT OF SCOPE here.** That is the
+    /// (`src/manager/freshness/probing.rs`) is OUT OF SCOPE here.** That is the
     /// check that would turn this hint into an accounting figure, and until it
     /// exists a hand-mode lease is trusted to the limit of its `until`.
     ///

@@ -79,7 +79,7 @@ fn set_direct_endpoint(mac: &Mac, node: &str, addr: &str) {
 /// This machine has no global IPv6 address (loopback-only CI, `reach.rs`'s own
 /// module doc says a global v6 address is what lets two Macs skip a relay
 /// entirely), so a row whose only direct endpoint is an IPv6 socket is
-/// exactly the shape `dial_peer_reaching_within` (`src/peer/serve.rs:1654`)
+/// exactly the shape `dial_peer_reaching_within` (`src/peer/serve/mod.rs`)
 /// must fall through on, the same way it falls through a stale IPv4 endpoint
 /// in `a_forwarded_borrow_reaches_the_lender_through_a_third_mac` above. The
 /// difference from that test is deliberate: there the row has NO address at
@@ -88,7 +88,7 @@ fn set_direct_endpoint(mac: &Mac, node: &str, addr: &str) {
 /// before the forwarder loop runs.
 ///
 /// Watch it fail by deleting the `for forwarder in forwarders_for(...)` loop
-/// in `dial_peer_reaching_within` (`src/peer/serve.rs`): the IPv6 attempt
+/// in `dial_peer_reaching_within` (`src/peer/serve/mod.rs`): the IPv6 attempt
 /// still fails, nothing else is tried, and this test times out at 429 instead
 /// of reaching 200.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -200,7 +200,7 @@ async fn no_ipv6_endpoint_falls_through_to_a_forwarder() {
 /// forwarded stream and the reply landing; `carrier` is killed inside that
 /// window, once the upstream has recorded the borrowed request on the lender's
 /// token (never on a timer, which can fire while the lease is still being
-/// asked for). `borrow_once` (`src/peer/serve.rs`) is mid-stream against a socket
+/// asked for). `borrow_once` (`src/peer/serve/mod.rs`) is mid-stream against a socket
 /// whose other end just vanished, so the read must fail with an I/O error
 /// almost immediately, and that is the case [`open_serve_within`]'s own doc
 /// distinguishes from a lender that is merely slow: that one is `Ok(None)` at
@@ -340,7 +340,7 @@ async fn forwarder_killed_mid_borrow_releases_the_client_promptly() {
     lender.shutdown();
 }
 
-/// Mirrors `BORROW_TIMEOUT` (`src/peer/serve.rs`), kept as a named constant
+/// Mirrors `BORROW_TIMEOUT` (`src/peer/serve/mod.rs`), kept as a named constant
 /// here rather than a bare `10` in the assertion above, since this test's
 /// whole point is proving the release happens well inside it.
 const BORROW_TIMEOUT_SECS: u64 = 10;
@@ -516,7 +516,7 @@ async fn a_vanished_lenders_next_borrow_re_asks_and_the_cap_is_not_corrupted() {
 /// or writing anything.**
 ///
 /// `asks_for_other_lanes`: no production code in this tree reports a "no
-/// network" state at all. `spawn_mapping_keeper` (`src/peer/reach.rs:1185`)
+/// network" state at all. `spawn_mapping_keeper` (`src/peer/reach/mod.rs`)
 /// only ever answers "no gateway responded" (silence) or a NAT-PMP mapping; a
 /// captive portal answering every request with a 302 on the TCP link a
 /// NAT-PMP UDP probe never touches would today read as the SAME "no gateway"
@@ -535,7 +535,7 @@ async fn a_vanished_lenders_next_borrow_re_asks_and_the_cap_is_not_corrupted() {
 #[tokio::test]
 #[ignore = "needs_unbuilt_pieces: no keeper 'no network' state and no `tcr peer reach` verb \
             exist in this tree to assert a captive-portal HTTP 302 against; those and \
-            src/peer/reach.rs's MappingKeeper are not built yet"]
+            src/peer/reach/mod.rs's MappingKeeper are not built yet"]
 async fn a_captive_portal_reports_no_network_and_pins_nothing() {
     unimplemented!(
         "blocked on `tcr peer reach` (PUNCH) and the keeper's no-network read (REVERSE); see \

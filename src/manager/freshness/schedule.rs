@@ -46,7 +46,7 @@
 //! # Randomness without a `rand` dependency
 //!
 //! This crate deliberately carries no direct `rand` dependency — the existing
-//! jitter in `src/proxy.rs` derives its randomness from the loop clock
+//! jitter in `src/proxy/mod.rs` derives its randomness from the loop clock
 //! (`now.nanosecond()`) for exactly that reason. Re-reading the clock per
 //! account does NOT work here, though: the initial offsets for a whole fleet are
 //! drawn inside one tight loop, and successive `nanosecond()` reads in a tight

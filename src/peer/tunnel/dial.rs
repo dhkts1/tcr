@@ -895,10 +895,10 @@ async fn punch_dial(
     // borrow's own and both spent on a punch that a Mac nobody can dial cannot
     // answer. Measured, not reasoned: with the question asked on an empty row,
     // `an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs`
-    // (`tests/peer_e2e.rs`) fails on both platforms of one run with the carrier
+    // (`tests/peer/peer_e2e.rs`) fails on both platforms of one run with the carrier
     // refusing a connection at an allowance of two, and
     // `a_row_with_no_endpoints_is_reached_through_a_carry_grantee`
-    // (`tests/peer_forward.rs`) only passes if its fixture accepts a carried
+    // (`tests/peer/reach/peer_forward.rs`) only passes if its fixture accepts a carried
     // stream the borrow never gets to use.
     //
     // ONE exchange, never a loop. A second ask against a peer that did not

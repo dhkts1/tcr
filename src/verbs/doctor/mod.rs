@@ -256,7 +256,7 @@ pub fn holder_from(pid: u32, name: &str, argv: &[String]) -> PortHolder {
 
 /// Who is listening on `port`, on any address.
 ///
-/// Same enumeration `src/singleton.rs` uses for the takeover decision (the
+/// Same enumeration `src/stores/singleton/mod.rs` uses for the takeover decision (the
 /// `listeners` crate, no subprocess, so no `lsof` to be missing or to conflate
 /// "no holder" with "the tool failed"), and the same failure posture: an
 /// enumeration error is warned about, never turned into a confident "nobody

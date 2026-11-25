@@ -299,7 +299,7 @@ pub const MAX_MESSAGE_1_BYTES: usize = IK_MESSAGE_1_LEN;
 ///
 /// 256 and not 96: `snow` is handed this as the output buffer and a margin
 /// costs nothing here. `noise_message_one_lengths_are_what_the_gate_pins`
-/// (`tests/peer_noise.rs`) asserts every pattern's messages fit, against
+/// (`tests/peer/pairing/peer_noise.rs`) asserts every pattern's messages fit, against
 /// `snow` itself rather than against this comment.
 pub const HANDSHAKE_SCRATCH_BYTES: usize = 256;
 
@@ -1777,8 +1777,8 @@ where
 /// Mac's [`tcr_peer_wire::InstanceId`] so the responder can check it against
 /// the window an Accept opened. See [`XX_MESSAGE_1_LEN`] for why the payload
 /// and not a later frame. [`dial_handshake`] keeps its signature and delegates
-/// with an empty payload, because `src/peer/serve.rs`, `src/peer/lease.rs` and
-/// `tests/peer_lease.rs` all call it.
+/// with an empty payload, because `src/peer/serve/mod.rs`, `src/peer/lease/mod.rs` and
+/// `tests/peer/lending/peer_lease.rs` all call it.
 pub async fn dial_handshake_with_payload<S>(
     stream: &mut S,
     secret: &[u8; KEY_BYTES],
@@ -1917,7 +1917,7 @@ const PORT_INFO: &[u8] = b"tcr peer reach derived-port v1";
 /// Noise handshake hash.
 ///
 /// HKDF-SHA256 (RFC 5869) over the tree's own `hmac_sha256`
-/// (`src/peer/config.rs`), which is checked against RFC 4231 rather than
+/// (`src/peer/config/mod.rs`), which is checked against RFC 4231 rather than
 /// against itself. Extract with an all-zero salt, as the RFC says to when
 /// there is none, then one expand round, because 32 bytes is one block and the
 /// counter never reaches two.

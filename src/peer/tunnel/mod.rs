@@ -3,7 +3,7 @@
 //!
 //! # It is already written, once, for loopback
 //!
-//! `src/mitm.rs`'s `tunnel()` is a `copy_bidirectional` splice whose own
+//! `src/proxy/mitm/mod.rs`'s `tunnel()` is a `copy_bidirectional` splice whose own
 //! doc-comment is the security argument verbatim: TLS is never terminated, the
 //! client's end-to-end encryption to the real host is untouched, and no
 //! credentials are involved. [`splice`](crate::peer::tunnel::splice) is that body, extracted over two
@@ -91,7 +91,7 @@
 //!
 //! A gateway log line carries the peer, the target host, bytes up, bytes down
 //! and milliseconds, and NOTHING else, asserted by a test
-//! (`tests/peer_egress.rs`). A gateway is the one place where a lazy log line
+//! (`tests/peer/reach/peer_egress.rs`). A gateway is the one place where a lazy log line
 //! would leak a peer's entire request stream.
 
 use std::collections::VecDeque;

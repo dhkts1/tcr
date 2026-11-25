@@ -58,7 +58,7 @@ self_check() {
   check inert "docs and a markdown file"        docs/RELEASING.md CONTRIBUTING.md
   check inert "a screenshot"                    assets/tcrbar-panel-fleet.png
   # Must NOT be inert. A gate that cannot say `code` is not a gate.
-  check code  "rust source"                     src/session_wire.rs
+  check code  "rust source"                     src/records/session_wire/mod.rs
   check code  "swift source"                    apps/macos/Sources/TcrBar/FleetView.swift
   check code  "a workflow"                      .github/workflows/ci.yml
   check code  "Cargo.lock"                      Cargo.lock

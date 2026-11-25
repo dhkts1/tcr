@@ -6,7 +6,7 @@
 # whole set green again. A gate that cannot be shown failing is not a gate.
 #
 # Every probe patches a file this test suite owns directly. The one exception
-# is the peers-file mode probe: its writer (`src/config.rs::write_atomic`)
+# is the peers-file mode probe: its writer (`src/base/config/file.rs::write_atomic`)
 # lives in a file this suite does not own, so that probe patches the TEST to write the file with
 # `std::fs::write` instead of the one writer, which proves the assertion
 # measures the mode on disk rather than the writer's name.
@@ -159,7 +159,7 @@ probe peers_mode_check --test=it \
 SPEC
 
 # SKIPPED probe key_file_follows_symlink (gate a_planted_symlink_does_not_capture_the_node_key):
-# its anchor was `.create_new(true).mode(mode)` in src/peer/id.rs, and `write_key_file` no
+# its anchor was `.create_new(true).mode(mode)` in src/peer/config/id.rs, and `write_key_file` no
 # longer opens the file that way. It stages a tempfile and publishes it with `link(2)`, so the
 # symlink defence has a different shape and this mutation has no counterpart there.
 

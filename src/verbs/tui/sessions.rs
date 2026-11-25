@@ -54,7 +54,7 @@ pub(super) enum TreeRow {
     ///
     /// As of this writing, UNREACHABLE from a live request:
     /// [`crate::manager::Manager::record_served`] only creates a session entry
-    /// when its key is `Some`, and `handle` (`src/proxy.rs`) never pairs
+    /// when its key is `Some`, and `handle` (`src/proxy/mod.rs`) never pairs
     /// `SessionKind::Fallback` with a `Some` key — the fallback branch always
     /// hands back `(None, SessionKind::Fallback)`. So a real request that ends
     /// up `Fallback` is simply never tracked as a session at all, and this row

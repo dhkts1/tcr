@@ -141,7 +141,7 @@ pass "node-a1 minted an invite key"
 
 # Not a harness bug: `tcr peer invite` here is a fresh `docker exec` process,
 # not the long-lived `tcr --headless` server holding the mapping, and
-# `reach::external_socket()` (src/peer/reach.rs) is deliberately a
+# `reach::external_socket()` (src/peer/reach/mod.rs) is deliberately a
 # process-local register, "the keeper runs on its own thread for the life of
 # the listener" (its own doc comment). `tcr peer reach` sees the mapping
 # because it reads the PERSISTED state file the server writes

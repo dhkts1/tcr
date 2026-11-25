@@ -21,7 +21,7 @@
 //!
 //! `clear_cooldowns_for_fetch`, the sibling interaction (a cooldown must
 //! clear for exactly the locators a fetch just wrote, no other), is gated as
-//! a deterministic unit test beside it in `src/peer/serve.rs`'s own `mod
+//! a deterministic unit test beside it in `src/peer/serve/mod.rs`'s own `mod
 //! tests`: `dial_order`'s "every path is cooling, try them all anyway"
 //! fallback makes that interaction unobservable through a black-box dial
 //! outcome whenever the target address is genuinely reachable (the fallback

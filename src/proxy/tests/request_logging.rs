@@ -129,7 +129,7 @@ async fn buffered_request_logs_usage_line_with_real_token_counts() {
 }
 
 /// THE BITING TEST for the upstream-error blind spot this bridge closes:
-/// before this fix, `src/proxy.rs`'s only per-response log line was
+/// before this fix, `src/proxy/mod.rs`'s only per-response log line was
 /// "upstream response" (`account`, `path`, `status` — nothing else), so a
 /// non-2xx status was opaque: 64 `status=400` lines on 2026-09-07 with no
 /// way to tell one 400 from another. A real request against a real fake

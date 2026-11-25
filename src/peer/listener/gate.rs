@@ -216,7 +216,7 @@ impl RequestDedup {
 /// PARSE deliberately survives that ([`StreamKind::Unknown`]), and a handler
 /// that then treated it as a tunnel would be an open relay. Refusal is the only
 /// safe answer here, the inverse of `ProxyHost::Unknown`
-/// (`src/singleton.rs:105-125`), where degrading is what keeps a live proxy
+/// (`src/stores/singleton/mod.rs`), where degrading is what keeps a live proxy
 /// from being signalled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamRefusal {
