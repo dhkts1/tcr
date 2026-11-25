@@ -1081,7 +1081,7 @@ async fn predecessor_closed(channel: std::os::unix::net::UnixStream) -> std::io:
 ///
 /// One boot line says a key was written or adopted. It never carries the key.
 pub(crate) fn ensure_request_key(config: &mut Config, persist_path: Option<&std::path::Path>) {
-    if config.holds_request_key() {
+    if config.usable_request_key().is_some() {
         return;
     }
     let Some(path) = persist_path else {

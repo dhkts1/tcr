@@ -64,15 +64,6 @@ pub(super) fn save_request_key(
 }
 
 impl super::Config {
-    /// Whether this config holds a non-empty request key
-    /// ([`ProxyConfig::request_key`]).
-    pub fn holds_request_key(&self) -> bool {
-        self.proxy
-            .request_key
-            .as_deref()
-            .is_some_and(|key| !key.is_empty())
-    }
-
     /// Write `candidate` to the file at `path` as the request key
     /// ([`save_request_key`]) and hold whatever key the file then carries:
     /// `candidate` when it was written, the file's own when another writer got
