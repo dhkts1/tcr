@@ -189,8 +189,16 @@ impl Config {
     }
 
     /// Whether the loader set any account aside for holding no usable credential.
-    pub fn holds_quarantined_accounts(&self) -> bool {
+    fn holds_quarantined_accounts(&self) -> bool {
         !self.quarantined_accounts.is_empty()
+    }
+
+    /// Whether the in-memory `throttle` migration [`super::load`] made should be
+    /// written back: only when it migrated something and no account is
+    /// quarantined, since a whole-config save would drop the row the loader set
+    /// aside ([`Self::refuse_edit_if_quarantined`], the same hazard).
+    pub fn should_save_throttle_migration(&self) -> bool {
+        self.migrated_legacy_throttle && !self.holds_quarantined_accounts()
     }
 
     /// Refuse a CLI load-edit-save of the file at `config_path` while any account
