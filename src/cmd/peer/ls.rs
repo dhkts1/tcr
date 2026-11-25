@@ -166,7 +166,7 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
                     grant.handed_key_until =
                         peer_ls_handed_key_until(grant, &config_accounts, now_s);
                 }
-                let (until, ended) = peer_ls_ends(&row, &state.leases, &state.borrowed, now_s);
+                let (until, ended) = peer_ls_ends(&row, &state, now_s);
                 status::PeerLsRow::from_row(row, until, ended)
             })
             .collect();
@@ -186,12 +186,7 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
             .chain(found_rows.iter().cloned().map(status::PeerLsPeer::Found))
             .collect();
         let file = store.file();
-        let exits = peer_ls_exits(
-            &config_accounts,
-            &file.peers,
-            &state.last_seen,
-            peer::state::now_ms(),
-        );
+        let exits = peer_ls_exits(&config_accounts, &file.peers, &state, peer::state::now_ms());
         let out = status::PeerLsJson {
             supported: true,
             peers,
@@ -201,9 +196,9 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
             exits,
             pending_count: pending.len(),
             pending,
-            blocked_count: state.banned.len(),
+            blocked_count: state.blocked_count(),
             blocked: state.banned.clone(),
-            muted_count: state.muted.len(),
+            muted_count: state.muted_count(),
             muted: state.muted.clone(),
             limited: state.found_not_shown,
             caps: status::PeerCapsJson {
@@ -259,8 +254,8 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
         println!(
             "peer ls: pending={} blocked={} muted={} found={} not-shown={}",
             state.visible_pending().len(),
-            state.banned.len(),
-            state.muted.len(),
+            state.blocked_count(),
+            state.muted_count(),
             state.visible_found().len(),
             state.found_not_shown
         );
@@ -342,7 +337,7 @@ fn peer_ls_inert_exit_lines(accounts: &[config::Account]) -> Vec<String> {
 fn peer_ls_exits(
     accounts: &[config::Account],
     peers: &[peer::config::PeerRow],
-    last_seen: &[(tcr_peer_wire::PeerId, i64)],
+    state: &peer::state::PeerState,
     now_ms: i64,
 ) -> std::collections::BTreeMap<String, status::PeerExitJson> {
     let mut out = std::collections::BTreeMap::new();
@@ -364,10 +359,8 @@ fn peer_ls_exits(
                 let reachable = peers
                     .iter()
                     .any(|row| row.node == peer && row.has_endpoint());
-                let waited = last_seen
-                    .iter()
-                    .find(|(node, _)| *node == peer)
-                    .map(|(_, at)| *at)
+                let waited = state
+                    .last_seen_of(peer)
                     .and_then(|at| u64::try_from(now_ms.saturating_sub(at).max(0) / 1_000).ok());
                 (!reachable, if reachable { None } else { waited })
             }
@@ -396,8 +389,7 @@ fn peer_ls_exits(
 /// drawn as ended.
 fn peer_ls_ends(
     row: &peer::config::PeerRow,
-    leases: &[peer::state::LeaseRow],
-    borrowed: &[peer::state::BorrowedRow],
+    state: &peer::state::PeerState,
     now_s: u64,
 ) -> (Option<u64>, bool) {
     // (end, has it passed) for every lease this row is party to.
@@ -407,15 +399,9 @@ fn peer_ls_ends(
         .map(|grant| (grant.until, grant.has_ended(now_s)))
         .collect();
     ends.extend(
-        leases
-            .iter()
-            .filter(|held| held.peer == row.node)
-            .map(|held| {
-                (
-                    held.lease.until,
-                    held.lease.until.is_some_and(|until| until <= now_s),
-                )
-            }),
+        state
+            .leases_lent_to(row.node)
+            .map(|lease| (lease.until, lease.until.is_some_and(|until| until <= now_s))),
     );
     // The BORROWED side, on the same clock and the same `until`: a lease this
     // Mac holds FROM that row's Mac ends when the lender said it ends, and the
@@ -423,15 +409,9 @@ fn peer_ls_ends(
     // state file rather than from any running process, which is what makes it
     // answerable by a CLI invocation at all.
     ends.extend(
-        borrowed
-            .iter()
-            .filter(|held| held.lender == row.node)
-            .map(|held| {
-                (
-                    held.lease.until,
-                    held.lease.until.is_some_and(|until| until <= now_s),
-                )
-            }),
+        state
+            .leases_borrowed_from(row.node)
+            .map(|lease| (lease.until, lease.until.is_some_and(|until| until <= now_s))),
     );
 
     let live: Vec<Option<u64>> = ends

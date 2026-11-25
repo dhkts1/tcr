@@ -293,11 +293,7 @@ pub fn peer_status_rows(
     let now_s = u64::try_from(now_ms.max(0) / 1_000).unwrap_or(0);
     rows.iter()
         .map(|row| {
-            let last_seen_ms = state
-                .last_seen
-                .iter()
-                .find(|(peer, _)| *peer == row.node)
-                .map(|(_, at)| *at);
+            let last_seen_ms = state.last_seen_of(row.node);
             let paths = peer_paths(row, last_seen_ms, state, now_ms);
             let (until, ended) = row_ends(row, state, now_s);
             let live = newest_live_lease(row, state, now_ms);
@@ -439,10 +435,7 @@ pub(super) fn peer_paths(
     // paths answers `None`, a peer with any row has, and a path of its own with
     // no row carried nothing. Deciding it per path instead would make the two
     // answers depend on which endpoint happened to be looked at first.
-    let metered = state
-        .path_traffic
-        .iter()
-        .any(|traffic| traffic.peer == row.node);
+    let metered = state.is_metered(row.node);
 
     // One endpoint means one candidate for the peer-level `last_seen`; two mean
     // the timestamp cannot be attributed and both paths say so. See
@@ -461,14 +454,8 @@ pub(super) fn peer_paths(
                 Locator::Via { node } => (node.to_wire(), PathKind::Via),
                 Locator::Reverse { node } => (node.to_wire(), PathKind::Reverse),
             };
-            let traffic = state
-                .path_traffic
-                .iter()
-                .find(|traffic| traffic.peer == row.node && traffic.locator == endpoint.locator);
-            let measured = state
-                .paths
-                .iter()
-                .find(|stat| stat.peer == row.node && stat.locator == endpoint.locator);
+            let traffic = state.path_traffic_of(row.node, &endpoint.locator);
+            let measured = state.measured_path(&row.node, &endpoint.locator);
             PathStatus {
                 endpoint: address,
                 kind,
@@ -524,17 +511,8 @@ fn newest_live_lease<'a>(
     now_ms: i64,
 ) -> Option<&'a tcr_peer_wire::Lease> {
     state
-        .leases
-        .iter()
-        .filter(|held| held.peer == row.node)
-        .map(|held| &held.lease)
-        .chain(
-            state
-                .borrowed
-                .iter()
-                .filter(|borrowed| borrowed.lender == row.node)
-                .map(|borrowed| &borrowed.lease),
-        )
+        .leases_lent_to(row.node)
+        .chain(state.leases_borrowed_from(row.node))
         .filter(|lease| lease.expires_at_ms > now_ms)
         .max_by_key(|lease| lease.granted_at_ms)
 }
@@ -562,11 +540,11 @@ fn tokens_per_hour(
 
     let mut total = 0.0_f64;
     let mut measured = false;
-    for held in state.leases.iter().filter(|held| held.peer == row.node) {
-        let tcr_peer_wire::LeaseUnit::Tokens(amount) = held.lease.unit else {
+    for lease in state.leases_lent_to(row.node) {
+        let tcr_peer_wire::LeaseUnit::Tokens(amount) = lease.unit else {
             continue;
         };
-        let elapsed_ms = now_ms - held.lease.granted_at_ms;
+        let elapsed_ms = now_ms - lease.granted_at_ms;
         if elapsed_ms < MIN_ELAPSED_MS {
             // NOT measured. This sat above the check and marked the row
             // measured first, so a lease minted in the last second reported
@@ -585,7 +563,7 @@ fn tokens_per_hour(
         // the factor entirely reports the GRANT as if it had all been drawn,
         // which is the defect `a_lent_lease_in_tokens_reports_a_rate_from_the_ledger`
         // watched fail: 1 000 000 granted and half spent read as 500 000/h.
-        total += (amount as f64) * held.lease.spent.clamp(0.0, 1.0) / hours;
+        total += (amount as f64) * lease.spent.clamp(0.0, 1.0) / hours;
     }
     measured.then(|| total.round().max(0.0) as u64)
 }
@@ -612,22 +590,13 @@ fn row_ends(
         .collect();
     ends.extend(
         state
-            .leases
-            .iter()
-            .filter(|held| held.peer == row.node)
-            .map(|held| (held.lease.until, lease_has_ended(&held.lease, now_s))),
+            .leases_lent_to(row.node)
+            .map(|lease| (lease.until, lease_has_ended(lease, now_s))),
     );
     ends.extend(
         state
-            .borrowed
-            .iter()
-            .filter(|borrowed| borrowed.lender == row.node)
-            .map(|borrowed| {
-                (
-                    borrowed.lease.until,
-                    lease_has_ended(&borrowed.lease, now_s),
-                )
-            }),
+            .leases_borrowed_from(row.node)
+            .map(|lease| (lease.until, lease_has_ended(lease, now_s))),
     );
 
     if ends.is_empty() {

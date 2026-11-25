@@ -961,14 +961,11 @@ fn the_measured_paths_survive_a_restart_and_keep_the_rest_of_the_file() {
     let addr: SocketAddr = "127.0.0.1:9708".parse().expect("an addr");
 
     let mut state = tcr::peer::state::PeerState::default();
-    state.muted.push(tcr::peer::state::Mute {
-        // Dated far ahead on purpose: `save_paths` reads the file through
-        // `load` at the REAL clock, which prunes a mute whose deadline has
-        // passed, so a mute dated from this file's fixed clock would be pruned
-        // by the writer and read as "the section writer lost it".
-        addr: "127.0.0.1".to_string(),
-        until_ms: 4_102_444_800_000,
-    });
+    // Muted at the REAL clock on purpose: `save_paths` reads the file through
+    // `load` at the real clock, which prunes a mute whose deadline has passed,
+    // so a mute dated from this file's fixed clock would be pruned by the
+    // writer and read as "the section writer lost it".
+    state.mute("127.0.0.1", tcr::peer::state::now_ms());
     tcr::peer::state::save(&path, &state).expect("the first write");
 
     let mut table = PathTable::default();
@@ -990,7 +987,7 @@ fn the_measured_paths_survive_a_restart_and_keep_the_rest_of_the_file() {
     assert_eq!(stat.locator, Locator::Direct { addr });
     assert_eq!(stat.rtt_ms, Some(40.0));
     assert_eq!(
-        restored.muted.len(),
+        restored.muted_count(),
         1,
         "and a section writer keeps every other key: the mute the operator set is still there"
     );

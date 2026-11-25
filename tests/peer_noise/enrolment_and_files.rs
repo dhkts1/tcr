@@ -131,7 +131,7 @@ fn opening_the_window_keeps_every_other_key_in_the_state_file() {
 /// written is not an input to either decision.
 ///
 /// Watched red: with the `if mode != 0o600` branch in `crate::peer::state::load`
-/// deleted, the widened file is read back and `loaded.banned` is 1, not 0, and
+/// deleted, the widened file is read back and `loaded.blocked_count()` is 1, not 0, and
 /// nothing is quarantined.
 #[test]
 fn a_state_file_a_wider_mode_is_quarantined_and_the_saved_one_is_0600() {
@@ -142,12 +142,12 @@ fn a_state_file_a_wider_mode_is_quarantined_and_the_saved_one_is_0600() {
     let path = dir.path().join("peer-state.json");
 
     let mut value = state::PeerState::default();
-    value.banned.push(state::Ban {
-        addr: state::knock_address(&"127.0.0.1:9600".parse().expect("an addr")),
-        key: None,
-        since_ms: 1_000,
-        reason: state::BanReason::Blocked,
-    });
+    value.ban(
+        &state::knock_address(&"127.0.0.1:9600".parse().expect("an addr")),
+        None,
+        state::BanReason::Blocked,
+        1_000,
+    );
     state::save(&path, &value).expect("the state file writes");
 
     let mode = std::fs::metadata(&path)
@@ -162,8 +162,7 @@ fn a_state_file_a_wider_mode_is_quarantined_and_the_saved_one_is_0600() {
     assert_eq!(
         state::load(&path, 2_000)
             .expect("a 0600 file loads")
-            .banned
-            .len(),
+            .blocked_count(),
         1,
         "a file at the mode the writer produces is trusted"
     );
@@ -172,7 +171,7 @@ fn a_state_file_a_wider_mode_is_quarantined_and_the_saved_one_is_0600() {
         .expect("widen it by hand");
     let loaded = state::load(&path, 2_000).expect("a widened file still boots the node");
     assert!(
-        loaded.banned.is_empty(),
+        loaded.blocked_count() == 0,
         "a widened state file decides nothing: the node starts cold"
     );
     assert!(
@@ -212,8 +211,11 @@ fn a_state_file_this_writer_creates_carries_the_format_version() {
     let loaded = tcr::peer::state::load(&state, 5_000)
         .expect("the state loader reads a file the pairing window created");
     assert!(
-        loaded.leases.is_empty(),
-        "and it reads as an empty state rather than a quarantined one"
+        matches!(
+            loaded.pairing_window(5_000),
+            tcr::peer::state::PairingDeadline::Open { .. }
+        ),
+        "and it reads as the state the window wrote rather than a quarantined, empty one"
     );
 }
 

@@ -321,7 +321,7 @@ fn block_and_ignore_refuse_a_target_that_is_neither_a_request_nor_an_address() {
     }
     let state = mac.state();
     assert!(
-        state.banned.is_empty() && state.muted.is_empty(),
+        state.blocked_count() == 0 && state.muted_count() == 0,
         "a refusal writes nothing: {state:?}"
     );
 
@@ -334,10 +334,7 @@ fn block_and_ignore_refuse_a_target_that_is_neither_a_request_nor_an_address() {
         String::from_utf8_lossy(&accepted.stderr)
     );
     assert!(
-        mac.state()
-            .banned
-            .iter()
-            .any(|ban| ban.addr == "192.0.2.51"),
+        mac.state().is_address_banned("192.0.2.51"),
         "and it lands under the address the listener compares"
     );
 }
@@ -441,8 +438,7 @@ fn a_learned_key_survives_the_window_it_was_learned_in() {
     );
     assert!(
         state.is_key_banned(&learned),
-        "so the block bans the key as well as the address: {:?}",
-        state.banned
+        "so the block bans the key as well as the address: {state:?}"
     );
 }
 

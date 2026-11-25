@@ -1107,6 +1107,93 @@ impl PeerState {
         self.banned.iter().any(|ban| ban.key.as_ref() == Some(key))
     }
 
+    /// How many addresses the operator has blocked.
+    pub const fn blocked_count(&self) -> usize {
+        self.banned.len()
+    }
+
+    /// How many addresses the operator has muted, lifted or not: a mute whose
+    /// deadline has passed is still counted until [`load`] prunes it.
+    pub const fn muted_count(&self) -> usize {
+        self.muted.len()
+    }
+
+    /// One `tcr peer pending` line per mute, then one per ban, in file order.
+    pub fn refusal_lines(&self) -> Vec<String> {
+        let mutes = self
+            .muted
+            .iter()
+            .map(|mute| format!("{}: muted: until={} unix-ms", mute.addr, mute.until_ms));
+        let bans = self.banned.iter().map(|ban| {
+            format!(
+                "{}: blocked: reason={} since={} unix-ms key={}",
+                ban.addr,
+                ban.reason,
+                ban.since_ms,
+                ban.key
+                    .map_or_else(|| "not-learned".to_string(), |key| key.display())
+            )
+        });
+        mutes.chain(bans).collect()
+    }
+
+    /// When `peer` last answered, Unix milliseconds, or [`None`] when it never
+    /// has as far as this file knows.
+    pub fn last_seen_of(&self, peer: PeerId) -> Option<i64> {
+        self.last_seen
+            .iter()
+            .find(|(node, _)| *node == peer)
+            .map(|(_, at)| *at)
+    }
+
+    /// The leases this Mac's ledger has minted for `peer`, expired or not, in
+    /// ledger order.
+    pub fn leases_lent_to(&self, peer: PeerId) -> impl Iterator<Item = &Lease> {
+        self.leases
+            .iter()
+            .filter(move |held| held.peer == peer)
+            .map(|held| &held.lease)
+    }
+
+    /// The leases `peer` has granted this Mac, expired or not, in file order.
+    pub fn leases_borrowed_from(&self, peer: PeerId) -> impl Iterator<Item = &Lease> {
+        self.borrowed
+            .iter()
+            .filter(move |borrowed| borrowed.lender == peer)
+            .map(|borrowed| &borrowed.lease)
+    }
+
+    /// The borrowed leases keyed by lender, beside how many rows the file held.
+    ///
+    /// The two numbers differ when one lender has two rows: the later row
+    /// overwrites the earlier one in the map, which is what
+    /// [`crate::peer::serve::PeerLeaseProvider`] holds anyway.
+    pub fn into_borrowed_by_lender(self) -> (std::collections::HashMap<PeerId, Lease>, usize) {
+        let rows = self.borrowed.len();
+        let mut leases = std::collections::HashMap::new();
+        for row in self.borrowed {
+            leases.insert(row.lender, row.lease);
+        }
+        (leases, rows)
+    }
+
+    /// Whether any path to `peer` is metered at all: one traffic row for that
+    /// peer means every path of its own without a row carried nothing.
+    pub fn is_metered(&self, peer: PeerId) -> bool {
+        self.path_traffic.iter().any(|traffic| traffic.peer == peer)
+    }
+
+    /// What one path to `peer` carried, as the meter last wrote it.
+    pub fn path_traffic_of(
+        &self,
+        peer: PeerId,
+        locator: &crate::peer::config::Locator,
+    ) -> Option<&PathTraffic> {
+        self.path_traffic
+            .iter()
+            .find(|traffic| traffic.peer == peer && &traffic.locator == locator)
+    }
+
     /// Whether a knock from `addr` would be refused, without recording
     /// anything.
     ///
@@ -1858,8 +1945,7 @@ fn quarantine_corrupt(path: &Path, now_ms: i64, reason: &str) -> Option<PathBuf>
 /// not this case: there is nothing to lose and a first grant has to be able to
 /// create the file.
 pub fn save_leases(path: &Path, leases: &[LeaseRow]) -> Result<()> {
-    let leases = leases.to_vec();
-    replace_section(path, "lease rows", move |state| state.leases = leases)
+    PeerState::save_leases(path, leases.to_vec())
 }
 
 /// Replace ONLY the borrowed rows in the state file, keeping every other key,
@@ -1871,10 +1957,7 @@ pub fn save_leases(path: &Path, leases: &[LeaseRow]) -> Result<()> {
 /// never per relayed request: the borrower's copy of `spent` is the lender's
 /// figure and this file is not where it is kept.
 pub fn save_borrowed(path: &Path, borrowed: &[BorrowedRow]) -> Result<()> {
-    let borrowed = borrowed.to_vec();
-    replace_section(path, "borrowed lease rows", move |state| {
-        state.borrowed = borrowed;
-    })
+    PeerState::save_borrowed(path, borrowed.to_vec())
 }
 
 /// Replace ONLY the measured path costs, keeping every other key.
@@ -2000,6 +2083,18 @@ pub fn open_and_spend_ask(
 /// [`replace_section`]. Each one's reasons are on the free function of the
 /// same name.
 impl PeerState {
+    /// [`save_leases`].
+    fn save_leases(path: &Path, leases: Vec<LeaseRow>) -> Result<()> {
+        replace_section(path, "lease rows", move |state| state.leases = leases)
+    }
+
+    /// [`save_borrowed`].
+    fn save_borrowed(path: &Path, borrowed: Vec<BorrowedRow>) -> Result<()> {
+        replace_section(path, "borrowed lease rows", move |state| {
+            state.borrowed = borrowed;
+        })
+    }
+
     /// [`save_paths`].
     fn save_paths(path: &Path, paths: Vec<PathStat>) -> Result<()> {
         replace_section(path, "measured path costs", move |state| {
@@ -2101,6 +2196,32 @@ mod tests {
     use super::*;
     use crate::peer::tailnet_node::TailnetReport;
     use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// `tcr peer pending` prints these lines verbatim: mutes first, then bans,
+    /// a ban whose key was never learned saying so.
+    #[test]
+    fn the_refusal_lines_are_the_pending_verbs_text() {
+        let mut state = PeerState::default();
+        state.mute("192.0.2.7", 1_000);
+        state.ban("192.0.2.8", None, BanReason::Blocked, 2_000);
+        state.ban(
+            "192.0.2.9",
+            Some(PeerId([9_u8; 32])),
+            BanReason::ForgottenAndBlocked,
+            3_000,
+        );
+        assert_eq!(
+            state.refusal_lines(),
+            vec![
+                format!("192.0.2.7: muted: until={} unix-ms", 1_000 + MUTE_MS),
+                "192.0.2.8: blocked: reason=blocked since=2000 unix-ms key=not-learned".to_string(),
+                format!(
+                    "192.0.2.9: blocked: reason=forgotten-and-blocked since=3000 unix-ms key={}",
+                    PeerId([9_u8; 32]).display()
+                ),
+            ]
+        );
+    }
 
     /// One captured tracing event: its level and its message, which is all
     /// this test needs to tell an INFO "peer state restored" apart from a

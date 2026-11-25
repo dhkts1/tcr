@@ -61,18 +61,8 @@ pub(super) fn run_peer_pending(a: peer_cli::PeerPendingArgs) -> anyhow::Result<(
             knock.wire_version
         );
     }
-    for mute in &state.muted {
-        println!("{}: muted: until={} unix-ms", mute.addr, mute.until_ms);
-    }
-    for ban in &state.banned {
-        println!(
-            "{}: blocked: reason={} since={} unix-ms key={}",
-            ban.addr,
-            ban.reason,
-            ban.since_ms,
-            ban.key
-                .map_or_else(|| "not-learned".to_string(), |key| key.display())
-        );
+    for line in state.refusal_lines() {
+        println!("{line}");
     }
     Ok(())
 }

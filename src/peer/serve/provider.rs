@@ -97,10 +97,8 @@ impl PeerLeaseProvider {
         let now_ms = crate::now_ms();
         match crate::peer::state::load(&state_path, now_ms) {
             Ok(state) => {
-                let rows = state.borrowed.len();
-                for row in state.borrowed {
-                    leases.insert(row.lender, row.lease);
-                }
+                let (restored, rows) = state.into_borrowed_by_lender();
+                leases = restored;
                 tracing::info!(
                     path = %state_path.display(),
                     restored = leases.len(),
