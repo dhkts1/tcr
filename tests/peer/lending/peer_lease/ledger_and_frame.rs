@@ -269,7 +269,7 @@ fn the_n_plus_first_concurrent_borrowed_request_is_refused() {
 /// admission again and a missing key makes that call a no-op.
 ///
 /// Watched red: restore the `self.inflight.remove(&lease_id)` line in
-/// `Ledger::enter_relay` (`src/peer/lease.rs`) and the counter reads 0 rather
+/// `Ledger::enter_relay` (`src/peer/lease/mod.rs`) and the counter reads 0 rather
 /// than 2 right after the refusal, while the fourth request is admitted.
 #[test]
 fn a_cap_refusal_leaves_the_in_flight_counter_where_it_found_it() {
@@ -358,7 +358,7 @@ fn a_zero_in_flight_cap_refuses_and_parks_no_counter() {
 /// to bound.
 ///
 /// Watched red: delete the `admit_served` refusal from
-/// `Ledger::enter_relay` (`src/peer/lease.rs`) and the second `enter_relay`
+/// `Ledger::enter_relay` (`src/peer/lease/mod.rs`) and the second `enter_relay`
 /// below answers `Ok(())`.
 #[test]
 fn one_request_id_is_relayed_once_and_the_ceiling_then_binds() {
@@ -1124,7 +1124,7 @@ fn the_provider_is_configured_by_a_disclose_grant_and_an_address() {
     // could carry to it is a row that answers nothing, and the provider would
     // walk it on every dry-fleet request forever. An address is one way back;
     // `a_lender_with_no_address_still_installs_the_provider_through_a_carrier`
-    // (`tests/peer_forward.rs`) holds the other.
+    // (`tests/peer/reach/peer_forward.rs`) holds the other.
     file.row_mut(&lender)
         .expect("the lender row")
         .endpoints

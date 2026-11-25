@@ -16,7 +16,7 @@
 //! tagged enum and serde would not write it, so no requester could name a
 //! target and the id was rebuilt on the forwarder, and forward-dial support
 //! made the variant a struct variant, so it travels now and
-//! `tests/peer_egress.rs`'s `a_relay_target_travels_on_the_wire` is where that
+//! `tests/peer/reach/peer_egress.rs`'s `a_relay_target_travels_on_the_wire` is where that
 //! is on the record.
 //!
 //! # The requester's half, added for forward-dial
@@ -1895,7 +1895,7 @@ fn a_dialable_lender_is_asked_before_one_that_needs_carrying() {
 /// The two are different operator problems, an address that went stale and a
 /// Mac that can never be dialled at all, and before the desk existed only the
 /// second could be said. The sentence is asserted here rather than in
-/// `tests/peer_e2e.rs` because a refusal reaches a real peer's log through
+/// `tests/peer/peer_e2e.rs` because a refusal reaches a real peer's log through
 /// `listener::RefusalLog`, a per-address rate limit another refusal in the
 /// same run can spend.
 #[tokio::test]

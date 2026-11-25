@@ -4814,7 +4814,7 @@ extension View {
 /// resolved to some other account shows up as the wrong row changing rather than
 /// as a lie. That is a backstop, not the expectation: resolution is an exact
 /// name match falling back to an exact email match, case-sensitive both times
-/// (`src/identity.rs`, `match_accounts`), and two accounts sharing an email
+/// (`src/base/identity.rs`, `match_accounts`), and two accounts sharing an email
 /// across orgs come back ambiguous rather than resolved. A non-zero exit is
 /// rendered in place.
 ///

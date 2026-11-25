@@ -12,7 +12,7 @@ use super::*;
 /// **Thirty-two callers released together take three tokens, not thirty-two.**
 ///
 /// The attack a sequential loop cannot run. `the_fourth_knock_in_ten_seconds_\
-/// gets_nothing` (`tests/peer_pairing.rs`) spends its tokens one at a time, and
+/// gets_nothing` (`tests/peer/pairing/peer_pairing.rs`) spends its tokens one at a time, and
 /// a token bucket refuses the fourth call whatever else is true: so it proves
 /// the bucket is wired and proves nothing about a race. This releases
 /// thirty-two threads from a barrier onto the SAME `Admission` at the SAME
@@ -225,7 +225,7 @@ async fn thirty_knocks_in_waves_of_two_earn_at_most_three_acks() {
 ///
 /// The id changer, run in parallel and with real churn.
 /// `a_rotating_instance_id_from_one_address_is_one_row`
-/// (`tests/peer_pairing.rs`) rotates three FIXED ids one at a time; this fires
+/// (`tests/peer/pairing/peer_pairing.rs`) rotates three FIXED ids one at a time; this fires
 /// twenty at once with an unpredictable id each, which is the shape that wins
 /// against coalescing keyed on the id (twenty rows), against a queue cap
 /// checked outside the write lock (nine rows), and against a reservation that
@@ -369,7 +369,7 @@ async fn a_knock_that_renames_itself_never_takes_a_second_row_or_a_pinned_macs_p
 /// comes back after the message-1 deadline.**
 ///
 /// `the_third_unauthenticated_socket_from_one_address_is_refused`
-/// (`tests/peer_pairing.rs`) proves the third is refused. The attack this adds
+/// (`tests/peer/pairing/peer_pairing.rs`) proves the third is refused. The attack this adds
 /// is the one that makes a cap into a lockout: hold the sockets past the
 /// deadline and see whether the counter is ever given back. A slot leaked on
 /// the timeout path is a permanent refusal of every future connection from
@@ -456,7 +456,7 @@ async fn ten_silent_sockets_hold_two_slots_and_give_them_all_back() {
 /// `state::visible_pending` hides the placeholder from them.
 ///
 /// `a_knock_whose_message_1_does_not_validate_reserves_nothing`
-/// (`tests/peer_pairing.rs`) covers the INVALID message 1. This is the valid
+/// (`tests/peer/pairing/peer_pairing.rs`) covers the INVALID message 1. This is the valid
 /// one, which is the case that gets a reservation in the first place.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_valid_message_one_then_silence_holds_no_slot_and_no_queue_row() {
@@ -607,7 +607,7 @@ const NOISE_TAG_BYTES: usize = 16;
 /// leaves no row.**
 ///
 /// `a_first_frame_above_the_bound_is_refused_before_allocation`
-/// (`tests/peer_pairing.rs`) bounds MESSAGE 1. This is the second bound, on the
+/// (`tests/peer/pairing/peer_pairing.rs`) bounds MESSAGE 1. This is the second bound, on the
 /// knock frame that rides the session message 1 establishes: the frame whose
 /// length prefix a stranger who has completed an `NN` handshake gets to choose.
 /// Both sides of the boundary, because a bound tested only from above can be
@@ -671,7 +671,7 @@ async fn a_knock_frame_at_the_bound_is_taken_and_one_byte_over_gets_nothing() {
 /// window.**
 ///
 /// `an_accepted_window_admits_one_instance_id_only`
-/// (`tests/peer_pairing.rs`) sends one impostor. This sends ten at once, with a
+/// (`tests/peer/pairing/peer_pairing.rs`) sends one impostor. This sends ten at once, with a
 /// churned id each, and brackets them with the accepted id so the zeros cannot
 /// be explained by the socket cap having refused everything: the accepted id
 /// gets bytes before the flood AND after it.
@@ -776,7 +776,7 @@ async fn a_fresh_instance_id_knocking_after_an_accept_never_inherits_the_window(
 /// **Twenty knocks from a muted address get nothing, and the mute is not one
 /// millisecond shorter for it.**
 ///
-/// `a_knock_from_a_muted_address_gets_zero_bytes` (`tests/peer_pairing.rs`)
+/// `a_knock_from_a_muted_address_gets_zero_bytes` (`tests/peer/pairing/peer_pairing.rs`)
 /// sends one knock. The attacks this adds are the two a flooder would actually
 /// try: knock enough times in parallel that one of them slips between another's
 /// read and write, and knock in the hope that the re-knock itself refreshes,

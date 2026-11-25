@@ -531,12 +531,12 @@ async fn two_blackholing_endpoints_leave_a_later_step_time_to_run() {
 ///
 /// This is the half the compile-error red in `probe.rs` could not prove:
 /// both `PathTable::cool_down` and `probe::drop_cooling_endpoints` are
-/// exercised directly by unit tests in `tests/peer_probe.rs`, so a dial that
-/// forgot to call `peer::probe::cool_down` on failure would still leave those
+/// exercised directly by unit tests in `tests/peer/reach/peer_probe.rs`, so a dial that
+/// forgot to call `peer::reach::probe::cool_down` on failure would still leave those
 /// green. Only a real dial that writes into the INSTALLED table and a second
 /// read of `dial_order` against that same table can show the wiring works.
 ///
-/// Watched red: comment out the two `crate::peer::probe::cool_down(...)`
+/// Watched red: comment out the two `crate::peer::reach::probe::cool_down(...)`
 /// calls in `src/peer/serve.rs` and the dead endpoint is still in the second
 /// order.
 #[tokio::test(flavor = "multi_thread")]

@@ -19,7 +19,7 @@ use super::*;
 /// comes back out names `endpoints` and no longer names `addrs`.
 ///
 /// Watched red: with the `for legacy in &disk.addrs` loop deleted from
-/// `PeerRowOnDisk`'s `From` impl (`src/peer/config.rs`), this fails on the
+/// `PeerRowOnDisk`'s `From` impl (`src/peer/config/mod.rs`), this fails on the
 /// first assertion, `left: 0, right: 1`, "an upgraded file keeps the one
 /// address it was paired over", which is precisely the operator losing the
 /// only way back to a Mac they had already trusted.

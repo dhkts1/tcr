@@ -422,7 +422,7 @@ async fn a_host_off_the_allow_list_is_refused() {
 /// grant opens an unbounded relay through the gateway path.
 ///
 /// Forwarding itself exists now and is `tunnel::handle_forward_on`, gated by
-/// `tests/peer_forward.rs`. What this test keeps measuring is that the two
+/// `tests/peer/reach/peer_forward.rs`. What this test keeps measuring is that the two
 /// entry points stayed apart: a carry never becomes a forward by a grant.
 #[tokio::test]
 async fn a_relay_target_is_refused_by_a_gateway() {
@@ -497,7 +497,7 @@ async fn a_relay_target_is_refused_by_a_gateway() {
 /// tagged (`tag = "target"`), `PeerId` serializes as a string, and serde
 /// refuses an internally-tagged newtype variant whose content is not a map. So
 /// `TUNNEL{Peer}` could not be written by any node, and the forwarder every
-/// gate in `tests/peer_forward.rs` measures was reachable by nobody. That
+/// gate in `tests/peer/reach/peer_forward.rs` measures was reachable by nobody. That
 /// test's own failure message said what to do when the patch landed, and this
 /// is it: the variant is now `Peer { node }` and the assertion is that it
 /// travels, and travels back as the same id.

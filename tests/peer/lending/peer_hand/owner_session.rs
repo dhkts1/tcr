@@ -9,7 +9,7 @@ use super::*;
 
 /// The owner's listener, its peers file and its manager, as one fixture.
 ///
-/// Built by hand rather than borrowed from `tests/peer_lease.rs`'s `mesh`
+/// Built by hand rather than borrowed from `tests/peer/lending/peer_lease.rs`'s `mesh`
 /// module, which is private to that binary: what this file needs and that one
 /// does not is a manager holding an account with a bearer, since a `Hand`
 /// grant is the one path on which the lender reads its own access token.
@@ -551,7 +551,7 @@ async fn a_hand_grant_is_followed_by_the_owners_bearer_on_the_same_session() {
 /// borrower that stored anything it was sent.
 ///
 /// Watched red by deleting the `tokio::spawn(read_handed_bearers(..))` line
-/// from `lease::request_lease` (`src/peer/lease.rs`): the hand leg polls out
+/// from `lease::request_lease` (`src/peer/lease/mod.rs`): the hand leg polls out
 /// with an empty store and the first assertion names the lease id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_borrowed_hand_lease_leaves_the_owners_bearer_in_this_process() {

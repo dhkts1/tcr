@@ -495,7 +495,7 @@ async fn the_third_unauthenticated_socket_from_one_address_is_refused() {
 /// as "the handshake with the lender failed".
 ///
 /// Caught by `borrowed_requests_are_paced_by_the_lenders_own_bucket`
-/// (`tests/peer_lease.rs`) in the full workspace run, not
+/// (`tests/peer/lending/peer_lease.rs`) in the full workspace run, not
 /// by anything this file wrote: which is why it is pinned HERE, in the file
 /// that owns the cap, rather than left to a neighbour's test to notice again.
 ///

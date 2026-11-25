@@ -13,5 +13,5 @@ memory of one.
 Adding a message type: hand-write two fixtures for it (every optional field
 populated, and every optional field absent) straight from the type's own
 `Serialize` derive and field names, add the matching assertions to
-`tests/peer_wire_saved.rs`, and leave every existing fixture in this
+`tests/peer/pairing/peer_wire_saved.rs`, and leave every existing fixture in this
 directory untouched.

@@ -191,7 +191,7 @@ fn a_second_open_of_the_same_reply_is_refused() {
 /// **A reply one millisecond past the ask's deadline is refused, and one
 /// millisecond before it still opens.**
 ///
-/// The shape `tests/peer_abuse.rs`'s
+/// The shape `tests/peer/pairing/peer_abuse.rs`'s
 /// `an_accepted_window_is_shut_at_the_instant_it_expires_and_before_it_opens`
 /// already uses: only the clock differs between the two calls, so a refusal
 /// caused by the wrong ask (already ruled out above) cannot be the answer

@@ -12,7 +12,7 @@
 //! `observed_you_at` at a Mac that is not the peer at all.
 //!
 //! A carrier cannot stamp the inner header itself: a blind forward writes no
-//! header of its own (`src/peer/tunnel.rs`'s module doc on that point). The
+//! header of its own (`src/peer/tunnel/mod.rs`'s module doc on that point). The
 //! origin stamps `via`, and the origin is the only party that knows which
 //! carrier it went through. So a non-empty inner `via` is this node's one
 //! signal that the socket in front of it is not the peer's.
@@ -20,7 +20,7 @@
 //! # Driven over an in-memory duplex, not a socket
 //!
 //! `from` is the whole point of the test, and this box has one address
-//! (`tests/peer_reach.rs`'s `offer_from` explains why a duplex stands in for
+//! (`tests/peer/reach/peer_reach.rs`'s `offer_from` explains why a duplex stands in for
 //! a socket for exactly this reason). Everything under the call is shipped
 //! code: `listener::serve_accepted` is what the real accept loop calls.
 
@@ -50,7 +50,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
 ///
 /// `via` is the inner header's own `via`: empty for a direct arrival, naming
 /// a carrier for a carried one. The exchange is otherwise the one
-/// `tests/peer_probe.rs`'s `open_control` drives over a real socket:
+/// `tests/peer/reach/peer_probe.rs`'s `open_control` drives over a real socket:
 /// `noise::dial_handshake` for the `IK` return, then `noise::send_control`
 /// for the header and for the frame.
 async fn hello_from(

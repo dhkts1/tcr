@@ -339,7 +339,7 @@ struct FakeStoreState {
 
 /// Bind a loopback TCP listener and serve `PUT /{name}` and `GET /{name}`
 /// over a shared map, on a dedicated thread with its own runtime, the shape
-/// `spawn_http_server` in `tests/peer_reach_upnp.rs:161` serves the fake
+/// `spawn_http_server` in `tests/peer/reach/peer_reach_upnp.rs:161` serves the fake
 /// UPnP device in.
 fn spawn_fake_store(calls: CallLog) -> SocketAddr {
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the fake store");

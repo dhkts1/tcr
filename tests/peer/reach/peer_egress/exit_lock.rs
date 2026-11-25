@@ -63,7 +63,7 @@ fn local_exit(listener: TcpListener) -> Arc<std::sync::atomic::AtomicUsize> {
 /// is WHICH process opened the connection to the origin, which is the whole of
 /// the exit lock. A completed 200 through the production carry cannot be
 /// observed in this process at all, and the reason is structural rather than an
-/// omission: `send_through` builds its client with `tcr::http_client::builder`,
+/// omission: `send_through` builds its client with `tcr::base::http_client::builder`,
 /// which carries the bundled webpki roots, so there is no root store a
 /// test can add a fixture CA to and no `SSL_CERT_FILE` that would be read. The
 /// body half of a carry is already measured, against a real TLS origin, by
@@ -611,7 +611,7 @@ fn an_unpinned_account_writes_no_egress_keys() {
 /// dead code.
 ///
 /// A doc gate rather than a behaviour one because the behaviour is already
-/// covered (`tests/peer_lease.rs` drives a real borrow through this arm); what
+/// covered (`tests/peer/lending/peer_lease.rs` drives a real borrow through this arm); what
 /// was wrong was only the sentence, and the failure worth catching is that
 /// sentence coming back.
 ///

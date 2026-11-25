@@ -92,7 +92,7 @@ final class PeerListDocumentTests: XCTestCase {
 
     /// **The status block's spellings still win where they are sent.**
     ///
-    /// `PeerStatusRow` (`src/status.rs`) says `id`, `name`, `address`,
+    /// `PeerStatusRow` (`src/status/mod.rs`) says `id`, `name`, `address`,
     /// `trusted`, and the fallbacks above must not shadow them. The control is
     /// a row carrying BOTH spellings with different values: the first key is
     /// the answer, or the fix for one producer is a regression for the other.
@@ -250,7 +250,7 @@ final class PeerListDocumentTests: XCTestCase {
         XCTAssertTrue(lent[1].ended)
     }
 
-    /// **The shape the CLI writes TODAY.** `src/peer/config.rs:414`'s
+    /// **The shape the CLI writes TODAY.** `src/peer/config/mod.rs:414`'s
     /// `LendGrant` is `{window, fraction, ttlS, maxInflight}` under
     /// `rename_all = "camelCase"`, and this decoder also accepts `ttl`. Both
     /// spellings decode to the same field, the alternative is a panel that

@@ -158,7 +158,7 @@ fn scratch_env(
         .env("TMPDIR", home.join("tmp"))
         .env("CODEX_HOME", home.join(".codex"))
         // An override path that does not exist is how a run says "this machine has no
-        // Claude Code or Codex login" (see `tests/headless_sigterm.rs`).
+        // Claude Code or Codex login" (see `tests/proxy/headless_sigterm.rs`).
         .env(
             "TCR_CLAUDE_CODE_CREDENTIALS",
             home.join("no-claude-code-login.json"),

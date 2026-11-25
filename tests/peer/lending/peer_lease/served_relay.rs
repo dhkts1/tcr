@@ -693,7 +693,7 @@ async fn a_relayed_frame_the_lender_receives_holds_no_credential() {
     let store = open_borrower_store(&pair.borrower_peers, pair.lender_id, peer_addr);
 
     // The borrower's own client's headers, credentials included, which is the
-    // case `crate::fallback`'s `Ask` carries none of TODAY and the case the
+    // case `crate::peer::serve::fallback`'s `Ask` carries none of TODAY and the case the
     // scrub exists for. The same map
     // `a_borrowed_request_is_served_on_the_lenders_account` uses, from one
     // place: two lists of credential shapes is two places for one of them to

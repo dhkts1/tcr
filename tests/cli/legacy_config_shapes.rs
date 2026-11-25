@@ -8,7 +8,7 @@
 //! stale `throttle` key was a hard `load` error. Every affected install broke
 //! on the update — the CLI exited non-zero on every verb, and the server
 //! silently ran a zero-account fleet that answered every request with 429
-//! while looking alive. `src/config.rs`'s `load` now migrates that key
+//! while looking alive. `src/base/config.rs`'s `load` now migrates that key
 //! instead of rejecting it (see its doc-comment and the `legacy_throttle_*`
 //! unit tests there), but that fix only proves THIS rename is safe. The next
 //! one needs the same proof, and nothing else in this repo asserts it.

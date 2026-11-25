@@ -4,7 +4,7 @@
 //! # What is real here and what is a stand-in
 //!
 //! Real: the Noise handshake and session, the production stream header, the
-//! production prober (`peer::probe::probe_once` / `probe_session`), the
+//! production prober (`peer::reach::probe::probe_once` / `probe_session`), the
 //! production EWMA, the production comparator, the production dial order
 //! (`peer::serve::dial_order`), and, in
 //! `the_real_listener_echoes_a_probe_with_both_fields_untouched`, the shipped
@@ -286,7 +286,7 @@ async fn five_probes_against(delay: Duration) -> PathStat {
 /// whose only other cost is two frames on loopback. Nothing was wrong with the
 /// prober in that run.
 ///
-/// Watched red: in `src/peer/probe.rs::probe_once`, replace
+/// Watched red: in `src/peer/reach/probe.rs::probe_once`, replace
 /// `rtt_ms: u32::try_from(elapsed).unwrap_or(u32::MAX)` with `rtt_ms: 0` and
 /// both halves go red, the floor on 0 against 40 and the difference on 0
 /// against 0.
@@ -327,7 +327,7 @@ async fn five_probes_against_a_forty_millisecond_peer_read_forty() {
 /// end of it: asking again would cost a frame per minute per peer for as long
 /// as the session lives, and the answer cannot change inside one session.
 ///
-/// Watched red: in `src/peer/probe.rs::probe_session`, delete the
+/// Watched red: in `src/peer/reach/probe.rs::probe_session`, delete the
 /// `if outcome == ProbeOutcome::NotSupported { return ... }` block and the peer
 /// reads five probes instead of one.
 #[tokio::test]
@@ -552,7 +552,7 @@ async fn the_real_listener_echoes_a_probe_with_both_fields_untouched() {
 /// The EWMA is what `CollapseHint.observed_rtt_ms` carries, and `0` is how "no
 /// measurement" reads, which is what every build before this one sent.
 ///
-/// Watched red: in `src/peer/probe.rs::collapse_hint`, replace
+/// Watched red: in `src/peer/reach/probe.rs::collapse_hint`, replace
 /// `rtt_key(Some(rtt))` with `0` and the measured case reads 0.
 #[test]
 fn a_collapse_hint_carries_the_measured_round_trip() {
@@ -585,7 +585,7 @@ fn a_collapse_hint_carries_the_measured_round_trip() {
 /// Loss is recorded from a probe that went unanswered, and an older build's
 /// refusal is not loss.
 ///
-/// Watched red: in `src/peer/probe.rs::PathTable::record`, change the
+/// Watched red: in `src/peer/reach/probe.rs::PathTable::record`, change the
 /// `ProbeOutcome::NotSupported => return false` arm to fall through to the
 /// `NoAnswer` sample and the last assertion sees a loss figure.
 #[test]
@@ -638,7 +638,7 @@ fn two_endpoint_row(peer: PeerId, older: SocketAddr, newer: SocketAddr) -> PeerR
 /// leads, which is the order the row had before this change. So the reordering is
 /// the loss figure's doing and not the comparator's shape.
 ///
-/// Watched red: in `src/peer/probe.rs::order_endpoints`, replace the `lossy`
+/// Watched red: in `src/peer/reach/probe.rs::order_endpoints`, replace the `lossy`
 /// key with `0u8` and the lossy newer endpoint leads again.
 #[test]
 fn a_lossy_newer_endpoint_is_dialled_after_a_clean_older_one() {
@@ -698,7 +698,7 @@ fn a_lossy_newer_endpoint_is_dialled_after_a_clean_older_one() {
 /// Round trip orders two paths that are both under the cap, and the policy
 /// orders a hop against a socket.
 ///
-/// Watched red: in `src/peer/probe.rs::order_endpoints`, replace the `rtt` key
+/// Watched red: in `src/peer/reach/probe.rs::order_endpoints`, replace the `rtt` key
 /// with `0u32` and the slow-but-newer endpoint leads.
 #[test]
 fn round_trip_orders_two_clean_paths_and_the_policy_orders_the_hop() {
@@ -891,7 +891,7 @@ fn every_endpoint_cooling_still_returns_the_row_whole() {
 /// The carry order PROBE hands EGRESS-PIN: measured first, and an unprobed
 /// fleet keeps the freshness order `resolve_via` has today.
 ///
-/// Watched red: in `src/peer/probe.rs::carrier_key`, replace the `rtt` element
+/// Watched red: in `src/peer/reach/probe.rs::carrier_key`, replace the `rtt` element
 /// with `u32::MAX` and the lossless, faster carrier stops leading.
 #[test]
 fn the_carrier_key_is_measured_first_and_fresh_second() {
@@ -1009,7 +1009,7 @@ fn the_measured_paths_survive_a_restart_and_keep_the_rest_of_the_file() {
 /// measurements are taken on the paths this list chose, so a stranger who can
 /// make one fast path must not be able to buy the front of the queue with it.
 ///
-/// Watched red: in `src/peer/probe.rs::order_endpoints`, replace the
+/// Watched red: in `src/peer/reach/probe.rs::order_endpoints`, replace the
 /// `source_rank(endpoint)` key with `0u8` and both assertions on the brief
 /// endpoint fail, in the unmeasured case and in the measured one.
 #[test]
@@ -1082,7 +1082,7 @@ fn a_brief_endpoint_is_dialled_after_a_paired_one() {
 /// from rather than as one comparison between two: a single "drop is after
 /// brief" assertion passes just as happily if the new band swallowed one of the
 /// four above it. The seventh source, a pasted link, shares the drop's band and
-/// is asserted where it is written, in `tests/peer_moved.rs`.
+/// is asserted where it is written, in `tests/peer/pairing/peer_moved.rs`.
 ///
 /// The recency key is deliberately set against the source key here: the drop
 /// endpoint is the newest on the row and the paired one the oldest, so an order

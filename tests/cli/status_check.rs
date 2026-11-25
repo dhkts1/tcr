@@ -13,7 +13,7 @@
 //! calls. So a row reads `probeStatus: "error"` here for the same reason it
 //! would on a live proxy whose probe was rejected.
 //!
-//! Isolation follows `tests/doctor.rs`: a temp HOME, an explicit config, and a
+//! Isolation follows `tests/cli/doctor.rs`: a temp HOME, an explicit config, and a
 //! kernel-assigned port, so the live proxy is never the thing a test talks to.
 
 use std::io::{BufRead, BufReader, Write};
@@ -28,7 +28,7 @@ use tcr::probe::{ProbeCredential, ProbeError, ProbeFuture, Usage, UsageBucket, U
 use tcr::status::StatusPayload;
 
 /// The exit code `--check` reports a failed probe with
-/// (`tcr::cli::StatusCheck::exit_code`). Written out as a literal on
+/// (`tcr::verbs::cli::StatusCheck::exit_code`). Written out as a literal on
 /// purpose: it is a contract scripts read, so changing it must fail here.
 const PROBE_FAILED_EXIT: i32 = 4;
 
@@ -95,7 +95,7 @@ async fn payload_from(dir: &Path, prober: Arc<dyn UsageProber>) -> String {
 
 /// A `/_tcr/status` endpoint on a kernel-assigned port that answers every
 /// connection with `body`. Returns the port. The accept loop outlives the
-/// test's use of it on purpose, for the reason `tests/doctor.rs` gives.
+/// test's use of it on purpose, for the reason `tests/cli/doctor.rs` gives.
 fn fake_status_endpoint(body: String) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
     let port = listener.local_addr().expect("local addr").port();

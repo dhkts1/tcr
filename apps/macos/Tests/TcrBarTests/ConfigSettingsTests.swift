@@ -8,7 +8,7 @@ import XCTest
 /// pending read shows no value rather than an example one.
 final class ConfigSettingsTests: XCTestCase {
     /// Shaped like `tcr config show --json` on a file setting a control
-    /// account, pacing, and the fleet throttle off (`tests/config_show.rs`
+    /// account, pacing, and the fleet throttle off (`tests/cli/config_show.rs`
     /// asserts the same keys from the binary side). Values are fake.
     private let document = """
         {

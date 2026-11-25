@@ -17,7 +17,7 @@
 //!   and `codexUpstream` → a loopback stub that clears the Codex fixture's workspace.
 //!
 //! Every token below is fake. The Codex JWTs are put together at run time, as
-//! `tests/codex_import.rs` does, because the dotted form written out whole is what a secret
+//! `tests/codex/codex_import.rs` does, because the dotted form written out whole is what a secret
 //! scanner's JWT rule matches. The Claude fixtures' profile fetch, under `--yes`, goes to the real
 //! profile endpoint with a fake bearer and is refused, so the rows are named from the identity
 //! each source stores, which is the fallback under test.

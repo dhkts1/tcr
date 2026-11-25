@@ -13,7 +13,7 @@
 //! # Isolation
 //!
 //! The proxy runs in THIS process ([`Manager::with_live_refresher`] behind
-//! [`tcr::mitm::serve`]) on a kernel-assigned port, so it starts no
+//! [`tcr::proxy::mitm::serve`]) on a kernel-assigned port, so it starts no
 //! probe, warm or refresh loop and sends nothing upstream. The `tcr` binary gets
 //! a scratch `HOME`, no `XDG_CACHE_HOME`, and `TCR_CLAUDE_CODE_CREDENTIALS`
 //! pointing at a file that does not exist, so it can read neither the real

@@ -495,7 +495,7 @@ final class RealWorldDecodeTests: XCTestCase {
     }
 
     /// The same rule for `probeStatus`, whose token set is owned by
-    /// `ProbeStatus::as_str` (src/probe.rs) and is the one the capacity summary
+    /// `ProbeStatus::as_str` (src/records/probe.rs) and is the one the capacity summary
     /// reads through ``ProbeState/hasBeenProbed``.
     func testAFutureProbeStatusDegradesToNotEvidence() throws {
         let json = try XCTUnwrap(String(data: contractFixtureData(), encoding: .utf8))

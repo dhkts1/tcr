@@ -11,7 +11,7 @@
 //!
 //! Stand-ins, each named at its call site: the forwarder's accept loop, which
 //! is `src/peer/listener.rs`'s `StreamKind::Tunnel` arm and is another file's
-//! file, the same stand-in `tests/peer_forward.rs` uses, and this file's
+//! file, the same stand-in `tests/peer/reach/peer_forward.rs` uses, and this file's
 //! harness is that one's, copied rather than shared because two test binaries
 //! cannot import each other; and the verb itself, because `tcr peer status`
 //! asks the RUNNING proxy and the only proxy on this box is serving real
@@ -98,7 +98,7 @@ fn peers_file(tag: &str, rows: Vec<PeerRow>) -> std::path::PathBuf {
 }
 
 /// The header a requester writes for a forward, with the one field the wire
-/// cannot carry left out (`tests/peer_forward.rs` holds that defect's record).
+/// cannot carry left out (`tests/peer/reach/peer_forward.rs` holds that defect's record).
 const fn forward_header(hops_remaining: u8) -> StreamHeader {
     StreamHeader {
         kind: StreamKind::Tunnel,
@@ -618,7 +618,7 @@ fn tokens_are_charged_only_when_the_unit_and_the_path_are_both_known() {
 /// charge deleted.
 ///
 /// The keeper's key is MINTED here rather than passed in, because the file
-/// format of a node key is `peer::id`'s business and a test that wrote one by
+/// format of a node key is `peer::config::id`'s business and a test that wrote one by
 /// hand would be a second spelling of it. The caller pins the returned id.
 async fn listener_on(
     key_dir: &std::path::Path,

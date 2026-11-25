@@ -3,7 +3,7 @@
 make it misbehave on command.
 
 The in-process end-to-end answers with an axum router in the test binary
-(`tests/peer_e2e.rs`). Containers need the same answer from a separate address,
+(`tests/peer/peer_e2e.rs`). Containers need the same answer from a separate address,
 so this is that router with nothing else in it.
 
 Two endpoints beside the canned one:

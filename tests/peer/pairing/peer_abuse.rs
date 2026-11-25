@@ -3,7 +3,7 @@
 //!
 //! # What this file is for, and what it is not
 //!
-//! `tests/peer_pairing.rs` already asserts each cap's number once, in the
+//! `tests/peer/pairing/peer_pairing.rs` already asserts each cap's number once, in the
 //! ordinary sequential shape: the fourth knock in ten seconds, the ninth
 //! outstanding knock, the third unauthenticated socket, an `XX` from an
 //! unaccepted instance. Every one of those is a test that the cap is WIRED.
@@ -265,7 +265,7 @@ fn the_caps_are_still_the_numbers_the_plan_shipped() {
 }
 
 // ---------------------------------------------------------------------------
-// Scratch files and one Mac, the same shape `tests/peer_pairing.rs` uses
+// Scratch files and one Mac, the same shape `tests/peer/pairing/peer_pairing.rs` uses
 // ---------------------------------------------------------------------------
 
 /// A scratch directory named after this process, thread and a caller tag, so
@@ -303,7 +303,7 @@ impl Node {
 
     /// The state file as the LISTENER reads it: `load` runs `expire(now_ms)`
     /// on what it read, so a row's survival is a question about the clock the
-    /// reader passes. Reading at zero: as `tests/peer_pairing.rs` does, where
+    /// reader passes. Reading at zero: as `tests/peer/pairing/peer_pairing.rs` does, where
     /// no test asks about an accepted window, expires every window an
     /// operator just opened, because `now` is then before the instant they
     /// opened it. Every read here passes the real clock for that reason.

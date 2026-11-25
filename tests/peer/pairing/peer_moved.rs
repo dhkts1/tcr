@@ -701,7 +701,7 @@ fn counting_secret_hex() -> String {
 
 /// Write a peers file the store will read: JSON text, mode 0600.
 ///
-/// Text rather than through `PeerFile`, the reason `tests/peer_reach.rs` gives
+/// Text rather than through `PeerFile`, the reason `tests/peer/reach/peer_reach.rs` gives
 /// for its own: these tests are about what the verb prints, and going through
 /// the config structs would make them fail to COMPILE every time a field lands
 /// elsewhere, which is a different failure from the one they exist to report.

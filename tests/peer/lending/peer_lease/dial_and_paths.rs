@@ -142,7 +142,7 @@ fn a_leases_tokens_are_charged_to_the_path_it_was_noted_on() {
 /// **A hand-mode grant is served from the BORROWER, end to end, through the
 /// production provider.** The one path this file could not drive.
 ///
-/// Every other hand-mode gate lives in `tests/peer_hand.rs` and calls
+/// Every other hand-mode gate lives in `tests/peer/lending/peer_hand.rs` and calls
 /// `serve_on_handed_bearer` directly, so the whole of the borrower's own
 /// decision, does this lease have a live bearer and which of the two modes does
 /// that make it, was covered by nothing. This test starts at the real listener:
@@ -497,7 +497,7 @@ async fn a_borrowed_request_carries_its_query_string_to_the_lenders_upstream() {
 /// which kind of lease it happened to hold, which is the harder failure to see.
 ///
 /// Watched red: drop the `set_query` from `serve_on_handed_bearer`
-/// (`src/peer/lease.rs`) and the upstream sees a bare `/v1/messages`.
+/// (`src/peer/lease/mod.rs`) and the upstream sees a bare `/v1/messages`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_handed_request_carries_its_query_string_to_the_owners_upstream() {
     let (upstream, hits, served) = fleet::spawn_origin().await;

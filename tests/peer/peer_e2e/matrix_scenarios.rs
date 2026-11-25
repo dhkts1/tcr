@@ -12,7 +12,7 @@ use super::*;
 ///
 /// Only meaningful against a grant minted with `--for` or `--until`:
 /// `Lease::until` is copied straight from the GRANT's own end
-/// (`src/peer/lease.rs`'s `grant()`, `let end = granted.as_ref().and_then(|g|
+/// (`src/peer/lease/mod.rs`'s `grant()`, `let end = granted.as_ref().and_then(|g|
 /// g.until)`), so an open-ended grant (no `--for`, what [`lend_to`] mints)
 /// reads `until: null` REGARDLESS of whether a cached lease is live. A
 /// scenario that wants "is spender's cached lease for this row still there"
@@ -210,7 +210,7 @@ async fn no_ipv6_endpoint_falls_through_to_a_forwarder() {
 /// line is this test's named refusal.
 ///
 /// Watch it fail by deleting the `tracing::warn!` call on the `Err(err)` arm
-/// of `try_serve`'s match on `serve::open_serve` (`src/peer/lease.rs`): the
+/// of `try_serve`'s match on `serve::open_serve` (`src/peer/lease/mod.rs`): the
 /// borrow still fails, but the line this test greps for is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn forwarder_killed_mid_borrow_releases_the_client_promptly() {
@@ -354,14 +354,14 @@ const BORROW_TIMEOUT_SECS: u64 = 10;
 /// `Mac::shutdown` is `child.kill()`, so this is a crash, not a graceful stop.
 /// `spender`'s next request has nothing to dial and must be refused; the case
 /// this test pins is that the failure also DROPS the cached lease
-/// (`PeerLeaseProvider::try_serve`'s `Ok(None)` arm in `src/peer/lease.rs`),
+/// (`PeerLeaseProvider::try_serve`'s `Ok(None)` arm in `src/peer/lease/mod.rs`),
 /// which is what "re-asks" means operationally: `until` reads back `null`
 /// rather than a lease `spender` can never spend again. `bank` then reboots on
 /// the same port (its identity, in its own scratch HOME, is untouched by the
 /// kill) with a FRESH in-memory ledger: `held` for `spender` is back to zero,
 /// and `spender`'s next request must be served again, which is the re-ask
 /// actually completing. The eighth-lease cap
-/// ([`MAX_LEASES_PER_PEER`](../../../src/peer/lease.rs), `src/peer/lease.rs:472`)
+/// ([`MAX_LEASES_PER_PEER`](../../../src/peer/lease/mod.rs), `src/peer/lease/mod.rs:472`)
 /// is asserted by ABSENCE: `bank`'s fresh boot log must never contain the
 /// cap's own refusal line, because a ledger that came back corrupted (still
 /// counting the pre-crash lease as live) is exactly the failure mode that
@@ -369,7 +369,7 @@ const BORROW_TIMEOUT_SECS: u64 = 10;
 ///
 /// Watch it fail by deleting the cache-drop block (`let dropped = ...
 /// self.persist_borrowed();`) from the `Ok(None)` arm of `try_serve`'s match
-/// on `serve::open_serve` (`src/peer/lease.rs`): `until` stays non-null after
+/// on `serve::open_serve` (`src/peer/lease/mod.rs`): `until` stays non-null after
 /// the kill, because nothing ever told `spender` the lease was dead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_vanished_lenders_next_borrow_re_asks_and_the_cap_is_not_corrupted() {

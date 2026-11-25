@@ -10,7 +10,7 @@ use super::*;
 // # Why three of the four addresses are driven by value
 //
 // macOS puts only `127.0.0.1`, `::1` and one link-local address on `lo0`
-// (`tests/peer_abuse.rs` measured it: binding `127.0.0.2` fails with
+// (`tests/peer/pairing/peer_abuse.rs` measured it: binding `127.0.0.2` fails with
 // `EADDRNOTAVAIL`), and adding an alias needs root on a machine that is also
 // serving a live proxy. So `10.0.0.7` and `2001:db8::1` cannot be dialled from
 // here at all. They are driven through the address parameter
@@ -18,7 +18,7 @@ use super::*;
 // `serve_connection` reads inside the accept loop and not a copy of it, and
 // the wire-bytes half of the invariant is kept honest by one real-socket leg
 // from the one address this box has. That is the split
-// `tests/peer_pairing/caps.rs` uses for the same reason, in
+// `tests/peer/pairing/peer_pairing/caps.rs` uses for the same reason, in
 // `eight_concurrent_reservations_at_a_seven_row_queue_leave_exactly_eight_never_nine`.
 
 /// One Mac's files: a peers file, a state file beside it, a node key.

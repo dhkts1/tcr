@@ -43,7 +43,7 @@ Runtime-only (NOT persisted): current index, per-account learned quota + reset t
 ## Non-goals (keep it lean — NOT in this binary)
 Per-client keys, admin API, client locks, per-client attribution, egress routing, the configurable route table. Single global user. If Gil wants any later it's additive.
 
-**Keep-warm was a non-goal and is now shipped** (`src/warmer.rs`, `src/manager/warm.rs`), opt-in via
+**Keep-warm was a non-goal and is now shipped** (`src/clients/warmer.rs`, `src/manager/warm.rs`), opt-in via
 `warmupSeconds` and OFF by default because — unlike the zero-spend usage probe — it costs real quota.
 It is called out here so this section is not read as a claim that it is absent: a doc that denies a
 shipped feature is worse than no doc, because the next reader reasons from it. This one did mislead a

@@ -318,7 +318,7 @@ async fn a_forwarded_borrow_reaches_the_lender_through_a_third_mac() {
 /// half of the gate that has to hold whether or not a carrier was parked.
 ///
 /// The sentence the carrier says when it finds neither a parked carrier nor an
-/// address is gated in process, in `tests/peer_forward.rs`, rather than here:
+/// address is gated in process, in `tests/peer/reach/peer_forward.rs`, rather than here:
 /// a refusal reaches a peer's log through a per-address rate limit
 /// (`listener::RefusalLog`) that an enrolment refusal from the same loopback
 /// address earlier in the same run can spend, so an assertion on it here would
@@ -332,7 +332,7 @@ async fn a_forwarded_borrow_reaches_the_lender_through_a_third_mac() {
 /// carrier per friend when nothing can dial this Mac. So the assertion below
 /// is the 200 the forwarded-borrow test makes, over a socket the lender
 /// opened outwards, and the in-process half stays gated by
-/// `tests/peer_forward.rs::a_forward_rides_the_carrier_an_undialable_target_parked`.
+/// `tests/peer/reach/peer_forward.rs::a_forward_rides_the_carrier_an_undialable_target_parked`.
 ///
 /// Watched red by removing the `StreamKind::Park` arm from
 /// `listener::serve_stream`: the carrier never holds a socket, step 7's wait
@@ -437,7 +437,7 @@ async fn an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs(
     // borrower's own line says its lender answered on no address of its own
     // and that a Mac it may ask to carry took the stream. What happens after
     // that, on the carrier, is the half this file exercises and
-    // `tests/peer_forward.rs` gates in process, because the carrier's refusal
+    // `tests/peer/reach/peer_forward.rs` gates in process, because the carrier's refusal
     // reaches its log through a per-address rate limit that an enrolment
     // refusal in the same run can spend.
     let attempted = borrower.wait_for_log("a Mac this node may ask to carry reached it");

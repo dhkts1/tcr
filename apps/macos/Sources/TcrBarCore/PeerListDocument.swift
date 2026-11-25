@@ -250,7 +250,7 @@ public struct PeerListDocument: Decodable, Equatable, Sendable {
         /// The short `tcr-…` form of ``id``, from `status.rs`'s own `display`
         /// key.
         ///
-        /// Before this key existed, `PeerStatusRow::id` (`src/status.rs`) WAS
+        /// Before this key existed, `PeerStatusRow::id` (`src/status/mod.rs`) WAS
         /// the short form, which is what every live row's `id` decoded to;
         /// `tcr peer ls --json`'s rows carried the 52-character WIRE form
         /// under `node`/`id`, so ``mergingLive(_:)`` joined the two documents
@@ -374,7 +374,7 @@ public struct PeerListDocument: Decodable, Equatable, Sendable {
         /// sent.
         ///
         /// `tcr status --json`'s peers block (`PeerStatusRow` in
-        /// `src/status.rs`) says `id`, `name`, `address`, `trusted`. The
+        /// `src/status/mod.rs`) says `id`, `name`, `address`, `trusted`. The
         /// `tcr peer ls --json` document this type is decoded from says
         /// `node`, `label`, `endpoints[]`, `allow{}` and no `trusted` at all,
         /// which was measured against the built binary rather than read off a
@@ -611,7 +611,7 @@ extension PeerListDocument {
     /// sessions half already gives: `tcr peer ls --json` is a projection of two
     /// FILES, and a file cannot answer "how fast is this path right now" or
     /// "how many requests is that Mac serving for me". The serving process can,
-    /// and it reports them on its status payload (`src/status.rs`'s
+    /// and it reports them on its status payload (`src/status/mod.rs`'s
     /// `PeerStatusRow`). Thirteen of the sixteen fields this document decodes
     /// had no writer at all before that block existed, so the tab drew an empty
     /// row while both suites stayed green.

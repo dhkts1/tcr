@@ -136,7 +136,7 @@ extension QuotaState: Decodable {
 /// Why the server is holding an account out of rotation right now — its own
 /// verdict, not one this app re-derives.
 ///
-/// Rust spells these kebab-case (`src/stats.rs`'s `GateReason`, serialized by
+/// Rust spells these kebab-case (`src/records/stats.rs`'s `GateReason`, serialized by
 /// `gate_reason_token`): `ok`, `hold`, `five-hour`, `seven-day`,
 /// `fable-weekly`, `standard`, `login`, `rejected`, `disabled`, `reserved`,
 /// `parked`, `refused`.
@@ -231,14 +231,14 @@ extension StatusSource: Decodable {
 
 /// Health of the account's most recent quota probe.
 ///
-/// Rust owns these tokens (`ProbeStatus::as_str`, src/probe.rs): `never`, `ok`,
+/// Rust owns these tokens (`ProbeStatus::as_str`, src/records/probe.rs): `never`, `ok`,
 /// `error`, `timeout`, `rate-limited`. They are enumerated here rather than
 /// pattern-matched as strings so a variant this build has not seen lands in
 /// ``unknown(_:)`` deliberately, instead of being mistaken for a good probe.
 ///
 /// The distinction that matters to the capacity summary is ``never`` versus
 /// everything else. `error`, `timeout` and `rate-limited` all *keep the
-/// last-learned quota bar* — src/probe.rs:252-256 is explicit that a probe 429
+/// last-learned quota bar* — src/records/probe.rs:252-256 is explicit that a probe 429
 /// leaves serving quota untouched — so those rows still carry a real
 /// measurement. `never` means the account has never been probed at all (or is
 /// not an OAuth account), and its `quotaState: "ok"` is a Rust `#[default]`,
@@ -324,7 +324,7 @@ public enum Provider: Equatable, Sendable {
     case anthropic
     case codex
 
-    /// The wire token; `src/provider.rs` serialises the Rust enum lowercase.
+    /// The wire token; `src/base/provider.rs` serialises the Rust enum lowercase.
     public var token: String {
         switch self {
         case .anthropic: return "anthropic"
@@ -1967,7 +1967,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let serverSha: String?
     public let serverDirty: Bool?
 
-    /// Group labels (`src/stats.rs`'s `AccountSnapshot::groups`, carried onto
+    /// Group labels (`src/records/stats.rs`'s `AccountSnapshot::groups`, carried onto
     /// the wire as `"groups"`, always an array — `[]` for an unlabelled
     /// account, never `null`). Optional here, deliberately, unlike the wire's
     /// own `[]`-never-`null` rule: an older `tcr` that predates the field
@@ -1980,7 +1980,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let groups: [String]?
 
     /// Which of this account's own `groups` are held out of the general
-    /// pool (`src/stats.rs`'s reserved-group flag, carried onto the wire as
+    /// pool (`src/records/stats.rs`'s reserved-group flag, carried onto the wire as
     /// `"reservedGroups"`, repeated per row exactly the way `"groups"`
     /// itself already is — not a group-scoped lookup). Optional for the same
     /// forward-compat reason `groups` is: a server built before this field
@@ -2433,7 +2433,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     ///    yet" (src/cli.rs:258-271), so a nil gating quota is the absence of a
     ///    measurement, full stop.
     ///  - the account has been probed at least once. `ProbeStatus::Never` is
-    ///    Rust's `#[default]` (src/probe.rs:243-245), and it arrives paired with
+    ///    Rust's `#[default]` (src/records/probe.rs:243-245), and it arrives paired with
     ///    a `quotaState` of `"ok"` that is the *same* default rather than a
     ///    finding. A failed, timed-out or rate-limited probe still counts here:
     ///    those paths keep the last-learned bar.

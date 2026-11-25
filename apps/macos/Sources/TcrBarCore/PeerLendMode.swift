@@ -10,7 +10,7 @@ import Foundation
 /// How one grant's requests leave: over the owner's Mac, or on the borrower's
 /// own with a key the owner keeps renewing.
 ///
-/// The wire spelling is `src/peer/config.rs`'s `LendMode`, camelCase, and it
+/// The wire spelling is `src/peer/config/mod.rs`'s `LendMode`, camelCase, and it
 /// is SKIPPED when it is `serve`, which is what every grant written before
 /// modes existed already meant. So absent decodes to ``serve`` here too, and
 /// a grant that never asked for a handed key draws the default rather than an

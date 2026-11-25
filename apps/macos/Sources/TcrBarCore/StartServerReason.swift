@@ -51,7 +51,7 @@ extension ServerController.State {
 /// The refusal a `tcr` built before Codex accounts gives when the config it loads holds
 /// one, and the sentence TcrBar says in its place.
 ///
-/// The producer is tcr's config loader (`src/config.rs`): an account whose
+/// The producer is tcr's config loader (`src/base/config.rs`): an account whose
 /// `credentialVersion` is newer than the build understands is refused, with the whole
 /// load, rather than read in a shape it does not know. A Codex account is written at a
 /// newer version than any `tcr` from before Codex accounts understands, so every

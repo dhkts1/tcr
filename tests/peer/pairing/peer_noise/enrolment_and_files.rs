@@ -21,7 +21,7 @@ use super::*;
 // `listener.rs` as of this commit, and the two tests that measured it go with it rather than being
 // converted to `noise::accept_handshake`, which has no window parameter to
 // convert them to. The SAME invariant, under the CURRENT gate, is
-// `tests/peer_pairing/knock.rs::xx_from_an_unaccepted_instance_gets_zero_bytes` (the
+// `tests/peer/pairing/peer_pairing/knock.rs::xx_from_an_unaccepted_instance_gets_zero_bytes` (the
 // zero-bytes refusal) and its own positive control (the same dial answered
 // after Accept); `the_six_digit_code_binds_the_handshake_not_the_keys` above
 // keeps the six-digit-code assertion these two also made, through
@@ -838,7 +838,7 @@ fn a_hostile_enrolment_label_is_refused_and_spends_nothing() {
 /// other mode is refused rather than trusted.
 ///
 /// Watched red: with the `.permissions(0o600)` line removed from
-/// `crate::config::write_atomic`, the first assertion reads 0644 (this box's
+/// `crate::base::config::write_atomic`, the first assertion reads 0644 (this box's
 /// umask) and fails.
 #[test]
 fn the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused() {

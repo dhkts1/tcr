@@ -1,13 +1,13 @@
 //! A Codex request is never offered to a fallback provider: the borrower's half
 //! of "Codex is not lent over the mesh in this version". The lender's half, and
-//! the shared predicate both halves ask, are in `tests/peer_lease.rs`
+//! the shared predicate both halves ask, are in `tests/peer/lending/peer_lease.rs`
 //! (`codex_paths_never_open_a_relay`, `codex_path_in_a_frame_is_refused_by_the_lender`).
 //!
 //! # Why this is its own binary
 //!
 //! The seam's refusal can only be seen with a provider that refuses NOTHING
 //! installed, and the install is process-wide by design (`fallback::PROVIDER`).
-//! `tests/peer_lease.rs` already holds that binary's one installer, and a
+//! `tests/peer/lending/peer_lease.rs` already holds that binary's one installer, and a
 //! second in the same binary would race it. One test here, one install.
 //!
 //! # House rules

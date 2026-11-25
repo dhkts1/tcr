@@ -228,7 +228,7 @@ async fn codex_upgrade_426_is_logged_at_debug_not_warn() {
 /// **A Codex request is never offered to a peer's carry.** Codex stays off the mesh in this
 /// version, and a blind carry is an offer to a peer as much as a lease is. The seam's own first
 /// line for a host the mesh does not carry is the probe ([`OFFER`]), as in
-/// `tests/peer_egress.rs`: it fires once per offer. The Codex fleet has one account, so the
+/// `tests/peer/reach/peer_egress.rs`: it fires once per offer. The Codex fleet has one account, so the
 /// ladder is out of moves on its first connect failure, which is exactly when an Anthropic
 /// request IS offered (the control).
 ///

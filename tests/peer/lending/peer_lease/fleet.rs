@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // The fleet harness:a real `mitm::serve` in front of a real `Manager`, the
-// same shape `tests/throttle_exempt.rs` uses. Nothing here reaches the network
+// same shape `tests/proxy/throttle_exempt.rs` uses. Nothing here reaches the network
 // and nothing here touches the operator's config directory: every listener is `127.0.0.1:0` and
 // every account is an obviously fake fixture.
 // ---------------------------------------------------------------------------

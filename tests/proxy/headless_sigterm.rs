@@ -129,7 +129,7 @@ fn wait_for_line(
 /// alongside a wedged sccache and three concurrent release builds; 0/3 in
 /// isolation afterwards). The durable log is read only after the process has
 /// exited, and a clean exit drains the log writer's queue to disk first
-/// (`src/file_log.rs`), so it does not share that window.
+/// (`src/stores/file_log.rs`), so it does not share that window.
 ///
 /// This does NOT weaken the assertion. The question is "did the process log
 /// this", and the answer is yes if EITHER source has it. A line the process
@@ -137,7 +137,7 @@ fn wait_for_line(
 /// arm still reddens it, which is what `scripts/watch-sigterm-line-fail.sh`
 /// proves.
 fn durable_log_has_line(home: &std::path::Path, predicate: impl Fn(&str) -> bool) -> bool {
-    // A fresh HOME gets the new cache directory name (`src/paths.rs`).
+    // A fresh HOME gets the new cache directory name (`src/base/paths.rs`).
     let logs = home.join(".cache").join(paths::CACHE_DIR).join("logs");
     let Ok(entries) = std::fs::read_dir(&logs) else {
         return false;

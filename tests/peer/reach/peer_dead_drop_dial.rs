@@ -71,7 +71,7 @@ fn now_unix_seconds() -> u64 {
 }
 
 /// A loopback port nothing is listening on: bound, read back, released.
-/// `tests/peer_reach.rs`'s own helper, copied rather than shared, because
+/// `tests/peer/reach/peer_reach.rs`'s own helper, copied rather than shared, because
 /// each integration test file is its own crate.
 async fn a_closed_loopback_port() -> SocketAddr {
     let held = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -83,7 +83,7 @@ async fn a_closed_loopback_port() -> SocketAddr {
 }
 
 // ---------------------------------------------------------------------------
-// A fake `HttpsTemplateStore` target on loopback: `tests/peer_drop.rs`'s own
+// A fake `HttpsTemplateStore` target on loopback: `tests/peer/reach/peer_drop.rs`'s own
 // fake, copied rather than shared, because each integration test file is its
 // own crate.
 // ---------------------------------------------------------------------------

@@ -45,7 +45,7 @@ of each headline figure (the binary is `<target>/release/examples/load_test`).
 
 Each phase starts a fresh proxy, so its CPU and memory figures belong to that phase alone. Before
 every phase the bound-token map is filled to its cap (`BOUND_TOKEN_CAP`, 65,536 tokens, written
-through `tcr::bound_tokens::save` so the format is the proxy's own), because the map at its cap
+through `tcr::stores::bound_tokens::save` so the format is the proxy's own), because the map at its cap
 is where the 2026-10-15 profile found the proxy's largest cost. Every reply from the fake
 Anthropic mints a new message id and thinking signature, and every session echoes its last one
 on its next turn, so each `/v1/messages` request looks the map up and its reply records into it.
@@ -66,7 +66,7 @@ ending in a user message with a cache breakpoint. Every word is generated. A bre
 `ttl`, as Claude Code sends it, so the proxy's `ttl: 1h` rewrite changes every request, as it does
 live. Real requests are this size: the live log's median prompt is about 365,000 tokens.
 
-The rates come from the replay described in `src/config.rs` (`default_account_throttle`,
+The rates come from the replay described in `src/base/config.rs` (`default_account_throttle`,
 `default_fleet_throttle`). `steady` runs 75 s, which before `perf/idle-cost` spanned fifteen of
 the 5 s cache saves and one 60 s rewrite of the bound-token file at its cap; since then a cache is
 saved only when its content changed, and the bound-token file every ten minutes (see
@@ -252,7 +252,7 @@ The figures above predate the log writer queue below, which removed the first fi
 ## The log writer queue
 
 Since `perf/log-writer-queue`, the log file is written by one thread, `tcr-log-writer`, fed by a
-queue (`src/file_log.rs`): a tokio worker formats its line and queues it, and takes no lock on
+queue (`src/stores/file_log.rs`): a tokio worker formats its line and queues it, and takes no lock on
 the file. A headless proxy whose stdout is the null device no longer formats or writes a stdout
 copy at all; a terminal, a pipe or a file still gets one.
 
@@ -261,7 +261,7 @@ Three `overhead` runs each side, `--phases overhead`, alternating before and aft
 target directory with the script's own flags. The frame shares come from each run's
 `overhead.folded`: *mutex wait* is the share of samples whose leaf is `__psynch_mutexwait`, and
 *log writing* the share of samples with a frame from the log's writer on the stack
-(`tracing_appender`, `RollingFileAppender`, `Stdout`, `tcr::file_log`, or the `tcr-log-writer`
+(`tracing_appender`, `RollingFileAppender`, `Stdout`, `tcr::stores::file_log`, or the `tcr-log-writer`
 thread).
 
 | run | load 1m at start | served | CPU s / 1k req | added ms p99 | mutex wait | log writing |
@@ -289,7 +289,7 @@ thread).
 The queue holds 16,384 lines and the writer is not lossy: a full queue makes the emitter wait
 rather than drop a line. The queue's owner lives as long as the server and drains to disk on
 every way out, a panic included; why that matters, and what each exit does, is the module doc of
-`src/file_log.rs`. Because a line now reaches the file a moment after it is logged, the driver
+`src/stores/file_log.rs`. Because a line now reaches the file a moment after it is logged, the driver
 reads a phase's starting offset only once the log has been quiet for 500 ms, and reads its
 lines after the proxy has stopped and drained. Without that, the after runs above counted up to
 16 warm-up lines as the phase's. A fourth run each side with the fixed driver counted exactly one
@@ -341,7 +341,7 @@ wait, by the deepest `tcr` frame above it, out of all samples.
 
 ## One parse per request body
 
-Since `perf/parse-once`, a `/v1/messages` body is read once (`src/request_body.rs`). Before it,
+Since `perf/parse-once`, a `/v1/messages` body is read once (`src/records/request_body.rs`). Before it,
 seven places read it on their own, and at a multi-megabyte conversation those passes were most of
 what tcr spent on a request.
 
@@ -364,7 +364,7 @@ the whole body, counted from the code; "parse" is a `serde_json` walk, "scan" a 
 
 `system` and `tools` are read twice in the one walk (borrowed, then walked for breakpoints); they
 are a few percent of a long conversation. A body the rewrite does not change is never copied after
-it is collected. The pinned-exit carry in `src/peer/egress.rs` still patches the uuid with its own
+it is collected. The pinned-exit carry in `src/peer/tunnel/egress.rs` still patches the uuid with its own
 parse; it runs only for an account locked to one Mac.
 
 Each answer is the one its old parse gave, including when that parse failed, on the body as
@@ -420,7 +420,7 @@ serves a request a second or two, and between sessions nothing at all. Since `pe
   status they named. A non-2xx answer keeps its `upstream response` or `relayed response` line at
   INFO, which is what finds a 401 storm or a 429. On the live proxy the four lines were about
   4.5 a request and 75 to 93 MB of log a day.
-- **A cache is saved only when its content changed** (`src/save_gate.rs`). The pins and the
+- **A cache is saved only when its content changed** (`src/stores/save_gate.rs`). The pins and the
   Sessions/Tools table are saved 5 s after a change that adds, removes or moves an entry, and
   within a minute of a change to anything else (a pin's touch time, a session's counters), which
   moves on every request. The bound-token file, about 8 MB at its cap, is saved ten minutes after
@@ -429,7 +429,7 @@ serves a request a second or two, and between sessions nothing at all. Since `pe
 - **No timer runs while nothing changes.** Each cache's saver sleeps until a request changes it,
   where three timers woke every 5 s (one every 60 s) to look at a flag.
 - **Four tokio worker threads by default**, or the machine's cores when fewer, where tokio's
-  default is one per core. `TOKIO_WORKER_THREADS` sets the count (`tcr::server::worker_threads`).
+  default is one per core. `TOKIO_WORKER_THREADS` sets the count (`tcr::proxy::server::worker_threads`).
 - **A closed day of the usage ledger is gzipped** (`src/usage.rs`, "Closed days are gzipped"):
   every day older than yesterday, once when the ledger's writer starts and again each day. Every
   reader reads both forms.

@@ -42,7 +42,7 @@ fn now_ms() -> i64 {
 /// Hand built rather than taken from [`reach::punch_plan`] on purpose: the
 /// plan's own instants are 30 seconds apart, and what is under test here is
 /// the punch and the NAT, not the arithmetic
-/// `both_sides_of_a_pair_plan_the_same_slots` (`tests/peer_reach.rs`) already
+/// `both_sides_of_a_pair_plan_the_same_slots` (`tests/peer/reach/peer_reach.rs`) already
 /// covers. The port is the real derivation, because that is the value the
 /// whole mechanism rests on.
 fn slot_in(slot: u64, in_ms: i64) -> PunchSlot {

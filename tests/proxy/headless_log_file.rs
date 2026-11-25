@@ -1,7 +1,7 @@
 //! The durable log file of the BUILT BINARY, run the way TcrBar runs it: `--headless` with stdout
 //! on the null device (`ServerController.swift`, `standardOutput = FileHandle.nullDevice`).
 //!
-//! The file is written by one background thread fed by a queue (`src/file_log.rs`), and that
+//! The file is written by one background thread fed by a queue (`src/stores/file_log.rs`), and that
 //! thread stops, silently, when its guard is dropped. `src/main.rs` holds the guard in
 //! `run_server` for the process's life. This test checks the two ends of that life from outside:
 //!
@@ -15,7 +15,7 @@
 //! With stdout on the null device the proxy writes no second copy (`init_tracing`), so this is
 //! also the check that skipping stdout did not skip the file.
 //!
-//! Isolation is the same as `tests/headless_sigterm.rs`: `HOME` is a fresh temporary directory
+//! Isolation is the same as `tests/proxy/headless_sigterm.rs`: `HOME` is a fresh temporary directory
 //! set on the child's `Command`, `XDG_CACHE_HOME` is removed, the Claude Code login import points
 //! at a file that does not exist, and `--port 0` takes an ephemeral port, never the live 3456.
 use std::path::Path;

@@ -1,7 +1,7 @@
 import Combine
 import Foundation
 
-/// One rate bucket as `tcr config show --json` reports it (`src/config_show.rs`,
+/// One rate bucket as `tcr config show --json` reports it (`src/base/config_show.rs`,
 /// `ThrottleSetting`): `burst` requests at once after an idle spell, then one
 /// per `minSpacingMs`.
 public struct ConfigThrottle: Decodable, Equatable, Sendable {
@@ -28,7 +28,7 @@ public struct ConfigPacing: Decodable, Equatable, Sendable {
 }
 
 /// `tcr config show --json`: the effective rotation and limit settings, every
-/// default applied, as saved in the config file (`src/config_show.rs`,
+/// default applied, as saved in the config file (`src/base/config_show.rs`,
 /// `ConfigShow`), and under ``running`` the ones the proxy on the config's
 /// port is using, when one answered. Keys this type does not name are
 /// ignored, so a newer `tcr` that adds one does not break the decode.
@@ -116,7 +116,7 @@ public struct ConfigSettings: Decodable, Equatable, Sendable {
     /// is not using yet, in the order the pane draws them. Empty when no proxy
     /// answered. The control account never waits: `tcr control` applies it to
     /// the running proxy at once. Fable waits only when its own override
-    /// changed, the same rule as `ConfigShow::waiting` in `src/config_show.rs`.
+    /// changed, the same rule as `ConfigShow::waiting` in `src/base/config_show.rs`.
     public var waitingKeys: [String] {
         guard let running else { return [] }
         let fableWaits =

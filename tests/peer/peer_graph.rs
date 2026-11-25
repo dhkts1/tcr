@@ -1,9 +1,9 @@
 //! `tcr peer graph`, through the shipped binary.
 //!
 //! `peer::status::graph::peer_graph` and its schema are already covered end to end in
-//! `tests/peer_status.rs` (the flattened-edge shape, the masking, the
+//! `tests/peer/peer_status.rs` (the flattened-edge shape, the masking, the
 //! lease-direction rule, the expired-lease drop): that file owns
-//! `src/status.rs`'s derivation. This file owns the CLI SEAM: the verb that
+//! `src/status/mod.rs`'s derivation. This file owns the CLI SEAM: the verb that
 //! opens the two files, mints or loads the node key, and either prints the
 //! result or serves it, which is the part `peer_status.rs`'s pure-function
 //! tests cannot reach.
@@ -18,7 +18,7 @@ use tcr::log_err::LogErr as _;
 
 /// A scratch directory of this test's own, so a sibling test binary running at
 /// the same instant cannot read or write this one's peers file. Same shape as
-/// `tests/peer_reach.rs::scratch`.
+/// `tests/peer/reach/peer_reach.rs::scratch`.
 fn scratch(tag: &str) -> std::path::PathBuf {
     crate::peer_support::scratch_dir("graph", tag)
 }
@@ -92,7 +92,7 @@ fn run_graph(peers: &Path, extra: &[&str]) -> (String, String, bool) {
 
 /// **The gate for item 1**: the verb runs against a real peers file, minting
 /// this Mac's own node key on first use, the same as every other peer verb,
-/// and prints a document `tests/peer_status.rs`'s schema (`graph_schema_errors`)
+/// and prints a document `tests/peer/peer_status.rs`'s schema (`graph_schema_errors`)
 /// would accept: one `self` node, one node per pinned peer, one `path` edge per
 /// endpoint.
 #[test]

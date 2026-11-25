@@ -730,7 +730,7 @@ pub struct SessionRow {
     #[serde(default)]
     pub cache_read_tokens: u64,
     /// Cache-write tokens (5-minute plus 1-hour TTL creation), kept apart from `input_tokens`
-    /// — see `crate::session_wire::WireSession::input_tokens`'s doc-comment for why folding
+    /// — see `crate::records::session_wire::WireSession::input_tokens`'s doc-comment for why folding
     /// cache dimensions into `input_tokens` double-counts them against `cache_read_tokens`.
     /// `#[serde(default)]` so a payload from a server built before this field existed decodes
     /// as `0` rather than a parse failure.
@@ -744,7 +744,7 @@ pub struct SessionRow {
     /// decodes as an empty sparkline rather than a parse failure.
     #[serde(default)]
     pub req_per_minute: Vec<u16>,
-    /// This session's usage priced through `src/pricing.rs`, server-side, from a per-model
+    /// This session's usage priced through `src/base/pricing.rs`, server-side, from a per-model
     /// token tally kept on the session — a session that spans two models sums each model's
     /// own price rather than being priced once against whichever model is current. Same
     /// list-price-equivalent meaning as [`UsageTotals::cost_usd`], but plain `f64` rather than

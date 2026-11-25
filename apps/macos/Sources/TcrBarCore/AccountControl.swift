@@ -11,7 +11,7 @@ import Foundation
 ///     `tcr disable <name>` — exactly like the server control, and this process
 ///     stays credential-free.
 ///  2. **A failed call must never look like a success.** `query` on the Rust side
-///     (`src/identity.rs`, `match_accounts`) is an EXACT match on the account
+///     (`src/base/identity.rs`, `match_accounts`) is an EXACT match on the account
 ///     name — case-sensitive `==`, no substring, no email-part fallback. Names
 ///     are unique across a config by construction, so passing the row's own
 ///     `name` resolves to that row or to nothing. The exit code and stderr are

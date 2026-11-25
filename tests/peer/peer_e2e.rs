@@ -11,7 +11,7 @@
 //!
 //! # Isolation
 //!
-//! Same rules as `tests/headless_sigterm.rs` and `tests/first_run_no_config.rs`,
+//! Same rules as `tests/proxy/headless_sigterm.rs` and `tests/cli/first_run_no_config.rs`,
 //! set on the spawned [`Command`] and never on this process: `HOME` is a fresh
 //! [`tempfile::TempDir`], `XDG_CACHE_HOME` is a directory under it (so the
 //! affinity pins, the usage ledger, the owner claim and `peer-state.json` all

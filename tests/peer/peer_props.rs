@@ -203,7 +203,7 @@ proptest! {
 /// So this property bounds `f` by `GUARD`, the bound `lendable_fraction`
 /// actually promises, and separately asserts the monotonicity half exactly as
 /// asked: `f(subset scope) <= f(All)`, which holds because every account
-/// `scope_covers(&All, ..)` covers by construction (`src/peer/lease.rs:1702`)
+/// `scope_covers(&All, ..)` covers by construction (`src/peer/lease/mod.rs:1702`)
 /// and the fold is a maximum, so restricting the account set a maximum runs
 /// over can never raise it.
 const SWITCH_THRESHOLD: f64 = 0.9;

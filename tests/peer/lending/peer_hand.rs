@@ -363,7 +363,7 @@ fn an_expired_handed_bearer_is_not_returned() {
 /// that has ended, and a bearer the owner could not produce.
 ///
 /// Watched red by dropping the `mode != LendMode::Hand` guard in `handoff_for`
-/// (`src/peer/lease.rs`): the first assertion fails with a `Handoff` built for
+/// (`src/peer/lease/mod.rs`): the first assertion fails with a `Handoff` built for
 /// a serve-mode grant.
 #[test]
 fn a_handoff_is_built_only_for_a_live_hand_grant() {
@@ -1001,7 +1001,7 @@ fn an_expired_bearer_is_not_handed_over() {
 /// amount; the same request with no hint leaves `spent` unchanged.
 ///
 /// Watched red by making `Ledger::apply_usage_hint` return `0.0` before it adds
-/// (`src/peer/lease.rs`): the risen-`spent` assertion fails at 0.0 against 0.03.
+/// (`src/peer/lease/mod.rs`): the risen-`spent` assertion fails at 0.0 against 0.03.
 #[test]
 fn a_usage_hint_raises_spent_and_a_request_without_one_does_not() {
     let now_ms = crate_now_ms();

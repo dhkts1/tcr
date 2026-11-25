@@ -8,7 +8,7 @@
 //!
 //! # Isolation
 //!
-//! Same rules as `tests/first_run_no_config.rs`: `HOME` points at a fresh
+//! Same rules as `tests/cli/first_run_no_config.rs`: `HOME` points at a fresh
 //! [`tempfile::TempDir`], the config is written into that temp tree and passed
 //! explicitly, and the port under test is a kernel-assigned one bound by this
 //! test process. Nothing here reads the operator's real

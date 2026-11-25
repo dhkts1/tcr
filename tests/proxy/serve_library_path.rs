@@ -1,6 +1,6 @@
 //! The proxy booted as a **library**, with no `tcr` process anywhere.
 //!
-//! This is the gate for the `run_server` → [`tcr::server::serve`]
+//! This is the gate for the `run_server` → [`tcr::proxy::server::serve`]
 //! extraction. Before it, starting the proxy required `main`: the boot path
 //! called `std::process::exit` in its middle and handed its background tasks to
 //! "the process is about to die anyway", so nothing but the binary could run one
@@ -162,9 +162,9 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
 
     // The five loops this config enables: affinity flush + bound-token flush +
     // wire-sessions flush + quota probe + the expiring-reset spender
-    // (`autoUseExpiringResets` defaults on, `tcr::manager::auto_reset`). The bound-token flusher joined them when
+    // (`autoUseExpiringResets` defaults on, `tcr::manager::resets::auto`). The bound-token flusher joined them when
     // account-bound history (advisor ids, thinking signatures, message ids) became routing
-    // state that has to survive a restart (`tcr::bound_tokens`); it is keyed on the
+    // state that has to survive a restart (`tcr::stores::bound_tokens`); it is keyed on the
     // same `affinity_path` this config sets. The keep-warm loop is off, so it must NOT have
     // been spawned.
     assert_eq!(
@@ -317,7 +317,7 @@ async fn dropping_the_handle_stops_the_accept_loop_and_every_background_loop() {
 /// Asserted as *values*, without serving: this test may not create a proxy that
 /// could write anywhere.
 ///
-/// [the live proxy's shared pin cache]: tcr::affinity::default_path
+/// [the live proxy's shared pin cache]: tcr::stores::affinity::default_path
 #[test]
 fn the_convenience_constructor_touches_nothing_outside_the_process() {
     let options = ServeOptions::new(test_config());
@@ -345,7 +345,7 @@ fn the_convenience_constructor_touches_nothing_outside_the_process() {
 /// its port claim after the bind and withdraws it on shutdown.
 ///
 /// The claim is what makes a proxy identifiable when its process name is not
-/// `tcr` — `tcr::singleton` documents the silent OAuth token loss that
+/// `tcr` — `tcr::stores::singleton` documents the silent OAuth token loss that
 /// depends on it (`tcr login` stops refusing to run beside a live server, whose
 /// next persist writes its boot-time single-use refresh tokens back over the fresh
 /// ones). The file existing is therefore the behaviour, not an implementation

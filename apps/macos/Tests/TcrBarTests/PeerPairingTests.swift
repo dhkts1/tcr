@@ -15,7 +15,7 @@ final class PeerPairingTests: XCTestCase {
 
     /// Each line `src/peer/pair.rs` writes decodes to the event it names.
     ///
-    /// The literals are the ones `tests/peer_pairing.rs` pins on the other
+    /// The literals are the ones `tests/peer/pairing/peer_pairing.rs` pins on the other
     /// side, so the two halves of this wire are asserted against the same
     /// bytes rather than against each other's idea of them.
     func testEveryPrintedLineDecodes() {

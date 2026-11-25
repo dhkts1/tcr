@@ -306,7 +306,7 @@ fn pair_two_macs(initiator: &Mac, responder: &Mac) {
 /// edges (0-1, 1-2, ..., (N-1)-0) and every Mac ends the run with exactly two
 /// pinned rows.
 ///
-/// `tests/peer_e2e.rs`'s existing two-Mac test is untouched by this addition
+/// `tests/peer/peer_e2e.rs`'s existing two-Mac test is untouched by this addition
 /// and keeps passing on its own, so "every existing step still passes at N=2
 /// byte-for-byte" holds trivially: this is a new, separate driver, not a
 /// rewrite of that one.
@@ -402,7 +402,7 @@ async fn n_macs_pair_in_a_ring() {
 /// and discards the scan (`src/main.rs:2056-2062`), and the announcement dies
 /// with the short-lived CLI process that registered it, so there is no
 /// cross-process sighting to read. What the beacon may carry is
-/// `tests/peer_discovery.rs`'s subject; this is the switch.
+/// `tests/peer/pairing/peer_discovery.rs`'s subject; this is the switch.
 fn find_on(mac: &Mac) {
     let (stdout, stderr, ok) = mac.peer(&["find", "on", "--announce-name", "off"]);
     assert!(

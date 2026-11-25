@@ -1646,7 +1646,7 @@ final class AccountCommandTests: XCTestCase {
     }
 
     func testTheNameIsNeverTruncatedOrFlagged() {
-        // `query` resolves by exact name (`src/identity.rs`, `match_accounts`) —
+        // `query` resolves by exact name (`src/base/identity.rs`, `match_accounts`) —
         // an abbreviated name matches nothing at all. Pass it whole; the row
         // already knows the exact value.
         let name = "alice+tag@example.com"

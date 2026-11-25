@@ -3,7 +3,7 @@
 //!
 //! # The codec boundary a fixture is saved at
 //!
-//! `tests/peer_wire.rs`'s `a_frame_round_trips_and_a_short_buffer_asks_for_more`
+//! `tests/peer/pairing/peer_wire.rs`'s `a_frame_round_trips_and_a_short_buffer_asks_for_more`
 //! already covers `encode_frame`/`decode_frame`: a `u16` length prefix around
 //! whatever bytes it is given, with no field of its own and nothing in it
 //! that changes as a message type grows a field. Fixturing that layer would

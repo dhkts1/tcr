@@ -4,7 +4,7 @@
 #
 # `--org` existed to pick one of two rows sharing a name, back when
 # `Account.name` was an email and one email could name two accounts. Names are
-# unique now (`src/config.rs`, `migrate_duplicate_names`), so the flag narrows
+# unique now (`src/base/config.rs`, `migrate_duplicate_names`), so the flag narrows
 # nothing — and a flag in `--help` that narrows nothing is a lie the next reader
 # has to disprove. It came back once already, one verb at a time, which is why
 # this is a gate and not a note.

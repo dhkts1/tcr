@@ -5,7 +5,7 @@
 //! holds, that an upgrade never reaches an origin, that relays keep the client's bearer and add
 //! none to a call that came without one, and that a Claude request never lands on a Codex
 //! account.
-//! CONNECT routing is covered in `tests/intercepted_host.rs`, whose injected blind transport
+//! CONNECT routing is covered in `tests/proxy/intercepted_host.rs`, whose injected blind transport
 //! stays on loopback even when interception regresses. This binary uses base-URL requests.
 //!
 //! Never binds 3456 (`dead_port`). Never reads a real credential (`TCR_CODEX_AUTH` and
@@ -19,7 +19,7 @@
 //! `HTTP_PROXY`, `ALL_PROXY`, either case) is removed so no ambient proxy can carry a loopback
 //! call elsewhere; and the working directory is that HOME, so nothing a child runs looks at the
 //! developer's checkout (`tcr status` reads the build of the checkout it is started in). The
-//! config turns the quota probe off (`quotaProbeSeconds: 0`, as `tests/peer_e2e.rs` does): the
+//! config turns the quota probe off (`quotaProbeSeconds: 0`, as `tests/peer/peer_e2e.rs` does): the
 //! server's boot sweep would otherwise send carol's fixture bearer to `probe::USAGE_URL`, which
 //! is api.anthropic.com whatever `upstream` says, and its Codex half would put
 //! `/backend-api/wham/usage` calls in the ledger beside the ones these tests read, filling the

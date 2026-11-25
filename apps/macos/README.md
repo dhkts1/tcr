@@ -28,10 +28,10 @@ Session affinity persists the session→account pins to
 `~/.cache/tcr/session-affinity.json` — flushed every 5s while the map is
 dirty (`src/server.rs:674-690`) and restored at boot (`src/server.rs:643`) — so a
 takeover *inside* the pin TTL (`affinity::PIN_TTL_MS`, 15 minutes,
-`src/affinity.rs:71`) keeps most sessions warm, while one after it restores
+`src/stores/affinity.rs:71`) keeps most sessions warm, while one after it restores
 nothing at all. That the flush is incremental rather than shutdown-only is
 exactly because of this path: `--replace` follows SIGTERM with SIGKILL, and no
-shutdown hook runs for a SIGKILL (`src/affinity.rs:29-37`). None of it applies
+shutdown hook runs for a SIGKILL (`src/stores/affinity.rs:29-37`). None of it applies
 with `sessionAffinity` off, the explicit opt-out — the default is now ON
 (`src/manager/state.rs:33-50`).
 

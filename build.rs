@@ -18,7 +18,7 @@
 //! # Contract
 //!
 //! Emits three `rustc-env` variables, ALWAYS — never conditionally, so
-//! [`env!`] in `src/build_info.rs` compiles everywhere:
+//! [`env!`] in `src/base/build_info.rs` compiles everywhere:
 //!
 //! * `TCR_BUILD_SHA`   — short commit sha, or `unknown`
 //! * `TCR_BUILD_DIRTY` — `true` / `false` / `unknown` (tracked files only)

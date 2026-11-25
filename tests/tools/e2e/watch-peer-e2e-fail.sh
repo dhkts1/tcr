@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# watch-peer-e2e-fail.sh: prove tests/peer_e2e.rs is a gate and not a passenger.
+# watch-peer-e2e-fail.sh: prove tests/peer/peer_e2e.rs is a gate and not a passenger.
 #
 # A test that has only ever passed proves nothing about what it guards. This
 # breaks the two production lines the end-to-end depends on, one at a time,
 # and refuses to exit 0 unless each break turns the matching test RED with the
 # message that names it:
 #
-#   1. src/server/mod.rs       the peer-lease fallback install at boot
+#   1. src/proxy/server/mod.rs   the peer-lease fallback install at boot
 #      -> a_borrowed_request_... fails: the borrower's boot installs no provider
 #   2. src/peer/listener/connection.rs
 #                              the six digits the RESPONDER shows its operator
@@ -118,9 +118,9 @@ expect_green() {
 }
 
 # --- mutation 1: the borrower's boot installs no peer-lease provider ---------
-mutate "$ROOT/src/server/mod.rs" \
-  'match crate::fallback::install_peer_lease_provider(&peers_path) {' \
-  'match Ok::<_, anyhow::Error>(crate::fallback::Installed::NothingToBorrowFrom) {'
+mutate "$ROOT/src/proxy/server/mod.rs" \
+  'match crate::peer::serve::fallback::install_peer_lease_provider(&peers_path) {' \
+  'match Ok::<_, anyhow::Error>(crate::peer::serve::fallback::Installed::NothingToBorrowFrom) {'
 expect_red a_borrowed_request_reaches_the_lender_and_never_carries_the_borrowers_credential \
   "the borrower's boot must install a provider now that it has a lender" mutation-1.log
 restore
@@ -135,4 +135,4 @@ expect_red two_macs_find_each_other_pair_on_six_digits_and_pin \
 restore
 
 expect_green
-echo "PASS: tests/peer_e2e.rs catches both breaks and passes when they are undone"
+echo "PASS: tests/peer/peer_e2e.rs catches both breaks and passes when they are undone"

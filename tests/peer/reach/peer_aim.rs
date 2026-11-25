@@ -38,7 +38,7 @@
 //!
 //! # Driven over an in-memory duplex, not a socket
 //!
-//! The instrument is `tests/peer_carried_control.rs`'s, copied rather than
+//! The instrument is `tests/peer/reach/peer_carried_control.rs`'s, copied rather than
 //! reinvented: `tokio::io::duplex` against `listener::serve_accepted`, the
 //! asker's half hand-driven with `noise::dial_handshake` plus
 //! `noise::send_control`, and a header whose `via` names a carrier. The
@@ -332,7 +332,7 @@ async fn a_hint_about_a_third_mac_is_refused() {
 /// **The wire did not move.**
 ///
 /// Asserted here rather than argued in a commit body: the three keys are the
-/// ones `tests/peer_wire.rs` already pins for this frame, and a build that
+/// ones `tests/peer/pairing/peer_wire.rs` already pins for this frame, and a build that
 /// renamed or added one would make every older peer's hint unreadable. Green
 /// on the base by design, because this unit changes no field.
 #[test]

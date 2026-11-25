@@ -526,7 +526,7 @@ fn a_keeper_whose_internet_flag_goes_off_deletes_its_mapping_and_stops() {
 ///
 /// Pure, so both the `internet on` arm and the loopback arm are asserted
 /// without a router: `mapping_boot` is what `start_peer_mapping` routes on,
-/// and `tests/peer_boot.rs` asserts the booted server reaches it.
+/// and `tests/peer/peer_boot.rs` asserts the booted server reaches it.
 #[test]
 fn the_mapping_decision_reads_the_switch_and_the_bound_address() {
     let routable: SocketAddr = "192.168.1.4:9600"

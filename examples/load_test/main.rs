@@ -273,7 +273,7 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     let (cpu0, rss_boot, disk0) =
         refresh(&mut sys).context("the test proxy vanished before the phase")?;
     let load0 = System::load_average();
-    // The proxy writes its log on a background thread fed by a queue (`src/file_log.rs`), so the
+    // The proxy writes its log on a background thread fed by a queue (`src/stores/file_log.rs`), so the
     // warm-up's last `request usage` lines can land a moment after its replies. Read the offset
     // once the file has stopped growing, or those lines are counted as the phase's (measured:
     // up to all 16 of the `overhead` warm-up's).

@@ -4,7 +4,7 @@
 //! Nothing here reaches a real router and nothing multicasts on a real
 //! interface: [`tcr::peer::upnp::Discoverer::at`] takes a
 //! destination, so every test here points it at a fake SSDP responder bound
-//! to `127.0.0.1:0`, exactly as `tests/peer_reach.rs` points
+//! to `127.0.0.1:0`, exactly as `tests/peer/reach/peer_reach.rs` points
 //! [`tcr::peer::reach::NatPmp::at`] at a fake NAT-PMP gateway.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -438,7 +438,7 @@ fn add_port_mapping_refused_with_upnp_error_718_is_a_named_error() {
 #[test]
 fn a_silent_gateway_yields_a_named_silent_error() {
     // Bound but never read: exactly the SSDP-side equivalent of
-    // `tests/peer_reach.rs`'s `Behaviour::Silent`.
+    // `tests/peer/reach/peer_reach.rs`'s `Behaviour::Silent`.
     let socket = UdpSocket::bind("127.0.0.1:0").expect("bind a socket nobody answers from");
     let addr = socket.local_addr().expect("its own address");
     // Keep the socket alive for the duration of the search so the OS does not

@@ -296,7 +296,7 @@ async fn a_default_peers_file_opens_no_peer_port() {
 /// The ask was to "pass the SAME boot instance id
 /// (`SessionContext::instance_id()`) to discovery if the boot path starts it".
 /// It is satisfied by construction rather than by an argument: both sides read
-/// `peer::id::boot_instance_id()`, which is a `OnceLock`, so there is no
+/// `peer::config::id::boot_instance_id()`, which is a `OnceLock`, so there is no
 /// parameter through which they could differ: `SessionContext::new` reads it
 /// (`src/peer/listener.rs`) and `discovery::build_beacon_info` reads it on the
 /// beacon's side. `discovery::advertise` therefore takes no instance argument
@@ -1042,7 +1042,7 @@ mod lender {
 /// The DECISION is what is asserted, not a mapping: this test binds loopback
 /// (every test here does), and a keeper that ran would talk to whatever router
 /// the machine running the suite sits behind. `reach::mapping_boot` is
-/// asserted on all three inputs in `tests/peer_reach.rs`.
+/// asserted on all three inputs in `tests/peer/reach/peer_reach.rs`.
 ///
 /// Watch it fail: delete the `start_peer_mapping` call from
 /// `boot_peer_listener` and the count never moves.

@@ -2,7 +2,7 @@
 # Mutation-test the wire credential gates: no wire type may carry a
 # credential field.
 #
-# Runs three probes against BOTH gates in tests/peer_wire.rs:
+# Runs three probes against BOTH gates in tests/peer/pairing/peer_wire.rs:
 # the denylist (`wire_has_no_credential_field`) and the
 # allowlist (`every_wire_type_serializes_only_allowlisted_keys`). Each probe
 # adds a credential field to a real wire type: `MoveOffer`, "the only phase
@@ -40,7 +40,7 @@ trap restore EXIT INT TERM
 
 run_gate() {
   # $1 = test name, $2 = log file. Never piped: the exit code is the verdict.
-  # `tests/peer_wire.rs` is the `peer_wire` module of the shared `it` test crate.
+  # `tests/peer/pairing/peer_wire.rs` is the `peer_wire` module of the shared `it` test crate.
   CARGO_TARGET_DIR="$ROOT/target-mutate" cargo test \
     --manifest-path "$ROOT/Cargo.toml" --test it "peer_wire::$1" \
     >"$2" 2>&1

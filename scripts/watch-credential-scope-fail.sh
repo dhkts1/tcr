@@ -22,7 +22,7 @@ set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
-CONFIG="src/config.rs"
+CONFIG="src/base/config.rs"
 MANAGER="src/manager/mod.rs"
 BACKUP_DIR="$(mktemp -d -t cred-scope.XXXXXX)"
 cp "$CONFIG" "$BACKUP_DIR/config.rs"

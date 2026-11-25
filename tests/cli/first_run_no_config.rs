@@ -15,7 +15,7 @@
 //!
 //! # Isolation
 //!
-//! Same rules as `tests/headless_sigterm.rs`: `HOME` points at a fresh
+//! Same rules as `tests/proxy/headless_sigterm.rs`: `HOME` points at a fresh
 //! [`tempfile::TempDir`] and `XDG_CACHE_HOME` is removed, both set on the
 //! spawned [`Command`] rather than on this test process, so the real
 //! `~/.config/tcr.json` — which holds working credentials — and the live
@@ -66,7 +66,7 @@ fn run_tcr(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, Strin
         .env("CODEX_HOME", home.join(".codex"))
         .env("TCR_CODEX_AUTH", home.join("no-such-codex-auth.json"));
     // The helper's Claude Code login is a file that does not exist: the first run these
-    // assertions are about. `tests/claude_code_import.rs` covers the other first run, the one
+    // assertions are about. `tests/cli/claude_code_import.rs` covers the other first run, the one
     // that finds a login.
     let guard = connect_guard::ConnectGuard::attach(&mut command, home);
     let out = command

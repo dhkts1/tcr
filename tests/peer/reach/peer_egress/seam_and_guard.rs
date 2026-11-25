@@ -407,7 +407,7 @@ async fn a_carried_request_lands_in_the_ledger() {
 /// (`Manager::window_utilizations`).
 ///
 /// Watched red by deleting the `manager.update_quota` call from
-/// `record_carried` (`src/peer/egress.rs`): the window stays `None`, i.e. "we
+/// `record_carried` (`src/peer/tunnel/egress.rs`): the window stays `None`, i.e. "we
 /// have never seen this account's quota", and the assertion below names it.
 #[tokio::test]
 async fn a_carried_requests_spend_reaches_the_quota_window() {

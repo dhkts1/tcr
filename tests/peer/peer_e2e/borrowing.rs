@@ -431,7 +431,7 @@ async fn a_chained_borrow_leaf_from_middle_middle_from_root() {
 /// this item asked for a SECOND lender (`bank2`) as overflow, and the
 /// exploration for this test built exactly that topology first and found a
 /// real race that made it the wrong control, reported here rather than
-/// hidden: [`PeerLeaseProvider::lease_for`] (`src/peer/lease.rs:1455`) checks
+/// hidden: [`PeerLeaseProvider::lease_for`] (`src/peer/lease/mod.rs:1455`) checks
 /// its lease cache and only mints+caches a NEW lease on a miss; the check and
 /// the mint are two steps with an `.await` between them and no lock held
 /// across it, so N concurrent Asks that all see the SAME cache MISS each mint
@@ -801,7 +801,7 @@ fn boot_cost_once(with_peers: bool) -> f64 {
 /// is a claim about the borrower's ask path as much as about the lender's cap.
 ///
 /// Watch it fail by deleting the ask-gate block in `lease_for`
-/// (`src/peer/lease.rs`): five leases are minted at bank1 alone and all five
+/// (`src/peer/lease/mod.rs`): five leases are minted at bank1 alone and all five
 /// borrows are served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn five_concurrent_borrows_across_two_lenders_stop_at_four() {

@@ -4952,7 +4952,7 @@ enum RenderStates {
     /// collapsed to one SwiftUI identity, so the panel drew the FIRST row's
     /// numbers on both and neither wore its own gate pill, while `tcr status
     /// --json` reported the two correctly and differently. `tcr` now gives the
-    /// second row its own name (`src/config.rs`, `migrate_duplicate_names`), so
+    /// second row its own name (`src/base/config.rs`, `migrate_duplicate_names`), so
     /// the PNG must show BOTH halves of the Team row's name and truncate
     /// neither: the email on line one, the `/example-team` half as the first tag
     /// on the designations line. Read left to right across the two lines, that

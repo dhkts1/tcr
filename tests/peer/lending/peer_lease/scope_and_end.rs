@@ -788,7 +788,7 @@ fn a_grant_with_an_end_puts_it_on_the_lease_and_a_passed_end_mints_nothing() {
 /// suite happens to run and one that is not, three hours away on either side,
 /// and the assertion is the same at any hour and in any timezone. The literal
 /// 21:59-vs-22:01 boundary the decision names is pinned where an instant CAN be
-/// handed over, against `schedule_refusal` itself, in `tests/peer_props.rs`.
+/// handed over, against `schedule_refusal` itself, in `tests/peer/peer_props.rs`.
 ///
 /// Watch it fail by deleting the `schedule_refusal` call from `Ledger::grant`:
 /// the closed window then mints a lease, which is the defect this exists to

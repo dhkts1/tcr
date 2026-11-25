@@ -147,7 +147,7 @@ secondary slot: from its usage endpoint as `primary_window` and `secondary_windo
 response as `x-codex-{primary,secondary}-{used-percent,window-minutes,reset-at}` headers. tcr
 files each window into the five-hour or the weekly bar by its length, not by its slot: 600
 minutes or shorter is the five-hour bar, anything longer the weekly one, and the slot decides
-only when a window carries no length (`src/quota.rs`, `src/codex_probe.rs`). By slot, a Pro
+only when a window carries no length (`src/quota.rs`, `src/records/codex_probe.rs`). By slot, a Pro
 account's numbers would land in the wrong bar: measured on ChatGPT Pro logins, the usage
 endpoint reports a single window of 604800 seconds (seven days) in the primary slot, and
 `secondary_window: null`. So a Pro account shows its weekly bar only, never a fabricated
@@ -518,7 +518,7 @@ as does the collapsed ↻ badge; several kinds ask which.
 
 A reset that reaches its use-by unspent is lost, so tcr spends one by itself two hours before
 its use-by (Gil, 2026-11-17), through the same claim path as the button. Once a minute
-`manager::auto_reset` reads what the last usage read said each account holds; nothing is
+`manager::resets::auto` reads what the last usage read said each account holds; nothing is
 sent until a reset is due. Each reset is tried once, keyed by (slot, kind, use-by), and that
 key is the Claude claim's `request_id`, so no tick or retry spends two. A reset that needs
 the account at its limit first answers "nothing to reset" when it is not; that is recorded

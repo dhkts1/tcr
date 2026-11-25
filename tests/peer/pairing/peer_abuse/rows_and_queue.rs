@@ -24,7 +24,7 @@ fn found_row(instance: u8, addr: &str) -> Discovered {
 /// a held row each, and the twelve-row display cap still holds.**
 ///
 /// The per-address cap is the one an id changer meets, and
-/// `one_address_holds_at_most_two_found_rows` (`tests/peer_discovery.rs`)
+/// `one_address_holds_at_most_two_found_rows` (`tests/peer/pairing/peer_discovery.rs`)
 /// proves it against a rotating id. This attacks the cap's KEY instead: the
 /// address it counts by is the one the announcement carries
 /// (`Discovered::addrs`), and `Discovered` holds no source address at all, so
@@ -88,7 +88,7 @@ fn one_host_rotating_its_announced_address_still_shows_only_twelve_rows() {
 /// restarted by the scan that drops it.**
 ///
 /// `a_row_that_stops_announcing_leaves_after_sixty_seconds`
-/// (`tests/peer_discovery.rs`) covers the ordinary expiry. The attack here is
+/// (`tests/peer/pairing/peer_discovery.rs`) covers the ordinary expiry. The attack here is
 /// the boundary: a row observed at the exact TTL instant must be gone (the
 /// bound is strict), and a flood arriving in the same scan must not refresh
 /// rows it is not for.
@@ -136,7 +136,7 @@ fn a_found_row_dies_exactly_at_its_ttl_and_a_flood_does_not_revive_it() {
 /// thousand fresh addresses.**
 ///
 /// `an_unauthenticated_flood_writes_one_log_line_and_then_counts` and
-/// `the_refusal_log_is_bounded_in_addresses` (`tests/peer_noise.rs`) cover the
+/// `the_refusal_log_is_bounded_in_addresses` (`tests/peer/pairing/peer_noise.rs`) cover the
 /// time bound and the map bound separately. This attacks the two TOGETHER,
 /// which is where they interact: the map is capped at
 /// [`listener::REFUSAL_LOG_ADDRESSES`] and evicts the address whose last line
@@ -208,7 +208,7 @@ fn beating_one_addresss_quiet_hour_costs_a_thousand_fresh_addresses() {
 ///
 /// The sentence `state::MAX_PENDING_KNOCKS`'s own doc-comment makes, asserted
 /// for the first time. Every other pending-queue test in this file: and in
-/// `tests/peer_pairing.rs`, knocks from `127.0.0.1`, which is the only address
+/// `tests/peer/pairing/peer_pairing.rs`, knocks from `127.0.0.1`, which is the only address
 /// a loopback test can dial from, and `state::knock_address` coalesces all of
 /// them onto ONE row. So they measure the coalescing and they never once reach
 /// the cap: an assertion that the queue holds `<= 8` rows is satisfied by a

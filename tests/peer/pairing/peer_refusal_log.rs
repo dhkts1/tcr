@@ -7,7 +7,7 @@
 //! (`set_global_default`), and a subscriber is shared by every test in a
 //! binary: so a `matching("peer connection closed")` count here would include
 //! the lines other tests' listeners wrote, concurrently, about their own
-//! peers. Measured while writing it: run inside `tests/peer_pairing.rs` this
+//! peers. Measured while writing it: run inside `tests/peer/pairing/peer_pairing.rs` this
 //! counted THREE lines from three different source ports, none of which this
 //! test produced. A count that includes another test's events is not a
 //! measurement of the bound.
@@ -131,7 +131,7 @@ async fn an_authenticated_reconnect_loop_writes_one_log_line() {
     // construction (nothing had been silenced before it), and what proves the
     // counting works is the field being present at all plus
     // `an_unauthenticated_flood_writes_one_log_line_and_then_counts` in
-    // `tests/peer_noise.rs`, which drives the count directly.
+    // `tests/peer/pairing/peer_noise.rs`, which drives the count directly.
     assert!(
         lines[0].fields.contains_key("suppressed"),
         "the line has to carry what it stood for, or the bound is a silence: {:?}",

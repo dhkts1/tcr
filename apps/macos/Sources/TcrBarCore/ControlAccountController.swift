@@ -177,7 +177,7 @@ public final class ControlAccountController: ObservableObject {
     /// then stamped `control: true` on EVERY row whose name equalled it, so the
     /// panel showed both rows as control and matched a server that was itself
     /// confused. `tcr` fixed it below this app by making the name unique
-    /// (`src/config.rs`, `migrate_duplicate_names`), which is why this check can
+    /// (`src/base/config.rs`, `migrate_duplicate_names`), which is why this check can
     /// be the plain equality it looks like.
     public func isControl(_ name: String) -> Bool { !unavailable && current == name }
 

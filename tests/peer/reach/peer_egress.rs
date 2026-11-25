@@ -422,7 +422,7 @@ fn fake_origin_on(
 }
 
 /// A client that trusts the fake origin's CA and resolves [`ORIGIN`] to the
-/// loopback splice. Everything else is what `src/peer/egress.rs` builds.
+/// loopback splice. Everything else is what `src/peer/tunnel/egress.rs` builds.
 fn carried_client(origin: &Origin, splice_port: u16) -> reqwest::Client {
     tcr::http_client::builder()
         .no_proxy()
@@ -513,7 +513,7 @@ async fn real_gateway_pinning(
 /// a current-thread runtime, so the tasks it spawns are polled on this same
 /// thread and their events land in this collector: while another test in this
 /// binary, on another thread, cannot pollute the count. A global subscriber is
-/// what forced `tests/peer_refusal_log.rs` into its own binary.
+/// what forced `tests/peer/pairing/peer_refusal_log.rs` into its own binary.
 fn capture() -> (Collector, tracing::subscriber::DefaultGuard) {
     use tracing_subscriber::layer::SubscriberExt as _;
     let collector = Collector::default();

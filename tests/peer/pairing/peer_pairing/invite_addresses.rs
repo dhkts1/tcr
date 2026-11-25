@@ -172,7 +172,7 @@ fn tcr_peer_invite_names_every_address_and_the_internet_gap() {
 /// `invite --reply --stdin` opens the reply and runs the join with the key
 /// it carried.
 ///
-/// This is the wiring test, not the live-join test: `tests/peer_ask.rs`
+/// This is the wiring test, not the live-join test: `tests/peer/pairing/peer_ask.rs`
 /// covers the five refusal shapes against the library directly, and the
 /// container scenario (`tests/containers/scenarios/sealed-invite.sh`) is
 /// where both the "no address in the chat" claim over a real grep AND the

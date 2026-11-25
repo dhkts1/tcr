@@ -32,7 +32,7 @@
 //!   without these, a test would run the developer's own `tcr`.
 //!
 //! The fixture's JWTs are put together at run time from a header and a payload, as the unit tests
-//! in `src/oauth/codex.rs` put theirs together: the dotted form written out whole is what a secret
+//! in `src/clients/oauth/codex.rs` put theirs together: the dotted form written out whole is what a secret
 //! scanner's JWT rule matches.
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
