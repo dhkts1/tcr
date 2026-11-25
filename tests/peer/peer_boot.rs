@@ -112,6 +112,22 @@ fn listening_peers_file() -> peer_config::PeerFile {
     }
 }
 
+/// Held for the whole life of every server in this file that opens a peer
+/// port, shutdown included.
+///
+/// Such a server spawns the beacon task (`spawn_beacon`), and that task calls
+/// `discovery::stop_all` at shutdown whether `find` was on or not. The mDNS
+/// daemon behind it is one per PROCESS, and `cargo test` runs this file's
+/// tests as threads of one process, so a sibling's shutdown shut down the
+/// daemon the `find` test's announcer had just taken: its `register` then
+/// failed with the daemon gone, the next try is twenty seconds away
+/// (`BEACON_RESTAMP_INTERVAL`), and the test saw no beacon in its five. A lock
+/// rather than a daemon per server, because the production shape is the
+/// single daemon (the same choice as `register_lock` in
+/// `tests/peer/reach/peer_reach_upnp.rs`). A tokio lock, because the guard is
+/// held across every `.await` in the test.
+static PEER_PORT_SERVER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // ---------------------------------------------------------------------------
 // Item 1: `listener::serve` gets its production caller
 // ---------------------------------------------------------------------------
@@ -138,6 +154,7 @@ fn listening_peers_file() -> peer_config::PeerFile {
 /// `server::serve`: `peer_addr()` is then `None` and claim 1 fails first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_booted_server_answers_a_knock_and_refuses_the_local_route_on_its_peer_port() {
+    let _one_peer_port_server = PEER_PORT_SERVER.lock().await;
     let profile = Profile::new();
     profile.write_peers(listening_peers_file());
 
@@ -1050,6 +1067,7 @@ mod lender {
 async fn a_booted_server_with_internet_on_starts_the_mapping_keeper() {
     use tcr::peer::reach;
 
+    let _one_peer_port_server = PEER_PORT_SERVER.lock().await;
     let before = reach::mapping_boot_counts();
 
     let profile = Profile::new();
@@ -1101,6 +1119,7 @@ async fn a_booted_server_with_internet_on_starts_the_mapping_keeper() {
 async fn a_booted_server_with_find_on_announces_from_its_own_process() {
     use tcr::peer::discovery;
 
+    let _one_peer_port_server = PEER_PORT_SERVER.lock().await;
     let before = discovery::announcements();
 
     let profile = Profile::new();
@@ -1135,11 +1154,10 @@ async fn a_booted_server_with_find_on_announces_from_its_own_process() {
         "a serving process with `find` on has to be the one announcing: it registered no \
          beacon (announcements stayed at {before})"
     );
-    // What it is HOLDING is not asserted here: `discovery`'s registers are
-    // process-global (one announcer per Mac in production), and every other
-    // server this binary boots calls `stop_all` on its way out, which clears
-    // them. The count is monotonic and is the claim: a beacon was registered
-    // by this process.
+    // The count is the claim, not what the registers hold: it is monotonic, so
+    // no `stop_all` can take it back, and a beacon was registered by this
+    // process. `PEER_PORT_SERVER` is what stops a sibling's `stop_all` from
+    // shutting the daemon down under the registration itself.
 
     handle.shutdown().await;
 }
