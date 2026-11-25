@@ -1,4 +1,4 @@
-//! The borrower's side: asking a lender for a lease. The `crate::fallback`
+//! The borrower's side: asking a lender for a lease. The `crate::peer::serve::fallback`
 //! provider that asks is [`crate::peer::serve::PeerLeaseProvider`].
 
 use anyhow::{Context as _, Result};

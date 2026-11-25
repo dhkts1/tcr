@@ -34,7 +34,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use tcr::log_err::LogErr;
+use tcr::base::log_err::LogErr;
 
 static SCREEN_DIRTIED_BY_PANIC: AtomicBool = AtomicBool::new(false);
 

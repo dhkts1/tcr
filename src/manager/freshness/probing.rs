@@ -17,7 +17,7 @@ pub(crate) const SUSTAINED_5XX_THRESHOLD: u32 = 3;
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::manager) struct BoundAccount {
     name: String,
-    provider: crate::provider::Provider,
+    provider: crate::base::provider::Provider,
     account: Option<String>,
     org: Option<String>,
     org_name: Option<String>,
@@ -220,14 +220,14 @@ impl Manager {
     }
 
     /// Probe **every** OAuth account's quota once, sequentially, spaced
-    /// [`crate::probe::PROBE_SPACING`] apart.
+    /// [`crate::records::probe::PROBE_SPACING`] apart.
     ///
     /// This is the ONE-SHOT "refresh everything now" sweep, and it is still what
     /// `tcr accounts --probe` / `tcr status`'s offline fallback need: a caller
     /// with no server behind it wants every row filled before it renders, not a
     /// schedule. The *background* refresh no longer goes through here — since
     /// every account fired inside one `N * 350ms` window on an exact period,
-    /// which is the fleet synchronization [`crate::schedule`] exists to remove.
+    /// which is the fleet synchronization [`crate::manager::freshness::schedule`] exists to remove.
     /// The server drives [`Self::probe_account`] per account on independent
     /// random schedules instead.
     pub async fn probe_all(&self) {
@@ -239,7 +239,7 @@ impl Manager {
             // into its own 429 — the burst was what painted a false "error" on
             // every row. Sequential + spaced stays well inside the cadence.
             if i < last {
-                tokio::time::sleep(crate::probe::PROBE_SPACING).await;
+                tokio::time::sleep(crate::records::probe::PROBE_SPACING).await;
             }
         }
     }
@@ -380,13 +380,13 @@ impl Manager {
         &self,
         idx: usize,
         access_token: String,
-    ) -> Option<crate::probe::ProbeCredential> {
+    ) -> Option<crate::records::probe::ProbeCredential> {
         let provider = self.provider(idx)?;
         let account_id = match provider {
-            crate::provider::Provider::Anthropic => self.account_uuid(idx),
-            crate::provider::Provider::Codex => self.codex_account_id(idx),
+            crate::base::provider::Provider::Anthropic => self.account_uuid(idx),
+            crate::base::provider::Provider::Codex => self.codex_account_id(idx),
         };
-        Some(crate::probe::ProbeCredential {
+        Some(crate::records::probe::ProbeCredential {
             provider,
             access_token,
             account_id,
@@ -435,8 +435,8 @@ impl Manager {
         // imported. The profile endpoint asked below is Anthropic's and has no Codex twin:
         // asking it would only hand a Codex bearer to the wrong provider.
         match self.provider(idx) {
-            Some(crate::provider::Provider::Anthropic) => {}
-            Some(crate::provider::Provider::Codex) | None => return,
+            Some(crate::base::provider::Provider::Anthropic) => {}
+            Some(crate::base::provider::Provider::Codex) | None => return,
         }
         let (already_known, token) = {
             let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
@@ -511,7 +511,7 @@ impl Manager {
             // resolve to different entries rather than tying. It carries the
             // row's provider too: `identity::same_identity` never matches a row
             // of the other provider.
-            crate::identity::probe(
+            crate::base::identity::probe(
                 account.provider,
                 &account.name,
                 account.account_uuid.clone(),
@@ -547,8 +547,8 @@ impl Manager {
                 return;
             };
             match account.provider {
-                crate::provider::Provider::Anthropic => return,
-                crate::provider::Provider::Codex => {}
+                crate::base::provider::Provider::Anthropic => return,
+                crate::base::provider::Provider::Codex => {}
             }
             if account.organization_type.as_deref() == Some(plan_type) {
                 return;
@@ -562,7 +562,7 @@ impl Manager {
             );
             // The identity probe `save_plan` locates the on-disk row by, built from the row's
             // own stored identity (provider included), as the backfill builds it.
-            crate::identity::probe(
+            crate::base::identity::probe(
                 account.provider,
                 &account.name,
                 account.account_uuid.clone(),
@@ -573,7 +573,7 @@ impl Manager {
 
         self.persist_probed_plan(
             target,
-            crate::probe::Plan {
+            crate::records::probe::Plan {
                 organization_type: Some(plan_type.to_string()),
                 ..Default::default()
             },
@@ -583,7 +583,11 @@ impl Manager {
 
     /// Persist either provider's probed plan without a config lock wait, file read or fsync
     /// blocking a Tokio worker. The same writer lock still covers the complete surgical save.
-    async fn persist_probed_plan(&self, target: config::Account, plan: crate::probe::Plan) {
+    async fn persist_probed_plan(
+        &self,
+        target: config::Account,
+        plan: crate::records::probe::Plan,
+    ) {
         let Some(path) = self.config_path.clone() else {
             return;
         };
@@ -635,24 +639,29 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log_err::LogErr as _;
+    use crate::base::log_err::LogErr as _;
 
     struct NoNetwork;
 
     impl TokenRefresher for NoNetwork {
-        fn refresh(&self, _: crate::provider::Provider, _: String) -> oauth::RefreshFuture {
+        fn refresh(&self, _: crate::base::provider::Provider, _: String) -> oauth::RefreshFuture {
             panic!("a plan probe must not need a refresh");
         }
     }
 
     impl UsageProber for NoNetwork {
-        fn probe(&self, credential: crate::probe::ProbeCredential) -> crate::probe::ProbeFuture {
+        fn probe(
+            &self,
+            credential: crate::records::probe::ProbeCredential,
+        ) -> crate::records::probe::ProbeFuture {
             let codex = match credential.provider {
-                crate::provider::Provider::Anthropic => None,
-                crate::provider::Provider::Codex => Some(crate::codex_probe::CodexProbeFacts {
-                    plan_type: Some("pro".into()),
-                    ..Default::default()
-                }),
+                crate::base::provider::Provider::Anthropic => None,
+                crate::base::provider::Provider::Codex => {
+                    Some(crate::records::codex_probe::CodexProbeFacts {
+                        plan_type: Some("pro".into()),
+                        ..Default::default()
+                    })
+                }
             };
             Box::pin(async move {
                 Ok(Usage {
@@ -664,15 +673,15 @@ mod tests {
     }
 
     impl AccountWarmer for NoNetwork {
-        fn warm(&self, _: String, _: String) -> crate::warmer::WarmFuture {
+        fn warm(&self, _: String, _: String) -> crate::clients::warmer::WarmFuture {
             panic!("a plan probe must not warm an account");
         }
     }
 
     impl PlanProber for NoNetwork {
-        fn plan(&self, _: String) -> crate::probe::PlanFuture {
+        fn plan(&self, _: String) -> crate::records::probe::PlanFuture {
             Box::pin(async {
-                crate::probe::Plan {
+                crate::records::probe::Plan {
                     organization_type: Some("claude_team".into()),
                     ..Default::default()
                 }
@@ -680,7 +689,7 @@ mod tests {
         }
     }
 
-    async fn assert_plan_persistence_does_not_block(provider: crate::provider::Provider) {
+    async fn assert_plan_persistence_does_not_block(provider: crate::base::provider::Provider) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let mut account = serde_json::json!({
@@ -693,8 +702,8 @@ mod tests {
             "priority": 0,
         });
         let expected_plan = match provider {
-            crate::provider::Provider::Anthropic => "claude_team",
-            crate::provider::Provider::Codex => {
+            crate::base::provider::Provider::Anthropic => "claude_team",
+            crate::base::provider::Provider::Codex => {
                 account["organizationType"] = serde_json::json!("plus");
                 account["accountUuid"] = serde_json::json!("11111111-1111-4111-8111-111111111111");
                 "pro"
@@ -753,11 +762,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn codex_plan_persistence_does_not_block_the_async_runtime() {
-        assert_plan_persistence_does_not_block(crate::provider::Provider::Codex).await;
+        assert_plan_persistence_does_not_block(crate::base::provider::Provider::Codex).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn profile_plan_persistence_does_not_block_the_async_runtime() {
-        assert_plan_persistence_does_not_block(crate::provider::Provider::Anthropic).await;
+        assert_plan_persistence_does_not_block(crate::base::provider::Provider::Anthropic).await;
     }
 }

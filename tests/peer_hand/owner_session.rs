@@ -88,7 +88,7 @@ async fn owner_lending_expiring(
             .expect("0600 on the peers file");
     }
 
-    let config: tcr::config::Config = serde_json::from_str(&format!(
+    let config: tcr::base::config::Config = serde_json::from_str(&format!(
         r#"{{
             "proxy": {{ "port": 0 }},
             "upstream": "http://127.0.0.1:1",

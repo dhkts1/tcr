@@ -29,7 +29,7 @@ async fn sse_usage_sums_cache_tokens_across_split_chunks() {
     } = parse_sse_usage(
         futures::stream::iter(chunks),
         Provider::Anthropic,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await;
     assert_eq!(
@@ -69,7 +69,7 @@ async fn sse_usage_takes_final_output_not_sum() {
     } = parse_sse_usage(
         stream,
         Provider::Anthropic,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await;
     assert_eq!(
@@ -106,7 +106,7 @@ async fn sse_stream_with_non_message_events_records_no_stream_error() {
     } = parse_sse_usage(
         stream,
         Provider::Anthropic,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await;
     assert_eq!(parsed, ParsedUsage::default());
@@ -140,7 +140,7 @@ async fn sse_stream_severed_before_any_event_records_truncation() {
     } = parse_sse_usage(
         stream,
         Provider::Anthropic,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await;
     assert_eq!(parsed, ParsedUsage::default());
@@ -185,7 +185,7 @@ async fn sse_stream_with_malformed_utf8_after_message_start_records_truncation()
     } = parse_sse_usage(
         futures::stream::iter(chunks),
         Provider::Anthropic,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await;
     assert_eq!(
@@ -230,7 +230,7 @@ async fn sse_tool_use_is_reassembled_from_its_input_json_deltas() {
     } = parse_sse_usage(
         stream,
         Provider::Anthropic,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await;
     assert_eq!(stream_error, None);
@@ -245,7 +245,7 @@ async fn sse_tool_use_is_reassembled_from_its_input_json_deltas() {
     );
     assert_eq!(
         tool_uses[0].command_class,
-        Some(crate::session_wire::CommandClass::Search)
+        Some(crate::records::session_wire::CommandClass::Search)
     );
 }
 
@@ -269,7 +269,7 @@ async fn an_unfinished_tool_use_block_is_not_reported_as_running() {
     } = parse_sse_usage(
         stream,
         Provider::Anthropic,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await;
     assert_eq!(
@@ -306,7 +306,7 @@ async fn only_tool_use_blocks_are_collected_and_each_index_keeps_its_own() {
     let SseParse { tool_uses, .. } = parse_sse_usage(
         stream,
         Provider::Anthropic,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await;
     let heads: Vec<(&str, Option<&str>)> = tool_uses
@@ -353,7 +353,7 @@ async fn a_server_tool_use_block_is_collected_by_id_and_is_not_a_client_tool() {
     } = parse_sse_usage(
         stream,
         Provider::Anthropic,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await;
     assert_eq!(
@@ -397,7 +397,7 @@ async fn a_thinking_signature_is_assembled_from_its_deltas() {
     } = parse_sse_usage(
         stream,
         Provider::Anthropic,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await;
     assert_eq!(
@@ -439,7 +439,7 @@ async fn a_truncated_stream_reports_the_whole_tokens_and_not_a_half_signature() 
     } = parse_sse_usage(
         stream,
         Provider::Anthropic,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await;
     assert_eq!(stream_error.as_deref(), Some(TRUNCATED_STREAM_ERROR_KIND));
@@ -524,7 +524,7 @@ async fn a_codex_sse_stream_is_tee_d_into_the_ledger_shape() {
     let parsed = parse_sse_usage(
         stream,
         Provider::Codex,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await;
     assert_eq!(parsed.usage.input_total, 1200);
@@ -543,7 +543,7 @@ async fn parse_codex_stream(text: impl Into<Bytes>) -> SseParse {
     parse_sse_usage(
         stream,
         Provider::Codex,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await
 }
@@ -589,12 +589,12 @@ async fn a_codex_function_call_starts_a_running_tool_with_its_timeout() {
     let parsed = parse_codex_stream(STREAM).await;
     assert_eq!(
         parsed.codex_tool_calls,
-        vec![crate::session_wire::CodexToolCall {
-            event: crate::session_wire::ToolUseEvent {
+        vec![crate::records::session_wire::CodexToolCall {
+            event: crate::records::session_wire::ToolUseEvent {
                 id: "call_1".to_string(),
                 name: Some("exec_command".to_string()),
                 command_head: Some("cargo build".to_string()),
-                command_class: Some(crate::session_wire::CommandClass::Build),
+                command_class: Some(crate::records::session_wire::CommandClass::Build),
             },
             timeout_seconds: Some(120),
         }]
@@ -607,7 +607,7 @@ async fn a_codex_function_call_starts_a_running_tool_with_its_timeout() {
     let (status, body) = drive(
         Arc::clone(&manager),
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -674,7 +674,7 @@ async fn a_codex_local_shell_call_is_a_shell_command() {
             "\n\n",
         ))
         .await;
-    use crate::session_wire::CommandClass;
+    use crate::records::session_wire::CommandClass;
     // (call id, tool, head, class, timeout)
     type Call<'a> = (
         &'a str,
@@ -746,7 +746,7 @@ async fn anthropic_tool_parsing_is_unchanged() {
     let parsed = parse_sse_usage(
         stream,
         Provider::Anthropic,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
     )
     .await;
     assert!(
@@ -782,12 +782,12 @@ async fn the_codex_session_id_header_names_the_wire_session() {
     };
     for (path, headers, body) in [
         (
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             codex("  s-1  "),
             r#"{"input":[]}"#,
         ),
         (
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             codex("   "),
             r#"{"input":[]}"#,
         ),
@@ -856,12 +856,12 @@ async fn a_codex_request_tcr_answers_itself_closes_no_call() {
     manager.record_codex_wire_session_calls(
         Some("sess-held"),
         started,
-        &[crate::session_wire::CodexToolCall {
-            event: crate::session_wire::ToolUseEvent {
+        &[crate::records::session_wire::CodexToolCall {
+            event: crate::records::session_wire::ToolUseEvent {
                 id: "call_1".to_string(),
                 name: Some("exec_command".to_string()),
                 command_head: Some("cargo test".to_string()),
-                command_class: Some(crate::session_wire::CommandClass::Build),
+                command_class: Some(crate::records::session_wire::CommandClass::Build),
             },
             timeout_seconds: None,
         }],
@@ -871,7 +871,7 @@ async fn a_codex_request_tcr_answers_itself_closes_no_call() {
         let (status, body) = drive(
             Arc::clone(&manager),
             Method::POST,
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             Some(loopback_peer()),
             &[
                 ("authorization", "Bearer client-own"),
@@ -1129,7 +1129,9 @@ fn reference_usage_from_json(bytes: &[u8]) -> ParsedUsage {
     }
 }
 
-fn reference_response_tool_uses_from_json(bytes: &[u8]) -> Vec<crate::session_wire::ToolUseEvent> {
+fn reference_response_tool_uses_from_json(
+    bytes: &[u8],
+) -> Vec<crate::records::session_wire::ToolUseEvent> {
     let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
         return Vec::new();
     };
@@ -1143,10 +1145,10 @@ fn reference_response_tool_uses_from_json(bytes: &[u8]) -> Vec<crate::session_wi
                 .and_then(Value::as_str)
                 .is_some_and(|t| t == "tool_use")
         })
-        .take(crate::session_wire::PENDING_TOOL_CAP)
+        .take(crate::records::session_wire::PENDING_TOOL_CAP)
         .filter_map(|b| {
             let id = b.get("id").and_then(Value::as_str)?.to_string();
-            Some(crate::session_wire::tool_use_event_from_block(
+            Some(crate::records::session_wire::tool_use_event_from_block(
                 id,
                 b.get("name").and_then(Value::as_str).map(str::to_string),
                 b.get("input"),
@@ -1183,7 +1185,7 @@ fn reference_response_bound_tokens_from_json(bytes: &[u8]) -> Vec<MintedToken> {
         if let Some(minted) = minted {
             tokens.push(minted);
         }
-        if tokens.len() >= crate::session_wire::BOUND_TOKEN_SCAN_CAP {
+        if tokens.len() >= crate::records::session_wire::BOUND_TOKEN_SCAN_CAP {
             break;
         }
     }

@@ -13,7 +13,7 @@
 //! `127.0.0.1:3456`. Every state file is a fresh temp file this test writes
 //! and cleans up itself.
 
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 use tcr::peer::ask::{self, Ask, PendingAsk};
 use tcr::peer::config::join_key::JoinToken;
 use tcr::peer::noise;

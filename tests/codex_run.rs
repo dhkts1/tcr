@@ -26,7 +26,10 @@ impl Fixture {
         let port = listener.local_addr().unwrap().port();
         assert_ne!(port, 3456);
         listener.set_nonblocking(true).unwrap();
-        let config = home.path().join(".config").join(tcr::paths::CONFIG_FILE);
+        let config = home
+            .path()
+            .join(".config")
+            .join(tcr::base::paths::CONFIG_FILE);
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::create_dir_all(home.path().join(".codex")).unwrap();
         std::fs::write(

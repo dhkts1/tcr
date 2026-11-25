@@ -1,14 +1,14 @@
-//! Confirmed Claude banked-reset claims ([`crate::claude_resets`]). The usage probe reads the
+//! Confirmed Claude banked-reset claims ([`crate::records::claude_resets`]). The usage probe reads the
 //! bank; nothing here runs unless an operator confirmed one reset of one account.
 //!
 //! The shape is [`super::codex`]'s: the account's usage gate, an owner recheck after
 //! every await, one 90 s deadline, a usage read afterwards so the bars drop at once, one INFO
 //! line per attempt naming the account by its tcr index only, and fixed reasons, never the
 //! provider's body or a token.
-use crate::claude_resets::PickError;
+use crate::base::provider::Provider;
 use crate::manager::freshness::probing::BoundAccount;
 use crate::manager::*;
-use crate::provider::Provider;
+use crate::records::claude_resets::PickError;
 use std::time::Duration;
 use tcr_status_wire::ResetKind;
 use tokio::time::{Instant, timeout_at};
@@ -117,7 +117,7 @@ impl ClaimFailure {
     fn transport(reason: ClaudeResetError, error: reqwest::Error) -> Self {
         Self::because(
             reason,
-            crate::codex_probe::error_chain(&error.without_url()),
+            crate::records::codex_probe::error_chain(&error.without_url()),
         )
     }
 }
@@ -143,7 +143,7 @@ fn outcome_of(result: &str) -> Option<ClaudeResetOutcome> {
 
 impl Manager {
     /// The only path that spends a Claude banked reset. The caller must have confirmed
-    /// operator input. `kind` picks the grant ([`crate::claude_resets::ClaudeResetBank::pick`]);
+    /// operator input. `kind` picks the grant ([`crate::records::claude_resets::ClaudeResetBank::pick`]);
     /// `key` is the attempt's idempotency key, sent as the claim's `request_id`, so a retry
     /// of one attempt can never spend two resets.
     pub async fn reset_claude(
@@ -192,7 +192,7 @@ impl Manager {
         key: &str,
         index: &mut Option<usize>,
     ) -> Result<ClaudeResetResponse, ClaimFailure> {
-        if !crate::claude_resets::valid_request_id(key) {
+        if !crate::records::claude_resets::valid_request_id(key) {
             return Err(ClaudeResetError::Failed.into());
         }
         let deadline = Instant::now() + Duration::from_secs(90);
@@ -200,13 +200,13 @@ impl Manager {
             let (idx, org) = {
                 let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                 let idx = match target.resolve(&accounts) {
-                    crate::identity::Match::None => {
+                    crate::base::identity::Match::None => {
                         return Err(ClaimFailure::from(ClaudeResetError::Missing));
                     }
-                    crate::identity::Match::Ambiguous(_) => {
+                    crate::base::identity::Match::Ambiguous(_) => {
                         return Err(ClaimFailure::from(ClaudeResetError::Ambiguous));
                     }
-                    crate::identity::Match::One(idx) => idx,
+                    crate::base::identity::Match::One(idx) => idx,
                 };
                 *index = Some(idx);
                 let row = &accounts[idx];
@@ -238,7 +238,7 @@ impl Manager {
                 })?;
                 (grant.id.clone(), grant.reset.kind)
             };
-            let client = crate::http_client::builder()
+            let client = crate::base::http_client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(10))
@@ -249,7 +249,7 @@ impl Manager {
                 self.upstream_for(Provider::Anthropic).trim_end_matches('/')
             );
             let body = serde_json::json!({
-                "program": crate::claude_resets::PROGRAM,
+                "program": crate::records::claude_resets::PROGRAM,
                 "grant_id": grant_id,
                 "request_id": key,
             });
@@ -261,10 +261,10 @@ impl Manager {
                 let response = client
                     .post(&url)
                     .bearer_auth(token)
-                    .header("anthropic-beta", crate::probe::OAUTH_USAGE_BETA)
+                    .header("anthropic-beta", oauth::OAUTH_USAGE_BETA)
                     .header(
                         reqwest::header::USER_AGENT,
-                        crate::probe::CLAUDE_CODE_USER_AGENT,
+                        crate::records::probe::CLAUDE_CODE_USER_AGENT,
                     )
                     .json(&body)
                     .send()
@@ -356,7 +356,7 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Account;
+    use crate::base::config::Account;
     use crate::test_support::stub_upstream as stub;
     use axum::body::to_bytes;
     use axum::extract::Request;
@@ -425,7 +425,7 @@ mod tests {
                 .headers()
                 .get("user-agent")
                 .and_then(|v| v.to_str().ok())
-                == Some(crate::probe::CLAUDE_CODE_USER_AGENT);
+                == Some(crate::records::probe::CLAUDE_CODE_USER_AGENT);
             if req.uri().path() == "/api/oauth/usage" {
                 self.reads.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(req.uri().query(), Some("cedar_ember=1"));
@@ -448,7 +448,7 @@ mod tests {
                     .headers()
                     .get("anthropic-beta")
                     .and_then(|v| v.to_str().ok())
-                    == Some(crate::probe::OAUTH_USAGE_BETA);
+                    == Some(oauth::OAUTH_USAGE_BETA);
                 let body: serde_json::Value =
                     serde_json::from_slice(&to_bytes(req.into_body(), 8192).await.unwrap())
                         .unwrap();
@@ -496,8 +496,8 @@ mod tests {
 
     struct NoPlan;
     impl PlanProber for NoPlan {
-        fn plan(&self, _: String) -> crate::probe::PlanFuture {
-            Box::pin(async { crate::probe::Plan::default() })
+        fn plan(&self, _: String) -> crate::records::probe::PlanFuture {
+            Box::pin(async { crate::records::probe::Plan::default() })
         }
     }
 
@@ -529,10 +529,10 @@ mod tests {
         manager.probe_all().await;
         assert_eq!(selected(&manager), Some(0));
         let snapshot = manager.snapshot(OffsetDateTime::now_utc());
-        let urgency = crate::schedule::ProbeUrgency::of(&snapshot.accounts[0]);
-        assert!(crate::schedule::probe_interval_secs(300, urgency, 10) > 0);
-        let mut schedule = crate::schedule::FleetSchedule::capped(1);
-        let mut rng = crate::schedule::Rng::from_clock();
+        let urgency = freshness::schedule::ProbeUrgency::of(&snapshot.accounts[0]);
+        assert!(freshness::schedule::probe_interval_secs(300, urgency, 10) > 0);
+        let mut schedule = freshness::schedule::FleetSchedule::capped(1);
+        let mut rng = freshness::schedule::Rng::from_clock();
         schedule.sync(crate::now_ms(), &[0], 300, &mut rng);
         for idx in schedule.due(crate::now_ms() + 600_000) {
             manager.probe_account(idx).await;

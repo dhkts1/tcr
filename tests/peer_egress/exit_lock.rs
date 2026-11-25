@@ -14,7 +14,7 @@ use super::*;
 /// skipped it.
 fn pinned_account(peer: &PeerId, strict: bool) -> Account {
     Account {
-        egress: tcr::config::Egress::Via(*peer),
+        egress: tcr::base::config::Egress::Via(*peer),
         egress_strict: strict,
         ..fake_account()
     }
@@ -63,7 +63,7 @@ fn local_exit(listener: TcpListener) -> Arc<std::sync::atomic::AtomicUsize> {
 /// is WHICH process opened the connection to the origin, which is the whole of
 /// the exit lock. A completed 200 through the production carry cannot be
 /// observed in this process at all, and the reason is structural rather than an
-/// omission: `send_through` builds its client with `tcr::http_client::builder`,
+/// omission: `send_through` builds its client with `tcr::base::http_client::builder`,
 /// which carries the bundled webpki roots, so there is no root store a
 /// test can add a fixture CA to and no `SSL_CERT_FILE` that would be read. The
 /// body half of a carry is already measured, against a real TLS origin, by
@@ -101,7 +101,7 @@ fn attempt<'a>(
         )),
         peers_path: peers,
         session_key: None,
-        session_kind: tcr::stats::SessionKind::Fallback,
+        session_kind: tcr::records::stats::SessionKind::Fallback,
         wire_session_id: None,
         model: None,
         tool_uses: &[],
@@ -515,7 +515,10 @@ fn a_pin_that_is_neither_spelling_fails_the_config_load() {
     let peer = node().id;
     let good = serde_json::from_str::<Config>(&account(&format!("via {}", peer.to_wire())))
         .expect("the `via ` spelling is the one that loads");
-    assert_eq!(good.accounts[0].egress, tcr::config::Egress::Via(peer));
+    assert_eq!(
+        good.accounts[0].egress,
+        tcr::base::config::Egress::Via(peer)
+    );
     assert!(
         !good.accounts[0].egress_strict,
         "an absent `egressStrict` is not strict"
@@ -535,7 +538,7 @@ fn an_account_round_trips_the_exit_lock_it_was_written_with() {
     let peer = node().id;
 
     let plain = fake_account();
-    assert_eq!(plain.egress_pin(), tcr::config::EgressPin::default());
+    assert_eq!(plain.egress_pin(), tcr::base::config::EgressPin::default());
     assert!(plain.egress_pin().egress.is_local());
 
     let pinned = pinned_account(&peer, true);
@@ -594,7 +597,7 @@ fn an_unpinned_account_writes_no_egress_keys() {
     let back: Account = serde_json::from_str(&plain).expect("the keyless form reads back");
     assert_eq!(
         back.egress_pin(),
-        tcr::config::EgressPin::default(),
+        tcr::base::config::EgressPin::default(),
         "and absent reads as the default it stood for, which is the whole of the round trip"
     );
 }
@@ -719,12 +722,12 @@ async fn codex_pinned_account_is_never_carried() {
         let manager = fleet_with(
             &format!("https://{ORIGIN}"),
             vec![Account {
-                provider: tcr::provider::Provider::Codex,
+                provider: tcr::base::provider::Provider::Codex,
                 ..pinned_account(&gateway.id, strict)
             }],
         );
         let answer = egress::pinned_egress(egress::PinnedAttempt {
-            path_and_query: tcr::provider::CODEX_RESPONSES_PATH,
+            path_and_query: tcr::base::provider::CODEX_RESPONSES_PATH,
             ..attempt(&manager, &axum::http::Method::POST, &peers)
         })
         .await;

@@ -32,7 +32,7 @@
 //!   without these, a test would run the developer's own `tcr`.
 //!
 //! The fixture's JWTs are put together at run time from a header and a payload, as the unit tests
-//! in `src/oauth/codex.rs` put theirs together: the dotted form written out whole is what a secret
+//! in `src/clients/oauth/codex.rs` put theirs together: the dotted form written out whole is what a secret
 //! scanner's JWT rule matches.
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -81,7 +81,10 @@ fn scratch_home_answering(
     answer: &'static str,
 ) -> (tempfile::TempDir, PathBuf, Arc<AtomicUsize>) {
     let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
-    let config = home.path().join(".config").join(tcr::paths::CONFIG_FILE);
+    let config = home
+        .path()
+        .join(".config")
+        .join(tcr::base::paths::CONFIG_FILE);
     std::fs::create_dir_all(config.parent().expect("the config has a parent"))
         .expect("creating the scratch .config dir");
     let (upstream, answered) = spawn_codex_upstream(answer);
@@ -675,8 +678,8 @@ fn from_codex_non_interactive_emits_saved_notice_and_error() {
     );
     let consequence = format!(
         "{} {}",
-        tcr::login::CODEX_IMPORT_CONSEQUENCE,
-        tcr::login::CODEX_IMPORT_OLDER_PROXY
+        tcr::verbs::login::CODEX_IMPORT_CONSEQUENCE,
+        tcr::verbs::login::CODEX_IMPORT_OLDER_PROXY
     );
     assert_eq!(
         events(&out),
@@ -684,7 +687,7 @@ fn from_codex_non_interactive_emits_saved_notice_and_error() {
             serde_json::json!({"event": "notice", "text": consequence}),
             serde_json::json!({
                 "event": "notice",
-                "text": tcr::login::CODEX_FIRST_ACCOUNT_NOTICE
+                "text": tcr::verbs::login::CODEX_FIRST_ACCOUNT_NOTICE
             }),
             serde_json::json!({
                 "account": "alice@example.com",

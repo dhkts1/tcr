@@ -80,7 +80,7 @@
 //! 1. wire crate and the node key: [`config::id`], `tcr_peer_wire`
 //! 2. Noise, enrolment, the pin check: [`noise`], [`listener`], [`pair`]
 //! 3. discovery: [`discovery`]
-//! 4. the lease and SERVE: [`lease`], [`serve`], `crate::fallback`
+//! 4. the lease and SERVE: [`lease`], [`serve`], `crate::peer::serve::fallback`
 //! 5. the Peers tab (Swift)
 //! 6. blind egress: [`tunnel`], [`tunnel::egress`]
 //! 7. chains, deferred until a third machine exists

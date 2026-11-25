@@ -106,7 +106,7 @@ mod reset_urgency_tests;
 /// pure predicates) across the three tiers the fix adds: predicted-near is
 /// still eligible normally, predicted-over-but-not-rejected is skipped on the
 /// first two passes and usable as a last resort, and genuinely-rejected
-/// (`>= 1.0`, the only value [`crate::quota::Quota::reject_model_weekly`]
+/// (`>= 1.0`, the only value [`crate::records::quota::Quota::reject_model_weekly`]
 /// writes) is never picked.
 #[cfg(test)]
 mod fable_last_resort_tests;

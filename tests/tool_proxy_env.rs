@@ -10,7 +10,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 struct StatusStub {
     listener: TcpListener,
@@ -115,7 +115,7 @@ fn claude_shells_go_direct_and_nested_codex_regains_the_pool() {
     let tls_dir = home.join(".config");
     std::fs::create_dir_all(&tls_dir).unwrap();
     std::fs::create_dir(home.join("codex-home")).unwrap();
-    tcr::tls::load_tls_in(&tls_dir).unwrap();
+    tcr::base::tls::load_tls_in(&tls_dir).unwrap();
     let claude = home.join("real claude");
     let codex = home.join("real codex");
     script(
@@ -205,7 +205,7 @@ impl AgentFixture {
         let port = status.listener.local_addr().unwrap().port();
         std::fs::write(home.path().join("config.json"), format!(r#"{{"proxy":{{"port":{port},"requestKey":"fixture-key-one"}},"claudeCodeImport":false,"accounts":[{{"name":"alice@example.com","accessToken":"fixture"}}]}}"#)).unwrap();
         std::fs::create_dir_all(home.path().join(".config")).unwrap();
-        tcr::tls::load_tls_in(&home.path().join(".config")).unwrap();
+        tcr::base::tls::load_tls_in(&home.path().join(".config")).unwrap();
         Self {
             home,
             _status: status,

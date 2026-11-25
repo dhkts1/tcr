@@ -109,7 +109,7 @@ impl super::DeviceFactory for LibraryFactory {
         // calls `ClientConfig::builder()`, which panics unless a default
         // is installed. Installed here, the one place a device is built,
         // so no order of calls elsewhere can get ahead of it.
-        crate::http_client::install_crypto_provider();
+        crate::base::http_client::install_crypto_provider();
         let key_state = persist_state(keys)?;
         let config = tailscale::Config {
             key_state,

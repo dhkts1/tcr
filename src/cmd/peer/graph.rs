@@ -3,11 +3,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use tcr::cli;
-use tcr::config;
+use tcr::base::config;
 use tcr::peer;
 use tcr::peer::status::graph::{GraphEdgeDetail, GraphRole, peer_graph_block};
 use tcr::proxy;
+use tcr::verbs::cli;
 
 use super::peer_cli;
 

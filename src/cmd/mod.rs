@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use tcr::config;
+use tcr::base::config;
 
 pub(crate) mod peer;
 pub(crate) mod run;

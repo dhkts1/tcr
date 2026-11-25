@@ -12,12 +12,12 @@ use axum::Router;
 use axum::body::Body;
 use axum::response::Response;
 use axum::routing::any;
-use tcr::config::{Account, Config, ProxyConfig, ThrottleConfig};
-use tcr::log_err::LogErr as _;
+use tcr::base::config::{Account, Config, ProxyConfig, ThrottleConfig};
+use tcr::base::log_err::LogErr as _;
+use tcr::clients::oauth::{OAuthError, RefreshFuture, TokenRefresher};
+use tcr::clients::warmer::{AccountWarmer, WarmError, WarmFuture};
 use tcr::manager::Manager;
-use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
-use tcr::probe::{ProbeError, ProbeFuture, UsageProber};
-use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
+use tcr::records::probe::{ProbeError, ProbeFuture, UsageProber};
 
 /// The canned body the fake upstream answers with. A relayed request that
 /// reached a real account comes back as exactly these bytes.
@@ -49,13 +49,17 @@ async fn drain(req: axum::extract::Request) {
 
 struct NeverRefreshes;
 impl TokenRefresher for NeverRefreshes {
-    fn refresh(&self, _provider: tcr::provider::Provider, _refresh_token: String) -> RefreshFuture {
+    fn refresh(
+        &self,
+        _provider: tcr::base::provider::Provider,
+        _refresh_token: String,
+    ) -> RefreshFuture {
         Box::pin(async { Err(OAuthError::Transient("no refresher in lease tests".into())) })
     }
 }
 struct NeverProbes;
 impl UsageProber for NeverProbes {
-    fn probe(&self, _credential: tcr::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, _credential: tcr::records::probe::ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Err(ProbeError {
                 status: None,
@@ -121,7 +125,7 @@ pub(crate) fn codex_lending_manager(upstream: &str) -> Arc<Manager> {
     let mut config = config(
         upstream,
         vec![Account {
-            provider: tcr::provider::Provider::Codex,
+            provider: tcr::base::provider::Provider::Codex,
             ..account()
         }],
         ThrottleConfig::default(),
@@ -360,7 +364,7 @@ pub(crate) async fn spawn_proxy(manager: Arc<Manager>) -> String {
         .expect("bind the proxy");
     let addr = listener.local_addr().expect("proxy addr");
     tokio::spawn(async move {
-        tcr::mitm::serve(listener, manager, None).await;
+        tcr::proxy::mitm::serve(listener, manager, None).await;
     });
     format!("http://{addr}")
 }

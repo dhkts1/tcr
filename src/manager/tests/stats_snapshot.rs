@@ -23,7 +23,7 @@ fn account_uuid_accessor_returns_configured_value() {
 /// as a `quota_state` (`NearLimit` / Exhausted) while `status` remains "active".
 #[test]
 fn near_and_over_quota_render_active_with_honest_quota_state() {
-    use crate::stats::QuotaState;
+    use crate::records::stats::QuotaState;
 
     let manager = manager_of(vec![account("near", 0), account("full", 0)]);
     let now = OffsetDateTime::now_utc();
@@ -53,7 +53,7 @@ fn near_and_over_quota_render_active_with_honest_quota_state() {
 /// 0.96 → `NearLimit` (held, credential fine); 1.00 → Exhausted (fully spent).
 #[test]
 fn default_threshold_raise_gives_92pct_headroom_normal_near_full() {
-    use crate::stats::QuotaState;
+    use crate::records::stats::QuotaState;
 
     // The default the shipped config applies when `switchThreshold` is absent.
     let default_threshold = serde_json::from_str::<Config>(r#"{ "accounts": [] }"#)

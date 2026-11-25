@@ -3,7 +3,7 @@
 
 use super::*;
 use build_info::StandDownBuild;
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 fn silent() -> live_client::Liveness {
     live_client::Liveness::Silent {

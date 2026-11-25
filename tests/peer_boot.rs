@@ -26,10 +26,10 @@ mod peer_support;
 use std::time::Duration;
 
 use peer_support::CaptureLayer;
-use tcr::config::Config;
+use tcr::base::config::Config;
 use tcr::peer::{config as peer_config, serve as peer_serve};
-use tcr::server::{IncumbentPolicy, ServeOptions, ServeOutcome, TlsSetup, serve};
-use tcr::singleton::ProxyHost;
+use tcr::proxy::server::{IncumbentPolicy, ServeOptions, ServeOutcome, TlsSetup, serve};
+use tcr::stores::singleton::ProxyHost;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// The port `tcr` uses by default. Named so the assertion below says what it is
@@ -210,7 +210,7 @@ async fn a_booted_server_answers_a_knock_and_refuses_the_local_route_on_its_peer
     // The positive control for claim 3: that exact request IS answered, on the
     // proxy's own port. Without it, "zero bytes" could mean the server was
     // never up.
-    let status = tcr::http_client::builder()
+    let status = tcr::base::http_client::builder()
         .no_proxy()
         .build()
         .expect("a loopback client")
@@ -607,8 +607,7 @@ mod lender {
     use axum::http::HeaderMap;
     use axum::response::Response;
     use axum::routing::any;
-    use tcr::fallback::Ask;
-    use tcr::log_err::LogErr as _;
+    use tcr::base::log_err::LogErr as _;
     use tcr::peer::config::id::NodeKey;
     use tcr::peer::config::{
         Allow, ControlGrants, Endpoint, EndpointSource, LendGrant, PeerFile, PeerRow, PeerStore,
@@ -617,6 +616,7 @@ mod lender {
     use tcr::peer::listener::{self, SessionContext};
     use tcr::peer::serve;
     use tcr::peer::serve::LeaseServing;
+    use tcr::peer::serve::fallback::Ask;
     use tcr_peer_wire::{Lease, LeaseUnit, PeerId, Window};
 
     /// The lease id every test in this file spends.
@@ -679,7 +679,7 @@ mod lender {
     /// A manager with ONE fake account, pointed at `upstream`. No real email,
     /// no org uuid, no account uuid: this repository is public.
     fn lending_manager(upstream: &str) -> Arc<tcr::manager::Manager> {
-        let config: tcr::config::Config = serde_json::from_str(&format!(
+        let config: tcr::base::config::Config = serde_json::from_str(&format!(
             r#"{{
                 "proxy": {{ "port": 0 }},
                 "upstream": "{upstream}",
@@ -707,7 +707,7 @@ mod lender {
             .expect("bind the lender's proxy");
         let addr = listening.local_addr().expect("proxy addr");
         tokio::spawn(async move {
-            tcr::mitm::serve(listening, manager, None).await;
+            tcr::proxy::mitm::serve(listening, manager, None).await;
         });
         format!("http://{addr}")
     }
@@ -768,7 +768,7 @@ mod lender {
     /// chosen anyway proves nothing about the restriction. No real email, no
     /// org uuid.
     fn two_group_manager(upstream: &str) -> Arc<tcr::manager::Manager> {
-        let config: tcr::config::Config = serde_json::from_str(&format!(
+        let config: tcr::base::config::Config = serde_json::from_str(&format!(
             r#"{{
                 "proxy": {{ "port": 0 }},
                 "upstream": "{upstream}",
@@ -862,7 +862,7 @@ mod lender {
         // which lands on the first account (`spare-fake`) and pins this session
         // to it. `no_proxy` because this is a loopback call to the lender's own
         // proxy and an operator's `HTTPS_PROXY` must not redirect it.
-        let local = tcr::http_client::builder()
+        let local = tcr::base::http_client::builder()
             .no_proxy()
             .build()
             .expect("the local client builds");

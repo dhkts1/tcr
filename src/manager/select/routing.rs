@@ -152,9 +152,9 @@ impl Manager {
     ) -> RoutingCandidates {
         self.reload_groups_if_changed();
         let groups = self.groups();
-        let provider = crate::provider::Provider::of_path(path);
+        let provider = crate::base::provider::Provider::of_path(path);
         let is_fable =
-            provider.has_fable_bucket() && model.is_some_and(crate::model::is_fable_model);
+            provider.has_fable_bucket() && model.is_some_and(crate::base::model::is_fable_model);
         let unsupported = self.unsupported_exits(provider);
         // Each read under a lock of its own, so before the accounts lock and never nested in
         // it.

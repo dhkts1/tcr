@@ -44,12 +44,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tcr::config::{Account, Config, PacingConfig};
+use tcr::base::config::{Account, Config, PacingConfig};
+use tcr::base::model::is_fable_model;
+use tcr::clients::oauth::{OAuthError, RefreshFuture, TokenRefresher};
+use tcr::clients::warmer::{AccountWarmer, WarmError, WarmFuture};
 use tcr::manager::{InFlightGuard, Manager};
-use tcr::model::is_fable_model;
-use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
-use tcr::probe::{ProbeError, ProbeFuture, Usage, UsageBucket, UsageProber};
-use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
+use tcr::records::probe::{ProbeError, ProbeFuture, Usage, UsageBucket, UsageProber};
 use time::{Duration, OffsetDateTime};
 
 // ---------------------------------------------------------------------------
@@ -112,7 +112,11 @@ const fn pacing(cap: u32) -> PacingConfig {
 /// takes them.
 struct NeverRefreshes;
 impl TokenRefresher for NeverRefreshes {
-    fn refresh(&self, _provider: tcr::provider::Provider, _refresh_token: String) -> RefreshFuture {
+    fn refresh(
+        &self,
+        _provider: tcr::base::provider::Provider,
+        _refresh_token: String,
+    ) -> RefreshFuture {
         Box::pin(async {
             Err(OAuthError::Transient(
                 "no refresher in workload tests".into(),
@@ -123,7 +127,7 @@ impl TokenRefresher for NeverRefreshes {
 
 struct NeverProbes;
 impl UsageProber for NeverProbes {
-    fn probe(&self, _credential: tcr::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, _credential: tcr::records::probe::ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Err(ProbeError {
                 status: None,
@@ -1255,7 +1259,7 @@ fn fixed_epoch_spacing() {
 #[test]
 fn replay_clock_controls_quota_and_holds() {
     let now = t0();
-    let mut quota = tcr::quota::Quota::default();
+    let mut quota = tcr::records::quota::Quota::default();
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "anthropic-ratelimit-unified-5h-utilization",
@@ -1264,7 +1268,7 @@ fn replay_clock_controls_quota_and_holds() {
     assert!(quota.update_from_headers_at(&headers, now));
     assert_eq!(quota.updated_at, Some(now));
     assert_eq!(
-        quota.live_reset(tcr::quota::QuotaBucket::FiveHour, now),
+        quota.live_reset(tcr::records::quota::QuotaBucket::FiveHour, now),
         Some(now + Duration::hours(5))
     );
     quota.apply_usage_at(
@@ -1278,12 +1282,12 @@ fn replay_clock_controls_quota_and_holds() {
         now,
     );
     assert_eq!(
-        quota.live_reset(tcr::quota::QuotaBucket::SevenDay, now),
+        quota.live_reset(tcr::records::quota::QuotaBucket::SevenDay, now),
         Some(now + Duration::days(7))
     );
     quota.reject_model_weekly_at(&reqwest::header::HeaderMap::new(), now);
     assert_eq!(
-        quota.live_reset(tcr::quota::QuotaBucket::SevenDayOi, now),
+        quota.live_reset(tcr::records::quota::QuotaBucket::SevenDayOi, now),
         Some(now + Duration::days(7))
     );
 
@@ -1313,7 +1317,7 @@ fn replay_clock_controls_quota_and_holds() {
 #[test]
 fn replay_clock_controls_codex_holds() {
     let mut a = account("alpha", 0);
-    a.provider = tcr::provider::Provider::Codex;
+    a.provider = tcr::base::provider::Provider::Codex;
     let manager = manager_over(Config::fixture(vec![a]));
     let now = t0();
     let mut headers = reqwest::header::HeaderMap::new();
@@ -1347,8 +1351,8 @@ mod quota_replay {
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, VecDeque};
-    use tcr::provider::Provider;
-    use tcr::usage::UsageRecord;
+    use tcr::base::provider::Provider;
+    use tcr::records::usage::UsageRecord;
 
     const HOUR: i64 = 3_600_000;
     const DAY: i64 = 24 * HOUR;
@@ -1734,7 +1738,7 @@ mod quota_replay {
                     manager.mark_rate_limited_at(idx, 60, now);
                     60
                 } else {
-                    let seconds = tcr::quota::CodexQuotaRefusal::parse(&headers, &[], now)
+                    let seconds = tcr::records::quota::CodexQuotaRefusal::parse(&headers, &[], now)
                         .and_then(|refusal| refusal.reset)
                         .map_or(60, |reset| reset.unix_timestamp() - now.unix_timestamp());
                     manager.mark_codex_quota_limited_at(idx, seconds, now);
@@ -2154,7 +2158,7 @@ mod quota_replay {
                     .filter(|slot| slot.provider == request.provider())
                     .count();
                 let all_rejected = routed.pass.is_none()
-                    && routed.gated.get(&tcr::stats::GateReason::Rejected)
+                    && routed.gated.get(&tcr::records::stats::GateReason::Rejected)
                         == Some(&provider_accounts);
                 if all_rejected {
                     assert_eq!(

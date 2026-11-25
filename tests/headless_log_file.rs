@@ -1,7 +1,7 @@
 //! The durable log file of the BUILT BINARY, run the way TcrBar runs it: `--headless` with stdout
 //! on the null device (`ServerController.swift`, `standardOutput = FileHandle.nullDevice`).
 //!
-//! The file is written by one background thread fed by a queue (`src/file_log.rs`), and that
+//! The file is written by one background thread fed by a queue (`src/stores/file_log.rs`), and that
 //! thread stops, silently, when its guard is dropped. `src/main.rs` holds the guard in
 //! `run_server` for the process's life. This test checks the two ends of that life from outside:
 //!
@@ -21,10 +21,10 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 use tcr::test_support::child::KillOnDrop;
 
-use tcr::paths;
+use tcr::base::paths;
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The shutdown grace is 5 s (`server::DEFAULT_SHUTDOWN_GRACE`); this is "it hung", not "slow".

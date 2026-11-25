@@ -33,10 +33,10 @@ pub struct AccountRuntime {
     /// Which upstream this credential belongs to; copied from `config::Account::provider` at
     /// boot and never changed afterwards. Selection filters on it FIRST (`select::eligible`):
     /// a Claude request and a Codex account have nothing to say to each other.
-    pub provider: crate::provider::Provider,
+    pub provider: crate::base::provider::Provider,
     /// The pooled account's own UUID, injected into the outbound request body's
     /// `metadata.user_id.account_uuid` so it matches the token we serve with
-    /// (see [`crate::account_uuid`]). `None` leaves the body unchanged.
+    /// (see [`crate::records::account_uuid`]). `None` leaves the body unchanged.
     pub account_uuid: Option<String>,
     /// The org this pooled account is scoped to (UUID and name). Part of the
     /// account's identity so token rotation persists to the RIGHT config entry
@@ -264,28 +264,28 @@ pub struct AccountRuntime {
 /// A rotation slot answers a user's account query by the same field a config
 /// record does, so [`Manager::set_disabled_by_query`] can run the CLI's own
 /// resolution rule over the LIVE fleet.
-impl crate::identity::Queryable for AccountRuntime {
+impl crate::base::identity::Queryable for AccountRuntime {
     fn query_name(&self) -> &str {
         &self.name
     }
 }
 
-/// [`crate::identity::match_one`] over the rotation, blind to rows deleted
+/// [`crate::base::identity::match_one`] over the rotation, blind to rows deleted
 /// from the config ([`AccountRuntime::removed`]). A deleted row keeps its slot,
 /// so without this a query could still park, prioritise or promote it, and a
 /// re-login under the same name would read as ambiguous.
 pub(in crate::manager) fn match_listed(
     accounts: &[AccountRuntime],
     query: &str,
-) -> crate::identity::Match {
-    let hits: Vec<usize> = crate::identity::match_accounts(accounts, query)
+) -> crate::base::identity::Match {
+    let hits: Vec<usize> = crate::base::identity::match_accounts(accounts, query)
         .into_iter()
         .filter(|&idx| !accounts[idx].removed)
         .collect();
     match hits.as_slice() {
-        [] => crate::identity::Match::None,
-        [only] => crate::identity::Match::One(*only),
-        many => crate::identity::Match::Ambiguous(
+        [] => crate::base::identity::Match::None,
+        [only] => crate::base::identity::Match::One(*only),
+        many => crate::base::identity::Match::Ambiguous(
             many.iter().map(|&idx| accounts[idx].name.clone()).collect(),
         ),
     }
@@ -301,13 +301,16 @@ pub(crate) enum ResetTarget<'a> {
 }
 
 impl ResetTarget<'_> {
-    pub(in crate::manager) fn resolve(self, accounts: &[AccountRuntime]) -> crate::identity::Match {
+    pub(in crate::manager) fn resolve(
+        self,
+        accounts: &[AccountRuntime],
+    ) -> crate::base::identity::Match {
         match self {
             Self::Name(query) => match_listed(accounts, query),
             Self::Slot(idx) if accounts.get(idx).is_some_and(|row| !row.removed) => {
-                crate::identity::Match::One(idx)
+                crate::base::identity::Match::One(idx)
             }
-            Self::Slot(_) => crate::identity::Match::None,
+            Self::Slot(_) => crate::base::identity::Match::None,
         }
     }
 }

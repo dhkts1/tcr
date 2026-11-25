@@ -711,7 +711,7 @@ async fn the_add_route_echoes_the_provider_it_stored() {
 /// and mutating the live server.
 ///
 /// Driven through the REAL production stack — a real `TcpListener` and
-/// `crate::mitm::serve`, exactly how `main()` invokes it — not a
+/// `crate::proxy::mitm::serve`, exactly how `main()` invokes it — not a
 /// hand-built router, so a change to route registration or middleware
 /// ordering is covered here too, not only by the in-process `oneshot`
 /// tests above. Complements (does not replace) unit 3's own
@@ -728,7 +728,7 @@ async fn probe_add_capabilitys_blank_body_is_a_stamped_400_and_mutates_nothing()
         .expect("bind seam-probe listener");
     let addr = listener.local_addr().expect("listener addr");
     let serving = Arc::clone(&manager);
-    tokio::spawn(async move { crate::mitm::serve(listener, serving, None).await });
+    tokio::spawn(async move { mitm::serve(listener, serving, None).await });
 
     let client = crate::test_support::loopback::client();
     // The EXACT `Account` `login::probe_add_route` builds:

@@ -124,14 +124,14 @@ impl Manager {
 
     /// Attach the fan controller. Once: a second call is refused and logged,
     /// because two controllers would both dial the helper.
-    pub fn install_fan(&self, handle: Arc<crate::fan::FanHandle>) {
+    pub fn install_fan(&self, handle: Arc<crate::stores::fan::FanHandle>) {
         if self.fan.set(handle).is_err() {
             tracing::warn!("a fan controller is already attached; the second one was not");
         }
     }
 
     /// The fan controller, when this process runs one.
-    pub fn fan(&self) -> Option<&Arc<crate::fan::FanHandle>> {
+    pub fn fan(&self) -> Option<&Arc<crate::stores::fan::FanHandle>> {
         self.fan.get()
     }
 
@@ -185,7 +185,7 @@ impl Manager {
                 .current_by_provider
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            crate::stats::CurrentByProvider {
+            crate::records::stats::CurrentByProvider {
                 anthropic: serving.anthropic.and_then(listed_position),
                 codex: serving.codex.and_then(listed_position),
             }
@@ -195,8 +195,12 @@ impl Manager {
             .enumerate()
             .filter(|(_, a)| !a.removed)
             .map(|(idx, a)| {
-                let five_hour = a.quota.effective(crate::quota::QuotaBucket::FiveHour, now);
-                let seven_day = a.quota.effective(crate::quota::QuotaBucket::SevenDay, now);
+                let five_hour = a
+                    .quota
+                    .effective(crate::records::quota::QuotaBucket::FiveHour, now);
+                let seven_day = a
+                    .quota
+                    .effective(crate::records::quota::QuotaBucket::SevenDay, now);
                 // Honest quota state vs this account's OWN threshold (same gating
                 // dims `eligible` uses): the most-spent of the 5-hour and weekly
                 // windows decides near-limit vs exhausted. Status stays "active" —
@@ -206,7 +210,8 @@ impl Manager {
                     .into_iter()
                     .flatten()
                     .reduce(f64::max);
-                let quota_state = crate::stats::QuotaState::from_utilization(gating, threshold);
+                let quota_state =
+                    crate::records::stats::QuotaState::from_utilization(gating, threshold);
                 // Why this account is out and when it clears — the GENERAL
                 // (non-Fable) view: `is_fable = false`, so the model-scoped weekly
                 // never gates a general fleet row (an account spent only on its
@@ -235,7 +240,7 @@ impl Manager {
                 let reserved_groups = groups::carried_in(&a.groups, &groups.reserved);
                 let parked_groups = groups::carried_in(&a.groups, &groups.parked);
                 let control_allowed_groups = groups::carried_in(&a.groups, &groups.control_allowed);
-                let codex = crate::stats::CodexFacts {
+                let codex = crate::records::stats::CodexFacts {
                     auto_reset: self.auto_reset_for(idx, now_ms),
                     ..codex_snapshot_facts(a)
                 };
@@ -243,14 +248,14 @@ impl Manager {
                 // reported, or a week when it reported none. `None` on an Anthropic row, which
                 // therefore never carries the key.
                 let seven_day_span = match a.provider {
-                    crate::provider::Provider::Anthropic => None,
-                    crate::provider::Provider::Codex => a
+                    crate::base::provider::Provider::Anthropic => None,
+                    crate::base::provider::Provider::Codex => a
                         .quota
-                        .live_reset(crate::quota::QuotaBucket::SevenDay, now)
+                        .live_reset(crate::records::quota::QuotaBucket::SevenDay, now)
                         .map(|reset| {
                             let length_ms = codex
                                 .seven_day_window_minutes
-                                .map_or(crate::usage::WEEK_MS, |minutes| {
+                                .map_or(crate::records::usage::WEEK_MS, |minutes| {
                                     i64::from(minutes) * 60_000
                                 });
                             (odt_to_ms(reset), length_ms)
@@ -289,16 +294,20 @@ impl Manager {
                     },
                     disabled: a.disabled,
                     five_hour,
-                    five_hour_reset: a.quota.live_reset(crate::quota::QuotaBucket::FiveHour, now),
+                    five_hour_reset: a
+                        .quota
+                        .live_reset(crate::records::quota::QuotaBucket::FiveHour, now),
                     five_hour_absent_on_plan: a.quota.five_hour_absent_on_plan,
                     seven_day,
-                    seven_day_reset: a.quota.live_reset(crate::quota::QuotaBucket::SevenDay, now),
+                    seven_day_reset: a
+                        .quota
+                        .live_reset(crate::records::quota::QuotaBucket::SevenDay, now),
                     seven_day_oi: a
                         .quota
-                        .effective(crate::quota::QuotaBucket::SevenDayOi, now),
+                        .effective(crate::records::quota::QuotaBucket::SevenDayOi, now),
                     seven_day_oi_reset: a
                         .quota
-                        .live_reset(crate::quota::QuotaBucket::SevenDayOi, now),
+                        .live_reset(crate::records::quota::QuotaBucket::SevenDayOi, now),
                     requests: a.requests,
                     input_tokens: a.input_tokens,
                     output_tokens: a.output_tokens,
@@ -343,7 +352,7 @@ impl Manager {
                             idx,
                             now_ms,
                             a.quota
-                                .live_reset(crate::quota::QuotaBucket::FiveHour, now)
+                                .live_reset(crate::records::quota::QuotaBucket::FiveHour, now)
                                 .map(odt_to_ms),
                             seven_day_span,
                         ),
@@ -422,11 +431,11 @@ impl Manager {
 /// row itself, why its login is dead and the folder it was imported from.
 ///
 /// An Anthropic row keeps the defaults, whatever its quota holds, so its wire row gains no key.
-fn codex_snapshot_facts(a: &AccountRuntime) -> crate::stats::CodexFacts {
+fn codex_snapshot_facts(a: &AccountRuntime) -> crate::records::stats::CodexFacts {
     let quota_facts = a.quota.wire_facts(a.provider);
     match a.provider {
-        crate::provider::Provider::Anthropic => quota_facts,
-        crate::provider::Provider::Codex => crate::stats::CodexFacts {
+        crate::base::provider::Provider::Anthropic => quota_facts,
+        crate::base::provider::Provider::Codex => crate::records::stats::CodexFacts {
             login_error: a.login_error.clone(),
             codex_home: a.codex_home.clone(),
             token_sync_pending: a.pending_codex_writeback.is_some(),
@@ -446,7 +455,7 @@ mod tests {
         );
         account
             .quota
-            .apply_usage(&crate::codex_probe::usage_from_payload(
+            .apply_usage(&crate::records::codex_probe::usage_from_payload(
                 &serde_json::json!({
                     "rate_limit": null,
                     "rate_limit_reset_credits": {"available_count": 3}
@@ -475,7 +484,7 @@ mod tests {
     /// One turn on account `idx` for a Codex model id. The account, not the model id, decides
     /// the record's provider.
     fn spend(manager: &Manager, idx: usize, ts_ms: i64, reasoning: u64) {
-        let mut record = crate::usage::UsageRecord::from_quota_input(
+        let mut record = crate::records::usage::UsageRecord::from_quota_input(
             ts_ms,
             Some("gpt-5.1-codex".to_string()),
             None,
@@ -500,7 +509,7 @@ mod tests {
         let now_ms = odt_to_ms(now);
         let day = 86_400_000;
         let mut alice = runtime(r#"{"name":"alice@example.com","accessToken":"at-alice"}"#);
-        alice.quota.seven_day = Some(crate::quota::QuotaWindow {
+        alice.quota.seven_day = Some(crate::records::quota::QuotaWindow {
             utilization: 0.2,
             reset: Some(now + time::Duration::days(2)),
         });
@@ -511,7 +520,7 @@ mod tests {
             r#"{"name":"carol@example.com/codex","provider":"codex","accountUuid":"33333333-3333-4333-8333-333333333333","accessToken":"at-carol"}"#,
         );
         let carol_reset = now + time::Duration::days(2);
-        carol.quota.seven_day = Some(crate::quota::QuotaWindow {
+        carol.quota.seven_day = Some(crate::records::quota::QuotaWindow {
             utilization: 0.4,
             reset: Some(carol_reset),
         });
@@ -562,7 +571,7 @@ mod tests {
             .expect("a Codex row with a weekly reset");
         assert_eq!(
             carol_week.since,
-            odt_to_ms(carol_reset) - crate::usage::WEEK_MS,
+            odt_to_ms(carol_reset) - crate::records::usage::WEEK_MS,
             "seven days by default"
         );
         assert_eq!(carol_week.totals.requests, 1);
@@ -591,7 +600,7 @@ mod tests {
         let mut bob = runtime(
             r#"{"name":"bob@example.com/codex","provider":"codex","accountUuid":"22222222-2222-4222-8222-222222222222","accessToken":"at-bob"}"#,
         );
-        bob.quota.seven_day = Some(crate::quota::QuotaWindow {
+        bob.quota.seven_day = Some(crate::records::quota::QuotaWindow {
             utilization: 0.4,
             reset: Some(now + time::Duration::days(2)),
         });

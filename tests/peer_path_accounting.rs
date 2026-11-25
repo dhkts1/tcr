@@ -34,7 +34,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 use tcr::peer::config::{
     self, Allow, Endpoint, EndpointSource, Locator, PeerFile, PeerRow, PeerStore,

@@ -105,8 +105,8 @@ impl Manager {
             // target: warming it would hand its bearer to the wrong provider. A `match`, so a
             // third provider decides here instead of inheriting an answer.
             .filter(|(_, a)| match a.provider {
-                crate::provider::Provider::Anthropic => true,
-                crate::provider::Provider::Codex => false,
+                crate::base::provider::Provider::Anthropic => true,
+                crate::base::provider::Provider::Codex => false,
             })
             .filter(|(_, a)| {
                 a.account_type.is_oauth()
@@ -122,7 +122,7 @@ impl Manager {
                         || a.quota_known
                         || a.consecutive_probe_failures >= PROBE_FAILURES_BEFORE_WARMING_UNPROBED)
                     // A live future 5h reset means the session window is already running.
-                    && a.quota.live_reset(crate::quota::QuotaBucket::FiveHour, now).is_none()
+                    && a.quota.live_reset(crate::records::quota::QuotaBucket::FiveHour, now).is_none()
                     // A plan with no 5h window has nothing to start; a warm would only spend weekly quota.
                     && !a.quota.five_hour_absent_on_plan
                     // Warming an at/over-threshold account is wasted spend.
@@ -254,7 +254,7 @@ impl Manager {
 
     /// Warm ONE account, if it is still eligible at this instant.
     ///
-    /// The per-account entry point [`crate::schedule`] drives, and the
+    /// The per-account entry point [`crate::manager::freshness::schedule`] drives, and the
     /// re-checking is the point: an account's due instant was drawn up to a whole
     /// cadence ago, and in between it may have started serving traffic (live 5h
     /// window), crossed its threshold, or been disabled — all of which
@@ -273,7 +273,7 @@ impl Manager {
         self.warm_account(idx).await;
     }
 
-    /// Warm every eligible idle account once, SEQUENTIALLY with [`crate::probe::PROBE_SPACING`]
+    /// Warm every eligible idle account once, SEQUENTIALLY with [`crate::records::probe::PROBE_SPACING`]
     /// between calls (mirrors the spaced probe sweep). Overlapping sweeps are
     /// skipped via [`Self::warm_in_flight`] so two timers never double-warm.
     ///
@@ -294,7 +294,7 @@ impl Manager {
         for (i, idx) in idxs.into_iter().enumerate() {
             self.warm_account(idx).await;
             if i < last {
-                tokio::time::sleep(crate::probe::PROBE_SPACING).await;
+                tokio::time::sleep(crate::records::probe::PROBE_SPACING).await;
             }
         }
     }

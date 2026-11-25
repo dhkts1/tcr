@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tcr::config::Config;
+use tcr::base::config::Config;
 use tcr::manager::Manager;
 use tcr::proxy::ClientAddr;
 use tower::ServiceExt as _;
@@ -209,7 +209,7 @@ async fn codex_upgrade_426_is_logged_at_debug_not_warn() {
     let (status, log) = captured(send(
         manager,
         "GET",
-        tcr::provider::CODEX_RESPONSES_PATH,
+        tcr::base::provider::CODEX_RESPONSES_PATH,
         &[("upgrade", "websocket"), ("connection", "Upgrade")],
         "",
     ))
@@ -243,7 +243,7 @@ async fn codex_request_is_never_offered_to_a_peer_carry() {
     let (status, log) = captured(send(
         codex_only,
         "POST",
-        tcr::provider::CODEX_RESPONSES_PATH,
+        tcr::base::provider::CODEX_RESPONSES_PATH,
         &[("content-type", "application/json")],
         "{}",
     ))

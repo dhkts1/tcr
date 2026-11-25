@@ -81,7 +81,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 use axum::Router;
 use axum::body::Body;
@@ -843,7 +843,7 @@ fn tail(body: &str, lines: usize) -> String {
 
 /// One POST at a proxy, answered or not. Returns (status, body).
 async fn post_messages(proxy: &str) -> (u16, String) {
-    let client = tcr::http_client::builder()
+    let client = tcr::base::http_client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(30))
         .build()

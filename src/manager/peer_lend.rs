@@ -79,7 +79,7 @@ impl config::EgressPin {
 impl config::Account {
     /// Whether this account's exit lock forbids handing its bearer over.
     ///
-    /// The whole rule is in [`crate::config::EgressPin::forbids_handoff`]; this
+    /// The whole rule is in [`crate::base::config::EgressPin::forbids_handoff`]; this
     /// is the form the two callers that hold a config account want, so neither
     /// of them re-derives the pin.
     pub const fn cannot_be_handed(&self) -> bool {
@@ -227,7 +227,7 @@ impl Manager {
             .iter()
             .enumerate()
             // Lending a Codex account over the mesh is unmeasured (the borrower's proxy would need the chatgpt-account-id swap too), so this version never lends one.
-            .filter(|(_, account)| account.provider == crate::provider::Provider::Anthropic)
+            .filter(|(_, account)| account.provider == crate::base::provider::Provider::Anthropic)
             .filter(|(_, account)| !account.disabled && account.status != AccountStatus::Error)
             .filter(|(_, account)| {
                 // An account whose own name is not a label (an email, a uuid)
@@ -312,7 +312,7 @@ impl Manager {
     /// gate in `eligible` is a pure function of a LOCAL account's runtime. A
     /// remote candidate has no index and no runtime, so there is no honest way
     /// to put one in there, which is why the fallback seam lives at the
-    /// picker's `None` arm (`crate::fallback`) instead.
+    /// picker's `None` arm (`crate::peer::serve::fallback`) instead.
     ///
     /// # The answer is the BEST SINGLE ACCOUNT's headroom, not the fleet's sum
     ///
@@ -336,7 +336,7 @@ impl Manager {
     ///
     /// # An unmeasured window lends nothing
     ///
-    /// An absent [`crate::quota::QuotaWindow`] means "never read", not "empty".
+    /// An absent [`crate::records::quota::QuotaWindow`] means "never read", not "empty".
     /// It contributes `0.0`, so a fleet that has not been probed lends nothing
     /// at all. Guessing in the other direction gives away the owner's quota on
     /// no evidence, and the owner is not the one who benefits from the guess.
@@ -539,7 +539,7 @@ impl crate::peer::lease::WindowUtilization for Manager {
             accounts
                 .iter()
                 // Lending a Codex account over the mesh is unmeasured (the borrower's proxy would need the chatgpt-account-id swap too), so this version never lends one.
-                .filter(|account| account.provider == crate::provider::Provider::Anthropic)
+                .filter(|account| account.provider == crate::base::provider::Provider::Anthropic)
                 .filter(|account| !account.disabled && account.status != AccountStatus::Error)
                 .filter(|account| {
                     let label = tcr_peer_wire::sanitize_label(&account.name).unwrap_or_default();
@@ -687,11 +687,11 @@ mod tests {
     use time::Duration;
 
     use super::*;
-    use crate::quota::QuotaWindow;
+    use crate::records::quota::QuotaWindow;
 
     /// `0.95 - 0.05`, the default `switchThreshold` minus the default
     /// `controlReserve`, which is the guard band every figure below is measured
-    /// against. Read off `config::default_switch_threshold` (`src/config.rs:33`)
+    /// against. Read off `config::default_switch_threshold` (`src/base/config.rs:33`)
     /// and `config::default_control_reserve` (`:39`); `Manager::from_runtimes`
     /// builds its config from `{}`, so both defaults are what apply here.
     ///
@@ -926,7 +926,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
 
         let mut codex = account("alice-fake");
-        codex.provider = crate::provider::Provider::Codex;
+        codex.provider = crate::base::provider::Provider::Codex;
         codex.quota.seven_day = measured(0.10, now);
         let manager = Manager::from_runtimes(vec![codex]);
         assert_eq!(

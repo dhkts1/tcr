@@ -5,9 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use tcr::config::{self, Config, ConfigError};
-use tcr::live_client;
-use tcr::{affinity, build_info, config_keys, login, server, singleton, tui};
+use tcr::base::config::{self, Config, ConfigError};
+use tcr::proxy::live_client;
+use tcr::{
+    base::build_info, base::config_keys, proxy::server, stores::affinity, stores::singleton,
+    verbs::login, verbs::tui,
+};
 
 use super::ConfigFile;
 
@@ -94,7 +97,7 @@ const fn stand_down_exit_code(
 
 /// `tcr server` — the clap→[`server::ServeOptions`] adapter.
 ///
-/// Everything that actually boots the proxy lives in [`tcr::server`],
+/// Everything that actually boots the proxy lives in [`tcr::proxy::server`],
 /// which is usable from a test or any other embedder. What stays here is what
 /// only a *binary* may do: choose the logging subscriber, print the operator's
 /// stand-down diagnosis, turn that stand-down into a process exit code, and pick
@@ -102,7 +105,7 @@ const fn stand_down_exit_code(
 pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     let config_path = args.config.path();
     let (config, persist_path) = load_config(&config_path)?;
-    let restart_endpoint = match tcr::restart::Endpoint::bind() {
+    let restart_endpoint = match tcr::stores::restart::Endpoint::bind() {
         Ok(endpoint) => Some(endpoint),
         Err(error) => {
             eprintln!("[tcr] warning: listener handoff disabled: {error}");
@@ -110,7 +113,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         }
     };
     let handover = if args.replace {
-        tcr::restart::request_listener(args.port.unwrap_or(config.proxy.port)).await?
+        tcr::stores::restart::request_listener(args.port.unwrap_or(config.proxy.port)).await?
     } else {
         None
     };
@@ -203,14 +206,14 @@ pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         affinity_path: Some(affinity::default_path()),
         // The Sessions/Tools panel cache, a binary-only side effect exactly like the
         // pin cache above and for the same reason: one shared file, one writer.
-        wire_sessions_path: Some(tcr::session_wire_persist::default_path()),
+        wire_sessions_path: Some(tcr::stores::session_wire_persist::default_path()),
         // The shared usage ledger, a binary-only side effect exactly like the
         // pin cache above and for the same reason: one directory, one writer.
-        usage_dir: Some(tcr::usage::default_dir()),
+        usage_dir: Some(tcr::records::usage::default_dir()),
         tls: server::TlsSetup::Load,
         // This is a standalone `tcr` process, stated rather than sniffed from
         // `argv[0]`: the owner file is what makes a proxy identifiable when its
-        // process name is NOT `tcr` (see `tcr::singleton`), so the value
+        // process name is NOT `tcr` (see `tcr::stores::singleton`), so the value
         // has to come from the caller that knows.
         host: singleton::ProxyHost::Cli,
         // Claim the port for the next `tcr` (and for `tcr login`) to read. A
@@ -254,7 +257,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     // Fan control: a binary-only side effect like the caches above, because
     // `fan.json` is one shared file and the helper takes one holder. Started
     // after the bind, so a process that stood down never dials the helper.
-    match tcr::fan::start(tcr::paths::cache_dir().fan_file()) {
+    match tcr::stores::fan::start(tcr::base::paths::cache_dir().fan_file()) {
         Ok(fan) => handle.manager().install_fan(fan),
         Err(error) => {
             tracing::warn!(target: "tcr", %error, "fan control: could not start its thread; fans stay automatic");
@@ -307,7 +310,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
                     }
                 } => ShutdownTrigger::Sigterm,
                 () = handle.serving_stopped() => ShutdownTrigger::ServingStopped,
-                peer = tcr::restart::accept(restart_endpoint.as_ref()) => {
+                peer = tcr::stores::restart::accept(restart_endpoint.as_ref()) => {
                     successor = Some(peer);
                     ShutdownTrigger::Replaced
                 },
@@ -325,7 +328,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
             let tui_fut = tui::run(Arc::clone(handle.manager()));
             tokio::pin!(tui_fut);
             tokio::select! {
-                peer = tcr::restart::accept(restart_endpoint.as_ref()) => {
+                peer = tcr::stores::restart::accept(restart_endpoint.as_ref()) => {
                     successor = Some(peer);
                 }
 
@@ -350,7 +353,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         let Some(peer) = successor.take() else {
             break;
         };
-        let deadline = tokio::time::Instant::now() + tcr::restart::drain_ceiling();
+        let deadline = tokio::time::Instant::now() + tcr::stores::restart::drain_ceiling();
         let result = tokio::select! {
             result = handle.handoff(&peer) => result,
             _ = tokio::signal::ctrl_c() => break,
@@ -501,7 +504,10 @@ const fn wedged_incumbent_recovery(kind: singleton::ProxyKind) -> &'static str {
 /// Takes the log's owner by value because `std::process::exit` runs no
 /// destructor: whatever is still in the writer's queue is closed onto disk
 /// first, or it is lost.
-fn stand_down_exit(stand_down: &server::StandDown, file_log: Option<tcr::file_log::FileLog>) -> ! {
+fn stand_down_exit(
+    stand_down: &server::StandDown,
+    file_log: Option<tcr::stores::file_log::FileLog>,
+) -> ! {
     // Standing down is cheap and correct, but silent success here would mean
     // `cargo build && tcr` exits 0 with the OLD build still serving — say which
     // build actually holds the port before we go.

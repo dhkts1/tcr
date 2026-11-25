@@ -1044,7 +1044,7 @@ fn fetch(
                 reason: format!("could not start a runtime for the HTTP call: {err}"),
             })?;
         rt.block_on(async move {
-            let client = crate::http_client::builder()
+            let client = crate::base::http_client::builder()
                 // `no_proxy` for the reason `peer::serve::serve_on_own_account`
                 // and `peer::lease` give: an ambient `HTTP_PROXY` very commonly
                 // points AT tcr, and honouring it here would send a router call

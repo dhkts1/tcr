@@ -149,7 +149,7 @@ fn min_spacing_skips_recently_served() {
             now,
             now_ms,
             false,
-            crate::provider::Provider::Anthropic,
+            crate::base::provider::Provider::Anthropic,
             None,
             None,
             &HashSet::new(),
@@ -169,7 +169,7 @@ fn min_spacing_skips_recently_served() {
             later,
             later_ms,
             false,
-            crate::provider::Provider::Anthropic,
+            crate::base::provider::Provider::Anthropic,
             None,
             None,
             &HashSet::new(),
@@ -271,7 +271,7 @@ fn the_upstream_client_is_recycled_once_its_serve_budget_is_spent() {
 
 /// After the machine slept, the first send retires EVERY account's client,
 /// not only the sending one: every pooled connection outlived the sleep
-/// with idle timers that stood still (see `crate::wake`).
+/// with idle timers that stood still (see `crate::clients::wake`).
 ///
 /// The control half: sends with no sleep between them keep the SAME `Arc`,
 /// so this cannot pass against a build that rebuilt on every send; and a
@@ -401,7 +401,7 @@ fn in_flight_cap_zero_is_disabled_not_dark_pool() {
             now,
             now_ms,
             false,
-            crate::provider::Provider::Anthropic,
+            crate::base::provider::Provider::Anthropic,
             None,
             None,
             &HashSet::new(),
@@ -432,7 +432,7 @@ fn serving_client_has_no_total_timeout() {
     // one is set. Prove the marker on a control client first, so a future reqwest
     // that renames it fails HERE loudly instead of making the guard below pass
     // vacuously.
-    let control = crate::http_client::builder()
+    let control = crate::base::http_client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("build control client");

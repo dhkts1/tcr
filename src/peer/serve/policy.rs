@@ -15,7 +15,7 @@ use crate::proxy::{
 /// `src/proxy.rs` through `path_is_under`, and holds no list of its own.
 ///
 /// Refuses every **Codex** path too, by the one classifier the request path
-/// uses (`crate::provider::Provider::of_path`). Codex is not lent over the mesh
+/// uses (`crate::base::provider::Provider::of_path`). Codex is not lent over the mesh
 /// in this version: a lease is sized on the lender's Anthropic windows, and the
 /// lender's picker would serve the request on a Codex account no lease accounts
 /// for. Both halves ask this function, so the borrower's seam builds no `Ask`
@@ -29,7 +29,7 @@ pub fn serve_is_allowed_for_path(path: &str) -> bool {
     if !relay_path_is_routable(path) {
         return false;
     }
-    if !crate::provider::Provider::of_path(path).on_peer_mesh() {
+    if !crate::base::provider::Provider::of_path(path).on_peer_mesh() {
         return false;
     }
     if CLIENT_CREDENTIAL_PREFIXES
@@ -73,7 +73,7 @@ pub fn refused_path_kind(path: &str) -> &'static str {
     if !relay_path_is_routable(path) {
         "an unroutable path (one the upstream URL parser would read differently than it is \
          spelled)"
-    } else if crate::provider::Provider::of_path(path).on_peer_mesh() {
+    } else if crate::base::provider::Provider::of_path(path).on_peer_mesh() {
         "a client-credential or local-control path"
     } else {
         "a Codex path (Codex is not lent over the mesh in this version)"

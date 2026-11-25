@@ -221,7 +221,7 @@ async fn codex_upgrade_is_answered_426_and_never_forwarded() {
     let resp = drive_full(
         Arc::clone(&manager),
         Method::GET,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("upgrade", "websocket"),
@@ -298,7 +298,7 @@ async fn codex_inference_swaps_account_header_and_bearer() {
     let (status, body) = drive(
         manager,
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -311,7 +311,7 @@ async fn codex_inference_swaps_account_header_and_bearer() {
     .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let seen = codex_echo.last_request();
-    assert_eq!(seen.path, crate::provider::CODEX_RESPONSES_PATH);
+    assert_eq!(seen.path, crate::base::provider::CODEX_RESPONSES_PATH);
     assert_eq!(seen.header("authorization"), Some("Bearer at-bob"));
     assert_eq!(seen.header("chatgpt-account-id"), Some(CODEX_SERVING_ID));
     assert_eq!(
@@ -339,7 +339,7 @@ async fn codex_and_claude_requests_log_their_provider() {
     let (status, body) = drive(
         Arc::clone(&manager),
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -376,7 +376,7 @@ async fn codex_and_claude_requests_log_their_provider() {
                 Provider::Anthropic
             ),
             (
-                crate::provider::CODEX_RESPONSES_PATH.to_string(),
+                crate::base::provider::CODEX_RESPONSES_PATH.to_string(),
                 "bob@example.com/codex".to_string(),
                 Provider::Codex
             ),
@@ -406,7 +406,7 @@ async fn a_codex_inference_request_naming_its_routing_keeps_the_client_credentia
         let (status, body) = drive(
             Arc::clone(&manager),
             Method::POST,
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             Some(loopback_peer()),
             &[
                 ("authorization", "Bearer client-own"),
@@ -489,7 +489,7 @@ async fn the_account_header_comes_from_org_uuid_and_falls_back_to_account_uuid()
         let (status, body) = drive(
             manager,
             Method::POST,
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             Some(loopback_peer()),
             &[
                 ("authorization", "Bearer client-own"),
@@ -520,7 +520,7 @@ async fn codex_inference_inserts_account_header_when_client_sent_none() {
     let (status, body) = drive(
         manager,
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -552,7 +552,7 @@ async fn codex_body_is_forwarded_byte_identical() {
     let (status, answer) = drive_bytes(
         manager,
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         &[
             ("authorization", "Bearer client-own"),
             ("content-type", "application/json"),
@@ -599,19 +599,19 @@ async fn codex_json_body_is_neither_spliced_nor_rewritten() {
     );
     assert!(
         matches!(
-            crate::account_uuid::patch_account_uuid(body.as_bytes(), CODEX_SERVING_ID),
+            crate::records::account_uuid::patch_account_uuid(body.as_bytes(), CODEX_SERVING_ID),
             std::borrow::Cow::Owned(_)
         ),
         "precondition: the Anthropic splice WOULD rewrite this body"
     );
     assert!(
-        crate::cache_ttl::extend_all_ttls(body.as_bytes()).is_some(),
+        crate::records::cache_ttl::extend_all_ttls(body.as_bytes()).is_some(),
         "precondition: the 1-hour rewrite WOULD rewrite this body"
     );
     let (status, answer) = drive(
         manager,
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -646,7 +646,7 @@ async fn codex_non_inference_paths_relay_the_clients_own_bearer() {
     let (status, _) = drive(
         Arc::clone(&manager),
         Method::GET,
-        crate::provider::CODEX_USAGE_PATH,
+        crate::base::provider::CODEX_USAGE_PATH,
         Some(loopback_peer()),
         &[("authorization", "Bearer client-own")],
         "",
@@ -654,14 +654,14 @@ async fn codex_non_inference_paths_relay_the_clients_own_bearer() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let seen = codex_echo.last_request();
-    assert_eq!(seen.path, crate::provider::CODEX_USAGE_PATH);
+    assert_eq!(seen.path, crate::base::provider::CODEX_USAGE_PATH);
     assert_eq!(seen.header("authorization"), Some("Bearer client-own"));
     assert_ne!(seen.header("authorization"), Some("Bearer at-bob"));
 
     let (status, _) = drive(
         Arc::clone(&manager),
         Method::GET,
-        crate::provider::CODEX_USAGE_PATH,
+        crate::base::provider::CODEX_USAGE_PATH,
         Some(loopback_peer()),
         &[],
         "",
@@ -687,7 +687,7 @@ async fn codex_non_inference_paths_relay_the_clients_own_bearer() {
 }
 
 /// Every host tcr intercepts names the provider whose requests it carries, and no
-/// other host does. A host added to [`crate::tls::ALLOWED_HOSTS`] without a provider
+/// other host does. A host added to [`crate::base::tls::ALLOWED_HOSTS`] without a provider
 /// here would be refused outright by `handle`'s host-and-path check (it fails closed),
 /// so this fails first, at the table. Loopback names no provider: base-URL mode keeps
 /// the path's.
@@ -695,8 +695,8 @@ async fn codex_non_inference_paths_relay_the_clients_own_bearer() {
 /// Watched red: drop the `platform.claude.com` row and the first loop names it.
 #[test]
 fn every_intercepted_host_names_its_provider() {
-    use crate::provider::Provider;
-    for host in crate::tls::ALLOWED_HOSTS {
+    use crate::base::provider::Provider;
+    for host in crate::base::tls::ALLOWED_HOSTS {
         assert!(
             intercepted_host_provider(host).is_some(),
             "{host} is intercepted but names no provider"
@@ -704,7 +704,7 @@ fn every_intercepted_host_names_its_provider() {
     }
     for (host, _) in INTERCEPTED_HOST_PROVIDERS {
         assert!(
-            crate::tls::host_allowed(host),
+            crate::base::tls::host_allowed(host),
             "{host} names a provider but is not intercepted"
         );
     }
@@ -821,13 +821,13 @@ async fn an_anthropic_host_with_a_backend_api_path_is_refused_and_reaches_no_ori
         (
             Method::GET,
             "api.anthropic.com",
-            crate::provider::CODEX_USAGE_PATH,
+            crate::base::provider::CODEX_USAGE_PATH,
             vec![("authorization", "Bearer claude-client-token")],
         ),
         (
             Method::POST,
             "platform.claude.com",
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             vec![("content-type", "application/json")],
         ),
     ] {
@@ -885,7 +885,7 @@ async fn a_loopback_or_hostless_request_keeps_its_paths_provider() {
         let (status, _) = drive(
             Arc::clone(&manager),
             Method::GET,
-            crate::provider::CODEX_USAGE_PATH,
+            crate::base::provider::CODEX_USAGE_PATH,
             Some(loopback_peer()),
             &headers,
             "",
@@ -931,7 +931,7 @@ async fn codex_exhausted_pool_answers_a_codex_shaped_429() {
     let resp = drive_full(
         manager,
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),

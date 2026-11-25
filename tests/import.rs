@@ -117,7 +117,10 @@ struct Machine {
 impl Machine {
     fn new(workspace_answer: &'static str) -> Self {
         let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
-        let config = home.path().join(".config").join(tcr::paths::CONFIG_FILE);
+        let config = home
+            .path()
+            .join(".config")
+            .join(tcr::base::paths::CONFIG_FILE);
         std::fs::create_dir_all(config.parent().expect("the config has a parent"))
             .expect("creating the scratch .config dir");
         let (upstream, _answered) =

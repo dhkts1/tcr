@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 /// The one shared, well-known, non-private directory both modes log into:
 /// `logs/` in the cache directory, `~/.cache/tcr/logs/`
-/// (`tcr::paths::cache_dir`), with the log file prefix `tcr.log`.
+/// (`tcr::base::paths::cache_dir`), with the log file prefix `tcr.log`.
 ///
 /// The path is fixed for **human discoverability** — so `rg 'server started'
 /// ~/.cache/tcr/logs/*` always finds the right directory — not because any code
@@ -19,7 +19,10 @@ use std::path::{Path, PathBuf};
 /// cache directory could disagree, and an install would split its cache across
 /// two folders.
 fn log_location() -> (PathBuf, &'static str) {
-    (tcr::paths::cache_dir().log_dir(), tcr::paths::LOG_PREFIX)
+    (
+        tcr::base::paths::cache_dir().log_dir(),
+        tcr::base::paths::LOG_PREFIX,
+    )
 }
 
 /// Open the durable, rotating log directory, injectable for tests so they never
@@ -128,13 +131,13 @@ fn open_log_appender(
 /// `file` is an `Option` on purpose: a logging failure must never take the proxy
 /// down, so a log that will not open degrades to stdout-only.
 ///
-/// `file` is the queue of [`tcr::file_log`]'s writer thread, not the appender:
+/// `file` is the queue of [`tcr::stores::file_log`]'s writer thread, not the appender:
 /// the emitting thread formats its line and queues it, and one thread writes.
 /// The synchronous `Mutex<RollingFileAppender>` this replaced was the proxy's
 /// top frame under load (`docs/performance.md`). The queue comes with a
 /// `WorkerGuard` whose drop silently stops every later line from reaching
 /// disk, so this function never sees it: [`init_tracing`] returns it, wrapped
-/// in a [`tcr::file_log::FileLog`], for `run_server` to hold for the process's
+/// in a [`tcr::stores::file_log::FileLog`], for `run_server` to hold for the process's
 /// life and close on every way out. That module's doc lists each one.
 ///
 /// `stdout_sink` is an `Option` because stdout is skipped when it is the null
@@ -185,7 +188,7 @@ where
 /// Returns the owner of the file's writer thread, `None` when no file opened.
 /// The caller holds it for as long as anything should reach the file and
 /// closes it before any exit that runs no destructor: dropping it early stops
-/// every later line from reaching disk, silently (see [`tcr::file_log`]).
+/// every later line from reaching disk, silently (see [`tcr::stores::file_log`]).
 /// The TUI writes through the same queue for the same reason as headless: its
 /// file was behind the same lock, on the same tokio workers.
 /// The log filter when `RUST_LOG` is unset: `info`, and in a build with tcr's
@@ -200,7 +203,7 @@ const DEFAULT_LOG_FILTER: &str = "info,tailscale=warn,ts_=warn,kameo=warn";
 #[cfg(not(feature = "tailnet-node"))]
 const DEFAULT_LOG_FILTER: &str = "info";
 
-pub(super) fn init_tracing(headless: bool) -> Option<tcr::file_log::FileLog> {
+pub(super) fn init_tracing(headless: bool) -> Option<tcr::stores::file_log::FileLog> {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::util::SubscriberInitExt as _;
     let filter =
@@ -208,10 +211,10 @@ pub(super) fn init_tracing(headless: bool) -> Option<tcr::file_log::FileLog> {
     let (log_dir, log_prefix) = log_location();
     let (queue, file_log) = match open_log_appender(&log_dir, log_prefix) {
         Ok(file) => {
-            let (queue, file_log) = tcr::file_log::start(file);
+            let (queue, file_log) = tcr::stores::file_log::start(file);
             // Before the subscriber exists, so no line is ever queued that a
             // panic would leave behind.
-            tcr::file_log::install_panic_flush(file_log.flusher());
+            tcr::stores::file_log::install_panic_flush(file_log.flusher());
             (Some(queue), Some(file_log))
         }
         Err(err) => {
@@ -228,7 +231,7 @@ pub(super) fn init_tracing(headless: bool) -> Option<tcr::file_log::FileLog> {
         // log file it keeps one anyway: a proxy logging nowhere at all should
         // fail where a test of stdout can see it.
         let stdout_sink = (queue.is_none()
-            || !tcr::file_log::is_null_device(std::os::fd::AsFd::as_fd(&stdout)))
+            || !tcr::stores::file_log::is_null_device(std::os::fd::AsFd::as_fd(&stdout)))
         .then_some(std::io::stdout);
         // Colour only for a human at a terminal. Piped or redirected stdout is
         // something a program or a test will read back, and `NO_COLOR` is still

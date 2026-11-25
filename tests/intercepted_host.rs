@@ -31,7 +31,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 use axum::Router;
 use axum::body::Body;
@@ -170,7 +170,7 @@ struct Tcr {
 /// connected to a local byte-echo stub, including when a regression chooses it incorrectly.
 async fn start() -> Tcr {
     let leaf_dir = tempfile::tempdir().expect("a temp dir for the leaf");
-    let assets = tcr::tls::load_tls_in(leaf_dir.path()).expect("mint a leaf");
+    let assets = tcr::base::tls::load_tls_in(leaf_dir.path()).expect("mint a leaf");
     for host in ["chatgpt.com", "api.anthropic.com"] {
         assert!(
             assets
@@ -211,7 +211,7 @@ async fn start() -> Tcr {
     .expect("the test fleet's config parses");
     let manager = Manager::with_live_refresher(config, None);
     assert!(
-        manager.provider_account_count(tcr::provider::Provider::Codex) > 0,
+        manager.provider_account_count(tcr::base::provider::Provider::Codex) > 0,
         "a fleet with no Codex account blind-tunnels chatgpt.com out of the machine"
     );
 
@@ -235,7 +235,7 @@ async fn start() -> Tcr {
     });
     let blind_tunnels = Arc::new(Mutex::new(Vec::new()));
     let recorded_tunnels = Arc::clone(&blind_tunnels);
-    let connector: tcr::mitm::TunnelConnector = Arc::new(move |host, port| {
+    let connector: tcr::proxy::mitm::TunnelConnector = Arc::new(move |host, port| {
         recorded_tunnels.lock().unwrap().push((host, port));
         Box::pin(TcpStream::connect(blind_addr))
     });
@@ -247,7 +247,7 @@ async fn start() -> Tcr {
         .with_writer(trace.clone())
         .finish();
     tokio::spawn(
-        tcr::mitm::serve_with_tunnel_connector(
+        tcr::proxy::mitm::serve_with_tunnel_connector(
             listener,
             manager,
             Some(Arc::new(assets.acceptor)),
@@ -431,7 +431,7 @@ async fn a_marked_codex_connect_reaches_the_pool_and_relays_other_paths() {
     assert!(tcr.codex.seen().is_empty(), "the upgrade stays local");
     let ca = std::fs::read(&tcr.ca_path).unwrap();
     let proxy = reqwest::Proxy::https(format!("http://tcr-codex@{}", tcr.addr)).unwrap();
-    let client = tcr::http_client::builder()
+    let client = tcr::base::http_client::builder()
         .no_proxy()
         .proxy(proxy)
         .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())

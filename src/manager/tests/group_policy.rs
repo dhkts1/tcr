@@ -357,11 +357,11 @@ fn a_strict_groups_retry_hint_is_sized_by_its_own_member() {
     // `<= 60` control on CI (#189) with nothing wrong in the code.
     let now = OffsetDateTime::now_utc();
 
-    let fleet = manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic);
+    let fleet = manager.retry_after_hint(now, false, crate::base::provider::Provider::Anthropic);
     let scoped = manager.retry_after_hint_for_group(
         now,
         false,
-        crate::provider::Provider::Anthropic,
+        crate::base::provider::Provider::Anthropic,
         "codereview",
     );
 
@@ -978,14 +978,14 @@ fn reload_admits_a_codex_row_named_like_a_running_anthropic_row() {
 
     std::thread::sleep(std::time::Duration::from_millis(20));
     let codex = Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
         ..account_in_groups("alice@example.com", 1, &["codex-team"])
     };
     config::save(&path, &config_with(vec![codex])).expect("write reload config");
     manager.reload_groups_if_changed();
 
-    let rows: Vec<(String, crate::provider::Provider, Vec<String>)> = manager
+    let rows: Vec<(String, crate::base::provider::Provider, Vec<String>)> = manager
         .accounts
         .read()
         .expect("accounts lock poisoned")
@@ -997,12 +997,12 @@ fn reload_admits_a_codex_row_named_like_a_running_anthropic_row() {
         vec![
             (
                 "alice@example.com".to_string(),
-                crate::provider::Provider::Anthropic,
+                crate::base::provider::Provider::Anthropic,
                 vec!["anthropic-team".to_string()]
             ),
             (
                 "alice@example.com".to_string(),
-                crate::provider::Provider::Codex,
+                crate::base::provider::Provider::Codex,
                 vec!["codex-team".to_string()]
             ),
         ],

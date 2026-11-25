@@ -16,7 +16,7 @@ use super::*;
 /// only ever decides whether some other session should be moved.
 ///
 /// Why 60 minutes and not the 5 of [`CACHE_WARM_HOLD_SECS`] or
-/// the 15 of [`crate::affinity::PIN_TTL_MS`]: the count is a guess at how many
+/// the 15 of [`crate::stores::affinity::PIN_TTL_MS`]: the count is a guess at how many
 /// live sessions an account is carrying, and the two ways of guessing wrong are
 /// not symmetric. Counting a dead pin makes the emptiest account on the fleet
 /// read as one of the busiest and bounces every session that lands on it back
@@ -24,7 +24,7 @@ use super::*;
 /// account and stacks a second session onto it, which is paid later in a
 /// migration and a cold prefix. So take the widest window that still fixes the
 /// first failure. 60 minutes is that: it is the ceiling of every cache window
-/// this crate already believes in — [`crate::affinity::EXTENDED_PIN_TTL_MS`] is
+/// this crate already believes in — [`crate::stores::affinity::EXTENDED_PIN_TTL_MS`] is
 /// 55 minutes, derived from 52,951 real `request usage` records where a 15-60
 /// minute gap still hit Anthropic's cache 73-88% of the time and only past 60
 /// minutes fell to 12%. Past an hour no prefix is warm under any
@@ -109,13 +109,13 @@ impl Manager {
         // carve-outs.
         let strict_group = group.filter(|g| groups.is_strict(g));
         // THE PROVIDER THIS REQUEST BELONGS TO, decided by its path (see
-        // `crate::provider`'s module doc for why path and not host). Computed
+        // `crate::base::provider`'s module doc for why path and not host). Computed
         // here, above the hard lock, for the same reason `strict_group` is: the
         // lock returns before `eligible` is ever asked, so it has to ask this
         // itself. Every account this call returns is of this provider:
         // `eligible` refuses any other first, and each door below that does
         // not go through `eligible` checks it on its own.
-        let provider = crate::provider::Provider::of_path(path);
+        let provider = crate::base::provider::Provider::of_path(path);
 
         // A strict Codex peer exit is a configuration block, not an upstream failure.
         // Exclude it before locks, affinity and pool picks can select that account.
@@ -171,7 +171,7 @@ impl Manager {
         // Compute the Fable classification ONCE, not per-account.
         // The Fable weekly bucket is an Anthropic fact; a Codex request never consults it.
         let is_fable =
-            provider.has_fable_bucket() && model.is_some_and(crate::model::is_fable_model);
+            provider.has_fable_bucket() && model.is_some_and(crate::base::model::is_fable_model);
         // Compute the control-account three-way split ONCE (part 2). Consulted
         // twice below: the routing overlay (control-preferred / noise) after the
         // affinity fast-path, and the pool-pick exclusion (inference must never
@@ -1116,7 +1116,7 @@ impl Manager {
                 if let Some(account) = accounts.get(idx) {
                     let seven_day_oi = account
                         .quota
-                        .effective(crate::quota::QuotaBucket::SevenDayOi, now)
+                        .effective(crate::records::quota::QuotaBucket::SevenDayOi, now)
                         .unwrap_or(0.0);
                     tracing::info!(
                         account = %account.name,

@@ -19,9 +19,9 @@
 
 use super::claude::{ClaudeResetError, ClaudeResetOutcome};
 use super::codex::CodexResetOutcome;
-use crate::claude_resets::ClaudeResetBank;
+use crate::base::provider::Provider;
 use crate::manager::*;
-use crate::provider::Provider;
+use crate::records::claude_resets::ClaudeResetBank;
 use std::time::Duration;
 use tcr_status_wire::{AutoReset, AutoResetOutcome, ResetCredits, ResetKind};
 
@@ -70,8 +70,8 @@ const fn inside(ends_at_ms: i64, now_ms: i64) -> bool {
 /// The resets one row should spend at `now_ms`: for a Claude row, of each kind held, the
 /// grant whose use-by comes first, when that use-by is inside the window and the grant is
 /// neither paused nor spent; for a Codex row, its one earliest credit. `claude` is the bank
-/// the row may spend ([`crate::quota::Quota::eligible_claude_resets`]) and `codex` the
-/// credits it holds ([`crate::quota::Quota::spendable_codex_reset_credits`]); nothing when
+/// the row may spend ([`crate::records::quota::Quota::eligible_claude_resets`]) and `codex` the
+/// credits it holds ([`crate::records::quota::Quota::spendable_codex_reset_credits`]); nothing when
 /// either is `None`.
 pub fn due_in(
     idx: usize,
@@ -163,7 +163,7 @@ impl From<CodexResetOutcome> for AutoResetOutcome {
 }
 
 impl Manager {
-    /// See [`crate::config::Config::auto_reset_enabled`].
+    /// See [`crate::base::config::Config::auto_reset_enabled`].
     pub fn auto_reset_enabled(&self) -> bool {
         self.config
             .lock()
@@ -267,7 +267,7 @@ pub async fn run(manager: Arc<Manager>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude_resets::Grant;
+    use crate::records::claude_resets::Grant;
     use tcr_status_wire::BankedReset;
 
     const ENDS: i64 = 1_900_000_000_000;
@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(claude(&held, ENDS - 1), vec![due]);
         assert_eq!(claude(&held, ENDS), vec![], "at its use-by it is gone");
         assert_eq!(due.key(), "auto-3-weekly-1900000000000");
-        assert!(crate::claude_resets::valid_request_id(&due.key()));
+        assert!(crate::records::claude_resets::valid_request_id(&due.key()));
         assert!(valid_reset_key(&due.key()));
     }
 

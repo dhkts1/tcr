@@ -8,5 +8,6 @@
 
 pub(super) mod probing;
 pub(super) mod refresh;
+pub mod schedule;
 pub(super) mod usage;
 mod warm;

@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 use tcr::test_support::child::KillOnDrop;
 
 use axum::Router;
@@ -335,7 +335,10 @@ async fn start_server_with_first_port(
     let mut home = Some(home);
     for attempt in 0..ATTEMPTS {
         let home = home.take().unwrap_or_else(|| tempfile::tempdir().unwrap());
-        let config = home.path().join(".config").join(tcr::paths::CONFIG_FILE);
+        let config = home
+            .path()
+            .join(".config")
+            .join(tcr::base::paths::CONFIG_FILE);
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         write_config(&config, port, upstream, codex_upstream);
         let log = std::fs::File::create(home.path().join(SERVER_LOG)).unwrap();
@@ -392,19 +395,19 @@ async fn a_codex_test_server_retries_a_port_claimed_before_its_child_bound() {
         let occupied_port = incumbent.local_addr().unwrap().port();
         let (upstream, codex_upstream, _) = spawn_origins().await;
         let home = tempfile::tempdir().unwrap();
-        let owner_dir = home.path().join(".cache").join(tcr::paths::CACHE_DIR);
+        let owner_dir = home.path().join(".cache").join(tcr::base::paths::CACHE_DIR);
         std::fs::create_dir_all(&owner_dir).unwrap();
         // Model an embedded proxy that holds the port without answering. Its verified claim
         // guarantees a stand-down exit rather than depending on this test process's executable name.
-        let owner = tcr::singleton::ProxyOwner {
+        let owner = tcr::stores::singleton::ProxyOwner {
             pid: std::process::id(),
             port: occupied_port,
             sha: "test-fixture".into(),
-            host: tcr::singleton::ProxyHost::Embedded,
+            host: tcr::stores::singleton::ProxyHost::Embedded,
         };
         if embedded_claim {
-            tcr::singleton::write_owner_file(
-                &tcr::singleton::owner_path_in(&owner_dir, occupied_port),
+            tcr::stores::singleton::write_owner_file(
+                &tcr::stores::singleton::owner_path_in(&owner_dir, occupied_port),
                 &owner,
             )
             .unwrap();

@@ -3,7 +3,7 @@
 //! read without changing anything a selection reads.
 use super::select_test_support::{account, config_with, live_manager, pin};
 use super::*;
-use crate::quota::QuotaWindow;
+use crate::records::quota::QuotaWindow;
 use time::Duration;
 
 const MESSAGES: &str = "/v1/messages";
@@ -48,7 +48,7 @@ fn served(manager: &Manager, now: OffsetDateTime, model: Option<&str>) -> Option
         .or_else(|| {
             (manager.revalidation_serve_enabled()
                 && manager
-                    .locked_account_for(crate::provider::Provider::Anthropic)
+                    .locked_account_for(crate::base::provider::Provider::Anthropic)
                     .is_none())
             .then(|| manager.select_revalidation(&none, now, model, None, MESSAGES))
             .flatten()

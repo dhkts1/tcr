@@ -2,10 +2,10 @@
 //! refreshers, probers and warmers more than one subject file uses.
 
 use super::*;
-use crate::config::{Account, PacingConfig};
-use crate::oauth::{OAuthError, RefreshFuture};
-use crate::probe::{ProbeError, ProbeFuture, Usage, UsageBucket};
-use crate::warmer::{AccountWarmer, WarmError, WarmFuture};
+use crate::base::config::{Account, PacingConfig};
+use crate::clients::oauth::{OAuthError, RefreshFuture};
+use crate::clients::warmer::{AccountWarmer, WarmError, WarmFuture};
+use crate::records::probe::{ProbeError, ProbeFuture, Usage, UsageBucket};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use time::Duration;
 
@@ -78,7 +78,7 @@ fn manager_of(accounts: Vec<Account>) -> Arc<Manager> {
 impl TokenRefresher for CountingRefresher {
     fn refresh(
         &self,
-        _provider: crate::provider::Provider,
+        _provider: crate::base::provider::Provider,
         _refresh_token: String,
     ) -> RefreshFuture {
         let calls = Arc::clone(&self.calls);
@@ -99,7 +99,7 @@ impl TokenRefresher for CountingRefresher {
 
 struct NoProber;
 impl UsageProber for NoProber {
-    fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, _credential: crate::records::probe::ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Err(ProbeError {
                 status: None,
@@ -116,12 +116,12 @@ struct ScriptedProber {
     ok_token: String,
 }
 impl UsageProber for ScriptedProber {
-    fn probe(&self, credential: crate::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, credential: crate::records::probe::ProbeCredential) -> ProbeFuture {
         let ok = credential.access_token == self.ok_token;
         Box::pin(async move {
             if ok {
                 Ok(Usage {
-                    five_hour: crate::probe::WindowReading::Read(UsageBucket {
+                    five_hour: crate::records::probe::WindowReading::Read(UsageBucket {
                         utilization: Some(0.25),
                         reset_at_ms: Some(crate::now_ms() + 3_600_000),
                     }),
@@ -191,12 +191,12 @@ fn build_manager_with_path(config: Config, path: PathBuf) -> Arc<Manager> {
 /// counter is the point, not decoration: the backfill's whole contract is
 /// that it runs ONCE per account and never again.
 struct CountingPlanProber {
-    plan: crate::probe::Plan,
+    plan: crate::records::probe::Plan,
     calls: Arc<AtomicUsize>,
 }
 
 impl PlanProber for CountingPlanProber {
-    fn plan(&self, _access_token: String) -> crate::probe::PlanFuture {
+    fn plan(&self, _access_token: String) -> crate::records::probe::PlanFuture {
         self.calls.fetch_add(1, Ordering::Relaxed);
         let plan = self.plan.clone();
         Box::pin(async move { plan })
@@ -204,7 +204,7 @@ impl PlanProber for CountingPlanProber {
 }
 
 /// Give `manager` a [`CountingPlanProber`] that answers `plan`, and return its call count.
-fn count_plan_fetches(manager: &Manager, plan: crate::probe::Plan) -> Arc<AtomicUsize> {
+fn count_plan_fetches(manager: &Manager, plan: crate::records::probe::Plan) -> Arc<AtomicUsize> {
     let calls = Arc::new(AtomicUsize::new(0));
     manager.set_plan_prober(Arc::new(CountingPlanProber {
         plan,
@@ -216,11 +216,11 @@ fn count_plan_fetches(manager: &Manager, plan: crate::probe::Plan) -> Arc<Atomic
 /// A prober that records the credential of every probe and answers an empty
 /// success, so a test reads exactly what [`Manager::probe_account`] built.
 struct RecordingProber {
-    seen: Arc<Mutex<Vec<crate::probe::ProbeCredential>>>,
+    seen: Arc<Mutex<Vec<crate::records::probe::ProbeCredential>>>,
 }
 
 impl UsageProber for RecordingProber {
-    fn probe(&self, credential: crate::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, credential: crate::records::probe::ProbeCredential) -> ProbeFuture {
         self.seen
             .lock()
             .expect("seen lock poisoned")
@@ -247,7 +247,7 @@ struct RejectsWith {
 impl TokenRefresher for RejectsWith {
     fn refresh(
         &self,
-        _provider: crate::provider::Provider,
+        _provider: crate::base::provider::Provider,
         _refresh_token: String,
     ) -> RefreshFuture {
         let (status, code) = (self.status, self.code);
@@ -257,7 +257,7 @@ impl TokenRefresher for RejectsWith {
 
 fn codex_account(name: &str, priority: i64) -> Account {
     Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         account_uuid: Some("55555555-5555-4555-8555-555555555555".to_string()),
         org_uuid: Some("66666666-6666-4666-8666-666666666666".to_string()),
         ..account(name, priority)
@@ -323,7 +323,7 @@ fn accounts_mut(manager: &Manager) -> std::sync::RwLockWriteGuard<'_, Vec<Accoun
 fn set_fable_exhausted(manager: &Manager, idx: usize, util: f64) {
     let now = OffsetDateTime::now_utc();
     let mut a = manager.accounts.write().expect("accounts lock poisoned");
-    a[idx].quota.seven_day_oi = Some(crate::quota::QuotaWindow {
+    a[idx].quota.seven_day_oi = Some(crate::records::quota::QuotaWindow {
         utilization: util,
         reset: Some(now + Duration::hours(48)),
     });
@@ -381,7 +381,7 @@ fn set_over_threshold(manager: &Manager, idx: usize, util: f64, status: &str) {
     let now = OffsetDateTime::now_utc();
     let mut a = manager.accounts.write().expect("accounts lock poisoned");
     let account = &mut a[idx];
-    account.quota.seven_day = Some(crate::quota::QuotaWindow {
+    account.quota.seven_day = Some(crate::records::quota::QuotaWindow {
         utilization: util,
         reset: Some(now + Duration::hours(48)),
     });

@@ -289,7 +289,8 @@ fn stable_session_key(
     path: &str,
     client_is_loopback: bool,
 ) -> Option<(u64, SessionKind)> {
-    let parsed = crate::request_body::RequestBody::parse(Bytes::copy_from_slice(body), false);
+    let parsed =
+        crate::records::request_body::RequestBody::parse(Bytes::copy_from_slice(body), false);
     super::stable_session_key(headers, &parsed, secrets, method, path, client_is_loopback)
 }
 
@@ -782,9 +783,13 @@ async fn real_request_through_app_pins_on_prefix_for_loopback_v1_messages() {
     use tower::ServiceExt as _;
 
     struct NoRefresh;
-    impl crate::oauth::TokenRefresher for NoRefresh {
-        fn refresh(&self, _provider: Provider, _t: String) -> crate::oauth::RefreshFuture {
-            Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+    impl crate::clients::oauth::TokenRefresher for NoRefresh {
+        fn refresh(&self, _provider: Provider, _t: String) -> crate::clients::oauth::RefreshFuture {
+            Box::pin(async {
+                Err(crate::clients::oauth::OAuthError::Transient(
+                    "unused".into(),
+                ))
+            })
         }
     }
 
@@ -796,8 +801,8 @@ async fn real_request_through_app_pins_on_prefix_for_loopback_v1_messages() {
     let manager = Manager::new(
         config,
         Arc::new(NoRefresh),
-        Arc::new(crate::probe::LiveUsageProber::new()),
-        Arc::new(crate::warmer::LiveWarmer::new()),
+        Arc::new(crate::records::probe::LiveUsageProber::new()),
+        Arc::new(crate::clients::warmer::LiveWarmer::new()),
         None,
     );
 
@@ -978,7 +983,7 @@ async fn loopback_client_is_exempt() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     // The hybrid server injects ClientAddr; base-URL (non-CONNECT) needs no TLS.
-    tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+    tokio::spawn(async move { mitm::serve(listener, manager, None).await });
 
     let client = crate::test_support::loopback::client();
     // NO x-api-key — but the client is loopback, so it must be exempt.

@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 use tcr::peer::config::id::NodeKey;
 use tcr::peer::config::{

@@ -15,17 +15,20 @@ impl Manager {
 
     /// The slots a request of `provider` may never be served from: strict Codex peer exits
     /// this build cannot honour. Empty for `anthropic`.
-    pub(super) fn unsupported_exits(&self, provider: crate::provider::Provider) -> HashSet<usize> {
+    pub(super) fn unsupported_exits(
+        &self,
+        provider: crate::base::provider::Provider,
+    ) -> HashSet<usize> {
         match provider {
-            crate::provider::Provider::Anthropic => HashSet::new(),
-            crate::provider::Provider::Codex => self.codex_accounts_with_unsupported_exit(),
+            crate::base::provider::Provider::Anthropic => HashSet::new(),
+            crate::base::provider::Provider::Codex => self.codex_accounts_with_unsupported_exit(),
         }
     }
 
     pub(super) fn exclude_unsupported_codex_exits<'a>(
         &self,
         tried: &'a HashSet<usize>,
-        provider: crate::provider::Provider,
+        provider: crate::base::provider::Provider,
     ) -> std::borrow::Cow<'a, HashSet<usize>> {
         let unsupported = self.unsupported_exits(provider);
         if unsupported.is_empty() {
@@ -103,15 +106,15 @@ impl Manager {
         self.reload_groups_if_changed();
         let unsupported = self.codex_accounts_with_unsupported_exit();
         let groups = self.groups();
-        let locked = self.locked_account_for(crate::provider::Provider::Codex);
+        let locked = self.locked_account_for(crate::base::provider::Provider::Codex);
         self.accounts
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .enumerate()
             .filter(|(idx, account)| match account.provider {
-                crate::provider::Provider::Anthropic => false,
-                crate::provider::Provider::Codex => {
+                crate::base::provider::Provider::Anthropic => false,
+                crate::base::provider::Provider::Codex => {
                     !account.removed
                         && bound_to.is_none_or(|bound| bound == *idx)
                         && locked.is_none_or(|locked_idx| locked_idx == *idx)

@@ -1475,7 +1475,7 @@ fn a_lender_with_no_address_still_installs_the_provider_through_a_carrier() {
     };
 
     assert!(
-        tcr::fallback::peer_lease_provider(&store(
+        tcr::peer::serve::fallback::peer_lease_provider(&store(
             "carrier-installs",
             2,
             vec![
@@ -1489,7 +1489,7 @@ fn a_lender_with_no_address_still_installs_the_provider_through_a_carrier() {
     );
 
     assert!(
-        tcr::fallback::peer_lease_provider(&store(
+        tcr::peer::serve::fallback::peer_lease_provider(&store(
             "carrier-no-grant",
             2,
             vec![
@@ -1503,7 +1503,7 @@ fn a_lender_with_no_address_still_installs_the_provider_through_a_carrier() {
     );
 
     assert!(
-        tcr::fallback::peer_lease_provider(&store(
+        tcr::peer::serve::fallback::peer_lease_provider(&store(
             "carrier-no-address",
             2,
             vec![lender_row(true), carrier_row(true, Vec::new())],

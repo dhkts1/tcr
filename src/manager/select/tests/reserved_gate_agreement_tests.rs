@@ -1,7 +1,7 @@
 //! `eligible`, `account_gate` and `account_hard_ok` agree on the reserved gate.
 
 use super::*;
-use crate::config::{Account, PacingConfig};
+use crate::base::config::{Account, PacingConfig};
 
 fn account_runtime(groups: &[&str]) -> AccountRuntime {
     AccountRuntime::from_config(
@@ -48,7 +48,7 @@ fn agree_on_unrequested_traffic_across_group_and_reserved_combinations() {
                 now,
                 now_ms,
                 false,
-                crate::provider::Provider::Anthropic,
+                crate::base::provider::Provider::Anthropic,
                 None,
                 None,
                 &reserved,
@@ -119,7 +119,7 @@ fn an_explicit_matching_ask_is_never_reserved_blocked() {
                 now,
                 now_ms,
                 false,
-                crate::provider::Provider::Anthropic,
+                crate::base::provider::Provider::Anthropic,
                 Some(ask),
                 Some(ask),
                 &reserved,

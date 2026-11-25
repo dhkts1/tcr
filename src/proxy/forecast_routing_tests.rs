@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{Account, Config, ProxyConfig};
+use crate::base::config::{Account, Config, ProxyConfig};
 
 /// An obviously fake proxy key: the gate is exercised, no real key is used.
 const KEY: &str = "3333333333333333333333333333333333333333333333333333333333333333";
@@ -54,11 +54,11 @@ async fn history_and_ticks() {
     manager.attach_usage_ledger(ledger.path().to_path_buf(), 29);
     let reset = now_ms + 3_600_000;
     let tick = |percent: u64| {
-        let bucket = Some(crate::probe::UsageBucket {
+        let bucket = Some(crate::records::probe::UsageBucket {
             utilization: Some(percent as f64 / 100.0),
             reset_at_ms: Some(reset),
         });
-        crate::probe::Usage {
+        crate::records::probe::Usage {
             five_hour: bucket.into(),
             seven_day: bucket,
             seven_day_oi: bucket,
@@ -71,7 +71,7 @@ async fn history_and_ticks() {
         let (input, output) = if step % 2 == 0 { (100, 0) } else { (0, 25) };
         manager.record_usage(
             0,
-            crate::usage::UsageRecord::from_quota_input(
+            crate::records::usage::UsageRecord::from_quota_input(
                 (at.unix_timestamp_nanos() / 1_000_000) as i64 - 1,
                 Some("claude-fable-5".to_string()),
                 None,
@@ -96,7 +96,7 @@ async fn history_and_ticks() {
             && estimate["calibrated"] == true;
     assert_eq!(
         manager.shutdown_usage_ledger(Duration::from_secs(2)),
-        crate::usage::LedgerShutdown::Flushed
+        crate::records::usage::LedgerShutdown::Flushed
     );
     assert!(
         profile_and_scale_match,
@@ -113,7 +113,7 @@ fn fable_ledger(now_ms: i64) -> tempfile::TempDir {
     let ledger = tempfile::tempdir().expect("owned ledger");
     for back in 2..=48 {
         let ts = now_ms - back * 3_600_000;
-        let date = crate::usage::date_string(crate::usage::ledger_date(ts));
+        let date = crate::records::usage::date_string(crate::records::usage::ledger_date(ts));
         let path = ledger.path().join(format!("{date}.jsonl"));
         writeln!(
             std::fs::OpenOptions::new()
@@ -194,7 +194,7 @@ async fn served_response_headers_calibrate_under_their_own_request() {
     let value = document(Arc::clone(&manager)).await;
     assert_eq!(
         manager.shutdown_usage_ledger(Duration::from_secs(2)),
-        crate::usage::LedgerShutdown::Flushed
+        crate::records::usage::LedgerShutdown::Flushed
     );
     assert_eq!(
         value["forecast"]["providers"][0]["calibrated"], true,
@@ -216,7 +216,7 @@ async fn schema_one() {
     assert_eq!(document["schema"], 1, "the document names schema 1");
 }
 
-use crate::observations::ErrorKind;
+use crate::records::observations::ErrorKind;
 use crate::test_support::stub_upstream as stub;
 use time::format_description::well_known::Rfc3339;
 
@@ -271,7 +271,7 @@ fn served(manager: &Manager, idx: usize, model: &str, session: Option<u64>) {
     manager.record_response_model(provider, Some(model));
     manager.record_usage(
         idx,
-        crate::usage::UsageRecord::from_quota_input(
+        crate::records::usage::UsageRecord::from_quota_input(
             crate::now_ms(),
             Some(model.to_string()),
             session,
@@ -590,7 +590,7 @@ async fn a_codex_model_refusal_is_capacity() {
     });
     post(
         Arc::clone(&manager),
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         r#"{"model":"gpt-6.1-sol","input":[]}"#,
     )
     .await;
@@ -677,7 +677,7 @@ async fn reviewer_spent_revalidation_window_is_not_routable_now() {
         None,
         "positive control: the spent window actually refuses this request"
     );
-    let document = crate::routing::document(&manager, now).unwrap();
+    let document = routing::document(&manager, now).unwrap();
     let document = serde_json::to_value(document).unwrap();
     assert_eq!(
         document["providers"][0]["models"][0]["routable"], false,
@@ -869,7 +869,7 @@ async fn response_catalogue_case(provider: Provider, streaming: bool, named: boo
     });
     let path = match provider {
         Provider::Anthropic => "/v1/messages",
-        Provider::Codex => crate::provider::CODEX_RESPONSES_PATH,
+        Provider::Codex => crate::base::provider::CODEX_RESPONSES_PATH,
     };
     let mut req = Request::builder().method(Method::POST).uri(path)
             .header(HOST,"127.0.0.1").header(CONTENT_TYPE,"application/json")
@@ -1035,7 +1035,7 @@ async fn reviewer_unmetered_terminal_keeps_metered_ledger_model() {
     });
     let mut req = Request::builder()
         .method(Method::POST)
-        .uri(crate::provider::CODEX_RESPONSES_PATH)
+        .uri(crate::base::provider::CODEX_RESPONSES_PATH)
         .header(HOST, "127.0.0.1")
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"input":[]}"#))
@@ -1108,7 +1108,7 @@ async fn reviewer_unmetered_terminal_keeps_priced_usage() {
     let manager = keyed(Config {
         pricing: std::collections::HashMap::from([(
             "gpt-metered".into(),
-            crate::pricing::PricingOverride {
+            crate::base::pricing::PricingOverride {
                 input: 1.0,
                 output: 1.0,
                 cache_write_5m: None,
@@ -1122,7 +1122,7 @@ async fn reviewer_unmetered_terminal_keeps_priced_usage() {
     });
     let mut req = Request::builder()
         .method(Method::POST)
-        .uri(crate::provider::CODEX_RESPONSES_PATH)
+        .uri(crate::base::provider::CODEX_RESPONSES_PATH)
         .header(HOST, "127.0.0.1")
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"input":[]}"#))

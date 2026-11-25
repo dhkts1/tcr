@@ -838,7 +838,7 @@ fn a_hostile_enrolment_label_is_refused_and_spends_nothing() {
 /// other mode is refused rather than trusted.
 ///
 /// Watched red: with the `.permissions(0o600)` line removed from
-/// `crate::config::write_atomic`, the first assertion reads 0644 (this box's
+/// `crate::base::config::write_atomic`, the first assertion reads 0644 (this box's
 /// umask) and fails.
 #[test]
 fn the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused() {

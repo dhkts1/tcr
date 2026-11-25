@@ -4,11 +4,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use tcr::cli::{self, validate_group_label_chars};
-use tcr::config::Config;
-use tcr::doctor::{no_proxy_entry_exempts, points_at_tcr};
+use tcr::base::config::Config;
 use tcr::proxy::{self, GROUP_HEADER_NAME};
-use tcr::{codex_route, live_client, status, tls};
+use tcr::verbs::cli::{self, validate_group_label_chars};
+use tcr::verbs::doctor::{no_proxy_entry_exempts, points_at_tcr};
+use tcr::{base::tls, proxy::live_client, status, verbs::codex_route};
 
 use super::ConfigFile;
 use super::server::load_config;
@@ -107,8 +107,8 @@ fn claude_command() -> std::process::Command {
 /// sentence, so nothing has been printed or read yet when it bails. Resolve before
 /// adding the nested-agent launchers to PATH, so they cannot resolve to themselves.
 fn codex_command() -> anyhow::Result<(std::process::Command, PathBuf)> {
-    let codex =
-        tcr::codex_local::find_codex().map_err(|miss| anyhow::anyhow!("{}", miss.sentence()))?;
+    let codex = tcr::clients::codex_local::find_codex()
+        .map_err(|miss| anyhow::anyhow!("{}", miss.sentence()))?;
     Ok((std::process::Command::new(&codex.path), codex.path))
 }
 
@@ -414,7 +414,7 @@ fn codex_launch(
 
 /// The line `tcr run --codex` prints before its banner when the running proxy pools codex but
 /// no Codex account in its pool can serve right now: why each is out, worded as tcr's own 429
-/// lists its gates but in Codex words ([`tcr::stats::describe_codex_gates`]), and when the first one
+/// lists its gates but in Codex words ([`tcr::records::stats::describe_codex_gates`]), and when the first one
 /// frees ([`proxy::at_utc`]), or that none reports when. `None` when a Codex account is in
 /// rotation, or when the pool holds none (the launch already said so).
 ///
@@ -425,9 +425,9 @@ fn codex_pool_preflight(
     payload: &status::StatusPayload,
     now: time::OffsetDateTime,
 ) -> Option<String> {
-    use tcr::stats::GateReason;
+    use tcr::records::stats::GateReason;
     let codex: Vec<&status::AccountStatus> = payload
-        .accounts_of(tcr::provider::Provider::Codex)
+        .accounts_of(tcr::base::provider::Provider::Codex)
         .collect();
     if codex.is_empty() || codex.iter().any(|row| row.gate == GateReason::Ok) {
         return None;
@@ -458,23 +458,23 @@ fn codex_pool_preflight(
     };
     Some(format!(
         "[tcr] no Codex account can serve right now{} — {tail}",
-        tcr::stats::describe_codex_gates(&tally)
+        tcr::records::stats::describe_codex_gates(&tally)
     ))
 }
 
 /// Does `config` hold a Codex account and no Claude account, in any state? Only then does
 /// `tcr run` ask the running proxy whether it holds a Claude account.
 fn holds_only_codex(config: &Config) -> bool {
-    config.holds_provider(tcr::provider::Provider::Codex)
-        && !config.holds_provider(tcr::provider::Provider::Anthropic)
+    config.holds_provider(tcr::base::provider::Provider::Codex)
+        && !config.holds_provider(tcr::base::provider::Provider::Anthropic)
 }
 
 /// The warning `tcr run` prints for a claude session when the running proxy on `port` holds
 /// Codex accounts and no Claude account: every request this session sends will be refused.
 /// `None` when the proxy lists any Claude account, or no account at all.
 fn no_claude_account_warning(port: u16, payload: &status::StatusPayload) -> Option<String> {
-    (payload.holds_provider(tcr::provider::Provider::Codex)
-        && !payload.holds_provider(tcr::provider::Provider::Anthropic))
+    (payload.holds_provider(tcr::base::provider::Provider::Codex)
+        && !payload.holds_provider(tcr::base::provider::Provider::Anthropic))
     .then(|| {
         format!(
             "[tcr] warning: the proxy on :{port} holds no Claude account, so it will refuse \
@@ -600,7 +600,7 @@ fn no_proxy_rewrites(
 const MIN_CLAUDE_VERSION_FOR_GROUP: (u64, u64, u64) = (2, 1, 227);
 const MIN_CLAUDE_VERSION_FOR_GROUP_STR: &str = "2.1.227";
 
-// `validate_group_label_chars` moved to `tcr::cli` (imported below) so
+// `validate_group_label_chars` moved to `tcr::verbs::cli` (imported below) so
 // `tcr group add`'s surgical write can reuse the same Phase 1 validator instead
 // of a second one drifting out of sync with this one.
 
@@ -633,9 +633,9 @@ fn validate_group(config: &Config, group: &str) -> anyhow::Result<()> {
         // such a group, since a label exists only while some account carries it.
         let has_claude = config
             .group_members(group)
-            .any(|account| account.provider == tcr::provider::Provider::Anthropic);
+            .any(|account| account.provider == tcr::base::provider::Provider::Anthropic);
         if !has_claude {
-            anyhow::bail!("{}", tcr::provider_guard::group_has_no_claude(group));
+            anyhow::bail!("{}", tcr::verbs::provider_guard::group_has_no_claude(group));
         }
         return Ok(());
     }

@@ -21,7 +21,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 use tcr::peer::noise;
 use tcr::peer::reach::{

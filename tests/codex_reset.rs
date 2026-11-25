@@ -177,13 +177,13 @@ impl ResetProxy {
             "accountUuid":"fake-account-private-sentinel","expiresAt":tcr::now_ms()+3_600_000}],
             "proxy":{"port":port,"apiKey":"fake-local-private-sentinel"},"upstream":origin.url(),"codexUpstream":origin.url()});
         std::fs::write(&config, serde_json::to_vec(&fleet).unwrap()).unwrap();
-        let fleet: tcr::config::Config = serde_json::from_value(fleet).unwrap();
-        let prober = tcr::probe::LiveUsageProber::new().with_codex_base(origin.url());
+        let fleet: tcr::base::config::Config = serde_json::from_value(fleet).unwrap();
+        let prober = tcr::records::probe::LiveUsageProber::new().with_codex_base(origin.url());
         let manager = tcr::manager::Manager::new(
             fleet,
-            Arc::new(tcr::oauth::NoRefresh),
+            Arc::new(tcr::clients::oauth::NoRefresh),
             Arc::new(prober),
-            Arc::new(tcr::warmer::LiveWarmer::new()),
+            Arc::new(tcr::clients::warmer::LiveWarmer::new()),
             None,
         );
         let app = tcr::proxy::app(manager).layer(axum::Extension(tcr::proxy::ClientAddr(

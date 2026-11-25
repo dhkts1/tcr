@@ -5,7 +5,7 @@ fn snapshot_with_counters() -> StatsSnapshot {
         accounts: vec![AccountSnapshot {
             slot: 0,
             name: "alice@example.com".to_string(),
-            provider: crate::provider::Provider::Anthropic,
+            provider: crate::base::provider::Provider::Anthropic,
             organization_type: Some("claude_team".to_string()),
             rate_limit_tier: Some("default_raven".to_string()),
             seat_tier: Some("team_standard".to_string()),
@@ -46,7 +46,7 @@ fn snapshot_with_counters() -> StatsSnapshot {
             codex: Default::default(),
         }],
         current: Some(0),
-        current_by_provider: crate::stats::CurrentByProvider::default(),
+        current_by_provider: crate::records::stats::CurrentByProvider::default(),
         recent: Vec::new(),
         sessions: Vec::new(),
         wire_sessions: vec![tcr_status_wire::SessionRow {
@@ -125,7 +125,7 @@ fn quota_v1_contains_only_anthropic_capacity() {
     let mut snapshot = snapshot_with_counters();
     let mut codex = snapshot.accounts[0].clone();
     codex.name = "bob@example.com/codex".into();
-    codex.provider = crate::provider::Provider::Codex;
+    codex.provider = crate::base::provider::Provider::Codex;
     snapshot.accounts.push(codex.clone());
     let payload = QuotaPayload::from_snapshot(&snapshot);
     assert_eq!(payload.kind, "tcr.quota.v1");
@@ -377,14 +377,14 @@ fn payload_without_a_build_field_parses_as_unknown() {
         serde_json::from_str(legacy).expect("an older server's payload still parses");
     assert_eq!(payload.kind, STATUS_KIND);
     assert_eq!(payload.build, BuildInfo::default());
-    assert_eq!(payload.build.sha, crate::build_info::UNKNOWN);
+    assert_eq!(payload.build.sha, crate::base::build_info::UNKNOWN);
 
     // A partial build object degrades per-field rather than failing the parse.
     let partial = r#"{"kind":"tcr.status.v1","accounts":[],"build":{"sha":"cd146ce"}}"#;
     let payload: StatusPayload = serde_json::from_str(partial).expect("partial build parses");
     assert_eq!(payload.build.sha, "cd146ce");
     assert_eq!(payload.build.dirty, None);
-    assert_eq!(payload.build.built_at, crate::build_info::UNKNOWN);
+    assert_eq!(payload.build.built_at, crate::base::build_info::UNKNOWN);
 }
 
 /// BACK-COMPAT, direction 2 — an OLD client reading a NEW server. The old
@@ -585,7 +585,7 @@ fn status_payload_without_control_parses() {
 /// `control` round-trips over the wire like every other field, and
 /// `skip_serializing_if` means an UNSET control account does not even
 /// appear on the wire (never a `null` literal) — the same "clear removes
-/// the key" contract [`crate::config::save_control_account`] uses on disk.
+/// the key" contract [`crate::base::config::save_control_account`] uses on disk.
 #[test]
 fn control_round_trips_and_absent_serializes_no_key() {
     let with_control = StatusPayload::from_snapshot(
@@ -634,12 +634,15 @@ fn provider_crosses_for_a_codex_row_and_is_absent_on_an_anthropic_one() {
     );
 
     let mut snapshot = snapshot_with_counters();
-    snapshot.accounts[0].provider = crate::provider::Provider::Codex;
+    snapshot.accounts[0].provider = crate::base::provider::Provider::Codex;
     let codex = StatusPayload::from_snapshot(&snapshot, &[0.85], false, None, Default::default());
     let wire = serde_json::to_string(&codex).expect("serialize");
     assert!(wire.contains("\"provider\":\"codex\""), "{wire}");
     let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
-    assert_eq!(back.accounts[0].provider, crate::provider::Provider::Codex);
+    assert_eq!(
+        back.accounts[0].provider,
+        crate::base::provider::Provider::Codex
+    );
 }
 
 /// `mitm` is tri-state on the wire. A payload `from_snapshot` builds carries
@@ -850,7 +853,7 @@ fn account_status_carries_every_codex_field_through_the_snapshot() {
         }),
     };
     let mut snapshot = snapshot_with_counters();
-    snapshot.accounts[0].provider = crate::provider::Provider::Codex;
+    snapshot.accounts[0].provider = crate::base::provider::Provider::Codex;
     snapshot.accounts[0].codex = facts.clone();
     snapshot.accounts[0].usage = Some(usage.clone());
 
@@ -929,7 +932,7 @@ fn account_status_carries_every_codex_field_through_the_snapshot() {
 #[test]
 fn an_empty_quota_windows_list_crosses_the_payload_as_a_fact() {
     let mut snapshot = snapshot_with_counters();
-    snapshot.accounts[0].provider = crate::provider::Provider::Codex;
+    snapshot.accounts[0].provider = crate::base::provider::Provider::Codex;
     snapshot.accounts[0].codex.quota_windows = Some(Vec::new());
 
     let wire = serde_json::to_value(StatusPayload::from_snapshot(
@@ -1059,7 +1062,7 @@ fn an_anthropic_account_status_serializes_with_no_new_key() {
     });
     assert_eq!(
         snapshot.accounts[0].provider,
-        crate::provider::Provider::Anthropic
+        crate::base::provider::Provider::Anthropic
     );
 
     let wire = serde_json::to_value(StatusPayload::from_snapshot(
@@ -1163,7 +1166,7 @@ fn only_a_current_server_answers_which_accounts_it_holds() {
     );
     let mut codex = payload.accounts[0].clone();
     codex.name = "bob@example.com/codex".to_string();
-    codex.provider = crate::provider::Provider::Codex;
+    codex.provider = crate::base::provider::Provider::Codex;
     payload.accounts.push(codex);
     payload.mitm = Some(MitmStatus {
         intercepted_hosts: Vec::new(),
@@ -1172,14 +1175,14 @@ fn only_a_current_server_answers_which_accounts_it_holds() {
 
     let names = |payload: &StatusPayload| {
         payload
-            .current_accounts_of(crate::provider::Provider::Codex)
+            .current_accounts_of(crate::base::provider::Provider::Codex)
             .map(|rows| rows.map(|row| row.name.clone()).collect::<Vec<_>>())
     };
     assert_eq!(
         names(&payload),
         Some(vec!["bob@example.com/codex".to_string()])
     );
-    assert!(payload.holds_provider(crate::provider::Provider::Anthropic));
+    assert!(payload.holds_provider(crate::base::provider::Provider::Anthropic));
     assert!(payload.lists_account("alice@example.com"));
     assert!(!payload.lists_account("carol@example.com"));
 
@@ -1196,7 +1199,7 @@ fn empty_snapshot() -> StatsSnapshot {
     StatsSnapshot {
         accounts: Vec::new(),
         current: None,
-        current_by_provider: crate::stats::CurrentByProvider::default(),
+        current_by_provider: crate::records::stats::CurrentByProvider::default(),
         recent: Vec::new(),
         sessions: Vec::new(),
         wire_sessions: Vec::new(),
@@ -1275,7 +1278,7 @@ fn the_serving_facts_write_the_pinned_status_document() {
     );
     // No key and the default upstream: the four keys that ride only with them are absent.
     assert_eq!(
-        document(crate::provider::CODEX_UPSTREAM, false),
+        document(crate::base::provider::CODEX_UPSTREAM, false),
         concat!(
             r#"{"kind":"tcr.status.v1","accounts":[],"#,
             r#""build":{"sha":"unknown","dirty":null,"builtAt":"unknown"},"#,

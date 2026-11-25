@@ -13,7 +13,7 @@
 //! # Isolation
 //!
 //! The proxy runs in THIS process ([`Manager::with_live_refresher`] behind
-//! [`tcr::mitm::serve`]) on a kernel-assigned port, so it starts no
+//! [`tcr::proxy::mitm::serve`]) on a kernel-assigned port, so it starts no
 //! probe, warm or refresh loop and sends nothing upstream. The `tcr` binary gets
 //! a scratch `HOME`, no `XDG_CACHE_HOME`, and `TCR_CLAUDE_CODE_CREDENTIALS`
 //! pointing at a file that does not exist, so it can read neither the real
@@ -74,7 +74,7 @@ async fn boot_after(
     )
     .expect("write the scratch config");
     before_load(&config);
-    let loaded = tcr::config::load(&config).expect("load the scratch config");
+    let loaded = tcr::base::config::load(&config).expect("load the scratch config");
     assert_eq!(
         loaded.upstream, "http://127.0.0.1:0",
         "Claude inference stays on the fixture's upstream"
@@ -85,7 +85,7 @@ async fn boot_after(
     );
     let manager = Manager::with_live_refresher(loaded, follows_file.then(|| config.clone()));
     let served = Arc::clone(&manager);
-    tokio::spawn(async move { tcr::mitm::serve(listener, served, None).await });
+    tokio::spawn(async move { tcr::proxy::mitm::serve(listener, served, None).await });
     Fleet {
         home,
         config,
@@ -263,11 +263,13 @@ async fn quota_state_does_not_change_a_delete() {
     for (idx, used) in [(0, 0.9), (1, 1.0)] {
         fleet.manager.apply_usage(
             idx,
-            &tcr::probe::Usage {
-                five_hour: tcr::probe::WindowReading::Read(tcr::probe::UsageBucket {
-                    utilization: Some(used),
-                    reset_at_ms: Some(reset),
-                }),
+            &tcr::records::probe::Usage {
+                five_hour: tcr::records::probe::WindowReading::Read(
+                    tcr::records::probe::UsageBucket {
+                        utilization: Some(used),
+                        reset_at_ms: Some(reset),
+                    },
+                ),
                 seven_day: None,
                 seven_day_oi: None,
                 extra_usage_usd: None,
@@ -312,7 +314,7 @@ async fn a_deleted_row_in_the_middle_shifts_no_other_rows_threshold() {
         2,
         OffsetDateTime::now_utc(),
         None,
-        tcr::stats::SessionKind::Fallback,
+        tcr::records::stats::SessionKind::Fallback,
     );
     delete_and_expect(
         &fleet,
@@ -636,7 +638,7 @@ async fn a_login_after_a_delete_brings_the_account_back_serving() {
     )
     .await;
     delete_and_expect(&fleet, "alice@example.com", &["bob@example.com"]).await;
-    let login: tcr::config::Account =
+    let login: tcr::base::config::Account =
         serde_json::from_str(&oauth("alice@example.com", "")).unwrap();
     fleet.manager.add_or_update_account(login);
     let rows = poll(&fleet).await;
@@ -942,7 +944,7 @@ async fn an_old_shape_codex_row_is_replaced_live_and_comes_back_after_a_delete()
     .await;
     delete_and_expect(&fleet, "carol@example.com", &["dana@example.com"]).await;
 
-    let login = |codex_home: &str| -> tcr::config::Account {
+    let login = |codex_home: &str| -> tcr::base::config::Account {
         serde_json::from_str(&codex(
             "carol@example.com",
             "cccccccc-cccc-4ccc-8ccc-cccccccccccc",

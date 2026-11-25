@@ -30,7 +30,7 @@ async fn send_codex_turn(manager: &Arc<Manager>) -> Response {
     drive_full(
         Arc::clone(manager),
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -49,7 +49,7 @@ fn refusals(manager: &Manager) -> (u64, Option<CodexRefusalKind>) {
 
 #[tokio::test]
 async fn codex_error_responses_keep_status_content_type_and_retry_after() {
-    use crate::provider::Provider;
+    use crate::base::provider::Provider;
 
     let now = OffsetDateTime::now_utc();
     let mut config = codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9");
@@ -149,7 +149,7 @@ async fn every_codex_refusal_tcr_sends_bumps_the_refused_ring() {
     let manager = Manager::with_live_refresher(config, None);
     let now = OffsetDateTime::now_utc();
     manager.edit_quota_for_test(1, |quota| {
-        quota.seven_day = Some(crate::quota::QuotaWindow {
+        quota.seven_day = Some(crate::records::quota::QuotaWindow {
             utilization: 1.0,
             reset: Some(now + time::Duration::seconds(300)),
         });
@@ -220,7 +220,7 @@ async fn a_routed_codex_relay_bumps_the_unpooled_ring() {
     let (status, _) = drive(
         Arc::clone(&manager),
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -249,7 +249,7 @@ async fn a_routed_codex_relay_bumps_the_unpooled_ring() {
     let (status, _) = drive(
         Arc::clone(&manager),
         Method::GET,
-        crate::provider::CODEX_USAGE_PATH,
+        crate::base::provider::CODEX_USAGE_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -287,7 +287,7 @@ async fn the_status_document_carries_codex_traffic_and_a_non_default_upstream() 
     assert_eq!(payload.codex_upstream.as_deref(), Some("http://codex.test"));
 
     let manager = Manager::with_live_refresher(
-        codex_fleet("http://127.0.0.1:9", crate::provider::CODEX_UPSTREAM),
+        codex_fleet("http://127.0.0.1:9", crate::base::provider::CODEX_UPSTREAM),
         None,
     );
     let (status, _, body) = status_request(manager, Method::GET, Some(loopback_peer()), None).await;
@@ -359,7 +359,7 @@ async fn the_status_document_reports_log_mode_and_counts_an_unkeyed_request() {
 #[tokio::test]
 async fn a_live_delete_of_the_last_codex_account_reads_as_no_codex_account() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join(crate::paths::CONFIG_FILE);
+    let path = dir.path().join(crate::base::paths::CONFIG_FILE);
     let config = codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9");
     let write = |accounts: &[Account]| {
         std::fs::write(
@@ -413,7 +413,7 @@ async fn a_live_delete_of_the_last_codex_account_reads_as_no_codex_account() {
         .filter(|row| row.provider == Provider::Codex)
         .count();
     assert_eq!(codex_rows, 0, "the document no longer lists bob");
-    let route = crate::codex_route::codex_route(
+    let route = crate::verbs::codex_route::codex_route(
         Ok(&payload),
         3999,
         std::path::Path::new("/tmp/tcr-run-test/tcr-ca.pem"),
@@ -422,7 +422,7 @@ async fn a_live_delete_of_the_last_codex_account_reads_as_no_codex_account() {
     );
     assert_eq!(
         route.code.as_deref(),
-        Some(crate::codex_route::NO_CODEX_ACCOUNT)
+        Some(crate::verbs::codex_route::NO_CODEX_ACCOUNT)
     );
 
     let response = send_codex_turn(&manager).await;
@@ -436,7 +436,7 @@ async fn a_live_delete_of_the_last_codex_account_reads_as_no_codex_account() {
 #[tokio::test]
 async fn deleting_the_last_claude_account_returns_the_no_account_message() {
     let dir = tempfile::tempdir().expect("temporary config");
-    let path = dir.path().join(crate::paths::CONFIG_FILE);
+    let path = dir.path().join(crate::base::paths::CONFIG_FILE);
     let config = codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9");
     let write = |accounts: &[Account]| {
         std::fs::write(
@@ -706,7 +706,7 @@ async fn codex_model_failover_times_the_first_byte_the_client_receives() {
     let response = drive_full(
         manager,
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[("content-type", "application/json")],
         r#"{"model":"gpt-6.1-sol","input":[]}"#,
@@ -761,7 +761,7 @@ async fn codex_model_refusals_try_a_supporting_sibling_without_benching_free() {
             let response = drive_full(
                 Arc::clone(&manager),
                 Method::POST,
-                crate::provider::CODEX_RESPONSES_PATH,
+                crate::base::provider::CODEX_RESPONSES_PATH,
                 Some(loopback_peer()),
                 &[
                     ("authorization", "Bearer client-own"),
@@ -818,7 +818,7 @@ async fn codex_model_refusals_explain_an_unavailable_supporting_account() {
         let response = drive_full(
             Arc::clone(&manager),
             Method::POST,
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             Some(loopback_peer()),
             &[
                 ("authorization", "Bearer client-own"),
@@ -1354,7 +1354,7 @@ async fn codex_failed_stream_limits_move_the_next_pinned_turn() {
                 use tower::ServiceExt as _;
                 let mut request = Request::builder()
                     .method(Method::POST)
-                    .uri(crate::provider::CODEX_RESPONSES_PATH)
+                    .uri(crate::base::provider::CODEX_RESPONSES_PATH)
                     .header("authorization", "Bearer client-own")
                     .header(CONTENT_TYPE, "application/json")
                     .header("session-id", "test-stream-quota-session")
@@ -1474,7 +1474,8 @@ async fn unusable_codex_siblings_do_not_hide_a_spent_pools_reset() {
         let body = serde_json::json!({"error":{"type":"usage_limit_reached", "resets_at":reset}})
             .to_string();
         let refusal =
-            crate::quota::CodexQuotaRefusal::parse(&headers, body.as_bytes(), now).unwrap();
+            crate::records::quota::CodexQuotaRefusal::parse(&headers, body.as_bytes(), now)
+                .unwrap();
         manager.update_quota_with_codex_refusal(1, &headers, 429, Some(&refusal));
         manager.mark_codex_quota_limited(1, 3 * 86400);
         let response = exhausted_response(&manager, now, 2, false, Provider::Codex, None, None);
@@ -1498,7 +1499,7 @@ async fn codex_refusal_probe_releases_the_account_hold() {
         None,
     );
     let headers = HeaderMap::new();
-    let refusal = crate::quota::CodexQuotaRefusal::parse(
+    let refusal = crate::records::quota::CodexQuotaRefusal::parse(
         &headers,
         br#"{"error":{"type":"insufficient_quota"}}"#,
         OffsetDateTime::now_utc(),
@@ -1508,8 +1509,8 @@ async fn codex_refusal_probe_releases_the_account_hold() {
     manager.mark_codex_quota_limited(1, 6 * 86400);
     manager.apply_usage(
         1,
-        &crate::probe::Usage {
-            codex: Some(crate::codex_probe::CodexProbeFacts {
+        &crate::records::probe::Usage {
+            codex: Some(crate::records::codex_probe::CodexProbeFacts {
                 allowed: Some(true),
                 limit_reached: Some(false),
                 ..Default::default()
@@ -1630,7 +1631,8 @@ async fn check_codex_quota_body_case(
                 )
                 .header("x-codex-primary-reset-at", (reset + 3600).to_string());
             if reached_header {
-                response = response.header(crate::quota::CODEX_REACHED_TYPE_HEADER, "primary");
+                response =
+                    response.header(crate::records::quota::CODEX_REACHED_TYPE_HEADER, "primary");
             }
             response.body(Body::from(reply)).unwrap()
         }

@@ -2,8 +2,8 @@
 
 use super::select_test_support::{account, live_manager, pin};
 use super::*;
-use crate::config::Account;
-use crate::quota::QuotaWindow;
+use crate::base::config::Account;
+use crate::records::quota::QuotaWindow;
 use std::collections::HashSet;
 
 fn config_with(accounts: Vec<Account>, tier_hours: u32) -> Config {

@@ -187,7 +187,7 @@ async fn a_carried_response_never_hands_the_client_the_serving_accounts_headers(
         stream.flush().await.expect("flush");
     });
 
-    let response = tcr::http_client::builder()
+    let response = tcr::base::http_client::builder()
         .no_proxy()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -557,7 +557,7 @@ async fn a_mismatched_sni_closes_the_carry() {
     // A real ClientHello for the WRONG name, produced by a real client: the
     // point is a handshake this gateway was not asked to carry, not a
     // hand-written byte string only this parser would accept.
-    let wrong = tcr::http_client::builder()
+    let wrong = tcr::base::http_client::builder()
         .no_proxy()
         .resolve(
             "platform.claude.com",
@@ -635,7 +635,7 @@ async fn a_carry_that_sends_no_client_hello_is_closed_on() {
 async fn the_sni_parser_reads_a_real_client_hello() {
     let listener = loopback().await;
     let port = listener.local_addr().expect("the address").port();
-    let client = tcr::http_client::builder()
+    let client = tcr::base::http_client::builder()
         .no_proxy()
         .resolve(ORIGIN, SocketAddr::from(([127, 0, 0, 1], port)))
         .build()

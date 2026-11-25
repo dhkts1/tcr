@@ -202,7 +202,7 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
     let (borrower_origin, borrower_hits, borrower_served) = fleet::spawn_origin().await;
     let provider = PeerLeaseProvider::new(borrower_peers.clone()).with_hand_egress(
         borrower_origin,
-        tcr::http_client::builder().build().unwrap(),
+        tcr::base::http_client::builder().build().unwrap(),
     );
 
     // The first ask is what mints the lease and opens the session the bearer
@@ -510,7 +510,7 @@ async fn a_handed_request_carries_its_query_string_to_the_owners_upstream() {
         .expect("the handed-token store")
         .put(lease_id, "not-a-real-owner-token".to_string(), now + 60_000);
 
-    let client = tcr::http_client::builder()
+    let client = tcr::base::http_client::builder()
         .no_proxy()
         .build()
         .expect("a client");
@@ -639,7 +639,7 @@ async fn a_relay_outside_the_grants_hours_is_refused_rather_than_served() {
 async fn the_account_set_header_is_ignored_on_a_request_that_crossed_no_mac() {
     let (upstream, hits, _served) = fleet::spawn_upstream().await;
     let proxy = fleet::spawn_proxy(fleet::lending_manager(&upstream, Default::default())).await;
-    let client = tcr::http_client::builder()
+    let client = tcr::base::http_client::builder()
         .no_proxy()
         .build()
         .expect("a loopback client");
@@ -726,7 +726,7 @@ async fn codex_path_in_a_frame_is_refused_by_the_lender() {
         peer_addr,
         &pair.lender_key,
         &pair.borrower_key,
-        hostile_request("POST", tcr::provider::CODEX_RESPONSES_PATH),
+        hostile_request("POST", tcr::base::provider::CODEX_RESPONSES_PATH),
     )
     .await;
 

@@ -38,20 +38,20 @@ mod peer_support;
 use peer_support::{Collector, Node, dial_and_open, loopback, node};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use tcr::config::{Account, Config};
+use tcr::base::config::{Account, Config};
+use tcr::clients::oauth::{OAuthError, RefreshFuture, TokenRefresher};
+use tcr::clients::warmer::{AccountWarmer, WarmError, WarmFuture};
 use tcr::manager::Manager;
-use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
 use tcr::peer::config::{Allow, Endpoint, EndpointSource, PeerFile, PeerRow, ViaSetting};
 use tcr::peer::listener;
 use tcr::peer::noise;
 use tcr::peer::tunnel::egress::{self, GatewayCandidate};
 use tcr::peer::tunnel::{self, Admission, Carry, OriginRoute, TunnelBudget};
-use tcr::probe::{ProbeError, ProbeFuture, UsageProber};
-use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
+use tcr::records::probe::{ProbeError, ProbeFuture, UsageProber};
 use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -424,7 +424,7 @@ fn fake_origin_on(
 /// A client that trusts the fake origin's CA and resolves [`ORIGIN`] to the
 /// loopback splice. Everything else is what `src/peer/egress.rs` builds.
 fn carried_client(origin: &Origin, splice_port: u16) -> reqwest::Client {
-    tcr::http_client::builder()
+    tcr::base::http_client::builder()
         .no_proxy()
         // A carry that is broken rather than refused would otherwise hang this
         // suite: a mutation that dropped the first record turned a red test
@@ -525,14 +525,18 @@ fn capture() -> (Collector, tracing::subscriber::DefaultGuard) {
 
 struct NeverRefreshes;
 impl TokenRefresher for NeverRefreshes {
-    fn refresh(&self, _provider: tcr::provider::Provider, _refresh_token: String) -> RefreshFuture {
+    fn refresh(
+        &self,
+        _provider: tcr::base::provider::Provider,
+        _refresh_token: String,
+    ) -> RefreshFuture {
         Box::pin(async { Err(OAuthError::Transient("no refresher in egress tests".into())) })
     }
 }
 
 struct NeverProbes;
 impl UsageProber for NeverProbes {
-    fn probe(&self, _credential: tcr::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, _credential: tcr::records::probe::ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Err(ProbeError {
                 status: None,
@@ -619,7 +623,7 @@ fn carried_answer(
         account_idx: 0,
         account: Some("alice@example.com".to_string()),
         session_key: None,
-        session_kind: tcr::stats::SessionKind::Stable,
+        session_kind: tcr::records::stats::SessionKind::Stable,
         wire_session_id: None,
         model: None,
         method: "POST".to_string(),

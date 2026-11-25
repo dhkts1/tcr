@@ -1290,7 +1290,7 @@ fn peer_ls_fixture_document() -> tcr::peer::status::ls::PeerLsJson {
         &[(
             "alice@example.com".to_string(),
             vec!["work".to_string()],
-            tcr::provider::Provider::Anthropic,
+            tcr::base::provider::Provider::Anthropic,
         )],
     );
 

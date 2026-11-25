@@ -135,7 +135,7 @@ impl PhaseResult {
                 self.live_path_mentions
             ));
         }
-        if self.bound_tokens_restored != Some(tcr::bound_tokens::BOUND_TOKEN_CAP) {
+        if self.bound_tokens_restored != Some(tcr::stores::bound_tokens::BOUND_TOKEN_CAP) {
             out.push(format!(
                 "the bound-token map did not boot at its cap ({:?} restored)",
                 self.bound_tokens_restored
@@ -481,7 +481,7 @@ mod tests {
             upstream_requests: 1,
             upstream_max_per_s: 1,
             fleet_ceiling_per_s: Some(42),
-            bound_tokens_restored: Some(tcr::bound_tokens::BOUND_TOKEN_CAP),
+            bound_tokens_restored: Some(tcr::stores::bound_tokens::BOUND_TOKEN_CAP),
             unexpected_upstream_paths: BTreeMap::new(),
             untagged_upstream_requests: 0,
             refused_connects: 0,

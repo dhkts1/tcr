@@ -6,16 +6,16 @@ use std::env;
 use std::sync::Arc;
 
 use proptest::prelude::*;
-use tcr::config::{Account, Config};
+use tcr::base::config::{Account, Config};
+use tcr::clients::oauth::{OAuthError, RefreshFuture, TokenRefresher};
+use tcr::clients::warmer::{AccountWarmer, WarmError, WarmFuture};
 use tcr::manager::Manager;
-use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
 use tcr::peer::config::schedule::{Hhmm, Schedule};
 use tcr::peer::discovery;
 use tcr::peer::lease::schedule_refusal;
 use tcr::peer::listener::{Admission, KNOCK_BURST, KNOCK_INTERVAL_MS};
 use tcr::peer::serve::relay_path_is_routable;
-use tcr::probe::{ProbeError, ProbeFuture, UsageProber};
-use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
+use tcr::records::probe::{ProbeError, ProbeFuture, UsageProber};
 use tcr_peer_wire::LeaseRefusal;
 
 fn cases() -> u32 {
@@ -212,14 +212,18 @@ const GUARD: f64 = SWITCH_THRESHOLD - CONTROL_RESERVE;
 
 struct NeverRefreshes;
 impl TokenRefresher for NeverRefreshes {
-    fn refresh(&self, _provider: tcr::provider::Provider, _refresh_token: String) -> RefreshFuture {
+    fn refresh(
+        &self,
+        _provider: tcr::base::provider::Provider,
+        _refresh_token: String,
+    ) -> RefreshFuture {
         Box::pin(async { Err(OAuthError::Transient("no refresher in prop tests".into())) })
     }
 }
 
 struct NeverProbes;
 impl UsageProber for NeverProbes {
-    fn probe(&self, _credential: tcr::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, _credential: tcr::records::probe::ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Err(ProbeError {
                 status: None,

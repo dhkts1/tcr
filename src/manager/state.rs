@@ -3,7 +3,7 @@
 use super::*;
 
 impl Manager {
-    /// See [`crate::config::Config::probe_interval_seconds`].
+    /// See [`crate::base::config::Config::probe_interval_seconds`].
     pub fn probe_interval_seconds(&self) -> u64 {
         self.config
             .lock()
@@ -11,7 +11,7 @@ impl Manager {
             .probe_interval_seconds()
     }
 
-    /// See [`crate::config::Config::warmup_interval_seconds`].
+    /// See [`crate::base::config::Config::warmup_interval_seconds`].
     pub fn warmup_interval_seconds(&self) -> u64 {
         self.config
             .lock()
@@ -27,7 +27,7 @@ impl Manager {
     /// and the client-side prompt-cache hit ratio dropped 0.952 → 0.498 with
     /// `cache_creation` rising 6.5M/hour → 122M/hour, sustained seven hours — a
     /// single missing key costing roughly 100M re-created tokens per hour.
-    /// The read itself is [`crate::config::Config::session_affinity_enabled`],
+    /// The read itself is [`crate::base::config::Config::session_affinity_enabled`],
     /// which `tcr config show` calls too. When explicitly
     /// disabled, the hybrid server injects no `SessionKey` extension, so
     /// `select` always receives `affinity = None` and the disabled path is
@@ -39,7 +39,7 @@ impl Manager {
             .session_affinity_enabled()
     }
 
-    /// See [`crate::config::Config::revalidation_serve_enabled`].
+    /// See [`crate::base::config::Config::revalidation_serve_enabled`].
     pub fn revalidation_serve_enabled(&self) -> bool {
         self.config
             .lock()
@@ -47,7 +47,7 @@ impl Manager {
             .revalidation_serve_enabled()
     }
 
-    /// See [`crate::config::Config::load_balance_migration_enabled`].
+    /// See [`crate::base::config::Config::load_balance_migration_enabled`].
     pub fn load_balance_migration_enabled(&self) -> bool {
         self.config
             .lock()
@@ -55,7 +55,7 @@ impl Manager {
             .load_balance_migration_enabled()
     }
 
-    /// See [`crate::config::Config::cache_ttl_rewrite_enabled`].
+    /// See [`crate::base::config::Config::cache_ttl_rewrite_enabled`].
     pub fn cache_ttl_rewrite_enabled(&self) -> bool {
         self.config
             .lock()
@@ -63,7 +63,7 @@ impl Manager {
             .cache_ttl_rewrite_enabled()
     }
 
-    /// See [`crate::config::Config::divert_budget`].
+    /// See [`crate::base::config::Config::divert_budget`].
     pub fn divert_budget(&self) -> u32 {
         self.config
             .lock()
@@ -106,7 +106,7 @@ impl Manager {
     /// Deleted slots never count: they cannot serve another request. Refresh the file's
     /// account list before counting so a request sees a completed live delete before selection
     /// runs. An in-flight file writer is never waited on by the request path.
-    pub fn provider_account_count(&self, provider: crate::provider::Provider) -> usize {
+    pub fn provider_account_count(&self, provider: crate::base::provider::Provider) -> usize {
         self.reload_groups_if_changed();
         self.accounts
             .read()
@@ -119,7 +119,10 @@ impl Manager {
 
     /// The live locked slot, when the lock belongs to this request's provider.
     /// A lock never disables another provider's independent pool.
-    pub(crate) fn locked_account_for(&self, provider: crate::provider::Provider) -> Option<usize> {
+    pub(crate) fn locked_account_for(
+        &self,
+        provider: crate::base::provider::Provider,
+    ) -> Option<usize> {
         let idx = self.locked_idx?;
         self.account(idx, |account| {
             !account.removed && account.provider == provider
@@ -238,7 +241,7 @@ impl Manager {
     }
 
     /// Account `idx`'s exit lock, parsed once out of the config row that
-    /// carries it. See [`crate::config::Account::egress_pin`].
+    /// carries it. See [`crate::base::config::Account::egress_pin`].
     ///
     /// Read from `self.config` and not from the runtime row beside
     /// [`Self::access_token`], because the runtime row holds what this process
@@ -278,13 +281,13 @@ impl Manager {
 
     /// A slot's immutable provider, including retired slots. Bound history still
     /// needs this identity to release a conversation through its normal warning path.
-    pub fn provider(&self, idx: usize) -> Option<crate::provider::Provider> {
+    pub fn provider(&self, idx: usize) -> Option<crate::base::provider::Provider> {
         self.account(idx, |a| a.provider)
     }
 
     /// A provider only while its slot remains live. Rotation counts must match
     /// `provider_account_count`, which excludes retired rows.
-    pub(crate) fn live_provider(&self, idx: usize) -> Option<crate::provider::Provider> {
+    pub(crate) fn live_provider(&self, idx: usize) -> Option<crate::base::provider::Provider> {
         self.account(idx, |account| {
             (!account.removed).then_some(account.provider)
         })
@@ -305,8 +308,8 @@ mod tests {
             ]}"#,
         );
         for (idx, provider) in [
-            crate::provider::Provider::Anthropic,
-            crate::provider::Provider::Codex,
+            crate::base::provider::Provider::Anthropic,
+            crate::base::provider::Provider::Codex,
         ]
         .into_iter()
         .enumerate()

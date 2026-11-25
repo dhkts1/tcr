@@ -121,16 +121,18 @@ impl Manager {
         self.control_pooled
     }
 
-    /// The boot-time `controlIdentity` snapshot — see [`crate::control_identity`].
+    /// The boot-time `controlIdentity` snapshot — see [`crate::clients::control_identity`].
     pub const fn control_identity(&self) -> config::ControlIdentityMode {
         self.control_identity
     }
 
     /// The identity the control account must be checked against: its `name`
     /// and `accountUuid`. `None` when no control account is set.
-    pub fn control_identity_target(&self) -> Option<crate::control_identity::ControlIdentity> {
+    pub fn control_identity_target(
+        &self,
+    ) -> Option<crate::clients::control_identity::ControlIdentity> {
         let idx = self.control()?;
-        self.account(idx, |a| crate::control_identity::ControlIdentity {
+        self.account(idx, |a| crate::clients::control_identity::ControlIdentity {
             name: a.name.clone(),
             account_uuid: a.account_uuid.clone(),
         })
@@ -138,14 +140,14 @@ impl Manager {
 
     /// The `controlIdentity` question the proxy asks of a client bearer: is it
     /// signed in as an account other than the control account? `Some` only on a
-    /// [`Verdict::Mismatch`](crate::control_identity::Verdict); `None` when no
+    /// [`Verdict::Mismatch`](crate::clients::control_identity::Verdict); `None` when no
     /// control account is set, when the bearer did not resolve (logged at debug,
     /// fail-open), or when it matches. The bearer is resolved through
     /// `{upstream}/api/oauth/profile` and cached in `client_identities`; the
     /// first-warning flag is taken only on a mismatch, so a matching client never
     /// spends it.
     pub async fn foreign_client(&self, bearer: &str) -> Option<ForeignClient> {
-        use crate::control_identity::{Verdict, verdict};
+        use crate::clients::control_identity::{Verdict, verdict};
 
         let control = self.control_identity_target()?;
         let profile_url = format!("{}/api/oauth/profile", self.upstream());
@@ -159,7 +161,7 @@ impl Manager {
             return None;
         };
         Some(ForeignClient {
-            control_email: crate::identity::email_of(&control.name).to_string(),
+            control_email: crate::base::identity::email_of(&control.name).to_string(),
             client_shown: client.display(),
             first_warning: self.client_identities.first_warning(bearer).await,
         })
@@ -243,7 +245,7 @@ impl Manager {
                 // Carries the account's provider for the reason
                 // `set_disabled`'s probe does: `save_control_account`
                 // checks the row through `config::locate_account_entry`.
-                crate::identity::probe(
+                crate::base::identity::probe(
                     a.provider,
                     &a.name,
                     a.account_uuid.clone(),
@@ -281,14 +283,14 @@ impl Manager {
             match match_listed(&accounts[..], query) {
                 // Refused here as boot ignores it (see `assemble`): a `match`, so a third
                 // provider decides this too instead of inheriting an answer.
-                crate::identity::Match::One(idx) => match accounts[idx].provider {
-                    crate::provider::Provider::Anthropic => (idx, accounts[idx].name.clone()),
-                    crate::provider::Provider::Codex => {
+                crate::base::identity::Match::One(idx) => match accounts[idx].provider {
+                    crate::base::provider::Provider::Anthropic => (idx, accounts[idx].name.clone()),
+                    crate::base::provider::Provider::Codex => {
                         return SetControlOutcome::CodexAccount(accounts[idx].name.clone());
                     }
                 },
-                crate::identity::Match::None => return SetControlOutcome::NoMatch,
-                crate::identity::Match::Ambiguous(names) => {
+                crate::base::identity::Match::None => return SetControlOutcome::NoMatch,
+                crate::base::identity::Match::Ambiguous(names) => {
                     return SetControlOutcome::Ambiguous(names);
                 }
             }

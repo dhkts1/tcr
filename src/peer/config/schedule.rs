@@ -17,7 +17,7 @@
 //! There is no `tz` field: the schedule is evaluated against the offset this
 //! *host* is in at the instant being checked, the same
 //! `UtcOffset::local_offset_at(..).unwrap_or(UtcOffset::UTC)` pattern
-//! `src/usage.rs`'s [`crate::usage::local_day`] already uses, DST-
+//! `src/usage.rs`'s [`crate::records::usage::local_day`] already uses, DST-
 //! correct per instant, and this crate's multithreaded-soundness guard (which
 //! *can* make the lookup fail, depending on the platform and how many threads
 //! have already started) falls back to UTC rather than refusing every lease

@@ -1,6 +1,6 @@
 //! The one order a targeted config write and its in-memory mirror run in.
 //!
-//! A surgical writer in [`crate::config`] changes one key of the file; the
+//! A surgical writer in [`crate::base::config`] changes one key of the file; the
 //! running `Manager` then mirrors that key into its `Config` snapshot. Three
 //! invariants hold the two together, and [`Manager::write_through`] is where
 //! they live:
@@ -25,7 +25,7 @@
 use std::path::Path;
 use std::sync::PoisonError;
 
-use crate::config::{self, Config, ConfigError};
+use crate::base::config::{self, Config, ConfigError};
 
 use crate::manager::Manager;
 

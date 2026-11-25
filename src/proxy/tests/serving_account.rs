@@ -18,9 +18,13 @@ async fn account_uuid_is_rewritten_to_the_serving_account_on_a_real_request() {
     const ACCT_UUID: &str = "22222222-2222-2222-2222-222222222222"; // both 36 chars
 
     struct NoRefresh;
-    impl crate::oauth::TokenRefresher for NoRefresh {
-        fn refresh(&self, _provider: Provider, _t: String) -> crate::oauth::RefreshFuture {
-            Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+    impl crate::clients::oauth::TokenRefresher for NoRefresh {
+        fn refresh(&self, _provider: Provider, _t: String) -> crate::clients::oauth::RefreshFuture {
+            Box::pin(async {
+                Err(crate::clients::oauth::OAuthError::Transient(
+                    "unused".into(),
+                ))
+            })
         }
     }
 
@@ -64,8 +68,8 @@ async fn account_uuid_is_rewritten_to_the_serving_account_on_a_real_request() {
     let manager = Manager::new(
         config,
         Arc::new(NoRefresh),
-        Arc::new(crate::probe::LiveUsageProber::new()),
-        Arc::new(crate::warmer::LiveWarmer::new()),
+        Arc::new(crate::records::probe::LiveUsageProber::new()),
+        Arc::new(crate::clients::warmer::LiveWarmer::new()),
         None,
     );
     let inner = format!(r#"{{"account_uuid":"{CLIENT_UUID}","subscriptionType":"pro"}}"#);
@@ -122,9 +126,13 @@ async fn account_uuid_is_rewritten_to_the_serving_account_on_a_real_request() {
 #[tokio::test]
 async fn same_user_id_pins_one_account_and_surfaces_cache_read() {
     struct NoRefresh;
-    impl crate::oauth::TokenRefresher for NoRefresh {
-        fn refresh(&self, _provider: Provider, _t: String) -> crate::oauth::RefreshFuture {
-            Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+    impl crate::clients::oauth::TokenRefresher for NoRefresh {
+        fn refresh(&self, _provider: Provider, _t: String) -> crate::clients::oauth::RefreshFuture {
+            Box::pin(async {
+                Err(crate::clients::oauth::OAuthError::Transient(
+                    "unused".into(),
+                ))
+            })
         }
     }
 
@@ -142,8 +150,8 @@ async fn same_user_id_pins_one_account_and_surfaces_cache_read() {
     let manager = Manager::new(
         config,
         Arc::new(NoRefresh),
-        Arc::new(crate::probe::LiveUsageProber::new()),
-        Arc::new(crate::warmer::LiveWarmer::new()),
+        Arc::new(crate::records::probe::LiveUsageProber::new()),
+        Arc::new(crate::clients::warmer::LiveWarmer::new()),
         None,
     );
 
@@ -619,7 +627,7 @@ async fn codex_refusal_logs_only_allowlisted_evidence() {
             let response = drive_full(
                 manager,
                 Method::POST,
-                crate::provider::CODEX_RESPONSES_PATH,
+                crate::base::provider::CODEX_RESPONSES_PATH,
                 Some(loopback_peer()),
                 &[
                     ("content-type", "application/json"),

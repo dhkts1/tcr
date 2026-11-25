@@ -12,8 +12,8 @@ use serde_json::Value;
 use tcr_status_wire::CodexRefusalKind;
 use time::OffsetDateTime;
 
+use crate::base::provider::Provider;
 use crate::manager::Manager;
-use crate::provider::Provider;
 
 use super::client_error::{ClientError, ErrorKind};
 use super::{

@@ -42,17 +42,17 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 use axum::Router;
 use axum::body::Body;
 use axum::response::Response;
 use axum::routing::any;
-use tcr::config::{Account, Config, ProxyConfig, ThrottleConfig};
+use tcr::base::config::{Account, Config, ProxyConfig, ThrottleConfig};
+use tcr::clients::oauth::{OAuthError, RefreshFuture, TokenRefresher};
+use tcr::clients::warmer::{AccountWarmer, WarmError, WarmFuture};
 use tcr::manager::Manager;
-use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
-use tcr::probe::{ProbeError, ProbeFuture, UsageProber};
-use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
+use tcr::records::probe::{ProbeError, ProbeFuture, UsageProber};
 
 // ---------------------------------------------------------------------------
 // Stubs — nothing here ever reaches the network.
@@ -60,7 +60,11 @@ use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
 
 struct NeverRefreshes;
 impl TokenRefresher for NeverRefreshes {
-    fn refresh(&self, _provider: tcr::provider::Provider, _refresh_token: String) -> RefreshFuture {
+    fn refresh(
+        &self,
+        _provider: tcr::base::provider::Provider,
+        _refresh_token: String,
+    ) -> RefreshFuture {
         Box::pin(async {
             Err(OAuthError::Transient(
                 "no refresher in throttle tests".into(),
@@ -71,7 +75,7 @@ impl TokenRefresher for NeverRefreshes {
 
 struct NeverProbes;
 impl UsageProber for NeverProbes {
-    fn probe(&self, _credential: tcr::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, _credential: tcr::records::probe::ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Err(ProbeError {
                 status: None,
@@ -303,7 +307,7 @@ async fn spawn_proxy(manager: Arc<Manager>) -> String {
         .expect("bind proxy");
     let addr = listener.local_addr().expect("proxy addr");
     tokio::spawn(async move {
-        tcr::mitm::serve(listener, manager, None).await;
+        tcr::proxy::mitm::serve(listener, manager, None).await;
     });
     format!("http://{addr}")
 }

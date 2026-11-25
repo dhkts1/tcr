@@ -2,7 +2,7 @@
 //! it at boot.
 //!
 //! The file format, the identity resolution and the expiry rule live in
-//! [`crate::affinity`]; this is only the bridge between that file and the live
+//! [`crate::stores::affinity`]; this is only the bridge between that file and the live
 //! `Manager::affinity` map. Two things it is responsible for and the store is
 //! not:
 //!
@@ -17,10 +17,10 @@
 
 use std::path::Path;
 
-use crate::affinity::{self, LoadReport, StoredPin};
-use crate::config::ConfigError;
-use crate::identity;
-use crate::save_gate::SaveOutcome;
+use crate::base::config::ConfigError;
+use crate::base::identity;
+use crate::stores::affinity::{self, LoadReport, StoredPin};
+use crate::stores::save_gate::SaveOutcome;
 
 use crate::manager::{Manager, WarmWindow};
 
@@ -40,7 +40,7 @@ impl Manager {
     }
 
     /// Record whether `key`'s most recent request asked Anthropic's cache for
-    /// the extended `"ttl":"1h"` window (see [`crate::cache_ttl`]). Called from
+    /// the extended `"ttl":"1h"` window (see [`crate::records::cache_ttl`]). Called from
     /// the request path once per request, before `select()`, which reads it
     /// back through [`Self::warm_window`]; the persistence bridge below reads
     /// it too. A request that does NOT ask for the extended window clears
@@ -166,7 +166,7 @@ impl Manager {
     }
 
     /// The flusher's save: [`Self::flush_affinity`] when the pins differ from what the last
-    /// write put on disk, by the rule [`crate::save_gate`] states. A save that would write the
+    /// write put on disk, by the rule [`crate::stores::save_gate`] states. A save that would write the
     /// same pins writes nothing, and one that would only move touch times waits until
     /// [`crate::manager::AFFINITY_TOUCH_REFRESH`] has passed since the last write.
     ///
@@ -222,7 +222,7 @@ impl Manager {
     /// Each live account's identity, in account order: what a cache file's stored identities
     /// resolve against at restore. Copied under the accounts lock and returned after it is
     /// released, so the file read happens under no lock.
-    pub(in crate::manager) fn restore_candidates(&self) -> Vec<crate::config::Account> {
+    pub(in crate::manager) fn restore_candidates(&self) -> Vec<crate::base::config::Account> {
         let accounts = self
             .accounts
             .read()
@@ -249,11 +249,11 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
-    use crate::affinity::PIN_TTL_MS;
-    use crate::config::Account;
+    use crate::base::config::Account;
     use crate::manager::AccountRuntime;
+    use crate::stores::affinity::PIN_TTL_MS;
 
-    /// The store's own tests in [`crate::affinity`] cover the FILE half — format,
+    /// The store's own tests in [`crate::stores::affinity`] cover the FILE half — format,
     /// expiry, identity resolution. These cover the half only the manager has: the
     /// live map's `usize` indices being translated OUT to identities on save and
     /// back IN to (possibly different) indices on load. A snapshot that wrote the
@@ -349,8 +349,8 @@ mod tests {
             org_uuid: None,
             ..account("alice@example.com", "unused")
         };
-        let anthropic = named(crate::provider::Provider::Anthropic);
-        let codex = named(crate::provider::Provider::Codex);
+        let anthropic = named(crate::base::provider::Provider::Anthropic);
+        let codex = named(crate::base::provider::Provider::Codex);
         let now = crate::now_ms();
 
         let first = manager_over(&[anthropic.clone(), codex.clone()]);

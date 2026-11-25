@@ -3,7 +3,7 @@
 //! `peer::status::graph::peer_graph` and its schema are already covered end to end in
 //! `tests/peer_status.rs` (the flattened-edge shape, the masking, the
 //! lease-direction rule, the expired-lease drop): that file owns
-//! `src/status.rs`'s derivation. This file owns the CLI SEAM: the verb that
+//! `src/status/mod.rs`'s derivation. This file owns the CLI SEAM: the verb that
 //! opens the two files, mints or loads the node key, and either prints the
 //! result or serves it, which is the part `peer_status.rs`'s pure-function
 //! tests cannot reach.
@@ -14,7 +14,7 @@
 //! port for the loopback-refusal check, which never actually binds).
 
 use std::path::Path;
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 /// A scratch directory of this test's own, so a sibling test binary running at
 /// the same instant cannot read or write this one's peers file. Same shape as
@@ -212,7 +212,7 @@ async fn tcr_peer_graph_serve_answers_the_page_and_the_json_on_loopback() {
         .spawn()
         .expect("spawn tcr peer graph --serve");
 
-    let client = tcr::http_client::builder().build().unwrap();
+    let client = tcr::base::http_client::builder().build().unwrap();
     let mut last_err = None;
     let mut page = None;
     for _ in 0..50 {
@@ -278,7 +278,7 @@ async fn tcr_peer_graph_serve_403s_a_non_loopback_host_header_and_200s_a_loopbac
         .spawn()
         .expect("spawn tcr peer graph --serve");
 
-    let client = tcr::http_client::builder().build().unwrap();
+    let client = tcr::base::http_client::builder().build().unwrap();
     let mut ready = false;
     for _ in 0..50 {
         if client.get(format!("http://{addr}/")).send().await.is_ok() {

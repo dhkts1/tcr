@@ -19,7 +19,7 @@ use super::MIN_DEBIT;
 /// not be able to write it down: a restart loses every handed token and the
 /// owner pushes fresh ones, which costs one round trip and is the correct price.
 ///
-/// `rg -n 'HandedTokens' src/config.rs src/manager/mod.rs` is the containment
+/// `rg -n 'HandedTokens' src/base/config.rs src/manager/mod.rs` is the containment
 /// gate, and it needs a positive control beside it: an empty grep with no
 /// control is a claim about the probe, not about the code.
 ///
@@ -40,7 +40,7 @@ impl HandedTokens {
     ///
     /// **A store built here is not the store the request path reads, and a
     /// test that mixes the two reads it as a broken static.**
-    /// [`PeerLeaseProvider::try_serve`](crate::fallback::FallbackProvider::try_serve)'s hand arm can only ask
+    /// [`PeerLeaseProvider::try_serve`](crate::peer::serve::fallback::FallbackProvider::try_serve)'s hand arm can only ask
     /// [`handed_tokens`], the one store this process has, and no seam hands it
     /// another. So a test that puts a bearer into its OWN `HandedTokens` and
     /// then drives the provider sees `len 1` in front of it and an empty store

@@ -200,7 +200,7 @@ async fn a_borrow_that_was_delivered_is_never_offered_to_another_lender() {
 /// the walk back to a bare `downcast_ref` and watching this test stay green.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connect_failure_is_not_a_delivery_and_a_timeout_is() {
-    let client = tcr::http_client::builder()
+    let client = tcr::base::http_client::builder()
         .no_proxy()
         .timeout(std::time::Duration::from_millis(150))
         .build()

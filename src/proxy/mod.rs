@@ -51,23 +51,27 @@ use serde_json::Value;
 use tcr_status_wire::CodexRefusalKind;
 use time::OffsetDateTime;
 
-use crate::bound_tokens::BoundTokenKind;
-use crate::config;
-use crate::fallback;
-use crate::http_client::parse_retry_after;
+use crate::base::config;
+use crate::base::http_client::parse_retry_after;
+use crate::base::provider::Provider;
 use crate::manager::{
     AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, ExhaustionHint,
     InFlightGuard, Manager, MintedToken, SetControlOutcome, SetDisabledOutcome, SetPriorityOutcome,
 };
-use crate::observations::TRUNCATED_STREAM_ERROR_KIND;
-use crate::provider::Provider;
-use crate::quota::{UnifiedRejectionKind, quota_rejections};
+use crate::peer::serve::fallback;
+use crate::records::observations::TRUNCATED_STREAM_ERROR_KIND;
+use crate::records::quota::{UnifiedRejectionKind, quota_rejections};
+use crate::records::stats::{GateReason, SessionKind, describe_gates, gate_phrase};
 use crate::request_key::{ProxySecrets, key_matches};
-use crate::stats::{GateReason, SessionKind, describe_gates, gate_phrase};
+use crate::stores::bound_tokens::BoundTokenKind;
 
 mod client_error;
 mod ladder;
+pub mod live_client;
+pub mod mitm;
+pub mod routing;
 pub(crate) mod served;
+pub mod server;
 
 use client_error::{ClientError, ErrorKind};
 use ladder::{Ladder, Step, Wants};
@@ -148,7 +152,7 @@ const SSE_TEE_CAPACITY: usize = 256;
 /// The content-block type Anthropic uses for a tool IT runs — `--advisor` today, `web_search`
 /// next. Its result block travels with an `encrypted_content` that only the minting
 /// organization can decrypt, which is why the id has to be remembered at all: see
-/// [`crate::bound_tokens`].
+/// [`crate::stores::bound_tokens`].
 const SERVER_TOOL_USE_BLOCK_TYPE: &str = "server_tool_use";
 /// A reasoning block. Its `signature` is Anthropic's attestation over the block, arriving in
 /// the stream as `signature_delta` fragments; another account answers a history carrying it
@@ -645,7 +649,7 @@ fn max_attempts_for(account_count: usize) -> usize {
 }
 
 /// The client's socket address, injected into request extensions by the hybrid
-/// server ([`crate::mitm::serve_http`]) so the auth layer can exempt loopback
+/// server ([`crate::proxy::mitm::serve_http`]) so the auth layer can exempt loopback
 /// clients from the api-key gate. A localhost personal proxy must not demand its
 /// own key from the local user; a non-loopback client (were the listener ever
 /// bound wider than 127.0.0.1) still presents it: a loopback client is exempt.
@@ -653,7 +657,7 @@ fn max_attempts_for(account_count: usize) -> usize {
 pub struct ClientAddr(pub SocketAddr);
 
 /// The per-connection session key, injected into request extensions by the hybrid
-/// server ([`crate::mitm::serve_http`]) **only when session affinity is enabled**.
+/// server ([`crate::proxy::mitm::serve_http`]) **only when session affinity is enabled**.
 /// Its PRESENCE is the feature flag: it lets a request derive a pin via
 /// [`stable_session_key`] and pass it as [`Manager::select`]'s `affinity` arg; its
 /// absence (the default) leaves selection at the per-request LRU rotation. The
@@ -664,7 +668,7 @@ pub struct ClientAddr(pub SocketAddr);
 pub struct SessionKey(pub u64);
 
 /// The host of the `CONNECT` tunnel a request came through, injected into request extensions by
-/// the hybrid server (`crate::mitm::serve_http`) on every request it decrypts from a tunnel it
+/// the hybrid server (`crate::proxy::mitm::serve_http`) on every request it decrypts from a tunnel it
 /// terminated, and never on a base-URL request. A client cannot set an extension, so its
 /// presence means the request came through a tunnel to this host, whatever `Host` the request
 /// declares, and `handle`'s host guard holds the request to it.
@@ -707,9 +711,9 @@ fn request_keying(
 /// A deterministic hash of `prefix` + `value`, used to derive a stable affinity
 /// key. What this needs to hold is DETERMINISM ACROSS PROCESSES, not just
 /// within one — pins now persist to disk and are restored at boot (see
-/// [`crate::affinity`]), so a hash that only agreed with itself for the
+/// [`crate::stores::affinity`]), so a hash that only agreed with itself for the
 /// lifetime of one process would silently stop matching every restart. That
-/// property is documented, measured and cited at [`crate::affinity::StoredPin::key`]
+/// property is documented, measured and cited at [`crate::stores::affinity::StoredPin::key`]
 /// — read it there rather than re-deriving it here.
 fn stable_hash(prefix: &str, value: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -721,7 +725,7 @@ fn stable_hash(prefix: &str, value: &str) -> u64 {
 
 /// Tier 3 of [`stable_session_key`]: derive a fallback affinity key from the
 /// request's cacheable prefix, the exact text of its `system` and `tools` in the
-/// forwarded body ([`crate::request_body::RequestBody::affinity_prefix`]), when the client carries no stable identity at
+/// forwarded body ([`crate::records::request_body::RequestBody::affinity_prefix`]), when the client carries no stable identity at
 /// all. Returns `None` when BOTH are absent — there is then no cacheable
 /// prefix, so a pin buys no cache win and only concentrates unrelated
 /// anonymous traffic onto one account. This is the guard that stops every
@@ -764,7 +768,7 @@ fn prefix_session_key(system: Option<&str>, tools: Option<&str>) -> Option<u64> 
 /// session affinity's tier 0 ([`stable_session_key`]) and the wire session `handle` records.
 fn codex_session_id(headers: &HeaderMap) -> Option<&str> {
     headers
-        .get(crate::provider::CODEX_SESSION_HEADER)
+        .get(crate::base::provider::CODEX_SESSION_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -774,8 +778,8 @@ fn codex_session_id(headers: &HeaderMap) -> Option<&str> {
 /// session survives reconnects on one account (warm prompt cache). Priority:
 ///
 ///   0. for a CODEX request only (decided by `path`, see
-///      [`crate::provider::Provider::of_path`]), the `session-id` header
-///      ([`crate::provider::CODEX_SESSION_HEADER`]) Codex sends on every turn.
+///      [`crate::base::provider::Provider::of_path`]), the `session-id` header
+///      ([`crate::base::provider::CODEX_SESSION_HEADER`]) Codex sends on every turn.
 ///      It names one conversation, which is exactly the grain a pin wants, and
 ///      it is readable where the body is not: a Codex body is usually
 ///      zstd-compressed, which tiers 2 and 3 cannot parse. It outranks tier 1
@@ -841,7 +845,7 @@ fn codex_session_id(headers: &HeaderMap) -> Option<&str> {
 /// key — display provenance only, never a routing input.
 fn stable_session_key(
     headers: &HeaderMap,
-    body: &crate::request_body::RequestBody,
+    body: &crate::records::request_body::RequestBody,
     secrets: ProxySecrets<'_>,
     method: &Method,
     path: &str,
@@ -887,7 +891,7 @@ fn stable_session_key(
     }
 
     // Tier 2 (`metadata.user_id`) and tier 3 (`system`/`tools`) read the request's
-    // one parse; see [`crate::request_body`].
+    // one parse; see [`crate::records::request_body`].
     if let Some(user_id) = body.affinity_user_id() {
         return Some((stable_hash("uid:", user_id), SessionKind::Stable));
     }
@@ -935,7 +939,7 @@ pub const PEER_DIAL_ENDPOINT: &str = "peer-dial";
 /// read from memory. `GET` only, behind the same gate as [`STATUS_PATH`].
 pub const QUOTA_PATH: &str = "/_tcr/quota";
 
-/// Path of the routing document [`routing_handler`] serves ([`crate::routing`], schema 1):
+/// Path of the routing document [`routing_handler`] serves ([`crate::proxy::routing`], schema 1):
 /// which model families each provider pool can serve a new request for now, for a launcher
 /// that must not parse text. `GET` only, behind the same gate as [`STATUS_PATH`].
 pub const ROUTING_PATH: &str = "/_tcr/routing";
@@ -998,8 +1002,8 @@ pub const ADD_ACCOUNT_PATH: &str = "/_tcr/accounts";
 pub const ADD_ACCOUNT_ENDPOINT: &str = "accounts-add";
 
 /// Response header naming, comma-separated, every provider whose accounts this
-/// server can store: [`crate::provider::Provider::as_str`] over
-/// [`crate::provider::Provider::ALL`], so `anthropic,codex`. Set by
+/// server can store: [`crate::base::provider::Provider::as_str`] over
+/// [`crate::base::provider::Provider::ALL`], so `anthropic,codex`. Set by
 /// `stamp` (for `ADD_ACCOUNT_ROUTE`), so it rides on every answer the account-add route
 /// stamps — the blank-probe 400 `login::probe_add_route` provokes, a 405, a
 /// 409, a 200 — and never on the unstamped gate refusal, which must not confirm
@@ -1105,7 +1109,7 @@ pub const CONFIG_ENDPOINT: &str = "config";
 
 /// The fan mode, for `tcr fan` and TcrBar (which shells out to it): `POST`
 /// only, gated by [`read_command`] like [`CONFIG_PATH`]. The body is one
-/// [`crate::fan::FanRequest`]; a refused value is a stamped 400 with one
+/// [`crate::stores::fan::FanRequest`]; a refused value is a stamped 400 with one
 /// sentence, an accepted one a stamped 202 carrying the `fanControl` object as
 /// of that moment (the controller works on it after the answer). A process
 /// that runs no fan controller answers a stamped 503.
@@ -1384,17 +1388,17 @@ pub fn host_is_loopback(host: &str) -> bool {
 }
 
 /// The provider whose requests each host tcr intercepts carries: every host on
-/// [`crate::tls::ALLOWED_HOSTS`], and no other (`every_intercepted_host_names_its_provider`
+/// [`crate::base::tls::ALLOWED_HOSTS`], and no other (`every_intercepted_host_names_its_provider`
 /// pins both directions). `platform.claude.com` is Anthropic's: Claude Code refreshes its own
 /// login there.
 const INTERCEPTED_HOST_PROVIDERS: [(&str, Provider); 3] = [
     ("api.anthropic.com", Provider::Anthropic),
     ("platform.claude.com", Provider::Anthropic),
-    (crate::provider::CODEX_HOST, Provider::Codex),
+    (crate::base::provider::CODEX_HOST, Provider::Codex),
 ];
 
 /// The provider an intercepted `host` (no port) belongs to, compared as
-/// [`crate::tls::host_allowed`] compares it; `None` for any other host, loopback included.
+/// [`crate::base::tls::host_allowed`] compares it; `None` for any other host, loopback included.
 fn intercepted_host_provider(host: &str) -> Option<Provider> {
     INTERCEPTED_HOST_PROVIDERS
         .iter()
@@ -1419,7 +1423,7 @@ fn host_path_disagreement(host: &str, path: &str, path_provider: Provider) -> St
              other provider.",
             kind(host_provider),
             kind(path_provider),
-            crate::provider::CODEX_PATH_PREFIX,
+            crate::base::provider::CODEX_PATH_PREFIX,
         ),
         None => format!(
             "Refusing {host}{path}: tcr intercepts {host} but knows no provider for it, so it \
@@ -1512,7 +1516,7 @@ fn is_cross_site_request(headers: &HeaderMap) -> bool {
 /// a client with no bearer at all, and the peer borrower's refusal
 /// (`src/peer/serve.rs`), which is path-only.
 ///
-/// A Codex path (`crate::provider::Provider::of_path`) other than the one
+/// A Codex path (`crate::base::provider::Provider::of_path`) other than the one
 /// inference path is relayed with or without a bearer: Codex has no bookkeeping
 /// call a pooled account may answer, so nothing under `/backend-api/` but
 /// Codex model calls reach the rotation; its other paths retain the client credential.
@@ -1542,7 +1546,7 @@ fn relay_mode(method: &Method, path: &str, client_bearer: bool) -> Option<RelayM
 /// The paths that spend quota and therefore ALWAYS take the pooled path,
 /// whatever credential the client sent: Anthropic's `/v1/messages` and
 /// `/v1/messages/count_tokens`, and Codex's `/backend-api/codex/responses`.
-/// Exact match, and one list: [`crate::provider::Provider::is_inference_path`],
+/// Exact match, and one list: [`crate::base::provider::Provider::is_inference_path`],
 /// which `manager::select::classify_request` reads too.
 ///
 /// One exception, decided by `handle` rather than here: a Codex request that names a
@@ -1561,7 +1565,7 @@ fn client_bearer_of(headers: &HeaderMap) -> Option<&str> {
     (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
 }
 
-/// The `controlIdentity` check — see [`crate::control_identity`]. `Some` is the
+/// The `controlIdentity` check — see [`crate::clients::control_identity`]. `Some` is the
 /// refusal to return; `None` means the request proceeds.
 ///
 /// Runs on every ANTHROPIC request that carries a client bearer, relayed or
@@ -1578,7 +1582,7 @@ fn client_bearer_of(headers: &HeaderMap) -> Option<&str> {
 /// bearer. Fail-open on `Unknown` — a profile fetch that failed is logged at
 /// debug and the request is served.
 async fn refuse_foreign_client(manager: &Manager, bearer: &str) -> Option<Response> {
-    use crate::config::ControlIdentityMode;
+    use crate::base::config::ControlIdentityMode;
 
     let mode = manager.control_identity();
     if mode == ControlIdentityMode::Off {
@@ -1833,9 +1837,9 @@ async fn status_method_not_allowed() -> Response {
 /// It takes only [`Parts`](axum::http::request::Parts), so the request body is
 /// never read. It touches no account state, triggers no account probe, no token
 /// refresh and no config write. The one thing it does besides read is the heat:
-/// [`crate::heat::current`] may run an AppleSMC read on the blocking pool and
+/// [`crate::stores::heat::current`] may run an AppleSMC read on the blocking pool and
 /// writes the result into that module's own cache, waiting at most
-/// [`crate::heat::READ_DEADLINE`] for it. It returns the [`crate::status`]
+/// [`crate::stores::heat::READ_DEADLINE`] for it. It returns the [`crate::status`]
 /// projection, which carries no token, no key and no `Authorization` echo (see
 /// that module's no-secret invariant; a temperature and fan speeds are not
 /// secrets).
@@ -1887,10 +1891,10 @@ async fn status_handler(
             let (connects, requests) = manager.unkeyed_wire();
             (mode, connects, requests)
         }),
-        // Read on the blocking pool and kept for two seconds (`crate::heat`), so a
+        // Read on the blocking pool and kept for two seconds (`crate::stores::heat`), so a
         // burst of status requests costs one SMC read and none of it runs on this
         // worker. Absent where there is no AppleSMC.
-        heat: crate::heat::current().await,
+        heat: crate::stores::heat::current().await,
         // A copy of the controller's last published state: no SMC read, no lock
         // held past the copy.
         fan_control: manager.fan().map(|fan| fan.row()),
@@ -1970,7 +1974,7 @@ async fn routing_method_not_allowed() -> Response {
     .respond_local()
 }
 
-/// `GET /_tcr/routing`: the routing document, [`crate::routing`]'s schema 1.
+/// `GET /_tcr/routing`: the routing document, [`crate::proxy::routing`]'s schema 1.
 ///
 /// Gated exactly as [`status_handler`] is, through [`local_endpoint_gate`]. It answers from
 /// memory: the selector's own candidate evaluation, read without stamping, pinning or
@@ -1985,7 +1989,7 @@ async fn routing_handler(
         return refusal;
     }
 
-    let Some(body) = crate::routing::document(&manager, OffsetDateTime::now_utc())
+    let Some(body) = routing::document(&manager, OffsetDateTime::now_utc())
         .and_then(|document| serde_json::to_string(&document).ok())
     else {
         return ClientError::new(
@@ -2124,7 +2128,9 @@ async fn claude_reset_handler(State(manager): State<Arc<Manager>>, req: Request)
                         INVALID,
                     ),
                     _ if parsed.query.is_empty()
-                        || !crate::claude_resets::valid_request_id(&parsed.idempotency_key) =>
+                        || !crate::records::claude_resets::valid_request_id(
+                            &parsed.idempotency_key,
+                        ) =>
                     {
                         route_error(
                             &CLAUDE_RESET_ROUTE,
@@ -2500,7 +2506,7 @@ struct SetDisabledRequest {
 pub struct SetDisabledResponse {
     /// The RESOLVED account name, so the answer names what was actually parked.
     ///
-    /// It is NOT a partial or fuzzy match: [`crate::identity::match_accounts`] is
+    /// It is NOT a partial or fuzzy match: [`crate::base::identity::match_accounts`] is
     /// the account's exact name, byte-for-byte, case-sensitive and untrimmed.
     /// Measured against a fleet holding `alice@example.com`: `alice`, `alice@`,
     /// `example`, `ALICE@EXAMPLE.COM` and a trailing space are each a 404.
@@ -2523,7 +2529,7 @@ pub struct SetDisabledResponse {
 /// [`status_handler`] is — [`local_endpoint_gate`], no weaker for being a write —
 /// and it does the work through [`Manager::set_disabled_by_query`], which is the
 /// same call the TUI's `d` key makes. It does not invent a resolution rule: the
-/// CLI's own [`crate::identity::match_one`] runs against the server's live
+/// CLI's own [`crate::base::identity::match_one`] runs against the server's live
 /// rotation slots, so the two cannot disagree about which account a query names.
 ///
 /// The durable half is NOT swallowed. `persisted: false` plus a `warning` is a
@@ -2698,7 +2704,7 @@ async fn set_priority_handler(State(manager): State<Arc<Manager>>, req: Request)
 
 /// The request body of a `POST` to [`CONFIG_PATH`]: the key as the file spells
 /// it and the value in the words `tcr config set` takes
-/// ([`crate::config_set::Setting::parse`]).
+/// ([`crate::base::config_set::Setting::parse`]).
 #[derive(serde::Deserialize)]
 struct SetConfigRequest {
     key: String,
@@ -2711,7 +2717,7 @@ struct SetConfigRequest {
 pub struct SetConfigResponse {
     /// The key as the file spells it.
     pub key: String,
-    /// The value saved, in [`crate::config_set::Setting::value_text`]'s words.
+    /// The value saved, in [`crate::base::config_set::Setting::value_text`]'s words.
     pub value: String,
     /// Whether the file changed; `false` when it already said this.
     pub changed: bool,
@@ -2733,7 +2739,7 @@ async fn config_get_handler(
 
 /// `POST /_tcr/config`: save one setting to the config file, for `tcr config
 /// set`, gated by [`read_command`]. The value is parsed
-/// here again by the same [`crate::config_set::Setting::parse`] the CLI ran,
+/// here again by the same [`crate::base::config_set::Setting::parse`] the CLI ran,
 /// so this route refuses what the CLI refuses, in the same words, whoever
 /// calls it. The work is [`Manager::persist_setting`], which writes the file
 /// and leaves what this process runs alone.
@@ -2752,7 +2758,7 @@ async fn config_set_handler(State(manager): State<Arc<Manager>>, req: Request) -
         Ok(parsed) => parsed,
         Err(refusal) => return *refusal,
     };
-    let setting = match crate::config_set::Setting::parse(&key, &value) {
+    let setting = match crate::base::config_set::Setting::parse(&key, &value) {
         Ok(setting) => setting,
         Err(refusal) => {
             return route_error(
@@ -2769,7 +2775,7 @@ async fn config_set_handler(State(manager): State<Arc<Manager>>, req: Request) -
             &SetConfigResponse {
                 key: setting.key().as_str().to_string(),
                 value: setting.value_text(),
-                changed: write == crate::config_set::SettingWrite::Updated,
+                changed: write == crate::base::config_set::SettingWrite::Updated,
             },
         ),
         Err(crate::manager::SettingPersistError::NoConfigFile) => route_error(
@@ -2792,11 +2798,11 @@ async fn config_set_handler(State(manager): State<Arc<Manager>>, req: Request) -
 /// Never waits on the fans: the controller may be inside a 15 s unlock, and
 /// the mode is queued behind it (latest wins). The 202 body is the
 /// `fanControl` object as it stood when the command went in, with `command`
-/// the number the command was sent under ([`crate::fan::FanHandle::send`]);
+/// the number the command was sent under ([`crate::stores::fan::FanHandle::send`]);
 /// `tcr fan` polls the status route until `fanControl.command` reaches it and
 /// the state settles. A 1.2.12 `tcr fan` reads the rest, as it always did.
 async fn fan_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
-    let request: crate::fan::FanRequest = match read_command(
+    let request: crate::stores::fan::FanRequest = match read_command(
         &FAN_ROUTE,
         &manager,
         req,
@@ -2836,7 +2842,7 @@ async fn fan_handler(State(manager): State<Arc<Manager>>, req: Request) -> Respo
             }
             response
         }
-        Err(crate::fan::NotRunning) => route_error(
+        Err(crate::stores::fan::NotRunning) => route_error(
             &FAN_ROUTE,
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorKind::Api,
@@ -2983,7 +2989,7 @@ struct AddAccountRequest {
 /// deserializes it, and both halves of a wire contract belong to one type.
 ///
 /// This is a cross-BUILD wire contract — the same class as
-/// [`crate::singleton::ProxyHost::Unknown`] — because the `tcr` that
+/// [`crate::stores::singleton::ProxyHost::Unknown`] — because the `tcr` that
 /// deserializes a reply can be older than the `tcr` that served it. Every
 /// field below carries `#[serde(default)]` so a field a NEWER server has
 /// renamed or dropped does not fail the whole deserialize: `live_client::post_add_account`
@@ -3039,7 +3045,7 @@ pub struct AddAccountResponse {
 
 /// Shown when the submitted account carries no refresh token: it will serve
 /// until its access token expires and then go dead, silently, unless the
-/// operator hears about it now. `pub(crate)` so [`crate::login::login_with_token`]
+/// operator hears about it now. `pub(crate)` so [`crate::verbs::login::login_with_token`]
 /// can print the same hazard on the offline (file) route too — that path
 /// never goes through this module's `add_account_handler`, so nothing else
 /// would say it.
@@ -3088,12 +3094,12 @@ fn add_account_response(
 /// write, so it is authorized no more weakly than the read routes.
 ///
 /// The behaviour is [`Manager::add_or_update_account`]'s: the submitted identity
-/// resolves against the live rotation via [`crate::identity::match_one`], and
+/// resolves against the live rotation via [`crate::base::identity::match_one`], and
 /// either appends (nothing matched — a brand new account) or replaces an
 /// existing account's credentials in place (exactly one matched — a re-login).
 /// See that function's doc-comment for why the two cases use different
 /// resolution anchors for their durable write. An ambiguous match is a 409
-/// naming the candidates, via [`crate::config::ambiguous_query_message`] — never
+/// naming the candidates, via [`crate::base::config::ambiguous_query_message`] — never
 /// guessed.
 async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let parsed: AddAccountRequest = match read_command(
@@ -3688,7 +3694,10 @@ async fn handle_request(
     let codex_tunnel = parts
         .extensions
         .get::<InterceptedHost>()
-        .is_some_and(|host| host.0.eq_ignore_ascii_case(crate::provider::CODEX_HOST));
+        .is_some_and(|host| {
+            host.0
+                .eq_ignore_ascii_case(crate::base::provider::CODEX_HOST)
+        });
     let path_provider = Provider::of_path(&path);
     let provider = if codex_tunnel {
         Provider::Codex
@@ -3811,7 +3820,7 @@ async fn handle_request(
         // primitive the client-peer check uses above, and the same derivation the
         // local-endpoint gate runs — one answer to "which host did the client
         // mean", on both paths.
-        if !host_is_loopback(host) && !crate::tls::host_allowed(host) {
+        if !host_is_loopback(host) && !crate::base::tls::host_allowed(host) {
             tracing::debug!(target_host = %host, "rejected misrouted forward-proxy request");
             return ClientError::new(
                 StatusCode::MISDIRECTED_REQUEST,
@@ -3867,7 +3876,7 @@ async fn handle_request(
     //      426 that moves the client onto the transport tcr relays.
     match provider {
         Provider::Codex
-            if path == crate::provider::CODEX_RESPONSES_PATH
+            if path == crate::base::provider::CODEX_RESPONSES_PATH
                 && wants_websocket_upgrade(&req_headers) =>
         {
             tracing::debug!(
@@ -3970,7 +3979,7 @@ async fn handle_request(
     //The body is parsed ONCE, here, into every answer the rest of the handler reads
     // from it: the model, the wire session and its tool events, the account-bound
     // tokens, the affinity key's inputs, the extended-cache-window answer and the
-    // account-uuid splice point. See `crate::request_body` for why one walk, and how
+    // account-uuid splice point. See `crate::records::request_body` for why one walk, and how
     // each answer stays the one its old separate parse gave.
     //
     // The same walk sets every cache breakpoint to the 1-hour window, BEFORE anything
@@ -3987,7 +3996,7 @@ async fn handle_request(
     // A body that fails to parse yields "no model, no session, no tool events" rather
     // than rejecting the request: these are peeks, never a validation gate.
     let rewrite_ttl = provider.rewrites_cache_ttl() && manager.cache_ttl_rewrite_enabled();
-    let request = crate::request_body::RequestBody::parse(body_bytes, rewrite_ttl);
+    let request = crate::records::request_body::RequestBody::parse(body_bytes, rewrite_ttl);
     if let Some((before, after)) = request.rewritten() {
         tracing::debug!(before, after, "cache-ttl: breakpoints rewritten to 1h");
     }
@@ -4003,7 +4012,7 @@ async fn handle_request(
     // observability: `bound` is every account-bound token this conversation carries
     // (advisor ids, thinking signatures, redacted-thinking payloads, and any thread
     // `previous_message_id`) and it decides which account may serve this request, see
-    // `crate::bound_tokens`. It covers ALL messages rather than the tail window the tool
+    // `crate::stores::bound_tokens`. It covers ALL messages rather than the tail window the tool
     // events use, because the block that binds the conversation was minted on its FIRST
     // turn.
     //
@@ -4038,7 +4047,7 @@ async fn handle_request(
     let request_is_fable = provider.has_fable_bucket()
         && request_model
             .as_deref()
-            .is_some_and(crate::model::is_fable_model);
+            .is_some_and(crate::base::model::is_fable_model);
 
     // `tcr run --group <name>` (Phase 1, PREFER semantics only). Read once,
     // constant across the rotation loop — same shape as `request_model` above.
@@ -4194,7 +4203,7 @@ async fn handle_request(
     //  - Sonnet 5.5 and Haiku 5.5 keep it on another seat in the minting account's org, and on an
     //    account in another org DROP it silently: a 200, no error, the earlier reasoning gone,
     //    and nothing for the client to recover from. Hence the release below prefers a same-org
-    //    seat for those two (`same_org_release`, `crate::model::thinking_is_org_bound`).
+    //    seat for those two (`same_org_release`, `crate::base::model::thinking_is_org_bound`).
     //
     // The advisor and thread-state rejections are not fatal. Claude Code recovers from each in
     // one extra round trip: it strips the advisor blocks, or replays the full history as a new
@@ -4278,7 +4287,7 @@ async fn handle_request(
     let bound_candidate = bound_candidate.filter(|&(bound_idx, via)| {
         let thinking_travels = request_model
             .as_deref()
-            .is_some_and(|model| !crate::model::thinking_is_org_bound(model));
+            .is_some_and(|model| !crate::base::model::thinking_is_org_bound(model));
         let release = thinking_travels
             && !bound.carries_account_only_state
             && manager.bound_history_is_cold(
@@ -4876,8 +4885,10 @@ async fn handle_request(
                     // attribute it to; `is_connect` / `is_timeout` separate "never
                     // reached the host" from "the host went quiet mid-request".
                     ladder.transport_failed();
-                    manager
-                        .record_upstream_error(provider, crate::observations::ErrorKind::Transport);
+                    manager.record_upstream_error(
+                        provider,
+                        crate::records::observations::ErrorKind::Transport,
+                    );
                     // **Blind peer egress, the one offer per request.**
                     //
                     // Four conjuncts, and the first two are what stop a carry
@@ -5157,7 +5168,9 @@ async fn handle_request(
                 );
                 // The kind a status alone names, once per attempt, for the routing document.
                 // Observation only: the arms below keep every retry, hold and rotation.
-                if let Some(kind) = crate::observations::ErrorKind::of_status(status.as_u16()) {
+                if let Some(kind) =
+                    crate::records::observations::ErrorKind::of_status(status.as_u16())
+                {
                     manager.record_upstream_error(provider, kind);
                 }
             }
@@ -5449,7 +5462,7 @@ async fn handle_request(
                         match provider {
                             Provider::Codex => {
                                 let clock = OffsetDateTime::now_utc();
-                                let refusal = crate::quota::CodexQuotaRefusal::parse(
+                                let refusal = crate::records::quota::CodexQuotaRefusal::parse(
                                     &up_headers,
                                     &refusal_body,
                                     clock,
@@ -6050,7 +6063,10 @@ async fn handle_request(
         let bytes = match read_capped_body(upstream_body, MAX_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(BodyReadError::Transport) => {
-                manager.record_upstream_error(provider, crate::observations::ErrorKind::Transport);
+                manager.record_upstream_error(
+                    provider,
+                    crate::records::observations::ErrorKind::Transport,
+                );
                 return ClientError::new(
                     StatusCode::BAD_GATEWAY,
                     ErrorKind::Proxy,
@@ -6075,8 +6091,10 @@ async fn handle_request(
                 {
                     log_upstream_error_body(idx, account_name.as_deref(), status, &bytes);
                     // Capacity: this account cannot serve the model now, which is not overload.
-                    manager
-                        .record_upstream_error(provider, crate::observations::ErrorKind::Capacity);
+                    manager.record_upstream_error(
+                        provider,
+                        crate::records::observations::ErrorKind::Capacity,
+                    );
                     ladder.model_refused(account_name.clone(), detail);
                     ladder.bench(idx);
                     continue;
@@ -6352,7 +6370,7 @@ pub(crate) fn upgrade_required_response() -> Response {
 }
 
 /// Does this Codex request name a workspace routing of its own
-/// ([`crate::provider::CODEX_ROUTING_HEADERS`])? Such a request comes from a ChatGPT login whose
+/// ([`crate::base::provider::CODEX_ROUTING_HEADERS`])? Such a request comes from a ChatGPT login whose
 /// workspace is served by another backend origin, or under a residency or FedRAMP routing that
 /// no pooled account shares, so `handle` relays it on the client's own credential and never
 /// pools it. Present is enough, whatever the value: codex adds the override only for a `us` or
@@ -6361,7 +6379,7 @@ pub(crate) fn upgrade_required_response() -> Response {
 /// `model-provider/src/bearer_auth_provider.rs:31-47`), so a workspace served at `chatgpt.com`
 /// sends neither. Pure — unit-tested through `handle`.
 fn names_codex_routing(headers: &HeaderMap) -> bool {
-    crate::provider::CODEX_ROUTING_HEADERS
+    crate::base::provider::CODEX_ROUTING_HEADERS
         .iter()
         .any(|name| headers.contains_key(*name))
 }
@@ -6375,7 +6393,7 @@ fn names_codex_routing(headers: &HeaderMap) -> bool {
 /// (`core/src/client.rs:1704-1711`) and the identity lives in this header, not in a
 /// `metadata.user_id` field.
 ///
-/// The client's routing headers ([`crate::provider::CODEX_ROUTING_HEADERS`]) are dropped too: a
+/// The client's routing headers ([`crate::base::provider::CODEX_ROUTING_HEADERS`]) are dropped too: a
 /// request carrying one is relayed before it reaches the pool ([`names_codex_routing`]), and a
 /// pooled bearer must never travel under another workspace's routing even if one slipped by.
 ///
@@ -6393,15 +6411,15 @@ pub(crate) fn build_codex_upstream_headers(
     account_id: Option<&str>,
 ) -> HeaderMap {
     let mut out = build_upstream_headers(req_headers, token);
-    out.remove(crate::provider::CODEX_ACCOUNT_HEADER);
-    for name in crate::provider::CODEX_ROUTING_HEADERS {
+    out.remove(crate::base::provider::CODEX_ACCOUNT_HEADER);
+    for name in crate::base::provider::CODEX_ROUTING_HEADERS {
         out.remove(name);
     }
     if let Some(id) = account_id
         && let Ok(value) = HeaderValue::from_str(id)
     {
         out.insert(
-            HeaderName::from_static(crate::provider::CODEX_ACCOUNT_HEADER),
+            HeaderName::from_static(crate::base::provider::CODEX_ACCOUNT_HEADER),
             value,
         );
     }
@@ -6707,7 +6725,7 @@ fn build_raw_relay_headers(req_headers: &HeaderMap) -> HeaderMap {
 /// is a long-lived event stream that any total timeout would truncate mid-stream.
 ///
 /// Rebuilt on the first relay after the machine slept, for the reason the
-/// per-account clients are ([`crate::wake`]): its pooled connections died during
+/// per-account clients are ([`crate::clients::wake`]): its pooled connections died during
 /// the sleep and its idle timer did not move.
 ///
 /// `None` only if the TLS backend fails to initialise, which the caller answers with
@@ -6727,7 +6745,7 @@ fn relay_client() -> Option<Arc<reqwest::Client>> {
 
 /// [`RELAY_CLIENT`]'s settings, before `build`.
 fn relay_client_builder() -> reqwest::ClientBuilder {
-    crate::http_client::builder()
+    crate::base::http_client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
@@ -6743,9 +6761,11 @@ fn build_relay_client(builder: reqwest::ClientBuilder) -> Option<reqwest::Client
     }
 }
 
-static RELAY_CLIENT: std::sync::LazyLock<crate::wake::SleepAwareClient<reqwest::Client>> =
+static RELAY_CLIENT: std::sync::LazyLock<crate::clients::wake::SleepAwareClient<reqwest::Client>> =
     std::sync::LazyLock::new(|| {
-        crate::wake::SleepAwareClient::new("relay", || build_relay_client(relay_client_builder()))
+        crate::clients::wake::SleepAwareClient::new("relay", || {
+            build_relay_client(relay_client_builder())
+        })
     });
 
 /// Forward a request upstream WITHOUT touching account rotation — see the `1c`
@@ -7048,7 +7068,7 @@ const RESPONSE_SKIP: [&str; 10] = [
 /// already lowercased.
 ///
 /// Codex's per-account headers are the opposite case and are matched by EXPLICIT
-/// name, the eleven in [`crate::quota::CODEX_QUOTA_HEADERS`], never by the `x-codex-`
+/// name, the eleven in [`crate::records::quota::CODEX_QUOTA_HEADERS`], never by the `x-codex-`
 /// prefix: `x-codex-turn-state` shares that prefix, and it is the client's own
 /// sticky-routing token, which must reach the client.
 ///
@@ -7063,7 +7083,7 @@ const RESPONSE_SKIP: [&str; 10] = [
 pub(crate) fn is_account_scoped(name: &str) -> bool {
     name.starts_with("anthropic-ratelimit-")
         || name == "anthropic-organization-id"
-        || crate::quota::CODEX_QUOTA_HEADERS.contains(&name)
+        || crate::records::quota::CODEX_QUOTA_HEADERS.contains(&name)
 }
 
 /// Whose account produced the response being assembled — the one thing that
@@ -7183,7 +7203,7 @@ struct ParsedUsage {
 /// (no nested object, or no such field in it). A reported `0` comes back as
 /// `Some(0)`: it is a first-hand statement that nothing was written at 1h, and
 /// the caller must not treat it as missing data and fall back to the REQUEST's
-/// `cache_control` ttl ([`crate::request_body::RequestBody::extended_ttl`]), which is
+/// `cache_control` ttl ([`crate::records::request_body::RequestBody::extended_ttl`]), which is
 /// only evidence of what was ASKED for.
 fn cache_breakdown(usage: &Value) -> (u64, u64, Option<u64>) {
     let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
@@ -7216,7 +7236,7 @@ fn cache_breakdown(usage: &Value) -> (u64, u64, Option<u64>) {
 /// Two things happen here that neither caller should duplicate.
 ///
 /// **The model comes from the REQUEST, not the response.** It is parsed once per
-/// request ([`crate::request_body::RequestBody::model`]) and is the same on both arms; the response's
+/// request ([`crate::records::request_body::RequestBody::model`]) and is the same on both arms; the response's
 /// own `model` field can differ from what was asked for, and the ask is what the
 /// operator reasons about. One exception, and only when the request named no model: a
 /// Codex body is usually zstd and then does not parse, so each arm passes the model its
@@ -7237,13 +7257,13 @@ fn cache_breakdown(usage: &Value) -> (u64, u64, Option<u64>) {
 /// `extended_ttl` is a closure so that it is asked only when it is the only
 /// evidence left: a response that reported its own split, and a response that
 /// wrote no cache at all, both leave it uncalled. The handler's answer comes
-/// from the request's one parse ([`crate::request_body::RequestBody::extended_ttl`]).
+/// from the request's one parse ([`crate::records::request_body::RequestBody::extended_ttl`]).
 fn usage_record(
     parsed: &ParsedUsage,
     model: Option<String>,
     session: Option<u64>,
     extended_ttl: impl FnOnce() -> bool,
-) -> crate::usage::UsageRecord {
+) -> crate::records::usage::UsageRecord {
     let cache_1h = match parsed.cache_creation_1h {
         Some(reported) => reported,
         // `cache_creation > 0` FIRST, and it is not a micro-optimisation: with
@@ -7253,7 +7273,7 @@ fn usage_record(
         None if parsed.cache_creation > 0 && extended_ttl() => parsed.cache_creation,
         None => 0,
     };
-    let mut record = crate::usage::UsageRecord::from_quota_input(
+    let mut record = crate::records::usage::UsageRecord::from_quota_input(
         crate::now_ms(),
         model,
         session,
@@ -7287,7 +7307,7 @@ struct JsonParse {
 struct NonStreamedResponse {
     usage: ParsedUsage,
     model: Option<String>,
-    tool_uses: Vec<crate::session_wire::ToolUseEvent>,
+    tool_uses: Vec<crate::records::session_wire::ToolUseEvent>,
     bound_tokens: Vec<MintedToken>,
 }
 
@@ -7336,7 +7356,7 @@ fn usage_from_json(bytes: &[u8], provider: Provider) -> JsonParse {
 /// The `tool_use` events of a non-streamed body, parsing it on its own and
 /// silently: the tests' entry point.
 #[cfg(test)]
-fn response_tool_uses_from_json(bytes: &[u8]) -> Vec<crate::session_wire::ToolUseEvent> {
+fn response_tool_uses_from_json(bytes: &[u8]) -> Vec<crate::records::session_wire::ToolUseEvent> {
     serde_json::from_slice::<Value>(bytes)
         .map_or_default(|value| response_tool_uses_from_value(&value))
 }
@@ -7477,12 +7497,12 @@ fn codex_error_kind(error: Option<&Value>) -> String {
 
 /// Parse the `tool_use` blocks out of a non-streamed messages body — the JSON-path twin of
 /// [`parse_sse_usage`]'s block assembly, feeding the same
-/// [`crate::session_wire::tool_use_event_from_block`].
+/// [`crate::records::session_wire::tool_use_event_from_block`].
 ///
 /// Reads the tree [`parse_non_streamed_response`] already parsed, and returns its own `Vec`
 /// beside [`ParsedUsage`] rather than on it, because `ParsedUsage` is `Copy` on purpose (see
 /// its doc). A body that carries no `content` array yields no events.
-fn response_tool_uses_from_value(value: &Value) -> Vec<crate::session_wire::ToolUseEvent> {
+fn response_tool_uses_from_value(value: &Value) -> Vec<crate::records::session_wire::ToolUseEvent> {
     let Some(blocks) = value.get("content").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -7493,10 +7513,10 @@ fn response_tool_uses_from_value(value: &Value) -> Vec<crate::session_wire::Tool
                 .and_then(Value::as_str)
                 .is_some_and(|t| t == "tool_use")
         })
-        .take(crate::session_wire::PENDING_TOOL_CAP)
+        .take(crate::records::session_wire::PENDING_TOOL_CAP)
         .filter_map(|b| {
             let id = b.get("id").and_then(Value::as_str)?.to_string();
-            Some(crate::session_wire::tool_use_event_from_block(
+            Some(crate::records::session_wire::tool_use_event_from_block(
                 id,
                 b.get("name").and_then(Value::as_str).map(str::to_string),
                 b.get("input"),
@@ -7539,7 +7559,7 @@ fn response_bound_tokens_from_value(value: &Value) -> Vec<MintedToken> {
         if let Some(minted) = minted {
             tokens.push(minted);
         }
-        if tokens.len() >= crate::session_wire::BOUND_TOKEN_SCAN_CAP {
+        if tokens.len() >= crate::records::session_wire::BOUND_TOKEN_SCAN_CAP {
             break;
         }
     }
@@ -7553,7 +7573,7 @@ fn response_bound_tokens_from_value(value: &Value) -> Vec<MintedToken> {
 ///
 /// The bound tokens are their own value and not part of the tool blocks: none of them is a
 /// client-side call the Tools tab has anything to show. What they ARE is the thing that decides
-/// which account may serve the REST of this conversation — see [`crate::bound_tokens`]. The
+/// which account may serve the REST of this conversation — see [`crate::stores::bound_tokens`]. The
 /// message id and a `server_tool_use` id are taken the moment their event arrives, because
 /// each is whole there; a stream severed mid-turn has still told us who minted them. A
 /// thinking signature arrives as `signature_delta` fragments and is taken at
@@ -7567,7 +7587,7 @@ fn response_bound_tokens_from_value(value: &Value) -> Vec<MintedToken> {
 /// three of them mid-tool). A block is assembled from `content_block_start`
 /// (id, name), the `input_json_delta` fragments of its `input` object, and
 /// `content_block_stop`, then turned into an event by the same
-/// [`crate::session_wire::tool_use_event_from_block`] the request side uses —
+/// [`crate::records::session_wire::tool_use_event_from_block`] the request side uses —
 /// one head-building rule, two callers.
 ///
 /// `input_total` is taken from `message_start` (base + cache tokens); `output`
@@ -7617,7 +7637,7 @@ fn response_bound_tokens_from_value(value: &Value) -> Vec<MintedToken> {
 /// `response.completed` / `response.incomplete` event alone, read by [`codex_terminal_usage`],
 /// which also yields the model: a Codex request body is usually zstd, and the stream is the
 /// place tcr reads a Codex turn's model. A finished output item that is a tool call
-/// (`response.output_item.done`, read by [`crate::session_wire::codex_tool_call_from_item`])
+/// (`response.output_item.done`, read by [`crate::records::session_wire::codex_tool_call_from_item`])
 /// becomes one of [`SseParse::codex_tool_calls`]. The stream's failures are classified by the
 /// same rules as Anthropic's, in Codex's vocabulary. A `response.failed` event is recorded
 /// under its `response.error.code` and an `error` event under its nested `error.code`
@@ -7656,10 +7676,10 @@ where
     // complete event until the stop, and only completed blocks are returned.
     let mut open_tool_blocks: std::collections::HashMap<u64, OpenToolBlock> =
         std::collections::HashMap::new();
-    let mut tool_uses: Vec<crate::session_wire::ToolUseEvent> = Vec::new();
+    let mut tool_uses: Vec<crate::records::session_wire::ToolUseEvent> = Vec::new();
     let mut codex_tool_calls = Vec::new();
     // Account-bound tokens this turn minted — the message id, every server-tool id, every
-    // thinking signature, every redacted-thinking payload. See `crate::bound_tokens`.
+    // thinking signature, every redacted-thinking payload. See `crate::stores::bound_tokens`.
     let mut bound_tokens: Vec<MintedToken> = Vec::new();
     // Thinking signatures under construction, keyed by block index: a signature arrives as
     // `signature_delta` fragments that concatenate, so it is complete only at
@@ -7712,10 +7732,10 @@ where
                 // A tool call the client runs: a finished output item only, never the
                 // `response.output_item.added` that announces one before its arguments are complete.
                 if value.get("type").and_then(Value::as_str) == Some("response.output_item.done")
-                    && codex_tool_calls.len() < crate::session_wire::PENDING_TOOL_CAP
+                    && codex_tool_calls.len() < crate::records::session_wire::PENDING_TOOL_CAP
                     && let Some(call) = value
                         .get("item")
-                        .and_then(crate::session_wire::codex_tool_call_from_item)
+                        .and_then(crate::records::session_wire::codex_tool_call_from_item)
                 {
                     codex_tool_calls.push(call);
                 }
@@ -7816,7 +7836,7 @@ where
                     // A stream can only carry so many tool blocks before the cap that bounds
                     // the table itself applies; stop accumulating rather than grow with the
                     // response.
-                    if open_tool_blocks.len() < crate::session_wire::PENDING_TOOL_CAP {
+                    if open_tool_blocks.len() < crate::records::session_wire::PENDING_TOOL_CAP {
                         open_tool_blocks.insert(
                             index,
                             OpenToolBlock {
@@ -7898,7 +7918,7 @@ where
                     } else {
                         serde_json::from_str::<Value>(&open.input_json).ok()
                     };
-                    tool_uses.push(crate::session_wire::tool_use_event_from_block(
+                    tool_uses.push(crate::records::session_wire::tool_use_event_from_block(
                         open.id,
                         open.name,
                         input.as_ref(),
@@ -7938,7 +7958,7 @@ where
     };
     let expects_turn_end = match provider {
         Provider::Anthropic => true,
-        Provider::Codex => path == crate::provider::CODEX_RESPONSES_PATH,
+        Provider::Codex => path == crate::base::provider::CODEX_RESPONSES_PATH,
     };
     if expects_turn_end
         && !saw_turn_end
@@ -7966,7 +7986,7 @@ where
 /// One place, three callers (the two SSE arms and the message id), because a token added
 /// without the cap is an unbounded allocation driven by the upstream's response.
 fn push_bound_token(tokens: &mut Vec<MintedToken>, kind: BoundTokenKind, token: String) {
-    if tokens.len() >= crate::session_wire::BOUND_TOKEN_SCAN_CAP
+    if tokens.len() >= crate::records::session_wire::BOUND_TOKEN_SCAN_CAP
         || tokens.iter().any(|(_, seen)| *seen == token)
     {
         return;
@@ -8025,13 +8045,13 @@ struct SseParse {
     codex_stream_limit: Option<CodexStreamLimit>,
     /// Every COMPLETED client-side `tool_use` block — what the Tools tab's RUNNING NOW is built
     /// from.
-    tool_uses: Vec<crate::session_wire::ToolUseEvent>,
-    /// Every account-bound token the turn minted — see [`crate::bound_tokens`].
+    tool_uses: Vec<crate::records::session_wire::ToolUseEvent>,
+    /// Every account-bound token the turn minted — see [`crate::stores::bound_tokens`].
     bound_tokens: Vec<MintedToken>,
     /// Every tool call a Codex stream's finished output items asked for, in stream order, at
     /// most `PENDING_TOOL_CAP` of them; always empty on an Anthropic stream, whose calls are
     /// `tool_uses`.
-    codex_tool_calls: Vec<crate::session_wire::CodexToolCall>,
+    codex_tool_calls: Vec<crate::records::session_wire::CodexToolCall>,
 }
 
 /// Codex's failed-response reader recognizes quota codes and transient rate limits
@@ -8039,7 +8059,7 @@ struct SseParse {
 /// context, prompt, policy and overload errors do not condemn an account's quota.
 struct CodexStreamLimit {
     headers: HeaderMap,
-    refusal: Option<crate::quota::CodexQuotaRefusal>,
+    refusal: Option<crate::records::quota::CodexQuotaRefusal>,
     hold_seconds: i64,
 }
 
@@ -8060,7 +8080,8 @@ impl CodexStreamLimit {
             }
         }
         let now = OffsetDateTime::now_utc();
-        let refusal = crate::quota::CodexQuotaRefusal::from_error(&headers, Some(error), now);
+        let refusal =
+            crate::records::quota::CodexQuotaRefusal::from_error(&headers, Some(error), now);
         if refusal.is_none()
             && !matches!(
                 error.get("code").and_then(Value::as_str),
@@ -8205,7 +8226,7 @@ fn quiet_error_response(
 /// peer's account is not it. See the check at the top of the body.
 ///
 /// A request with **account-bound history** (`bound_to`, see
-/// [`crate::bound_tokens`]) never reaches one, and for a sharper reason: a
+/// [`crate::stores::bound_tokens`]) never reaches one, and for a sharper reason: a
 /// peer's account cannot read that history, so the provider would answer the
 /// same 400 or 404 the bench exists to prevent. Its 429 is timed on the bound
 /// account alone.
@@ -8500,7 +8521,7 @@ const fn unified_claim_for(reason: GateReason) -> Option<&'static str> {
 }
 
 /// Where a released conversation goes first when its model's thinking survives only inside the
-/// bound account's organization ([`crate::model::thinking_is_org_bound`]): `Some(idx)` names a
+/// bound account's organization ([`crate::base::model::thinking_is_org_bound`]): `Some(idx)` names a
 /// same-organization sibling of `bound_idx` that this request may use, and the caller serves on
 /// it without selecting again; `None` leaves the pick to the ordinary rotation, unchanged.
 ///
@@ -8523,7 +8544,7 @@ fn same_org_release(
     model: Option<&str>,
     select: impl FnOnce(&HashSet<usize>) -> Option<usize>,
 ) -> Option<usize> {
-    let model = model.filter(|m| crate::model::thinking_is_org_bound(m))?;
+    let model = model.filter(|m| crate::base::model::thinking_is_org_bound(m))?;
     let mut narrowed = manager.outside_org_of(bound_idx);
     narrowed.extend(tried.iter().copied());
     let picked = select(&narrowed);

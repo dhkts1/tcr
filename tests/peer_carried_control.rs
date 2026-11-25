@@ -26,7 +26,7 @@
 
 use std::net::SocketAddr;
 use std::time::Duration;
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 use crate::peer_support::DuplexTarget as Target;
 use tcr::peer::config::id::NodeKey;

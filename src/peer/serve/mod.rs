@@ -100,6 +100,7 @@
 //! bucket rather than asserting it in prose.
 
 mod borrow;
+pub mod fallback;
 mod frame;
 mod hello;
 mod lender;
@@ -377,7 +378,7 @@ mod tests {
     /// path is described as a client-credential path.
     #[test]
     fn refused_path_kind_names_the_codex_refusal_for_a_codex_path() {
-        let codex = crate::provider::CODEX_RESPONSES_PATH;
+        let codex = crate::base::provider::CODEX_RESPONSES_PATH;
         assert!(!serve_is_allowed_for_path(codex), "precondition: refused");
         let kind = refused_path_kind(codex);
         assert!(

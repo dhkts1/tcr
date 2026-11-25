@@ -1,7 +1,7 @@
 //! The per-account gates: holds, rejections, the terminal and hard gates, eligibility, pacing and the binding gate reason.
 
 use super::*;
-use crate::config::effective_fable_threshold;
+use crate::base::config::effective_fable_threshold;
 
 impl Manager {
     /// Milliseconds still to run on a LIVE rate-limit hold, or `None` when the
@@ -144,7 +144,7 @@ impl Manager {
     /// a cold account. Everything absent from it is a fact about ONE REQUEST rather
     /// than about the account, and a per-request fact may divert a request but must
     /// never move a pin. That covers the soft utilization threshold
-    /// ([`crate::quota::Quota::is_near`]), pacing, an entry in `tried`, model-scoped
+    /// ([`crate::records::quota::Quota::is_near`]), pacing, an entry in `tried`, model-scoped
     /// exhaustion ([`Self::model_blocked`]), and — the newest — a rate-limit hold
     /// that clears while the cache is still warm ([`Self::hold_clears_while_warm`]).
     ///
@@ -154,7 +154,7 @@ impl Manager {
     /// back.
     ///
     /// Known staleness caveat: `quota.status` is written ONLY from live response
-    /// headers ([`crate::quota`]), never by the background probe, so for a benched
+    /// headers ([`crate::records::quota`]), never by the background probe, so for a benched
     /// account it is stale-or-`None` and `None` passes here. That is acceptable
     /// precisely because a genuine rejection answers the next attempt with a 429,
     /// which arms a real hold — upstream stays the oracle instead of our own
@@ -401,7 +401,7 @@ impl Manager {
         now: OffsetDateTime,
         now_ms: i64,
         is_fable: bool,
-        provider: crate::provider::Provider,
+        provider: crate::base::provider::Provider,
         group: &str,
         reserved: &HashSet<String>,
         parked: &HashSet<String>,
@@ -496,7 +496,7 @@ impl Manager {
         now: OffsetDateTime,
         now_ms: i64,
         is_fable: bool,
-        provider: crate::provider::Provider,
+        provider: crate::base::provider::Provider,
         group: Option<&str>,
         reserved_group: Option<&str>,
         reserved: &HashSet<String>,
@@ -613,7 +613,7 @@ impl Manager {
     /// therefore stops feeding [`Manager::retry_after_hint`] a clear-instant it was
     /// never going to honour. Otherwise every ACTIVE gate contributes the instant it clears:
     /// a future hold its deadline, and a window at/over `threshold` its
-    /// [`crate::quota::QuotaWindow::live_reset`]. An account frees only once ALL of
+    /// [`crate::records::quota::QuotaWindow::live_reset`]. An account frees only once ALL of
     /// its gates clear, so the binding gate is the LATEST-clearing one and
     /// `free_at` is the MAX of the clear-instants. An active gate with no known
     /// reset (a window over threshold whose reset is unknown) is the

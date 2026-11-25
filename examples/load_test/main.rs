@@ -213,7 +213,7 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     harness::seed_bound_tokens(&scratch.bound_token_path(), now)?;
     // The fleet ceiling as the proxy will read it: through its own loader, from the file it
     // boots on, rather than a copy of the defaults that could drift from them.
-    let booted = tcr::config::load(&scratch.config_path())?;
+    let booted = tcr::base::config::load(&scratch.config_path())?;
     let fleet_ceiling_per_s = booted
         .fleet_bucket()
         .map(|(burst, spacing)| stats::gcra_window_bound(burst, spacing, 1_000));
@@ -273,7 +273,7 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     let (cpu0, rss_boot, disk0) =
         refresh(&mut sys).context("the test proxy vanished before the phase")?;
     let load0 = System::load_average();
-    // The proxy writes its log on a background thread fed by a queue (`src/file_log.rs`), so the
+    // The proxy writes its log on a background thread fed by a queue (`src/stores/file_log.rs`), so the
     // warm-up's last `request usage` lines can land a moment after its replies. Read the offset
     // once the file has stopped growing, or those lines are counted as the phase's (measured:
     // up to all 16 of the `overhead` warm-up's).

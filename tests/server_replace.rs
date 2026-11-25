@@ -10,7 +10,7 @@ use std::sync::{
     mpsc,
 };
 use std::time::{Duration, Instant};
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 struct Proxy {
     child: Child,
@@ -265,7 +265,7 @@ fn predecessor_retains_its_listener_until_the_receiver_acknowledges_it() {
     let home = scratch_home();
     let mut old = Proxy::spawn(home.path(), 0, false);
     let addr = old.ready();
-    let endpoint = tcr::restart::socket_path(old.child.id());
+    let endpoint = tcr::stores::restart::socket_path(old.child.id());
     let mut peer = UnixStream::connect(endpoint).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     peer.write_all(b"tcr-replace/2\n").unwrap();
@@ -304,7 +304,7 @@ fn incumbent_keeps_serving_after_failed_descriptor_send() {
     let home = scratch_home();
     let mut old = Proxy::spawn(home.path(), 0, false);
     let addr = old.ready();
-    let endpoint = tcr::restart::socket_path(old.child.id());
+    let endpoint = tcr::stores::restart::socket_path(old.child.id());
     let mut peer = UnixStream::connect(&endpoint).unwrap();
     peer.set_write_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -485,7 +485,7 @@ fn a_never_ending_tunnel_has_a_drain_ceiling() {
         home.path(),
         0,
         false,
-        &[(tcr::restart::DRAIN_CEILING_TEST_ENV, &ceiling_ms)],
+        &[(tcr::stores::restart::DRAIN_CEILING_TEST_ENV, &ceiling_ms)],
     );
     let addr = old.ready();
     let _held = held_tunnel(addr);
@@ -527,7 +527,7 @@ fn a_receiver_that_dies_after_receipt_still_drains_the_predecessor() {
     let mut old = Proxy::spawn(home.path(), 0, false);
     let addr = old.ready();
     let (_client, mut upstream) = held_tunnel(addr);
-    let mut peer = UnixStream::connect(tcr::restart::socket_path(old.child.id())).unwrap();
+    let mut peer = UnixStream::connect(tcr::stores::restart::socket_path(old.child.id())).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     peer.write_all(b"tcr-replace/2\n").unwrap();
     let listener = tcr_fdpass::recv_listener(&peer).unwrap();
@@ -681,7 +681,7 @@ fn assert_stand_down_flushes_the_actual_log_owner() {
 fn a_stand_down_flushes_its_log_and_a_taken_handoff_socket_still_serves() {
     use std::os::unix::process::CommandExt;
     if std::env::var_os("TCR_HANDOFF_SOCKET_TAKEN").is_some() {
-        let path = tcr::restart::socket_path(std::process::id());
+        let path = tcr::stores::restart::socket_path(std::process::id());
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let listener: std::os::fd::OwnedFd = listener.into();
         // The holder keeps this process's endpoint live across exec. Its input
@@ -761,7 +761,7 @@ fn a_stand_down_flushes_its_log_and_a_taken_handoff_socket_still_serves() {
         stderr.contains("listener handoff disabled"),
         "bind failure must warn: {stderr}"
     );
-    let path = tcr::restart::socket_path(proxy.child.id());
+    let path = tcr::stores::restart::socket_path(proxy.child.id());
     let deadline = Instant::now() + Duration::from_secs(5);
     while path.exists() {
         assert!(
@@ -783,7 +783,7 @@ fn replace_against_an_embedded_proxy_prints_the_stand_down_marker() {
     // This test process plays the embedded host: it holds the port and claims it.
     let held = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = held.local_addr().unwrap().port();
-    let owner_dir = tcr::paths::cache_dir_in(&tcr::paths::Roots {
+    let owner_dir = tcr::base::paths::cache_dir_in(&tcr::base::paths::Roots {
         home: Some(home.path().to_path_buf()),
         xdg_cache_home: None,
     })
@@ -792,13 +792,13 @@ fn replace_against_an_embedded_proxy_prints_the_stand_down_marker() {
     .unwrap()
     .to_path_buf();
     std::fs::create_dir_all(&owner_dir).unwrap();
-    tcr::singleton::write_owner_file(
-        &tcr::singleton::owner_path_in(&owner_dir, port),
-        &tcr::singleton::ProxyOwner {
+    tcr::stores::singleton::write_owner_file(
+        &tcr::stores::singleton::owner_path_in(&owner_dir, port),
+        &tcr::stores::singleton::ProxyOwner {
             pid: std::process::id(),
             port,
             sha: "0000000".to_string(),
-            host: tcr::singleton::ProxyHost::Embedded,
+            host: tcr::stores::singleton::ProxyHost::Embedded,
         },
     )
     .unwrap();
@@ -825,7 +825,7 @@ fn replace_against_an_embedded_proxy_prints_the_stand_down_marker() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(tcr::singleton::INCUMBENT_MARKER),
+        stderr.contains(tcr::stores::singleton::INCUMBENT_MARKER),
         "--replace against an embedded proxy must print the stand-down marker; status {}, \
          stderr: {stderr}",
         output.status

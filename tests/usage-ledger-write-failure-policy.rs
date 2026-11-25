@@ -28,10 +28,10 @@ mod peer_support;
 use peer_support::CaptureLayer;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
-use tcr::pricing::PricingTable;
-use tcr::usage::{LedgerAccount, UsageRecord, UsageTracker};
+use tcr::base::pricing::PricingTable;
+use tcr::records::usage::{LedgerAccount, UsageRecord, UsageTracker};
 use tracing_subscriber::layer::SubscriberExt;
 
 /// A scratch directory named after this process and thread, so concurrent

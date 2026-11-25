@@ -1,7 +1,7 @@
 //! `tcr` — the command-line binary.
 //!
 //! Boot sequence (DESIGN §main): load the config → hand it to
-//! [`tcr::server::serve`], which builds the [`Manager`], spawns the
+//! [`tcr::proxy::server::serve`], which builds the [`Manager`], spawns the
 //! axum proxy task and the background loops, and binds → run the TUI (or block
 //! in `--headless`) → shut the handle down, which flushes on exit.
 //!
@@ -18,9 +18,9 @@ use clap::{Parser, Subcommand};
 
 mod cmd;
 
-use tcr::cli::{self, PriorityArg};
-use tcr::config;
-use tcr::{demo, login, mint, server, update};
+use tcr::base::config;
+use tcr::verbs::cli::{self, PriorityArg};
+use tcr::{proxy::server, verbs::demo, verbs::login, verbs::mint, verbs::update};
 
 use cmd::ConfigFile;
 use cmd::peer::{peer_cli, run_peer};
@@ -191,7 +191,7 @@ struct FanProbeArgs {
 }
 
 /// `tcr setup …`: install, remove or report the two routes that make typing
-/// `claude` go through tcr. See `src/setup.rs` for what each writes.
+/// `claude` go through tcr. See `src/verbs/setup.rs` for what each writes.
 #[derive(clap::Args)]
 struct SetupArgs {
     #[command(subcommand)]
@@ -223,10 +223,10 @@ struct SetupTcrRunArgs {
     remove: bool,
 }
 
-/// Parse `--shell` through the one recogniser `src/setup.rs` uses for
+/// Parse `--shell` through the one recogniser `src/verbs/setup.rs` uses for
 /// `$SHELL`, so the flag and the variable can never disagree on a name.
-fn parse_shell(value: &str) -> Result<tcr::setup::Shell, String> {
-    tcr::setup::Shell::from_name(value)
+fn parse_shell(value: &str) -> Result<tcr::verbs::setup::Shell, String> {
+    tcr::verbs::setup::Shell::from_name(value)
         .ok_or_else(|| format!("{value} is not one of zsh, bash, fish"))
 }
 
@@ -237,7 +237,7 @@ struct SetupShellArgs {
     remove: bool,
     /// The shell to set up: zsh, bash or fish (default: $SHELL).
     #[arg(long, value_parser = parse_shell)]
-    shell: Option<tcr::setup::Shell>,
+    shell: Option<tcr::verbs::setup::Shell>,
 }
 
 #[derive(clap::Args)]
@@ -259,7 +259,7 @@ struct SetupStatusArgs {
     json: bool,
     /// The shell to check: zsh, bash or fish (default: $SHELL).
     #[arg(long, value_parser = parse_shell)]
-    shell: Option<tcr::setup::Shell>,
+    shell: Option<tcr::verbs::setup::Shell>,
     #[command(flatten)]
     config: ConfigFile,
 }
@@ -828,7 +828,7 @@ fn effective_argv(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
 }
 
 /// The CLI with every `--config` flag's help ending in the one sentence that
-/// says what the default is ([`tcr::paths::config_flag_default_help`]).
+/// says what the default is ([`tcr::base::paths::config_flag_default_help`]).
 ///
 /// Thirty-odd verbs take `--config`, each with its own description of what it
 /// reads the file for. The default used to be hand-copied into every one of
@@ -855,7 +855,7 @@ fn cli_command() -> clap::Command {
     }
     with_default(
         <Cli as clap::CommandFactory>::command(),
-        &tcr::paths::config_flag_default_help(),
+        &tcr::base::paths::config_flag_default_help(),
     )
 }
 
@@ -870,7 +870,7 @@ fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
 }
 
 /// The runtime is built here rather than by `#[tokio::main]`, whose default is one worker
-/// thread per core: see `tcr::server::worker_threads` for the count and why.
+/// thread per core: see `tcr::proxy::server::worker_threads` for the count and why.
 fn main() -> anyhow::Result<()> {
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let workers =
@@ -888,7 +888,7 @@ async fn run_main() -> anyhow::Result<()> {
         Some(Command::Server(args)) => run_server(args).await,
         Some(Command::Run(args)) => run_harness(args).await,
         Some(Command::Login(args)) => run_login(args).await,
-        Some(Command::Import(args)) => tcr::import::run(&args.config.path(), args.yes).await,
+        Some(Command::Import(args)) => tcr::verbs::import::run(&args.config.path(), args.yes).await,
         Some(Command::Mint(args)) => run_mint(args).await,
         Some(Command::Accounts(args)) => run_accounts(args).await,
         Some(Command::Remove(args)) => run_remove(args).await,
@@ -1112,7 +1112,7 @@ async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
 /// `tcr setup shell|claude-settings|status`. A refusal is an error, so the
 /// exit code is non-zero and the conflict lines are on stderr.
 fn run_setup(args: SetupArgs) -> anyhow::Result<()> {
-    use tcr::setup;
+    use tcr::verbs::setup;
     let homes = setup::Homes::from_env()?;
     match args.action {
         SetupAction::Shell(args) => {
@@ -1205,9 +1205,9 @@ async fn run_doctor(args: DoctorArgs) -> anyhow::Result<()> {
 
 /// `tcr fan [auto [--force] | fixed <RPM> | follow <QUIET_C> <FULL_C>]`.
 async fn run_fan(args: FanArgs) -> anyhow::Result<()> {
-    use tcr::fan::FanRequest;
+    use tcr::stores::fan::FanRequest;
     let request = match args.action {
-        Some(FanAction::Probe(probe)) => return tcr::fan_probe::run(probe.label).await,
+        Some(FanAction::Probe(probe)) => return tcr::verbs::fan_probe::run(probe.label).await,
         None => None,
         Some(FanAction::Auto { force }) => Some(FanRequest::Auto { force }),
         Some(FanAction::Fixed { rpm }) => Some(FanRequest::Fixed { rpm }),
@@ -1440,7 +1440,7 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
         return finish_login(result, args.non_interactive);
     }
     if args.codex {
-        let result = tcr::codex_cli_login::login(
+        let result = login::codex_cli::login(
             &config_path,
             args.force,
             args.account.as_deref(),

@@ -43,7 +43,7 @@ async fn borrowed_requests_are_paced_by_the_lenders_own_bucket() {
 /// Three concurrent borrowed requests against one lender, and how long the last
 /// one took. The lender's fleet is one account in one organization, so every
 /// one of the three lands in the same per-org bucket.
-async fn borrowed_burst(throttle: tcr::config::ThrottleConfig) -> std::time::Duration {
+async fn borrowed_burst(throttle: tcr::base::config::ThrottleConfig) -> std::time::Duration {
     let (upstream, _hits, _served) = fleet::spawn_upstream().await;
     let lender_proxy = fleet::spawn_proxy(fleet::lending_manager(&upstream, throttle)).await;
 

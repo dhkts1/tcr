@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use tcr::config::Config;
-use tcr::fallback::{self, Ask, FallbackProvider};
+use tcr::base::config::Config;
 use tcr::manager::Manager;
+use tcr::peer::serve::fallback::{self, Ask, FallbackProvider};
 use tower::ServiceExt as _;
 
 /// What the provider answers with, so the body the client reads proves WHERE
@@ -123,7 +123,7 @@ async fn a_codex_request_is_never_offered_to_a_fallback_provider() {
         "control: a dry fleet offers an Anthropic request to the provider"
     );
 
-    let (status, body) = post(tcr::provider::CODEX_RESPONSES_PATH, "{}").await;
+    let (status, body) = post(tcr::base::provider::CODEX_RESPONSES_PATH, "{}").await;
     assert_ne!(
         body.as_ref(),
         SENTINEL,

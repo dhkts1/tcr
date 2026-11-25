@@ -3,7 +3,7 @@
 //! # Why this is not in `tcr.json`
 //!
 //! Every field of the main config except group membership and `groupSettings`
-//! is a BOOT-TIME SNAPSHOT (`Config`, `src/config.rs:785`), and that rule is
+//! is a BOOT-TIME SNAPSHOT (`Config`, `src/base/config.rs:785`), and that rule is
 //! load-bearing: a whole evening was lost once to edits that applied perfectly
 //! and were simply not visible yet. Peer policy must not inherit it. A grant
 //! (`tcr peer allow`, `tcr peer lend`, `tcr peer share on`) has to take effect
@@ -27,7 +27,7 @@
 //!
 //! (The blueprint's §4 puts the socket fields in a new `peer` key in
 //! `tcr.json` instead. Same two tiers, one fewer file to explain; this
-//! skeleton keeps them here so nothing in `src/config.rs` changes at all, and
+//! skeleton keeps them here so nothing in `src/base/config.rs` changes at all, and
 //! the coder who lands phase 2 can move them with Gil's answer in hand.)
 //!
 //! # Mode 0600, and what an outstanding invite really is
@@ -3120,7 +3120,7 @@ pub fn save(path: &Path, file: &PeerFile) -> Result<()> {
     let mut file = file.clone();
     file.ensure_lease_ids()?;
     let json = serde_json::to_string_pretty(&file)?;
-    crate::config::write_atomic(path, &json)?;
+    crate::base::config::write_atomic(path, &json)?;
     Ok(())
 }
 
@@ -3729,7 +3729,7 @@ mod tests {
     fn a_key_this_build_does_not_know_survives_a_load_and_a_save() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tcr-peers.json");
-        crate::config::write_atomic(
+        crate::base::config::write_atomic(
             &path,
             r#"{"discovery": true, "futureSetting": "app", "futureObject": {"n": 3}}"#,
         )
@@ -3773,7 +3773,8 @@ mod tests {
     fn an_unknown_tailnet_word_loads_as_off_and_is_saved_back() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tcr-peers.json");
-        crate::config::write_atomic(&path, r#"{"discovery": true, "tailnet": "both"}"#).unwrap();
+        crate::base::config::write_atomic(&path, r#"{"discovery": true, "tailnet": "both"}"#)
+            .unwrap();
 
         let mut file = read_or_default(&path).unwrap();
         assert_eq!(file.tailnet, TailnetSetting::Unknown("both".to_string()));

@@ -42,7 +42,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 use tcr::peer::config::id::NodeKey;
 use tcr::peer::config::{self, Allow, Endpoint, EndpointSource, PeerFile, PeerRow};

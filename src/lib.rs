@@ -6,78 +6,18 @@
 
 #![forbid(unsafe_code)]
 
-pub mod account_uuid;
-pub mod affinity;
-pub mod bound_tokens;
-pub mod build_info;
-pub(crate) mod cache_file;
-pub mod cache_ttl;
-pub mod claude_code_login;
-pub mod claude_resets;
-pub mod cli;
-pub mod codex_cli_login;
-pub mod codex_local;
-pub mod codex_login;
-pub mod codex_probe;
-pub mod codex_route;
-mod codex_token_store;
-pub mod config;
-pub mod config_keys;
-pub mod config_set;
-pub mod config_show;
-pub mod control_identity;
-pub mod demo;
-pub mod doctor;
-pub mod fallback;
-pub mod fan;
-pub mod fan_probe;
-pub mod file_log;
-pub(crate) mod forecast;
-#[cfg(unix)]
-pub mod handoff;
-pub mod heat;
-pub mod http_client;
-pub mod identity;
-pub mod import;
-pub mod live_client;
-pub mod log_err;
-pub mod login;
+pub mod base;
+pub mod clients;
 pub mod manager;
-pub mod mint;
-pub mod mitm;
-pub mod model;
-pub mod oauth;
-pub mod observations;
-pub mod paths;
 pub mod peer;
-pub mod pricing;
-pub mod probe;
-pub mod provider;
-pub mod provider_guard;
 pub mod proxy;
-pub mod quota;
-pub mod request_body;
+pub mod records;
 pub mod request_key;
-pub mod restart;
-pub mod routing;
-pub mod save_gate;
-pub mod schedule;
-pub mod server;
-pub mod session_wire;
-pub mod session_wire_persist;
-pub mod setup;
-pub mod singleton;
-pub mod stats;
 pub mod status;
+pub mod stores;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
-pub mod tls;
-pub mod tui;
-pub mod update;
-pub mod usage;
-pub mod wake;
-pub mod warmer;
-pub mod wrap;
+pub mod verbs;
 
 use time::OffsetDateTime;
 

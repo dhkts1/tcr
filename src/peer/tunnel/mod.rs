@@ -743,7 +743,7 @@ impl PathMeter {
 /// [`crate::peer::lease::handed_tokens`] is a process-local store: the
 /// alternative is a handle threaded from boot through the forwarder and the
 /// ledger, and a handle the ledger can reach is a handle
-/// [`crate::config::Config`] can reach.
+/// [`crate::base::config::Config`] can reach.
 ///
 /// Nothing here writes the state file. Summing the meter into
 /// [`crate::peer::state::save_path_traffic`] is the serving process's act, on

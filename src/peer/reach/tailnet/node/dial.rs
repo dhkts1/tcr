@@ -443,8 +443,8 @@ pub async fn dial_for_cli(
     if is_tailnet_ip(addr.ip())
         && crate::peer::config::read_or_default(peers_path)?.tailnet_mode() == TailnetMode::Node
     {
-        let config_path = crate::config::default_path();
-        let config = crate::config::load(&config_path)
+        let config_path = crate::base::config::default_path();
+        let config = crate::base::config::load(&config_path)
             .with_context(|| format!("reading {}", config_path.display()))?;
         let stream = dial_through_server(
             config.proxy.port,

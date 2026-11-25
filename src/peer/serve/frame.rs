@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{LeaseRefusal, MAX_FRAME_BYTES, PROTO_VERSION};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::fallback::Ask;
 use crate::peer::noise;
+use crate::peer::serve::fallback::Ask;
 
 use super::policy::{
     SERVE_METHOD, lender_forwards_header, scrub_client_credentials, serve_is_allowed_for_path,

@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 use tcr::manager::Manager;
 use tcr::peer::config::PeerStore;
 use tcr::peer::config::id::NodeKey;

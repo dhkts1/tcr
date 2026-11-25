@@ -34,7 +34,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 use tcr::test_support::child::KillOnDrop;
 
 /// `{"alg":"none","typ":"JWT"}`.
@@ -162,7 +162,7 @@ impl Scratch {
         let home = tempfile::tempdir().expect("a scratch HOME");
         let config_dir = home.path().join(".config");
         std::fs::create_dir_all(&config_dir).expect("the scratch .config");
-        let config = config_dir.join(tcr::paths::CONFIG_FILE);
+        let config = config_dir.join(tcr::base::paths::CONFIG_FILE);
         let log = home.path().join("codex.log");
         let watched = log.clone();
         let (upstream, answered) = spawn_upstream(BOB_CLEARED, move || seen(&watched));
@@ -509,7 +509,7 @@ fn fake_tcr(dir: &Path, version: &str) {
 /// the de-duplication removed, the one on both is warned about twice.
 #[test]
 fn login_codex_prints_its_notices_only_when_they_hold() {
-    let n1 = tcr::login::CODEX_FIRST_ACCOUNT_NOTICE.to_string();
+    let n1 = tcr::verbs::login::CODEX_FIRST_ACCOUNT_NOTICE.to_string();
 
     // (a) The first account, no codex login, two older tcrs on PATH.
     let scratch = Scratch::new("[]");

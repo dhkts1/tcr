@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use tcr::config;
+use tcr::base::config;
 use tcr::peer;
 
 use super::peer_cli;
@@ -491,7 +491,7 @@ pub(super) fn run_peer_lend(a: peer_cli::PeerLendArgs) -> anyhow::Result<()> {
 /// rows, so nothing is read for `all` or `group:`. A config that is missing or
 /// unreadable skips the check, as `tcr peer ls` treats one, rather than failing
 /// a verb about the peers file. The refusal is
-/// [`tcr::provider_guard::provider_guard`]'s, in the words every
+/// [`tcr::verbs::provider_guard::provider_guard`]'s, in the words every
 /// Claude-only refusal uses.
 fn refuse_a_lend_scope_naming_codex(
     scope: &tcr_peer_wire::LendScope,
@@ -505,8 +505,11 @@ fn refuse_a_lend_scope_naming_codex(
         return Ok(());
     };
     for account in main.accounts_labelled(labels) {
-        tcr::provider_guard::provider_guard(account, tcr::provider_guard::ClaudeOnlyVerb::Lend)
-            .map_err(anyhow::Error::msg)?;
+        tcr::verbs::provider_guard::provider_guard(
+            account,
+            tcr::verbs::provider_guard::ClaudeOnlyVerb::Lend,
+        )
+        .map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }
@@ -514,7 +517,7 @@ fn refuse_a_lend_scope_naming_codex(
 /// One lend grant, with the operator's numbers clamped and the clamp SAID.
 ///
 /// The fraction ceiling is `0.5`, mirroring the clamp the main config already
-/// applies to `controlReserve` (`src/config.rs:855-856`) rather than inventing a
+/// applies to `controlReserve` (`src/base/config.rs:855-856`) rather than inventing a
 /// second number for the same kind of quantity. A clamp is printed, never
 /// silent: an operator who typed `0.9` and got `0.5` has to be able to see that
 /// happen, or they will believe the file says something it does not.
@@ -916,7 +919,7 @@ mod peer_grant_tests {
     /// peers fixtures give: a field added to `Config` later must not turn this
     /// into a compile error.
     fn config_with_account(dir: &Path, egress: &str) -> PathBuf {
-        let path = dir.join(tcr::paths::CONFIG_FILE);
+        let path = dir.join(tcr::base::paths::CONFIG_FILE);
         std::fs::write(
             &path,
             format!(

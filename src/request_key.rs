@@ -223,7 +223,8 @@ fn basic_user_password(value: &str) -> Option<(String, String)> {
             other => other,
         })
         .collect();
-    let decoded = String::from_utf8(crate::oauth::codex::base64url_decode(&url_safe)?).ok()?;
+    let decoded =
+        String::from_utf8(crate::clients::oauth::codex::base64url_decode(&url_safe)?).ok()?;
     let (user, password) = decoded.split_once(':')?;
     Some((user.to_string(), password.to_string()))
 }
@@ -302,7 +303,7 @@ impl ConnectClass {
             Self::AnthropicApi
         } else if host.eq_ignore_ascii_case("platform.claude.com") {
             Self::ClaudePlatform
-        } else if host.eq_ignore_ascii_case(crate::provider::CODEX_HOST) {
+        } else if host.eq_ignore_ascii_case(crate::base::provider::CODEX_HOST) {
             Self::Chatgpt
         } else {
             Self::Other
@@ -326,7 +327,7 @@ pub enum PathClass {
     Messages,
     /// Any other `/v1/` path (`/v1/models`, ...).
     V1Other,
-    /// A Codex path ([`crate::provider::Provider::of_path`]).
+    /// A Codex path ([`crate::base::provider::Provider::of_path`]).
     Codex,
     /// `/api/...`, where Claude Code's unkeyed `HEAD /api/hello` lands.
     Api,
@@ -335,7 +336,8 @@ pub enum PathClass {
 
 impl PathClass {
     pub fn of(path: &str) -> Self {
-        if crate::provider::Provider::of_path(path) == crate::provider::Provider::Codex {
+        if crate::base::provider::Provider::of_path(path) == crate::base::provider::Provider::Codex
+        {
             Self::Codex
         } else if path == "/v1/messages" || path.starts_with("/v1/messages/") {
             Self::Messages

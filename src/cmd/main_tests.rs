@@ -3,7 +3,7 @@
 //! with the binary's other modules rather than widening `src/`.
 
 use super::*;
-use tcr::codex_route::no_codex_account_reason;
+use tcr::verbs::codex_route::no_codex_account_reason;
 
 /// Every `--config` flag, on every verb, says the default once and the same
 /// way.
@@ -32,7 +32,7 @@ fn every_config_flag_states_the_default_file() {
         "found only {} --config flags",
         flags.len()
     );
-    let sentence = tcr::paths::config_flag_default_help();
+    let sentence = tcr::base::paths::config_flag_default_help();
     for (verb, help, long_help) in &flags {
         assert!(
             help.ends_with(&format!("{sentence}.")),
@@ -58,7 +58,7 @@ fn every_config_flag_states_the_default_file() {
         .render_help()
         .to_string();
     assert!(
-        rendered.contains(&format!("~/.config/{}", tcr::paths::CONFIG_FILE)),
+        rendered.contains(&format!("~/.config/{}", tcr::base::paths::CONFIG_FILE)),
         "{rendered}"
     );
 }
@@ -194,7 +194,7 @@ fn from_codex_parses_alone_and_with_codex_home_name_and_account() {
 /// error.
 #[test]
 fn restart_hint_names_only_commands_that_parse() {
-    let commands: Vec<&str> = tcr::live_client::RESTART_HINT
+    let commands: Vec<&str> = tcr::proxy::live_client::RESTART_HINT
         .split('`')
         .skip(1)
         .step_by(2)
@@ -203,7 +203,7 @@ fn restart_hint_names_only_commands_that_parse() {
     assert!(
         !commands.is_empty(),
         "the hint must name a tcr command to run: {}",
-        tcr::live_client::RESTART_HINT
+        tcr::proxy::live_client::RESTART_HINT
     );
     for command in commands {
         let argv: Vec<&str> = command.split_whitespace().collect();
@@ -236,9 +236,9 @@ fn codex_remedies_name_only_commands_that_parse() {
         login::codex_identity_refusal("carol@example.com", "erin@example.com/codex").reason,
         workspace.reason,
         no_codex_account_reason(3999, "chatgpt.com"),
-        tcr::oauth::NO_REFRESH_CODEX_MESSAGE.to_string(),
+        tcr::clients::oauth::NO_REFRESH_CODEX_MESSAGE.to_string(),
         login::no_codex_login_message(Path::new("/Users/example/.codex/auth.json")),
-        tcr::codex_cli_login::codex_login_saved_line("bob@example.com", Some("ChatGPT Pro")),
+        login::codex_cli::codex_login_saved_line("bob@example.com", Some("ChatGPT Pro")),
         login::CODEX_IMPORT_RUN_LINE.to_string(),
         login::CODEX_FIRST_ACCOUNT_NOTICE.to_string(),
     ];
@@ -382,7 +382,7 @@ fn the_troubleshooting_login_remedies_parse_and_name_the_folder() {
 #[test]
 fn the_pooled_codex_verdict_names_a_command_that_parses() {
     for requests in [1, 2] {
-        let verdict = tcr::doctor::CodexReport {
+        let verdict = tcr::verbs::doctor::CodexReport {
             port: 3999,
             rows: Vec::new(),
             route: tcr_status_wire::CodexRoute {
@@ -396,7 +396,7 @@ fn the_pooled_codex_verdict_names_a_command_that_parses() {
             upstream: "https://chatgpt.com".to_string(),
             upstream_is_default: true,
             bin: Ok((PathBuf::from("/opt/homebrew/bin/codex"), "PATH".to_string())),
-            env: tcr::doctor::CodexEnv::default(),
+            env: tcr::verbs::doctor::CodexEnv::default(),
             login: PathBuf::from("/Users/example/.codex/auth.json"),
             login_exists: true,
             requests_10m: Some(requests),
@@ -438,7 +438,7 @@ fn login_help_lists_codex_as_a_whole_token() {
         "--codex-home",
     ] {
         assert!(
-            tcr::codex_local::help_has_whole_token(&help, token),
+            tcr::clients::codex_local::help_has_whole_token(&help, token),
             "`tcr login --help` must carry {token} as a whole token:\n{help}"
         );
     }
@@ -488,7 +488,7 @@ fn the_group_argv_tcrbar_sends_is_unchanged() {
 /// the restart hint above once went wrong.
 #[test]
 fn every_command_a_codex_refusal_names_parses() {
-    use tcr::provider_guard;
+    use tcr::verbs::provider_guard;
     let sentences = [
         provider_guard::reserve_strands_codex(
             "orchard",
@@ -682,7 +682,7 @@ fn help_names_both_providers() {
         let help = sub(path).render_long_help().to_string();
         for token in tokens {
             assert!(
-                tcr::codex_local::help_has_whole_token(&help, token),
+                tcr::clients::codex_local::help_has_whole_token(&help, token),
                 "`tcr {} --help` must carry {token} as a whole token:\n{help}",
                 path.join(" ")
             );

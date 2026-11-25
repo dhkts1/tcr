@@ -2,7 +2,7 @@
 
 use super::select_test_support::{live_manager, pin, pin_of};
 use super::*;
-use crate::config::Account;
+use crate::base::config::Account;
 use std::collections::HashSet;
 
 fn account(name: &str, groups: &[&str]) -> Account {

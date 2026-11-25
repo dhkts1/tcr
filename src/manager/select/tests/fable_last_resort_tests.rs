@@ -2,8 +2,8 @@
 
 use super::select_test_support::{account, live_manager};
 use super::*;
-use crate::config::Account;
-use crate::quota::QuotaWindow;
+use crate::base::config::Account;
+use crate::records::quota::QuotaWindow;
 use std::collections::HashSet;
 use time::Duration;
 
@@ -100,7 +100,7 @@ fn fable_weekly_threshold_at_one_frees_prediction_but_not_rejection() {
 /// `account_gate`'s `FableWeekly` push must agree with `model_blocked` on the
 /// same account under both an absent and a set `fableWeeklyThreshold` — two
 /// independently-resolved copies is exactly how the panel and routing can
-/// drift; see [`crate::config::effective_fable_threshold`], the one resolver both consume.
+/// drift; see [`crate::base::config::effective_fable_threshold`], the one resolver both consume.
 #[test]
 fn account_gate_and_model_blocked_agree_on_fable_weekly_under_both_settings() {
     for fable_weekly_threshold in [None, Some(1.0)] {

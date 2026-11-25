@@ -1,10 +1,10 @@
 //! The setup this file's test modules share: one way to build a manager,
 //! a healthy account, and the session-pin map read and written directly.
 use super::*;
-use crate::config::Account;
-use crate::oauth::NoRefresh;
-use crate::probe::LiveUsageProber;
-use crate::warmer::LiveWarmer;
+use crate::base::config::Account;
+use crate::clients::oauth::NoRefresh;
+use crate::clients::warmer::LiveWarmer;
+use crate::records::probe::LiveUsageProber;
 
 /// A healthy Anthropic account, the same shape every module in this file builds.
 pub(super) fn account(name: &str) -> Account {

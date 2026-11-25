@@ -1016,7 +1016,7 @@ fn rekeys_with_rejection_rolling_in(remaining_ms: i64, extended: bool) -> bool {
     {
         let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
         accounts[home].quota.status = Some("rejected".to_string());
-        accounts[home].quota.five_hour = Some(crate::quota::QuotaWindow {
+        accounts[home].quota.five_hour = Some(crate::records::quota::QuotaWindow {
             utilization: 1.0,
             reset: Some(now + Duration::milliseconds(remaining_ms)),
         });

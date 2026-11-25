@@ -108,7 +108,7 @@ use crate::peer::tunnel::PEER_EGRESS_PORT;
 /// The ONLY origins a gateway will carry. Deny by default: a host absent from
 /// this list is refused, not tunnelled.
 ///
-/// Independent of [`crate::tls::ALLOWED_HOSTS`]: a local interception capability
+/// Independent of [`crate::base::tls::ALLOWED_HOSTS`]: a local interception capability
 /// must not grant a peer gateway permission to dial another origin.
 pub const PEER_EGRESS_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com"];
 
@@ -1012,15 +1012,15 @@ pub struct PinnedAttempt<'a> {
     /// The client's session key, for the served counter.
     pub session_key: Option<u64>,
     /// What kind of session it was.
-    pub session_kind: crate::stats::SessionKind,
+    pub session_kind: crate::records::stats::SessionKind,
     /// The wire-session id, when the request carried one.
     pub wire_session_id: Option<&'a str>,
     /// The model the request asked for.
     pub model: Option<String>,
     /// The tool-use events parsed out of the request body.
-    pub tool_uses: &'a [crate::session_wire::ToolUseEvent],
+    pub tool_uses: &'a [crate::records::session_wire::ToolUseEvent],
     /// The tool results parsed out of the request body.
-    pub tool_results: &'a [crate::session_wire::ToolResultEvent],
+    pub tool_results: &'a [crate::records::session_wire::ToolResultEvent],
 }
 
 /// Take the carry for an account that is locked to one exit, BEFORE the direct
@@ -1278,7 +1278,7 @@ pub struct CarriedRecord<'a> {
     /// The client's session key, for the served counter.
     pub session_key: Option<u64>,
     /// What kind of session it was.
-    pub session_kind: crate::stats::SessionKind,
+    pub session_kind: crate::records::stats::SessionKind,
     /// The wire-session id, when the request carried one.
     pub wire_session_id: Option<&'a str>,
     /// The model the request asked for.
@@ -1298,9 +1298,9 @@ pub struct CarriedRecord<'a> {
     /// [`axum_response_from`] strips before the client sees them.
     pub upstream_headers: &'a HeaderMap,
     /// The tool-use and tool-result events parsed out of the request body.
-    pub tool_uses: &'a [crate::session_wire::ToolUseEvent],
+    pub tool_uses: &'a [crate::records::session_wire::ToolUseEvent],
     /// The tool results parsed out of the request body.
-    pub tool_results: &'a [crate::session_wire::ToolResultEvent],
+    pub tool_results: &'a [crate::records::session_wire::ToolResultEvent],
 }
 
 /// Record a carried request exactly the way a directly-served one is recorded.
@@ -1424,8 +1424,8 @@ async fn record_the_hold_the_ladder_would(
         }
         return;
     }
-    let rejections = crate::quota::quota_rejections(headers);
-    let retry_after_raw = crate::http_client::parse_retry_after(headers);
+    let rejections = crate::records::quota::quota_rejections(headers);
+    let retry_after_raw = crate::base::http_client::parse_retry_after(headers);
     let retry_after = retry_after_raw.unwrap_or(60);
     if rejections.is_empty() {
         // No unified rejection: a transient limit, and the hold is the one the
@@ -1458,13 +1458,15 @@ async fn record_the_hold_the_ladder_would(
         );
         return;
     }
-    if rejections.contains(&crate::quota::UnifiedRejectionKind::FableWeekly) {
+    if rejections.contains(&crate::records::quota::UnifiedRejectionKind::FableWeekly) {
         manager.mark_model_weekly_rejected(idx, headers);
     }
-    if rejections
-        .iter()
-        .any(|kind| !matches!(kind, crate::quota::UnifiedRejectionKind::FableWeekly))
-    {
+    if rejections.iter().any(|kind| {
+        !matches!(
+            kind,
+            crate::records::quota::UnifiedRejectionKind::FableWeekly
+        )
+    }) {
         manager.mark_rate_limited(
             idx,
             crate::proxy::jittered_quota_hold(
@@ -1543,7 +1545,7 @@ async fn send_through(
     host: &str,
     splice_port: u16,
 ) -> Result<reqwest::Response> {
-    let client = crate::http_client::builder()
+    let client = crate::base::http_client::builder()
         .no_proxy()
         .resolve(host, SocketAddr::from(([127, 0, 0, 1], splice_port)))
         .build()

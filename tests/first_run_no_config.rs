@@ -31,7 +31,7 @@ use std::process::Command;
 /// The config path the child will resolve from its own `HOME`
 /// (`config::default_path`).
 fn config_path_in(home: &std::path::Path) -> PathBuf {
-    home.join(".config").join(tcr::paths::CONFIG_FILE)
+    home.join(".config").join(tcr::base::paths::CONFIG_FILE)
 }
 
 /// Run `tcr <args…>` against a scratch `HOME`, returning (exit code, stdout, stderr).
@@ -188,7 +188,7 @@ fn accounts_with_no_config_exits_zero_with_an_empty_table() {
         "`tcr accounts` must create the config it could not find"
     );
     assert!(
-        stderr.contains("created") && stderr.contains(tcr::paths::CONFIG_FILE),
+        stderr.contains("created") && stderr.contains(tcr::base::paths::CONFIG_FILE),
         "creating the config must say so once, got: {stderr}"
     );
 }

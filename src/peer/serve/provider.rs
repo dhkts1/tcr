@@ -1,4 +1,4 @@
-//! The borrower's `crate::fallback` provider, [`PeerLeaseProvider`], and the
+//! The borrower's `crate::peer::serve::fallback` provider, [`PeerLeaseProvider`], and the
 //! hand-mode serve it falls to, [`serve_on_handed_bearer`].
 
 use std::collections::HashMap;
@@ -11,13 +11,13 @@ use axum::response::Response;
 use futures::future::BoxFuture;
 use tcr_peer_wire::{Lease, LeaseRequest, LeaseUnit, PeerId, Window};
 
-use crate::fallback::{Ask, FallbackProvider};
 use crate::peer::config::PeerStore;
 use crate::peer::lease::{
     handed_tokens, lenders_in_ask_order, nothing_left_this_mac, report_handed_spend,
     reported_utilization, request_lease,
 };
 use crate::peer::serve;
+use crate::peer::serve::fallback::{Ask, FallbackProvider};
 
 /// The peer-lease implementation of the proxy's fallback seam.
 ///
@@ -127,7 +127,7 @@ impl PeerLeaseProvider {
             // `peer::serve::serve_on_own_account` gives: an environment proxy
             // variable must not silently route a request that is spending
             // somebody else's account through a third host.
-            hand_egress: crate::http_client::builder()
+            hand_egress: crate::base::http_client::builder()
                 .no_proxy()
                 .build()
                 .inspect_err(|err| {
@@ -138,7 +138,7 @@ impl PeerLeaseProvider {
                     );
                 })
                 .ok()
-                .map(|client| (crate::config::default_upstream(), client)),
+                .map(|client| (crate::base::config::default_upstream(), client)),
         }
     }
 

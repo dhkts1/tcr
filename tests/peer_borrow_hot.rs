@@ -30,10 +30,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tcr::config::Config;
+use tcr::base::config::Config;
 use tcr::peer::config as peer_config;
-use tcr::server::{IncumbentPolicy, ServeOptions, ServeOutcome, TlsSetup, serve};
-use tcr::singleton::ProxyHost;
+use tcr::proxy::server::{IncumbentPolicy, ServeOptions, ServeOutcome, TlsSetup, serve};
+use tcr::stores::singleton::ProxyHost;
 
 /// The port `tcr` uses by default. Named so the assertion below says what it is
 /// protecting rather than showing a bare number.
@@ -168,7 +168,7 @@ async fn a_disclose_grant_written_after_boot_is_borrowed_on_without_a_restart() 
     };
     assert_ne!(handle.addr().port(), LIVE_PROXY_PORT);
     assert!(
-        tcr::fallback::configured_provider().is_none(),
+        tcr::peer::serve::fallback::configured_provider().is_none(),
         "a peers file whose only row may not be disclosed to describes nobody to borrow from, \
          so the boot read must install no provider"
     );
@@ -188,7 +188,7 @@ async fn a_disclose_grant_written_after_boot_is_borrowed_on_without_a_restart() 
 
     // Moment 3: one POST at a fleet with no account, which is the only
     // condition under which a provider is consulted at all.
-    let client = tcr::http_client::builder()
+    let client = tcr::base::http_client::builder()
         .no_proxy()
         .build()
         .expect("a loopback client");
@@ -212,8 +212,8 @@ async fn a_disclose_grant_written_after_boot_is_borrowed_on_without_a_restart() 
         "the request after the grant must have dialled the lender, with no restart in between: \
          this is the whole claim"
     );
-    let provider =
-        tcr::fallback::configured_provider().expect("the grant installed a provider after boot");
+    let provider = tcr::peer::serve::fallback::configured_provider()
+        .expect("the grant installed a provider after boot");
     assert_eq!(
         provider.name(),
         "peer-lease",

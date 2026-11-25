@@ -20,9 +20,9 @@ on:
       - scripts/install-tcrbar-from-dmg.sh
       - scripts/e2e-first-run.sh
       - scripts/check-e2e-first-run-safe.sh
-      - src/claude_code_login.rs
-      - src/config.rs
-      - src/config/**
+      - src/clients/claude_code_login.rs
+      - src/base/config.rs
+      - src/base/config/**
       - .github/workflows/e2e-install.yml
 
 permissions:

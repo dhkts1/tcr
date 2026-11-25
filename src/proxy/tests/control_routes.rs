@@ -321,7 +321,7 @@ async fn control_endpoint_409s_an_ambiguous_query_naming_the_candidates() {
 
 /// The same two-org fleet with the names a migration would have given it:
 /// the qualified name parks exactly its own row, live AND on disk. The
-/// resolution rule is the CLI's own [`crate::identity::match_one`], run
+/// resolution rule is the CLI's own [`crate::base::identity::match_one`], run
 /// against the LIVE rotation slots.
 #[tokio::test]
 async fn control_endpoint_parks_the_row_a_qualified_name_points_at() {
@@ -1074,7 +1074,7 @@ async fn priority_endpoint_moves_a_codex_account_within_its_own_provider() {
         )
     };
     assert_eq!(
-        fresh(crate::provider::CODEX_RESPONSES_PATH),
+        fresh(crate::base::provider::CODEX_RESPONSES_PATH),
         Some(1),
         "bob leads the Codex pool"
     );
@@ -1096,7 +1096,7 @@ async fn priority_endpoint_moves_a_codex_account_within_its_own_provider() {
     let payload: SetPriorityResponse = serde_json::from_slice(&body).expect("a priority payload");
     assert_eq!(payload.name, "carol@example.com/codex");
     assert_eq!(
-        fresh(crate::provider::CODEX_RESPONSES_PATH),
+        fresh(crate::base::provider::CODEX_RESPONSES_PATH),
         Some(2),
         "the next fresh Codex request goes to carol"
     );
@@ -1119,7 +1119,7 @@ async fn priority_endpoint_moves_a_codex_account_within_its_own_provider() {
 /// precisely the one shape that was never the attack.
 ///
 /// The peer is always loopback and no proxy api-key is configured, because that
-/// is the population this class applies to: [`crate::config`] defaults
+/// is the population this class applies to: [`crate::base::config`] defaults
 /// `api_key: None` and nothing generates one, so on a fresh install loopback is
 /// the whole gate. With a key configured the route is closed by the key check
 /// (see [`control_endpoint_rejects_a_bad_api_key`]) — requiring a header also

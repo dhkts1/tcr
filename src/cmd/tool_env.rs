@@ -51,7 +51,7 @@ impl Host<'static> {
     pub(crate) fn current() -> Self {
         Self {
             env: &process_env,
-            own_ca: tcr::tls::minted_ca_path(),
+            own_ca: tcr::base::tls::minted_ca_path(),
         }
     }
 }
@@ -85,12 +85,12 @@ fn resolve(name: &Path, past_cmux_shims: bool) -> Option<PathBuf> {
         std::env::split_paths(&std::env::var_os("PATH")?)
             .map(|dir| dir.join(name))
             .find(|p| {
-                tcr::codex_local::is_executable_file(p)
-                    && !tcr::codex_local::is_tool_launcher(p)
-                    && !(past_cmux_shims && tcr::codex_local::is_cmux_shim(p))
+                tcr::clients::codex_local::is_executable_file(p)
+                    && !tcr::clients::codex_local::is_tool_launcher(p)
+                    && !(past_cmux_shims && tcr::clients::codex_local::is_cmux_shim(p))
             })?
     };
-    tcr::codex_local::is_executable_file(&path)
+    tcr::clients::codex_local::is_executable_file(&path)
         .then(|| std::path::absolute(path).ok())
         .flatten()
 }
@@ -120,7 +120,7 @@ fn caller_env(port: Option<u16>, host: &Host<'_>) -> BTreeMap<String, String> {
             // Strip only our own CA; caller bundles remain part of the shell env.
             if (CAS.contains(key) && Path::new(&value) == host.own_ca)
                 || (PROXIES.contains(key)
-                    && port.is_some_and(|port| tcr::doctor::points_at_tcr(&value, port)))
+                    && port.is_some_and(|port| tcr::verbs::doctor::points_at_tcr(&value, port)))
             {
                 return None;
             }
@@ -182,16 +182,16 @@ pub(crate) fn apply(
     let claude = launcher_target(claude);
     let tcr = std::env::current_exe()?.canonicalize()?;
     let config = std::path::absolute(config)?;
-    let codex_bin = tcr::codex_local::find_codex_for_launcher()
+    let codex_bin = tcr::clients::codex_local::find_codex_for_launcher()
         .ok()
         .and_then(|found| executable(&found.path));
     let host = Host::current();
-    let helper_parent = std::path::absolute(tcr::paths::cache_dir().root().join("tool-env"))?;
+    let helper_parent = std::path::absolute(tcr::base::paths::cache_dir().root().join("tool-env"))?;
     let original = |key: &str, saved: &str| {
         inherited(cmd, key, &host)
             .filter(|v| !v.is_empty())
             .and_then(|value| {
-                if tcr::codex_local::is_tool_launcher(Path::new(&value))
+                if tcr::clients::codex_local::is_tool_launcher(Path::new(&value))
                     || Path::new(&value).starts_with(&helper_parent)
                 {
                     (host.env)(saved).filter(|v| !v.is_empty())
@@ -230,7 +230,7 @@ pub(crate) fn apply(
         })
         .unwrap_or_else(|| "/bin/bash".into());
     let caller = caller_env(model_port(cmd, &host), &host);
-    let parent = std::path::absolute(tcr::paths::cache_dir().root().join("tool-env"))?;
+    let parent = std::path::absolute(tcr::base::paths::cache_dir().root().join("tool-env"))?;
     private_dir(&parent)?;
     let setup = SetupKey {
         prefix: prefix.as_deref(),
@@ -403,7 +403,7 @@ impl SetupKey<'_> {
         // scripts a running session of an older tcr uses.
         let fields = [
             Some(env!("CARGO_PKG_VERSION").as_bytes()),
-            Some(tcr::build_info::SHA.as_bytes()),
+            Some(tcr::base::build_info::SHA.as_bytes()),
             self.prefix.map(str::as_bytes),
             self.env_file.map(str::as_bytes),
             Some(self.shell.as_bytes()),

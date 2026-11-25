@@ -22,13 +22,15 @@ use std::path::Path;
 
 use std::sync::Arc;
 
-use tcr::cli::snapshot_offline;
-use tcr::oauth::NoRefresh;
-use tcr::probe::{ProbeCredential, ProbeError, ProbeFuture, Usage, UsageBucket, UsageProber};
+use tcr::clients::oauth::NoRefresh;
+use tcr::records::probe::{
+    ProbeCredential, ProbeError, ProbeFuture, Usage, UsageBucket, UsageProber,
+};
 use tcr::status::StatusPayload;
+use tcr::verbs::cli::snapshot_offline;
 
 /// The exit code `--check` reports a failed probe with
-/// (`tcr::cli::StatusCheck::exit_code`). Written out as a literal on
+/// (`tcr::verbs::cli::StatusCheck::exit_code`). Written out as a literal on
 /// purpose: it is a contract scripts read, so changing it must fail here.
 const PROBE_FAILED_EXIT: i32 = 4;
 
@@ -53,7 +55,7 @@ impl UsageProber for HealthyProber {
     fn probe(&self, _credential: ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Ok(Usage {
-                five_hour: tcr::probe::WindowReading::Read(UsageBucket {
+                five_hour: tcr::records::probe::WindowReading::Read(UsageBucket {
                     utilization: Some(0.2),
                     reset_at_ms: None,
                 }),
@@ -80,7 +82,7 @@ const FLEET: &str = r#"{
 async fn payload_from(dir: &Path, prober: Arc<dyn UsageProber>) -> String {
     let path = dir.join("fleet.json");
     std::fs::write(&path, FLEET).expect("write the fleet config");
-    let config = tcr::config::load(&path).expect("load the fleet config");
+    let config = tcr::base::config::load(&path).expect("load the fleet config");
     let snapshot = snapshot_offline(config, Arc::new(NoRefresh), prober, true).await;
     let thresholds = vec![1.0; snapshot.accounts.len()];
     let payload = StatusPayload::from_snapshot(
@@ -279,9 +281,9 @@ async fn routing_proxy(home: &Path) -> u16 {
         ),
     )
     .expect("write the proxy config");
-    let config = tcr::config::load(&path).expect("load the proxy config");
+    let config = tcr::base::config::load(&path).expect("load the proxy config");
     let manager = tcr::manager::Manager::with_live_refresher(config, None);
-    tokio::spawn(async move { tcr::mitm::serve(listener, manager, None).await });
+    tokio::spawn(async move { tcr::proxy::mitm::serve(listener, manager, None).await });
     port
 }
 

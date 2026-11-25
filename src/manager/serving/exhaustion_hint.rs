@@ -26,7 +26,7 @@ impl Manager {
         &self,
         now: OffsetDateTime,
         is_fable: bool,
-        provider: crate::provider::Provider,
+        provider: crate::base::provider::Provider,
     ) -> i64 {
         self.exhaustion_hint(now, is_fable, provider, None)
             .retry_after
@@ -50,7 +50,7 @@ impl Manager {
         &self,
         now: OffsetDateTime,
         is_fable: bool,
-        provider: crate::provider::Provider,
+        provider: crate::base::provider::Provider,
         group: &str,
     ) -> i64 {
         self.exhaustion_hint(now, is_fable, provider, Some(group))
@@ -120,7 +120,7 @@ impl Manager {
         &self,
         now: OffsetDateTime,
         is_fable: bool,
-        provider: crate::provider::Provider,
+        provider: crate::base::provider::Provider,
         group: Option<&str>,
     ) -> ExhaustionHint {
         self.exhaustion_hint_over(now, is_fable, Some(provider), group, None)
@@ -128,7 +128,7 @@ impl Manager {
 
     /// [`Self::exhaustion_hint`] for a request that ONE account alone may serve.
     ///
-    /// Exists for a request whose history is account-bound (see [`crate::bound_tokens`]): the
+    /// Exists for a request whose history is account-bound (see [`crate::stores::bound_tokens`]): the
     /// proxy benches every other account, so the fleet-wide hint times the wait against
     /// accounts this request will never be allowed to use. Any of them freeing sooner wins the
     /// fleet's `min`, spends the request's one-shot soft-wait waking early, and answers a 429
@@ -153,16 +153,16 @@ impl Manager {
         &self,
         now: OffsetDateTime,
         is_fable: bool,
-        provider: Option<crate::provider::Provider>,
+        provider: Option<crate::base::provider::Provider>,
         group: Option<&str>,
         only: Option<usize>,
     ) -> ExhaustionHint {
         let now_ms = odt_to_ms(now);
         let codex_candidates = match provider.or_else(|| only.and_then(|idx| self.provider(idx))) {
-            Some(crate::provider::Provider::Codex) => {
+            Some(crate::base::provider::Provider::Codex) => {
                 Some(self.codex_candidate_indices(only, group))
             }
-            Some(crate::provider::Provider::Anthropic) | None => None,
+            Some(crate::base::provider::Provider::Anthropic) | None => None,
         };
         let groups = self.groups();
         let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
@@ -199,8 +199,8 @@ impl Manager {
             );
             if reason == GateReason::Rejected {
                 match account.provider {
-                    crate::provider::Provider::Anthropic => {}
-                    crate::provider::Provider::Codex => {
+                    crate::base::provider::Provider::Anthropic => {}
+                    crate::base::provider::Provider::Codex => {
                         if let Some(at) = Self::rejected_codex_free_at_ms(account, threshold, now) {
                             rejected_codex_soonest =
                                 Some(rejected_codex_soonest.map_or(at, |best| best.min(at)));
@@ -248,7 +248,7 @@ impl Manager {
     /// A measured Codex quota deadline keeps its full duration
     /// ([`Self::mark_codex_quota_limited`]); only transient rate limits use the bounded hold.
     /// The account stays rejected until a usage probe sees the window it stored roll, reads
-    /// the account allowed ([`crate::quota::Quota::apply_usage`]), or a served 2xx carrying a
+    /// the account allowed ([`crate::records::quota::Quota::apply_usage`]), or a served 2xx carrying a
     /// window reads it allowed.
     fn rejected_codex_free_at_ms(
         account: &AccountRuntime,
@@ -259,9 +259,9 @@ impl Manager {
         // A deadline the refusal named and that has passed promises nothing; only a refusal
         // that named none falls back to its window and its hold.
         match account.quota.codex_refusal_deadline(now) {
-            crate::quota::RefusalDeadline::Ahead(reset) => Some(odt_to_ms(reset)),
-            crate::quota::RefusalDeadline::Passed => None,
-            crate::quota::RefusalDeadline::Unnamed => {
+            crate::records::quota::RefusalDeadline::Ahead(reset) => Some(odt_to_ms(reset)),
+            crate::records::quota::RefusalDeadline::Passed => None,
+            crate::records::quota::RefusalDeadline::Unnamed => {
                 Self::rejected_codex_window(account, threshold, now)
                     .map(|(_, reset)| odt_to_ms(reset))
                     .or(account.rate_limited_until_ms)
@@ -301,10 +301,10 @@ impl Manager {
     /// whose reset is latest, as in [`Self::rejected_codex_window`]. `None` when no such window
     /// is stored.
     ///
-    /// The stored utilization, not [`crate::quota::QuotaWindow::effective`], which reads a
+    /// The stored utilization, not [`crate::records::quota::QuotaWindow::effective`], which reads a
     /// window past its reset as `0.0`: that the window rolled is the clock's inference, and the
     /// refusal stands until a usage probe reads the new window
-    /// ([`crate::quota::Quota::apply_usage`]), or a served 2xx that carries a window reads the
+    /// ([`crate::records::quota::Quota::apply_usage`]), or a served 2xx that carries a window reads the
     /// account allowed.
     fn rolled_codex_window(
         account: &AccountRuntime,
@@ -374,8 +374,8 @@ impl Manager {
         free_at: Option<OffsetDateTime>,
     ) -> (GateReason, Option<OffsetDateTime>) {
         match account.provider {
-            crate::provider::Provider::Anthropic => return (gate, free_at),
-            crate::provider::Provider::Codex => {}
+            crate::base::provider::Provider::Anthropic => return (gate, free_at),
+            crate::base::provider::Provider::Codex => {}
         }
         if gate != GateReason::Rejected {
             return (gate, free_at);

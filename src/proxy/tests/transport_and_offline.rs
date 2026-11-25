@@ -168,7 +168,7 @@ async fn transport_failure_retries_the_same_account_first() {
 /// `manager/mod.rs`'s tests: a hand-built stub would prove nothing about
 /// what the LIVE h2 error's `source()` chain actually renders.
 async fn h2_transport_error_for(url: &str) -> reqwest::Error {
-    crate::http_client::builder()
+    crate::base::http_client::builder()
         .http2_prior_knowledge()
         .timeout(Duration::from_secs(5))
         .build()
@@ -600,7 +600,7 @@ async fn the_mixed_ladder_forwards_the_real_529_instead_of_synthesizing_a_429() 
 /// `reqwest::Error`. A hand-built stub would prove nothing here: the whole
 /// question is what the LIVE error's `source()` chain looks like.
 async fn transport_error_for(url: &str) -> reqwest::Error {
-    crate::http_client::builder()
+    crate::base::http_client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .expect("client builds")
@@ -852,7 +852,7 @@ async fn base_url_loopback_proceeds_not_rejected_503() {
 
 /// Test 4 — the MITM-terminated shape (origin-form `/v1/messages`, `Host:
 /// api.anthropic.com`) passes the guard via the allowlist branch
-/// (`crate::tls::host_allowed`) → rotation loop → dead upstream → 503.
+/// (`crate::base::tls::host_allowed`) → rotation loop → dead upstream → 503.
 #[tokio::test]
 async fn anthropic_host_proceeds_not_rejected_503() {
     let addr = spawn_dead_upstream_proxy().await;

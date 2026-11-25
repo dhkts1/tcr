@@ -7,10 +7,10 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use tcr_peer_wire::{Lease, PeerId, StreamHeader, StreamKind};
 
-use crate::fallback::Ask;
 use crate::peer::config::PeerStore;
 use crate::peer::config::id::NodeKey;
 use crate::peer::noise::{self, Handshake, recv_json, send_json};
+use crate::peer::serve::fallback::Ask;
 
 use super::frame::{SERVE_FLOW, ServeAck, ServeReply, recv_body, send_body, serve_request_from};
 use super::policy::serve_is_allowed_for_path;
@@ -35,7 +35,7 @@ use crate::peer::tunnel::dial::dial_peer_reaching;
 ///
 /// # `headers` is the borrower's own, and it is scrubbed here
 ///
-/// [`Ask`] carries none today, and `crate::fallback`'s module doc says why: the
+/// [`Ask`] carries none today, and `crate::peer::serve::fallback`'s module doc says why: the
 /// only code that strips a client credential sits 215 lines downstream of the
 /// seam an [`Ask`] is built at. So the production caller hands in an empty map,
 /// and this parameter exists for the two cases an empty map cannot serve, the

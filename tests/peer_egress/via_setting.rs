@@ -369,8 +369,8 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     .expect("the config fixture writes");
 
     let wire = peer.to_wire();
-    let read_pin = |label: &str| -> tcr::config::EgressPin {
-        let loaded = tcr::config::load(&config)
+    let read_pin = |label: &str| -> tcr::base::config::EgressPin {
+        let loaded = tcr::base::config::load(&config)
             .unwrap_or_else(|err| panic!("the config reads back after {label}: {err}"));
         loaded.accounts[0].egress_pin()
     };
@@ -389,7 +389,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     assert!(ok, "the pin by id: {out}{err}");
     assert_eq!(
         read_pin("the pin by id").egress,
-        tcr::config::Egress::Via(peer),
+        tcr::base::config::Egress::Via(peer),
         "the account leaves through the Mac the id names: {out}"
     );
     assert!(
@@ -411,7 +411,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     assert!(ok, "back to local: {out}{err}");
     assert_eq!(
         read_pin("back to local").egress,
-        tcr::config::Egress::Local,
+        tcr::base::config::Egress::Local,
         "`local` is the word for this Mac's own socket: {out}"
     );
 
@@ -432,7 +432,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     );
     assert_eq!(
         read_pin("the pin by name").egress,
-        tcr::config::Egress::Via(peer),
+        tcr::base::config::Egress::Via(peer),
         "and lands the same pin the id did: {out}"
     );
 
@@ -450,7 +450,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     let after = read_pin("--must on its own");
     assert_eq!(
         after.egress,
-        tcr::config::Egress::Via(peer),
+        tcr::base::config::Egress::Via(peer),
         "--must changes what an unreachable exit COSTS and never where the exit is: {out}"
     );
     assert!(
@@ -475,7 +475,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     );
     assert_eq!(
         read_pin("the refused name").egress,
-        tcr::config::Egress::Via(peer),
+        tcr::base::config::Egress::Via(peer),
         "and the refusal leaves the pin that was there: {out}{err}"
     );
 }

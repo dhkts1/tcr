@@ -37,19 +37,19 @@ mod tcr_env;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
-use tcr::fallback::{self, Ask, FallbackProvider};
+use tcr::base::provider::Provider;
 use tcr::peer::config::{
     Allow, ControlGrants, Endpoint, EndpointSource, LendGrant, PeerFile, PeerRow, PeerStore,
 };
 use tcr::peer::lease::{self, Ledger, RelayRefusal};
 use tcr::peer::serve;
 use tcr::peer::serve::PeerLeaseProvider;
+use tcr::peer::serve::fallback::{self, Ask, FallbackProvider};
 use tcr::peer::tunnel::dial;
-use tcr::provider::Provider;
 use tcr_peer_wire::{Lease, LeaseRefusal, LeaseRequest, LeaseUnit, PeerId, Window};
 
 #[path = "peer_lease/borrow_deadline.rs"]

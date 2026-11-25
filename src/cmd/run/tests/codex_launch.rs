@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use clap::Parser as _;
-use tcr::doctor::{no_proxy_entry_exempts, points_at_tcr};
-use tcr::{live_client, status};
+use tcr::verbs::doctor::{no_proxy_entry_exempts, points_at_tcr};
+use tcr::{proxy::live_client, status};
 
 use crate::cmd::run::launch_env::LaunchKey;
 use crate::cmd::run::{
@@ -367,7 +367,7 @@ fn codex_launch_follows_what_the_running_proxy_reports() {
             pooling().map(|mut payload| {
                 payload
                     .accounts
-                    .retain(|row| row.provider != tcr::provider::Provider::Codex);
+                    .retain(|row| row.provider != tcr::base::provider::Provider::Codex);
                 payload
             }),
             true,

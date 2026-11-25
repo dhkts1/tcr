@@ -36,7 +36,7 @@ async fn spawn_upstream_recording(seen: Bodies) -> String {
 /// A manager with ONE fake account pointed at `upstream`; `extra` is spliced
 /// into the top-level config object (the unmodelled flags live there).
 fn manager(upstream: &str, extra: &str) -> Arc<tcr::manager::Manager> {
-    let config: tcr::config::Config = serde_json::from_str(&format!(
+    let config: tcr::base::config::Config = serde_json::from_str(&format!(
         r#"{{
             "proxy": {{ "port": 0 }},
             "upstream": "{upstream}",
@@ -63,7 +63,7 @@ async fn spawn_proxy(manager: Arc<tcr::manager::Manager>) -> String {
         .expect("bind the proxy");
     let addr = listening.local_addr().expect("proxy addr");
     tokio::spawn(async move {
-        tcr::mitm::serve(listening, manager, None).await;
+        tcr::proxy::mitm::serve(listening, manager, None).await;
     });
     format!("http://{addr}")
 }
@@ -210,8 +210,9 @@ async fn a_rewritten_long_body_gets_its_uuid_patched_after_the_splices() {
     let upstream = spawn_upstream_recording(Arc::clone(&seen)).await;
     let proxy = spawn_proxy(manager(&upstream, "")).await;
     let body = long_body(1024 * 1024, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", None);
-    let rewritten = tcr::cache_ttl::extend_all_ttls(&body).expect("breakpoints to extend");
-    let expected = tcr::account_uuid::patch_account_uuid(&rewritten, SERVING_UUID).into_owned();
+    let rewritten = tcr::records::cache_ttl::extend_all_ttls(&body).expect("breakpoints to extend");
+    let expected =
+        tcr::records::account_uuid::patch_account_uuid(&rewritten, SERVING_UUID).into_owned();
     assert_ne!(expected, rewritten, "control: the patch changes something");
 
     assert_eq!(send_body(&proxy, body).await, 200);

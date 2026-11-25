@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tcr::{live_client, status};
+use tcr::{proxy::live_client, status};
 
 use crate::cmd::run::launch_env::{
     LaunchKey, LaunchRequestKey, apply_base_url_env, apply_codex_see_through_env,

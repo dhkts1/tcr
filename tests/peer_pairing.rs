@@ -29,7 +29,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 use tcr::peer::config::id::NodeKey;
 use tcr::peer::config::join_key;
 use tcr::peer::config::{self, NetworkKey, PeerFile};

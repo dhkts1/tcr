@@ -34,14 +34,14 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 
-use tcr::fallback::Ask;
 use tcr::peer::config::LendMode;
 use tcr::peer::lease::{
     HANDOFF_RENEW_LEAD_MS, HandedBearer, HandedTokens, Ledger, bearer_fingerprint, handed_tokens,
     handoff_for, handoff_push_is_due, handoff_renewal_due, lease_has_ended, usage_hint,
 };
+use tcr::peer::serve::fallback::Ask;
 use tcr::peer::serve::serve_on_handed_bearer;
 use tcr_peer_wire::{Control, Lease, LeaseUnit, Window};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -184,7 +184,7 @@ impl FakeOrigin {
     /// A client that can reach THIS origin and no other: the hostname resolves
     /// to this origin's port and nothing else is routable.
     fn client(&self) -> reqwest::Client {
-        tcr::http_client::builder()
+        tcr::base::http_client::builder()
             .no_proxy()
             // A hang would otherwise turn a red gate into a wait: a loopback
             // origin that has not answered in ten seconds has failed.
@@ -528,7 +528,7 @@ fn a_bearer_goes_out_on_a_return_visit_and_on_no_other_handshake() {
 #[test]
 fn a_held_account_is_not_handed_over_and_the_roomiest_one_is() {
     let manager_with = |accounts: &str| {
-        let config: tcr::config::Config = serde_json::from_str(&format!(
+        let config: tcr::base::config::Config = serde_json::from_str(&format!(
             r#"{{
                 "proxy": {{ "port": 0 }},
                 "upstream": "http://127.0.0.1:1",
@@ -636,7 +636,7 @@ fn a_strictly_pinned_account_is_never_handed_over() {
         }"#;
 
     let manager_with = |accounts: String| {
-        let config: tcr::config::Config = serde_json::from_str(&format!(
+        let config: tcr::base::config::Config = serde_json::from_str(&format!(
             r#"{{
                 "proxy": {{ "port": 0 }},
                 "upstream": "http://127.0.0.1:1",
@@ -699,7 +699,7 @@ fn a_strictly_pinned_account_is_never_handed_over() {
 #[test]
 fn a_hand_lease_is_funded_only_by_an_account_whose_bearer_can_go_out() {
     let manager_with = |accounts: &str| {
-        let config: tcr::config::Config = serde_json::from_str(&format!(
+        let config: tcr::base::config::Config = serde_json::from_str(&format!(
             r#"{{
                 "proxy": {{ "port": 0 }},
                 "upstream": "http://127.0.0.1:1",
@@ -1290,7 +1290,7 @@ fn a_strict_local_pin_refuses_a_hand_grant_at_lend_time() {
 /// `EgressPin::may_be_handed` and the unresolvable index reads as lendable.
 #[test]
 fn an_account_index_the_exit_locks_do_not_cover_is_refused() {
-    use tcr::config::{Egress, EgressPin};
+    use tcr::base::config::{Egress, EgressPin};
 
     let free = EgressPin {
         egress: Egress::Local,

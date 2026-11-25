@@ -1,11 +1,11 @@
-//! `Manager` glue for [`crate::session_wire::WireSessionTracker`] — split verbatim from
+//! `Manager` glue for [`crate::records::session_wire::WireSessionTracker`] — split verbatim from
 //! `mod.rs`, mirroring `usage.rs`/`snapshot.rs`'s split.
 
 use std::path::Path;
 
 use crate::manager::*;
-use crate::session_wire::{CodexToolCall, ToolResultEvent, ToolUseEvent};
-use crate::session_wire_persist::{self, LoadReport};
+use crate::records::session_wire::{CodexToolCall, ToolResultEvent, ToolUseEvent};
+use crate::stores::session_wire_persist::{self, LoadReport};
 
 impl Manager {
     /// Fold one request's session identity, model and parsed tool events into the wire-session
@@ -46,7 +46,7 @@ impl Manager {
     /// [`Self::record_wire_session_usage`], and NOT from the request call site: this is the
     /// only source that can ever put a tool in `running`, because a Claude Code request body
     /// carries each `tool_use` together with its `tool_result` — see
-    /// [`crate::session_wire::tool_use_event_from_block`].
+    /// [`crate::records::session_wire::tool_use_event_from_block`].
     pub fn record_wire_session_tool_uses(
         &self,
         session_id: Option<&str>,
@@ -72,20 +72,20 @@ impl Manager {
     /// Add token counts learned from a response's usage to the wire-session table. Called
     /// beside [`Self::record_usage`] (the per-account ledger) by
     /// `proxy::served::ServedTurn::finish`, for streamed and non-streamed turns alike, with the SAME
-    /// [`crate::usage::UsageRecord`], so the account ledger, the per-model tally and the wire
+    /// [`crate::records::usage::UsageRecord`], so the account ledger, the per-model tally and the wire
     /// session's quota totals never disagree about what a response carried.
     ///
     /// The record's base input and both cache-creation tiers (`UsageRecord::input`/`cache_5m`/
     /// `cache_1h`) fold into the session's `input_tokens`/`cache_creation_tokens` totals and
     /// into the per-model pricing tally kept in
-    /// [`crate::session_wire::WireSession::by_model`] — wire 2. The QUOTA figure
+    /// [`crate::records::session_wire::WireSession::by_model`] — wire 2. The QUOTA figure
     /// (`UsageRecord::input_total()`) is deliberately NOT read there: it already folds cache
     /// reads in, and folding it into `input_tokens` too was the 2026-09-14 double-count
-    /// incident (see [`crate::session_wire::WireSession::input_tokens`]).
+    /// incident (see [`crate::records::session_wire::WireSession::input_tokens`]).
     pub fn record_wire_session_usage(
         &self,
         session_id: Option<&str>,
-        record: &crate::usage::UsageRecord,
+        record: &crate::records::usage::UsageRecord,
     ) {
         let Some(session_id) = session_id else {
             return;
@@ -109,7 +109,7 @@ impl Manager {
         self.record_codex_wire_request(
             session_id,
             account,
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             now,
         );
     }
@@ -170,15 +170,15 @@ impl Manager {
     }
 
     /// Add a Codex response's usage to its wire session: the same
-    /// [`crate::usage::UsageRecord`] [`Self::record_wire_session_usage`] takes, whose reasoning
+    /// [`crate::records::usage::UsageRecord`] [`Self::record_wire_session_usage`] takes, whose reasoning
     /// tokens and own stamp (`ts_ms`) the Codex session also keeps, so the account ledger and
     /// the session never disagree about what a response carried, or when. Unlike its Claude
     /// twin it stamps no Anthropic cache TTL, and the usage's model names the session — see
-    /// [`crate::session_wire::WireSessionTracker::record_codex_usage`].
+    /// [`crate::records::session_wire::WireSessionTracker::record_codex_usage`].
     pub fn record_codex_wire_session_usage(
         &self,
         session_id: Option<&str>,
-        record: &crate::usage::UsageRecord,
+        record: &crate::records::usage::UsageRecord,
     ) {
         let Some(session_id) = session_id else {
             return;
@@ -193,7 +193,7 @@ impl Manager {
     }
 
     /// The live wire-session table, projected onto [`tcr_status_wire::SessionRow`] — what
-    /// [`Self::snapshot`] hangs onto [`crate::stats::StatsSnapshot::wire_sessions`].
+    /// [`Self::snapshot`] hangs onto [`crate::records::stats::StatsSnapshot::wire_sessions`].
     pub(in crate::manager) fn wire_sessions_snapshot(
         &self,
         now: OffsetDateTime,
@@ -243,17 +243,21 @@ impl Manager {
                             .values()
                             .filter(|r| {
                                 (r.tool == "Agent" || r.tool == "Task")
-                                    && !crate::session_wire::running_call_is_lost(r, now_ms)
+                                    && !crate::records::session_wire::running_call_is_lost(
+                                        r, now_ms,
+                                    )
                             })
                             .count() as u64,
                         // Belt and braces beside `WireSessionTracker::restore`'s own drop: an
                         // entry too old to still be running is a LOST result, whatever put it
-                        // there — see `crate::session_wire::running_call_is_lost`.
+                        // there — see `crate::records::session_wire::running_call_is_lost`.
                         running: s
                             .tools
                             .running
                             .into_values()
-                            .filter(|r| !crate::session_wire::running_call_is_lost(r, now_ms))
+                            .filter(|r| {
+                                !crate::records::session_wire::running_call_is_lost(r, now_ms)
+                            })
                             .map(|r| tcr_status_wire::RunningToolRow {
                                 tool: r.tool,
                                 started_ms: r.started_ms,
@@ -304,8 +308,8 @@ impl Manager {
                     // covers, and a session nothing was priced for always reads at least as
                     // many unpriced requests as requests, the rule TcrBar draws no dollars by.
                     unpriced_requests: match s.provider {
-                        crate::provider::Provider::Anthropic => 0,
-                        crate::provider::Provider::Codex => {
+                        crate::base::provider::Provider::Anthropic => 0,
+                        crate::base::provider::Provider::Codex => {
                             unpriced.max(s.requests.saturating_sub(priced))
                         }
                     },
@@ -316,18 +320,18 @@ impl Manager {
     }
 
     /// Price one session's per-model token tallies against the account ledger's OWN pricing
-    /// table (`crate::usage::UsageTracker::price_for`) and sum — one model's price at a time,
+    /// table (`crate::records::usage::UsageTracker::price_for`) and sum — one model's price at a time,
     /// so a session that spans two models is priced correctly rather than averaged. A model
     /// this table has no entry for contributes `0.0` to the cost, the same "unpriced" outcome
-    /// `crate::pricing` documents for the account-level ledger, so `SessionRow::cost_usd` stays
+    /// `crate::base::pricing` documents for the account-level ledger, so `SessionRow::cost_usd` stays
     /// a plain total, never an `Option`. The second value counts the usage records the cost
     /// leaves out, from each unpriced model's tally, and the third the usage records it covers;
     /// the projection reports the requests no price covers as `SessionRow::unpriced_requests`
     /// on Codex sessions only, so a Claude session on a model this build cannot price keeps the
     /// bare zero it has always shown.
     fn price_session(
-        usage: &crate::usage::UsageTracker,
-        by_model: &HashMap<String, crate::session_wire::ModelTokenTally>,
+        usage: &crate::records::usage::UsageTracker,
+        by_model: &HashMap<String, crate::records::session_wire::ModelTokenTally>,
     ) -> (f64, u64, u64) {
         let (mut unpriced, mut priced) = (0, 0);
         let nanos: u64 = by_model
@@ -335,7 +339,7 @@ impl Manager {
             .filter_map(|(model, tally)| {
                 if let Some(price) = usage.price_for(model) {
                     priced += tally.requests;
-                    Some(crate::pricing::cost_nanos(
+                    Some(crate::base::pricing::cost_nanos(
                         &price,
                         tally.input,
                         tally.cache_5m,
@@ -415,7 +419,7 @@ impl Manager {
     }
 
     /// The flusher's save: [`Self::flush_wire_sessions`] when the table differs from what the
-    /// last write put on disk, by the rule [`crate::save_gate`] states. A new or departed
+    /// last write put on disk, by the rule [`crate::stores::save_gate`] states. A new or departed
     /// session is written at once; a change to the sessions already on disk waits until
     /// [`crate::manager::WIRE_SESSIONS_REFRESH`] has passed since the last write.
     ///
@@ -423,7 +427,7 @@ impl Manager {
     pub fn flush_wire_sessions_if_changed(
         &self,
         path: &Path,
-    ) -> Result<crate::save_gate::SaveOutcome, config::ConfigError> {
+    ) -> Result<crate::stores::save_gate::SaveOutcome, config::ConfigError> {
         self.wire_sessions_file.save_if_changed(
             || {
                 let now_ms = crate::now_ms();
@@ -442,7 +446,7 @@ impl Manager {
     fn wire_sessions_to_save(
         &self,
         now_ms: i64,
-    ) -> HashMap<String, crate::session_wire::WireSession> {
+    ) -> HashMap<String, crate::records::session_wire::WireSession> {
         let tracker = self
             .wire_sessions
             .lock()
@@ -477,8 +481,8 @@ mod tests {
     use time::Duration;
 
     use super::*;
-    use crate::session_wire::wire_usage;
-    use crate::usage::UsageRecord;
+    use crate::records::session_wire::wire_usage;
+    use crate::records::usage::UsageRecord;
 
     /// `WireSessionTracker` itself is unit-tested in `session_wire.rs` with canned bodies;
     /// these tests prove the `Manager` GLUE — the lock, the projection to `SessionRow`, and
@@ -600,7 +604,7 @@ mod tests {
         ];
         manager.record_wire_session(Some("sess-lost"), None, None, started, &uses, &[]);
 
-        let grace_ms = crate::session_wire::RUNNING_BASH_LOST_MS;
+        let grace_ms = crate::records::session_wire::RUNNING_BASH_LOST_MS;
         let inside = manager.snapshot(started + Duration::milliseconds(grace_ms));
         assert_eq!(
             inside.wire_sessions[0].tools.running.len(),
@@ -631,7 +635,7 @@ mod tests {
     /// projected as running past its timeout.
     #[test]
     fn a_codex_call_past_its_own_timeout_is_not_projected_as_running() {
-        use crate::session_wire::CodexToolCall;
+        use crate::records::session_wire::CodexToolCall;
         let started = OffsetDateTime::now_utc();
         let call = |id: &str, timeout_seconds: Option<u64>| CodexToolCall {
             event: ToolUseEvent {
@@ -736,7 +740,7 @@ mod tests {
             timed_out: true,
         };
         let bash = |id: &str, command: &str| {
-            crate::session_wire::tool_use_event_from_block(
+            crate::records::session_wire::tool_use_event_from_block(
                 id.to_string(),
                 Some("Bash".to_string()),
                 Some(&serde_json::json!({ "command": command })),
@@ -931,7 +935,7 @@ mod tests {
     /// counters moving waits for `WIRE_SESSIONS_REFRESH`; a new session is written at once.
     #[test]
     fn a_second_wire_session_save_with_no_change_writes_nothing() {
-        use crate::save_gate::SaveOutcome;
+        use crate::stores::save_gate::SaveOutcome;
         let path = tmp_wire_sessions_path("unchanged");
         let manager = Manager::from_runtimes(vec![]);
         let now = OffsetDateTime::now_utc();
@@ -1169,7 +1173,7 @@ mod tests {
     /// no order.
     #[test]
     fn codex_sessions_are_produced_in_the_canonical_shape() {
-        use crate::session_wire::{CodexToolCall, CommandClass, ToolUseEvent};
+        use crate::records::session_wire::{CodexToolCall, CommandClass, ToolUseEvent};
         const NOW: i64 = 1_767_225_600_000;
         const ID: &str = "019a3c5e-0000-7000-8000-000000000002";
         let at = |ms: i64| {
