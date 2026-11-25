@@ -198,6 +198,17 @@ impl Config {
             .filter(|key| !key.is_empty())
     }
 
+    /// Every account whose peer label (its name through
+    /// [`tcr_peer_wire::sanitize_label`]) is one of `labels`, in config order.
+    pub fn accounts_labelled<'a>(
+        &'a self,
+        labels: &'a [String],
+    ) -> impl Iterator<Item = &'a Account> {
+        self.accounts.iter().filter(move |account| {
+            tcr_peer_wire::sanitize_label(&account.name).is_ok_and(|label| labels.contains(&label))
+        })
+    }
+
     /// The name `controlAccount` names, in either of its shapes; `None` when unset.
     pub fn control_account_name(&self) -> Option<&str> {
         self.control_account
