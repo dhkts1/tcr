@@ -370,8 +370,24 @@ fn clean_up_staging(staged: &Path) {
 ///
 /// Stdio is inherited so the installer's own progress and errors are the user's
 /// progress and errors — we add nothing by capturing and re-printing them.
+///
+/// On Linux, `execve` refuses a file some process still holds open for
+/// writing (`ETXTBSY`). Our own write is closed by then, but another thread
+/// forking at that moment inherits the descriptor until its child execs, so
+/// the spawn is retried briefly on that one error (seen in CI under the
+/// parallel test runner, 2026-11-25).
 fn run_installer(staged: &Path, install_dir: &Path) -> anyhow::Result<std::process::ExitStatus> {
-    let spawned = installer_command(staged, install_dir).status();
+    const BUSY_RETRIES: u32 = 10;
+    let mut spawned = installer_command(staged, install_dir).status();
+    for _ in 0..BUSY_RETRIES {
+        match &spawned {
+            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spawned = installer_command(staged, install_dir).status();
+            }
+            _ => break,
+        }
+    }
     clean_up_staging(staged);
     spawned.with_context(|| format!("failed to run the installer at {}", staged.display()))
 }
