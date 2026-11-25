@@ -21,7 +21,7 @@
 //!   import it into the config under test.
 //! * `proxy.port` in the config the test writes → a port nothing is listening
 //!   on, obtained by binding and releasing one. The import probes that port for
-//!   a live account-add route before writing (`oauth::login_route`), and this
+//!   a live account-add route before writing (`login::login_route`), and this
 //!   machine may well have a real proxy on the default 3456 — which this test
 //!   must neither talk to nor add an account to.
 //!

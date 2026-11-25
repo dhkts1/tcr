@@ -43,7 +43,7 @@ async fn post_add_account_reads_a_stamped_400_as_rejected() {
 }
 
 /// The providers a STAMPED answer names come back beside it, read off the very probe
-/// `oauth::probe_add_route` already sends. The same header on an UNSTAMPED answer — an older
+/// `login::probe_add_route` already sends. The same header on an UNSTAMPED answer — an older
 /// tcr's catch-all, anything that is not this route — is no proof of anything and is not read.
 #[tokio::test]
 async fn post_add_account_with_providers_reads_them_off_a_stamped_answer_only() {

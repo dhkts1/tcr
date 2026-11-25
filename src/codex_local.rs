@@ -427,7 +427,7 @@ pub struct CodexNotice {
 
 /// The notices a Codex save prints, in order, each only when it holds: the first-account notice,
 /// `first_account`, when the config held no Codex row in any state before the save
-/// ([`crate::oauth::first_codex_account_notice`] words it); the no-login notice when codex has no
+/// ([`crate::login::first_codex_account_notice`] words it); the no-login notice when codex has no
 /// login file of its own; then one warning per older `tcr`.
 pub fn codex_notices(first_account: Option<String>) -> Vec<CodexNotice> {
     let mut notices = Vec::new();

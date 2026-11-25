@@ -459,7 +459,7 @@ fn process_command(pid: u32) -> Vec<String> {
 /// still true and load-bearing throughout — but "no takeover" is not a
 /// consequence of it, and where a bind fails to actually refuse depends on
 /// the incumbent's address AND the platform, not merely on the port being
-/// held. `oauth::login`'s
+/// held. `login::login`'s
 /// guard binds nothing at all, so no backstop of any strength applies to it:
 /// on an enumeration failure it proceeds beside a live server it failed to
 /// detect, and the server's next `persist_tokens` writes its boot-time tokens
@@ -608,7 +608,7 @@ pub fn replaceable_incumbents_with_owner(
 /// caller that renders "kill {pid}" would be telling the operator to SIGTERM a
 /// GUI that installs no handler for it — no `applicationWillTerminate`, no final
 /// session→account pin write. A bare `u32` cannot carry that distinction, so it
-/// is not returned as one; see `oauth::login_guard_refusal`.
+/// is not returned as one; see `login::login_guard_refusal`.
 pub fn live_proxy_server(port: u16) -> Option<Incumbent> {
     let holders = port_listeners(port);
     let owner = classify_port_owner(port, &holders, &default_owner_path(port), process_command);

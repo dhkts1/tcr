@@ -38,11 +38,11 @@ pub struct Tokens {
     /// reads current plan/workspace claims. Other OAuth producers leave it absent.
     pub id_token: Option<String>,
     pub access_token: String,
-    /// `None` only for a `claude setup-token` credential ([`login_with_token`]):
+    /// `None` only for a `claude setup-token` credential ([`crate::login::login_with_token`]):
     /// that mint carries only the `user:inference` scope, and the CLI that
     /// produces it never surfaces a refresh token to the caller at all — so
     /// there is nothing to store. Every OTHER producer of a `Tokens` MUST
-    /// yield `Some(...)`: [`tokens_from_exchange_body`] `bail!`s rather than
+    /// yield `Some(...)`: [`crate::login::tokens_from_exchange_body`] `bail!`s rather than
     /// return `None`, and [`refresh_access_token_at`] falls back to the
     /// refresh token it was just called with when the endpoint omits a
     /// rotated one. See that fallback's doc comment before touching either.
@@ -79,14 +79,14 @@ struct RefreshRequest<'a> {
 }
 
 #[derive(Debug, Deserialize)]
-struct RefreshResponse {
-    access_token: String,
+pub(crate) struct RefreshResponse {
+    pub(crate) access_token: String,
     #[serde(default)]
-    refresh_token: Option<String>,
+    pub(crate) refresh_token: Option<String>,
     #[serde(default)]
-    expires_at: Option<i64>,
+    pub(crate) expires_at: Option<i64>,
     #[serde(default)]
-    expires_in: Option<i64>,
+    pub(crate) expires_in: Option<i64>,
 }
 
 /// Normalize an `expires_at` to milliseconds. OAuth backends may report seconds;
@@ -104,7 +104,7 @@ pub const fn normalize_expires_at(value: i64) -> i64 {
 /// default 3600). Saturating so a hostile/huge `expires_in` can never overflow
 /// the i64 multiply into a negative expiry (which would make [`is_expired`]
 /// always true → a single-use-refresh-token storm).
-fn expires_at_from(now_ms: i64, expires_in: Option<i64>) -> i64 {
+pub(crate) fn expires_at_from(now_ms: i64, expires_in: Option<i64>) -> i64 {
     now_ms.saturating_add(expires_in.unwrap_or(3600).saturating_mul(1000))
 }
 
@@ -126,7 +126,7 @@ pub const fn is_expiring_soon(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
 }
 
 /// `Accept` header the token endpoint expects from a "recognised" client.
-/// Shared between [`refresh_access_token_at`], [`exchange_code`] and
+/// Shared between [`refresh_access_token_at`], [`crate::login::exchange_code`] and
 /// `mint::exchange_mint_code` — see [`OAUTH_USER_AGENT`] for why sending it
 /// matters. `pub(crate)` rather than private so `mint.rs` sends the identical
 /// value instead of a second copy that could drift.
@@ -359,45 +359,8 @@ impl TokenRefresher for NoRefresh {
     }
 }
 
-// ===========================================================================
-// Login: the browser OAuth (PKCE) flow, setup tokens and the Claude Code and
-// Codex imports, one concern per child module. Each child reads this module's
-// imports through `use super::*`, and the `pub use` lines keep every
-// `crate::oauth::...` path resolving.
-// ===========================================================================
-
-use std::io::IsTerminal as _;
-use std::io::Write as _;
-use std::path::Path;
-
-use anyhow::{Context as _, anyhow, bail};
-use oauth2::basic::BasicClient;
-use oauth2::{AuthUrl, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope, TokenUrl};
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::net::TcpListener;
-
-use crate::config::{self, Account, Config};
-use crate::log_err::LogErr as _;
-use crate::singleton;
-
-mod account;
-mod admission;
-mod browser;
-mod claude_import;
-mod codex_import;
-mod login_ui;
-mod persist;
 mod profile;
-mod setup_token;
 #[cfg(test)]
 mod tests;
 
-pub use account::*;
-pub(crate) use admission::*;
-pub use browser::*;
-pub use claude_import::*;
-pub use codex_import::*;
-pub use login_ui::*;
-pub use persist::*;
 pub use profile::*;
-pub use setup_token::*;

@@ -20,7 +20,7 @@
 //!   scratch the Keychain).
 //! * `proxy.port` in the config the test writes → `0`, which cannot name an actual listener.
 //!   The import probes that port for a live account-add route before it writes
-//!   (`oauth::login_route`). A released ephemeral port can be reused by another test's stub;
+//!   (`login::login_route`). A released ephemeral port can be reused by another test's stub;
 //!   port zero avoids that race and never reaches a real proxy on the default 3456.
 //! * `codexUpstream` in the config the test writes → a stub on loopback ([`spawn_codex_upstream`]).
 //!   Before it writes, the import asks `codexUpstream` where the login's workspace is served
@@ -675,8 +675,8 @@ fn from_codex_non_interactive_emits_saved_notice_and_error() {
     );
     let consequence = format!(
         "{} {}",
-        tcr::oauth::CODEX_IMPORT_CONSEQUENCE,
-        tcr::oauth::CODEX_IMPORT_OLDER_PROXY
+        tcr::login::CODEX_IMPORT_CONSEQUENCE,
+        tcr::login::CODEX_IMPORT_OLDER_PROXY
     );
     assert_eq!(
         events(&out),
@@ -684,7 +684,7 @@ fn from_codex_non_interactive_emits_saved_notice_and_error() {
             serde_json::json!({"event": "notice", "text": consequence}),
             serde_json::json!({
                 "event": "notice",
-                "text": tcr::oauth::CODEX_FIRST_ACCOUNT_NOTICE
+                "text": tcr::login::CODEX_FIRST_ACCOUNT_NOTICE
             }),
             serde_json::json!({
                 "account": "alice@example.com",

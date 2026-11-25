@@ -83,7 +83,7 @@ pub struct CodexLogin {
     pub expires_at_ms: Option<i64>,
     /// The login belongs to a FedRAMP workspace: its id token, or else its access token, carries
     /// `chatgpt_account_is_fedramp: true` ([`crate::codex_oauth::IdClaims`]). tcr refuses to
-    /// import such a login (`oauth::import_codex_login`).
+    /// import such a login (`login::import_codex_login`).
     pub is_fedramp: bool,
 }
 

@@ -21,7 +21,7 @@ mod tool_env;
 
 use tcr::cli::{self, PriorityArg};
 use tcr::config;
-use tcr::{demo, mint, oauth, server, update};
+use tcr::{demo, login, mint, server, update};
 
 use cmd::ConfigFile;
 use cmd::peer::{peer_cli, run_peer};
@@ -1406,17 +1406,17 @@ fn run_ui() -> anyhow::Result<()> {
 /// `tcr login` — browser OAuth PKCE flow that authenticates a Claude account
 /// and appends (or updates) it in the config, OR (`--token`) a
 /// `claude setup-token` credential read from stdin. The heavy lifting lives
-/// in [`oauth::login`] / [`oauth::login_with_token`]; this just resolves the
+/// in [`login::login`] / [`login::login_with_token`]; this just resolves the
 /// config path and reports.
 async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
     let config_path = args.config.path();
     let ui = if args.non_interactive {
-        oauth::LoginUi::Machine
+        login::LoginUi::Machine
     } else {
-        oauth::LoginUi::Terminal
+        login::LoginUi::Terminal
     };
     if args.from_claude_code {
-        let result = oauth::login_from_claude_code(
+        let result = login::login_from_claude_code(
             &config_path,
             args.force,
             args.name.as_deref(),
@@ -1428,7 +1428,7 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
         return finish_login(result, args.non_interactive);
     }
     if args.from_codex {
-        let result = oauth::login_from_codex(
+        let result = login::login_from_codex(
             &config_path,
             args.force,
             args.name.as_deref(),
@@ -1453,7 +1453,7 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
         return finish_login(result, args.non_interactive);
     }
     if args.token {
-        let name = oauth::login_with_token(
+        let name = login::login_with_token(
             &config_path,
             args.force,
             args.name.as_deref(),
@@ -1464,7 +1464,7 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
         println!("Logged in as '{name}'.");
         return Ok(());
     }
-    let result = oauth::login(
+    let result = login::login(
         &config_path,
         args.force,
         args.account.as_deref(),
@@ -1480,7 +1480,7 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
 /// (whose stream already said it as `{"event":"saved",…}`).
 ///
 /// A machine caller gets a failure the same way it got every other step — one JSON line on
-/// stdout, coded when it is a refusal a GUI titles by its code (`oauth::machine_error_line`) —
+/// stdout, coded when it is a refusal a GUI titles by its code (`login::machine_error_line`) —
 /// and the human-readable half on one stderr line rather than as anyhow's indented multi-line
 /// chain, which a GUI would have to render as a wall of text. It exits here rather than
 /// returning the error, because `main`'s reporter would print that chain on top of what was
@@ -1494,7 +1494,7 @@ fn finish_login(result: anyhow::Result<String>, non_interactive: bool) -> anyhow
             Ok(())
         }
         Err(error) if non_interactive => {
-            let (line, reason) = oauth::machine_error_line(&error);
+            let (line, reason) = login::machine_error_line(&error);
             println!("{line}");
             eprintln!("{reason}");
             std::process::exit(1);

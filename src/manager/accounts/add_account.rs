@@ -134,7 +134,7 @@ impl Manager {
     ///
     /// Resolution uses [`crate::identity::resolve`]/[`crate::identity::same_identity`]
     /// — the SAME rule the durable half ([`config::save_account`]) and `tcr
-    /// login` (`oauth::upsert_account`) already run — never
+    /// login` (`login::upsert_account`) already run — never
     /// [`crate::identity::match_one`]. `match_one` goes through
     /// [`crate::identity::Queryable`], which exposes only the name: it
     /// cannot compare `account_uuid`, so it was structurally unable to tell two
@@ -351,7 +351,7 @@ impl Manager {
                         // `refresh_plan` silently never refreshes it again.
                         // Identity fields are BACKFILLED — filled in only where
                         // the row does not already carry a value — mirroring
-                        // `oauth::upsert_account`. Backfilling (rather than
+                        // `login::upsert_account`. Backfilling (rather than
                         // ignoring) is what permanently closes the split-brain
                         // trigger: once a legacy no-org row's org is filled in,
                         // it stops being loosely matched by every org variant of

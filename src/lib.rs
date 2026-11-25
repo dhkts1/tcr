@@ -41,6 +41,7 @@ pub mod http_client;
 pub mod identity;
 pub mod import;
 pub mod log_err;
+pub mod login;
 pub mod manager;
 pub mod mint;
 pub mod mitm;

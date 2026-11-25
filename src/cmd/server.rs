@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use tcr::cli;
 use tcr::config::{self, Config, ConfigError};
-use tcr::{affinity, build_info, config_keys, oauth, server, singleton, tui};
+use tcr::{affinity, build_info, config_keys, login, server, singleton, tui};
 
 use super::ConfigFile;
 
@@ -130,7 +130,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     // never fatal: the failure paths all warn and boot with zero accounts,
     // exactly as this line did before.
     let config = if config.accounts.is_empty() && !config.refuses_claude_code_import() {
-        match oauth::auto_import_claude_code_login(&config_path).await {
+        match login::auto_import_claude_code_login(&config_path).await {
             // Re-read: the import wrote the file, and re-reading is what makes
             // the running fleet the one on disk.
             Some(_) => load_config(&config_path).map_or(config, |(fresh, _)| fresh),

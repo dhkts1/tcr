@@ -5,7 +5,7 @@
 //! (`~/.config/tcr.json`) directly, so friends can curate the fleet without
 //! hand-editing JSON.
 //!
-//! The seam copies [`crate::oauth::login`]: pure functions here `load` → mutate
+//! The seam copies [`crate::login::login`]: pure functions here `load` → mutate
 //! a `&mut Config` → [`config::save`]; `main.rs` is a thin parse-and-delegate
 //! layer. Every load/save wrapper WARNS to stderr when a proxy is already
 //! listening on the config's port — a running server refreshes tokens and
@@ -106,7 +106,7 @@ fn load_config_with_creation(config_path: &Path) -> anyhow::Result<(Config, bool
 /// to render — re-read from disk after a successful import, so the verb shows
 /// the account it just wrote rather than the empty fleet it loaded a moment
 /// ago. Everything about "is there a login, did the write work" lives in
-/// [`crate::oauth::auto_import_claude_code_login`]; what lives HERE is the one
+/// [`crate::login::auto_import_claude_code_login`]; what lives HERE is the one
 /// rule that keeps it idempotent: a config with accounts in it is never
 /// touched, so an account removed on purpose stays removed.
 ///
@@ -118,7 +118,7 @@ async fn import_claude_code_login_if_empty(config_path: &Path, config: Config) -
     if !config.accounts.is_empty() || config.refuses_claude_code_import() {
         return config;
     }
-    if crate::oauth::auto_import_claude_code_login(config_path)
+    if crate::login::auto_import_claude_code_login(config_path)
         .await
         .is_none()
     {
