@@ -71,8 +71,8 @@ use crate::peer::config::{
 use crate::peer::dialaddrs;
 use crate::peer::id::KEY_BYTES;
 use crate::peer::id::{NodeKey, default_config_dir};
-use crate::peer::listener::{NodeFacts, hello_for_peer};
 use crate::peer::noise::{self, Handshake};
+use crate::peer::serve::{NodeFacts, hello_for_peer};
 use crate::peer::state::now_ms;
 
 mod addresses;

@@ -117,7 +117,7 @@ pub use frame::{
     MAX_BODY_BYTES, MAX_RELAYED_BODY_BYTES, SERVE_FLOW, ServeAck, ServeReply, ServeRequest,
     serve_request_from,
 };
-pub use hello::say_hello;
+pub use hello::{NodeFacts, hello_for_peer, say_hello};
 pub use lender::{
     NoFleetUtilization, SERVED_LINE, ScopeRestriction, WindowUtilization, handle_serve_on,
     utilization_rise,

@@ -84,7 +84,6 @@ use crate::peer::state::knock_address;
 mod admission;
 mod connection;
 mod gate;
-mod hello;
 mod knock;
 mod pairing;
 mod scope;
@@ -101,7 +100,6 @@ pub use gate::{
     RequestDedup, StreamRefusal, handoff_is_permitted, peer_stream_gate, peer_stream_gate_hop,
     peer_stream_gate_rows,
 };
-pub use hello::{NodeFacts, hello_for_peer};
 pub use scope::{
     InternetAdmission, internet_admission, own_mac_admission, shares_a_global_v6_prefix,
 };

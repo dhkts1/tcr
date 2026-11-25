@@ -19,7 +19,6 @@ use super::admission::{
 use super::gate::{
     RequestDedup, handoff_is_permitted, peer_stream_gate_hop, peer_stream_gate_rows,
 };
-use super::hello::{NodeFacts, hello_for_peer};
 use super::knock::{KnockClock, record_pairing_key, serve_knock};
 use super::pairing::{AcceptedSession, accept_pairing_or_return};
 use super::scope::{InternetAdmission, admission_for_this_host};
@@ -27,6 +26,7 @@ use super::{
     ConnectionFailure, HANDSHAKE_TIMEOUT, SessionContext, now_ms, on_blocking_thread,
     outstanding_secrets,
 };
+use crate::peer::serve::{NodeFacts, hello_for_peer};
 
 /// Handshake, gate, and then serve one stream until it closes.
 ///

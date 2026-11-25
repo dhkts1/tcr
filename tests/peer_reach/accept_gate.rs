@@ -460,7 +460,7 @@ async fn a_real_loopback_knock_is_answered_through_the_accept_loop() {
 /// knows.
 #[test]
 fn a_hello_carries_the_address_this_node_saw_the_peer_from() {
-    use tcr::peer::listener::{NodeFacts, hello_for_peer};
+    use tcr::peer::serve::{NodeFacts, hello_for_peer};
 
     let node = tcr_peer_wire::PeerId([0x71; 32]);
     let seen: SocketAddr = "203.0.113.7:51820".parse().expect("a test address parses");
@@ -480,7 +480,7 @@ fn a_hello_carries_the_address_this_node_saw_the_peer_from() {
 /// reader has to decide the meaning of.
 #[test]
 fn a_hello_from_a_node_that_saw_no_address_carries_no_field() {
-    use tcr::peer::listener::{NodeFacts, hello_for_peer};
+    use tcr::peer::serve::{NodeFacts, hello_for_peer};
 
     let hello = hello_for_peer(
         &NodeFacts::minimal(tcr_peer_wire::PeerId([0x72; 32])),

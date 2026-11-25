@@ -267,7 +267,7 @@ const UPNP_MAPPING_DESCRIPTION: &str = "tcr peer internet (upnp)";
 /// A process-local register rather than a parameter, and the reason is the
 /// shape of the two sides: the keeper runs on its own thread for the life of
 /// the listener, and `Hello.addrs` is assembled per connection in
-/// `crate::peer::listener::NodeFacts::listening`, three call sites away with
+/// `crate::peer::serve::NodeFacts::listening`, three call sites away with
 /// no channel between them. Threading it through would put an
 /// `Option<SocketAddr>` in every signature between the accept loop and the
 /// handshake, which is a wider change than the fact deserves.

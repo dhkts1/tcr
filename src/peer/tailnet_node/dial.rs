@@ -83,7 +83,7 @@ impl DialSlot {
 }
 
 /// The socket this process's node listens on, for the `Hello`
-/// (`crate::peer::listener::NodeFacts::listening`): `None` when this process
+/// (`crate::peer::serve::NodeFacts::listening`): `None` when this process
 /// runs no node.
 pub fn advertised_listen() -> Option<SocketAddr> {
     server_slot().listen()

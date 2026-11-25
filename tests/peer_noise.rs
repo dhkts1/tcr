@@ -38,11 +38,11 @@ use tcr::log_err::LogErr as _;
 
 use tcr::peer::config::{Allow, ControlGrants, PeerRow};
 use tcr::peer::listener::{
-    self, NodeFacts, RequestDedup, StreamRefusal, hello_for_peer, peer_stream_gate_hop,
-    peer_stream_gate_rows,
+    self, RequestDedup, StreamRefusal, peer_stream_gate_hop, peer_stream_gate_rows,
 };
 use tcr::peer::noise::{self, Handshake, PinRefusal};
 use tcr::peer::pair::{self, PairingWindow};
+use tcr::peer::serve::{NodeFacts, hello_for_peer};
 use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
 use tokio::io::{AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
