@@ -116,10 +116,15 @@
 //! is how "zero bytes written after a refusal" is asserted on the socket rather
 //! than on a log line.
 
-use anyhow::{Context, Result, anyhow, bail};
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use snow::{Builder, HandshakeState, TransportState};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::sync::mpsc;
 
 use tcr_peer_wire::{MAX_FRAME_BYTES, PeerId, decode_frame, encode_frame};
 
@@ -1048,6 +1053,280 @@ where
 {
     let bytes = recv_encrypted(stream, &mut session.transport).await?;
     serde_json::from_slice(&bytes).context("peer serve: a frame did not parse")
+}
+
+/// Plaintext chunk size for a splice: well under the frame ceiling, so one
+/// large body cannot monopolise the stream.
+pub const CHUNK_BYTES: usize = 16 * 1024;
+
+/// How long the peer's direction is still pumped after the local end has
+/// closed its own.
+///
+/// A request whose client has read what it wanted and gone away is the ordinary
+/// case, and the reply the far end is still writing was being thrown away: the
+/// pump ended on the FIRST direction to finish. Half-closing instead means the
+/// other direction has to end on something, and a peer that never closes is the
+/// same task-holding shape [`FIRST_RECORD_TIMEOUT`](crate::peer::tunnel::FIRST_RECORD_TIMEOUT) exists for, so it ends on
+/// this.
+pub const HALF_CLOSE_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+// ---------------------------------------------------------------------------
+// The Noise session as a byte stream
+// ---------------------------------------------------------------------------
+
+/// A Noise session as an `AsyncRead + AsyncWrite` stream.
+///
+/// The adapter named in [`crate::peer::tunnel`]'s module docs. It exists so the splice can be ONE
+/// function over two generic halves instead of one function per pairing of
+/// concrete socket types.
+///
+/// Reading yields the plaintext the peer sent; writing encrypts and frames.
+/// A write shorter than [`CHUNK_BYTES`] is one frame, there is no coalescing,
+/// because a splice that waited for a full chunk would stall a TLS handshake
+/// that is a few hundred bytes long and then silent.
+pub struct NoiseStream {
+    /// This side of the plaintext duplex. The pump owns the other side.
+    plaintext: DuplexStream,
+    /// The pump, so its error can be collected by [`Self::finish`] rather than
+    /// dropped on the floor.
+    pump: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl NoiseStream {
+    /// Start pumping `session` over `socket` and return the plaintext side.
+    ///
+    /// Two tasks, for the cancel-safety reason in [`crate::peer::tunnel`]'s module docs: a framer
+    /// that reads whole frames off the socket's read half and nothing else, and
+    /// a mixer that owns the session and is therefore the only thing that
+    /// touches the cipher.
+    pub fn start<S>(socket: S, mut session: PeerSession) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mine, theirs) = tokio::io::duplex(CHUNK_BYTES * 4);
+        let pump = tokio::spawn(async move {
+            let (mut read_half, mut write_half) = tokio::io::split(socket);
+            // One frame in flight plus one queued: enough that the framer is
+            // never the bottleneck, bounded so a fast peer cannot make this
+            // node buffer its stream in memory.
+            let (frames_tx, mut frames_rx) = mpsc::channel::<Vec<u8>>(2);
+            let framer = tokio::spawn(async move {
+                loop {
+                    match read_frame(&mut read_half).await {
+                        Ok(frame) => {
+                            if frames_tx.send(frame).await.is_err() {
+                                return;
+                            }
+                        }
+                        // EOF and a torn frame are the same fact here, the
+                        // session is over. The mixer reports it, because the
+                        // mixer is the half with the context.
+                        Err(_) => return,
+                    }
+                }
+            });
+
+            let mut plain = theirs;
+            let mut from_local = vec![0_u8; CHUNK_BYTES];
+            // Set when the LOCAL end closes its half. From then on the local
+            // read arm is off and what is still coming back from the peer is
+            // pumped until the peer closes too or this deadline passes.
+            let mut draining_until: Option<tokio::time::Instant> = None;
+            // Whether this side has sent its end-of-stream frame yet.
+            let mut sent_end = false;
+            let outcome = loop {
+                tokio::select! {
+                    frame = frames_rx.recv() => {
+                        let Some(frame) = frame else { break Ok(()) };
+                        let mut out = vec![0_u8; MAX_FRAME_BYTES];
+                        let len = match session.transport.read_message(&frame, &mut out) {
+                            Ok(len) => len,
+                            Err(err) => break Err(anyhow!(
+                                "peer tunnel: a carried frame did not decrypt under the \
+                                 session key: {err}"
+                            )),
+                        };
+                        // The peer's end-of-stream frame: the same fact as its
+                        // FIN, said inside the session (see
+                        // [`send_end_of_stream`]).
+                        if len == 0 {
+                            break Ok(());
+                        }
+                        out.truncate(len);
+                        if plain.write_all(&out).await.is_err() {
+                            // The local end went away. Not an error: it is how
+                            // a finished request looks.
+                            break Ok(());
+                        }
+                    }
+                    read = plain.read(&mut from_local), if draining_until.is_none() => {
+                        match read {
+                            // **Half-close, not close.** The local end going
+                            // away says nothing about the other direction, and
+                            // ending the whole pump here dropped whatever the
+                            // peer was still sending: on a gateway carry that
+                            // is the origin's reply, thrown away because the
+                            // client hung up a moment early.
+                            Ok(0) => {
+                                // A local end that is GONE, rather than one
+                                // that closed its write half, has nobody left
+                                // to hand the drained bytes to: an empty write
+                                // is how that is asked, and it is what keeps
+                                // `NoiseStream::finish` returning at once.
+                                if plain.write(&[]).await.is_err() {
+                                    break Ok(());
+                                }
+                                // Every data byte is already delivered, so a
+                                // frame that cannot be written (the far end
+                                // reset as this end finished) is not a failed
+                                // carry: the drain below still runs, as it did
+                                // when only the half-close could fail.
+                                if let Err(err) =
+                                    send_end_of_stream(&mut write_half, &mut session).await
+                                {
+                                    tracing::debug!(
+                                        error = %err,
+                                        "peer tunnel: the end-of-stream frame was not written; \
+                                         draining what the far end still sends"
+                                    );
+                                }
+                                sent_end = true;
+                                let _shutdown = write_half.shutdown().await;
+                                draining_until =
+                                    Some(tokio::time::Instant::now() + HALF_CLOSE_DRAIN);
+                            }
+                            Ok(n) => {
+                                if let Err(err) = send_encrypted(
+                                    &mut write_half,
+                                    &mut session.transport,
+                                    &from_local[..n],
+                                )
+                                .await
+                                {
+                                    break Err(err.context(
+                                        "peer tunnel: the carried stream could not be written",
+                                    ));
+                                }
+                            }
+                            Err(err) => break Err(anyhow::Error::new(err)
+                                .context("peer tunnel: the local end of the carry failed")),
+                        }
+                    }
+                    () = sleep_or_never(draining_until) => {
+                        break Ok(());
+                    }
+                }
+            };
+            // Say the end of the stream, inside the session and then as a
+            // half-close, so the far end sees it rather than a hang, then stop
+            // the framer. The frame is best-effort here: the pump is ending
+            // whatever happens, often because the far end already went.
+            if !sent_end && let Err(err) = send_end_of_stream(&mut write_half, &mut session).await {
+                tracing::debug!(
+                    error = %err,
+                    "peer tunnel: the end-of-stream frame was not written; the far end learns \
+                     from the socket closing instead"
+                );
+            }
+            let _shutdown = write_half.shutdown().await;
+            framer.abort();
+            outcome
+        });
+        Self {
+            plaintext: mine,
+            pump,
+        }
+    }
+
+    /// Wait for the pump to stop and surface whatever ended it.
+    ///
+    /// The one place a carried stream's failure becomes visible. A caller that
+    /// drops a [`NoiseStream`] instead sees a clean end of stream, because the
+    /// splice copies the PLAINTEXT half: a frame that did not decrypt under
+    /// the session key, and a write to the peer that failed, both end the pump
+    /// and leave the splice's own count looking like an ordinary finish.
+    ///
+    /// # It had no production caller, and the doc here used to claim it did
+    ///
+    /// Two tests called it and nothing in `src/` did, so a carry that died
+    /// inside the pump was logged as "carried". Kept and wired rather than
+    /// removed: the fact it reports exists nowhere else, and a gateway's log
+    /// line is the whole record of a stream nobody may read. Both splice
+    /// callers in this module now await it before they claim anything.
+    /// [`crate::peer::egress`]'s requester-side splice still drops its stream
+    /// and is the remaining site.
+    pub async fn finish(self) -> Result<()> {
+        // Dropping our half first is what tells the pump to stop; without it a
+        // pump whose peer is silent would be joined forever.
+        drop(self.plaintext);
+        self.pump
+            .await
+            .context("peer tunnel: the carry task did not finish cleanly")?
+    }
+}
+
+impl AsyncRead for NoiseStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.plaintext).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for NoiseStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.plaintext).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.plaintext).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.plaintext).poll_shutdown(cx)
+    }
+}
+
+/// Send this side's end of a carried stream: one encrypted frame with an
+/// empty payload.
+///
+/// # Why a frame and not only a FIN
+///
+/// The pump used to say "done" by shutting its socket's write half and
+/// nothing else. A transport with no half-close loses that: tcr's own tailnet
+/// node is one, the `tailscale` crate's `poll_shutdown` does nothing at
+/// 0.6.1, and the close it sends on drop can be lost (upstream #446). The far
+/// pump then never learns the stream ended: it waits out its own drain, or
+/// forever. Said inside the session it reaches the far pump over any
+/// transport, and the half-close still follows for every transport that has
+/// one.
+///
+/// It needs no version bump. A payload is never empty otherwise (a local read
+/// of 0 bytes is the end, not a frame), and a pump from before this change
+/// writes the empty payload to its local end as zero bytes, a no-op, then
+/// sees the FIN as it always did.
+async fn send_end_of_stream<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    session: &mut PeerSession,
+) -> Result<()> {
+    send_encrypted(writer, &mut session.transport, &[]).await
+}
+
+/// Sleep until `at`, or never when there is nothing to wait for.
+///
+/// The half-close drain's timer, written as one future so the pump's `select!`
+/// has an arm that is simply never ready while both directions are open.
+async fn sleep_or_never(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// A frame reader that keeps the bytes it has already taken off the socket.

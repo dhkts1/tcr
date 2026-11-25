@@ -43,8 +43,8 @@ use std::sync::{Arc, Mutex};
 
 use tcr::peer::config::{self, Allow, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore};
 use tcr::peer::listener;
-use tcr::peer::noise::{self, Handshake};
-use tcr::peer::tunnel::{self, Carry, Forward, NoiseStream, OriginRoute, TunnelBudget};
+use tcr::peer::noise::{self, Handshake, NoiseStream};
+use tcr::peer::tunnel::{self, Carry, Forward, OriginRoute, TunnelBudget};
 use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};

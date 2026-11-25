@@ -772,7 +772,7 @@ async fn a_carried_stream_that_died_reports_it_through_finish() {
     .expect("the dialler's handshake");
     let (ours, session) = accepting.await.expect("the responder task");
 
-    let mut carried = tcr::peer::tunnel::NoiseStream::start(ours, session);
+    let mut carried = noise::NoiseStream::start(ours, session);
     // Not a frame this session can open: the pump breaks on it.
     noise::write_frame(&mut theirs, &[0_u8; 64])
         .await
@@ -846,7 +846,7 @@ async fn a_local_end_that_closes_still_gets_what_the_peer_already_sent() {
     .expect("the dialler's handshake");
     let (ours, session) = accepting.await.expect("the responder task");
 
-    let mut carried = tcr::peer::tunnel::NoiseStream::start(ours, session);
+    let mut carried = noise::NoiseStream::start(ours, session);
     // The local end is done talking, and is still there to be answered.
     carried.shutdown().await.expect("half-close the local end");
 

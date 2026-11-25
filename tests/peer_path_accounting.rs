@@ -41,11 +41,10 @@ use tcr::peer::config::{
 };
 use tcr::peer::lease::Ledger;
 use tcr::peer::listener;
-use tcr::peer::noise::{self, Handshake};
+use tcr::peer::noise::{self, Handshake, NoiseStream};
 use tcr::peer::state;
 use tcr::peer::tunnel::{
-    self, BUDGET_WINDOW_MS, Carry, Forward, NoiseStream, OriginRoute, PathMeter, TunnelBudget,
-    path_meter,
+    self, BUDGET_WINDOW_MS, Carry, Forward, OriginRoute, PathMeter, TunnelBudget, path_meter,
 };
 use tcr_peer_wire::{
     Lease, LeaseUnit, LendScope, PeerId, StreamHeader, StreamKind, TunnelTarget, Window,

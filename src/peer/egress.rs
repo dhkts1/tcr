@@ -101,8 +101,8 @@ use tokio::net::TcpListener;
 use crate::peer::config::{CARRY_SETUP_TIMEOUT, PeerFile, PeerRow, ViaRoute, ViaSetting};
 use crate::peer::id::KEY_BYTES;
 use crate::peer::id::NodeKey;
-use crate::peer::noise::{self, Handshake};
-use crate::peer::tunnel::{self, NoiseStream};
+use crate::peer::noise::{self, Handshake, NoiseStream};
+use crate::peer::tunnel;
 
 /// The ONLY origins a gateway will carry. Deny by default: a host absent from
 /// this list is refused, not tunnelled.
