@@ -654,7 +654,7 @@ impl ViaSetting {
     }
 
     /// The one Mac this setting pins, when it pins one.
-    pub fn pinned_peer(&self) -> Option<&PeerId> {
+    pub const fn pinned_peer(&self) -> Option<&PeerId> {
         match &self.route {
             ViaRoute::Pinned(peer) => Some(peer),
             ViaRoute::Auto | ViaRoute::Off => None,
@@ -888,6 +888,11 @@ impl TryFrom<String> for NetworkKey {
     }
 }
 
+/// What a completed session left on one pinned row
+/// ([`PeerFile::session_memory`]): its key, its rendezvous secret, and the
+/// address it last said it sees this Mac at, as written.
+pub type SessionMemory<'a> = (PeerId, Option<[u8; 32]>, Option<&'a str>);
+
 impl PeerFile {
     /// The display name to announce and to enrol under: the operator's own, or
     /// the host name when they have not set one.
@@ -971,7 +976,7 @@ impl PeerFile {
     /// passed `--replace`, because every Mac still holding it goes dark to this
     /// one: the refusal answers how many pinned peers that is, for the verb's
     /// own words. Answers whether a key was replaced.
-    pub fn set_network_key(&mut self, key: NetworkKey, replace: bool) -> Result<bool, usize> {
+    pub const fn set_network_key(&mut self, key: NetworkKey, replace: bool) -> Result<bool, usize> {
         let replaced = self.network_key.is_some();
         if replaced && !replace {
             return Err(self.peers.len());
@@ -982,7 +987,7 @@ impl PeerFile {
 
     /// Drop this Mac's network key (`tcr peer network-key clear`). Answers
     /// whether there was one to drop.
-    pub fn clear_network_key(&mut self) -> bool {
+    pub const fn clear_network_key(&mut self) -> bool {
         self.network_key.take().is_some()
     }
 
@@ -1039,7 +1044,7 @@ impl PeerFile {
     }
 
     /// Turn the dead drop on or off. See [`DeadDropConfig::switch`].
-    pub fn switch_drop(&mut self, on: bool) -> bool {
+    pub const fn switch_drop(&mut self, on: bool) -> bool {
         self.dead_drop.switch(on)
     }
 
@@ -1179,7 +1184,7 @@ impl PeerFile {
     }
 
     /// How many Macs this one pins.
-    pub fn pinned_count(&self) -> usize {
+    pub const fn pinned_count(&self) -> usize {
         self.peers.len()
     }
 
@@ -1219,7 +1224,7 @@ impl PeerFile {
     /// What completed sessions left on each pinned row, in file order: its
     /// key, its rendezvous secret, and the address it last said it sees this
     /// Mac at, as written. A row may carry either, both, or neither.
-    pub fn session_memory(&self) -> Vec<(PeerId, Option<[u8; 32]>, Option<&str>)> {
+    pub fn session_memory(&self) -> Vec<SessionMemory<'_>> {
         self.peers
             .iter()
             .map(|row| {
@@ -2345,7 +2350,7 @@ impl DeadDropConfig {
     /// configured is refused and changes nothing, rather than writing a switch
     /// that starts no task because [`Self::is_live`] needs a store too.
     /// Answers whether the switch was written.
-    pub fn switch(&mut self, on: bool) -> bool {
+    pub const fn switch(&mut self, on: bool) -> bool {
         if on && self.store.is_none() {
             return false;
         }
