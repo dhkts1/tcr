@@ -41,7 +41,7 @@
 //! The instrument is `tests/peer_carried_control.rs`'s, copied rather than
 //! reinvented: `tokio::io::duplex` against `listener::serve_accepted`, the
 //! asker's half hand-driven with `noise::dial_handshake` plus
-//! `serve::send_control`, and a header whose `via` names a carrier. The
+//! `noise::send_control`, and a header whose `via` names a carrier. The
 //! accepting address is the whole point of the fixture and this box has one
 //! address, so a duplex stands in for the socket.
 
@@ -53,7 +53,6 @@ use tcr::peer::id::NodeKey;
 use tcr::peer::listener;
 use tcr::peer::noise::{self, Handshake};
 use tcr::peer::reach;
-use tcr::peer::serve;
 use tcr_peer_wire::{CollapseHint, Control, PeerId, StreamHeader, StreamKind};
 
 /// A carrier's own connection to this node, RFC 5737 TEST-NET-3. Every
@@ -117,10 +116,10 @@ async fn hint_from(
         hops_remaining: 1,
         request_id: 11,
     };
-    serve::send_control(&mut theirs, &mut session, &header)
+    noise::send_control(&mut theirs, &mut session, &header)
         .await
         .expect("the header writes");
-    serve::send_control(&mut theirs, &mut session, &Control::CollapseHint(hint))
+    noise::send_control(&mut theirs, &mut session, &Control::CollapseHint(hint))
         .await
         .expect("the hint writes");
 
@@ -130,7 +129,7 @@ async fn hint_from(
     // say so.
     let answer = match timeout(
         Duration::from_secs(5),
-        serve::recv_control::<_, Control>(&mut theirs, &mut session),
+        noise::recv_control::<_, Control>(&mut theirs, &mut session),
     )
     .await
     {

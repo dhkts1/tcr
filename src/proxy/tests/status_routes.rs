@@ -100,7 +100,7 @@ async fn peer_dial_splices_bytes_both_ways_through_the_listener() {
             far_tx
                 .send((addr, theirs))
                 .map_err(|_| anyhow::anyhow!("the test stopped listening"))?;
-            Ok(Box::new(ours) as crate::peer::serve::PeerStream)
+            Ok(Box::new(ours) as crate::peer::noise::PeerStream)
         })
     });
     let _clear = ClearSlot;

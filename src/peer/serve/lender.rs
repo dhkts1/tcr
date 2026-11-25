@@ -7,11 +7,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::peer::config::PeerStore;
 use crate::peer::lease::Ledger;
-use crate::peer::noise;
+use crate::peer::noise::{self, recv_json, send_json};
 
 use super::frame::{
-    MAX_RELAYED_BODY_BYTES, SERVE_FLOW, ServeAck, ServeReply, ServeRequest, recv_body, recv_json,
-    send_body, send_json,
+    MAX_RELAYED_BODY_BYTES, SERVE_FLOW, ServeAck, ServeReply, ServeRequest, recv_body, send_body,
 };
 use super::policy::{
     SERVE_METHOD, lender_forwards_header, refused_path_kind, serve_is_allowed_for_path,

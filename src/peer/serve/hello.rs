@@ -5,10 +5,9 @@ use tcr_peer_wire::{Control, Hello, PeerId, StreamHeader, StreamKind};
 
 use crate::peer::config::{Locator, PeerStore};
 use crate::peer::id::NodeKey;
-use crate::peer::noise::{self, Handshake};
+use crate::peer::noise::{self, Handshake, recv_control, send_control};
 
 use super::dial::dial_peer_with_endpoint;
-use super::frame::{recv_control, send_control};
 use crate::peer::config::node_key_dir;
 use crate::peer::state::peer_state_path;
 

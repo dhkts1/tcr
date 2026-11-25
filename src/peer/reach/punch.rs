@@ -260,7 +260,7 @@ pub trait PunchNet {
         &self,
         port: u16,
         within: Duration,
-    ) -> impl Future<Output = std::io::Result<crate::peer::serve::PeerStream>> + Send;
+    ) -> impl Future<Output = std::io::Result<crate::peer::noise::PeerStream>> + Send;
 
     /// Connect to `target` FROM local `port`, within `within`.
     fn connect_from(
@@ -268,7 +268,7 @@ pub trait PunchNet {
         port: u16,
         target: SocketAddr,
         within: Duration,
-    ) -> impl Future<Output = std::io::Result<crate::peer::serve::PeerStream>> + Send;
+    ) -> impl Future<Output = std::io::Result<crate::peer::noise::PeerStream>> + Send;
 }
 
 /// Which half of the punch got through.
@@ -298,7 +298,7 @@ pub struct Punched {
     /// The stream, with nothing sent on it yet: the caller runs the handshake
     /// its role calls for, and a stranger who guessed the port gets no further
     /// than that handshake.
-    pub stream: crate::peer::serve::PeerStream,
+    pub stream: crate::peer::noise::PeerStream,
 }
 
 impl std::fmt::Debug for Punched {
@@ -418,7 +418,7 @@ async fn punch_connect_loop<N: PunchNet + Sync>(
     port: u16,
     target: SocketAddr,
     within: Duration,
-) -> std::io::Result<crate::peer::serve::PeerStream> {
+) -> std::io::Result<crate::peer::noise::PeerStream> {
     let deadline = tokio::time::Instant::now() + within;
     let mut last = std::io::Error::new(
         std::io::ErrorKind::TimedOut,
@@ -469,10 +469,10 @@ impl PunchNet for KernelPunchNet {
         &self,
         port: u16,
         within: Duration,
-    ) -> std::io::Result<crate::peer::serve::PeerStream> {
+    ) -> std::io::Result<crate::peer::noise::PeerStream> {
         let listener = Self::bound(port)?.listen(8)?;
         match tokio::time::timeout(within, listener.accept()).await {
-            Ok(Ok((stream, _from))) => Ok(Box::new(stream) as crate::peer::serve::PeerStream),
+            Ok(Ok((stream, _from))) => Ok(Box::new(stream) as crate::peer::noise::PeerStream),
             Ok(Err(err)) => Err(err),
             Err(_elapsed) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -486,10 +486,10 @@ impl PunchNet for KernelPunchNet {
         port: u16,
         target: SocketAddr,
         within: Duration,
-    ) -> std::io::Result<crate::peer::serve::PeerStream> {
+    ) -> std::io::Result<crate::peer::noise::PeerStream> {
         let socket = Self::bound(port)?;
         match tokio::time::timeout(within, socket.connect(target)).await {
-            Ok(Ok(stream)) => Ok(Box::new(stream) as crate::peer::serve::PeerStream),
+            Ok(Ok(stream)) => Ok(Box::new(stream) as crate::peer::noise::PeerStream),
             Ok(Err(err)) => Err(err),
             Err(_elapsed) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,

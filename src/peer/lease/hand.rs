@@ -648,7 +648,7 @@ fn lease_ends_at_ms(lease: &Lease) -> i64 {
 /// Whichever way it ends, the copy goes: [`HandedTokens::forget`] runs on the
 /// way out rather than waiting for a read that may never come.
 pub(super) async fn read_handed_bearers(
-    mut stream: serve::PeerStream,
+    mut stream: crate::peer::noise::PeerStream,
     mut session: crate::peer::noise::PeerSession,
     lease: Lease,
     lender: PeerId,
@@ -661,7 +661,7 @@ pub(super) async fn read_handed_bearers(
     register_handed_meter(lease.lease_id, hints);
 
     // THE FRAME READER, and it is what makes the `select!` below safe at all.
-    // `serve::recv_control` is not cancel safe: a hint arriving while a Handoff
+    // `noise::recv_control` is not cancel safe: a hint arriving while a Handoff
     // is half read dropped that read with bytes already taken off the socket,
     // and the next read then met the tail of one frame as a length prefix, so
     // the Noise stream desynced and this borrower forgot its bearer for the
@@ -685,7 +685,7 @@ pub(super) async fn read_handed_bearers(
                     biased;
                     Some(hint) = hints_rx.recv() => {
                         if let Err(err) =
-                            serve::send_control(&mut stream, &mut session, &hint).await
+                            crate::peer::noise::send_control(&mut stream, &mut session, &hint).await
                         {
                             tracing::debug!(
                                 peer = %lender.display(),

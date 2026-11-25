@@ -318,7 +318,7 @@ where
 /// standard shape for recursive async and the only reason this function is not
 /// one line at the call site.
 fn serve_punched(
-    stream: serve::PeerStream,
+    stream: noise::PeerStream,
     context: SessionContext,
     from: SocketAddr,
     bind: SocketAddr,

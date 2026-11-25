@@ -870,7 +870,7 @@ pub async fn join_as(
 async fn connect_in_key_order(
     peers_path: &Path,
     token: &JoinToken,
-) -> Result<(SocketAddr, crate::peer::serve::PeerStream)> {
+) -> Result<(SocketAddr, noise::PeerStream)> {
     let mut refusals: Vec<String> = Vec::new();
     for addr in token.sockets() {
         match crate::peer::tailnet_node::dial_for_cli(peers_path, addr).await {

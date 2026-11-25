@@ -117,6 +117,7 @@
 //! than on a log line.
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 use snow::{Builder, HandshakeState, TransportState};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -977,6 +978,76 @@ pub async fn recv_encrypted<R: AsyncRead + Unpin>(
         .context("peer stream: this frame did not decrypt under the session key")?;
     plaintext.truncate(len);
     Ok(plaintext)
+}
+
+/// Everything a stream to a peer has to be, as ONE name.
+///
+/// `Box<dyn AsyncRead + AsyncWrite + Unpin + Send>` is what this wants to say
+/// and Rust cannot spell it: a trait object takes one non-auto trait plus auto
+/// traits, and `AsyncRead` and `AsyncWrite` are two. So the pair gets a name,
+/// with a blanket impl so every existing stream type already satisfies it and
+/// nothing has to be registered. Reported to the lead as the one place the
+/// brief's literal signature is not expressible.
+pub trait PeerTransport: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> PeerTransport for T {}
+
+/// One stream to a peer, whatever opened it.
+///
+/// **The transport seam.** Every handler below a dial already works on
+/// `AsyncRead + AsyncWrite + Unpin` and none of them names a socket, so this
+/// alias is the one place a second way of reaching a peer, a relay, a
+/// forwarded carry, a different protocol, arrives without touching a single
+/// handler. `Send` because a TUNNEL hands its stream to a pump that outlives
+/// the frame that dialled it, and boxed because two transports are two types
+/// and a caller choosing between them at runtime cannot be generic over both.
+pub type PeerStream = Box<dyn PeerTransport>;
+
+/// Write one frame of this stream: `serde_json`, then the Noise transport.
+///
+/// One framing for every stream kind and every frame on it, because a second
+/// spelling of "write a frame" is where a length check goes missing. `pub` so a
+/// test can stand in for the listener's dispatch arm, which is the one line of
+/// this feature that lives outside this file.
+pub async fn send_control<S, T>(stream: &mut S, session: &mut PeerSession, value: &T) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    send_json(stream, session, value).await
+}
+
+/// One JSON frame, decrypted. See [`send_control`].
+pub async fn recv_control<S, T>(stream: &mut S, session: &mut PeerSession) -> Result<T>
+where
+    S: AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    recv_json(stream, session).await
+}
+
+/// One JSON frame, encrypted.
+pub(crate) async fn send_json<S, T>(
+    stream: &mut S,
+    session: &mut PeerSession,
+    value: &T,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let bytes = serde_json::to_vec(value).context("peer serve: a frame did not serialize")?;
+    send_encrypted(stream, &mut session.transport, &bytes).await
+}
+
+/// One JSON frame, decrypted.
+pub(crate) async fn recv_json<S, T>(stream: &mut S, session: &mut PeerSession) -> Result<T>
+where
+    S: AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    let bytes = recv_encrypted(stream, &mut session.transport).await?;
+    serde_json::from_slice(&bytes).context("peer serve: a frame did not parse")
 }
 
 /// A frame reader that keeps the bytes it has already taken off the socket.

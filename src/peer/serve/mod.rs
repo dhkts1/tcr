@@ -110,13 +110,12 @@ mod policy;
 
 pub use borrow::{Borrowed, open_serve, open_serve_within};
 pub use dial::{
-    PeerStream, PeerTransport, Reached, dial_order, dial_peer, dial_peer_reaching,
-    dial_peer_reaching_within, dial_peer_with_endpoint, dial_peer_within, forwarders_for,
-    has_a_way_back,
+    Reached, dial_order, dial_peer, dial_peer_reaching, dial_peer_reaching_within,
+    dial_peer_with_endpoint, dial_peer_within, forwarders_for, has_a_way_back,
 };
 pub use frame::{
     MAX_BODY_BYTES, MAX_RELAYED_BODY_BYTES, SERVE_FLOW, ServeAck, ServeReply, ServeRequest,
-    recv_control, send_control, serve_request_from,
+    serve_request_from,
 };
 pub use hello::say_hello;
 pub use lender::{

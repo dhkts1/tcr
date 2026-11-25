@@ -6,39 +6,14 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use tcr_peer_wire::{Control, PeerId, StreamHeader, StreamKind};
-use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::peer::config::{Endpoint, Locator, PeerRow, PeerStore};
 use crate::peer::id::NodeKey;
-use crate::peer::noise::{self, Handshake};
+use crate::peer::noise::{self, Handshake, PeerStream, recv_control, send_control};
 
 use super::BORROW_TIMEOUT;
-use super::frame::{recv_control, send_control};
 use crate::peer::config::node_key_dir;
 use crate::peer::state::peer_state_path;
-
-/// Everything a stream to a peer has to be, as ONE name.
-///
-/// `Box<dyn AsyncRead + AsyncWrite + Unpin + Send>` is what this wants to say
-/// and Rust cannot spell it: a trait object takes one non-auto trait plus auto
-/// traits, and `AsyncRead` and `AsyncWrite` are two. So the pair gets a name,
-/// with a blanket impl so every existing stream type already satisfies it and
-/// nothing has to be registered. Reported to the lead as the one place the
-/// brief's literal signature is not expressible.
-pub trait PeerTransport: AsyncRead + AsyncWrite + Unpin + Send {}
-
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> PeerTransport for T {}
-
-/// One stream to a peer, whatever opened it.
-///
-/// **The transport seam.** Every handler below a dial already works on
-/// `AsyncRead + AsyncWrite + Unpin` and none of them names a socket, so this
-/// alias is the one place a second way of reaching a peer, a relay, a
-/// forwarded carry, a different protocol, arrives without touching a single
-/// handler. `Send` because a TUNNEL hands its stream to a pump that outlives
-/// the frame that dialled it, and boxed because two transports are two types
-/// and a caller choosing between them at runtime cannot be generic over both.
-pub type PeerStream = Box<dyn PeerTransport>;
 
 /// The order the endpoints on a row are tried in.
 ///

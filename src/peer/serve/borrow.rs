@@ -10,13 +10,10 @@ use tcr_peer_wire::{Lease, PeerId, StreamHeader, StreamKind};
 use crate::fallback::Ask;
 use crate::peer::config::PeerStore;
 use crate::peer::id::NodeKey;
-use crate::peer::noise::{self, Handshake};
+use crate::peer::noise::{self, Handshake, recv_json, send_json};
 
 use super::dial::dial_peer_reaching;
-use super::frame::{
-    SERVE_FLOW, ServeAck, ServeReply, recv_body, recv_json, send_body, send_json,
-    serve_request_from,
-};
+use super::frame::{SERVE_FLOW, ServeAck, ServeReply, recv_body, send_body, serve_request_from};
 use super::policy::serve_is_allowed_for_path;
 use crate::peer::config::node_key_dir;
 

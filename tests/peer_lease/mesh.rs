@@ -169,7 +169,7 @@ pub(crate) async fn spawn_lender_that_takes_nothing(
                     return;
                 };
                 let Ok(header) =
-                    serve::recv_control::<_, StreamHeader>(&mut stream, &mut session).await
+                    noise::recv_control::<_, StreamHeader>(&mut stream, &mut session).await
                 else {
                     return;
                 };
@@ -216,7 +216,7 @@ async fn accept_pinned(
             return None;
         }
     };
-    match serve::recv_control(stream, &mut session).await {
+    match noise::recv_control(stream, &mut session).await {
         Ok(header) => Some((session, header)),
         Err(err) => {
             eprintln!("{who}: no stream header: {err:#}");
@@ -230,7 +230,7 @@ async fn accept_pinned(
 /// arrives), the body and its empty terminator read, then a 200 carrying
 /// [`fleet::CANNED`].
 async fn answer_canned(stream: &mut tokio::net::TcpStream, session: &mut noise::PeerSession) {
-    serve::send_control(stream, session, &serve::ServeAck::Accepted)
+    noise::send_control(stream, session, &serve::ServeAck::Accepted)
         .await
         .expect("the ack frame");
     noise::recv_encrypted(stream, &mut session.transport)
@@ -245,7 +245,7 @@ async fn answer_canned(stream: &mut tokio::net::TcpStream, session: &mut noise::
         headers: vec![("content-type".to_string(), "application/json".to_string())],
         body_bytes: fleet::CANNED.len(),
     };
-    serve::send_control(stream, session, &reply)
+    noise::send_control(stream, session, &reply)
         .await
         .expect("the reply frame");
     noise::send_encrypted(stream, &mut session.transport, fleet::CANNED)
@@ -389,7 +389,7 @@ pub(crate) async fn spawn_counting_lease_lender(
                 };
                 match header.kind {
                     StreamKind::Control => {
-                        let control: Control = serve::recv_control(&mut stream, &mut session)
+                        let control: Control = noise::recv_control(&mut stream, &mut session)
                             .await
                             .expect("the control frame");
                         std::assert_matches!(
@@ -413,7 +413,7 @@ pub(crate) async fn spawn_counting_lease_lender(
                             }),
                             refusal: None,
                         };
-                        serve::send_control(&mut stream, &mut session, &Control::LeaseGrant(grant))
+                        noise::send_control(&mut stream, &mut session, &Control::LeaseGrant(grant))
                             .await
                             .expect("the grant frame");
                     }

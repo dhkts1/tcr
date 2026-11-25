@@ -1201,7 +1201,7 @@ async fn forwarder_and_target(
 /// The handshake is against B's pinned key over whatever the dial returned,
 /// which is the claim being made: a forwarded stream is not a second kind of
 /// stream to its caller.
-async fn speak_to_target(stream: tcr::peer::serve::PeerStream, secret: &[u8; 32], target: &PeerId) {
+async fn speak_to_target(stream: noise::PeerStream, secret: &[u8; 32], target: &PeerId) {
     let mut stream = stream;
     let mut nested = noise::dial_handshake(
         &mut stream,
@@ -1530,7 +1530,7 @@ fn undialable_row(peer: &PeerId, label: &str) -> PeerRow {
 /// This is the shape of the real thing rather than a stand-in: the carrier a
 /// Mac parks IS a socket it opened outwards, so a client socket to the Mac
 /// playing the target is the same object in the same direction.
-async fn carrier_to(addr: std::net::SocketAddr) -> tcr::peer::serve::PeerStream {
+async fn carrier_to(addr: std::net::SocketAddr) -> noise::PeerStream {
     Box::new(
         TcpStream::connect(addr)
             .await

@@ -518,17 +518,17 @@ pub(super) async fn hostile_serve(
         hops_remaining: 1,
         request_id: request.request_id,
     };
-    serve::send_control(&mut stream, &mut session, &header)
+    tcr::peer::noise::send_control(&mut stream, &mut session, &header)
         .await
         .expect("the header is written");
-    serve::send_control(&mut stream, &mut session, &request)
+    tcr::peer::noise::send_control(&mut stream, &mut session, &request)
         .await
         .expect("the frame is written");
     // THE ACK, read exactly where a borrower reads it. A refusal here is a
     // refusal before the body, so it is reported in the same word the caller
     // already reads; a lender that closed the stream instead answers `Err`,
     // which is what every `bail!` in `handle_serve_on` does.
-    let ack: serve::ServeAck = serve::recv_control(&mut stream, &mut session).await?;
+    let ack: serve::ServeAck = tcr::peer::noise::recv_control(&mut stream, &mut session).await?;
     if let serve::ServeAck::Refused { refusal } = ack {
         return Ok(serve::ServeReply::Refused { refusal });
     }
@@ -542,7 +542,7 @@ pub(super) async fn hostile_serve(
         .await
         .expect("the body terminator is written");
 
-    serve::recv_control(&mut stream, &mut session).await
+    tcr::peer::noise::recv_control(&mut stream, &mut session).await
 }
 
 /// Write a peers file BY HAND, at mode 0600, so a test can assert what a shape

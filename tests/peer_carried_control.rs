@@ -33,7 +33,6 @@ use tcr::peer::id::NodeKey;
 use tcr::peer::listener;
 use tcr::peer::noise::{self, Handshake};
 use tcr::peer::reach;
-use tcr::peer::serve;
 use tcr_peer_wire::{Caps, Control, Hello, PeerId, StreamHeader, StreamKind};
 
 /// The target: a pinned row for `peer` already on its file, so the ordinary
@@ -52,7 +51,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
 /// `via` is the inner header's own `via`: empty for a direct arrival, naming
 /// a carrier for a carried one. The exchange is otherwise the one
 /// `tests/peer_probe.rs`'s `open_control` drives over a real socket:
-/// `noise::dial_handshake` for the `IK` return, then `serve::send_control`
+/// `noise::dial_handshake` for the `IK` return, then `noise::send_control`
 /// for the header and for the frame.
 async fn hello_from(
     target: &Target,
@@ -88,7 +87,7 @@ async fn hello_from(
         hops_remaining: 1,
         request_id: 7,
     };
-    serve::send_control(&mut theirs, &mut session, &header)
+    noise::send_control(&mut theirs, &mut session, &header)
         .await
         .expect("the header writes");
 
@@ -107,13 +106,13 @@ async fn hello_from(
         boot_id: None,
         observed_you_at: None,
     });
-    serve::send_control(&mut theirs, &mut session, &hello)
+    noise::send_control(&mut theirs, &mut session, &hello)
         .await
         .expect("the hello writes");
 
     let answer: Control = timeout(
         Duration::from_secs(5),
-        serve::recv_control(&mut theirs, &mut session),
+        noise::recv_control(&mut theirs, &mut session),
     )
     .await
     .expect("the target answers within the deadline")

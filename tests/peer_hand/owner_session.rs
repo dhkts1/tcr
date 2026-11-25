@@ -173,7 +173,7 @@ async fn ask_for_a_lease(owner: &Owner, secret: &[u8; 32]) -> (Lease, Option<Con
     // close.
     let next = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        tcr::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
+        tcr::peer::noise::recv_control::<_, Control>(&mut stream, &mut session),
     )
     .await;
     let next = match next {
@@ -273,7 +273,7 @@ async fn ask_owner_for_a_lease(
         hops_remaining: 1,
         request_id: tcr::peer::id::random_id().expect("a request id"),
     };
-    tcr::peer::serve::send_control(&mut stream, &mut session, &header)
+    tcr::peer::noise::send_control(&mut stream, &mut session, &header)
         .await
         .expect("the header goes");
     let ask = tcr_peer_wire::LeaseRequest {
@@ -282,7 +282,7 @@ async fn ask_owner_for_a_lease(
         ttl_s: 300,
         max_inflight: 2,
     };
-    tcr::peer::serve::send_control(&mut stream, &mut session, &Control::LeaseRequest(ask))
+    tcr::peer::noise::send_control(&mut stream, &mut session, &Control::LeaseRequest(ask))
         .await
         .expect("the ask goes");
     (stream, session)
@@ -294,7 +294,7 @@ async fn read_the_grant(
     stream: &mut tokio::net::TcpStream,
     session: &mut tcr::peer::noise::PeerSession,
 ) -> Lease {
-    let granted: Control = tcr::peer::serve::recv_control(stream, session)
+    let granted: Control = tcr::peer::noise::recv_control(stream, session)
         .await
         .expect("the owner answers the ask");
     let Control::LeaseGrant(grant) = granted else {
@@ -411,7 +411,7 @@ async fn a_poisoned_lease_ledger_hands_nothing_over() {
     for _ in 0..2 {
         let next = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            tcr::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
+            tcr::peer::noise::recv_control::<_, Control>(&mut stream, &mut session),
         )
         .await;
         match next {
@@ -473,7 +473,7 @@ async fn a_hand_grant_is_followed_by_the_owners_bearer_on_the_same_session() {
         // in serve mode nothing comes at all and the read waits for the close.
         let next = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            tcr::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
+            tcr::peer::noise::recv_control::<_, Control>(&mut stream, &mut session),
         )
         .await;
 
@@ -778,7 +778,7 @@ async fn the_owner_hands_a_bearer_once_and_stops_at_revoke() {
     for _ in 0..2 {
         let read = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            tcr::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
+            tcr::peer::noise::recv_control::<_, Control>(&mut stream, &mut session),
         )
         .await;
         let Ok(Ok(Control::Handoff {
@@ -812,7 +812,7 @@ async fn the_owner_hands_a_bearer_once_and_stops_at_revoke() {
     std::fs::write(&peers, stripped).expect("rewrite the peers file");
     let after = tokio::time::timeout(
         std::time::Duration::from_secs(4),
-        tcr::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
+        tcr::peer::noise::recv_control::<_, Control>(&mut stream, &mut session),
     )
     .await;
     assert!(

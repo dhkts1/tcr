@@ -68,9 +68,10 @@ pub async fn request_lease(
         hops_remaining: 1,
         request_id: random_id()?,
     };
-    serve::send_control(&mut stream, &mut session, &header).await?;
-    serve::send_control(&mut stream, &mut session, &Control::LeaseRequest(*ask)).await?;
-    let answer: Control = serve::recv_control(&mut stream, &mut session).await?;
+    crate::peer::noise::send_control(&mut stream, &mut session, &header).await?;
+    crate::peer::noise::send_control(&mut stream, &mut session, &Control::LeaseRequest(*ask))
+        .await?;
+    let answer: Control = crate::peer::noise::recv_control(&mut stream, &mut session).await?;
     match answer {
         Control::LeaseGrant(grant) => {
             if let Some(refusal) = grant.refusal {

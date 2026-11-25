@@ -1532,13 +1532,11 @@ pub fn authorize_forward(carry: &Carry<'_>, forward: &Forward<'_>) -> Result<For
 /// fact that turns these bytes into traffic over a PATH: the row's endpoints
 /// are [`Locator`]s and the address dialled is one of them, so the meter can
 /// key on the same value the peers file spells.
-/// The return is [`crate::peer::serve::PeerStream`], the boxed form of that
+/// The return is [`crate::peer::noise::PeerStream`], the boxed form of that
 /// same widening: [`reach_target`] chooses at runtime between this and a
 /// carrier off the desk, and two transports are two types no caller can be
 /// generic over.
-async fn dial_pinned_peer(
-    row: &PeerRow,
-) -> Option<(std::net::SocketAddr, crate::peer::serve::PeerStream)> {
+async fn dial_pinned_peer(row: &PeerRow) -> Option<(std::net::SocketAddr, noise::PeerStream)> {
     crate::peer::serve::dial_peer_with_endpoint(row).await
 }
 
@@ -1728,7 +1726,7 @@ pub const CLIENT_FORWARD_HOPS: u8 = 1;
 ///
 /// # What comes back, and why the caller cannot tell it apart
 ///
-/// A [`crate::peer::serve::PeerStream`], exactly what a direct dial returns.
+/// A [`crate::peer::noise::PeerStream`], exactly what a direct dial returns.
 /// The forwarder splices the onward socket RAW ([`handle_forward_on`]), so
 /// the bytes this stream carries are the target's own socket, and the caller
 /// runs its ordinary handshake over it against the TARGET's pinned key. That
@@ -1757,7 +1755,7 @@ pub async fn open_forward_to(
     target: &PeerId,
     via: &[PeerId],
     borrow_timeout_ms: u64,
-) -> Result<crate::peer::serve::PeerStream> {
+) -> Result<noise::PeerStream> {
     if forwarder.node == *target {
         bail!(
             "peer forward: {} cannot carry a stream to itself; a direct dial is what that \

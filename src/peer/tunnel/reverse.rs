@@ -33,7 +33,7 @@ pub const MAX_PARKED_PER_PEER: usize = MAX_OPEN_CARRIES_PER_PEER as usize;
 /// One carrier a peer opened TO this node, waiting for a forward to ride back
 /// out over it.
 struct ParkedCarry {
-    stream: crate::peer::serve::PeerStream,
+    stream: crate::peer::noise::PeerStream,
     parked_at_ms: i64,
 }
 
@@ -107,7 +107,7 @@ impl ReverseDesk {
     fn park(
         &mut self,
         peer: PeerId,
-        stream: crate::peer::serve::PeerStream,
+        stream: crate::peer::noise::PeerStream,
         now_ms: i64,
     ) -> ParkOutcome {
         let queue = self.open.entry(peer).or_default();
@@ -129,7 +129,7 @@ impl ReverseDesk {
     /// here: every carrier is equally able to carry, and the oldest is the one
     /// closest to its TTL, so spending it first is what keeps a desk from
     /// holding a socket until it expires unused.
-    pub fn take(&mut self, peer: &PeerId, now_ms: i64) -> Option<crate::peer::serve::PeerStream> {
+    pub fn take(&mut self, peer: &PeerId, now_ms: i64) -> Option<crate::peer::noise::PeerStream> {
         let queue = self.open.get_mut(peer)?;
         drop_expired(queue, now_ms);
         queue.pop_front().map(|carry| carry.stream)
@@ -190,7 +190,7 @@ pub fn reverse_desk() -> &'static std::sync::Mutex<ReverseDesk> {
 pub fn park_reverse_carry(
     store: &PeerStore,
     peer: PeerId,
-    stream: crate::peer::serve::PeerStream,
+    stream: crate::peer::noise::PeerStream,
     now_ms: i64,
 ) -> ParkOutcome {
     if store.row(&peer).is_none() {
@@ -263,7 +263,7 @@ impl ReachedTarget {
 pub(super) async fn reach_target(
     row: &PeerRow,
     now_ms: i64,
-) -> Option<(ReachedTarget, crate::peer::serve::PeerStream)> {
+) -> Option<(ReachedTarget, crate::peer::noise::PeerStream)> {
     if let Ok(mut desk) = reverse_desk().lock() {
         if let Some(parked) = desk.take(&row.node, now_ms) {
             tracing::debug!(

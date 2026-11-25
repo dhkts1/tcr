@@ -28,7 +28,7 @@ pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 pub type DialFn = Arc<
     dyn Fn(
             SocketAddr,
-        ) -> Pin<Box<dyn Future<Output = Result<crate::peer::serve::PeerStream>> + Send>>
+        ) -> Pin<Box<dyn Future<Output = Result<crate::peer::noise::PeerStream>> + Send>>
         + Send
         + Sync,
 >;
@@ -180,7 +180,7 @@ pub(super) fn dialler<D: TailnetDevice>(
                 inner: stream,
                 _live: live.enter(addr.ip()),
             };
-            Ok(Box::new(counted) as crate::peer::serve::PeerStream)
+            Ok(Box::new(counted) as crate::peer::noise::PeerStream)
         })
     })
 }
@@ -195,7 +195,7 @@ pub(super) fn dialler<D: TailnetDevice>(
 pub async fn dial_through_node(
     addr: SocketAddr,
     within: Duration,
-) -> Option<Result<crate::peer::serve::PeerStream>> {
+) -> Option<Result<crate::peer::noise::PeerStream>> {
     dial_in_slot(server_slot(), addr, within).await
 }
 
@@ -204,7 +204,7 @@ pub async fn dial_in_slot(
     slot: &DialSlot,
     addr: SocketAddr,
     within: Duration,
-) -> Option<Result<crate::peer::serve::PeerStream>> {
+) -> Option<Result<crate::peer::noise::PeerStream>> {
     if !is_tailnet_ip(addr.ip()) {
         return None;
     }
@@ -254,7 +254,7 @@ pub enum RouteDial {
     /// The dial was tried and failed.
     Failed(anyhow::Error),
     /// The stream to the target.
-    Dialled(crate::peer::serve::PeerStream),
+    Dialled(crate::peer::noise::PeerStream),
 }
 
 /// The dial route's dial: through this process's node, to a tailnet address
@@ -443,7 +443,7 @@ pub async fn dial_through_server(
 pub async fn dial_for_cli(
     peers_path: &Path,
     addr: SocketAddr,
-) -> Result<crate::peer::serve::PeerStream> {
+) -> Result<crate::peer::noise::PeerStream> {
     if is_tailnet_ip(addr.ip())
         && crate::peer::config::read_or_default(peers_path)?
             .tailnet

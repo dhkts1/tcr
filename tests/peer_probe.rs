@@ -108,7 +108,7 @@ fn far_end(
             move |remote| noise::pin_check_rows(remote, &pin_rows),
         )
         .await?;
-        let header: StreamHeader = serve::recv_control(&mut stream, &mut session).await?;
+        let header: StreamHeader = noise::recv_control(&mut stream, &mut session).await?;
         anyhow::ensure!(header.kind == StreamKind::Control, "a CONTROL stream");
 
         loop {
@@ -155,7 +155,7 @@ async fn open_control(
         hops_remaining: 1,
         request_id: 11,
     };
-    serve::send_control(&mut stream, &mut session, &header).await?;
+    noise::send_control(&mut stream, &mut session, &header).await?;
     Ok((stream, session))
 }
 
@@ -522,10 +522,10 @@ async fn the_real_listener_echoes_a_probe_with_both_fields_untouched() {
         nonce: 0x0123_4567_89ab_cdef,
         sent_ms: FIXED_MS,
     };
-    serve::send_control(&mut stream, &mut session, &asked)
+    noise::send_control(&mut stream, &mut session, &asked)
         .await
         .expect("the probe goes out");
-    let answer: Control = serve::recv_control(&mut stream, &mut session)
+    let answer: Control = noise::recv_control(&mut stream, &mut session)
         .await
         .expect("the listener answers");
     assert_eq!(

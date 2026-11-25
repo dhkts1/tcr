@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{LeaseRefusal, MAX_FRAME_BYTES, PROTO_VERSION};
@@ -283,55 +283,4 @@ where
         }
         body.extend_from_slice(&frame);
     }
-}
-
-/// Write one frame of this stream: `serde_json`, then the Noise transport.
-///
-/// One framing for every stream kind and every frame on it, because a second
-/// spelling of "write a frame" is where a length check goes missing. `pub` so a
-/// test can stand in for the listener's dispatch arm, which is the one line of
-/// this feature that lives outside this file.
-pub async fn send_control<S, T>(
-    stream: &mut S,
-    session: &mut noise::PeerSession,
-    value: &T,
-) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-    T: Serialize,
-{
-    send_json(stream, session, value).await
-}
-
-/// One JSON frame, decrypted. See [`send_control`].
-pub async fn recv_control<S, T>(stream: &mut S, session: &mut noise::PeerSession) -> Result<T>
-where
-    S: AsyncRead + Unpin,
-    T: for<'de> Deserialize<'de>,
-{
-    recv_json(stream, session).await
-}
-
-/// One JSON frame, encrypted.
-pub(super) async fn send_json<S, T>(
-    stream: &mut S,
-    session: &mut noise::PeerSession,
-    value: &T,
-) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-    T: Serialize,
-{
-    let bytes = serde_json::to_vec(value).context("peer serve: a frame did not serialize")?;
-    noise::send_encrypted(stream, &mut session.transport, &bytes).await
-}
-
-/// One JSON frame, decrypted.
-pub(super) async fn recv_json<S, T>(stream: &mut S, session: &mut noise::PeerSession) -> Result<T>
-where
-    S: AsyncRead + Unpin,
-    T: for<'de> Deserialize<'de>,
-{
-    let bytes = noise::recv_encrypted(stream, &mut session.transport).await?;
-    serde_json::from_slice(&bytes).context("peer serve: a frame did not parse")
 }
