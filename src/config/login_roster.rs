@@ -6,21 +6,6 @@ use std::collections::HashSet;
 use super::{Account, Config};
 
 impl Config {
-    /// Append `account` behind the whole fleet: at one past the highest
-    /// priority any row carries, or 0 when none carries one.
-    pub fn append_at_next_priority(&mut self, account: Account) {
-        let next_priority = self
-            .accounts
-            .iter()
-            .filter_map(|a| a.priority)
-            .max()
-            .map_or(0, |max| max + 1);
-        self.accounts.push(Account {
-            priority: Some(next_priority),
-            ..account
-        });
-    }
-
     /// The Claude row a stored login identity already is: by
     /// [`crate::identity::same_identity`] with the Anthropic `probe` when both
     /// it and the row carry an account UUID, else by `email` against the email

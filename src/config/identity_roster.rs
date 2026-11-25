@@ -160,6 +160,21 @@ impl Config {
         self.accounts.push(account);
     }
 
+    /// [`Self::append_account`], behind the whole fleet: at one past the
+    /// highest priority any row carries, or 0 when none carries one.
+    pub fn append_at_next_priority(&mut self, account: Account) {
+        let next_priority = self
+            .accounts
+            .iter()
+            .filter_map(|a| a.priority)
+            .max()
+            .map_or(0, |max| max + 1);
+        self.append_account(Account {
+            priority: Some(next_priority),
+            ..account
+        });
+    }
+
     /// One value per row, in row order, each built from the row and this
     /// config's `http1_only`: how the manager derives its index-aligned runtime
     /// rows.
