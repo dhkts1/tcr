@@ -38,7 +38,7 @@ FILES=(
   "src/peer/state.rs"
   "src/peer/pair.rs"
   "src/peer/id.rs"
-  "src/peer/config.rs"
+  "src/peer/config/mod.rs"
   "src/peer/config/join_key.rs"
   "src/peer/discovery.rs"
   "tests/peer_noise/enrolment_and_files.rs"
@@ -124,7 +124,7 @@ probe enrolment_writes_nothing --test=it \
 SPEC
 
 probe invite_not_spent --test=it \
-  peer_noise::a_one_use_invite_refuses_its_second_joiner src/peer/config.rs <<'SPEC'
+  peer_noise::a_one_use_invite_refuses_its_second_joiner src/peer/config/mod.rs <<'SPEC'
             invite.uses_left = invite.uses_left.saturating_sub(1);
             invite.clone()
         };
@@ -152,7 +152,7 @@ probe peers_file_mode --test=it \
 SPEC
 
 probe peers_mode_check --test=it \
-  peer_noise::the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused src/peer/config.rs <<'SPEC'
+  peer_noise::the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused src/peer/config/mod.rs <<'SPEC'
             if mode != 0o600 {
 @@@
             if false {
