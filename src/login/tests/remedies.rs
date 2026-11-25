@@ -84,12 +84,12 @@ fn codex_relogin_workspace_refusal_drops_unknown_plans() {
     );
 }
 
-/// A running proxy's status read, as `cli::fetch_live_status` hands it over: parsed from the
+/// A running proxy's status read, as `live_client::fetch_live_status` hands it over: parsed from the
 /// wire, listing no Codex row (the server may not have admitted the new one yet), with the
 /// listener `mitm` reports.
 fn live_proxy_reporting(
     mitm: serde_json::Value,
-) -> Result<crate::status::StatusPayload, crate::cli::LiveStatusError> {
+) -> Result<crate::status::StatusPayload, crate::live_client::LiveStatusError> {
     Ok(serde_json::from_value(serde_json::json!({
         "kind": crate::status::STATUS_KIND,
         "accounts": [],
@@ -120,7 +120,7 @@ fn a_proxy_without_mitm_gets_the_not_pooled_notice() {
     );
     assert_eq!(
         first_codex_account_notice(
-            &Err(crate::cli::LiveStatusError::NoAnswer(
+            &Err(crate::live_client::LiveStatusError::NoAnswer(
                 "the server did not answer within 5s".to_string()
             )),
             NOTICE_PORT,
@@ -150,7 +150,7 @@ fn a_minted_chatgpt_leaf_gets_the_first_account_notice() {
     );
     assert_eq!(
         first_codex_account_notice(
-            &Err(crate::cli::LiveStatusError::NoServer),
+            &Err(crate::live_client::LiveStatusError::NoServer),
             NOTICE_PORT,
             notice_ca(),
             false,

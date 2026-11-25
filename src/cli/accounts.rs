@@ -6,13 +6,13 @@ use std::path::Path;
 use anyhow::{Context as _, bail};
 
 use super::account_query::resolve_account;
-use super::live_client::{RESTART_HINT, fetch_live_status};
 use super::live_edit::{
     CONTROL_WORDS, ENABLE_WORDS, Live, LiveSite, PRIORITY_WORDS, REMOVE_WORDS, post_set_control,
     post_set_disabled, post_set_priority,
 };
 use super::{edit_account, load_config, load_for_edit};
 use crate::config::{self, Config};
+use crate::live_client::{RESTART_HINT, fetch_live_status};
 use crate::provider::Provider;
 
 /// How to set an account's priority: an explicit integer, or a relative

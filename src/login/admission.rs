@@ -103,8 +103,8 @@ pub(super) fn login_guard_refusal_for(
 }
 
 /// What a live proxy said, structurally, about whether it can accept a live
-/// account add. Read from [`crate::cli::post_add_account`]'s own
-/// [`crate::cli::LiveControlError`] classification, which is itself driven by
+/// account add. Read from [`crate::live_client::post_add_account`]'s own
+/// [`crate::live_client::LiveControlError`] classification, which is itself driven by
 /// [`crate::proxy::ENDPOINT_HEADER`] — never by matching error text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum AddCapability {
@@ -124,7 +124,7 @@ pub(super) enum AddCapability {
     /// Something holds the port and is either an older proxy answering
     /// without the route (identified structurally, never by error text) or
     /// accepted the connection and then produced nothing usable before the
-    /// deadline — the wedged-port shape `cli::probe_incumbent`'s own tests
+    /// deadline — the wedged-port shape `live_client::probe_incumbent`'s own tests
     /// document as measured and real (`a_listener_that_never_answers_is_silent_not_answering`).
     /// Both are first-hand evidence a live process holds the port — at least
     /// as strong as the `incumbent` pid heuristic, and stronger exactly where
@@ -157,7 +157,8 @@ pub(super) async fn probe_add_capability(config: &Config) -> AddCapability {
 /// which is how a server that predates the header, and every non-answer, reads.
 async fn probe_add_route(config: &Config) -> (AddCapability, Vec<crate::provider::Provider>) {
     let probe = Account::new("", crate::provider::Provider::default(), "");
-    let (answer, providers) = crate::cli::post_add_account_with_providers(config, &probe).await;
+    let (answer, providers) =
+        crate::live_client::post_add_account_with_providers(config, &probe).await;
     let capability = match answer {
         // A blank name/token can never be added, so `Ok` cannot happen in
         // practice — but a stamped success is just as much "the route
@@ -165,11 +166,11 @@ async fn probe_add_route(config: &Config) -> (AddCapability, Vec<crate::provider
         Ok(_) => AddCapability::Present,
         // The route validated the (deliberately bad) body and said so,
         // stamped — exactly the positive capability signal.
-        Err(crate::cli::LiveControlError::Rejected(_)) => AddCapability::Present,
-        Err(crate::cli::LiveControlError::Unauthorized) => AddCapability::Unauthorized,
+        Err(crate::live_client::LiveControlError::Rejected(_)) => AddCapability::Present,
+        Err(crate::live_client::LiveControlError::Unauthorized) => AddCapability::Unauthorized,
         // A connection could not be made at all — the ONLY genuinely-absent
         // case.
-        Err(crate::cli::LiveControlError::NoServer) => AddCapability::Absent,
+        Err(crate::live_client::LiveControlError::NoServer) => AddCapability::Absent,
         // Everything else (`NoRoute`, `NoAnswer`, `Unusable`) is first-hand
         // evidence something holds the port, just not usably.
         Err(other) => AddCapability::Unusable(other.why()),

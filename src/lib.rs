@@ -39,6 +39,7 @@ pub mod heat;
 pub mod http_client;
 pub mod identity;
 pub mod import;
+pub mod live_client;
 pub mod log_err;
 pub mod login;
 pub mod manager;

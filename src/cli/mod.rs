@@ -27,7 +27,6 @@ mod accounts;
 mod fan;
 mod groups;
 mod list_v1;
-mod live_client;
 mod live_edit;
 mod live_reads;
 mod render;
@@ -47,10 +46,6 @@ pub use groups::{
     unreserve_group, validate_group_label_chars,
 };
 pub use list_v1::list_v1;
-pub use live_client::{
-    IncumbentProbe, LiveStatusError, Liveness, RESTART_HINT, fetch_live_status, probe_incumbent,
-};
-pub(crate) use live_client::{LiveControlError, post_add_account, post_add_account_with_providers};
 pub use live_reads::{live_peers, routing, sessions};
 pub use render::{StatusSource, list_accounts, render_accounts, snapshot_offline};
 pub use reset::{codex_reset, reset};

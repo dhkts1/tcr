@@ -3,13 +3,13 @@
 
 use std::path::Path;
 
-use super::live_client::{
-    LiveStatusError, Unreached, fetch_live_status, fetch_live_status_body, parse_live_status,
-    send_loopback_with_redirect_policy,
-};
 use super::load_config;
 use super::status::skew_report;
 use crate::config::Config;
+use crate::live_client::{
+    LiveStatusError, Unreached, fetch_live_status, fetch_live_status_body, parse_live_status,
+    send_loopback_with_redirect_policy,
+};
 
 /// The peers block as the RUNNING proxy reports it, `tcr peer status --json`.
 ///

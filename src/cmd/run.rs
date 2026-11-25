@@ -8,7 +8,7 @@ use tcr::cli::{self, validate_group_label_chars};
 use tcr::config::Config;
 use tcr::doctor::{no_proxy_entry_exempts, points_at_tcr};
 use tcr::proxy::{self, GROUP_HEADER_NAME};
-use tcr::{codex_route, status, tls};
+use tcr::{codex_route, live_client, status, tls};
 
 use super::ConfigFile;
 use super::server::load_config;
@@ -135,7 +135,7 @@ pub(crate) async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // ONE read of the running proxy answers both "is it listening" and "does
         // it intercept chatgpt.com", so the two cannot disagree. The CA is named,
         // never loaded: loading it here could re-mint a leaf the proxy never reads.
-        let live = cli::fetch_live_status(&config).await;
+        let live = live_client::fetch_live_status(&config).await;
         let ca = tls::minted_ca_path();
         let launch = codex_launch(&args, port, &live, &ca, ca.is_file(), &|var| {
             std::env::var(var).ok()
@@ -220,7 +220,7 @@ pub(crate) async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // ONE read of the running proxy's status per launch. It decides the request key (sent
         // only to a server that reports `requestKeyMode`), and, for a config that holds Codex
         // accounts and no Claude one, whether the proxy will refuse this whole session.
-        let live = cli::fetch_live_status(&config).await;
+        let live = live_client::fetch_live_status(&config).await;
         if holds_only_codex(&config)
             && let Ok(payload) = &live
             && let Some(warning) = no_claude_account_warning(port, payload)
@@ -376,7 +376,7 @@ impl CodexLaunch {
 fn codex_launch(
     args: &RunArgs,
     port: u16,
-    status: &Result<status::StatusPayload, cli::LiveStatusError>,
+    status: &Result<status::StatusPayload, live_client::LiveStatusError>,
     ca: &Path,
     ca_is_file: bool,
     inherited: &dyn Fn(&str) -> Option<String>,

@@ -3,9 +3,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use super::live_client::{LiveStatusError, fetch_live_status};
 use super::load_config;
 use super::render::{StatusSource, account_status_rows, resolve_thresholds, snapshot_offline};
+use crate::live_client::{LiveStatusError, fetch_live_status};
 use crate::oauth::NoRefresh;
 use crate::probe::{LiveUsageProber, UsageProber};
 use crate::provider::Provider;

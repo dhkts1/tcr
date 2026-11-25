@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::manager::Manager;
-use crate::{affinity, build_info, cli, mitm, session_wire_persist, singleton, tls};
+use crate::{affinity, build_info, live_client, mitm, session_wire_persist, singleton, tls};
 
 mod peer_mesh;
 use peer_mesh::{boot_peer_listener, peers_file_beside_config};
@@ -299,7 +299,7 @@ pub struct StandDown {
     pub kind: singleton::ProxyKind,
     /// ONE probe of the incumbent: which build it runs, and whether it answers
     /// at all. Both halves are needed to pick an exit code.
-    pub probe: cli::IncumbentProbe,
+    pub probe: live_client::IncumbentProbe,
     /// The build comparison, verdict + human line produced together.
     pub report: build_info::StandDownReport,
 }
@@ -1220,7 +1220,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     if let singleton::Takeover::IncumbentPresent(incumbent) = takeover {
         // ONE probe of the incumbent, answering two questions: which build it is
         // executing, and whether it is executing anything at all.
-        let probe = cli::probe_incumbent(&config).await;
+        let probe = live_client::probe_incumbent(&config).await;
         // Read the checkout LIVE. The build stamps alone cannot see an edit made
         // since the last commit (build.rs re-runs only when a git ref moves), so
         // comparing two stamps would print "build in sync" for a proxy that

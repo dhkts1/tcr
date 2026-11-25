@@ -1074,7 +1074,7 @@ impl Diagnosis {
 }
 
 fn codex_rows(
-    live: Result<&StatusPayload, &crate::cli::LiveStatusError>,
+    live: Result<&StatusPayload, &crate::live_client::LiveStatusError>,
     config: &crate::config::Config,
 ) -> Vec<CodexRow> {
     match live {
@@ -1128,7 +1128,7 @@ fn codex_rows(
 /// `tcr run --codex` would launch. codex's login is checked for existence, never read.
 pub fn inspect_codex(
     port: u16,
-    live: Result<&StatusPayload, &crate::cli::LiveStatusError>,
+    live: Result<&StatusPayload, &crate::live_client::LiveStatusError>,
     config: &crate::config::Config,
 ) -> CodexReport {
     let rows = codex_rows(live, config);

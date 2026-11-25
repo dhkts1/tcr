@@ -5,8 +5,8 @@ use std::path::Path;
 
 use anyhow::bail;
 
-use super::live_client::{ControlRoute, LiveControlError, RESTART_HINT, call_route};
 use crate::config::Config;
+use crate::live_client::{ControlRoute, LiveControlError, RESTART_HINT, call_route};
 
 /// What a verb that asks the running proxy first may do with its file.
 pub(super) enum Live<T> {

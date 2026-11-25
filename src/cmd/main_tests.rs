@@ -194,7 +194,7 @@ fn from_codex_parses_alone_and_with_codex_home_name_and_account() {
 /// error.
 #[test]
 fn restart_hint_names_only_commands_that_parse() {
-    let commands: Vec<&str> = cli::RESTART_HINT
+    let commands: Vec<&str> = tcr::live_client::RESTART_HINT
         .split('`')
         .skip(1)
         .step_by(2)
@@ -203,7 +203,7 @@ fn restart_hint_names_only_commands_that_parse() {
     assert!(
         !commands.is_empty(),
         "the hint must name a tcr command to run: {}",
-        cli::RESTART_HINT
+        tcr::live_client::RESTART_HINT
     );
     for command in commands {
         let argv: Vec<&str> = command.split_whitespace().collect();

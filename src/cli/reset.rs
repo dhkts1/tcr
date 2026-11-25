@@ -3,8 +3,8 @@
 use std::path::Path;
 use std::time::Duration;
 
-use super::live_client::{ControlRoute, LiveControlError, RouteAnswer, call_route_with_policy};
 use crate::config;
+use crate::live_client::{ControlRoute, LiveControlError, RouteAnswer, call_route_with_policy};
 use crate::provider::Provider;
 
 const CODEX_RESET_ROUTE: ControlRoute = ControlRoute {

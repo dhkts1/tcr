@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use time::OffsetDateTime;
 
-use super::live_client::{LiveStatusError, fetch_live_status};
 use super::render::{
     StatusSource, account_status_rows_at, render_accounts, resolve_thresholds, snapshot_offline,
     status_rows_json,
@@ -16,6 +15,7 @@ use super::{
 };
 use crate::build_info::{self, BuildInfo};
 use crate::config::Config;
+use crate::live_client::{LiveStatusError, fetch_live_status};
 use crate::oauth::NoRefresh;
 use crate::probe::{LiveUsageProber, ProbeStatus};
 use crate::provider::Provider;

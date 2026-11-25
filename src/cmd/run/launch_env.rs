@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use tcr::cli;
+use tcr::live_client;
 use tcr::proxy::GROUP_HEADER_NAME;
 use tcr::{request_key, status};
 
@@ -103,11 +103,11 @@ pub(super) enum LaunchKey {
 
 impl LaunchKey {
     /// `config_key` is the loaded config's `proxy.requestKey`; `status` is the
-    /// launch's one read of the running server ([`cli::fetch_live_status`]).
+    /// launch's one read of the running server ([`live_client::fetch_live_status`]).
     /// `tcr run` never writes a key: only the server generates one.
     pub(super) fn decide(
         config_key: Option<&str>,
-        status: &Result<status::StatusPayload, cli::LiveStatusError>,
+        status: &Result<status::StatusPayload, live_client::LiveStatusError>,
     ) -> Self {
         let Some(raw) = config_key.filter(|key| !key.is_empty()) else {
             return Self::NoKeyInConfig;

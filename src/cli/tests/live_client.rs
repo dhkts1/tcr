@@ -1,8 +1,11 @@
-//! Tests for the loopback client in `cli/live_client.rs`: the add-account route, the live
+//! Tests for the loopback client in `src/live_client.rs`: the add-account route, the live
 //! status read and the incumbent probe.
 
 use super::*;
 use crate::build_info::HANDOFF_SINCE;
+use crate::live_client::{
+    Liveness, post_add_account, post_add_account_with_providers, probe_incumbent,
+};
 #[test]
 fn the_restart_hint_names_the_first_version_with_handoff() {
     assert!(RESTART_HINT.contains("stop it"));

@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tcr::{cli, status};
+use tcr::{live_client, status};
 
 use crate::cmd::run::launch_env::{
     LaunchKey, LaunchRequestKey, apply_base_url_env, apply_codex_see_through_env,
@@ -144,7 +144,9 @@ fn sent(key: &str) -> LaunchKey {
 
 /// A running server's status read, parsed from the wire, with `requestKeyMode`
 /// set to `mode` or left out, as a server older than request keys leaves it.
-fn status_reporting(mode: Option<&str>) -> Result<status::StatusPayload, cli::LiveStatusError> {
+fn status_reporting(
+    mode: Option<&str>,
+) -> Result<status::StatusPayload, live_client::LiveStatusError> {
     let mut wire = serde_json::json!({
         "kind": status::STATUS_KIND,
         "accounts": [],
@@ -185,13 +187,15 @@ fn the_request_key_is_sent_only_to_a_server_that_reports_request_key_mode() {
         "an older server compares the whole Codex header: a keyed URL would run unpooled"
     );
     assert_eq!(
-        LaunchKey::decide(Some(KEY), &Err(cli::LiveStatusError::NoServer)),
+        LaunchKey::decide(Some(KEY), &Err(live_client::LiveStatusError::NoServer)),
         LaunchKey::StatusUnread("nothing is listening".to_string())
     );
     assert_eq!(
         LaunchKey::decide(
             Some(KEY),
-            &Err(cli::LiveStatusError::Unusable("HTTP 401".to_string()))
+            &Err(live_client::LiveStatusError::Unusable(
+                "HTTP 401".to_string()
+            ))
         ),
         LaunchKey::StatusUnread("HTTP 401".to_string())
     );
