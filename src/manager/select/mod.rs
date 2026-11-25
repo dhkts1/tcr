@@ -1,7 +1,8 @@
 //! `Manager` account-selection and eligibility methods, split verbatim from `mod.rs`.
 //!
-//! This file holds the selector's shared vocabulary: the request classes, the
-//! divert verdict, the threshold resolvers and the pool-pass types. Each child
+//! This file holds the selector's shared vocabulary: the divert verdict, the
+//! threshold resolvers and the pool-pass types. The request classes are the
+//! parent's ([`RequestClass`]), because the throttle reads them too. Each child
 //! holds one concern: the entry points ([`routing`]), the whole selection path
 //! ([`with_group`]), the revalidation serve ([`revalidation`]), the per-account
 //! gates ([`gates`]), the Codex slot filters ([`codex`]), the pool picks
@@ -27,42 +28,6 @@ pub(super) const AFFINITY_CAP: usize = 1024;
 /// Bound on [`Manager::conn_affinity`] — see its doc-comment for why the map is
 /// memory-only and never persisted.
 pub(super) const CONN_AFFINITY_CAP: usize = 256;
-
-/// The three-way split of an UNPINNED request (control account, part 2 — see
-/// the module doc and `docs/plans/control-routing-bridge-coder.md`). Classified
-/// from `path` alone (the caller's already query-stripped request path), never
-/// from a session/affinity key — see [`classify_request`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RequestClass {
-    /// `/v1/messages`, `/v1/messages/count_tokens` and Codex's
-    /// `/backend-api/codex/responses` — pool only. **Never** the control
-    /// account, even when `controlAccount` names an ENABLED (pooled) account —
-    /// see [`Manager::select`]'s pool-pick exclusion.
-    ///
-    /// Two opt-ins lift that, both off by default, and both leave
-    /// [`Manager::pool_pick_respects_control_reserve`]'s floor in force:
-    /// `groupSettings.<g>.allowControlAccount` for one explicit `--group g` ask,
-    /// and [`crate::config::Config::control_pooled`] for the whole pool.
-    Inference,
-    /// `/api/event_logging*`, `/mcp-registry*` — high-volume noise. Follows the
-    /// requesting connection ([`Manager::conn_affinity`]) rather than the
-    /// control account, so it never burns the one account being kept clean.
-    Noise,
-    /// Everything else — the identity/control plane. Prefers the control
-    /// account (bypassing its `disabled` gate — see
-    /// [`Manager::control_eligible`]) when it is genuinely usable; degrades to
-    /// normal rotation otherwise. The classification **fails safe**: an unknown
-    /// path defaults here rather than to the pool, the opposite of
-    /// `CLIENT_CREDENTIAL_PREFIXES`'s fail-unsafe growth.
-    ControlPreferred,
-}
-
-// Only a request WITHOUT a client bearer reaches this classifier on a `Noise`
-// or `ControlPreferred` path: with one, `proxy::relay_mode` relays every
-// non-inference path under the client's own credential first, and the
-// `controlIdentity` check (`crate::control_identity`) has already confirmed
-// that credential IS the control account. So the control-preferred pick below
-// is the bearer-less fallback, not the identity plane's main road.
 
 /// Why the group-respecting first pass of [`Manager::select_with_group`] came up
 /// empty, so the soft fallback had to drop the group and serve from the whole
@@ -134,25 +99,6 @@ impl GroupMiss {
             Self::AllGated => "every account in the requested group is currently unavailable",
             Self::Paced => "every account in the requested group is paced out",
         }
-    }
-}
-
-/// Classify an unpinned request's path into the three-way split. Inference is
-/// whatever the path's own provider calls inference
-/// ([`crate::provider::Provider::is_inference_path`]): exact matches only,
-/// which keeps `stable_session_key`'s `/v1/messages/count_tokens must NOT
-/// prefix-match /v1/messages` guard, read from the one list in
-/// `crate::provider` rather than a copy here that could drift from it. Prefix
-/// match for the two noise paths, matching the bridge's own examples
-/// (`/api/event_logging/v2/batch`, and any `/mcp-registry...` route).
-pub(super) fn classify_request(path: &str) -> RequestClass {
-    let provider = crate::provider::Provider::of_path(path);
-    if provider.is_inference_path(path) {
-        RequestClass::Inference
-    } else if path.starts_with("/api/event_logging") || path.starts_with("/mcp-registry") {
-        RequestClass::Noise
-    } else {
-        RequestClass::ControlPreferred
     }
 }
 

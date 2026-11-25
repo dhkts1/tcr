@@ -462,6 +462,61 @@ impl PendingCodexWriteback {
     }
 }
 
+/// The three-way split of an UNPINNED request (control account, part 2 — see
+/// the module doc and `docs/plans/control-routing-bridge-coder.md`). Classified
+/// from `path` alone (the caller's already query-stripped request path), never
+/// from a session/affinity key — see [`classify_request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::manager) enum RequestClass {
+    /// `/v1/messages`, `/v1/messages/count_tokens` and Codex's
+    /// `/backend-api/codex/responses` — pool only. **Never** the control
+    /// account, even when `controlAccount` names an ENABLED (pooled) account —
+    /// see [`Manager::select`]'s pool-pick exclusion.
+    ///
+    /// Two opt-ins lift that, both off by default, and both leave
+    /// [`Manager::pool_pick_respects_control_reserve`]'s floor in force:
+    /// `groupSettings.<g>.allowControlAccount` for one explicit `--group g` ask,
+    /// and [`crate::config::Config::control_pooled`] for the whole pool.
+    Inference,
+    /// `/api/event_logging*`, `/mcp-registry*` — high-volume noise. Follows the
+    /// requesting connection ([`Manager::conn_affinity`]) rather than the
+    /// control account, so it never burns the one account being kept clean.
+    Noise,
+    /// Everything else — the identity/control plane. Prefers the control
+    /// account (bypassing its `disabled` gate — see
+    /// [`Manager::control_eligible`]) when it is genuinely usable; degrades to
+    /// normal rotation otherwise. The classification **fails safe**: an unknown
+    /// path defaults here rather than to the pool, the opposite of
+    /// `CLIENT_CREDENTIAL_PREFIXES`'s fail-unsafe growth.
+    ControlPreferred,
+}
+
+// Only a request WITHOUT a client bearer reaches this classifier on a `Noise`
+// or `ControlPreferred` path: with one, `proxy::relay_mode` relays every
+// non-inference path under the client's own credential first, and the
+// `controlIdentity` check (`crate::control_identity`) has already confirmed
+// that credential IS the control account. So the control-preferred pick below
+// is the bearer-less fallback, not the identity plane's main road.
+
+/// Classify an unpinned request's path into the three-way split. Inference is
+/// whatever the path's own provider calls inference
+/// ([`crate::provider::Provider::is_inference_path`]): exact matches only,
+/// which keeps `stable_session_key`'s `/v1/messages/count_tokens must NOT
+/// prefix-match /v1/messages` guard, read from the one list in
+/// `crate::provider` rather than a copy here that could drift from it. Prefix
+/// match for the two noise paths, matching the bridge's own examples
+/// (`/api/event_logging/v2/batch`, and any `/mcp-registry...` route).
+pub(in crate::manager) fn classify_request(path: &str) -> RequestClass {
+    let provider = crate::provider::Provider::of_path(path);
+    if provider.is_inference_path(path) {
+        RequestClass::Inference
+    } else if path.starts_with("/api/event_logging") || path.starts_with("/mcp-registry") {
+        RequestClass::Noise
+    } else {
+        RequestClass::ControlPreferred
+    }
+}
+
 /// Owns all rotation state and the machinery to refresh tokens and reach upstream.
 pub struct Manager {
     /// This manager's own `Arc`, so a method holding `&self` can hand work to a
@@ -786,7 +841,7 @@ pub struct Manager {
     /// Codex has its own revalidation budget; a Claude fallback never spends it.
     next_codex_revalidation_at_ms: std::sync::atomic::AtomicI64,
     /// Connection-scoped affinity for NOISE traffic (`/api/event_logging`,
-    /// `/mcp-registry` — see [`select::classify_request`]): connection key
+    /// `/mcp-registry` — see [`classify_request`]): connection key
     /// ([`crate::proxy::SessionKey`]'s wrapped `u64`, minted per-connection by
     /// [`Manager::next_session_key`]) → `(account index, last-touch ms)`.
     ///
