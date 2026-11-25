@@ -194,12 +194,11 @@ pub(super) fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()
                         .with_upnp(reach::upnp_discoverer());
                     match keeper.map() {
                         Ok(granted) => {
-                            let over =
-                                if keeper.steps().contains(&reach::MappingStep::MappedOverUpnp) {
-                                    " (over upnp; nat-pmp did not answer)"
-                                } else {
-                                    ""
-                                };
+                            let over = if keeper.granted_by() == Some(reach::MappedOver::Upnp) {
+                                " (over upnp; nat-pmp did not answer)"
+                            } else {
+                                ""
+                            };
                             format!(
                                 "tcp {} -> {} for {}s{over}",
                                 granted.external_port, granted.internal_port, granted.lifetime_secs

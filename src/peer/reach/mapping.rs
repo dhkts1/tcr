@@ -695,6 +695,23 @@ impl MappingKeeper {
         Ok(Some(confirmed))
     }
 
+    /// [`Self::delete`] as a keeper's last act, then the steps it took.
+    ///
+    /// A delete the router does not confirm is logged and not returned: the
+    /// mapping expires on its own within the lifetime it was granted, and the
+    /// caller is shutting the keeper down either way.
+    fn finish(mut self) -> Vec<MappingStep> {
+        if let Err(err) = self.delete() {
+            tracing::warn!(
+                error = %err,
+                "peer internet: the router did not confirm the mapping was deleted; it expires \
+                 on its own within {}s",
+                self.lifetime_secs
+            );
+        }
+        self.steps
+    }
+
     /// Re-issue the UPnP `AddPortMapping` that granted the held mapping.
     ///
     /// Split out so [`Self::renew`] reads as the routing decision it is. The
@@ -886,14 +903,7 @@ pub fn run_mapping_while(
     // has been failing: leaving a mapping behind is a port on the router that
     // forwards to a listener this node has just stopped running.
     publish_external(None, None);
-    if let Err(err) = keeper.delete() {
-        tracing::warn!(
-            error = %err,
-            "peer internet: the router did not confirm the mapping was deleted; it expires \
-             on its own within {lifetime_secs}s"
-        );
-    }
-    Ok(keeper.steps().to_vec())
+    Ok(keeper.finish())
 }
 
 /// Sleep `wait` in [`MAPPING_STOP_POLL`] ticks, answering whether the full
