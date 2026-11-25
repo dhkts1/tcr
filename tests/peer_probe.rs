@@ -30,14 +30,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tcr::log_err::LogErr as _;
 
-use tcr::peer::config::{Allow, Endpoint, EndpointSource, Locator, PeerFile, PeerRow, PeerStore};
+use tcr::peer::config::{
+    Allow, Endpoint, EndpointSource, Locator, PathPolicy, PathsConfig, PeerFile, PeerRow, PeerStore,
+};
 use tcr::peer::id::NodeKey;
 use tcr::peer::listener::{self, SessionContext};
 use tcr::peer::noise::{self, Handshake, PeerSession};
-use tcr::peer::probe::{
-    self, PathPolicy, PathStat, PathTable, PathsConfig, ProbeOutcome, ProbeStop,
-};
+use tcr::peer::probe::{self, PathTable, ProbeOutcome, ProbeStop};
 use tcr::peer::serve;
+use tcr::peer::state::PathStat;
+use tcr::peer::tunnel::dial;
 use tcr_peer_wire::{Control, PeerId, StreamHeader, StreamKind};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -107,7 +109,7 @@ fn far_end(
             move |remote| noise::pin_check_rows(remote, &pin_rows),
         )
         .await?;
-        let header: StreamHeader = serve::recv_control(&mut stream, &mut session).await?;
+        let header: StreamHeader = noise::recv_control(&mut stream, &mut session).await?;
         anyhow::ensure!(header.kind == StreamKind::Control, "a CONTROL stream");
 
         loop {
@@ -154,7 +156,7 @@ async fn open_control(
         hops_remaining: 1,
         request_id: 11,
     };
-    serve::send_control(&mut stream, &mut session, &header).await?;
+    noise::send_control(&mut stream, &mut session, &header).await?;
     Ok((stream, session))
 }
 
@@ -521,10 +523,10 @@ async fn the_real_listener_echoes_a_probe_with_both_fields_untouched() {
         nonce: 0x0123_4567_89ab_cdef,
         sent_ms: FIXED_MS,
     };
-    serve::send_control(&mut stream, &mut session, &asked)
+    noise::send_control(&mut stream, &mut session, &asked)
         .await
         .expect("the probe goes out");
-    let answer: Control = serve::recv_control(&mut stream, &mut session)
+    let answer: Control = noise::recv_control(&mut stream, &mut session)
         .await
         .expect("the listener answers");
     assert_eq!(
@@ -778,7 +780,7 @@ fn round_trip_orders_two_clean_paths_and_the_policy_orders_the_hop() {
 /// **The shipped dial order delegates to the comparator, and an unmeasured
 /// fleet dials exactly as it did before this change.**
 ///
-/// `serve::dial_order` is what `dial_peer_with_endpoint` calls, so this is the
+/// `dial::dial_order` is what `dial_peer_with_endpoint` calls, so this is the
 /// wiring assertion: with no measurements the answer is still via-last,
 /// newest-first, which is what every build before this one did.
 ///
@@ -799,7 +801,7 @@ fn the_shipped_dial_order_is_the_comparator_and_an_unmeasured_row_is_unchanged()
         ),
     );
 
-    let shipped = serve::dial_order(&row);
+    let shipped = dial::dial_order(&row);
     assert_eq!(
         shipped,
         probe::order_endpoints(&row, &PathTable::default()),
@@ -959,14 +961,11 @@ fn the_measured_paths_survive_a_restart_and_keep_the_rest_of_the_file() {
     let addr: SocketAddr = "127.0.0.1:9708".parse().expect("an addr");
 
     let mut state = tcr::peer::state::PeerState::default();
-    state.muted.push(tcr::peer::state::Mute {
-        // Dated far ahead on purpose: `save_paths` reads the file through
-        // `load` at the REAL clock, which prunes a mute whose deadline has
-        // passed, so a mute dated from this file's fixed clock would be pruned
-        // by the writer and read as "the section writer lost it".
-        addr: "127.0.0.1".to_string(),
-        until_ms: 4_102_444_800_000,
-    });
+    // Muted at the REAL clock on purpose: `save_paths` reads the file through
+    // `load` at the real clock, which prunes a mute whose deadline has passed,
+    // so a mute dated from this file's fixed clock would be pruned by the
+    // writer and read as "the section writer lost it".
+    state.mute("127.0.0.1", tcr::peer::state::now_ms());
     tcr::peer::state::save(&path, &state).expect("the first write");
 
     let mut table = PathTable::default();
@@ -988,7 +987,7 @@ fn the_measured_paths_survive_a_restart_and_keep_the_rest_of_the_file() {
     assert_eq!(stat.locator, Locator::Direct { addr });
     assert_eq!(stat.rtt_ms, Some(40.0));
     assert_eq!(
-        restored.muted.len(),
+        restored.muted_count(),
         1,
         "and a section writer keeps every other key: the mute the operator set is still there"
     );

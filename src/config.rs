@@ -526,7 +526,7 @@ pub struct EgressPin {
 ///
 /// # Why this is about an account and not about the machine
 ///
-/// `tcr-peers.json` already carries [`crate::peer::egress::ViaSetting`], which
+/// `tcr-peers.json` already carries [`crate::peer::config::ViaSetting`], which
 /// answers a different question: how this Mac reaches the internet when its own
 /// path is dead. This one answers where ONE account leaves from on every
 /// request, working local path or not. The two never merge, and a reader who

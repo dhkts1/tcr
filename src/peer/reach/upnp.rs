@@ -8,15 +8,15 @@
 //!   NAT-PMP: identity stays the pinned static key, re-proven by the
 //!   handshake every time, so a forged mapping buys nothing.
 //! - **Synchronous on purpose, from a caller with nothing else in flight.**
-//!   [`Discoverer::discover`] drives a plain [`std::net::UdpSocket`] with a
-//!   read timeout; [`UpnpClient`]'s HTTP calls run on a DEDICATED thread with
+//!   [`Discoverer::discover`](crate::peer::reach::upnp::Discoverer::discover) drives a plain [`std::net::UdpSocket`] with a
+//!   read timeout; [`UpnpClient`](crate::peer::reach::upnp::UpnpClient)'s HTTP calls run on a DEDICATED thread with
 //!   its own current-thread `tokio` runtime, the same pattern as
 //!   `update::fetch_bytes` (`src/update.rs`), for the same reason: a caller
 //!   already inside `#[tokio::main]` cannot `block_on` on its own thread, and
 //!   a fresh thread has no runtime to collide with.
 //! - **The discovery destination is injectable**, exactly as
 //!   [`crate::peer::reach::NatPmp::at`] takes a gateway address: a test points
-//!   [`Discoverer::at`] at a loopback fake and nothing here ever sends a
+//!   [`Discoverer::at`](crate::peer::reach::upnp::Discoverer::at) at a loopback fake and nothing here ever sends a
 //!   packet to a real multicast group in the test suite.
 //!
 //! # Why a hand-rolled XML reader and not a crate
@@ -26,22 +26,22 @@
 //! that matter beyond the `u:` prefix on an action name (never parsed, only
 //! written), no processing instructions worth interpreting, no DTD. A crate
 //! earns its keep on a document nobody controls the shape of; the shape here
-//! is one page of UPnP IGD's own spec. [`parse_xml`] is a few dozen lines and
-//! builds a plain tree; [`XmlNode::child`] and [`XmlNode::find_all`] are the
+//! is one page of UPnP IGD's own spec. [`parse_xml`](crate::peer::reach::upnp::parse_xml) is a few dozen lines and
+//! builds a plain tree; [`XmlNode::child`](crate::peer::reach::upnp::XmlNode::child) and [`XmlNode::find_all`](crate::peer::reach::upnp::XmlNode::find_all) are the
 //! entire reading API, and neither cares what order sibling elements arrive
 //! in: see the shuffled-order proptest in `tests/peer_reach_upnp.rs`.
 //!
 //! # The four calls, and the one invariant that binds them
 //!
-//! [`Discoverer::discover`] finds a gateway over SSDP; [`UpnpClient::discover`]
+//! [`Discoverer::discover`](crate::peer::reach::upnp::Discoverer::discover) finds a gateway over SSDP; [`UpnpClient::discover`](crate::peer::reach::upnp::UpnpClient::discover)
 //! fetches its device description and locates the WANIPConnection control
 //! URL (version 1 or 2, a gateway is asked for both in one search, and
-//! either answers the same [`UpnpClient`]). From there,
-//! [`UpnpClient::add_port_mapping`], [`UpnpClient::get_external_address`] and
-//! [`UpnpClient::delete_port_mapping`] are three SOAP actions against the one
+//! either answers the same [`UpnpClient`](crate::peer::reach::upnp::UpnpClient)). From there,
+//! [`UpnpClient::add_port_mapping`](crate::peer::reach::upnp::UpnpClient::add_port_mapping), [`UpnpClient::get_external_address`](crate::peer::reach::upnp::UpnpClient::get_external_address) and
+//! [`UpnpClient::delete_port_mapping`](crate::peer::reach::upnp::UpnpClient::delete_port_mapping) are three SOAP actions against the one
 //! control URL. A refusal, most commonly UPnP error 718,
-//! `ConflictInMappingEntry`, is [`UpnpError::Refused`], never a panic and
-//! never silently swallowed: [`UpnpClient::call`] treats any SOAP fault as a
+//! `ConflictInMappingEntry`, is [`UpnpError::Refused`](crate::peer::reach::upnp::UpnpError::Refused), never a panic and
+//! never silently swallowed: [`UpnpClient::call`](crate::peer::reach::upnp::UpnpClient::call) treats any SOAP fault as a
 //! value to return, not a shape to retry past.
 //!
 //! # An SSDP answer is an unauthenticated datagram from anyone on the link
@@ -54,15 +54,15 @@
 //! is a named refusal with a test:
 //!
 //! 1. the `LOCATION` header must live on the very address the datagram came
-//!    from ([`check_location`]) and that address must be a private IPv4, so a
+//!    from ([`check_location`](crate::peer::reach::upnp::check_location)) and that address must be a private IPv4, so a
 //!    LAN host cannot aim this client at loopback, at another host's admin
-//!    page, or at an address off the link. [`LocationPolicy`] is derived from
+//!    page, or at an address off the link. [`LocationPolicy`](crate::peer::reach::upnp::LocationPolicy) is derived from
 //!    the search destination, never from the answer;
 //! 2. the resolved `controlURL` must share the description's own authority
-//!    ([`locate_control_url`]), so neither an absolute `controlURL` nor a
+//!    ([`locate_control_url`](crate::peer::reach::upnp::locate_control_url)), so neither an absolute `controlURL` nor a
 //!    `URLBase` can move the SOAP calls to a third host;
 //! 3. redirects are never followed and never silently treated as a body: a
-//!    3xx is [`UpnpError::Redirected`], because following one would hand rule
+//!    3xx is [`UpnpError::Redirected`](crate::peer::reach::upnp::UpnpError::Redirected), because following one would hand rule
 //!    2 back to the description's author;
 //! 4. the HTTP client is built with `.no_proxy()`, for the reason
 //!    `peer::serve::serve_on_own_account` and `peer::lease` give: we ARE a
@@ -72,7 +72,7 @@
 //! **What the four rules do NOT decide is who answers.** They bound where this
 //! client can be sent; the race for the first `M-SEARCH` answer is still won by
 //! whoever on the link replies fastest, and that host then serves the bytes.
-//! So every answer is read under a ceiling as well ([`MAX_BODY_BYTES`]): a LAN
+//! So every answer is read under a ceiling as well ([`MAX_BODY_BYTES`](crate::peer::reach::upnp::MAX_BODY_BYTES)): a LAN
 //! host that wins the race cannot make this node hold an unbounded body just
 //! by promising one.
 

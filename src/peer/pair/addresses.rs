@@ -3,81 +3,13 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-/// What kind of path one address in a join key is, as the Mac that minted the
-/// key knew it.
-///
-/// **How this Mac learned the address, not a claim on the wire.** The same rule
-/// [`crate::peer::config::EndpointSource`] follows, and the reason it is not
-/// rendered into the key: a sender's word about its own address is not
-/// evidence, the joiner dials in the order it was given, and a reader that
-/// believed a kind field would be believing the one party that cannot be
-/// checked. It exists so `tcr peer invite` can tell an operator which of the
-/// lines under their key is the tailnet one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DialAddressKind {
-    /// The listener is bound to one specific address and somebody chose it, so
-    /// it is the only address the key carries.
-    Chosen,
-    /// A tailnet address: a `utun` interface holding one out of
-    /// `100.64.0.0/10`. First, because it works from any network the friend is
-    /// on without a router forwarding anything.
-    Tailscale,
-    /// The address of tcr's own tailnet node, as the serving process
-    /// recorded it (`crate::peer::tailnet_node`): there is no `utun` for it,
-    /// so it is read off the state file rather than an interface. First, for
-    /// the reason [`Self::Tailscale`] is.
-    TailnetNode,
-    /// The external socket a held port mapping published, which is the one
-    /// address a friend anywhere on the internet can open.
-    Internet,
-    /// An address a real interface holds: reachable from this network and no
-    /// further.
-    Lan,
-    /// Read out of a pasted key. This Mac derived nothing about it, which is
-    /// what a parsed key honestly knows.
-    FromKey,
-}
-
-impl DialAddressKind {
-    /// The one word a surface prints for this kind. One spelling, so an
-    /// operator grepping their scrollback and a reader of this file see the
-    /// same token.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Chosen => "chosen",
-            Self::Tailscale => "tailscale",
-            Self::TailnetNode => "tailnet-node",
-            Self::Internet => "internet",
-            Self::Lan => "lan",
-            Self::FromKey => "from-key",
-        }
-    }
-}
-
-/// One address a friend could dial this Mac at, with what kind of path it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DialAddress {
-    /// The full socket, as it goes into the key.
-    pub addr: SocketAddr,
-    /// See [`DialAddressKind`]: local knowledge, never part of the key.
-    pub kind: DialAddressKind,
-}
-
-impl DialAddress {
-    /// An address read out of a pasted key.
-    pub const fn from_key(addr: SocketAddr) -> Self {
-        Self {
-            addr,
-            kind: DialAddressKind::FromKey,
-        }
-    }
-}
+use crate::peer::config::join_key::{DialAddress, DialAddressKind};
 
 /// One address an interface holds, with the interface's own name.
 ///
 /// The name is carried because the address alone cannot answer the one question
 /// the rank order turns on: `100.64.0.0/10` is both a tailnet and the range a
-/// mobile hotspot hands out (`crate::peer::listener::is_lan_scope`'s own doc
+/// mobile hotspot hands out (`crate::peer::reach::is_lan_scope`'s own doc
 /// says so), and putting a hotspot address first would put the slowest path
 /// first for everybody on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,15 +29,15 @@ pub struct HostAddress {
 /// by nothing outside that hotspot; ranking one of those first would put the
 /// deadest address at the top of every key minted on a tethered Mac.
 ///
-/// The range check is [`crate::peer::listener::is_carrier_grade_nat`], the one
-/// exported predicate `crate::peer::listener::is_lan_scope_v4` sits beside; an
+/// The range check is [`crate::peer::reach::is_carrier_grade_nat`], the one
+/// exported predicate `crate::peer::reach::is_lan_scope_v4` sits beside; an
 /// IPv6 address is never a tailnet one here because `is_tailnet` only ever
 /// sees the range's own /10, which is IPv4.
 fn is_tailnet(host: &HostAddress) -> bool {
     let IpAddr::V4(v4) = host.addr else {
         return false;
     };
-    host.interface.starts_with("utun") && crate::peer::listener::is_carrier_grade_nat(v4)
+    host.interface.starts_with("utun") && crate::peer::reach::is_carrier_grade_nat(v4)
 }
 
 /// Every address a friend could dial this Mac at, best first.

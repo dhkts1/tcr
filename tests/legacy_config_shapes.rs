@@ -104,7 +104,7 @@ fn a_peers_file_with_no_dead_drop_key_reads_as_off() {
         file.dead_drop
     );
     assert!(
-        !file.dead_drop.is_live(),
+        !file.drop_is_live(),
         "a file that never asked for a dead drop publishes nothing and fetches nothing"
     );
     assert!(

@@ -370,7 +370,7 @@ async fn an_authenticated_peer_that_never_sends_a_header_is_closed_on_a_deadline
     let client = NodeKey::load_or_mint(&client_dir).expect("mint the dialler's key");
 
     let mut file = node.file();
-    file.peers.push(PeerRow {
+    file.pin(PeerRow {
         node: client.id(),
         label: "dialler".to_string(),
         endpoints: vec![Endpoint::direct(
@@ -505,8 +505,9 @@ fn a_fifth_headerless_session_from_one_peer_is_refused() {
 /// refusal below becomes the allowed tuple.
 #[test]
 fn a_gateway_carries_an_allow_listed_name_on_one_port_only() {
-    use tcr::peer::egress::{PEER_EGRESS_HOSTS, PEER_EGRESS_PORT};
+    use tcr::peer::egress::PEER_EGRESS_HOSTS;
     use tcr::peer::tunnel;
+    use tcr::peer::tunnel::PEER_EGRESS_PORT;
 
     let peer = PeerId([13_u8; 32]);
     let carried = tcr_peer_wire::TunnelTarget::Origin {
@@ -772,7 +773,7 @@ async fn a_carried_stream_that_died_reports_it_through_finish() {
     .expect("the dialler's handshake");
     let (ours, session) = accepting.await.expect("the responder task");
 
-    let mut carried = tcr::peer::tunnel::NoiseStream::start(ours, session);
+    let mut carried = noise::NoiseStream::start(ours, session);
     // Not a frame this session can open: the pump breaks on it.
     noise::write_frame(&mut theirs, &[0_u8; 64])
         .await
@@ -846,7 +847,7 @@ async fn a_local_end_that_closes_still_gets_what_the_peer_already_sent() {
     .expect("the dialler's handshake");
     let (ours, session) = accepting.await.expect("the responder task");
 
-    let mut carried = tcr::peer::tunnel::NoiseStream::start(ours, session);
+    let mut carried = noise::NoiseStream::start(ours, session);
     // The local end is done talking, and is still there to be answered.
     carried.shutdown().await.expect("half-close the local end");
 

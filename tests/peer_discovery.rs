@@ -9,7 +9,8 @@
 //! compare.
 
 use tcr::peer::config::NetworkKey;
-use tcr::peer::discovery::{self, Discovered, FoundList, FoundSource};
+use tcr::peer::discovery::{self, Discovered, FoundList};
+use tcr::peer::state::{self, FoundSource};
 use tcr_peer_wire::{INSTANCE_ID_BYTES, InstanceId, PeerId};
 
 /// An instance id distinctive enough that a fragment of it could not appear by
@@ -442,7 +443,7 @@ fn a_row_that_stops_announcing_leaves_after_sixty_seconds() {
     assert_eq!(found.len(), 2);
 
     // One keeps announcing, the other does not, one millisecond past the TTL.
-    let later = 1_000 + discovery::FOUND_TTL_MS + 1;
+    let later = 1_000 + state::FOUND_TTL_MS + 1;
     found.observe(vec![row(1, "192.0.2.7")], later);
     let shown = found.shown();
     assert_eq!(
@@ -552,10 +553,11 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
     // ---- control: before the scan, A cannot reach B at all.
     let stale = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
-        .peers
-        .remove(0);
+        .row(&b)
+        .cloned()
+        .expect("B's row");
     assert!(
-        tcr::peer::serve::dial_peer(&stale).await.is_none(),
+        tcr::peer::tunnel::dial::dial_peer(&stale).await.is_none(),
         "the control: A's only endpoint for B is a port nobody listens on, so the dial \
          must fail before the beacon, otherwise the last assertion proves nothing"
     );
@@ -600,8 +602,9 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
 
     let refreshed = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
-        .peers
-        .remove(0);
+        .row(&b)
+        .cloned()
+        .expect("B's row");
     assert_eq!(
         refreshed.added_at, stale.added_at,
         "and without re-pinning: the row is the same row, so every grant on it survived"
@@ -622,7 +625,9 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
         "timed by this node's clock and never by anything in the announcement"
     );
     assert!(
-        tcr::peer::serve::dial_peer(&refreshed).await.is_some(),
+        tcr::peer::tunnel::dial::dial_peer(&refreshed)
+            .await
+            .is_some(),
         "A dials the address B announced and gets a connection: {:?}",
         refreshed.endpoints
     );
@@ -651,7 +656,7 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
 // ---------------------------------------------------------------------------
 
 /// A share brief naming `node` at `addr`, the whole of what
-/// [`discovery::neighbor_briefs`] is allowed to put in one.
+/// [`tcr::peer::config::PeerFile::neighbor_briefs`] is allowed to put in one.
 fn brief(node: PeerId, addr: std::net::SocketAddr) -> tcr_peer_wire::NeighborBrief {
     tcr_peer_wire::NeighborBrief {
         node,
@@ -706,9 +711,8 @@ async fn a_brief_from_a_mutual_friend_refreshes_that_friends_locator() {
 
     let refreshed = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
-        .peers
-        .into_iter()
-        .find(|row| row.node == c)
+        .row(&c)
+        .cloned()
         .expect("C is still a pinned row, not re-created");
     let learned = refreshed
         .endpoints
@@ -880,9 +884,8 @@ async fn five_hundred_brief_addresses_write_once_and_never_outrank_the_paired_en
 
     let row = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
-        .peers
-        .into_iter()
-        .find(|row| row.node == c)
+        .row(&c)
+        .cloned()
         .expect("C is still pinned");
     assert!(
         row.endpoints.len() <= tcr::peer::config::MAX_ENDPOINTS_PER_PEER,
@@ -1082,7 +1085,7 @@ fn a_flood_holds_two_rows_per_address_and_nothing_survives_the_ttl() {
     );
 
     // And the other half of the real bound: the window.
-    found.observe(Vec::new(), 1_000 + discovery::FOUND_TTL_MS);
+    found.observe(Vec::new(), 1_000 + state::FOUND_TTL_MS);
     assert_eq!(
         found.len(),
         0,
@@ -1101,10 +1104,10 @@ fn found_ttl_covers_three_browses() {
     let browse_interval_ms = i64::try_from(discovery::BROWSE_INTERVAL.as_millis())
         .expect("BROWSE_INTERVAL fits in an i64 of milliseconds");
     assert!(
-        discovery::FOUND_TTL_MS >= 3 * browse_interval_ms,
+        state::FOUND_TTL_MS >= 3 * browse_interval_ms,
         "FOUND_TTL_MS ({}) must cover three browses at BROWSE_INTERVAL ({}), or a row that \
          missed two scans in a row leaves before a third has a chance to renew it",
-        discovery::FOUND_TTL_MS,
+        state::FOUND_TTL_MS,
         browse_interval_ms
     );
 }

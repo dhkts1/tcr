@@ -40,9 +40,9 @@ use tcr::fallback::Ask;
 use tcr::peer::config::LendMode;
 use tcr::peer::lease::{
     HANDOFF_RENEW_LEAD_MS, HandedBearer, HandedTokens, Ledger, bearer_fingerprint, handed_tokens,
-    handoff_for, handoff_push_is_due, handoff_renewal_due, lease_has_ended, serve_on_handed_bearer,
-    usage_hint,
+    handoff_for, handoff_push_is_due, handoff_renewal_due, lease_has_ended, usage_hint,
 };
+use tcr::peer::serve::serve_on_handed_bearer;
 use tcr_peer_wire::{Control, Lease, LeaseUnit, Window};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;

@@ -26,6 +26,10 @@ set -uo pipefail
 # and wrong in every other checkout.
 ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 STAMP="$$-$(date +%s)"
+# `test_module_path`: where a test lives inside its test file, read from the source.
+# shellcheck source=tests/tools/peer-test-path.sh
+source "$(dirname "$0")/peer-test-path.sh"
+
 LOG_DIR=/tmp/lan-p2p
 BACKUP_DIR="$LOG_DIR/mutate-identity-$STAMP"
 mkdir -p "$BACKUP_DIR" "$LOG_DIR"
@@ -35,8 +39,9 @@ FILES=(
   "src/peer/pair.rs"
   "src/peer/id.rs"
   "src/peer/config.rs"
+  "src/peer/config/join_key.rs"
   "src/peer/discovery.rs"
-  "tests/peer_noise.rs"
+  "tests/peer_noise/enrolment_and_files.rs"
 )
 for f in "${FILES[@]}"; do
   cp "$ROOT/$f" "$BACKUP_DIR/$(echo "$f" | tr / _)"
@@ -55,6 +60,18 @@ FAILED=0
 # stdin: OLD text, a line `@@@`, NEW text.
 probe() {
   local name="$1" target="$2" filter="$3" file="$4"
+  # A `--test=it` filter is written `<module>::<test>`; the child module between them is read
+  # from the source, so a test file split into a directory cannot leave a filter that matches
+  # nothing. A name defined in zero or two places makes the probe INVALID and fails the run.
+  if [ "$target" = "--test=it" ]; then
+    local module="${filter%%::*}" leaf="${filter#*::}" inner
+    if ! inner="$(test_module_path "$module" "$leaf")"; then
+      echo "probe=$name INVALID: the test name did not resolve to exactly one fn"
+      FAILED=1
+      return
+    fi
+    filter="$module::$inner"
+  fi
   restore
   local spec="$BACKUP_DIR/$name.spec"
   cat >"$spec"
@@ -100,23 +117,23 @@ SPEC
 
 probe enrolment_writes_nothing --test=it \
   peer_noise::a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides src/peer/pair.rs <<'SPEC'
-    file.peers.push(row.clone());
+    file.pin(row.clone());
     save(peers_path, &file)?;
 @@@
-    file.peers.push(row.clone());
+    file.pin(row.clone());
 SPEC
 
 probe invite_not_spent --test=it \
-  peer_noise::a_one_use_invite_refuses_its_second_joiner src/peer/pair.rs <<'SPEC'
-        invite.uses_left = invite.uses_left.saturating_sub(1);
-        invite.clone()
-    };
-    if invite.uses_left == 0 {
-        file.pending_invites.remove(position);
-    }
+  peer_noise::a_one_use_invite_refuses_its_second_joiner src/peer/config.rs <<'SPEC'
+            invite.uses_left = invite.uses_left.saturating_sub(1);
+            invite.clone()
+        };
+        if invite.uses_left == 0 {
+            self.pending_invites.remove(position);
+        }
 @@@
-        invite.clone()
-    };
+            invite.clone()
+        };
 SPEC
 
 probe enrolment_label_unsanitized --test=it \
@@ -128,7 +145,7 @@ probe enrolment_label_unsanitized --test=it \
 SPEC
 
 probe peers_file_mode --test=it \
-  peer_noise::the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused tests/peer_noise.rs <<'SPEC'
+  peer_noise::the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused tests/peer_noise/enrolment_and_files.rs <<'SPEC'
     tcr::peer::config::save(path, &file).expect("the peers file is written");
 @@@
     std::fs::write(path, serde_json::to_string(&file).expect("json")).expect("written");
@@ -141,27 +158,26 @@ probe peers_mode_check --test=it \
             if false {
 SPEC
 
-probe key_file_follows_symlink --test=it \
-  peer_noise::a_planted_symlink_does_not_capture_the_node_key src/peer/id.rs <<'SPEC'
-        .create_new(true)
-        .mode(mode)
-@@@
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-SPEC
+# SKIPPED probe key_file_follows_symlink (gate a_planted_symlink_does_not_capture_the_node_key):
+# its anchor was `.create_new(true).mode(mode)` in src/peer/id.rs, and `write_key_file` no
+# longer opens the file that way. It stages a tempfile and publishes it with `link(2)`, so the
+# symlink defence has a different shape and this mutation has no counterpart there.
 
 probe stdin_ignores_its_reader --test=it \
   peer_noise::a_join_token_arrives_on_stdin_and_never_in_a_message src/peer/pair.rs <<'SPEC'
+pub fn token_from_reader<R: std::io::BufRead>(mut reader: R) -> Result<JoinToken> {
+    let mut line = String::new();
     reader
         .read_line(&mut line)
         .context("peer join: could not read the join key from standard input")?;
 @@@
+pub fn token_from_reader<R: std::io::BufRead>(mut reader: R) -> Result<JoinToken> {
+    let mut line = String::new();
     let _ignored = &mut reader;
 SPEC
 
 probe refusal_echoes_the_secret --test=it \
-  peer_noise::a_join_token_arrives_on_stdin_and_never_in_a_message src/peer/pair.rs <<'SPEC'
+  peer_noise::a_join_token_arrives_on_stdin_and_never_in_a_message src/peer/config/join_key.rs <<'SPEC'
             .context("peer join: the secret field is not 32 base32-encoded bytes")?;
 @@@
             .with_context(|| format!("peer join: the secret field {secret:?} is not 32 base32-encoded bytes"))?;

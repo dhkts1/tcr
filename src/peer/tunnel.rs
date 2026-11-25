@@ -6,7 +6,7 @@
 //! `src/mitm.rs`'s `tunnel()` is a `copy_bidirectional` splice whose own
 //! doc-comment is the security argument verbatim: TLS is never terminated, the
 //! client's end-to-end encryption to the real host is untouched, and no
-//! credentials are involved. [`splice`] is that body, extracted over two
+//! credentials are involved. [`splice`](crate::peer::tunnel::splice) is that body, extracted over two
 //! generic halves rather than two `TcpStream`s, because neither half of a peer
 //! carry is a bare socket on both ends.
 //!
@@ -14,7 +14,7 @@
 //!
 //! `snow` exposes a FRAME API over byte slices, not a stream, while
 //! `copy_bidirectional` needs `AsyncRead + AsyncWrite + Unpin`. So the splice
-//! needs [`NoiseStream`], an adapter that turns one authenticated Noise session
+//! needs [`NoiseStream`](crate::peer::noise::NoiseStream), an adapter that turns one authenticated Noise session
 //! into a byte stream.
 //!
 //! It is built out of a `tokio::io::duplex` pair plus one pump task rather than
@@ -36,8 +36,8 @@
 //! A TUNNEL's target is an origin or a peer, and the peer form is the reach
 //! story for two Macs that both moved: the requester asks a pinned friend with
 //! a reachable address to splice it onward.
-//! [`handle_forward_on`] is that half, and the three things that keep it from
-//! being an open relay are all in [`authorize_forward`]: the requester holds
+//! [`handle_forward_on`](crate::peer::tunnel::handle_forward_on) is that half, and the three things that keep it from
+//! being an open relay are all in [`authorize_forward`](crate::peer::tunnel::authorize_forward): the requester holds
 //! `allow.relay`, the TARGET is a row in this Mac's own peers file (so no
 //! address a peer chose is ever dialled), and one hop is spent per forward
 //! with zero refused.
@@ -47,13 +47,13 @@
 //! target. The target therefore authenticates the REQUESTER, this node holds
 //! ciphertext, and the meter is the same two byte counts a gateway has.
 //!
-//! [`open_forward_to`] is the REQUESTER's half of the same picture, and it did
+//! [`open_forward_to`](crate::peer::tunnel::dial::open_forward_to) is the REQUESTER's half of the same picture, and it did
 //! not exist for a long time: every gate on the forwarding path was built
 //! and nothing in the tree ever opened a TUNNEL whose target was a peer, so a
 //! peer reachable only through a friend was reachable by nobody.
 //!
 //! Forwarded bytes are charged to the REQUESTER out of the same
-//! [`TunnelBudget`] a carry draws on, through the same [`reserve_for`]: one
+//! [`TunnelBudget`](crate::peer::tunnel::TunnelBudget) a carry draws on, through the same [`reserve_for`]: one
 //! cap, one hour, one peer. That is what makes a transitive forward grant
 //! bounded rather than merely honest, the node two hops out spends the
 //! grantee's hour and never a fresh one.
@@ -61,7 +61,7 @@
 //! # What a blind hop may validate, and the ceiling of that
 //!
 //! A host and a port, and then one thing more: **the first ClientHello's SNI
-//! must equal the CONNECTed host** ([`assert_sni_matches_target`]), so a
+//! must equal the CONNECTed host** ([`assert_sni_matches_target`](crate::peer::tunnel::assert_sni_matches_target)), so a
 //! granted peer cannot domain-front to some other service behind the same
 //! address. A gateway cannot do better than that without terminating TLS, at
 //! which point it is not blind, so this is the ceiling, and the ceiling ships
@@ -72,12 +72,12 @@
 //! Bytes, streams and wall time. **Never quota**, it cannot see a model, a
 //! path, an account or a response header, and a design that let it meter quota
 //! would be admitting it can see. The two counters `copy_bidirectional`
-//! returns are the meter, plus a cap ([`TunnelBudget`]).
+//! returns are the meter, plus a cap ([`TunnelBudget`](crate::peer::tunnel::TunnelBudget)).
 //!
 //! The cap is enforced twice and neither is redundant. At admission, a peer
 //! already over its hour is refused before a socket to the origin is opened
-//! ([`TunnelBudget::admit`]); and during the splice, the peer half is wrapped
-//! in [`Metered`] with this carry's allowance, so one stream that never ends
+//! ([`TunnelBudget::admit`](crate::peer::tunnel::TunnelBudget::admit)); and during the splice, the peer half is wrapped
+//! in [`Metered`](crate::peer::tunnel::Metered) with this carry's allowance, so one stream that never ends
 //! cannot spend an unbounded number of bytes under one admission. An
 //! admission-only cap is a cap on stream count, which is not what the operator
 //! asked for.
@@ -86,7 +86,7 @@
 //! closed.** A reservation is taken at admission and released at the end of the
 //! carry, so `cap` bounds concurrent traffic too: without it, five carries
 //! opened at once were each handed the whole remaining hour and could spend it
-//! five times over. [`MAX_OPEN_CARRIES_PER_PEER`] is the concurrency bound that
+//! five times over. [`MAX_OPEN_CARRIES_PER_PEER`](crate::peer::tunnel::MAX_OPEN_CARRIES_PER_PEER) is the concurrency bound that
 //! falls out of that arithmetic.
 //!
 //! A gateway log line carries the peer, the target host, bytes up, bytes down
@@ -102,16 +102,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
-use tokio::io::{
-    AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, DuplexStream, ReadBuf,
-};
+use tcr_peer_wire::{PeerId, TunnelTarget};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 
 use crate::peer::config::{Locator, PeerRow, PeerStore};
-use crate::peer::noise::{self, PeerSession};
+use crate::peer::noise::{self, CHUNK_BYTES, NoiseStream, PeerSession};
 
+/// The dialler: every way this node opens a stream to a pinned peer, direct,
+/// punched, forwarded, through a dead drop or over the tailnet node.
+pub mod dial;
 mod reverse;
 
 use reverse::reach_target;
@@ -121,10 +121,6 @@ pub use reverse::{
     ReverseWatch, keep_reverse_carrier, park_reverse_carry, reverse_carriers,
     reverse_carry_is_wanted, reverse_desk, reverse_step, watch_reverse_need,
 };
-
-/// Plaintext chunk size for a splice: well under the frame ceiling, so one
-/// large body cannot monopolise the stream.
-pub const CHUNK_BYTES: usize = 16 * 1024;
 
 /// How many bytes one peer may spend on carried traffic per rolling hour,
 /// absent an operator setting.
@@ -172,240 +168,6 @@ pub const MAX_CLIENT_HELLO_BYTES: usize = 16 * 1024;
 /// opens a carry and then goes quiet is holding a task and a socket on somebody
 /// else's Mac, and being pinned does not make that free.
 pub const FIRST_RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// How long the peer's direction is still pumped after the local end has
-/// closed its own.
-///
-/// A request whose client has read what it wanted and gone away is the ordinary
-/// case, and the reply the far end is still writing was being thrown away: the
-/// pump ended on the FIRST direction to finish. Half-closing instead means the
-/// other direction has to end on something, and a peer that never closes is the
-/// same task-holding shape [`FIRST_RECORD_TIMEOUT`] exists for, so it ends on
-/// this.
-pub const HALF_CLOSE_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
-
-// ---------------------------------------------------------------------------
-// The Noise session as a byte stream
-// ---------------------------------------------------------------------------
-
-/// A Noise session as an `AsyncRead + AsyncWrite` stream.
-///
-/// The adapter named in the module docs. It exists so the splice can be ONE
-/// function over two generic halves instead of one function per pairing of
-/// concrete socket types.
-///
-/// Reading yields the plaintext the peer sent; writing encrypts and frames.
-/// A write shorter than [`CHUNK_BYTES`] is one frame, there is no coalescing,
-/// because a splice that waited for a full chunk would stall a TLS handshake
-/// that is a few hundred bytes long and then silent.
-pub struct NoiseStream {
-    /// This side of the plaintext duplex. The pump owns the other side.
-    plaintext: DuplexStream,
-    /// The pump, so its error can be collected by [`Self::finish`] rather than
-    /// dropped on the floor.
-    pump: tokio::task::JoinHandle<Result<()>>,
-}
-
-impl NoiseStream {
-    /// Start pumping `session` over `socket` and return the plaintext side.
-    ///
-    /// Two tasks, for the cancel-safety reason in the module docs: a framer
-    /// that reads whole frames off the socket's read half and nothing else, and
-    /// a mixer that owns the session and is therefore the only thing that
-    /// touches the cipher.
-    pub fn start<S>(socket: S, mut session: PeerSession) -> Self
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        let (mine, theirs) = tokio::io::duplex(CHUNK_BYTES * 4);
-        let pump = tokio::spawn(async move {
-            let (mut read_half, mut write_half) = tokio::io::split(socket);
-            // One frame in flight plus one queued: enough that the framer is
-            // never the bottleneck, bounded so a fast peer cannot make this
-            // node buffer its stream in memory.
-            let (frames_tx, mut frames_rx) = mpsc::channel::<Vec<u8>>(2);
-            let framer = tokio::spawn(async move {
-                loop {
-                    match noise::read_frame(&mut read_half).await {
-                        Ok(frame) => {
-                            if frames_tx.send(frame).await.is_err() {
-                                return;
-                            }
-                        }
-                        // EOF and a torn frame are the same fact here, the
-                        // session is over. The mixer reports it, because the
-                        // mixer is the half with the context.
-                        Err(_) => return,
-                    }
-                }
-            });
-
-            let mut plain = theirs;
-            let mut from_local = vec![0_u8; CHUNK_BYTES];
-            // Set when the LOCAL end closes its half. From then on the local
-            // read arm is off and what is still coming back from the peer is
-            // pumped until the peer closes too or this deadline passes.
-            let mut draining_until: Option<tokio::time::Instant> = None;
-            // Whether this side has sent its end-of-stream frame yet.
-            let mut sent_end = false;
-            let outcome = loop {
-                tokio::select! {
-                    frame = frames_rx.recv() => {
-                        let Some(frame) = frame else { break Ok(()) };
-                        let mut out = vec![0_u8; tcr_peer_wire::MAX_FRAME_BYTES];
-                        let len = match session.transport.read_message(&frame, &mut out) {
-                            Ok(len) => len,
-                            Err(err) => break Err(anyhow!(
-                                "peer tunnel: a carried frame did not decrypt under the \
-                                 session key: {err}"
-                            )),
-                        };
-                        // The peer's end-of-stream frame: the same fact as its
-                        // FIN, said inside the session (see
-                        // [`send_end_of_stream`]).
-                        if len == 0 {
-                            break Ok(());
-                        }
-                        out.truncate(len);
-                        if plain.write_all(&out).await.is_err() {
-                            // The local end went away. Not an error: it is how
-                            // a finished request looks.
-                            break Ok(());
-                        }
-                    }
-                    read = plain.read(&mut from_local), if draining_until.is_none() => {
-                        match read {
-                            // **Half-close, not close.** The local end going
-                            // away says nothing about the other direction, and
-                            // ending the whole pump here dropped whatever the
-                            // peer was still sending: on a gateway carry that
-                            // is the origin's reply, thrown away because the
-                            // client hung up a moment early.
-                            Ok(0) => {
-                                // A local end that is GONE, rather than one
-                                // that closed its write half, has nobody left
-                                // to hand the drained bytes to: an empty write
-                                // is how that is asked, and it is what keeps
-                                // `NoiseStream::finish` returning at once.
-                                if plain.write(&[]).await.is_err() {
-                                    break Ok(());
-                                }
-                                // Every data byte is already delivered, so a
-                                // frame that cannot be written (the far end
-                                // reset as this end finished) is not a failed
-                                // carry: the drain below still runs, as it did
-                                // when only the half-close could fail.
-                                if let Err(err) =
-                                    send_end_of_stream(&mut write_half, &mut session).await
-                                {
-                                    tracing::debug!(
-                                        error = %err,
-                                        "peer tunnel: the end-of-stream frame was not written; \
-                                         draining what the far end still sends"
-                                    );
-                                }
-                                sent_end = true;
-                                let _shutdown = write_half.shutdown().await;
-                                draining_until =
-                                    Some(tokio::time::Instant::now() + HALF_CLOSE_DRAIN);
-                            }
-                            Ok(n) => {
-                                if let Err(err) = noise::send_encrypted(
-                                    &mut write_half,
-                                    &mut session.transport,
-                                    &from_local[..n],
-                                )
-                                .await
-                                {
-                                    break Err(err.context(
-                                        "peer tunnel: the carried stream could not be written",
-                                    ));
-                                }
-                            }
-                            Err(err) => break Err(anyhow::Error::new(err)
-                                .context("peer tunnel: the local end of the carry failed")),
-                        }
-                    }
-                    () = sleep_or_never(draining_until) => {
-                        break Ok(());
-                    }
-                }
-            };
-            // Say the end of the stream, inside the session and then as a
-            // half-close, so the far end sees it rather than a hang, then stop
-            // the framer. The frame is best-effort here: the pump is ending
-            // whatever happens, often because the far end already went.
-            if !sent_end && let Err(err) = send_end_of_stream(&mut write_half, &mut session).await {
-                tracing::debug!(
-                    error = %err,
-                    "peer tunnel: the end-of-stream frame was not written; the far end learns \
-                     from the socket closing instead"
-                );
-            }
-            let _shutdown = write_half.shutdown().await;
-            framer.abort();
-            outcome
-        });
-        Self {
-            plaintext: mine,
-            pump,
-        }
-    }
-
-    /// Wait for the pump to stop and surface whatever ended it.
-    ///
-    /// The one place a carried stream's failure becomes visible. A caller that
-    /// drops a [`NoiseStream`] instead sees a clean end of stream, because the
-    /// splice copies the PLAINTEXT half: a frame that did not decrypt under
-    /// the session key, and a write to the peer that failed, both end the pump
-    /// and leave the splice's own count looking like an ordinary finish.
-    ///
-    /// # It had no production caller, and the doc here used to claim it did
-    ///
-    /// Two tests called it and nothing in `src/` did, so a carry that died
-    /// inside the pump was logged as "carried". Kept and wired rather than
-    /// removed: the fact it reports exists nowhere else, and a gateway's log
-    /// line is the whole record of a stream nobody may read. Both splice
-    /// callers in this module now await it before they claim anything.
-    /// [`crate::peer::egress`]'s requester-side splice still drops its stream
-    /// and is the remaining site.
-    pub async fn finish(self) -> Result<()> {
-        // Dropping our half first is what tells the pump to stop; without it a
-        // pump whose peer is silent would be joined forever.
-        drop(self.plaintext);
-        self.pump
-            .await
-            .context("peer tunnel: the carry task did not finish cleanly")?
-    }
-}
-
-impl AsyncRead for NoiseStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.plaintext).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for NoiseStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.plaintext).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.plaintext).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.plaintext).poll_shutdown(cx)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The cap, as a stream wrapper
@@ -513,42 +275,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
 // ---------------------------------------------------------------------------
 // The splice
 // ---------------------------------------------------------------------------
-
-/// Send this side's end of a carried stream: one encrypted frame with an
-/// empty payload.
-///
-/// # Why a frame and not only a FIN
-///
-/// The pump used to say "done" by shutting its socket's write half and
-/// nothing else. A transport with no half-close loses that: tcr's own tailnet
-/// node is one, the `tailscale` crate's `poll_shutdown` does nothing at
-/// 0.6.1, and the close it sends on drop can be lost (upstream #446). The far
-/// pump then never learns the stream ended: it waits out its own drain, or
-/// forever. Said inside the session it reaches the far pump over any
-/// transport, and the half-close still follows for every transport that has
-/// one.
-///
-/// It needs no version bump. A payload is never empty otherwise (a local read
-/// of 0 bytes is the end, not a frame), and a pump from before this change
-/// writes the empty payload to its local end as zero bytes, a no-op, then
-/// sees the FIN as it always did.
-async fn send_end_of_stream<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    session: &mut PeerSession,
-) -> Result<()> {
-    noise::send_encrypted(writer, &mut session.transport, &[]).await
-}
-
-/// Sleep until `at`, or never when there is nothing to wait for.
-///
-/// The half-close drain's timer, written as one future so the pump's `select!`
-/// has an arm that is simply never ready while both directions are open.
-async fn sleep_or_never(at: Option<tokio::time::Instant>) {
-    match at {
-        Some(at) => tokio::time::sleep_until(at).await,
-        None => std::future::pending().await,
-    }
-}
 
 /// Splice two streams until either closes, returning `(bytes_a_to_b,
 /// bytes_b_to_a)`, the two figures the gateway meters and the only two it has.
@@ -1157,6 +883,14 @@ impl Drop for CarryReservation<'_> {
     }
 }
 
+/// The only port those origins are carried on.
+///
+/// Part of the allow-list decision rather than a free field, for the reason
+/// [`TunnelTarget::Origin`] gives: host-and-port is the whole of what a blind
+/// hop can enforce, so leaving the port open would hand a granted peer every
+/// service on the same name.
+pub const PEER_EGRESS_PORT: u16 = 443;
+
 /// The origin this gateway will carry to, or the refusal, decided before a
 /// socket to it exists.
 ///
@@ -1173,7 +907,7 @@ impl Drop for CarryReservation<'_> {
 /// constant, because that list is what the caller configured this gateway
 /// with. The port is the constant: it is not a field anybody sets, it is the
 /// other half of the same decision, and
-/// [`crate::peer::egress::PEER_EGRESS_PORT`] is where it is written down once.
+/// [`PEER_EGRESS_PORT`] is where it is written down once.
 pub fn allowed_origin<'a>(
     target: &'a TunnelTarget,
     hosts: &[&str],
@@ -1197,12 +931,12 @@ pub fn allowed_origin<'a>(
             peer.display()
         );
     }
-    if *port != crate::peer::egress::PEER_EGRESS_PORT {
+    if *port != PEER_EGRESS_PORT {
         bail!(
             "peer tunnel: {} asked for {host}:{port}, and this gateway carries that name on \
              port {} only; refused before anything was dialled",
             peer.display(),
-            crate::peer::egress::PEER_EGRESS_PORT
+            PEER_EGRESS_PORT
         );
     }
     Ok((host, *port))
@@ -1524,7 +1258,7 @@ pub fn authorize_forward(carry: &Carry<'_>, forward: &Forward<'_>) -> Result<For
 
 /// Dial a pinned row's own addresses, and nothing else.
 ///
-/// One function around [`crate::peer::serve::dial_peer`] so that widening
+/// One function around [`dial::dial_peer`] so that widening
 /// that return type, a `TcpStream` today, a boxed
 /// `AsyncRead + AsyncWrite` once endpoints land, is one line of merge here
 /// instead of one per use: an `impl Trait` return already accepts either.
@@ -1532,14 +1266,12 @@ pub fn authorize_forward(carry: &Carry<'_>, forward: &Forward<'_>) -> Result<For
 /// fact that turns these bytes into traffic over a PATH: the row's endpoints
 /// are [`Locator`]s and the address dialled is one of them, so the meter can
 /// key on the same value the peers file spells.
-/// The return is [`crate::peer::serve::PeerStream`], the boxed form of that
+/// The return is [`crate::peer::noise::PeerStream`], the boxed form of that
 /// same widening: [`reach_target`] chooses at runtime between this and a
 /// carrier off the desk, and two transports are two types no caller can be
 /// generic over.
-async fn dial_pinned_peer(
-    row: &PeerRow,
-) -> Option<(std::net::SocketAddr, crate::peer::serve::PeerStream)> {
-    crate::peer::serve::dial_peer_with_endpoint(row).await
+async fn dial_pinned_peer(row: &PeerRow) -> Option<(std::net::SocketAddr, noise::PeerStream)> {
+    dial::dial_peer_with_endpoint(row).await
 }
 
 /// Forward one TUNNEL stream to a pinned peer: the forwarder's half of reach.
@@ -1698,112 +1430,6 @@ where
         "peer forward: carried"
     );
     Ok((up, down))
-}
-
-// ---------------------------------------------------------------------------
-// The requester's half
-// ---------------------------------------------------------------------------
-
-/// How many hops a client asks a forwarder for.
-///
-/// One. The requester spends it at the forwarder and the target is the far
-/// end, so a second hop is a chain nothing in this build constructs, and a
-/// budget that is not spent is a budget an intermediate could spend on this
-/// node's behalf. [`authorize_forward`] clamps it again by the FORWARDER's own
-/// `maxHops`, so this number can only ever ask for less than the operator
-/// there allows.
-pub const CLIENT_FORWARD_HOPS: u8 = 1;
-
-/// Ask `forwarder` to carry a stream to `target`, and return that stream.
-///
-/// # This is the half that did not exist, and what its absence meant
-///
-/// Everything else on the forwarded path was built and gated
-/// ([`authorize_forward`], [`handle_forward_on`]) and nothing could reach it:
-/// no code anywhere opened a `StreamKind::Tunnel` whose target was a peer, so
-/// a row whose only endpoint was a [`crate::peer::config::Locator::Via`] was
-/// dialled by nobody and `serve.rs`'s dial loop logged it and moved on. This
-/// function is that opening, and [`crate::peer::serve::dial_peer_reaching`] is
-/// the caller that decides when to use it.
-///
-/// # What comes back, and why the caller cannot tell it apart
-///
-/// A [`crate::peer::serve::PeerStream`], exactly what a direct dial returns.
-/// The forwarder splices the onward socket RAW ([`handle_forward_on`]), so
-/// the bytes this stream carries are the target's own socket, and the caller
-/// runs its ordinary handshake over it against the TARGET's pinned key. That
-/// is the whole of the blindness argument from this side: this node holds a
-/// session with the forwarder that carries a second session the forwarder has
-/// no key for.
-///
-/// # Ordering, which is not an accident
-///
-/// The header is written before this returns, so the forwarder is already
-/// waiting on the requester's first bytes ([`handle_forward_on`]'s deadline)
-/// when the caller starts its handshake with the target. A caller that wrote
-/// nothing would be closed by that deadline rather than pinning a task on the
-/// forwarder, which is why nothing here waits for an acknowledgement: a
-/// forward has none to give: the next thing the forwarder does is dial, and
-/// its refusals all happen before any byte of the nested session moves.
-///
-/// The dial to the forwarder is [`crate::peer::serve::dial_peer_within`],
-/// which follows DIRECT endpoints only. That is what bounds this: a forwarder
-/// reached through a forwarder would be a chain this node builds one hop at a
-/// time with no budget of its own, and the hop count is the forwarder's bound,
-/// never the requester's.
-pub async fn open_forward_to(
-    forwarder: &PeerRow,
-    node_secret: &[u8; crate::peer::id::KEY_BYTES],
-    target: &PeerId,
-    via: &[PeerId],
-    borrow_timeout_ms: u64,
-) -> Result<crate::peer::serve::PeerStream> {
-    if forwarder.node == *target {
-        bail!(
-            "peer forward: {} cannot carry a stream to itself; a direct dial is what that \
-             asks for",
-            target.display()
-        );
-    }
-    let (_reached, mut stream) = crate::peer::serve::dial_peer_within(forwarder, borrow_timeout_ms)
-        .await
-        .ok_or_else(|| {
-            anyhow!(
-                "peer forward: none of {}'s own addresses answered, so it cannot carry \
-                     anything to {}",
-                forwarder.label,
-                target.display()
-            )
-        })?;
-    let mut session = noise::dial_handshake(
-        &mut stream,
-        node_secret,
-        noise::Handshake::Return,
-        Some(&forwarder.node.0),
-        None,
-    )
-    .await
-    .context("peer forward: the handshake with the forwarder failed")?;
-
-    let header = StreamHeader {
-        kind: StreamKind::Tunnel,
-        target: Some(TunnelTarget::Peer { node: *target }),
-        via: via.to_vec(),
-        hops_remaining: CLIENT_FORWARD_HOPS,
-        request_id: crate::peer::id::random_id()?,
-    };
-    let bytes = serde_json::to_vec(&header)
-        .context("peer forward: the forwarding header did not serialize")?;
-    noise::send_encrypted(&mut stream, &mut session.transport, &bytes)
-        .await
-        .context("peer forward: the forwarder did not take the stream header")?;
-
-    tracing::debug!(
-        forwarder = %forwarder.node.display(),
-        target = %target.display(),
-        "peer forward: asked a pinned Mac to carry a stream to another pinned Mac"
-    );
-    Ok(Box::new(NoiseStream::start(stream, session)))
 }
 
 #[cfg(test)]

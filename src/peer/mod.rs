@@ -137,25 +137,8 @@ pub mod state;
 /// global IPv6 address, and a port both ends of a pair can compute.
 pub mod reach;
 
-/// A second router client beside [`reach`]'s NAT-PMP one, for gateways that
-/// speak only UPnP IGD.
-pub mod reach_upnp;
-
 /// What each path to a peer costs: RTT and loss, measured on a live session.
 pub mod probe;
-
-/// Where two Macs that both moved leave each other an address: the per-pair
-/// name and the sealed record. Crypto and naming only, called by nothing yet.
-pub mod drop;
-
-/// What one Mac sends one friend after it changed networks: a sealed record
-/// saying where it is now. The seal and the refusals only, called by nothing
-/// yet.
-pub mod moved;
-
-/// One codec for a list of dial addresses, shared by the v3 join key and the
-/// sealed reply so the same list is never spelled into bytes twice.
-pub mod dialaddrs;
 
 /// The sealed exchange: an ask that names no address, and a reply sealed to
 /// it that names no address either.

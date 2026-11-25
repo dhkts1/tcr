@@ -1,5 +1,6 @@
 use super::*;
 use std::time::Duration;
+use tokio::io::DuplexStream;
 
 use crate::peer::id::NodeKey;
 
@@ -79,10 +80,10 @@ async fn pumps_with_no_half_close() -> (NoiseStream, NoiseStream) {
 /// **Over a transport with no half-close, the far end still sees the end
 /// of the stream at once, and the near pump stops at once too.**
 ///
-/// The end-of-stream frame ([`send_end_of_stream`]) is what carries it.
+/// The end-of-stream frame ([`send_end_of_stream`](crate::peer::noise::send_end_of_stream)) is what carries it.
 /// Watch it fail by making the pump skip the frame (or ignore an empty
 /// one on receipt): the far read then waits for the near pump's
-/// [`HALF_CLOSE_DRAIN`], ten seconds, and the two-second deadline fails.
+/// [`HALF_CLOSE_DRAIN`](crate::peer::noise::HALF_CLOSE_DRAIN), ten seconds, and the two-second deadline fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_end_of_a_carry_crosses_a_transport_with_no_half_close() {
     let (mut near, mut far) = pumps_with_no_half_close().await;

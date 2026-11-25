@@ -19,7 +19,8 @@ async fn a_knock_without_the_network_key_gets_zero_bytes() {
     let node = Node::new("netkey-knock");
     let key = NetworkKey::from_bytes([0x5A; 32]);
     let mut file = node.file();
-    file.network_key = Some(key);
+    file.set_network_key(key, false)
+        .expect("a fresh peers file holds no key to refuse over");
     node.write_file(&file);
     let addr = serve(node.context()).await;
 
@@ -74,7 +75,8 @@ async fn a_knock_whose_message_1_does_not_validate_reserves_nothing() {
     let node = Node::new("knock-order");
     let key = NetworkKey::from_bytes([0x7C; 32]);
     let mut file = node.file();
-    file.network_key = Some(key);
+    file.set_network_key(key, false)
+        .expect("a fresh peers file holds no key to refuse over");
     node.write_file(&file);
     let addr = serve(node.context()).await;
 
@@ -223,7 +225,7 @@ async fn a_keyed_knock_at_a_keyless_node_is_refused() {
 /// it, where the key width is the one the RFC vector needs.
 #[test]
 fn hmac_sha256_matches_rfc_4231_case_2() {
-    let digest = tcr::peer::drop::hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+    let digest = config::drop::hmac_sha256(b"Jefe", b"what do ya want for nothing?");
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
         hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
@@ -270,7 +272,7 @@ fn the_network_key_round_trips_through_its_paste_string() {
 #[test]
 fn a_share_link_round_trips_with_and_without_a_join_key() {
     let network_key = NetworkKey::from_bytes([0x2B; 32]);
-    let token = pair::JoinToken::new(
+    let token = join_key::JoinToken::new(
         vec!["127.0.0.1:9600".parse().expect("a loopback address")],
         PeerId([0x3C; 32]),
         [0x4D; 32],
@@ -350,7 +352,7 @@ fn a_link_with_a_spent_join_key_still_sets_the_network_key() {
         network_key,
         // A secret for an invite that is no longer on the registrar's disk:
         // the enrolment will fail, and the network key must not.
-        join: Some(pair::JoinToken::new(
+        join: Some(join_key::JoinToken::new(
             vec!["127.0.0.1:9600".parse().expect("a loopback address")],
             PeerId([0x7F; 32]),
             [0x80; 32],
@@ -375,7 +377,7 @@ fn a_link_with_a_spent_join_key_still_sets_the_network_key() {
 /// else by naming both shapes.
 #[test]
 fn join_input_accepts_a_link_or_a_bare_key() {
-    let token = pair::JoinToken::new(
+    let token = join_key::JoinToken::new(
         vec!["127.0.0.1:9600".parse().expect("a loopback address")],
         PeerId([0x11; 32]),
         [0x22; 32],
@@ -432,7 +434,7 @@ fn join_stdin_keeps_the_key_out_of_argv_and_every_log_line() {
 
     // A token pointing at a port nothing is listening on: the dial fails, which
     // is the noisy path.
-    let token = pair::JoinToken::new(
+    let token = join_key::JoinToken::new(
         vec!["127.0.0.1:1".parse().expect("a loopback address")],
         PeerId([0x99; 32]),
         [0xAA; 32],
@@ -495,7 +497,7 @@ fn join_stdin_keeps_the_key_out_of_argv_and_every_log_line() {
 /// operator would see a refusal about base32 for a key that was fine.
 #[test]
 fn the_stdin_reader_takes_one_line_and_refuses_an_empty_one() {
-    let token = pair::JoinToken::new(
+    let token = join_key::JoinToken::new(
         vec!["127.0.0.1:9600".parse().expect("a loopback address")],
         PeerId([0x44; 32]),
         [0x55; 32],

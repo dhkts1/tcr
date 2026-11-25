@@ -25,12 +25,12 @@
 //! stored value an attacker could not use is a value the registrar could not
 //! use either. The mitigations that actually work are the boring ones: single
 //! use, a short TTL, mode 0600, the row deleted on use,
-//! [`MAX_OUTSTANDING_INVITES`], and an explicit revoke.
+//! [`MAX_OUTSTANDING_INVITES`](crate::peer::pair::MAX_OUTSTANDING_INVITES), and an explicit revoke.
 //!
-//! [`JoinToken::to_token_v3`] does not change any of that. It changes what the
+//! [`JoinToken::to_token_v3`](crate::peer::config::join_key::JoinToken::to_token_v3) does not change any of that. It changes what the
 //! key LOOKS like, an opaque run rather than three plain-text fields, so a
 //! glance over a shoulder learns nothing. It is still exactly as much of a
-//! bearer secret as [`JoinToken::to_token`], and whoever holds either string
+//! bearer secret as [`JoinToken::to_token`](crate::peer::config::join_key::JoinToken::to_token), and whoever holds either string
 //! can spend it. Mode B, the sealed exchange in `src/peer/ask.rs`, is the one
 //! that changes what travels rather than what a string looks like.
 //!
@@ -53,32 +53,31 @@
 //! ([`crate::peer::state::PeerState::accepted_window`],
 //! [`crate::peer::listener::accept_pairing_or_return`]); outside that window
 //! the listener answers an `XX` message 1 with zero bytes, the same silence a
-//! failed pin check gets. [`PairingWindow`] and [`open_pairing_window`] below
+//! failed pin check gets. [`PairingWindow`](crate::peer::pair::PairingWindow) and [`open_pairing_window`](crate::peer::pair::open_pairing_window) below
 //! remain the node-wide TYPE and MINTER (nothing in production reads them),
-//! kept for [`pairing_window`]'s own test coverage rather than deleted, which
+//! kept for [`pairing_window`](crate::peer::pair::pairing_window)'s own test coverage rather than deleted, which
 //! is out of scope here.
 
 use std::net::SocketAddr;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tcr_peer_wire::{Control, Crockford, Enroll, PeerId, StreamHeader, StreamKind, sanitize_label};
+use tcr_peer_wire::{Control, Enroll, PeerId, StreamHeader, StreamKind, sanitize_label};
 
+use crate::peer::config::join_key::{JoinToken, KEY_PREFIX};
 use crate::peer::config::{
-    ControlGrants, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore, PendingInvite,
-    read_or_default, save,
+    ControlGrants, Endpoint, EndpointSource, PeerRow, PeerStore, PendingInvite, read_or_default,
+    save,
 };
-use crate::peer::dialaddrs;
 use crate::peer::id::KEY_BYTES;
 use crate::peer::id::{NodeKey, default_config_dir};
-use crate::peer::listener::{NodeFacts, hello_for_peer};
 use crate::peer::noise::{self, Handshake};
+use crate::peer::serve::{NodeFacts, hello_for_peer};
+use crate::peer::state::now_ms;
 
 mod addresses;
 
-pub use addresses::{
-    DialAddress, DialAddressKind, HostAddress, dial_addresses, local_dial_addresses,
-};
+pub use addresses::{HostAddress, dial_addresses, local_dial_addresses};
 
 /// How many invites may be outstanding at once.
 ///
@@ -91,312 +90,6 @@ pub const MAX_OUTSTANDING_INVITES: usize = 8;
 /// The default life of an invite. Short on purpose: the row is join-capable
 /// while it exists.
 pub const INVITE_DEFAULT_TTL_SECS: u32 = 600;
-
-/// The one-line key an operator pastes.
-///
-/// Shape: `tcr-join:v2:<addr,addr,…>:<b32 static-pub>:<b32 secret32>`, and a v1
-/// key with one address is still read. A version field because this string is
-/// the one thing an operator moves between two builds by hand.
-///
-/// # Why it is a list
-///
-/// It used to be the one address the peers file's `listen` field held, and a
-/// listener bound to `0.0.0.0` made every key say `0.0.0.0`: the friend's `tcr
-/// peer join` then dialled its own machine. A bind address is not a dial
-/// address, and there is no single dial address either, the friend on the
-/// tailnet and the friend in the next room reach this Mac at different ones. So
-/// the key carries all of them, best first, and the joiner works down the list.
-#[derive(Debug, Clone)]
-pub struct JoinToken {
-    /// Where to dial, best first and never empty. Addresses, never names to
-    /// resolve: discovery is a separate, optional mechanism and a key must work
-    /// without it.
-    pub addrs: Vec<DialAddress>,
-    /// The registrar's static public key, the `IK` half.
-    pub registrar: PeerId,
-    /// The 32-byte join secret, the `psk1` half.
-    pub secret: [u8; 32],
-}
-
-/// Two keys are equal when they carry the same bytes.
-///
-/// [`DialAddressKind`] is deliberately not compared: it is what the minting Mac
-/// knew about its own address, it never goes on the wire, and a key that
-/// round-trips through a paste buffer would otherwise stop equalling itself.
-impl PartialEq for JoinToken {
-    fn eq(&self, other: &Self) -> bool {
-        self.registrar == other.registrar
-            && self.secret == other.secret
-            && self.addrs.len() == other.addrs.len()
-            && self
-                .addrs
-                .iter()
-                .zip(other.addrs.iter())
-                .all(|(ours, theirs)| ours.addr == theirs.addr)
-    }
-}
-
-impl Eq for JoinToken {}
-
-/// What every join key starts with, whatever version follows it.
-pub const KEY_PREFIX: &str = "tcr-join:";
-
-/// The v1 key: exactly one address. Still read, never minted.
-pub const TOKEN_PREFIX: &str = "tcr-join:v1:";
-
-/// The v2 key: one or more addresses, comma-separated, best first, in plain
-/// text.
-///
-/// The addresses stay readable here for the reason this doc used to give on
-/// its own: an operator reading a key out loud could at least see which
-/// machine it points at. That reasoning is overruled: the owner does not want
-/// an address visible at a glance, and [`TOKEN_PREFIX_V3`] is now what
-/// `tcr peer invite` mints by default. This spelling stays, and is still
-/// minted by `--plain`, for a script that greps a key out of stdout and for a
-/// friend on a build old enough to only read this one.
-pub const TOKEN_PREFIX_V2: &str = "tcr-join:v2:";
-
-/// The v3 key: the same three fields as v2, framed and base32'd as one opaque
-/// run rather than three plain-text ones. No crypto change: it is a second
-/// spelling of the same bearer secret, not encryption, and every surface that
-/// prints one says so.
-pub const TOKEN_PREFIX_V3: &str = "tcr-join:v3:";
-
-/// The four magic bytes in front of a v3 key's version byte, a sibling of
-/// [`crate::peer::moved::MOVED_LINK_PREFIX`]'s own magic.
-const TOKEN_V3_MAGIC: [u8; 4] = *b"TCRK";
-
-/// The only v3 format version there is yet.
-const TOKEN_V3_VERSION: u8 = 1;
-
-impl JoinToken {
-    /// A key for a list of addresses, best first, as a pasted key knows them.
-    ///
-    /// The kinds are [`DialAddressKind::FromKey`], which is what a caller
-    /// holding bare sockets can honestly say. [`mint_invite_as`] builds its own
-    /// with the kinds it derived.
-    pub fn new(addrs: Vec<SocketAddr>, registrar: PeerId, secret: [u8; 32]) -> Self {
-        Self {
-            addrs: addrs.into_iter().map(DialAddress::from_key).collect(),
-            registrar,
-            secret,
-        }
-    }
-
-    /// Every address in the key, in the order to dial them.
-    pub fn sockets(&self) -> impl Iterator<Item = SocketAddr> + '_ {
-        self.addrs.iter().map(|entry| entry.addr)
-    }
-
-    /// Render the key for pasting.
-    ///
-    /// The addresses stay plain text, an operator who has to read a key out
-    /// loud can at least see which machine it points at, and base32ing
-    /// `127.0.0.1:9600` hides nothing that the two 52-character fields after it
-    /// do not already reveal is there. The two 32-byte fields go through the one
-    /// base32 codec this tree has.
-    ///
-    /// Always v2, including for a single address: one shape to read back means
-    /// the parser's v1 arm only ever sees a key an older build minted.
-    pub fn to_token(&self) -> String {
-        let addrs = self
-            .sockets()
-            .map(|addr| addr.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            "{TOKEN_PREFIX_V2}{addrs}:{}:{}",
-            self.registrar.to_wire(),
-            Crockford::encode(&self.secret)
-        )
-    }
-
-    /// Render the key as one opaque run: magic, version, the addresses through
-    /// [`dialaddrs::encode`], the registrar's 32 bytes, the secret's 32 bytes,
-    /// all of it through the one base32 codec this tree has.
-    ///
-    /// It is exactly as much of a bearer secret as [`Self::to_token`] is. This
-    /// spelling hides an address from a glance; it does not encrypt anything,
-    /// and no surface that prints it may say otherwise.
-    pub fn to_token_v3(&self) -> String {
-        let mut body = Vec::new();
-        body.extend_from_slice(&TOKEN_V3_MAGIC);
-        body.push(TOKEN_V3_VERSION);
-        body.extend_from_slice(&self.to_v3_body());
-        format!("{TOKEN_PREFIX_V3}{}", Crockford::encode(&body))
-    }
-
-    /// The three fields, in v3's compact spelling, with no magic and no
-    /// version: the address list through [`dialaddrs::encode`], the
-    /// registrar's 32 bytes, the secret's 32 bytes.
-    ///
-    /// [`Self::to_token_v3`] wraps this in a magic, a version and a base32
-    /// prefix for a pasted key. `src/peer/ask.rs` seals it directly instead:
-    /// its own frame already carries a magic and a version, and wrapping the
-    /// key's again would be the same fact spelled twice.
-    pub fn to_v3_body(&self) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&dialaddrs::encode(&self.sockets().collect::<Vec<_>>()));
-        body.extend_from_slice(&self.registrar.0);
-        body.extend_from_slice(&self.secret);
-        body
-    }
-
-    /// The inverse of [`Self::to_v3_body`]: the three fields back out of the
-    /// same compact spelling, with no magic or version to check (the caller
-    /// already checked its own).
-    pub fn from_v3_body(bytes: &[u8]) -> Result<Self> {
-        let (addrs, rest) =
-            dialaddrs::decode_prefix(bytes).map_err(|refusal| anyhow!("peer join: {refusal}"))?;
-        if rest.len() != 64 {
-            bail!(
-                "peer join: this key has the wrong number of bytes left after its address \
-                 list, which is what a paste cut short or padded looks like"
-            );
-        }
-        if addrs.is_empty() {
-            bail!("peer join: this key carries no address to dial");
-        }
-        let registrar = PeerId(
-            rest[..32]
-                .try_into()
-                .context("peer join: the registrar bytes are the wrong length")?,
-        );
-        let secret: [u8; 32] = rest[32..64]
-            .try_into()
-            .context("peer join: the secret bytes are the wrong length")?;
-        Ok(Self::new(addrs, registrar, secret))
-    }
-
-    /// Parse a pasted key, v3, v2 or v1. Refuses an unknown version rather
-    /// than guessing, because the alternative is a silent wrong-key dial.
-    ///
-    /// v3 is checked first: it is what this build mints by default. Split from
-    /// the RIGHT for v2 and v1: an IPv6 address carries colons of its own, and
-    /// the two fields after it do not, so the two rightmost separators are the
-    /// only ones whose position is known. The address field is then split on
-    /// commas, which no address contains (an IPv6 one is bracketed).
-    pub fn parse(token: &str) -> Result<Self> {
-        let token = token.trim();
-        if let Some(body) = token.strip_prefix(TOKEN_PREFIX_V3) {
-            return Self::parse_v3(body);
-        }
-        let (body, version) = if let Some(body) = token.strip_prefix(TOKEN_PREFIX_V2) {
-            (body, KeyVersion::V2)
-        } else if let Some(body) = token.strip_prefix(TOKEN_PREFIX) {
-            (body, KeyVersion::V1)
-        } else {
-            bail!(
-                "peer join: this is not a join key (it must start with {TOKEN_PREFIX_V3:?}, \
-                 {TOKEN_PREFIX_V2:?} from `--plain`, or {TOKEN_PREFIX:?} from an older build); \
-                 an unknown version is refused rather than guessed, because guessing it would \
-                 be a silent dial to the wrong key"
-            );
-        };
-
-        let mut fields = body.rsplitn(3, ':');
-        let (Some(secret), Some(registrar), Some(addrs)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            bail!(
-                "peer join: a join key is `{TOKEN_PREFIX_V2}<host:port,…>:<registrar>:<secret>`, \
-                 and this one has fewer than three fields after the version"
-            );
-        };
-
-        let addrs = match version {
-            KeyVersion::V1 => vec![parse_dial_addr(addrs)?],
-            KeyVersion::V2 => {
-                let mut parsed = Vec::new();
-                for field in addrs.split(',') {
-                    parsed.push(parse_dial_addr(field)?);
-                }
-                parsed
-            }
-        };
-        if addrs.is_empty() {
-            bail!("peer join: this key carries no address to dial");
-        }
-
-        let registrar = PeerId::parse(registrar).map_err(|refusal| {
-            anyhow!("peer join: the registrar field is unreadable: {refusal}")
-        })?;
-        // The secret is decoded, never echoed: every refusal below names the
-        // FIELD and its shape, and no arm of this function prints the value.
-        // A pasted token that failed to parse is still a live bearer secret,
-        // and the place operators paste one is a terminal that keeps scrollback.
-        let secret = Crockford::decode_key32(secret)
-            .map_err(|refusal| anyhow!("{refusal}"))
-            .context("peer join: the secret field is not 32 base32-encoded bytes")?;
-        Ok(Self::new(addrs, registrar, secret))
-    }
-
-    /// [`Self::parse`]'s v3 arm: unwrap the base32, check the magic and
-    /// version, then read the three fields by offset rather than by split,
-    /// which is what an opaque run buys over the comma-and-colon shape of v2.
-    fn parse_v3(body: &str) -> Result<Self> {
-        let bytes = Crockford::decode(body)
-            .map_err(|refusal| anyhow!("{refusal}"))
-            .context(
-                "peer join: a v3 key is not a whole run of base32 bytes, which is what a paste cut \
-             short looks like",
-            )?;
-        let min_len = TOKEN_V3_MAGIC.len() + 1 + 1 + 32 + 32;
-        if bytes.len() < min_len {
-            bail!(
-                "peer join: this v3 key is shorter than it should be, which is what a paste cut \
-                 short looks like"
-            );
-        }
-        if bytes[..TOKEN_V3_MAGIC.len()] != TOKEN_V3_MAGIC {
-            bail!("peer join: this does not carry a v3 key's magic bytes");
-        }
-        let version = bytes[TOKEN_V3_MAGIC.len()];
-        if version != TOKEN_V3_VERSION {
-            bail!(
-                "peer join: this v3 key names format version {version}, which this build does not know"
-            );
-        }
-        let rest = &bytes[TOKEN_V3_MAGIC.len() + 1..];
-        Self::from_v3_body(rest)
-    }
-}
-
-/// Which spelling of the key a paste turned out to be. A typed pair rather than
-/// a `bool`, because the two arms differ in how the address field is split and
-/// a caller reading `true` would have to remember which way round it went.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyVersion {
-    /// One address, minted by a build before the key carried a list.
-    V1,
-    /// A comma-separated list, best first.
-    V2,
-}
-
-/// One address field out of a key: a socket, and one a friend could actually
-/// open.
-///
-/// The unspecified address is the whole reason the key grew a list. An older
-/// build copied the peers file's `listen` field in verbatim, so a listener on
-/// `0.0.0.0` minted a key reading `0.0.0.0:7755`, and the friend's `tcr peer
-/// join` dialled its own machine and reported that nothing answered. It is
-/// refused here, with the one sentence that fixes it, rather than dialled.
-fn parse_dial_addr(field: &str) -> Result<SocketAddr> {
-    let addr: SocketAddr = field
-        .parse()
-        .with_context(|| format!("peer join: {field:?} is not the host:port to dial"))?;
-    if addr.ip().is_unspecified() {
-        bail!(
-            "peer join: this key says {addr}, which is the address the other Mac LISTENS on \
-             and not one anything can dial. Ask for a fresh key: `tcr peer invite` on a build \
-             that carries dialable addresses puts every address that Mac answers at into it"
-        );
-    }
-    if addr.port() == 0 {
-        bail!("peer join: this key says {addr}, and port 0 is not a port anything listens on");
-    }
-    Ok(addr)
-}
 
 /// Where `tcr peer join` takes the token from.
 ///
@@ -418,20 +111,12 @@ pub enum TokenSource<'a> {
     Stdin,
 }
 
-/// Read the join token from wherever the operator put it.
+/// Read one join key from any reader, so a test can drive the stdin path
+/// without a terminal.
 ///
 /// **Nothing here logs or prints the token.** A refusal names the field and
 /// its shape (see [`JoinToken::parse`]), because a terminal keeps scrollback
 /// and a failed paste is still a live bearer secret.
-pub fn read_join_token(source: TokenSource<'_>) -> Result<JoinToken> {
-    match source {
-        TokenSource::Argv(token) => JoinToken::parse(token),
-        TokenSource::Stdin => token_from_reader(std::io::stdin().lock()),
-    }
-}
-
-/// [`read_join_token`]'s stdin arm, against any reader, so a test can drive it
-/// without a terminal.
 ///
 /// One line: a token is one line by construction, and reading to end of file
 /// instead would make a trailing newline plus anything after it part of the
@@ -661,8 +346,7 @@ pub fn accept_enrolment(
     }
     // A re-enrolment of a key already pinned replaces the row rather than
     // adding a second one, for the reason `pin_row` documents.
-    file.peers.retain(|existing| existing.node != joiner);
-    file.peers.push(row.clone());
+    file.pin(row.clone());
     save(peers_path, &file)?;
 
     tracing::info!(
@@ -869,7 +553,7 @@ pub async fn join_as(
 async fn connect_in_key_order(
     peers_path: &Path,
     token: &JoinToken,
-) -> Result<(SocketAddr, crate::peer::serve::PeerStream)> {
+) -> Result<(SocketAddr, noise::PeerStream)> {
     let mut refusals: Vec<String> = Vec::new();
     for addr in token.sockets() {
         match crate::peer::tailnet_node::dial_for_cli(peers_path, addr).await {
@@ -909,7 +593,7 @@ const ENROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 ///
 /// The added clause names the ordinary cause: a found row leaves
 /// `tcr peer ls --json` within a minute of its last announcement (see
-/// `crate::peer::discovery::FOUND_TTL_MS`), so a Trust pressed on a row for a
+/// `crate::peer::state::FOUND_TTL_MS`), so a Trust pressed on a row for a
 /// Mac that just slept or left the network is not a bug, it is a race an
 /// operator can read as one.
 fn could_not_reach(addr: SocketAddr) -> String {
@@ -951,11 +635,9 @@ pub async fn knock(store: &PeerStore, addr: SocketAddr, proposed_name: &str) -> 
             // from at boot, and `None` when this Mac has no listener at all,
             // which is the honest answer rather than the default port: a Mac
             // with the feature off is not listening on it.
-            listen_port: file.listen.map(|listen| listen.port()),
+            listen_port: file.listen_port(),
         },
-        file.network_key
-            .as_ref()
-            .map(super::config::NetworkKey::as_bytes),
+        file.network_psk(),
     )
     .await
 }
@@ -1203,9 +885,7 @@ pub fn confirm(
 pub fn forget(store: &PeerStore, peer: &PeerId) -> Result<bool> {
     let _lock = crate::peer::config::FileLock::acquire(store.path())?;
     let mut file = read_or_default(store.path())?;
-    let before = file.peers.len();
-    file.peers.retain(|row| row.node != *peer);
-    let removed = file.peers.len() != before;
+    let removed = file.forget(peer);
     if removed {
         save(store.path(), &file)?;
         // The row is gone from the file; the process may still hold this pair's
@@ -1220,17 +900,6 @@ pub fn forget(store: &PeerStore, peer: &PeerId) -> Result<bool> {
         );
     }
     Ok(removed)
-}
-
-/// Every peer that still holds `relay`, which is what `forget` does NOT
-/// revoke. A surface that offers `forget` has to say this when the list is not
-/// empty.
-pub fn peers_still_holding_relay(file: &PeerFile) -> Vec<PeerId> {
-    file.peers
-        .iter()
-        .filter(|row| row.allow.relay)
-        .map(|row| row.node)
-        .collect()
 }
 
 /// Write or replace one pinned row, leaving every grant at its default: a bare
@@ -1266,8 +935,7 @@ fn pin_row(
     // A re-pin of the same key replaces the row rather than adding a second
     // one: two rows for one key would make "is this peer pinned" answerable
     // two ways.
-    file.peers.retain(|existing| existing.node != peer);
-    file.peers.push(row.clone());
+    file.pin(row.clone());
     save(store.path(), &file)?;
     Ok(row)
 }
@@ -1377,9 +1045,6 @@ fn random_id() -> Result<u64> {
     Ok(u64::from_be_bytes(head))
 }
 
-// Compat for outside callers (src/main.rs); wave 2 repoints them to `state`.
-pub use crate::peer::state::now_ms;
-
 /// A 32-byte join secret is the same width as a static key, which is why both
 /// are [`KEY_BYTES`].
 const _: () = assert!(KEY_BYTES == 32);
@@ -1399,6 +1064,8 @@ pub const LINK_PREFIX: &str = "tcr://peer/join?";
 
 /// The link version, checked and never guessed at, same rule as
 /// [`TOKEN_PREFIX`].
+///
+/// [`TOKEN_PREFIX`]: crate::peer::config::join_key::TOKEN_PREFIX
 pub const LINK_VERSION: u32 = 1;
 
 /// A share link: a network key, and optionally a join key riding along.
@@ -1606,7 +1273,7 @@ impl JoinInput {
         // the wrong one is told which verb reads it rather than left to read
         // "neither of these" about a string that plainly starts `tcr://peer/`.
         // Nothing about it is parsed here, and no part of the paste is printed.
-        if raw.starts_with(crate::peer::moved::MOVED_LINK_PREFIX) {
+        if raw.starts_with(crate::peer::config::moved::MOVED_LINK_PREFIX) {
             bail!(
                 "peer join: that is a moved link, which says where a Mac you already trust \
                  is now. `tcr peer moved open --stdin` is what reads one; it joins nothing \

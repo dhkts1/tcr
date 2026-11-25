@@ -26,6 +26,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{InstanceId, Lease, PeerId};
 
+use crate::peer::ask::PendingAsk;
+
 /// This file's own format version. See the module docs: additive fields do NOT
 /// bump it.
 pub const FORMAT_VERSION: u32 = 1;
@@ -174,7 +176,7 @@ pub struct PeerState {
     /// expired grant, and the first probe after a wake moves it. The
     /// `updated_at_ms` on each row is what a reader judges staleness by.
     #[serde(default)]
-    pub paths: Vec<crate::peer::probe::PathStat>,
+    pub paths: Vec<PathStat>,
     /// What each path to each peer CARRIED inside the rolling hour, beside what
     /// it cost.
     ///
@@ -229,7 +231,7 @@ pub struct PeerState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tailnet_peers: Vec<TailnetPeer>,
     /// Macs heard announcing on the LAN in the last
-    /// [`crate::peer::discovery::FOUND_TTL_MS`], not trusted, not pinned. See
+    /// [`FOUND_TTL_MS`], not trusted, not pinned. See
     /// [`Found`]. Written by the serving process's browse task and read by
     /// `tcr peer ls --json`, the same split `pending` already draws between a
     /// writer that runs continuously and a reader that runs once per
@@ -297,7 +299,7 @@ pub struct LeaseRow {
 ///
 /// The borrower's half of [`LeaseRow`], and the reason it exists at all: the
 /// borrower's copy of a lease lived only in
-/// [`crate::peer::lease::PeerLeaseProvider`]'s in-memory cache, so no CLI
+/// [`crate::peer::serve::PeerLeaseProvider`]'s in-memory cache, so no CLI
 /// process could read it and `tcr peer ls --json` printed `until: null` on
 /// every Mac that was being lent to. The lease is the borrower's own view of
 /// the lender's promise, a HINT, exactly as that cache's doc says, since the
@@ -314,6 +316,64 @@ pub struct BorrowedRow {
     /// The peer that GRANTED this lease, the Mac this node borrows from, and
     /// the row `tcr peer ls` draws the `until` on.
     pub lender: PeerId,
+}
+
+/// One path's cost, as the EWMA left it.
+///
+/// Keyed by peer AND locator, because "how far away is that Mac" is not one
+/// number: the same peer reached directly and through a forwarder are two
+/// paths with two costs, and collapsing them is exactly how a lossy hop comes
+/// to look like a lossy Mac.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathStat {
+    /// The peer at the far end.
+    pub peer: PeerId,
+    /// The path that was measured.
+    #[serde(flatten)]
+    pub locator: crate::peer::config::Locator,
+    /// Round trip in milliseconds, smoothed. `None` until an ack arrives: a
+    /// path that has only ever timed out has a loss figure and no RTT, and
+    /// writing a zero there would make it look like the fastest path on the
+    /// row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
+    /// Loss in percent, smoothed over the same window.
+    pub loss_pct: f64,
+    /// How many probes this row has seen. Kept because an EWMA over one sample
+    /// and over twenty read the same and are not worth the same.
+    pub samples: u32,
+    /// When the last sample landed, Unix milliseconds.
+    pub updated_at_ms: i64,
+}
+
+impl PathStat {
+    /// [`Self::rtt_ms`] as the sort key uses it: a path nobody has measured
+    /// sorts after every path that has been.
+    pub(crate) fn rtt_key(&self) -> u32 {
+        rtt_key(self.rtt_ms)
+    }
+}
+
+/// A smoothed round trip as a whole number of milliseconds, saturating at both
+/// ends.
+///
+/// One function rather than a cast at each reader: an `as` on a `f64` that is
+/// NaN or out of range is a silent zero or a silent `u32::MAX`, and the two
+/// readers here, the sort key and the collapse hint, would not have gone
+/// wrong the same way.
+pub(crate) fn rtt_key(rtt_ms: Option<f64>) -> u32 {
+    rtt_ms.map_or(u32::MAX, |rtt| {
+        let rounded = rtt.round();
+        if !rounded.is_finite() || rounded <= 0.0 {
+            0
+        } else if rounded >= f64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            // Bounded by the two arms above, so the cast cannot saturate.
+            rounded as u32
+        }
+    })
 }
 
 /// What ONE path to ONE peer carried inside the rolling hour, as the serving
@@ -525,38 +585,6 @@ impl PeerState {
     }
 }
 
-/// `tcr peer tailnet --json`: the setting, whether this binary can act on
-/// `node`, and what the serving process last recorded.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TailnetReport {
-    /// The setting, as the peers file says now: the word as written, a word
-    /// this build does not know included.
-    pub mode: crate::peer::config::TailnetSetting,
-    /// Whether this binary was built with the `tailnet-node` cargo feature.
-    pub node_supported: bool,
-    /// What the serving process recorded, or `None` when none has.
-    /// Serialized as `null`, never left out: a reader tells "no server has
-    /// recorded one" from a missing key by this.
-    pub held: Option<TailnetRecord>,
-}
-
-impl TailnetReport {
-    /// The report for the peers file at `peers_path` and the state file
-    /// beside it.
-    pub fn read(peers_path: &Path, now_ms: i64) -> Result<Self> {
-        let file = crate::peer::config::read_or_default(peers_path)?;
-        let state_path = peer_state_path(peers_path);
-        let state = load(&state_path, now_ms)
-            .with_context(|| format!("reading {}", state_path.display()))?;
-        Ok(Self {
-            mode: file.tailnet,
-            node_supported: crate::peer::tailnet_node::SUPPORTED,
-            held: state.tailnet,
-        })
-    }
-}
-
 /// One knock waiting on the operator, as the Peers tab renders it.
 ///
 /// `addr` is the key: see [`PeerState::pending`]. `instance_id` and
@@ -662,6 +690,24 @@ fn bracketed_dial_address(addr: &str, port: u16) -> String {
     }
 }
 
+/// How long a row survives after its last announcement.
+/// `abuse-resistance.md`: "a row that stops announcing leaves after 60 s".
+pub const FOUND_TTL_MS: i64 = 60_000;
+
+/// Where a found row was heard.
+///
+/// Ordered `Lan` before `Tailnet` so a sorted list of sources reads the way
+/// `tcr peer ls --json` writes it: `["lan", "tailnet"]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FoundSource {
+    /// An mDNS beacon on this LAN.
+    Lan,
+    /// A beacon datagram over the tailnet, from one of the operator's own
+    /// Macs as the Tailscale app on this Mac names them.
+    Tailnet,
+}
+
 /// One Mac this node heard announce on the LAN: not trusted, not pinned, and
 /// carrying no key to become either. [`Knock`]'s twin for the found list, and
 /// with `Knock`'s own doc discipline: [`Self::addr`] is the key in
@@ -695,18 +741,18 @@ pub struct Found {
     /// so a row's age is honest rather than reset every browse.
     pub first_seen_ms: i64,
     /// When it was last heard. A row is dropped
-    /// [`crate::peer::discovery::FOUND_TTL_MS`] after this.
+    /// [`FOUND_TTL_MS`] after this.
     pub last_seen_ms: i64,
     /// Which sources heard it: `lan`, `tailnet`, or both. A file written
     /// before this key existed reads as `lan`, the only source there was.
     #[serde(default = "lan_only")]
-    pub sources: Vec<crate::peer::discovery::FoundSource>,
+    pub sources: Vec<FoundSource>,
 }
 
 /// [`Found::sources`] for a row written before the key existed: mDNS was
 /// the only way a row was found then.
-fn lan_only() -> Vec<crate::peer::discovery::FoundSource> {
-    vec![crate::peer::discovery::FoundSource::Lan]
+fn lan_only() -> Vec<FoundSource> {
+    vec![FoundSource::Lan]
 }
 
 impl Found {
@@ -831,38 +877,6 @@ pub const MAX_PENDING_KNOCKS: usize = 8;
 /// trial-decrypt message 1 against.
 pub const MAX_OUTSTANDING_ASKS: usize = 8;
 
-/// One outstanding ask: a one-time keypair minted for a sealed exchange, with
-/// the clock that sweeps it. Lives in the state file, never the peers file:
-/// it is transient, it has a deadline, and losing it costs one re-minted ask,
-/// where losing the peers file costs every pin.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct PendingAsk {
-    /// This row's id, so `spend_ask` can remove exactly the row that opened,
-    /// even when two rows are live at once.
-    pub id: u64,
-    /// The public half, printed as the ask a friend pastes into a chat.
-    pub public: [u8; 32],
-    /// The private half. Never logged, never printed: see [`Debug`] below.
-    pub private: [u8; 32],
-    /// The absolute deadline, swept by [`PeerState::expire`] like every other
-    /// transient row with a clock.
-    pub until_ms: i64,
-}
-
-impl std::fmt::Debug for PendingAsk {
-    /// The private key is deliberately not printed, [`MovedKeys`]'s own move
-    /// (`src/peer/moved.rs:148-153`) for the same reason: a `{:?}` in a log
-    /// line is how a secret reaches a file that keeps scrollback.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingAsk")
-            .field("id", &self.id)
-            .field("public", &"[32 bytes]")
-            .field("private", &"(withheld)")
-            .field("until_ms", &self.until_ms)
-            .finish()
-    }
-}
-
 /// The coalescing key for a knock: the peer's IP, with the ephemeral source
 /// port dropped.
 ///
@@ -955,9 +969,8 @@ impl PeerState {
         // beacon stopped is gone from `tcr peer ls --json` within
         // `FOUND_TTL_MS` of its last announcement, never restored across a
         // boot older than its TTL.
-        self.found.retain(|row| {
-            now_ms.saturating_sub(row.last_seen_ms) < crate::peer::discovery::FOUND_TTL_MS
-        });
+        self.found
+            .retain(|row| now_ms.saturating_sub(row.last_seen_ms) < FOUND_TTL_MS);
         // A closed window whose handshake LEARNED A STATIC KEY is kept as a
         // record, and it authorizes nothing: [`Self::accepted_window`] reads
         // the clock, so an expired row admits no pairing either way.
@@ -1092,6 +1105,93 @@ impl PeerState {
     /// the earliest moment it can be.
     pub fn is_key_banned(&self, key: &PeerId) -> bool {
         self.banned.iter().any(|ban| ban.key.as_ref() == Some(key))
+    }
+
+    /// How many addresses the operator has blocked.
+    pub const fn blocked_count(&self) -> usize {
+        self.banned.len()
+    }
+
+    /// How many addresses the operator has muted, lifted or not: a mute whose
+    /// deadline has passed is still counted until [`load`] prunes it.
+    pub const fn muted_count(&self) -> usize {
+        self.muted.len()
+    }
+
+    /// One `tcr peer pending` line per mute, then one per ban, in file order.
+    pub fn refusal_lines(&self) -> Vec<String> {
+        let mutes = self
+            .muted
+            .iter()
+            .map(|mute| format!("{}: muted: until={} unix-ms", mute.addr, mute.until_ms));
+        let bans = self.banned.iter().map(|ban| {
+            format!(
+                "{}: blocked: reason={} since={} unix-ms key={}",
+                ban.addr,
+                ban.reason,
+                ban.since_ms,
+                ban.key
+                    .map_or_else(|| "not-learned".to_string(), |key| key.display())
+            )
+        });
+        mutes.chain(bans).collect()
+    }
+
+    /// When `peer` last answered, Unix milliseconds, or [`None`] when it never
+    /// has as far as this file knows.
+    pub fn last_seen_of(&self, peer: PeerId) -> Option<i64> {
+        self.last_seen
+            .iter()
+            .find(|(node, _)| *node == peer)
+            .map(|(_, at)| *at)
+    }
+
+    /// The leases this Mac's ledger has minted for `peer`, expired or not, in
+    /// ledger order.
+    pub fn leases_lent_to(&self, peer: PeerId) -> impl Iterator<Item = &Lease> {
+        self.leases
+            .iter()
+            .filter(move |held| held.peer == peer)
+            .map(|held| &held.lease)
+    }
+
+    /// The leases `peer` has granted this Mac, expired or not, in file order.
+    pub fn leases_borrowed_from(&self, peer: PeerId) -> impl Iterator<Item = &Lease> {
+        self.borrowed
+            .iter()
+            .filter(move |borrowed| borrowed.lender == peer)
+            .map(|borrowed| &borrowed.lease)
+    }
+
+    /// The borrowed leases keyed by lender, beside how many rows the file held.
+    ///
+    /// The two numbers differ when one lender has two rows: the later row
+    /// overwrites the earlier one in the map, which is what
+    /// [`crate::peer::serve::PeerLeaseProvider`] holds anyway.
+    pub fn into_borrowed_by_lender(self) -> (std::collections::HashMap<PeerId, Lease>, usize) {
+        let rows = self.borrowed.len();
+        let mut leases = std::collections::HashMap::new();
+        for row in self.borrowed {
+            leases.insert(row.lender, row.lease);
+        }
+        (leases, rows)
+    }
+
+    /// Whether any path to `peer` is metered at all: one traffic row for that
+    /// peer means every path of its own without a row carried nothing.
+    pub fn is_metered(&self, peer: PeerId) -> bool {
+        self.path_traffic.iter().any(|traffic| traffic.peer == peer)
+    }
+
+    /// What one path to `peer` carried, as the meter last wrote it.
+    pub fn path_traffic_of(
+        &self,
+        peer: PeerId,
+        locator: &crate::peer::config::Locator,
+    ) -> Option<&PathTraffic> {
+        self.path_traffic
+            .iter()
+            .find(|traffic| traffic.peer == peer && &traffic.locator == locator)
     }
 
     /// Whether a knock from `addr` would be refused, without recording
@@ -1446,7 +1546,7 @@ impl PeerState {
         &self,
         peer: &PeerId,
         locator: &crate::peer::config::Locator,
-    ) -> Option<&crate::peer::probe::PathStat> {
+    ) -> Option<&PathStat> {
         self.paths
             .iter()
             .find(|stat| &stat.peer == peer && &stat.locator == locator)
@@ -1845,23 +1945,19 @@ fn quarantine_corrupt(path: &Path, now_ms: i64, reason: &str) -> Option<PathBuf>
 /// not this case: there is nothing to lose and a first grant has to be able to
 /// create the file.
 pub fn save_leases(path: &Path, leases: &[LeaseRow]) -> Result<()> {
-    let leases = leases.to_vec();
-    replace_section(path, "lease rows", move |state| state.leases = leases)
+    PeerState::save_leases(path, leases.to_vec())
 }
 
 /// Replace ONLY the borrowed rows in the state file, keeping every other key,
 /// [`save_leases`] for the other direction, and the same locked
 /// read-modify-write for the same reasons. See [`PeerState::borrowed`].
 ///
-/// Called by [`crate::peer::lease::PeerLeaseProvider`] when the set of live
+/// Called by [`crate::peer::serve::PeerLeaseProvider`] when the set of live
 /// borrowed leases CHANGES, a lease granted, or a refused one dropped, and
 /// never per relayed request: the borrower's copy of `spent` is the lender's
 /// figure and this file is not where it is kept.
 pub fn save_borrowed(path: &Path, borrowed: &[BorrowedRow]) -> Result<()> {
-    let borrowed = borrowed.to_vec();
-    replace_section(path, "borrowed lease rows", move |state| {
-        state.borrowed = borrowed;
-    })
+    PeerState::save_borrowed(path, borrowed.to_vec())
 }
 
 /// Replace ONLY the measured path costs, keeping every other key.
@@ -1875,7 +1971,7 @@ pub fn save_borrowed(path: &Path, borrowed: &[BorrowedRow]) -> Result<()> {
 /// one EWMA step and not one file write, and a write per probe per peer per
 /// minute would move the file's mtime often enough to make every `PeerStore`
 /// on this Mac re-read its config for nothing.
-pub fn save_paths(path: &Path, paths: &[crate::peer::probe::PathStat]) -> Result<()> {
+pub fn save_paths(path: &Path, paths: &[PathStat]) -> Result<()> {
     PeerState::save_paths(path, paths.to_vec())
 }
 
@@ -1987,8 +2083,20 @@ pub fn open_and_spend_ask(
 /// [`replace_section`]. Each one's reasons are on the free function of the
 /// same name.
 impl PeerState {
+    /// [`save_leases`].
+    fn save_leases(path: &Path, leases: Vec<LeaseRow>) -> Result<()> {
+        replace_section(path, "lease rows", move |state| state.leases = leases)
+    }
+
+    /// [`save_borrowed`].
+    fn save_borrowed(path: &Path, borrowed: Vec<BorrowedRow>) -> Result<()> {
+        replace_section(path, "borrowed lease rows", move |state| {
+            state.borrowed = borrowed;
+        })
+    }
+
     /// [`save_paths`].
-    fn save_paths(path: &Path, paths: Vec<crate::peer::probe::PathStat>) -> Result<()> {
+    fn save_paths(path: &Path, paths: Vec<PathStat>) -> Result<()> {
         replace_section(path, "measured path costs", move |state| {
             state.paths = paths;
         })
@@ -2086,7 +2194,34 @@ fn holds_exactly(path: &Path, json: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer::tailnet_node::TailnetReport;
     use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// `tcr peer pending` prints these lines verbatim: mutes first, then bans,
+    /// a ban whose key was never learned saying so.
+    #[test]
+    fn the_refusal_lines_are_the_pending_verbs_text() {
+        let mut state = PeerState::default();
+        state.mute("192.0.2.7", 1_000);
+        state.ban("192.0.2.8", None, BanReason::Blocked, 2_000);
+        state.ban(
+            "192.0.2.9",
+            Some(PeerId([9_u8; 32])),
+            BanReason::ForgottenAndBlocked,
+            3_000,
+        );
+        assert_eq!(
+            state.refusal_lines(),
+            vec![
+                format!("192.0.2.7: muted: until={} unix-ms", 1_000 + MUTE_MS),
+                "192.0.2.8: blocked: reason=blocked since=2000 unix-ms key=not-learned".to_string(),
+                format!(
+                    "192.0.2.9: blocked: reason=forgotten-and-blocked since=3000 unix-ms key={}",
+                    PeerId([9_u8; 32]).display()
+                ),
+            ]
+        );
+    }
 
     /// One captured tracing event: its level and its message, which is all
     /// this test needs to tell an INFO "peer state restored" apart from a
@@ -2230,7 +2365,7 @@ mod tests {
     ///
     /// Watch it fail by removing the `self.found.retain(..)` line from
     /// [`PeerState::expire`]: the row then survives past
-    /// `discovery::FOUND_TTL_MS` and this assertion catches it still present.
+    /// `FOUND_TTL_MS` and this assertion catches it still present.
     #[test]
     fn a_found_row_leaves_after_its_ttl() {
         let now = 1_000_000_i64;
@@ -2242,7 +2377,7 @@ mod tests {
         assert_eq!(state.found.len(), 1, "the found row was written");
         assert_eq!(state.pending.len(), 1, "the pending row was written");
 
-        let past_ttl = now + crate::peer::discovery::FOUND_TTL_MS + 1;
+        let past_ttl = now + FOUND_TTL_MS + 1;
         state.expire(past_ttl);
 
         assert!(
@@ -2470,10 +2605,7 @@ mod tests {
             "the old file is read and trusted, not put aside: {origin:?}"
         );
         assert_eq!(state.found.len(), 1);
-        assert_eq!(
-            state.found[0].sources,
-            [crate::peer::discovery::FoundSource::Lan]
-        );
+        assert_eq!(state.found[0].sources, [FoundSource::Lan]);
     }
 
     /// **A route is answered only from a fresh, ready, app-mode reading, and

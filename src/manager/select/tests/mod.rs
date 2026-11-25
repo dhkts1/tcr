@@ -57,7 +57,7 @@ mod sticky_divert_replay_tests;
 /// which had ZERO coverage: reverting either hunk left the whole suite green.
 ///
 /// A lease's scope is expressed as exactly this ask
-/// ([`crate::peer::serve::ScopeRestriction::Group`]), so every door out of a
+/// ([`crate::peer::lease::ScopeRestriction::Group`]), so every door out of a
 /// strict group is an account outside the scope serving a borrowed request on
 /// somebody else's Mac.
 #[cfg(test)]

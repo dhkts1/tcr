@@ -18,25 +18,16 @@ pub(super) fn run_peer_via(a: peer_cli::PeerViaArgs) -> anyhow::Result<()> {
     // listener's enrolment write also round-trip: without it the last
     // writer wins and one of the two operators' choices disappears.
     let lock = peer::config::FileLock::acquire(&peers_path)?;
-    let file = peer::config::read_or_default(&peers_path)?;
+    let mut file = peer::config::read_or_default(&peers_path)?;
     let asked = match a.setup_timeout_ms {
-        None => peer::egress::ViaSetting::parse(&a.target)?,
-        Some(ms) => peer::egress::ViaSetting::parse(&a.target)?.with_setup_timeout_ms(ms)?,
+        None => peer::config::ViaSetting::parse(&a.target)?,
+        Some(ms) => peer::config::ViaSetting::parse(&a.target)?.with_setup_timeout_ms(ms)?,
     };
-    if let peer::egress::ViaRoute::Pinned(peer_id) = &asked.route {
-        let known = file.peers.iter().any(|row| row.node == *peer_id);
-        if !known {
-            anyhow::bail!(
-                "peer via: {} is not a Mac this one has pinned, so there is nothing \
-                 to route through (`tcr peer ls` prints the pinned ones)",
-                peer_id.display()
-            );
-        }
-    }
-
-    let current = peer::egress::via_setting(&file);
-    if asked == current {
-        println!("peer via: {} (unchanged)", current.to_spec());
+    // The whole write: one field on the struct every other `tcr peer`
+    // mutation round-trips, so the choice survives the next `allow`,
+    // `lend` or `name` instead of being dropped by it.
+    if !file.choose_via(&asked)? {
+        println!("peer via: {} (unchanged)", asked.to_spec());
         println!(
             "peer via: `auto` carries a request through a trusted Mac only after the \
              direct path has failed with nothing having left this Mac, and the carry \
@@ -44,33 +35,30 @@ pub(super) fn run_peer_via(a: peer_cli::PeerViaArgs) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    // The whole write: one field on the struct every other `tcr peer`
-    // mutation round-trips, so the choice survives the next `allow`,
-    // `lend` or `name` instead of being dropped by it.
-    let mut file = file;
-    file.via = asked.clone();
     peer::config::save(&peers_path, &file)?;
     drop(lock);
     println!("peer via: ok {}", asked.to_spec());
     if let Some(ms) = a.setup_timeout_ms {
         println!("peer via: a carry gives a Mac {ms}ms to take it, then gives up");
     }
-    match asked.route {
-        peer::egress::ViaRoute::Off => println!(
+    if asked.is_off() {
+        println!(
             "peer via: off, this Mac never routes out through a peer, and a request \
              whose direct path fails gets exactly the answer it got before this \
              feature existed"
-        ),
-        peer::egress::ViaRoute::Auto => println!(
-            "peer via: auto carries a request through a trusted Mac only after the \
-             direct path has failed with nothing having left this Mac, and the carry \
-             is blind, the credential stays inside this Mac's own TLS"
-        ),
-        peer::egress::ViaRoute::Pinned(peer_id) => println!(
+        );
+    } else if let Some(peer_id) = asked.pinned_peer() {
+        println!(
             "peer via: only {} is asked, and never any other Mac, a pin that stops \
              answering means no carry at all, which is the point of pinning one",
             peer_id.display()
-        ),
+        );
+    } else {
+        println!(
+            "peer via: auto carries a request through a trusted Mac only after the \
+             direct path has failed with nothing having left this Mac, and the carry \
+             is blind, the credential stays inside this Mac's own TLS"
+        );
     }
     println!("peer via: it takes effect on the next request; nothing needs a restart");
     Ok(())

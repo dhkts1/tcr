@@ -49,7 +49,9 @@ fn a_peers_file_with_the_old_addrs_key_loads_and_re_saves_as_endpoints() {
         .expect("tighten the fixture to the mode the reader requires");
 
     let file = config::read_or_default(&path).expect("a legacy peers file still reads");
-    let row = &file.peers[0];
+    let node = PeerId::parse("248H248H248H248H248H248H248H248H248H248H248H248H248G")
+        .expect("the fixture's node is a wire id");
+    let row = file.row(&node).expect("the legacy row");
     assert_eq!(
         row.endpoints.len(),
         1,
@@ -139,9 +141,8 @@ fn every_pin_writer_records_the_address_it_was_reached_over() {
 
     let row = node
         .file()
-        .peers
-        .into_iter()
-        .find(|row| row.node == peer)
+        .row(&peer)
+        .cloned()
         .expect("the compare pinned a row");
     assert_eq!(
         row.endpoints.len(),
@@ -165,9 +166,7 @@ fn every_pin_writer_records_the_address_it_was_reached_over() {
     // An invite needs a listen address to hand out, so the file names one; the
     // port is never bound here because this half drives `accept_enrolment`
     // directly rather than over a socket.
-    let mut file = node.file();
-    file.listen = Some("127.0.0.1:9600".parse().expect("the literal parses"));
-    node.write_file(&file);
+    node.listen_on("127.0.0.1:9600".parse().expect("the literal parses"));
     let store = config::PeerStore::open(&node.peers).expect("re-open after the listen edit");
     let (invite, _token) = pair::mint_invite_as(&store, &node.key, "attic-nuc", 600, 1, None)
         .expect("mint a one-use invite");
@@ -202,9 +201,8 @@ fn every_pin_writer_records_the_address_it_was_reached_over() {
     // stream, teaches the announced port.
     let saved = node
         .file()
-        .peers
-        .into_iter()
-        .find(|row| row.node == joiner)
+        .row(&joiner)
+        .cloned()
         .expect("the enrolment pinned a row");
     assert_eq!(
         saved.endpoints, enrolled.endpoints,
@@ -267,19 +265,18 @@ async fn a_peer_that_moved_announces_its_new_port_and_is_reached_there() {
     pair::confirm(&b_store, &a.key.id(), "222222", Some(a_addr)).expect("B pins A");
 
     // B announces the port it really listens on.
-    let mut b_file = b.file();
-    b_file.listen = Some(b_addr);
-    b.write_file(&b_file);
+    b.listen_on(b_addr);
 
     // ---- control: before the Hello, A cannot reach B at all.
     let stale_row = a
         .file()
-        .peers
-        .into_iter()
-        .find(|row| row.node == b.key.id())
+        .row(&b.key.id())
+        .cloned()
         .expect("A has a row for B");
     assert!(
-        tcr::peer::serve::dial_peer(&stale_row).await.is_none(),
+        tcr::peer::tunnel::dial::dial_peer(&stale_row)
+            .await
+            .is_none(),
         "the control: A's only endpoint for B is a port nobody listens on, so the dial \
          must fail before the Hello, otherwise the last assertion proves nothing"
     );
@@ -298,9 +295,8 @@ async fn a_peer_that_moved_announces_its_new_port_and_is_reached_there() {
     // ---- A's row for B now names the port B announced, and A reaches it.
     let refreshed = config::read_or_default(&a.peers)
         .expect("A's file reads")
-        .peers
-        .into_iter()
-        .find(|row| row.node == b.key.id())
+        .row(&b.key.id())
+        .cloned()
         .expect("A still has one row for B, not two");
     assert!(
         refreshed
@@ -316,7 +312,9 @@ async fn a_peer_that_moved_announces_its_new_port_and_is_reached_there() {
          survived"
     );
     assert!(
-        tcr::peer::serve::dial_peer(&refreshed).await.is_some(),
+        tcr::peer::tunnel::dial::dial_peer(&refreshed)
+            .await
+            .is_some(),
         "A dials the port B announced and B answers: {:?}",
         refreshed.endpoints
     );
@@ -341,14 +339,12 @@ async fn a_peer_that_moved_announces_its_new_port_and_is_reached_there() {
 /// constructor and the second assertion reads `None`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_completed_return_visit_registers_the_pairs_rendezvous_secret() {
-    use tcr::peer::reach;
-
     let node = Node::new("rendezvous-secret");
     let (peer_secret, peer_public) = noise::generate_static().expect("a peer keypair");
     let peer_id = PeerId(peer_public);
 
     let mut file = node.file();
-    file.peers.push(config::PeerRow {
+    file.pin(config::PeerRow {
         node: peer_id,
         label: "laptop-9".to_string(),
         endpoints: Vec::new(),
@@ -365,7 +361,7 @@ async fn a_completed_return_visit_registers_the_pairs_rendezvous_secret() {
     let responder_id = PeerId(responder_public);
 
     assert!(
-        reach::port_secret_for(&responder_id).is_none(),
+        noise::port_secret_for(&responder_id).is_none(),
         "the responder's key was generated for this test, so nothing may hold a secret \
          for it before the handshake runs"
     );
@@ -386,17 +382,17 @@ async fn a_completed_return_visit_registers_the_pairs_rendezvous_secret() {
         "the session carries the hash it ended on, or nothing downstream can derive a port"
     );
     assert_eq!(
-        reach::port_secret_for(&responder_id),
-        Some(reach::port_secret(&session.handshake_hash)),
+        noise::port_secret_for(&responder_id),
+        Some(noise::port_secret(&session.handshake_hash)),
         "the register holds the DERIVED secret for this pair, and it is the one \
-         `reach::port_secret` computes from the session's own hash"
+         `noise::port_secret` computes from the session's own hash"
     );
 }
 
 /// **A `Hello` carries a brief about a mutual friend, over the shipped accept
 /// loop, and the far side records it.**
 ///
-/// The unit gate for the brief wiring. `discovery::neighbor_briefs` and
+/// The unit gate for the brief wiring. `PeerFile::neighbor_briefs` and
 /// `observe_neighbor_briefs` have tests of their own, and those tests call
 /// both functions directly: they stay green with every call site deleted,
 /// which was the state of this tree before this fix, the field on the wire
@@ -432,7 +428,7 @@ async fn a_hello_carries_a_brief_for_a_mutual_friend_and_the_far_side_records_it
     // too, with no address for it at all: the state a Mac is in when a friend
     // it has not spoken to since it moved.
     let mut a_file = a.file();
-    a_file.peers.push(config::PeerRow {
+    a_file.pin(config::PeerRow {
         node: c,
         label: "studio-mac".to_string(),
         endpoints: vec![config::Endpoint::direct(
@@ -446,15 +442,13 @@ async fn a_hello_carries_a_brief_for_a_mutual_friend_and_the_far_side_records_it
         allow: config::Allow::default(),
         lend: Vec::new(),
     });
-    for row in &mut a_file.peers {
-        if row.node == b.key.id() {
-            row.allow.control.briefs = true;
-        }
+    if let Some(row) = a_file.row_mut(&b.key.id()) {
+        row.allow.control.briefs = true;
     }
     a.write_file(&a_file);
 
     let mut b_file = b.file();
-    b_file.peers.push(config::PeerRow {
+    b_file.pin(config::PeerRow {
         node: c,
         label: "the-studio".to_string(),
         endpoints: Vec::new(),
@@ -470,20 +464,13 @@ async fn a_hello_carries_a_brief_for_a_mutual_friend_and_the_far_side_records_it
     // here, whatever the operator had granted it. So the two nodes swapping
     // neighbour lists is two grants, and this test sets both rather than
     // relying on the applying side taking whatever arrives.
-    for row in &mut b_file.peers {
-        if row.node == a.key.id() {
-            row.allow.control.briefs = true;
-        }
+    if let Some(row) = b_file.row_mut(&a.key.id()) {
+        row.allow.control.briefs = true;
     }
     b.write_file(&b_file);
 
     // ---- control: B holds no way to reach C before the Hello.
-    let before = b
-        .file()
-        .peers
-        .into_iter()
-        .find(|row| row.node == c)
-        .expect("B has a row for C");
+    let before = b.file().row(&c).cloned().expect("B has a row for C");
     assert!(
         before.endpoints.is_empty(),
         "the control: B must start with no endpoint for C, or the assertion below is \
@@ -512,9 +499,8 @@ async fn a_hello_carries_a_brief_for_a_mutual_friend_and_the_far_side_records_it
     // ---- the recording half: B's row for C gains that locator, as a brief.
     let after = config::read_or_default(&b.peers)
         .expect("B's file reads")
-        .peers
-        .into_iter()
-        .find(|row| row.node == c)
+        .row(&c)
+        .cloned()
         .expect("B still has one row for C, not two");
     let learned = after
         .endpoints

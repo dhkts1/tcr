@@ -6,7 +6,7 @@ use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
 use crate::peer::config::{PeerRow, PeerStore};
 use crate::peer::noise::Handshake;
 
-use super::admission::{REQUEST_DEDUP_CAPACITY, REQUEST_DEDUP_TTL_MS};
+use crate::peer::lease::{REQUEST_DEDUP_CAPACITY, REQUEST_DEDUP_TTL_MS};
 
 /// May the owner's bearer go out on a session this handshake produced?
 ///

@@ -11,7 +11,7 @@
 //! The library supports Apple silicon and Linux, not Intel Macs, and brings a
 //! C crypto library this repository otherwise avoids. Gil, 2026-10-20: source
 //! builds only, behind the `tailnet-node` feature, which no release build
-//! turns on. [`SUPPORTED`] is the one place that decides whether this binary
+//! turns on. [`SUPPORTED`](crate::peer::tailnet_node::SUPPORTED) is the one place that decides whether this binary
 //! can act on the setting; everything here that does not touch the library
 //! itself compiles and is tested in every build, so CI exercises the
 //! supervisor, the key file and the join and leave orderings without the
@@ -19,19 +19,19 @@
 //!
 //! # Who does what
 //!
-//! - **Joining is the CLI's** ([`join_with`]). It reads the auth key from
+//! - **Joining is the CLI's** ([`join_with`](crate::peer::tailnet_node::join_with)). It reads the auth key from
 //!   stdin, builds a device in its own process, waits until control says the
 //!   node is authorized, writes the key file, shuts the device down, and only
-//!   then sets the mode. The auth key is held in an [`AuthKey`], which has no
+//!   then sets the mode. The auth key is held in an [`AuthKey`](crate::peer::tailnet_node::AuthKey), which has no
 //!   `Display` and a redacting `Debug`, and is never written anywhere.
-//! - **Serving is the server's** ([`Supervisor`]). It starts its device from
+//! - **Serving is the server's** ([`Supervisor`](crate::peer::tailnet_node::Supervisor)). It starts its device from
 //!   the key file alone, listens on the node's address at the peer port, and
 //!   hands every accepted connection to the same
 //!   [`crate::peer::listener::serve_one`] the kernel listener uses. Admission
 //!   needs no change: the source is a tailnet address and the bind is the
 //!   node's, neither LAN nor loopback, so a stranger on the tailnet gets
 //!   return visits and enrolments only (`internet_admission`).
-//! - **Leaving is the CLI's** ([`leave_with`]): mode off, wait until the
+//! - **Leaving is the CLI's** ([`leave_with`](crate::peer::tailnet_node::leave_with)): mode off, wait until the
 //!   serving process has let go, then delete the key file.
 //!
 //! # Why a supervisor
@@ -39,23 +39,23 @@
 //! About a minute without network panics the library's relay and control
 //! tasks, and nothing restarts them (upstream issue #439): the process lives
 //! on with a dead tailnet, which is exactly what a laptop that sleeps does. So
-//! the server checks the device every [`HEALTH_EVERY`] (a `self_node()`
-//! lookup under [`CONTROL_TIMEOUT`]) and whenever the default gateway changes,
-//! and a failed check shuts the device down within [`SHUTDOWN_DEADLINE`] and
+//! the server checks the device every [`HEALTH_EVERY`](crate::peer::tailnet_node::HEALTH_EVERY) (a `self_node()`
+//! lookup under [`CONTROL_TIMEOUT`](crate::peer::tailnet_node::CONTROL_TIMEOUT)) and whenever the default gateway changes,
+//! and a failed check shuts the device down within [`SHUTDOWN_DEADLINE`](crate::peer::tailnet_node::SHUTDOWN_DEADLINE) and
 //! builds a new one from the same keys.
 //!
 //! # Every wait on control is bounded
 //!
 //! Before registration, `ipv4_addr`, `self_node` and `is_authorized` wait
 //! until control answers, which with no network is forever. Every such call
-//! here runs under [`CONTROL_TIMEOUT`], and nothing asks for an address before
-//! [`TailnetDevice::authorization`] has said yes.
+//! here runs under [`CONTROL_TIMEOUT`](crate::peer::tailnet_node::CONTROL_TIMEOUT), and nothing asks for an address before
+//! [`TailnetDevice::authorization`](crate::peer::tailnet_node::TailnetDevice::authorization) has said yes.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+use serde::Serialize;
 
 /// Whether this binary can act on `tailnet: "node"`: built with the
 /// `tailnet-node` feature, for the one Mac target the library supports.
@@ -68,6 +68,38 @@ pub const SUPPORTED: bool = cfg!(all(
     target_os = "macos",
     target_arch = "aarch64"
 ));
+
+/// `tcr peer tailnet --json`: the setting, whether this binary can act on
+/// `node`, and what the serving process last recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailnetReport {
+    /// The setting, as the peers file says now: the word as written, a word
+    /// this build does not know included.
+    pub mode: crate::peer::config::TailnetSetting,
+    /// Whether this binary was built with the `tailnet-node` cargo feature.
+    pub node_supported: bool,
+    /// What the serving process recorded, or `None` when none has.
+    /// Serialized as `null`, never left out: a reader tells "no server has
+    /// recorded one" from a missing key by this.
+    pub held: Option<crate::peer::state::TailnetRecord>,
+}
+
+impl TailnetReport {
+    /// The report for the peers file at `peers_path` and the state file
+    /// beside it.
+    pub fn read(peers_path: &Path, now_ms: i64) -> Result<Self> {
+        let file = crate::peer::config::read_or_default(peers_path)?;
+        let state_path = crate::peer::state::peer_state_path(peers_path);
+        let state = crate::peer::state::load(&state_path, now_ms)
+            .with_context(|| format!("reading {}", state_path.display()))?;
+        Ok(Self {
+            mode: file.tailnet,
+            node_supported: SUPPORTED,
+            held: state.tailnet,
+        })
+    }
+}
 
 /// How often the supervisor wakes: re-reads the mode and refreshes the record.
 pub const TICK: Duration = Duration::from_secs(10);
@@ -178,45 +210,4 @@ pub async fn join(peers_path: &Path, name: Option<String>, auth_key: AuthKey) ->
         JOIN_DEADLINE,
     )
     .await
-}
-
-/// The server's supervisor, for the peers file at `peers_path`, serving
-/// accepted connections through `context` on `port`. Runs until `stop` flips.
-pub async fn run_in_server(
-    peers_path: PathBuf,
-    state_path: PathBuf,
-    port: u16,
-    context: crate::peer::listener::SessionContext,
-    stop: tokio::sync::watch::Receiver<bool>,
-) {
-    let serve: ServeFn<<<BuiltFactory as DeviceFactory>::Device as TailnetDevice>::Stream> =
-        Arc::new(move |accepted| {
-            let context = context.clone();
-            Box::pin(crate::peer::listener::serve_one(
-                accepted.stream,
-                context,
-                accepted.from,
-                accepted.bind,
-                // The node's socket is bound to the node's own address, so the
-                // address a connection was sent to is the bind itself.
-                Some(accepted.bind),
-            ))
-        });
-    let paths = NodePaths {
-        key: key_path_for_peers(&peers_path),
-        peers: peers_path,
-        state: state_path,
-    };
-    let gateway: GatewayFn = Arc::new(crate::peer::reach::default_gateway_ipv4);
-    // A build without the library only ever records `nodeUnsupported` when the
-    // mode is `node`, which needs no 10 s wake.
-    let every = if <BuiltFactory as DeviceFactory>::SUPPORTED {
-        TICK
-    } else {
-        TICK * 2
-    };
-    Supervisor::new(BuiltFactory::default(), paths, port, serve, gateway)
-        .with_dial_slot(server_slot().clone())
-        .run(every, stop)
-        .await;
 }

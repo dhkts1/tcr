@@ -31,7 +31,7 @@ pub fn peer_graph_block(
             Vec::new()
         }
     };
-    let state_path = crate::peer::serve::peer_state_path(peers_path);
+    let state_path = crate::peer::state::peer_state_path(peers_path);
     let state = match crate::peer::state::load(&state_path, now_ms) {
         Ok(state) => state,
         Err(err) => {
@@ -206,11 +206,7 @@ pub fn peer_graph(
 
     for row in rows {
         let peer = row.node.display();
-        let last_seen_ms = state
-            .last_seen
-            .iter()
-            .find(|(node, _)| *node == row.node)
-            .map(|(_, at)| *at);
+        let last_seen_ms = state.last_seen_of(row.node);
         nodes.push(GraphNode {
             id: peer.clone(),
             name: masked_label(&row.label),
@@ -254,23 +250,19 @@ pub fn peer_graph(
         }
 
         // Leases this Mac has LENT that peer: this Mac's quota, drawn there.
-        for held in state.leases.iter().filter(|held| held.peer == row.node) {
-            if held.lease.expires_at_ms <= now_ms {
+        for lease in state.leases_lent_to(row.node) {
+            if lease.expires_at_ms <= now_ms {
                 continue;
             }
-            edges.push(lease_edge(&me, &peer, &held.lease));
+            edges.push(lease_edge(&me, &peer, lease));
         }
         // And the ones it has BORROWED from that peer: the arrow turns around,
         // because the lender is always `from`.
-        for borrowed in state
-            .borrowed
-            .iter()
-            .filter(|borrowed| borrowed.lender == row.node)
-        {
-            if borrowed.lease.expires_at_ms <= now_ms {
+        for lease in state.leases_borrowed_from(row.node) {
+            if lease.expires_at_ms <= now_ms {
                 continue;
             }
-            edges.push(lease_edge(&peer, &me, &borrowed.lease));
+            edges.push(lease_edge(&peer, &me, lease));
         }
     }
 

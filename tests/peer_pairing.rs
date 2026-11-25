@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tcr::log_err::LogErr as _;
+use tcr::peer::config::join_key;
 use tcr::peer::config::{self, NetworkKey, PeerFile};
 use tcr::peer::id::NodeKey;
 use tcr::peer::listener::{self, SessionContext};

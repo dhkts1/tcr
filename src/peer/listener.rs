@@ -12,7 +12,7 @@
 //! So: a peer frame must never reach it. The peer listener is its own
 //! `TcpListener`, bound where `tcr-peers.json` says and absent
 //! entirely when it says nothing, and it has its own gate
-//! ([`peer_stream_gate`]). `local_endpoint_gate` is not relaxed by one
+//! ([`peer_stream_gate`](crate::peer::listener::peer_stream_gate)). `local_endpoint_gate` is not relaxed by one
 //! character, and **neither arm of the existing listener is widened**, the
 //! serving socket has two origins, an inherited descriptor
 //! (`src/server.rs:1133-1143`) and the loopback bind below it, and a peer
@@ -36,7 +36,7 @@
 //! answering it would hand this node's static key to whoever asked. It is
 //! answered only inside a pairing window the operator opened
 //! ([`crate::peer::pair::open_pairing_window`]), and the log a refused
-//! connection writes is bounded to one line ([`RefusalLog`]), because a line
+//! connection writes is bounded to one line ([`RefusalLog`](crate::peer::listener::RefusalLog)), because a line
 //! per connection is a disk-filling primitive handed to anyone who can reach
 //! the port.
 //!
@@ -53,13 +53,13 @@
 //!
 //! [`serve_stream`] dispatches `StreamKind::Serve` to
 //! [`crate::peer::serve::handle_serve_on`] and holds the three things a
-//! listener cannot derive ([`LeaseServing`]: the ledger, this node's own proxy
+//! listener cannot derive ([`LeaseServing`](crate::peer::serve::LeaseServing): the ledger, this node's own proxy
 //! base, a reader for its own quota). Every decision about the request, the
 //! path refusal, the method, the lease, the debit, which account serves, is in
 //! `src/peer/serve.rs`, and this file's only contribution is the gate that
 //! already ran above.
 //!
-//! A build with no [`LeaseServing`] REFUSES a SERVE rather than accepting a
+//! A build with no [`LeaseServing`](crate::peer::serve::LeaseServing) REFUSES a SERVE rather than accepting a
 //! stream it cannot answer, which is the same shape every ungranted kind has.
 
 use std::net::SocketAddr;
@@ -77,13 +77,18 @@ use crate::peer::id::KEY_BYTES;
 use crate::peer::id::NodeKey;
 use crate::peer::lease::Ledger;
 use crate::peer::noise::{self, Handshake};
-use crate::peer::serve::{self, WindowUtilization};
+use crate::peer::reach::is_lan_scope;
+use crate::peer::serve::LeaseServing;
 use crate::peer::state::knock_address;
+use crate::peer::tailnet_node::{
+    BuiltFactory, DeviceFactory, GatewayFn, NodePaths, ServeFn, Supervisor, TICK, TailnetDevice,
+    key_path_for_peers, server_slot,
+};
+use crate::peer::tunnel::dial;
 
 mod admission;
 mod connection;
 mod gate;
-mod hello;
 mod knock;
 mod pairing;
 mod scope;
@@ -92,18 +97,15 @@ pub use admission::{
     ACCEPTED_WINDOW_SECS, Admission, HeaderlessSession, KNOCK_BURST, KNOCK_INTERVAL_MS,
     MAX_HEADERLESS_PER_PEER, MAX_KNOCK_FRAME_BYTES, MAX_UNAUTHENTICATED_PER_ADDRESS,
     MAX_UNAUTHENTICATED_SOCKETS, MESSAGE_1_TIMEOUT, PunchInFlight, REFUSAL_LOG_ADDRESSES,
-    REFUSAL_LOG_QUIET_MS, REQUEST_DEDUP_CAPACITY, REQUEST_DEDUP_TTL_MS, RefusalLog,
-    STREAM_HEADER_TIMEOUT, unauthenticated_allowance,
+    REFUSAL_LOG_QUIET_MS, RefusalLog, STREAM_HEADER_TIMEOUT, unauthenticated_allowance,
 };
 pub use connection::serve_accepted;
 pub use gate::{
     RequestDedup, StreamRefusal, handoff_is_permitted, peer_stream_gate, peer_stream_gate_hop,
     peer_stream_gate_rows,
 };
-pub use hello::{NodeFacts, hello_for_peer};
 pub use scope::{
-    InternetAdmission, internet_admission, is_carrier_grade_nat, is_lan_scope, is_tailscale_v6,
-    own_mac_admission, shares_a_global_v6_prefix,
+    InternetAdmission, internet_admission, own_mac_admission, shares_a_global_v6_prefix,
 };
 
 use admission::lock_admission;
@@ -415,6 +417,47 @@ pub async fn serve_one<S>(
     }
 }
 
+/// The server's supervisor, for the peers file at `peers_path`, serving
+/// accepted connections through `context` on `port`. Runs until `stop` flips.
+pub async fn run_in_server(
+    peers_path: PathBuf,
+    state_path: PathBuf,
+    port: u16,
+    context: SessionContext,
+    stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let serve: ServeFn<<<BuiltFactory as DeviceFactory>::Device as TailnetDevice>::Stream> =
+        Arc::new(move |accepted| {
+            let context = context.clone();
+            Box::pin(serve_one(
+                accepted.stream,
+                context,
+                accepted.from,
+                accepted.bind,
+                // The node's socket is bound to the node's own address, so the
+                // address a connection was sent to is the bind itself.
+                Some(accepted.bind),
+            ))
+        });
+    let paths = NodePaths {
+        key: key_path_for_peers(&peers_path),
+        peers: peers_path,
+        state: state_path,
+    };
+    let gateway: GatewayFn = Arc::new(crate::peer::reach::default_gateway_ipv4);
+    // A build without the library only ever records `nodeUnsupported` when the
+    // mode is `node`, which needs no 10 s wake.
+    let every = if <BuiltFactory as DeviceFactory>::SUPPORTED {
+        TICK
+    } else {
+        TICK * 2
+    };
+    Supervisor::new(BuiltFactory::default(), paths, port, serve, gateway)
+        .with_dial_slot(server_slot().clone())
+        .run(every, stop)
+        .await;
+}
+
 /// Why one connection ended, and whether the peer had authenticated by then.
 ///
 /// The flag is what lets [`serve_on`] bound the log: a refusal before the
@@ -442,34 +485,6 @@ impl ConnectionFailure {
             error,
         }
     }
-}
-
-/// What the LENDER's half of a SERVE needs, which this file holds and does not
-/// decide.
-///
-/// Three things, and each one is a thing a listener cannot derive: the ledger
-/// that funds a relayed request (process state, persisted by the lender),
-/// this node's OWN proxy base (the whole of "own picker, own Bearer, own
-/// bucket", see [`crate::peer::serve::handle_serve_on`]), and a reader for
-/// this node's own quota so the debit is the measured rise rather than
-/// `MIN_DEBIT`.
-///
-/// `None` on [`SessionContext`] is a build with no lease serving wired, and the
-/// dispatch arm then REFUSES a SERVE rather than accepting a stream it cannot
-/// answer. That is the same shape as every other ungranted kind: a refusal,
-/// never a silent accept.
-#[derive(Clone)]
-pub struct LeaseServing {
-    /// The lender's ledger, shared with whatever else reads it (`tcr peer ls`,
-    /// the panel row).
-    pub ledger: Arc<Mutex<Ledger>>,
-    /// This node's own proxy base, e.g. `http://127.0.0.1:3456`.
-    pub upstream: String,
-    /// This node's own quota, read either side of the relay.
-    pub utilization: Arc<dyn WindowUtilization>,
-    /// The owner's manager, for `handoff_bearer`. A hand-mode grant is the one
-    /// path on which the lender reads its own access token for another Mac.
-    pub manager: Arc<crate::manager::Manager>,
 }
 
 /// What one connection needs from this node, owned so the task can outlive the
@@ -609,7 +624,7 @@ where
 /// and that Mac proves who it is inside its own Noise session, exactly as it
 /// would on a forward the friend dialled.
 pub async fn park_one_carrier(friend: &PeerRow, context: &SessionContext) -> Result<()> {
-    let Some((addr, mut stream)) = serve::dial_peer_with_endpoint(friend).await else {
+    let Some((addr, mut stream)) = dial::dial_peer_with_endpoint(friend).await else {
         bail!(
             "peer reverse: none of {}'s addresses answered, so no carrier could be parked there",
             friend.node.display()

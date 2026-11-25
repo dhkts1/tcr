@@ -32,13 +32,13 @@
 //!
 //! # A cooldown is not a failure detector either
 //!
-//! [`PathTable::cool_down`] is the one exception to "nothing here evicts a
+//! [`PathTable::cool_down`](crate::peer::probe::PathTable::cool_down) is the one exception to "nothing here evicts a
 //! row", and it is a narrower thing than that sentence guards against: an
 //! endpoint that just failed to answer a DIAL, not a probe, is skipped by
-//! [`dial_order`] for [`PATH_RETRY_COOLDOWN`], while another endpoint on the
+//! [`dial_order`](crate::peer::probe::dial_order) for [`PATH_RETRY_COOLDOWN`](crate::peer::probe::PATH_RETRY_COOLDOWN), while another endpoint on the
 //! row is not cooling. It never empties a row. When every endpoint is
-//! cooling, [`dial_order`] returns the row whole, on the same rule
-//! [`PathsConfig::max_loss_pct`] already states for loss: a path that is the
+//! cooling, [`dial_order`](crate::peer::probe::dial_order) returns the row whole, on the same rule
+//! [`PathsConfig::max_loss_pct`](crate::peer::config::PathsConfig::max_loss_pct) already states for loss: a path that is the
 //! only path home is still tried. Nothing is declared dead, nothing is
 //! evicted, and no work is rescheduled away from a Mac; a cooling endpoint is
 //! dialled again the moment its window closes or the moment it is the last
@@ -48,12 +48,12 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{CollapseHint, Control, PeerId};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::peer::config::{Endpoint, EndpointSource, Locator, PeerRow};
+use crate::peer::config::{Endpoint, EndpointSource, Locator, PathPolicy, PathsConfig, PeerRow};
 use crate::peer::noise::{self, PeerSession};
+use crate::peer::state::{PathStat, rtt_key};
 
 /// One probe per trusted peer per minute, on a session that is already open.
 ///
@@ -83,10 +83,6 @@ pub const PATH_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 /// read as "the last twenty probes" without keeping twenty numbers per path.
 pub const PATH_SAMPLE_WINDOW: u32 = 20;
 
-/// The default loss ceiling, in percent, above which a path is dialled after
-/// the paths that are under it.
-pub const DEFAULT_MAX_LOSS_PCT: u8 = 5;
-
 /// The smoothing factor for [`PATH_SAMPLE_WINDOW`].
 fn alpha() -> f64 {
     2.0 / (f64::from(PATH_SAMPLE_WINDOW) + 1.0)
@@ -101,119 +97,8 @@ fn ewma(previous: Option<f64>, sample: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// The operator's policy: the `paths` section of the peers file
-// ---------------------------------------------------------------------------
-
-/// Which kind of path the operator wants tried first.
-///
-/// A typed enum and not a string, so the peers file, the dial order and a
-/// future panel row cannot disagree about what `"direct"` meant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PathPolicy {
-    /// A socket this Mac opens itself, first. The default, because a forwarded
-    /// hop spends a third machine's bytes and needs its consent.
-    #[default]
-    Direct,
-    /// A forwarded hop first. For the Mac whose direct path is the one that
-    /// keeps failing (a hotel network, a carrier NAT), where trying it first
-    /// buys nothing but a connect timeout per request.
-    Via,
-}
-
-/// The `paths` section of the peers file ([`crate::peer::config::PeerFile`]).
-///
-/// Every field has a default that reproduces the behaviour of a build with no
-/// `paths` section at all, which is what lets the field arrive without a
-/// migration: `Direct` first, five percent, and an empty allow list that allows
-/// every forwarder the row already carries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct PathsConfig {
-    /// Which kind of path is tried first.
-    pub prefer: PathPolicy,
-    /// The loss ceiling in percent. A path measured above it is tried after
-    /// every path under it. **After, and never dropped**: a lossy path that is
-    /// the only path is still the way home.
-    pub max_loss_pct: u8,
-    /// The forwarders this Mac is willing to be carried by. **Empty means every
-    /// forwarder already on the row**, not "none": the row's own `Via`
-    /// endpoints are written by the pinning code, so an empty list here is the
-    /// absence of a further restriction rather than a refusal.
-    pub via_allow: Vec<PeerId>,
-}
-
-impl Default for PathsConfig {
-    fn default() -> Self {
-        Self {
-            prefer: PathPolicy::Direct,
-            max_loss_pct: DEFAULT_MAX_LOSS_PCT,
-            via_allow: Vec::new(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // What was measured
 // ---------------------------------------------------------------------------
-
-/// One path's cost, as the EWMA left it.
-///
-/// Keyed by peer AND locator, because "how far away is that Mac" is not one
-/// number: the same peer reached directly and through a forwarder are two
-/// paths with two costs, and collapsing them is exactly how a lossy hop comes
-/// to look like a lossy Mac.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PathStat {
-    /// The peer at the far end.
-    pub peer: PeerId,
-    /// The path that was measured.
-    #[serde(flatten)]
-    pub locator: Locator,
-    /// Round trip in milliseconds, smoothed. `None` until an ack arrives: a
-    /// path that has only ever timed out has a loss figure and no RTT, and
-    /// writing a zero there would make it look like the fastest path on the
-    /// row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rtt_ms: Option<f64>,
-    /// Loss in percent, smoothed over the same window.
-    pub loss_pct: f64,
-    /// How many probes this row has seen. Kept because an EWMA over one sample
-    /// and over twenty read the same and are not worth the same.
-    pub samples: u32,
-    /// When the last sample landed, Unix milliseconds.
-    pub updated_at_ms: i64,
-}
-
-impl PathStat {
-    /// [`Self::rtt_ms`] as the sort key uses it: a path nobody has measured
-    /// sorts after every path that has been.
-    fn rtt_key(&self) -> u32 {
-        rtt_key(self.rtt_ms)
-    }
-}
-
-/// A smoothed round trip as a whole number of milliseconds, saturating at both
-/// ends.
-///
-/// One function rather than a cast at each reader: an `as` on a `f64` that is
-/// NaN or out of range is a silent zero or a silent `u32::MAX`, and the two
-/// readers here, the sort key and the collapse hint, would not have gone
-/// wrong the same way.
-fn rtt_key(rtt_ms: Option<f64>) -> u32 {
-    rtt_ms.map_or(u32::MAX, |rtt| {
-        let rounded = rtt.round();
-        if !rounded.is_finite() || rounded <= 0.0 {
-            0
-        } else if rounded >= f64::from(u32::MAX) {
-            u32::MAX
-        } else {
-            // Bounded by the two arms above, so the cast cannot saturate.
-            rounded as u32
-        }
-    })
-}
 
 /// One endpoint's cooldown: the instant [`dial_order`] may try it again.
 ///
@@ -580,7 +465,7 @@ pub fn drop_cooling_endpoints(
 
 /// [`order_endpoints`] against the process-local table, with cooling
 /// endpoints dropped by [`drop_cooling_endpoints`], which is what
-/// [`crate::peer::serve::dial_order`] calls.
+/// [`crate::peer::tunnel::dial::dial_order`] calls.
 ///
 /// A poisoned lock falls back to the policy defaults and SAYS SO: the dial has
 /// to produce an order, the default order is the one every build before this

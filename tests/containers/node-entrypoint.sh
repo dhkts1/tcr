@@ -42,7 +42,7 @@ fi
 
 # The overlay network, when this node is on one, models a tailnet: an
 # address in 100.64.0.0/10 held by an interface named `utun*`, because
-# `pair::is_tailnet` (src/peer/pair.rs) ranks an address first only when
+# `pair::addresses::is_tailnet` (src/peer/pair/addresses.rs) ranks an address first only when
 # both of those are true. Docker attaches it as an ordinary bridge
 # interface (commonly `eth1`), so rename it here, under the NET_ADMIN
 # capability every node in the cast already has.

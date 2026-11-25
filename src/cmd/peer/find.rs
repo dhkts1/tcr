@@ -3,7 +3,7 @@
 use tcr::peer;
 
 use super::peer_cli;
-use super::{ensure_listen_for_opt_in, lock_peers_file, masked_label, print_listen_written};
+use super::{lock_peers_file, masked_label, print_listen_written};
 
 /// `tcr peer find on|off [--announce-name on|off]`, one switch that starts or
 /// stops both [`peer::discovery::advertise`] and [`peer::discovery::browse`].
@@ -73,23 +73,26 @@ async fn run_peer_find_with(
     let peers_path = args.peers.path();
     let (_lock, mut file) = lock_peers_file(&peers_path)?;
 
-    // The flag flips the config key on BOTH arms. It used to be read only
-    // inside the `on` arm, so `tcr peer find off --announce-name on` accepted
-    // the flag, wrote the file without it and still exited 0, a silently
-    // ignored preference, which is worse than a refusal. The flag is a stored
-    // preference and does not depend on which way discovery is being set.
-    if let Some(state) = args.announce_name {
-        file.announce_name = matches!(state, peer_cli::Switch::On);
-    }
+    // The flag flips the config key on BOTH arms (see `PeerFile::switch_find`):
+    // it is a stored preference and does not depend on which way discovery is
+    // being set.
+    let announce_name = args
+        .announce_name
+        .map(|state| matches!(state, peer_cli::Switch::On));
 
     // What this run wrote into `listen`, if anything. Said after the save and
     // not before it, because a scan that fails exits non-zero having written
     // nothing, and a line promising a port in that case would be a lie.
-    let mut listen_written = None;
+    //
+    // This used to refuse on the `on` arm and send the operator to a text
+    // editor for a key no walkthrough names, which stopped a first-time
+    // reader at their very first command. Finding peers needs a port to
+    // announce, so the verb provides one instead of asking for it.
+    let listen_written =
+        file.switch_find(matches!(args.state, peer_cli::Switch::On), announce_name);
 
     match args.state {
         peer_cli::Switch::Off => {
-            file.discovery = false;
             // The flag, and nothing else: the beacon lives in the serving
             // process, which reads this file and withdraws it. A `stop_all`
             // here would reach only this command's own (empty) daemon.
@@ -97,14 +100,6 @@ async fn run_peer_find_with(
             println!("a running server stops announcing within a minute");
         }
         peer_cli::Switch::On => {
-            file.discovery = true;
-
-            // This used to refuse here and send the operator to a text editor
-            // for a key no walkthrough names, which stopped a first-time
-            // reader at their very first command. Finding peers needs a port
-            // to announce, so the verb provides one instead of asking for it.
-            listen_written = ensure_listen_for_opt_in(&mut file);
-
             let store = peer::config::PeerStore::open(&peers_path)?;
             // One scan, so `find on` reports what is already on the LAN. The
             // ANNOUNCING half is the server's: see [`PeerFinder`].

@@ -614,8 +614,9 @@ mod lender {
     };
     use tcr::peer::id::NodeKey;
     use tcr::peer::lease::Ledger;
-    use tcr::peer::listener::{self, LeaseServing, SessionContext};
+    use tcr::peer::listener::{self, SessionContext};
     use tcr::peer::serve;
+    use tcr::peer::serve::LeaseServing;
     use tcr_peer_wire::{Lease, LeaseUnit, PeerId, Window};
 
     /// The lease id every test in this file spends.

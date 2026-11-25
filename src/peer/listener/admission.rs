@@ -113,13 +113,7 @@ pub fn unauthenticated_allowance(file: &PeerFile) -> (usize, usize) {
     // (`tests/peer_lease.rs`) is the gate, with the bare constants it fails
     // with the lender closing the third connection with zero bytes, and it
     // stays green on the largest-grant form.
-    let largest: usize = file
-        .peers
-        .iter()
-        .flat_map(|row| row.lend.iter())
-        .map(|grant| usize::from(grant.max_inflight))
-        .max()
-        .unwrap_or(0);
+    let largest: usize = file.largest_grant_inflight();
     (
         MAX_UNAUTHENTICATED_SOCKETS.saturating_add(largest),
         MAX_UNAUTHENTICATED_PER_ADDRESS.saturating_add(largest),
@@ -139,7 +133,7 @@ pub const MESSAGE_1_TIMEOUT: Duration = Duration::from_secs(5);
 /// counting it. A replayed `IK` message 1 reaches exactly that state without
 /// the far side having to keep anything alive.
 ///
-/// The same number as [`HANDSHAKE_TIMEOUT`], for the same reason: the header
+/// The same number as [`HANDSHAKE_TIMEOUT`](crate::peer::listener::HANDSHAKE_TIMEOUT), for the same reason: the header
 /// is one frame a caller already has in hand when it dials.
 pub const STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -164,18 +158,6 @@ pub const MAX_KNOCK_FRAME_BYTES: usize = 512;
 /// CLI and the listener come to disagree about whether a window is open.
 pub const ACCEPTED_WINDOW_SECS: i64 = crate::peer::pair::PAIRING_WINDOW_SECS;
 
-/// How many served request ids are remembered, per connection here, and, by
-/// [`crate::peer::lease::SERVED_CAPACITY`], per process in the ledger.
-///
-/// Sized from the design's own figure: the accounting backstop has to outlive a
-/// burst rather than a session. The ledger's cache is the one that actually
-/// catches a replayed debit ([`RequestDedup`] says why); this figure is named
-/// through to it so the two layers cannot disagree about what a burst is.
-pub const REQUEST_DEDUP_CAPACITY: usize = 4096;
-
-/// How long a served request id is remembered.
-pub const REQUEST_DEDUP_TTL_MS: i64 = 600_000;
-
 /// How long the listener stays silent, **per address**, after logging one
 /// refusal.
 ///
@@ -188,7 +170,7 @@ pub const REFUSAL_LOG_QUIET_MS: i64 = 3_600_000;
 
 /// How many addresses the refusal log remembers. A map a stranger can grow
 /// without bound is a memory bug with a security label, which is the same
-/// sentence [`RequestDedup`] carries: an address that has not been refused
+/// sentence [`RequestDedup`](crate::peer::listener::RequestDedup) carries: an address that has not been refused
 /// within [`REFUSAL_LOG_QUIET_MS`] is dropped, and above this cap the oldest
 /// entry goes so the map cannot outgrow it even inside one hour.
 pub const REFUSAL_LOG_ADDRESSES: usize = 1_024;

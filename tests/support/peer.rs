@@ -48,6 +48,26 @@ pub(crate) fn scratch_dir(file: &str, tag: &str) -> PathBuf {
     dir
 }
 
+/// Point the peers file at `peers` at a listen address, the way an operator
+/// does: by editing the `listen` key by hand. No verb writes a chosen address
+/// (the opt-in verbs write only the default), so a test that needs one makes
+/// the same edit, leaving every other key exactly as it was.
+pub(crate) fn hand_edit_listen(peers: &Path, addr: SocketAddr) {
+    let body = std::fs::read_to_string(peers).expect("the peers file reads back");
+    let mut file: serde_json::Value = serde_json::from_str(&body).expect("the peers file is JSON");
+    file["listen"] = serde_json::Value::String(addr.to_string());
+    std::fs::write(
+        peers,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&file).expect("it re-serializes")
+        ),
+    )
+    .expect("the peers file rewrites");
+    std::fs::set_permissions(peers, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("the peers file takes 0600");
+}
+
 /// One machine's key material, as a test holds it.
 pub(crate) struct Node {
     pub secret: [u8; 32],

@@ -9,7 +9,7 @@ use super::*;
 fn peer_commands_keep_their_node_keys_in_separate_fixture_homes() {
     let first = scratch("first-cli-home");
     let second = scratch("second-cli-home");
-    let token = pair::JoinToken::new(
+    let token = join_key::JoinToken::new(
         vec!["127.0.0.1:1".parse().expect("a loopback address")],
         PeerId([0x88; 32]),
         [0x99; 32],
@@ -272,7 +272,7 @@ fn a_link_with_a_dead_join_key_still_sets_the_network_key_through_the_cli() {
     let network_key = NetworkKey::from_bytes([0x9C; 32]);
     let link = pair::ShareLink {
         network_key,
-        join: Some(pair::JoinToken::new(
+        join: Some(join_key::JoinToken::new(
             vec!["127.0.0.1:1".parse().expect("a loopback address")],
             PeerId([0xAB; 32]),
             [0xCD; 32],
@@ -338,7 +338,9 @@ fn the_network_key_is_printed_once_and_never_again() {
     // It is on disk, at 0600.
     let file = config::read_or_default(&peers).expect("the peers file reads");
     assert_eq!(
-        file.network_key.map(|key| key.to_paste_string()).as_deref(),
+        file.network_psk()
+            .map(|bytes| NetworkKey::from_bytes(*bytes).to_paste_string())
+            .as_deref(),
         Some(printed.as_str()),
         "what was printed must be what was stored"
     );
@@ -431,7 +433,9 @@ fn network_key_set_over_an_existing_key_requires_replace() {
     );
     let file = config::read_or_default(&peers).expect("the peers file reads");
     assert_eq!(
-        file.network_key.map(|key| key.to_paste_string()).as_deref(),
+        file.network_psk()
+            .map(|bytes| NetworkKey::from_bytes(*bytes).to_paste_string())
+            .as_deref(),
         Some(first_key.as_str()),
         "a refused `set` must not have touched the stored key"
     );
@@ -451,7 +455,9 @@ fn network_key_set_over_an_existing_key_requires_replace() {
     );
     let file = config::read_or_default(&peers).expect("the peers file reads");
     assert_eq!(
-        file.network_key.map(|key| key.to_paste_string()).as_deref(),
+        file.network_psk()
+            .map(|bytes| NetworkKey::from_bytes(*bytes).to_paste_string())
+            .as_deref(),
         Some(second_key.as_str()),
         "the replaced key must be what is stored"
     );

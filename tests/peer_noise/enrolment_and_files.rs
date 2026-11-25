@@ -21,7 +21,7 @@ use super::*;
 // `listener.rs` as of this commit, and the two tests that measured it go with it rather than being
 // converted to `noise::accept_handshake`, which has no window parameter to
 // convert them to. The SAME invariant, under the CURRENT gate, is
-// `tests/peer_pairing.rs::xx_from_an_unaccepted_instance_gets_zero_bytes` (the
+// `tests/peer_pairing/knock.rs::xx_from_an_unaccepted_instance_gets_zero_bytes` (the
 // zero-bytes refusal) and its own positive control (the same dial answered
 // after Accept); `the_six_digit_code_binds_the_handshake_not_the_keys` above
 // keeps the six-digit-code assertion these two also made, through
@@ -131,7 +131,7 @@ fn opening_the_window_keeps_every_other_key_in_the_state_file() {
 /// written is not an input to either decision.
 ///
 /// Watched red: with the `if mode != 0o600` branch in `crate::peer::state::load`
-/// deleted, the widened file is read back and `loaded.banned` is 1, not 0, and
+/// deleted, the widened file is read back and `loaded.blocked_count()` is 1, not 0, and
 /// nothing is quarantined.
 #[test]
 fn a_state_file_a_wider_mode_is_quarantined_and_the_saved_one_is_0600() {
@@ -142,12 +142,12 @@ fn a_state_file_a_wider_mode_is_quarantined_and_the_saved_one_is_0600() {
     let path = dir.path().join("peer-state.json");
 
     let mut value = state::PeerState::default();
-    value.banned.push(state::Ban {
-        addr: state::knock_address(&"127.0.0.1:9600".parse().expect("an addr")),
-        key: None,
-        since_ms: 1_000,
-        reason: state::BanReason::Blocked,
-    });
+    value.ban(
+        &state::knock_address(&"127.0.0.1:9600".parse().expect("an addr")),
+        None,
+        state::BanReason::Blocked,
+        1_000,
+    );
     state::save(&path, &value).expect("the state file writes");
 
     let mode = std::fs::metadata(&path)
@@ -162,8 +162,7 @@ fn a_state_file_a_wider_mode_is_quarantined_and_the_saved_one_is_0600() {
     assert_eq!(
         state::load(&path, 2_000)
             .expect("a 0600 file loads")
-            .banned
-            .len(),
+            .blocked_count(),
         1,
         "a file at the mode the writer produces is trusted"
     );
@@ -172,7 +171,7 @@ fn a_state_file_a_wider_mode_is_quarantined_and_the_saved_one_is_0600() {
         .expect("widen it by hand");
     let loaded = state::load(&path, 2_000).expect("a widened file still boots the node");
     assert!(
-        loaded.banned.is_empty(),
+        loaded.blocked_count() == 0,
         "a widened state file decides nothing: the node starts cold"
     );
     assert!(
@@ -212,8 +211,11 @@ fn a_state_file_this_writer_creates_carries_the_format_version() {
     let loaded = tcr::peer::state::load(&state, 5_000)
         .expect("the state loader reads a file the pairing window created");
     assert!(
-        loaded.leases.is_empty(),
-        "and it reads as an empty state rather than a quarantined one"
+        matches!(
+            loaded.pairing_window(5_000),
+            tcr::peer::state::PairingDeadline::Open { .. }
+        ),
+        "and it reads as the state the window wrote rather than a quarantined, empty one"
     );
 }
 
@@ -227,23 +229,23 @@ fn a_state_file_this_writer_creates_carries_the_format_version() {
 #[test]
 fn a_join_token_round_trips() {
     for addr in ["127.0.0.1:9600", "[::1]:9600"] {
-        let token = pair::JoinToken::new(
+        let token = join_key::JoinToken::new(
             vec![addr.parse().expect("a test address")],
             PeerId([3_u8; 32]),
             [7_u8; 32],
         );
         let rendered = token.to_token();
         assert!(
-            rendered.starts_with(pair::KEY_PREFIX),
+            rendered.starts_with(join_key::KEY_PREFIX),
             "an operator has to be able to see what they are pasting: {rendered}"
         );
         assert_eq!(
-            pair::JoinToken::parse(&rendered).expect("the token parses"),
+            join_key::JoinToken::parse(&rendered).expect("the token parses"),
             token,
             "the address {addr} did not survive the round trip"
         );
         assert_eq!(
-            pair::JoinToken::parse(&format!("  {rendered}\n")).expect("a pasted token parses"),
+            join_key::JoinToken::parse(&format!("  {rendered}\n")).expect("a pasted token parses"),
             token,
             "a paste carries whitespace"
         );
@@ -259,7 +261,7 @@ fn a_join_token_round_trips() {
 /// version measures the version check.
 #[test]
 fn a_join_token_with_an_unknown_version_is_refused() {
-    let good = pair::JoinToken::new(
+    let good = join_key::JoinToken::new(
         vec!["127.0.0.1:9600".parse().expect("a test address")],
         PeerId([3_u8; 32]),
         [7_u8; 32],
@@ -274,7 +276,7 @@ fn a_join_token_with_an_unknown_version_is_refused() {
         good, unknown,
         "the fixture has to differ from the good token"
     );
-    let error = pair::JoinToken::parse(&unknown)
+    let error = join_key::JoinToken::parse(&unknown)
         .expect_err("a v4 token must be refused rather than read as one of the three known ones");
     assert!(
         format!("{error:#}").contains("not a join key"),
@@ -289,7 +291,7 @@ fn a_join_token_with_an_unknown_version_is_refused() {
         "tcr-join:v1:127.0.0.1:9600",
         "tcr-join:v1:not-an-address:0000000000000000000000000000000000000000000000000000:0000000000000000000000000000000000000000000000000000",
     ] {
-        let refused = pair::JoinToken::parse(bad);
+        let refused = join_key::JoinToken::parse(bad);
         assert!(
             refused.is_err(),
             "{bad:?} parsed into a token, which means `tcr peer join` would dial something \
@@ -688,9 +690,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
     let registrar_file =
         peer_config::read_or_default(&registrar_peers).expect("the registrar's file reads");
     let registrar_row = registrar_file
-        .peers
-        .iter()
-        .find(|row| row.node == joiner_key.id())
+        .row(&joiner_key.id())
         .expect("the registrar recorded the joiner: the hole this test exists for");
     assert_eq!(registrar_row.label, "laptop-2");
     assert!(
@@ -704,7 +704,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
 
     let joiner_file = peer_config::read_or_default(&joiner_peers).expect("the joiner's file reads");
     assert!(
-        joiner_file.peers.iter().any(|row| row.node == registrar_id),
+        joiner_file.row(&registrar_id).is_some(),
         "and the joiner pins the registrar, so the row exists on both sides"
     );
 
@@ -776,10 +776,10 @@ fn a_one_use_invite_refuses_its_second_joiner() {
 
     let file = peer_config::read_or_default(&peers).expect("the file reads");
     assert_eq!(
-        file.peers.len(),
+        file.pinned_count(),
         1,
         "the second joiner must leave no row: {:?}",
-        file.peers
+        file.pinned_ids()
     );
     assert!(outstanding_secrets(&file).is_empty());
 }
@@ -821,7 +821,7 @@ fn a_hostile_enrolment_label_is_refused_and_spends_nothing() {
     }
 
     let file = peer_config::read_or_default(&peers).expect("the file reads");
-    assert!(file.peers.is_empty(), "nothing is pinned on a refusal");
+    assert!(file.pinned_count() == 0, "nothing is pinned on a refusal");
     assert_eq!(
         file.invite(invite.id).map(|row| row.uses_left),
         Some(1),
@@ -913,7 +913,7 @@ fn a_planted_symlink_does_not_capture_the_node_key() {
 /// empty-input refusal, the first assertion fails.
 #[test]
 fn a_join_token_arrives_on_stdin_and_never_in_a_message() {
-    let token = pair::JoinToken::new(
+    let token = join_key::JoinToken::new(
         vec!["127.0.0.1:9600".parse().expect("a test address")],
         PeerId([3_u8; 32]),
         [7_u8; 32],
@@ -940,11 +940,11 @@ fn a_join_token_arrives_on_stdin_and_never_in_a_message() {
     let sentinel = "SENTINELSECRETVALUE0123456789ABCDEFGHJKMNPQRSTVWXYZ0";
     let malformed = format!(
         "{}{}:{}:{sentinel}",
-        pair::TOKEN_PREFIX,
+        join_key::TOKEN_PREFIX,
         "127.0.0.1:9600",
         PeerId([3_u8; 32]).to_wire()
     );
-    let refusal = pair::JoinToken::parse(&malformed)
+    let refusal = join_key::JoinToken::parse(&malformed)
         .expect_err("a 51-character secret field is not 32 bytes");
     let text = format!("{refusal:#}");
     assert!(
@@ -1035,8 +1035,8 @@ fn forget_takes_the_file_lock() {
     assert!(
         tcr::peer::config::read_or_default(&peers)
             .expect("the file reads")
-            .peers
-            .is_empty(),
+            .pinned_count()
+            == 0,
         "and both rows are gone"
     );
     assert!(
@@ -1076,11 +1076,11 @@ fn a_pin_takes_the_file_lock_and_an_enrolment_still_completes() {
     );
     let written = tcr::peer::config::read_or_default(&peers).expect("the file reads");
     assert_eq!(
-        written.peers.len(),
+        written.pinned_count(),
         1,
         "one row, for the peer just confirmed"
     );
-    assert_eq!(written.peers[0].node, peer);
+    assert_eq!(written.pinned_ids(), vec![peer]);
 
     let held = tcr::peer::config::FileLock::acquire(&peers).expect("take the file lock first");
     let started = std::time::Instant::now();

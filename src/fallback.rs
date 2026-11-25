@@ -70,7 +70,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 
 use crate::peer::config::PeerStore;
-use crate::peer::lease::PeerLeaseProvider;
+use crate::peer::serve::PeerLeaseProvider;
 
 /// What a provider is told about a request the local fleet could not serve.
 ///
@@ -319,7 +319,9 @@ pub fn peer_lease_provider(store: &PeerStore) -> Option<PeerLeaseProvider> {
     let lenders = store
         .peers()
         .into_iter()
-        .filter(|row| row.allow.allow_disclose && crate::peer::serve::has_a_way_back(row, store))
+        .filter(|row| {
+            row.allow.allow_disclose && crate::peer::tunnel::dial::has_a_way_back(row, store)
+        })
         .count();
     if lenders == 0 {
         return None;

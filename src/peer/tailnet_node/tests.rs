@@ -1125,7 +1125,7 @@ fn counting_slot(peers: &Path) -> (DialSlot, Arc<AtomicUsize>) {
         counter.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {
             let (ours, _theirs) = tokio::io::duplex(64);
-            Ok(Box::new(ours) as crate::peer::serve::PeerStream)
+            Ok(Box::new(ours) as crate::peer::noise::PeerStream)
         })
     });
     let slot = DialSlot::default();

@@ -9,7 +9,7 @@ use super::{lock_peer_state, peer_state_path, pending_row_for_readers};
 pub(super) fn run_peer_pending(a: peer_cli::PeerPendingArgs) -> anyhow::Result<()> {
     let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
     let state_path = peer_state_path(&peers_path);
-    let now = peer::pair::now_ms();
+    let now = peer::state::now_ms();
     let state = peer::state::load(&state_path, now)?;
     // Every read surface in this verb reads `visible_pending`, for the
     // reason `PeerState::visible_pending` gives: a reservation
@@ -61,18 +61,8 @@ pub(super) fn run_peer_pending(a: peer_cli::PeerPendingArgs) -> anyhow::Result<(
             knock.wire_version
         );
     }
-    for mute in &state.muted {
-        println!("{}: muted: until={} unix-ms", mute.addr, mute.until_ms);
-    }
-    for ban in &state.banned {
-        println!(
-            "{}: blocked: reason={} since={} unix-ms key={}",
-            ban.addr,
-            ban.reason,
-            ban.since_ms,
-            ban.key
-                .map_or_else(|| "not-learned".to_string(), |key| key.display())
-        );
+    for line in state.refusal_lines() {
+        println!("{line}");
     }
     Ok(())
 }

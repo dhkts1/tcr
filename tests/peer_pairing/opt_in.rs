@@ -27,8 +27,8 @@ fn peers_file_with_no_listener(tag: &str) -> std::path::PathBuf {
     let dir = scratch(tag);
     let peers = dir.join("tcr-peers.json");
     let fresh = PeerFile::default();
-    assert!(
-        fresh.listen.is_none(),
+    assert_eq!(
+        fresh.listen, None,
         "the default must still be no listener at all; that default is the privacy promise \
          these three verbs are allowed to break only on an explicit opt-in"
     );
@@ -40,7 +40,7 @@ fn peers_file_with_no_listener(tag: &str) -> std::path::PathBuf {
 /// fake label: this repository is public.
 fn pin_one_peer(peers: &std::path::Path) {
     let mut file = config::read_or_default(peers).expect("the seeded peers file reads back");
-    file.peers.push(config::PeerRow {
+    file.pin(config::PeerRow {
         node: PeerId([0x5a; 32]),
         label: "laptop-2".to_string(),
         endpoints: Vec::new(),
@@ -89,10 +89,8 @@ fn find_on_gives_this_mac_a_port_when_it_has_none() {
 
     // A port the operator chose is the operator's: a second run changes
     // nothing and says nothing about it.
-    let mut file = config::read_or_default(&peers).expect("the peers file reads back");
     let chosen: SocketAddr = "127.0.0.1:19000".parse().expect("a literal address");
-    file.listen = Some(chosen);
-    config::save(&peers, &file).expect("write a hand-chosen port");
+    crate::peer_support::hand_edit_listen(&peers, chosen);
 
     let (stdout, stderr, ok) = run_tcr(&peers, &["find", "on"]);
     assert!(
@@ -150,11 +148,11 @@ fn share_on_gives_this_mac_a_port_when_it_has_none() {
         ok,
         "`tcr peer share off`.\nstdout: {stdout}\nstderr: {stderr}"
     );
-    assert!(
+    assert_eq!(
         config::read_or_default(&untouched)
             .expect("the peers file reads back")
-            .listen
-            .is_none(),
+            .listen,
+        None,
         "turning something off must never open a port: {stdout}"
     );
 }
