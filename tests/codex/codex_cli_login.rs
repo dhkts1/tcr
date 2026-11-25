@@ -742,7 +742,7 @@ fn hanging_codex_script(log: &Path) -> String {
 fn gone(expected: (u32, u64)) -> bool {
     let pid = expected.0;
     use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
-    let mut system = System::new();
+    let mut system = System::new().expect("sysinfo builds a System on this platform");
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,
@@ -768,7 +768,7 @@ fn cleanup_will_not_signal_a_reused_fixture_pid() {
 fn kill_hard(expected: (u32, u64)) {
     let pid = expected.0;
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
-    let mut system = System::new();
+    let mut system = System::new().expect("sysinfo builds a System on this platform");
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,
@@ -798,7 +798,7 @@ impl TestProcessCleanup {
 
     fn remember(&mut self, pid: u32) {
         use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-        let mut system = System::new();
+        let mut system = System::new().expect("sysinfo builds a System on this platform");
         system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
             true,
@@ -906,7 +906,7 @@ fn login_codex_stops_codex_and_removes_its_folder_when_cancelled() {
             .map(|pid| {
                 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
                 let pid: u32 = pid.trim().parse().expect("a logged pid");
-                let mut system = System::new();
+                let mut system = System::new().expect("sysinfo builds a System on this platform");
                 system.refresh_processes_specifics(
                     ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
                     true,
@@ -928,7 +928,7 @@ fn login_codex_stops_codex_and_removes_its_folder_when_cancelled() {
             assert!(sent.success(), "the group was signalled");
         } else {
             use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
-            let mut system = System::new();
+            let mut system = System::new().expect("sysinfo builds a System on this platform");
             system.refresh_processes_specifics(
                 ProcessesToUpdate::Some(&[Pid::from_u32(tcr)]),
                 true,

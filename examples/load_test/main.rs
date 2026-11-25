@@ -251,7 +251,7 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     }
     stub.take_arrivals();
 
-    let mut sys = System::new();
+    let mut sys = System::new().context("building a sysinfo System to sample the test proxy")?;
     let spid = Pid::from_u32(pid);
     let refresh = |sys: &mut System| {
         sys.refresh_processes_specifics(
@@ -272,7 +272,7 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     };
     let (cpu0, rss_boot, disk0) =
         refresh(&mut sys).context("the test proxy vanished before the phase")?;
-    let load0 = System::load_average();
+    let load0 = load_average("the phase start");
     // The proxy writes its log on a background thread fed by a queue (`src/stores/file_log.rs`), so the
     // warm-up's last `request usage` lines can land a moment after its replies. Read the offset
     // once the file has stopped growing, or those lines are counted as the phase's (measured:
@@ -298,8 +298,8 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     let sampler = {
         let stop = Arc::clone(&stop);
         let peak = Arc::clone(&peak);
+        let mut sys = System::new().context("building a sysinfo System for the RSS sampler")?;
         std::thread::spawn(move || {
-            let mut sys = System::new();
             while !stop.load(Ordering::Relaxed) {
                 sys.refresh_processes_specifics(
                     ProcessesToUpdate::Some(&[spid]),
@@ -365,7 +365,7 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     let elapsed = started.elapsed();
 
     let (cpu1, _, disk1) = refresh(&mut sys).context("the test proxy vanished during the phase")?;
-    let load1 = System::load_average();
+    let load1 = load_average("the phase end");
     let threads = tokio::task::spawn_blocking(move || harness::thread_count(pid)).await??;
     stop.store(true, Ordering::Relaxed);
     if sampler.join().is_err() {
@@ -475,6 +475,17 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
         threads: Some(threads),
         info_lines: Some(info_messages.values().sum()),
         info_messages,
+    })
+}
+
+/// The 1/5/15-minute load average. A failed read prints a note and reports zeros,
+/// which is what sysinfo 0.39 returned, silently, when `getloadavg` failed.
+fn load_average(when: &str) -> sysinfo::LoadAvg {
+    System::load_average().unwrap_or_else(|error| {
+        eprintln!(
+            "[load-test] could not read the load average at {when}: {error}; reporting zeros"
+        );
+        sysinfo::LoadAvg::default()
     })
 }
 

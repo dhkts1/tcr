@@ -56,6 +56,7 @@ use serde::Serialize;
 use tcr_status_wire::{CodexRoute, CodexTraffic};
 
 use crate::base::config_keys::UnknownKey;
+use crate::base::log_err::LogErr as _;
 use crate::records::stats::GateReason;
 use crate::status::StatusPayload;
 use crate::verbs::setup::{BASE_URL_VAR, routes_to_port};
@@ -276,13 +277,20 @@ pub fn port_holder(port: u16) -> Option<PortHolder> {
         .find(|listener| listener.socket.port() == port)
         .map(|listener| listener.process.pid)?;
 
-    let mut system = sysinfo::System::new();
-    system.refresh_processes_specifics(
-        sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
-        false,
-        sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
-    );
-    let process = system.process(sysinfo::Pid::from_u32(pid));
+    // A System that cannot be built is logged and reads as a holder whose name
+    // and argv could not be read, the same as one that exited before the refresh.
+    let mut system =
+        sysinfo::System::new().log_warn("building a sysinfo System to name the port holder");
+    if let Some(system) = system.as_mut() {
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+            false,
+            sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+        );
+    }
+    let process = system
+        .as_ref()
+        .and_then(|system| system.process(sysinfo::Pid::from_u32(pid)));
     let name = process.map_or_else(String::new, |p| p.name().to_string_lossy().into_owned());
     let argv = process.map_or_else(Vec::new, |p| {
         p.cmd()
