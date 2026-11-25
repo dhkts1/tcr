@@ -45,8 +45,9 @@ use tcr::fallback::{self, Ask, FallbackProvider};
 use tcr::peer::config::{
     Allow, ControlGrants, Endpoint, EndpointSource, LendGrant, PeerFile, PeerRow, PeerStore,
 };
-use tcr::peer::lease::{self, Ledger, PeerLeaseProvider, RelayRefusal};
+use tcr::peer::lease::{self, Ledger, RelayRefusal};
 use tcr::peer::serve;
+use tcr::peer::serve::PeerLeaseProvider;
 use tcr::provider::Provider;
 use tcr_peer_wire::{Lease, LeaseRefusal, LeaseRequest, LeaseUnit, PeerId, Window};
 

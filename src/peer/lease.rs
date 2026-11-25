@@ -52,14 +52,15 @@ mod tests;
 pub use hand::{
     HANDOFF_RENEW_LEAD_MS, HandedBearer, HandedTokens, bearer_fingerprint, handed_baseline,
     handed_tokens, handoff_for, handoff_push_is_due, handoff_renewal_due, lease_has_ended,
-    serve_on_handed_bearer, usage_hint,
+    usage_hint,
 };
+pub(crate) use hand::{report_handed_spend, reported_utilization};
 pub use ledger::{
     Ledger, MAX_LEASES_PER_PEER, REQUEST_DEDUP_CAPACITY, REQUEST_DEDUP_TTL_MS, SERVED_CAPACITY,
     SERVED_PER_LEASE_CAPACITY, SERVED_TTL_MS, ScopeRestriction, WindowUtilization,
 };
 pub use lend_end::parse_lend_end;
-pub use provider::{PeerLeaseProvider, lenders_in_ask_order, nothing_left_this_mac, request_lease};
+pub use provider::{lenders_in_ask_order, nothing_left_this_mac, request_lease};
 
 /// Why one RELAYED REQUEST was refused, as opposed to why a LEASE was.
 ///

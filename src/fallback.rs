@@ -70,7 +70,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 
 use crate::peer::config::PeerStore;
-use crate::peer::lease::PeerLeaseProvider;
+use crate::peer::serve::PeerLeaseProvider;
 
 /// What a provider is told about a request the local fleet could not serve.
 ///

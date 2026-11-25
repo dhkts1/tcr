@@ -299,7 +299,7 @@ pub struct LeaseRow {
 ///
 /// The borrower's half of [`LeaseRow`], and the reason it exists at all: the
 /// borrower's copy of a lease lived only in
-/// [`crate::peer::lease::PeerLeaseProvider`]'s in-memory cache, so no CLI
+/// [`crate::peer::serve::PeerLeaseProvider`]'s in-memory cache, so no CLI
 /// process could read it and `tcr peer ls --json` printed `until: null` on
 /// every Mac that was being lent to. The lease is the borrower's own view of
 /// the lender's promise, a HINT, exactly as that cache's doc says, since the
@@ -1866,7 +1866,7 @@ pub fn save_leases(path: &Path, leases: &[LeaseRow]) -> Result<()> {
 /// [`save_leases`] for the other direction, and the same locked
 /// read-modify-write for the same reasons. See [`PeerState::borrowed`].
 ///
-/// Called by [`crate::peer::lease::PeerLeaseProvider`] when the set of live
+/// Called by [`crate::peer::serve::PeerLeaseProvider`] when the set of live
 /// borrowed leases CHANGES, a lease granted, or a refused one dropped, and
 /// never per relayed request: the borrower's copy of `spent` is the lender's
 /// figure and this file is not where it is kept.

@@ -107,6 +107,7 @@ mod frame;
 mod hello;
 mod lender;
 mod policy;
+mod provider;
 
 pub use borrow::{Borrowed, open_serve, open_serve_within};
 pub use dial::{
@@ -125,6 +126,7 @@ pub use policy::{
     CLIENT_CREDENTIAL_HEADERS, LENDER_FORWARDED_HEADERS, SERVE_METHOD, lender_forwards_header,
     refused_path_kind, relay_path_is_routable, scrub_client_credentials, serve_is_allowed_for_path,
 };
+pub use provider::{PeerLeaseProvider, serve_on_handed_bearer};
 
 /// Open one SERVE to a lender and return its answer.
 ///

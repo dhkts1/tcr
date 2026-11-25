@@ -516,7 +516,7 @@ async fn a_handed_request_carries_its_query_string_to_the_owners_upstream() {
         .expect("a client");
     let ask = ask_with_query("/v1/messages", "beta=true");
     let response =
-        lease::serve_on_handed_bearer(&upstream, &client, &ask, lease_id, Window::SevenDay, now)
+        serve::serve_on_handed_bearer(&upstream, &client, &ask, lease_id, Window::SevenDay, now)
             .await
             .expect("the handed request reached the fake upstream")
             .expect("a lease with a live handed bearer is served from here");

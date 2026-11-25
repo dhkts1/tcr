@@ -4,13 +4,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use anyhow::{Context as _, Result};
-use axum::http::HeaderMap;
-use axum::response::Response;
 use tcr_peer_wire::{Control, Lease, PeerId, Window};
 
 use super::MIN_DEBIT;
-use crate::fallback::Ask;
-use crate::peer::serve;
 
 /// The borrower's side of `hand` mode: the owner's short-lived
 /// bearers, in memory, keyed by lease.
@@ -211,7 +207,7 @@ pub(super) fn forget_handed_meter(lease_id: u128) {
 /// Never blocks and never fails the request: a hint that cannot be sent is a
 /// debit the owner does not learn about, which is worth a line and is not worth
 /// failing a served request over.
-pub(super) fn report_handed_spend(lease_id: u128, utilization: Option<f64>) {
+pub(crate) fn report_handed_spend(lease_id: u128, utilization: Option<f64>) {
     let Some(utilization) = utilization else {
         return;
     };
@@ -245,7 +241,7 @@ pub(super) fn report_handed_spend(lease_id: u128, utilization: Option<f64>) {
 /// `Quota::update_from_headers` because that merges into an account's quota,
 /// and a borrower has no account of the owner's to merge into. It is one
 /// figure, for one window, off one answer.
-fn reported_utilization(head: &[(String, String)], window: Window) -> Option<f64> {
+pub(crate) fn reported_utilization(head: &[(String, String)], window: Window) -> Option<f64> {
     let name = match window {
         Window::FiveHour => "anthropic-ratelimit-unified-5h-utilization",
         Window::SevenDay => "anthropic-ratelimit-unified-7d-utilization",
@@ -482,127 +478,6 @@ pub fn handed_baseline(lender: &PeerId, utilization: Option<f64>) -> Result<f64,
 /// observed spread of `expires_at` on a refreshed credential, which nobody
 /// has measured.
 pub const HANDOFF_RENEW_LEAD_MS: i64 = 5 * 60 * 1_000;
-
-/// Serve one borrowed request LOCALLY, on the bearer the owner handed over.
-///
-/// This is the half of the rule that makes `hand` mode different from
-/// `serve` mode at all: the bytes never touch the owner's Mac, so the request
-/// leaves from this node's own client and the owner never sees the plaintext.
-/// In `serve` mode the same lease would have gone through
-/// [`serve::open_serve`] and out of the owner's machine instead.
-///
-/// `client` is supplied by the caller rather than built here, because the
-/// caller is the only code that knows which client this node's egress policy
-/// says to use, and because a test points one at a fake origin with
-/// `reqwest::ClientBuilder::resolve` (the escape `src/peer/egress.rs` already
-/// documents: it overrides DNS only, so TLS still validates the real hostname).
-///
-/// `Ok(None)` for "no live handed bearer for this lease", which is not an
-/// error: the owner may not have pushed one yet, or the lease may have ended.
-/// The fallback ladder's next rung answers the client, and an unauthenticated
-/// call to upstream never happens.
-pub async fn serve_on_handed_bearer(
-    upstream_base: &str,
-    client: &reqwest::Client,
-    ask: &Ask<'_>,
-    lease_id: u128,
-    window: Window,
-    now_ms: i64,
-) -> Result<Option<Response>> {
-    // The client's own headers, narrowed to the names a lender forwards, for
-    // the reason `try_serve` hands them to `open_serve`: this request goes to
-    // the API, and the API answers 400 to one with no `anthropic-version`. Hand
-    // mode sends from THIS Mac, so the narrowing that `serve_request_from` does
-    // on the wire is done here instead; `build_handed_bearer_headers` then puts
-    // the owner's bearer on and strips what a pooled request never carries.
-    let mut forwarded = HeaderMap::new();
-    for (name, value) in &ask.headers {
-        if serve::lender_forwards_header(name.as_str()) {
-            forwarded.append(name.clone(), value.clone());
-        }
-    }
-    let Some(headers) = crate::proxy::build_handed_bearer_headers(&forwarded, lease_id, now_ms)
-    else {
-        return Ok(None);
-    };
-
-    // `set_path` on a parsed base, never `format!`, for the reason
-    // `peer::serve::serve_on_own_account` gives at length: a path that does not
-    // begin with `/` turns the authority into userinfo and sends this request
-    // to a host the client named.
-    let mut url =
-        reqwest::Url::parse(upstream_base).context("peer hand: the upstream base is not a URL")?;
-    url.set_path(ask.path);
-    url.set_query(ask.query);
-
-    let mut send = client.request(
-        reqwest::Method::from_bytes(ask.method.as_bytes())
-            .context("peer hand: the client's method is not a method")?,
-        url,
-    );
-    for (name, value) in &headers {
-        send = send.header(name.clone(), value.clone());
-    }
-    if !ask.body.is_empty() {
-        send = send.body(ask.body.clone());
-    }
-
-    let response = send
-        .send()
-        .await
-        .context("peer hand: the request on the handed bearer did not reach upstream")?;
-    let status = response.status().as_u16();
-    let head: Vec<(String, String)> = response
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_string(), value.to_string()))
-        })
-        .collect();
-    // WHAT THIS ANSWER COST THE OWNER, REPORTED BACK. A hand-mode lease was
-    // debited by nobody: the request leaves from this Mac, so the owner never
-    // sees it, and the only evidence of the spend is the rate-limit header on
-    // this answer. `report_handed_spend` turns two successive answers into the
-    // rise and sends it up the lease's own control session. See
-    // [`HandedMeter`].
-    report_handed_spend(lease_id, reported_utilization(&head, window));
-
-    let body = response
-        .bytes()
-        .await
-        .context("peer hand: the upstream response body did not read")?;
-
-    // Built here rather than through `peer::serve`'s private `response_from`:
-    // that function belongs to the relay path, this node is not relaying, and
-    // widening its visibility would make one helper answer for two paths that
-    // have different reasons to drop a header.
-    let mut builder = Response::builder().status(
-        axum::http::StatusCode::from_u16(status)
-            .with_context(|| format!("peer hand: {status} is not a status code"))?,
-    );
-    for (name, value) in &head {
-        // Hop-by-hop response headers describe the connection this node just
-        // made, not the one it is answering, exactly as the proxy drops them on
-        // the way back from upstream.
-        if crate::proxy::is_response_skip(name) {
-            continue;
-        }
-        let Ok(name) = axum::http::HeaderName::try_from(name.as_str()) else {
-            continue;
-        };
-        let Ok(value) = axum::http::HeaderValue::from_str(value) else {
-            continue;
-        };
-        builder = builder.header(name, value);
-    }
-    builder
-        .body(axum::body::Body::from(body))
-        .context("peer hand: could not build the response for this node's own client")
-        .map(Some)
-}
 
 /// When this lease stops being a lease, on the borrower's own clock.
 ///
