@@ -284,7 +284,7 @@ pub(super) struct ReservePlan {
 /// The safety rail and the lines of `tcr group reserve <group>`, or the refusal
 /// to print instead. Pure: it reads `config` and decides; nothing is written.
 ///
-/// A fleet with no Codex account ([`Config::holds_codex`]) runs the rail and
+/// A fleet with no Codex account ([`Config::holds_provider`]) runs the rail and
 /// the words it always has: refuse when the reservation would leave zero
 /// enabled, unreserved accounts, warn below three. `force` changes nothing
 /// there.
@@ -319,7 +319,7 @@ pub(super) fn plan_reserve(
             .collect()
     };
 
-    if !config.holds_codex() {
+    if !config.holds_provider(Provider::Codex) {
         let remaining = config.unreserved_enabled_count(&reserved_after);
         if remaining == 0 {
             let currently_reserved = sorted_reserved();

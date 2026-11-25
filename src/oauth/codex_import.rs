@@ -137,7 +137,7 @@ pub fn no_codex_login_message(path: &Path) -> String {
 /// needing a re-login all count. Read before a Codex save, it decides
 /// [`CODEX_FIRST_ACCOUNT_NOTICE`].
 pub(crate) fn holds_no_codex_row(config_path: &Path) -> anyhow::Result<bool> {
-    Ok(!load_or_default(config_path)?.holds_codex())
+    Ok(!load_or_default(config_path)?.holds_provider(crate::provider::Provider::Codex))
 }
 
 /// What a Codex save says when the config held no Codex row before it: whether tcr pools codex

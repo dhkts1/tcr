@@ -61,7 +61,14 @@ impl Config {
         self.accounts.is_empty()
     }
 
-    /// Whether any account of `provider` is configured, in any state.
+    /// Whether any account of `provider` is configured, in any state
+    /// (disabled, grouped, pinned, or not).
+    ///
+    /// With [`Provider::Codex`](crate::provider::Provider::Codex) it is the
+    /// gate every Codex-aware CLI sentence sits behind: a fleet for which it is
+    /// false is Claude-only, and prints exactly what it printed before Codex
+    /// accounts existed. Reads [`Self::accounts`], so a row the loader set
+    /// aside never counts, and neither does one already deleted from the file.
     pub fn holds_provider(&self, provider: crate::provider::Provider) -> bool {
         self.accounts.iter().any(|a| a.provider == provider)
     }
