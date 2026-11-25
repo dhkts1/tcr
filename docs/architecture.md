@@ -147,7 +147,7 @@ secondary slot: from its usage endpoint as `primary_window` and `secondary_windo
 response as `x-codex-{primary,secondary}-{used-percent,window-minutes,reset-at}` headers. tcr
 files each window into the five-hour or the weekly bar by its length, not by its slot: 600
 minutes or shorter is the five-hour bar, anything longer the weekly one, and the slot decides
-only when a window carries no length (`src/quota.rs`, `src/records/codex_probe.rs`). By slot, a Pro
+only when a window carries no length (`src/records/quota/mod.rs`, `src/records/codex_probe.rs`). By slot, a Pro
 account's numbers would land in the wrong bar: measured on ChatGPT Pro logins, the usage
 endpoint reports a single window of 604800 seconds (seven days) in the primary slot, and
 `secondary_window: null`. So a Pro account shows its weekly bar only, never a fabricated

@@ -236,7 +236,7 @@ nothing reads them.
 
 **An account with no `refreshToken` is not broken, but it is on a clock.** It serves
 requests normally until `accessToken` expires, then goes dead — there is nothing for the
-refresh loop (`src/manager/refresh.rs`) to mint a new access token from, so it skips the
+refresh loop (`src/manager/freshness/refresh.rs`) to mint a new access token from, so it skips the
 account cleanly rather than erroring, and it stays skipped. The only account shape that
 produces this today is one added via `tcr login --token` (`docs/cli.md` §"`--token`: adding
 a `claude setup-token` credential"): that credential's `user:inference`-only scope means the
@@ -388,7 +388,7 @@ unchanged from the value already running in production, and only the fleet ceili
 ## Keys read from the unmodelled map
 
 These ten are not fields of `Config`. They land in the flattened `extra` map and are read
-back out by name across the manager (see `src/manager/state.rs` and `src/manager/throttle.rs`).
+back out by name across the manager (see `src/manager/state.rs` and `src/manager/serving/throttle.rs`).
 They are fully live config with a caller in the boot or request path, not compatibility
 leftovers.
 

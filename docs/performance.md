@@ -108,7 +108,7 @@ The proxy writes one `request usage` line per served `/v1/messages` request and 
 `served`; the report prints both. In `overhead` a handful of lines still show a few ms of
 `throttle_ms` (8 of 58,315 in run 3 below, at most 8 ms; 3 of 79,667 in a later pass, at most
 6 ms). Nothing is throttled there: with both buckets off, `Manager::throttle_send` takes no lock
-and never sleeps (`src/manager/throttle.rs`), but `src/proxy.rs` still times the call, so on a
+and never sleeps (`src/manager/serving/throttle.rs`), but `src/proxy/mod.rs` still times the call, so on a
 machine at load 100 and more a task descheduled inside it shows up as a millisecond or two.
 
 **peak footprint** is the proxy's lifetime peak physical footprint, from `vmmap --summary` at
@@ -304,7 +304,7 @@ mutex (`Manager::record_bound_tokens`, `Manager::bound_token_account`) and the u
 buckets). Since `perf/fewer-locks`:
 
 - the map is 16 parts by token hash, each with its own mutex and a sixteenth of the cap
-  (`ShardedBoundTokens` in `src/manager/bound_tokens.rs`, whose doc says what that changes in
+  (`ShardedBoundTokens` in `src/manager/sessions/bound_tokens.rs`, whose doc says what that changes in
   eviction order and why a `DashMap` lost);
 - the usage buckets have a mutex per account, and the ledger handle a read-write lock;
 - the ledger's writer thread waits 2 ms before it blocks on an empty queue. Without that, the
@@ -430,7 +430,7 @@ serves a request a second or two, and between sessions nothing at all. Since `pe
   where three timers woke every 5 s (one every 60 s) to look at a flag.
 - **Four tokio worker threads by default**, or the machine's cores when fewer, where tokio's
   default is one per core. `TOKIO_WORKER_THREADS` sets the count (`tcr::proxy::server::worker_threads`).
-- **A closed day of the usage ledger is gzipped** (`src/usage.rs`, "Closed days are gzipped"):
+- **A closed day of the usage ledger is gzipped** (`src/records/usage/mod.rs`, "Closed days are gzipped"):
   every day older than yesterday, once when the ledger's writer starts and again each day. Every
   reader reads both forms.
 

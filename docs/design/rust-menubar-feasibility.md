@@ -24,7 +24,7 @@ holds still.
 | Bucket | Lines | Note |
 |---|---:|---|
 | Evaporates — the process boundary disappears | ~1,490 | `TcrTool.swift` entirely; most of `ServerController.swift`; `ToggleVerdict`'s `notHonoured` state is **structurally impossible** in-process against `Manager::set_disabled` (`src/manager/mod.rs`), which mutates live rotation *and* persists |
-| Already has a Rust counterpart | ~750 | `QuotaState` (`src/records/stats.rs`), `ProbeStatus` (`src/records/probe.rs`), `StatusSource` and `HeldWindow` (`src/cli.rs`), bar fill (`src/tui.rs`). Group colour is **better** in Rust — APCA (`src/base/config.rs`) against Swift's WCAG, plus `derive_group_color`, which Swift has no counterpart for |
+| Already has a Rust counterpart | ~750 | `QuotaState` (`src/records/stats.rs`), `ProbeStatus` (`src/records/probe.rs`), `StatusSource` and `HeldWindow` (`src/verbs/cli/render.rs`), bar fill (`src/verbs/tui/cells.rs`). Group colour is **better** in Rust — APCA (`src/base/config.rs`) against Swift's WCAG, plus `derive_group_color`, which Swift has no counterpart for |
 | Genuinely new Rust | **~1,250** | ordering/severity, readiness and tallies, the group tag + menu model, controller state |
 | Platform code, stays `objc2` regardless | ~790 | IOKit power assertions, `SMAppService`, the menu-bar image composition |
 
@@ -32,10 +32,10 @@ holds still.
 bucket is a *lower* bound (it excludes the `#[serde(default)]` forward-compat scaffolding and
 `.unknown(String)` degrade arms that exist only because a newer client may talk to an older server —
 in-process, version skew is a compile error), and the reuse bucket is an *upper* bound, because
-every reusable formatter in `src/tui.rs` is a private `fn` returning a `ratatui::Style`. Reuse costs
+every reusable formatter in `src/verbs/tui/` is a private `fn` returning a `ratatui::Style`. Reuse costs
 a `pub` plus a severity-as-data/style split.
 
-One hypothesis that did **not** survive: `src/tui.rs` was expected to be a large reuse win. It covers
+One hypothesis that did **not** survive: `src/verbs/tui/` was expected to be a large reuse win. It covers
 the primitives and almost none of the fleet-level derivations the menu bar exists for, and it has
 never rendered an account group tag at all — its "group" concept is session→account grouping.
 
