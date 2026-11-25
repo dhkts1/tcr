@@ -985,6 +985,21 @@ impl PeerFile {
         Ok(replaced)
     }
 
+    /// `tcr peer network-key set`: [`Self::set_network_key`] with a freshly
+    /// minted key. The refusal is decided BEFORE the mint, so a refused `set`
+    /// draws nothing from the CSPRNG and a mint failure never hides a refusal.
+    /// The outer error is the mint's; the inner is the refusal's pinned count.
+    /// Answers whether a key was replaced, and the key now held.
+    pub fn mint_network_key(&mut self, replace: bool) -> Result<Result<(bool, NetworkKey), usize>> {
+        let replaced = self.network_key.is_some();
+        if replaced && !replace {
+            return Ok(Err(self.peers.len()));
+        }
+        let key = NetworkKey::mint()?;
+        self.network_key = Some(key);
+        Ok(Ok((replaced, key)))
+    }
+
     /// Drop this Mac's network key (`tcr peer network-key clear`). Answers
     /// whether there was one to drop.
     pub const fn clear_network_key(&mut self) -> bool {

@@ -34,11 +34,10 @@ pub(super) fn run_peer_network_key(args: peer_cli::PeerNetworkKeyArgs) -> anyhow
             Ok(())
         }
         peer_cli::PeerNetworkKeyAction::Set => {
-            let key = peer::config::NetworkKey::mint()?;
             // A key already here is not something to overwrite on the strength
             // of one word of argv: every Mac still holding it goes dark to this
             // one, and the refusal names how many that is.
-            let replaced = file.set_network_key(key, args.replace).map_err(|pinned| {
+            let (replaced, key) = file.mint_network_key(args.replace)?.map_err(|pinned| {
                 anyhow::anyhow!(
                     "peer network-key: a key is already set on this Mac, and minting another \
                      cuts off every Mac still holding the old one, {pinned} pinned peer(s) here, \
