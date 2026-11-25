@@ -328,7 +328,7 @@ fn merge_account(
             // at runtime (`AccountRuntime::from_config`'s `unwrap_or(0)`),
             // which silently promotes a freshly added account to the PRIMARY
             // tier ahead of the established fleet. Mirrors
-            // `oauth::upsert_account`'s historical default. Skipped when the
+            // `login::upsert_account`'s historical default. Skipped when the
             // caller submitted an explicit priority (the documented
             // new-account case — see `AddAccountRequest`'s doc-comment in
             // `proxy.rs`), which is never overridden.
@@ -456,7 +456,7 @@ mod tests {
     /// `priority` reads as 0 at runtime (`AccountRuntime::from_config`'s
     /// `unwrap_or(0)`), which silently promotes a freshly added account to the
     /// PRIMARY tier ahead of the established fleet. Mirrors
-    /// `oauth::upsert_account`'s historical default, which this route did not
+    /// `login::upsert_account`'s historical default, which this route did not
     /// share before this fix.
     #[test]
     fn save_account_added_path_assigns_max_plus_one_priority_when_none_submitted() {

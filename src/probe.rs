@@ -319,7 +319,7 @@ async fn fetch_usage_at(
 
     let status = resp.status();
     if !status.is_success() {
-        let retry_after_secs = crate::proxy::parse_retry_after(resp.headers())
+        let retry_after_secs = crate::http_client::parse_retry_after(resp.headers())
             .and_then(|seconds| u64::try_from(seconds).ok());
         let detail = resp.text().await.unwrap_or_default();
         let detail = detail.chars().take(200).collect::<String>();

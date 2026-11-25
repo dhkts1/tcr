@@ -5,8 +5,8 @@ use super::*;
 use build_info::StandDownBuild;
 use tcr::log_err::LogErr as _;
 
-fn silent() -> cli::Liveness {
-    cli::Liveness::Silent {
+fn silent() -> live_client::Liveness {
+    live_client::Liveness::Silent {
         why: "the server did not answer within 5s".to_string(),
     }
 }
@@ -35,7 +35,7 @@ fn a_wedged_embedded_incumbent_is_not_told_to_run_replace() {
     let advice = wedged_incumbent_recovery(singleton::ProxyKind::Tcr);
     assert!(
         advice.contains("Stop the proxy explicitly")
-            && advice.contains(&format!("tcr {} or newer", tcr::restart::HANDOFF_SINCE)),
+            && advice.contains(&format!("tcr {} or newer", build_info::HANDOFF_SINCE)),
         "standalone recovery must explain when handoff is available: {advice}"
     );
 }
@@ -50,7 +50,7 @@ fn a_clean_stand_down_exits_zero() {
         StandDownBuild::Unknown,
     ] {
         assert_eq!(
-            stand_down_exit_code(&cli::Liveness::Answering, verdict),
+            stand_down_exit_code(&live_client::Liveness::Answering, verdict),
             0,
             "{verdict:?} is a working incumbent"
         );
@@ -63,7 +63,7 @@ fn a_clean_stand_down_exits_zero() {
 /// script, CI step and launchd job, which read the code and not the stderr.
 #[test]
 fn a_stale_incumbent_exits_non_zero() {
-    let code = stand_down_exit_code(&cli::Liveness::Answering, StandDownBuild::Stale);
+    let code = stand_down_exit_code(&live_client::Liveness::Answering, StandDownBuild::Stale);
     assert_ne!(code, 0, "a detected skew must be visible to `tcr && next`");
     assert_ne!(code, 1, "1 is a genuine startup failure");
     assert_ne!(code, 2, "2 is clap's usage error");
@@ -133,11 +133,11 @@ fn the_stand_down_exit_codes_are_the_numbers_tcrbar_switches_on() {
     // them, so the contract is asserted through the function TcrBar's input
     // actually comes from, against the same literals.
     assert_eq!(
-        stand_down_exit_code(&cli::Liveness::Answering, StandDownBuild::InSync),
+        stand_down_exit_code(&live_client::Liveness::Answering, StandDownBuild::InSync),
         0
     );
     assert_eq!(
-        stand_down_exit_code(&cli::Liveness::Answering, StandDownBuild::Stale),
+        stand_down_exit_code(&live_client::Liveness::Answering, StandDownBuild::Stale),
         3,
         "a stale incumbent must reach Swift as .incumbentIsStale"
     );

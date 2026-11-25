@@ -191,18 +191,6 @@ pub(super) fn effective_threshold(threshold: f64, reserve: f64, allow_reserve: b
     }
 }
 
-/// The ONE resolver for the effective Fable-weekly (`7d_oi`) threshold, consumed
-/// by both [`Manager::model_blocked`] and [`Manager::account_gate`]'s `FableWeekly`
-/// push so they can never independently drift — see
-/// [`crate::config::Config::fable_weekly_threshold`]'s doc for the operator-facing
-/// contract. `today` is whatever threshold the caller would otherwise apply to
-/// this bucket (the account's own `switch_threshold`, or `global_threshold`) —
-/// `config_override.unwrap_or(today)` byte-for-byte reproduces pre-knob
-/// behaviour when the knob is absent. Pure.
-pub fn effective_fable_threshold(config_override: Option<f64>, today: f64) -> f64 {
-    config_override.unwrap_or(today)
-}
-
 /// One pass of the pool pick, in the order the selector tries them for unpinned work:
 /// the provider's hard account lock, [`Manager::select_with_group`]'s three, then
 /// [`Manager::select_revalidation`]'s fallback once the proxy finds all three empty. Each

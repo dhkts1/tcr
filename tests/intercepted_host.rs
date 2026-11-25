@@ -71,7 +71,7 @@ impl TraceLog {
         );
         assert!(!logs.contains(CHATGPT_BEARER), "{logs}");
         assert!(
-            !logs.contains(tcr::mitm::CODEX_PROXY_AUTHORIZATION),
+            !logs.contains(tcr::request_key::CODEX_PROXY_AUTHORIZATION),
             "{logs}"
         );
     }
@@ -170,7 +170,7 @@ struct Tcr {
 /// connected to a local byte-echo stub, including when a regression chooses it incorrectly.
 async fn start() -> Tcr {
     let leaf_dir = tempfile::tempdir().expect("a temp dir for the leaf");
-    let assets = tcr::mitm::load_tls_in(leaf_dir.path()).expect("mint a leaf");
+    let assets = tcr::tls::load_tls_in(leaf_dir.path()).expect("mint a leaf");
     for host in ["chatgpt.com", "api.anthropic.com"] {
         assert!(
             assets
@@ -344,7 +344,7 @@ async fn through_tunnel_with_peer_port(
     tcp.write_all(
         format!(
             "CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\nProxy-Authorization: {}\r\n\r\n",
-            tcr::mitm::CODEX_PROXY_AUTHORIZATION
+            tcr::request_key::CODEX_PROXY_AUTHORIZATION
         )
         .as_bytes(),
     )

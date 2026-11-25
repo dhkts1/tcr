@@ -18,6 +18,10 @@
 //!   that adds its own root (`add_root_certificate`, tests only) adds it to
 //!   this set.
 //!
+//! It also reads the one response header every upstream caller honours,
+//! `retry-after` ([`parse_retry_after`]): the proxy, the peer egress and both
+//! quota probes parse it the same way.
+//!
 //! `clippy.toml` disallows `reqwest::Client::builder`, `reqwest::Client::new`
 //! and `reqwest::get` everywhere else, so a new site cannot skip it.
 
@@ -69,8 +73,43 @@ fn bundled_roots() -> impl Iterator<Item = reqwest::Certificate> {
         })
 }
 
+/// Parse a numeric `retry-after` header (seconds). RFC-date form is ignored (the
+/// caller falls back to a default).
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<i64> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+}
+
 #[cfg(test)]
 mod tests {
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    use super::parse_retry_after;
+
+    #[test]
+    fn parse_retry_after_ignores_rfc_date() {
+        // Numeric seconds parse to Some(n).
+        let mut numeric = HeaderMap::new();
+        numeric.insert("retry-after", HeaderValue::from_static("30"));
+        assert_eq!(parse_retry_after(&numeric), Some(30));
+
+        // RFC-date form is NOT parsed — current behavior returns None, so the
+        // caller falls back to its default. (This documents the gap a follow-up
+        // fix will close; do not change parse_retry_after to make this Some.)
+        let mut rfc_date = HeaderMap::new();
+        rfc_date.insert(
+            "retry-after",
+            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
+        assert_eq!(parse_retry_after(&rfc_date), None);
+
+        // Absent header → None.
+        let empty = HeaderMap::new();
+        assert_eq!(parse_retry_after(&empty), None);
+    }
+
     /// Every bundled root loads, so `builder` trusts the whole Mozilla set.
     #[test]
     fn every_bundled_root_loads() {

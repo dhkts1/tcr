@@ -1,6 +1,7 @@
 //! The account and org identity read from Anthropic's profile endpoint.
 
 use super::*;
+use crate::config::{Account, Config};
 
 /// Profile endpoint used to name the account.
 pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
@@ -9,10 +10,10 @@ pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 /// account (falls back to a prompt when absent) and `account_uuid`/`org_uuid`/
 /// `org_name` key the account's identity so multi-org logins stay distinct.
 pub struct Profile {
-    pub(super) email: Option<String>,
-    pub(super) account_uuid: Option<String>,
-    pub(super) org_uuid: Option<String>,
-    pub(super) org_name: Option<String>,
+    pub(crate) email: Option<String>,
+    pub(crate) account_uuid: Option<String>,
+    pub(crate) org_uuid: Option<String>,
+    pub(crate) org_name: Option<String>,
     /// `organization.organization_type`, verbatim — the account's PLAN. See
     /// [`crate::config::Account::organization_type`] for why this field and not
     /// `account.has_claude_max`.
@@ -44,7 +45,7 @@ impl Profile {
     /// taken from the token-exchange response instead. A field the profile
     /// endpoint did send is kept. Both answers describe the one token the
     /// exchange just minted, so they cannot name two different accounts.
-    pub(super) fn or_exchange_identity(self, identity: ExchangeIdentity) -> Self {
+    pub(crate) fn or_exchange_identity(self, identity: ExchangeIdentity) -> Self {
         let (account_uuid, email) = identity
             .account
             .map_or((None, None), |a| (a.uuid, a.email_address));
@@ -63,7 +64,7 @@ impl Profile {
     /// This profile, with each identity field the profile endpoint left empty taken from
     /// what the tool the login was imported from stored beside it. The endpoint describes the
     /// token itself, so a field it did send wins.
-    pub(super) fn or_stored_identity(self, stored: &StoredClaudeIdentity) -> Self {
+    pub(crate) fn or_stored_identity(self, stored: &StoredClaudeIdentity) -> Self {
         Self {
             email: self.email.or_else(|| stored.email.clone()),
             account_uuid: self.account_uuid.or_else(|| stored.account_uuid.clone()),
@@ -236,11 +237,11 @@ pub async fn try_fetch_profile_at(
 ///
 /// The token endpoint sends these on every exchange, whatever the scope
 /// (`docs/design/long-lived-tokens.md`, "Identity arrives free at exchange
-/// time"). [`login`] still asks the profile endpoint first, because only it
+/// time"). [`crate::login::login`] still asks the profile endpoint first, because only it
 /// carries the plan fields; this is what names the row when that fetch comes
-/// back empty, instead of [`unnamed_fallback`].
+/// back empty, instead of [`crate::login::unnamed_fallback`].
 #[derive(Debug, Default, Deserialize)]
-pub(super) struct ExchangeIdentity {
+pub(crate) struct ExchangeIdentity {
     #[serde(default)]
     account: Option<ExchangeAccount>,
     #[serde(default)]

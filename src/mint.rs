@@ -3,14 +3,14 @@
 //! on the clipboard. Nothing is written to the config file: this command
 //! exports, it never stores (`docs/design/long-lived-tokens.md`).
 //!
-//! Deliberately separate from [`crate::oauth`]'s login flow rather than a new
+//! Deliberately separate from [`crate::login`]'s login flow rather than a new
 //! branch inside it: the authorize host (`claude.com/cai/oauth/authorize`,
-//! not [`oauth::AUTHORIZE_URL`]) and redirect target (an out-of-band paste
+//! not [`login::AUTHORIZE_URL`]) and redirect target (an out-of-band paste
 //! page, not a local callback server) both differ, and `login_hint` here is
 //! load-bearing ergonomics for a KNOWN row rather than the add-a-new-account
-//! convenience it is in [`oauth::login`]. What IS shared — [`oauth::CLIENT_ID`],
-//! [`oauth::TOKEN_ENDPOINT`], [`oauth::OAUTH_SCOPES`],
-//! [`oauth::LOGIN_TOKEN_LIFETIME_SECS`] and the two headers the endpoint
+//! convenience it is in [`login::login`]. What IS shared — [`oauth::CLIENT_ID`],
+//! [`oauth::TOKEN_ENDPOINT`], [`login::OAUTH_SCOPES`],
+//! [`login::LOGIN_TOKEN_LIFETIME_SECS`] and the two headers the endpoint
 //! requires to avoid a bogus 429 — is reused by name, never re-typed.
 
 use std::io::IsTerminal as _;
@@ -26,11 +26,12 @@ use serde::Deserialize;
 use crate::config::{self, Account};
 use crate::identity;
 use crate::log_err::LogErr as _;
+use crate::login;
 use crate::oauth;
 use crate::provider_guard::{self, ClaudeOnlyVerb};
 
 /// Authorize endpoint used by `tcr mint`. Measured against the live endpoint
-/// (`docs/design/long-lived-tokens.md`) — distinct from [`oauth::AUTHORIZE_URL`],
+/// (`docs/design/long-lived-tokens.md`) — distinct from [`login::AUTHORIZE_URL`],
 /// which the browser-login flow uses.
 pub const MINT_AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
 
@@ -66,7 +67,7 @@ fn build_mint_flow(login_hint: &str) -> anyhow::Result<MintFlow> {
 
     let (auth_url, csrf) = client
         .authorize_url(|| CsrfToken::new_random_len(32))
-        .add_scope(Scope::new(oauth::OAUTH_SCOPES.to_string()))
+        .add_scope(Scope::new(login::OAUTH_SCOPES.to_string()))
         .set_pkce_challenge(challenge)
         .add_extra_param("code", "true")
         .add_extra_param("login_hint", login_hint)
@@ -91,7 +92,7 @@ fn mint_exchange_request_body(code: &str, verifier: &str, state: &str) -> serde_
         "client_id": oauth::CLIENT_ID,
         "redirect_uri": MINT_REDIRECT_URI,
         "code_verifier": verifier,
-        "expires_in": oauth::LOGIN_TOKEN_LIFETIME_SECS,
+        "expires_in": login::LOGIN_TOKEN_LIFETIME_SECS,
     })
 }
 
@@ -123,7 +124,7 @@ struct MintOrg {
 }
 
 /// Exchange the pasted authorization code for a long-lived token. A
-/// `.no_proxy()` client, exactly like [`oauth::exchange_code`]: an ambient
+/// `.no_proxy()` client, exactly like [`login::exchange_code`]: an ambient
 /// `HTTPS_PROXY` points at tcr itself, and routing this exchange through it
 /// would loop back into the very proxy this token is meant to feed.
 async fn exchange_mint_code(
@@ -222,7 +223,7 @@ fn evaluate_mint_response(requested_email: &str, response: MintExchangeResponse)
         };
     }
 
-    let requested_secs = oauth::LOGIN_TOKEN_LIFETIME_SECS as i64;
+    let requested_secs = login::LOGIN_TOKEN_LIFETIME_SECS as i64;
     let granted_secs = response.expires_in.unwrap_or(0);
     if granted_secs != requested_secs {
         return MintOutcome::LifetimeMismatch {
@@ -243,7 +244,7 @@ fn evaluate_mint_response(requested_email: &str, response: MintExchangeResponse)
 }
 
 /// Split a pasted `code#state` on `#`, keeping the part before it — exactly as
-/// [`oauth::login_with_token`] reads a bare line, per the bridge brief. Falls
+/// [`login::login_with_token`] reads a bare line, per the bridge brief. Falls
 /// back to the whole trimmed string when no `#` is present rather than
 /// erroring: a caller that pasted a bare code (no state) should not be
 /// refused a value [`exchange_mint_code`] can still try.
@@ -575,7 +576,7 @@ mod tests {
             .find(|(k, _)| k == "scope")
             .map(|(_, v)| v.into_owned())
             .expect("scope param present");
-        assert_eq!(scope, oauth::OAUTH_SCOPES);
+        assert_eq!(scope, login::OAUTH_SCOPES);
     }
 
     // --- exchange body ---------------------------------------------------
@@ -583,7 +584,7 @@ mod tests {
     #[test]
     fn mint_exchange_body_requests_the_long_lived_lifetime() {
         let body = mint_exchange_request_body("code123", "verifier", "state");
-        assert_eq!(body["expires_in"], oauth::LOGIN_TOKEN_LIFETIME_SECS);
+        assert_eq!(body["expires_in"], login::LOGIN_TOKEN_LIFETIME_SECS);
         assert_eq!(body["grant_type"], "authorization_code");
         assert_eq!(body["redirect_uri"], MINT_REDIRECT_URI);
     }
@@ -609,7 +610,7 @@ mod tests {
             "alice@example.com",
             response(
                 Some("alice@example.com"),
-                Some(oauth::LOGIN_TOKEN_LIFETIME_SECS as i64),
+                Some(login::LOGIN_TOKEN_LIFETIME_SECS as i64),
             ),
         );
         assert!(matches!(outcome, MintOutcome::Minted { .. }));
@@ -621,7 +622,7 @@ mod tests {
             "alice@example.com",
             response(
                 Some("mallory@example.com"),
-                Some(oauth::LOGIN_TOKEN_LIFETIME_SECS as i64),
+                Some(login::LOGIN_TOKEN_LIFETIME_SECS as i64),
             ),
         );
         assert!(matches!(outcome, MintOutcome::IdentityMismatch { .. }));
@@ -659,7 +660,7 @@ mod tests {
             outcome: MintOutcome::Minted {
                 token: "secret-token".to_string(),
                 org: "acme-corp".to_string(),
-                granted_secs: oauth::LOGIN_TOKEN_LIFETIME_SECS as i64,
+                granted_secs: login::LOGIN_TOKEN_LIFETIME_SECS as i64,
             },
         }];
         assert_eq!(

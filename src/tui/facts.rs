@@ -75,7 +75,7 @@ pub(super) fn live_facts(manager: &Manager, snapshot: &StatsSnapshot) -> Dashboa
             .filter(|home| !home.is_empty())
             .map(PathBuf::from),
         |codex_rows| {
-            let ca = crate::mitm::minted_ca_path();
+            let ca = crate::tls::minted_ca_path();
             let ca_readable = ca.is_file();
             let route = crate::codex_route::codex_route_in_process(
                 &manager.mitm_status(),

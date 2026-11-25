@@ -162,7 +162,7 @@ fn persist_via_file(config_path: &Path, account: Account) -> anyhow::Result<Stri
 
 /// The surgical half of a live-route fallback — [`config::save_account`]'s
 /// single-account read-modify-write — used when [`probe_add_route`]
-/// confirmed the route moments earlier but [`crate::cli::post_add_account`]
+/// confirmed the route moments earlier but [`crate::live_client::post_add_account`]
 /// itself then could not apply it (the route disappeared, or the proxy
 /// stopped answering before its 5s deadline). Bridge item A: this replaces
 /// [`persist_via_file`] on exactly those two arms of [`finish_login_account`].
@@ -256,7 +256,7 @@ fn persist_via_account_or_file(config_path: &Path, account: &Account) -> anyhow:
 /// On the live path the running server owns the durable write — this must
 /// NOT also whole-file [`config::save`] the (possibly already-stale) `config`
 /// this process is holding; that write is exactly the clobber this unit
-/// exists to remove. The quiet [`crate::cli::LiveControlError::NoServer`]
+/// exists to remove. The quiet [`crate::live_client::LiveControlError::NoServer`]
 /// case carries that SAME clobber risk, not a lesser one: the proxy the
 /// earlier capability probe confirmed alive can have exited any time in the
 /// profile-fetch / stdin-prompt / round-trip window since, so any OTHER
@@ -276,7 +276,7 @@ pub(super) async fn finish_login_account(
     match route {
         WriteRoute::File => persist_via_file(config_path, account),
         WriteRoute::Live => {
-            match crate::cli::post_add_account(config, &account).await {
+            match crate::live_client::post_add_account(config, &account).await {
                 // Behind the provider gate, and checked anyway: a non-Anthropic
                 // row the server did not confirm storing AS that provider is a
                 // row it stored as a Claude account, whose tokens go to Anthropic
@@ -315,14 +315,14 @@ pub(super) async fn finish_login_account(
                 // / round-trip window since. Same surgical write as
                 // `NoRoute`/`Unusable` below, falling back to a whole-file
                 // write only when there is no file yet at all.
-                Err(crate::cli::LiveControlError::NoServer) => {
+                Err(crate::live_client::LiveControlError::NoServer) => {
                     persist_via_account_or_file(config_path, &account)
                 }
                 // The proxy rejected our api-key. Writing the file here would
                 // be the clobber this unit exists to remove, in a new place:
                 // the running server keeps whatever it already had while the
                 // file quietly disagrees. Change nothing, exit non-zero.
-                Err(crate::cli::LiveControlError::Unauthorized) => bail!(
+                Err(crate::live_client::LiveControlError::Unauthorized) => bail!(
                     "the proxy on :{} rejected the api-key in {} — the config was NOT changed, \
                      because writing it would leave the running proxy unaware of this login. \
                      Fix `proxy.apiKey` and retry.",
@@ -333,7 +333,7 @@ pub(super) async fn finish_login_account(
                 // identity matched more than one live account). Do not fall
                 // back — the file's own resolution could land on a different
                 // account than the one the server was talking about.
-                Err(crate::cli::LiveControlError::Rejected(message)) => bail!(
+                Err(crate::live_client::LiveControlError::Rejected(message)) => bail!(
                     "the proxy running on :{} refused this: {message} Nothing was changed.",
                     config.proxy.port
                 ),
@@ -349,19 +349,19 @@ pub(super) async fn finish_login_account(
                 // re-reading the file fresh instead of trusting the stale
                 // snapshot. It is still HALF a login — say so loudly,
                 // mirroring `set_enabled`'s NoRoute arm.
-                Err(crate::cli::LiveControlError::NoRoute) => {
+                Err(crate::live_client::LiveControlError::NoRoute) => {
                     let saved = persist_via_account(config_path, &account)?;
                     eprintln!(
                         "[tcr] WARNING: the proxy running on :{} is too old to accept a live login (no {} route), so the account was written to {} while the proxy is running. It will not see this account until it restarts. {}",
                         config.proxy.port,
                         crate::proxy::ADD_ACCOUNT_PATH,
                         config_path.display(),
-                        crate::cli::RESTART_HINT,
+                        crate::live_client::RESTART_HINT,
                     );
                     Ok(saved)
                 }
                 // It answered something unusable, or did not answer in time
-                // (the wedged-port shape `cli::probe_incumbent`'s own tests
+                // (the wedged-port shape `live_client::probe_incumbent`'s own tests
                 // document as measured and real — the probe confirmed the
                 // route seconds ago and `post_add_account` then hit its own
                 // 5s deadline). Same shape of consequence as `NoRoute`, same

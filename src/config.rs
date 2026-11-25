@@ -1167,6 +1167,18 @@ pub struct AccountRename {
     pub org: Option<String>,
 }
 
+/// The ONE resolver for the effective Fable-weekly (`7d_oi`) threshold, consumed
+/// by both [`crate::manager::Manager::model_blocked`] and [`crate::manager::Manager::account_gate`]'s `FableWeekly`
+/// push so they can never independently drift — see
+/// [`Config::fable_weekly_threshold`]'s doc for the operator-facing
+/// contract. `today` is whatever threshold the caller would otherwise apply to
+/// this bucket (the account's own `switch_threshold`, or `global_threshold`) —
+/// `config_override.unwrap_or(today)` byte-for-byte reproduces pre-knob
+/// behaviour when the knob is absent. Pure.
+pub fn effective_fable_threshold(config_override: Option<f64>, today: f64) -> f64 {
+    config_override.unwrap_or(today)
+}
+
 impl Config {
     /// Whether session affinity is on, read from the unmodelled top-level
     /// `sessionAffinity` (default `true`: ON unless the file says
@@ -1204,13 +1216,10 @@ impl Config {
 
     /// The Fable weekly threshold the fleet-wide gate applies: the override
     /// when the file sets one, otherwise [`Self::switch_threshold`]. Resolved
-    /// through the manager's own resolver, so this and the selection path
+    /// through [`effective_fable_threshold`], so this and the selection path
     /// cannot disagree.
     pub fn effective_fable_weekly_threshold(&self) -> f64 {
-        crate::manager::effective_fable_threshold(
-            self.fable_weekly_threshold,
-            self.switch_threshold,
-        )
+        effective_fable_threshold(self.fable_weekly_threshold, self.switch_threshold)
     }
 
     /// The set of group labels currently marked `reserved`. Cheap to call —

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser as _;
 use tcr::doctor::{no_proxy_entry_exempts, points_at_tcr};
-use tcr::{cli, status};
+use tcr::{live_client, status};
 
 use crate::cmd::run::launch_env::LaunchKey;
 use crate::cmd::run::{
@@ -47,14 +47,14 @@ fn run_args(argv: &[&str]) -> RunArgs {
     run_args_of(Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} must parse: {e}")))
 }
 
-/// The running proxy's status as `cli::fetch_live_status` hands it over:
+/// The running proxy's status as `live_client::fetch_live_status` hands it over:
 /// parsed from the wire, so the tri-state `mitm` key is read the way a real
 /// answer is. `None` leaves the key out, as a server older than it does.
 /// Its pool holds one Codex account, without which the proxy intercepts no
 /// `chatgpt.com` tunnel at all.
 fn live_status(
     mitm: Option<serde_json::Value>,
-) -> Result<status::StatusPayload, cli::LiveStatusError> {
+) -> Result<status::StatusPayload, live_client::LiveStatusError> {
     let mut wire = serde_json::json!({
         "kind": status::STATUS_KIND,
         "accounts": [{
@@ -278,7 +278,7 @@ fn codex_launch_follows_what_the_running_proxy_reports() {
     };
     // (label, argv, the status read, whether the CA is on disk, the launch and
     // notices wanted — or the refusal's text).
-    type Live = Result<status::StatusPayload, cli::LiveStatusError>;
+    type Live = Result<status::StatusPayload, live_client::LiveStatusError>;
     type Want = Result<(CodexLaunch, Vec<String>), &'static str>;
     let rows: Vec<(&str, &[&str], Live, bool, Want)> = vec![
         (
@@ -291,14 +291,14 @@ fn codex_launch_follows_what_the_running_proxy_reports() {
         (
             "not listening",
             CODEX_RUN,
-            Err(cli::LiveStatusError::NoServer),
+            Err(live_client::LiveStatusError::NoServer),
             true,
             direct("no proxy answered on 127.0.0.1:3999"),
         ),
         (
             "no answer",
             CODEX_RUN,
-            Err(cli::LiveStatusError::NoAnswer(
+            Err(live_client::LiveStatusError::NoAnswer(
                 "the server did not answer within 5s".to_string(),
             )),
             true,
@@ -310,7 +310,7 @@ fn codex_launch_follows_what_the_running_proxy_reports() {
         (
             "an answer that is not a usable status",
             CODEX_RUN,
-            Err(cli::LiveStatusError::Unusable(
+            Err(live_client::LiveStatusError::Unusable(
                 "HTTP 401 Unauthorized — the proxy api-key in the config was rejected".to_string(),
             )),
             true,
@@ -513,7 +513,7 @@ fn a_direct_codex_launch_drops_only_the_proxy_variables_aimed_at_this_tcr() {
     let launch = codex_launch(
         &run_args(CODEX_RUN),
         3999,
-        &Err(cli::LiveStatusError::NoServer),
+        &Err(live_client::LiveStatusError::NoServer),
         Path::new("/tmp/ca.pem"),
         false,
         &env,

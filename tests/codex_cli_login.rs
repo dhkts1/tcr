@@ -509,7 +509,7 @@ fn fake_tcr(dir: &Path, version: &str) {
 /// the de-duplication removed, the one on both is warned about twice.
 #[test]
 fn login_codex_prints_its_notices_only_when_they_hold() {
-    let n1 = tcr::oauth::CODEX_FIRST_ACCOUNT_NOTICE.to_string();
+    let n1 = tcr::login::CODEX_FIRST_ACCOUNT_NOTICE.to_string();
 
     // (a) The first account, no codex login, two older tcrs on PATH.
     let scratch = Scratch::new("[]");

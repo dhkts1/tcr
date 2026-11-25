@@ -154,7 +154,7 @@ async fn live_refresher_sends_each_provider_to_its_own_token_endpoint() {
             .unwrap_or_else(|| panic!("the {route} endpoint was never called: {seen:?}"));
         body.clone()
     };
-    assert_eq!(body_at("codex")["client_id"], crate::codex_oauth::CLIENT_ID);
+    assert_eq!(body_at("codex")["client_id"], codex::CLIENT_ID);
     assert_eq!(body_at("codex")["refresh_token"], "rt-codex");
     assert_eq!(body_at("anthropic")["client_id"], CLIENT_ID);
     assert_eq!(body_at("anthropic")["refresh_token"], "rt-anthropic");
@@ -176,6 +176,41 @@ async fn no_refresh_never_hits_the_endpoint_and_fails_transiently() {
     assert!(matches!(err, OAuthError::Transient(_)));
     assert_eq!(
         err.to_string(),
+        format!("token refresh failed transiently: {NO_REFRESH_MESSAGE}")
+    );
+}
+
+/// An offline snapshot never refreshes; for a Codex row its remedy names the command that
+/// signs a Codex account in again, and the Anthropic remedy is the one it always was.
+///
+/// Watched red: one message for both providers names `tcr login` for a Codex row.
+#[tokio::test]
+async fn the_offline_expired_token_remedy_names_tcr_login_codex() {
+    let err = NoRefresh
+        .refresh(
+            crate::provider::Provider::Codex,
+            "rt-never-sent".to_string(),
+        )
+        .await
+        .expect_err("NoRefresh never refreshes");
+    std::assert_matches!(err, OAuthError::Transient(_));
+    assert_eq!(
+        err.to_string(),
+        format!("token refresh failed transiently: {NO_REFRESH_CODEX_MESSAGE}")
+    );
+    assert!(
+        NO_REFRESH_CODEX_MESSAGE.contains("re-run after `tcr login --codex --account <name>`"),
+        "{NO_REFRESH_CODEX_MESSAGE}"
+    );
+    let claude = NoRefresh
+        .refresh(
+            crate::provider::Provider::Anthropic,
+            "rt-never-sent".to_string(),
+        )
+        .await
+        .expect_err("NoRefresh never refreshes");
+    assert_eq!(
+        claude.to_string(),
         format!("token refresh failed transiently: {NO_REFRESH_MESSAGE}")
     );
 }

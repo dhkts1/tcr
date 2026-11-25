@@ -852,7 +852,7 @@ async fn base_url_loopback_proceeds_not_rejected_503() {
 
 /// Test 4 — the MITM-terminated shape (origin-form `/v1/messages`, `Host:
 /// api.anthropic.com`) passes the guard via the allowlist branch
-/// (`crate::mitm::host_allowed`) → rotation loop → dead upstream → 503.
+/// (`crate::tls::host_allowed`) → rotation loop → dead upstream → 503.
 #[tokio::test]
 async fn anthropic_host_proceeds_not_rejected_503() {
     let addr = spawn_dead_upstream_proxy().await;

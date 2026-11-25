@@ -54,13 +54,16 @@ use time::OffsetDateTime;
 use crate::bound_tokens::BoundTokenKind;
 use crate::config;
 use crate::fallback;
+use crate::http_client::parse_retry_after;
 use crate::manager::{
     AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, ExhaustionHint,
     InFlightGuard, Manager, MintedToken, SetControlOutcome, SetDisabledOutcome, SetPriorityOutcome,
 };
+use crate::observations::TRUNCATED_STREAM_ERROR_KIND;
 use crate::provider::Provider;
 use crate::quota::{UnifiedRejectionKind, quota_rejections};
-use crate::stats::{GateReason, SessionKind};
+use crate::request_key::{ProxySecrets, key_matches};
+use crate::stats::{GateReason, SessionKind, describe_gates, gate_phrase};
 
 mod client_error;
 mod ladder;
@@ -142,14 +145,6 @@ pub const RELAYED_HEADER_NAME: &str = "x-tcr-relayed";
 /// the parser (usage counting becomes best-effort) rather than letting the buffer
 /// grow without bound or gating the client passthrough on the parser.
 const SSE_TEE_CAPACITY: usize = 256;
-/// The fixed `stream_error` kind [`parse_sse_usage`] synthesizes when a stream
-/// ends without Anthropic's `message_stop` terminator and no more specific
-/// in-band `error` event already explained why. Named so the proxy handler's
-/// classifier can tell "we witnessed an explicit error" (always trustworthy)
-/// apart from "we never saw the terminator" (trustworthy only when we also
-/// know we saw everything there was to see — see the handler's use of this).
-/// `pub(crate)` so [`crate::routing::ErrorKind::of_stream`] reads this spelling, not a copy.
-pub(crate) const TRUNCATED_STREAM_ERROR_KIND: &str = "truncated";
 /// The content-block type Anthropic uses for a tool IT runs — `--advisor` today, `web_search`
 /// next. Its result block travels with an `encrypted_content` that only the minting
 /// organization can decrypt, which is why the id has to be remembered at all: see
@@ -709,33 +704,6 @@ fn request_keying(
     }
 }
 
-/// The two proxy secrets a client may send this proxy: `proxy.apiKey` and the request key.
-/// Neither is a client identity (so [`stable_session_key`] skips an `x-api-key` equal to
-/// either) nor a credential for any other host (so [`build_passthrough_headers`] strips it).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ProxySecrets<'a> {
-    pub api_key: Option<&'a str>,
-    pub request_key: Option<&'a str>,
-}
-
-impl ProxySecrets<'_> {
-    /// No secret configured.
-    pub const NONE: ProxySecrets<'static> = ProxySecrets {
-        api_key: None,
-        request_key: None,
-    };
-
-    /// Is `value` one of these secrets? Constant-time per secret ([`key_matches`]); an
-    /// empty secret matches nothing.
-    pub fn contains(&self, value: Option<&str>) -> bool {
-        [self.api_key, self.request_key]
-            .into_iter()
-            .flatten()
-            .filter(|secret| !secret.is_empty())
-            .any(|secret| key_matches(value, secret))
-    }
-}
-
 /// A deterministic hash of `prefix` + `value`, used to derive a stable affinity
 /// key. What this needs to hold is DETERMINISM ACROSS PROCESSES, not just
 /// within one — pins now persist to disk and are restored at boot (see
@@ -1033,7 +1001,7 @@ pub const ADD_ACCOUNT_ENDPOINT: &str = "accounts-add";
 /// server can store: [`crate::provider::Provider::as_str`] over
 /// [`crate::provider::Provider::ALL`], so `anthropic,codex`. Set by
 /// `stamp` (for `ADD_ACCOUNT_ROUTE`), so it rides on every answer the account-add route
-/// stamps — the blank-probe 400 `oauth::probe_add_route` provokes, a 405, a
+/// stamps — the blank-probe 400 `login::probe_add_route` provokes, a 405, a
 /// 409, a 200 — and never on the unstamped gate refusal, which must not confirm
 /// the route exists to a caller that failed the gate.
 ///
@@ -1044,7 +1012,7 @@ pub const ADD_ACCOUNT_ENDPOINT: &str = "accounts-add";
 /// needs no such proof, and the header's absence changes nothing for one.
 ///
 /// A SECOND header, deliberately, never a new value of [`ENDPOINT_HEADER`]:
-/// `cli::post_add_account` recognises the route by that stamp's exact value, and
+/// `live_client::post_add_account` recognises the route by that stamp's exact value, and
 /// every older CLI (TcrBar's bundled one included) would read a changed stamp as
 /// "no such route" and refuse every Anthropic login.
 pub const PROVIDERS_HEADER: &str = "x-tcr-providers";
@@ -1416,7 +1384,7 @@ pub fn host_is_loopback(host: &str) -> bool {
 }
 
 /// The provider whose requests each host tcr intercepts carries: every host on
-/// [`crate::mitm::ALLOWED_HOSTS`], and no other (`every_intercepted_host_names_its_provider`
+/// [`crate::tls::ALLOWED_HOSTS`], and no other (`every_intercepted_host_names_its_provider`
 /// pins both directions). `platform.claude.com` is Anthropic's: Claude Code refreshes its own
 /// login there.
 const INTERCEPTED_HOST_PROVIDERS: [(&str, Provider); 3] = [
@@ -1426,7 +1394,7 @@ const INTERCEPTED_HOST_PROVIDERS: [(&str, Provider); 3] = [
 ];
 
 /// The provider an intercepted `host` (no port) belongs to, compared as
-/// [`crate::mitm::host_allowed`] compares it; `None` for any other host, loopback included.
+/// [`crate::tls::host_allowed`] compares it; `None` for any other host, loopback included.
 fn intercepted_host_provider(host: &str) -> Option<Provider> {
     INTERCEPTED_HOST_PROVIDERS
         .iter()
@@ -2996,7 +2964,7 @@ struct AddAccountRequest {
     /// The upstream the credential belongs to. Absent is Anthropic: every body
     /// posted before this field existed, and every Anthropic row, which
     /// `config::Account` serializes with no `provider` key. A Codex import
-    /// (`oauth::login_from_codex`) posts `"provider": "codex"`. Without this
+    /// (`login::login_from_codex`) posts `"provider": "codex"`. Without this
     /// field the route dropped it, filed that credential as an Anthropic account
     /// and resolved it onto any Anthropic row sharing its name or id, overwriting
     /// that row's own single-use refresh token.
@@ -3018,11 +2986,11 @@ struct AddAccountRequest {
 /// [`crate::singleton::ProxyHost::Unknown`] — because the `tcr` that
 /// deserializes a reply can be older than the `tcr` that served it. Every
 /// field below carries `#[serde(default)]` so a field a NEWER server has
-/// renamed or dropped does not fail the whole deserialize: `cli::post_add_account`
+/// renamed or dropped does not fail the whole deserialize: `live_client::post_add_account`
 /// maps a deserialize failure on a 2xx to `LiveControlError::Unusable`, and
-/// `oauth::probe_add_route` reads that as `AddCapability::Unusable` — a
+/// `login::probe_add_route` reads that as `AddCapability::Unusable` — a
 /// *successful* live add would then look indistinguishable from a wedged or
-/// route-less proxy, and `oauth::admit_login` REFUSES outright (bridge item D)
+/// route-less proxy, and `login::admit_login` REFUSES outright (bridge item D)
 /// instead of silently falling back to the file beside a server that just
 /// handled the request correctly. Field ADDITIONS are already safe on their
 /// own (an older CLI just ignores a key it doesn't know); this attribute is
@@ -3071,7 +3039,7 @@ pub struct AddAccountResponse {
 
 /// Shown when the submitted account carries no refresh token: it will serve
 /// until its access token expires and then go dead, silently, unless the
-/// operator hears about it now. `pub(crate)` so [`crate::oauth::login_with_token`]
+/// operator hears about it now. `pub(crate)` so [`crate::login::login_with_token`]
 /// can print the same hazard on the offline (file) route too — that path
 /// never goes through this module's `add_account_handler`, so nothing else
 /// would say it.
@@ -3139,11 +3107,11 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
         Ok(parsed) => parsed,
         Err(refusal) => return *refusal,
     };
-    // LOAD-BEARING CAPABILITY SIGNAL: `oauth::probe_add_route` deliberately
+    // LOAD-BEARING CAPABILITY SIGNAL: `login::probe_add_route` deliberately
     // POSTs a blank name to trigger exactly this branch, and reads a STAMPED
     // 400 back as proof this route exists. Changing the status (e.g. to 422),
     // or answering without the route's stamp, silently turns that read into
-    // `AddCapability::Unusable` — `oauth::admit_login` then REFUSES outright (bridge
+    // `AddCapability::Unusable` — `login::admit_login` then REFUSES outright (bridge
     // item D) rather than falling back to the file, so this degrades to a
     // needless refusal beside a server that actually has the route, not the
     // whole-file clobber this feature exists to remove. See the seam test
@@ -3843,7 +3811,7 @@ async fn handle_request(
         // primitive the client-peer check uses above, and the same derivation the
         // local-endpoint gate runs — one answer to "which host did the client
         // mean", on both paths.
-        if !host_is_loopback(host) && !crate::mitm::host_allowed(host) {
+        if !host_is_loopback(host) && !crate::tls::host_allowed(host) {
             tracing::debug!(target_host = %host, "rejected misrouted forward-proxy request");
             return ClientError::new(
                 StatusCode::MISDIRECTED_REQUEST,
@@ -4907,7 +4875,8 @@ async fn handle_request(
                     // attribute it to; `is_connect` / `is_timeout` separate "never
                     // reached the host" from "the host went quiet mid-request".
                     ladder.transport_failed();
-                    manager.record_upstream_error(provider, crate::routing::ErrorKind::Transport);
+                    manager
+                        .record_upstream_error(provider, crate::observations::ErrorKind::Transport);
                     // **Blind peer egress, the one offer per request.**
                     //
                     // Four conjuncts, and the first two are what stop a carry
@@ -5187,7 +5156,7 @@ async fn handle_request(
                 );
                 // The kind a status alone names, once per attempt, for the routing document.
                 // Observation only: the arms below keep every retry, hold and rotation.
-                if let Some(kind) = crate::routing::ErrorKind::of_status(status.as_u16()) {
+                if let Some(kind) = crate::observations::ErrorKind::of_status(status.as_u16()) {
                     manager.record_upstream_error(provider, kind);
                 }
             }
@@ -6080,7 +6049,7 @@ async fn handle_request(
         let bytes = match read_capped_body(upstream_body, MAX_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(BodyReadError::Transport) => {
-                manager.record_upstream_error(provider, crate::routing::ErrorKind::Transport);
+                manager.record_upstream_error(provider, crate::observations::ErrorKind::Transport);
                 return ClientError::new(
                     StatusCode::BAD_GATEWAY,
                     ErrorKind::Proxy,
@@ -6105,7 +6074,8 @@ async fn handle_request(
                 {
                     log_upstream_error_body(idx, account_name.as_deref(), status, &bytes);
                     // Capacity: this account cannot serve the model now, which is not overload.
-                    manager.record_upstream_error(provider, crate::routing::ErrorKind::Capacity);
+                    manager
+                        .record_upstream_error(provider, crate::observations::ErrorKind::Capacity);
                     ladder.model_refused(account_name.clone(), detail);
                     ladder.bench(idx);
                     continue;
@@ -6196,28 +6166,6 @@ async fn handle_request(
         strict_group,
         bound_to,
     )
-}
-
-/// Length-independent comparison of the presented key against the configured
-/// one. It never returns early on a length mismatch, so the loop count depends
-/// only on the *presented* key's length (attacker-controlled) and never reveals
-/// the configured key's length via timing. The length delta is folded into the
-/// accumulator so a matching-prefix but wrong-length key still compares unequal.
-pub(crate) fn key_matches(provided: Option<&str>, expected: &str) -> bool {
-    let Some(provided) = provided else {
-        return false;
-    };
-    let (a, b) = (provided.as_bytes(), expected.as_bytes());
-    // Seed the accumulator with the length mismatch instead of branching on it
-    // (a bare `as u8` truncation would alias e.g. 256 vs 0, so reduce to 0/1).
-    let mut diff: u8 = u8::from(a.len() != b.len());
-    for (i, &x) in a.iter().enumerate() {
-        // Read past the configured key's end as 0 rather than short-circuiting;
-        // the length delta above already forces a non-match in that case.
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Why [`read_capped_body`] stopped short of a full buffer.
@@ -7172,15 +7120,6 @@ fn build_response(
         headers.append(name.clone(), value.clone());
     }
     response
-}
-
-/// Parse a numeric `retry-after` header (seconds). RFC-date form is ignored (the
-/// caller falls back to a default).
-pub(crate) fn parse_retry_after(headers: &HeaderMap) -> Option<i64> {
-    headers
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<i64>().ok())
 }
 
 #[cfg(test)]
@@ -8680,63 +8619,6 @@ fn switch_warning(
         .retry_after(SWITCH_WARNING_RETRY_AFTER_SECS)
         .respond(provider),
     )
-}
-
-/// What a gate means, in words a person reads after an account count or after "out".
-const fn gate_phrase(reason: GateReason) -> &'static str {
-    match reason {
-        GateReason::Ok => "in rotation",
-        GateReason::Hold => "on an upstream hold",
-        GateReason::Refused => "refused upstream (403)",
-        GateReason::FiveHour => "in the 5-hour window",
-        GateReason::SevenDay => "in the weekly window",
-        GateReason::FableWeekly => "in the Fable weekly window",
-        GateReason::Standard => "at a token limit",
-        GateReason::Login => "needing re-login",
-        GateReason::Rejected => "rejected upstream",
-        GateReason::Disabled => "disabled",
-        GateReason::Reserved => "reserved for another group",
-        GateReason::Parked => "in a parked group",
-    }
-}
-
-/// `: 3 in the 5-hour window, 1 on an upstream hold` — or empty when nothing is
-/// gated, so the message never ends in a dangling colon.
-pub fn describe_gates(gated: &std::collections::BTreeMap<GateReason, usize>) -> String {
-    describe_gates_with(gated, gate_phrase)
-}
-
-fn describe_gates_with(
-    gated: &std::collections::BTreeMap<GateReason, usize>,
-    phrase: fn(GateReason) -> &'static str,
-) -> String {
-    let parts: Vec<String> = gated
-        .iter()
-        .map(|(reason, n)| format!("{n} {}", phrase(*reason)))
-        .collect();
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!(": {}", parts.join(", "))
-    }
-}
-
-/// What a gate means for a Codex account: [`gate_phrase`]'s words, except where a Codex
-/// account's gate means something else. ChatGPT's own refusal is no Claude "rejected", and a
-/// Codex account in a reserved group is unreachable, because a Codex request carries no group
-/// that could reach it.
-const fn codex_gate_phrase(reason: GateReason) -> &'static str {
-    match reason {
-        GateReason::Rejected => "refused by ChatGPT",
-        GateReason::Reserved => "unreachable in a reserved group",
-        other => gate_phrase(other),
-    }
-}
-
-/// [`describe_gates`] in [`codex_gate_phrase`]'s words, for a tally of Codex accounts:
-/// `: 1 in the weekly window, 1 needing re-login`, or empty when nothing is gated.
-pub fn describe_codex_gates(gated: &std::collections::BTreeMap<GateReason, usize>) -> String {
-    describe_gates_with(gated, codex_gate_phrase)
 }
 
 /// `HH:MM:SS UTC` for a message a human reads next to a seconds count, with the date in front

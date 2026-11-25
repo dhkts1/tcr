@@ -1,6 +1,7 @@
 //! The per-account gates: holds, rejections, the terminal and hard gates, eligibility, pacing and the binding gate reason.
 
 use super::*;
+use crate::config::effective_fable_threshold;
 
 impl Manager {
     /// Milliseconds still to run on a LIVE rate-limit hold, or `None` when the

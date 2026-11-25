@@ -38,7 +38,7 @@ pub const RESTART_HINT: &str = concat!(
 /// rest write it and shout. Collapsing them is how a half-applied disable becomes
 /// invisible again.
 ///
-/// `pub(crate)`: [`crate::oauth`]'s live-login half reuses this exact enum for
+/// `pub(crate)`: [`crate::login`]'s live-login half reuses this exact enum for
 /// [`post_add_account`] rather than defining a parallel one — see that
 /// function's doc-comment.
 #[derive(Debug)]
@@ -168,7 +168,7 @@ pub(super) struct ControlRoute {
 }
 
 /// 400 is the route's own request validation (a blank name or token), the
-/// positive capability signal `oauth::probe_add_route` looks for; 409 is a
+/// positive capability signal `login::probe_add_route` looks for; 409 is a
 /// submitted identity that matched more than one live account.
 const ADD_ACCOUNT_ROUTE: ControlRoute = ControlRoute {
     path: crate::proxy::ADD_ACCOUNT_PATH,
@@ -273,7 +273,7 @@ pub(super) async fn call_route_with_policy<T: serde::de::DeserializeOwned>(
 /// already serializes to the exact wire shape
 /// [`crate::proxy::ADD_ACCOUNT_PATH`] expects (see that route's
 /// `AddAccountRequest` doc-comment), so a caller builds the credential once —
-/// for a real login, or `crate::oauth::probe_add_route`'s deliberately
+/// for a real login, or `crate::login::probe_add_route`'s deliberately
 /// blank probe — and this function never re-lists its fields.
 ///
 /// A stamped `400` is this route's own request-validation failure (a blank

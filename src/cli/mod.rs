@@ -5,7 +5,7 @@
 //! (`~/.config/tcr.json`) directly, so friends can curate the fleet without
 //! hand-editing JSON.
 //!
-//! The seam copies [`crate::oauth::login`]: pure functions here `load` → mutate
+//! The seam copies [`crate::login::login`]: pure functions here `load` → mutate
 //! a `&mut Config` → [`config::save`]; `main.rs` is a thin parse-and-delegate
 //! layer. Every load/save wrapper WARNS to stderr when a proxy is already
 //! listening on the config's port — a running server refreshes tokens and
@@ -26,7 +26,6 @@ mod accounts;
 mod fan;
 mod groups;
 mod list_v1;
-mod live_client;
 mod live_edit;
 mod live_reads;
 mod render;
@@ -45,10 +44,6 @@ pub use groups::{
     unreserve_group, validate_group_label_chars,
 };
 pub use list_v1::list_v1;
-pub use live_client::{
-    IncumbentProbe, LiveStatusError, Liveness, RESTART_HINT, fetch_live_status, probe_incumbent,
-};
-pub(crate) use live_client::{LiveControlError, post_add_account, post_add_account_with_providers};
 pub use live_reads::{live_peers, routing, sessions};
 pub use render::{StatusSource, list_accounts, render_accounts, snapshot_offline};
 pub use reset::{codex_reset, reset};
@@ -104,7 +99,7 @@ fn load_config_with_creation(config_path: &Path) -> anyhow::Result<(Config, bool
 /// to render — re-read from disk after a successful import, so the verb shows
 /// the account it just wrote rather than the empty fleet it loaded a moment
 /// ago. Everything about "is there a login, did the write work" lives in
-/// [`crate::oauth::auto_import_claude_code_login`]; what lives HERE is the one
+/// [`crate::login::auto_import_claude_code_login`]; what lives HERE is the one
 /// rule that keeps it idempotent: a config with accounts in it is never
 /// touched, so an account removed on purpose stays removed.
 ///
@@ -116,7 +111,7 @@ async fn import_claude_code_login_if_empty(config_path: &Path, config: Config) -
     if !config.holds_no_accounts() || config.refuses_claude_code_import() {
         return config;
     }
-    if crate::oauth::auto_import_claude_code_login(config_path)
+    if crate::login::auto_import_claude_code_login(config_path)
         .await
         .is_none()
     {

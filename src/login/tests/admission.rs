@@ -232,7 +232,7 @@ async fn probe_add_capability_connection_refused_is_absent() {
     assert_eq!(probe_add_capability(&config).await, AddCapability::Absent);
 }
 
-/// The WEDGED shape `cli::probe_incumbent`'s own tests document as
+/// The WEDGED shape `live_client::probe_incumbent`'s own tests document as
 /// measured and real (`a_listener_that_never_answers_is_silent_not_answering`):
 /// bound, the connect succeeds off the kernel backlog, and nothing is
 /// ever written back. Costs the probe's own 5s deadline by construction.

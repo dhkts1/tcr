@@ -8,7 +8,7 @@ use tcr::cli::{self, validate_group_label_chars};
 use tcr::config::Config;
 use tcr::doctor::{no_proxy_entry_exempts, points_at_tcr};
 use tcr::proxy::{self, GROUP_HEADER_NAME};
-use tcr::{codex_route, mitm, status};
+use tcr::{codex_route, live_client, status, tls};
 
 use super::ConfigFile;
 use super::server::load_config;
@@ -135,8 +135,8 @@ pub(crate) async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // ONE read of the running proxy answers both "is it listening" and "does
         // it intercept chatgpt.com", so the two cannot disagree. The CA is named,
         // never loaded: loading it here could re-mint a leaf the proxy never reads.
-        let live = cli::fetch_live_status(&config).await;
-        let ca = mitm::minted_ca_path();
+        let live = live_client::fetch_live_status(&config).await;
+        let ca = tls::minted_ca_path();
         let launch = codex_launch(&args, port, &live, &ca, ca.is_file(), &|var| {
             std::env::var(var).ok()
         })?;
@@ -220,7 +220,7 @@ pub(crate) async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // ONE read of the running proxy's status per launch. It decides the request key (sent
         // only to a server that reports `requestKeyMode`), and, for a config that holds Codex
         // accounts and no Claude one, whether the proxy will refuse this whole session.
-        let live = cli::fetch_live_status(&config).await;
+        let live = live_client::fetch_live_status(&config).await;
         if holds_only_codex(&config)
             && let Ok(payload) = &live
             && let Some(warning) = no_claude_account_warning(port, payload)
@@ -350,7 +350,7 @@ impl CodexLaunch {
 /// # The running proxy decides
 ///
 /// The proxy loads its MITM leaf once, at boot, and nothing reloads it. This
-/// used to be decided by a load in THIS process instead (`mitm::load_tls`),
+/// used to be decided by a load in THIS process instead (`tls::load_tls`),
 /// which re-mints a stale leaf on disk and reports coverage the running proxy
 /// does not have. So with an older proxy running, or a current one whose TLS
 /// load failed at boot, it printed the see-through banner over a session
@@ -376,7 +376,7 @@ impl CodexLaunch {
 fn codex_launch(
     args: &RunArgs,
     port: u16,
-    status: &Result<status::StatusPayload, cli::LiveStatusError>,
+    status: &Result<status::StatusPayload, live_client::LiveStatusError>,
     ca: &Path,
     ca_is_file: bool,
     inherited: &dyn Fn(&str) -> Option<String>,
@@ -414,7 +414,7 @@ fn codex_launch(
 
 /// The line `tcr run --codex` prints before its banner when the running proxy pools codex but
 /// no Codex account in its pool can serve right now: why each is out, worded as tcr's own 429
-/// lists its gates but in Codex words ([`proxy::describe_codex_gates`]), and when the first one
+/// lists its gates but in Codex words ([`tcr::stats::describe_codex_gates`]), and when the first one
 /// frees ([`proxy::at_utc`]), or that none reports when. `None` when a Codex account is in
 /// rotation, or when the pool holds none (the launch already said so).
 ///
@@ -458,7 +458,7 @@ fn codex_pool_preflight(
     };
     Some(format!(
         "[tcr] no Codex account can serve right now{} — {tail}",
-        proxy::describe_codex_gates(&tally)
+        tcr::stats::describe_codex_gates(&tally)
     ))
 }
 
@@ -738,12 +738,12 @@ fn mark_run_active(cmd: &mut std::process::Command) {
 /// migration at startup; a client must never replace the CA while that server still
 /// presents the leaf it loaded at boot. Missing or unusable material selects base-URL mode.
 fn see_through_ca() -> Option<PathBuf> {
-    let ca = mitm::minted_ca_path();
+    let ca = tls::minted_ca_path();
     see_through_ca_in(ca.parent().unwrap_or_else(|| Path::new(".")))
 }
 
 fn see_through_ca_in(dir: &Path) -> Option<PathBuf> {
-    match mitm::existing_ca_path_in(dir) {
+    match tls::existing_ca_path_in(dir) {
         Ok(ca_path) => match ca_path {
             Some(ca) if ca.is_file() => Some(ca),
             // A path we cannot read is not a CA we can hand to claude.

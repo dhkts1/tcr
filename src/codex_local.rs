@@ -384,6 +384,40 @@ pub fn codex_login_child_path(codex: &Path) -> String {
     codex_child_path(codex, env_value("PATH").as_deref(), &fixed)
 }
 
+/// The warning for a `tcr` at `path`, reporting `version`, that is 0.2.45 or older: it predates
+/// the `credentialVersion` check, so it would read a Codex row as a Claude account and send its
+/// OpenAI token to Anthropic the next time it starts on this config.
+pub fn older_tcr_reads_codex_as_claude_notice(path: &Path, version: &str) -> String {
+    format!(
+        "the tcr at {} ({version}) predates Codex accounts: update it before it next starts — it \
+         would read this login as a Claude account and send its token to Anthropic",
+        path.display()
+    )
+}
+
+/// The warning for a `tcr` at `path`, reporting `version`, from 0.2.46 on that still lacks
+/// `--from-codex`: it checks `credentialVersion`, so it refuses a config holding a Codex row
+/// outright, and every command it runs on this config fails until it is updated.
+pub fn older_tcr_refuses_config_notice(path: &Path, version: &str) -> String {
+    format!(
+        "the tcr at {} ({version}) predates Codex accounts: update it — until then it refuses \
+         this config, so every command it runs fails",
+        path.display()
+    )
+}
+
+/// The notice for a codex with no login of its own at `path` (an existence check, never a
+/// read): tcr re-credentials a pooled codex's requests, but codex itself still has to start
+/// signed in. A login kept in the system keyring (codex's `keyring` and `auto` stores) is
+/// invisible to tcr, which is why the sentence leaves that case open.
+pub fn codex_has_no_login_notice(path: &Path) -> String {
+    format!(
+        "codex needs a login of its own to start, even when pooled, and none is at {}: unless \
+         codex keeps its login in the keyring, run `codex login` once",
+        path.display()
+    )
+}
+
 /// A notice a Codex save prints: the sentence, and whether it is a warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexNotice {
@@ -393,7 +427,7 @@ pub struct CodexNotice {
 
 /// The notices a Codex save prints, in order, each only when it holds: the first-account notice,
 /// `first_account`, when the config held no Codex row in any state before the save
-/// ([`crate::oauth::first_codex_account_notice`] words it); the no-login notice when codex has no
+/// ([`crate::login::first_codex_account_notice`] words it); the no-login notice when codex has no
 /// login file of its own; then one warning per older `tcr`.
 pub fn codex_notices(first_account: Option<String>) -> Vec<CodexNotice> {
     let mut notices = Vec::new();
@@ -405,7 +439,7 @@ pub fn codex_notices(first_account: Option<String>) -> Vec<CodexNotice> {
     }
     if !codex_login_exists() {
         notices.push(CodexNotice {
-            text: crate::oauth::codex_has_no_login_notice(&codex_login_path()),
+            text: codex_has_no_login_notice(&codex_login_path()),
             warning: false,
         });
     }
@@ -441,10 +475,10 @@ impl OlderTcr {
     pub fn notice(&self) -> String {
         match self.kind {
             OlderTcrKind::ReadsCodexAsClaude => {
-                crate::oauth::older_tcr_reads_codex_as_claude_notice(&self.path, &self.version)
+                older_tcr_reads_codex_as_claude_notice(&self.path, &self.version)
             }
             OlderTcrKind::RefusesConfig => {
-                crate::oauth::older_tcr_refuses_config_notice(&self.path, &self.version)
+                older_tcr_refuses_config_notice(&self.path, &self.version)
             }
         }
     }

@@ -150,14 +150,14 @@ pub(crate) fn holds_no_codex_row(config_path: &Path) -> anyhow::Result<bool> {
 /// Keyed on the leaf, not on the route's `pooled`: a running server may not have admitted the
 /// new row yet, and the route over its payload would then say it holds no Codex account.
 pub fn first_codex_account_notice(
-    live: &Result<crate::status::StatusPayload, crate::cli::LiveStatusError>,
+    live: &Result<crate::status::StatusPayload, crate::live_client::LiveStatusError>,
     port: u16,
     ca: &Path,
     ca_readable: bool,
 ) -> String {
     let leaf_takes_chatgpt = match live {
         Ok(payload) => payload.minted_leaf_intercepts(crate::provider::CODEX_HOST),
-        Err(crate::cli::LiveStatusError::NoServer) => true,
+        Err(crate::live_client::LiveStatusError::NoServer) => true,
         Err(_) => false,
     };
     let codex_rows = live
@@ -180,8 +180,8 @@ pub(crate) async fn read_first_codex_account_notice(config_path: &Path) -> Strin
     else {
         return CODEX_FIRST_ACCOUNT_NOTICE.to_string();
     };
-    let live = crate::cli::fetch_live_status(&config).await;
-    let ca = crate::mitm::minted_ca_path();
+    let live = crate::live_client::fetch_live_status(&config).await;
+    let ca = crate::tls::minted_ca_path();
     first_codex_account_notice(&live, config.proxy.port, &ca, ca.is_file())
 }
 

@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use time::OffsetDateTime;
 
-use super::live_client::{LiveStatusError, fetch_live_status};
 use super::render::{
     StatusSource, account_status_rows_at, render_accounts, snapshot_offline, status_rows_json,
 };
@@ -15,6 +14,7 @@ use super::{
 };
 use crate::build_info::{self, BuildInfo};
 use crate::config::Config;
+use crate::live_client::{LiveStatusError, fetch_live_status};
 use crate::oauth::NoRefresh;
 use crate::probe::{LiveUsageProber, ProbeStatus};
 use crate::provider::Provider;
@@ -118,7 +118,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
         fetch_live_status(&config).await
     };
     let holds_codex = status_holds_provider(&live_read, &config, Provider::Codex);
-    let ca = crate::mitm::minted_ca_path();
+    let ca = crate::tls::minted_ca_path();
     let ca_readable = ca.is_file();
     let codex_route = crate::codex_route::codex_route(
         live_read.as_ref(),

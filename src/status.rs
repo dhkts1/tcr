@@ -414,9 +414,9 @@ pub struct UnkeyedCount {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MitmStatus {
-    /// The hosts the listener can terminate, [`crate::mitm::ALLOWED_HOSTS`]
+    /// The hosts the listener can terminate, [`crate::tls::ALLOWED_HOSTS`]
     /// intersected with the loaded leaf's coverage
-    /// ([`crate::mitm::TlsAssets::intercepted_hosts`]). Empty when MITM is off.
+    /// ([`crate::tls::TlsAssets::intercepted_hosts`]). Empty when MITM is off.
     /// `chatgpt.com` here says the leaf allows it, not that it is terminated:
     /// the listener does that only while the pool holds a Codex account, counted
     /// on every CONNECT, and the payload's account rows say whether it does.
@@ -432,7 +432,7 @@ pub struct MitmStatus {
 }
 
 impl MitmStatus {
-    /// A leaf tcr minted under `tcr-ca.pem` ([`crate::mitm::minted_ca_path`]).
+    /// A leaf tcr minted under `tcr-ca.pem` ([`crate::tls::minted_ca_path`]).
     pub const LEAF_MINTED: &'static str = "minted";
     /// No TLS material loaded: the boot-time load failed, or this process
     /// never loaded any. MITM is off and every `CONNECT` is blind-tunnelled.
@@ -440,7 +440,7 @@ impl MitmStatus {
 
     /// The status of a listener that loaded `assets`, or of one that loaded
     /// nothing (`None`).
-    pub fn of(assets: Option<&crate::mitm::TlsAssets>) -> Self {
+    pub fn of(assets: Option<&crate::tls::TlsAssets>) -> Self {
         let Some(assets) = assets else {
             return Self {
                 intercepted_hosts: Vec::new(),

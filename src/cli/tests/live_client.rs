@@ -1,14 +1,15 @@
-//! Tests for the loopback client in `cli/live_client.rs`: the add-account route, the live
+//! Tests for the loopback client in `src/live_client.rs`: the add-account route, the live
 //! status read and the incumbent probe.
 
 use super::*;
+use crate::build_info::HANDOFF_SINCE;
+use crate::live_client::{
+    Liveness, post_add_account, post_add_account_with_providers, probe_incumbent,
+};
 #[test]
 fn the_restart_hint_names_the_first_version_with_handoff() {
     assert!(RESTART_HINT.contains("stop it"));
-    assert!(RESTART_HINT.contains(&format!(
-        "if it runs tcr {} or newer",
-        crate::restart::HANDOFF_SINCE
-    )));
+    assert!(RESTART_HINT.contains(&format!("if it runs tcr {HANDOFF_SINCE} or newer")));
 }
 /// A minimal valid live server config: the port, no accounts, no api-key.
 fn add_route_config(port: u16) -> Config {
@@ -45,7 +46,7 @@ async fn post_add_account_reads_a_stamped_400_as_rejected() {
 }
 
 /// The providers a STAMPED answer names come back beside it, read off the very probe
-/// `oauth::probe_add_route` already sends. The same header on an UNSTAMPED answer — an older
+/// `login::probe_add_route` already sends. The same header on an UNSTAMPED answer — an older
 /// tcr's catch-all, anything that is not this route — is no proof of anything and is not read.
 #[tokio::test]
 async fn post_add_account_with_providers_reads_them_off_a_stamped_answer_only() {

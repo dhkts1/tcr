@@ -2,41 +2,6 @@ use super::*;
 
 // --- remedies that name the right command ------------------------------------------
 
-/// An offline snapshot never refreshes; for a Codex row its remedy names the command that
-/// signs a Codex account in again, and the Anthropic remedy is the one it always was.
-///
-/// Watched red: one message for both providers names `tcr login` for a Codex row.
-#[tokio::test]
-async fn the_offline_expired_token_remedy_names_tcr_login_codex() {
-    let err = NoRefresh
-        .refresh(
-            crate::provider::Provider::Codex,
-            "rt-never-sent".to_string(),
-        )
-        .await
-        .expect_err("NoRefresh never refreshes");
-    std::assert_matches!(err, OAuthError::Transient(_));
-    assert_eq!(
-        err.to_string(),
-        format!("token refresh failed transiently: {NO_REFRESH_CODEX_MESSAGE}")
-    );
-    assert!(
-        NO_REFRESH_CODEX_MESSAGE.contains("re-run after `tcr login --codex --account <name>`"),
-        "{NO_REFRESH_CODEX_MESSAGE}"
-    );
-    let claude = NoRefresh
-        .refresh(
-            crate::provider::Provider::Anthropic,
-            "rt-never-sent".to_string(),
-        )
-        .await
-        .expect_err("NoRefresh never refreshes");
-    assert_eq!(
-        claude.to_string(),
-        format!("token refresh failed transiently: {NO_REFRESH_MESSAGE}")
-    );
-}
-
 /// A refusal over a running proxy names the login that was run as the one to run again,
 /// for both kinds of incumbent; plain `tcr login` still says `run 'tcr login'`.
 ///
@@ -119,12 +84,12 @@ fn codex_relogin_workspace_refusal_drops_unknown_plans() {
     );
 }
 
-/// A running proxy's status read, as `cli::fetch_live_status` hands it over: parsed from the
+/// A running proxy's status read, as `live_client::fetch_live_status` hands it over: parsed from the
 /// wire, listing no Codex row (the server may not have admitted the new one yet), with the
 /// listener `mitm` reports.
 fn live_proxy_reporting(
     mitm: serde_json::Value,
-) -> Result<crate::status::StatusPayload, crate::cli::LiveStatusError> {
+) -> Result<crate::status::StatusPayload, crate::live_client::LiveStatusError> {
     Ok(serde_json::from_value(serde_json::json!({
         "kind": crate::status::STATUS_KIND,
         "accounts": [],
@@ -155,7 +120,7 @@ fn a_proxy_without_mitm_gets_the_not_pooled_notice() {
     );
     assert_eq!(
         first_codex_account_notice(
-            &Err(crate::cli::LiveStatusError::NoAnswer(
+            &Err(crate::live_client::LiveStatusError::NoAnswer(
                 "the server did not answer within 5s".to_string()
             )),
             NOTICE_PORT,
@@ -185,7 +150,7 @@ fn a_minted_chatgpt_leaf_gets_the_first_account_notice() {
     );
     assert_eq!(
         first_codex_account_notice(
-            &Err(crate::cli::LiveStatusError::NoServer),
+            &Err(crate::live_client::LiveStatusError::NoServer),
             NOTICE_PORT,
             notice_ca(),
             false,

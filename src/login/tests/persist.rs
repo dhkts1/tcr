@@ -378,7 +378,7 @@ async fn finish_login_live_path_does_not_clobber_a_concurrent_rotation() {
         ..Account::fixture("bob@example.com")
     };
     let rotate_config = load_or_default(&path).unwrap();
-    crate::cli::post_add_account(&rotate_config, &rotated_bob)
+    crate::live_client::post_add_account(&rotate_config, &rotated_bob)
         .await
         .expect("the live re-login must succeed");
 
@@ -575,7 +575,7 @@ fn assert_the_rotation_survived_and_one_was_added(
 }
 
 /// THE σ5 EXPERIMENT bridge item A calls for. The WEDGED shape
-/// `cli::probe_incumbent`'s own tests document as measured and real
+/// `live_client::probe_incumbent`'s own tests document as measured and real
 /// (`a_listener_that_never_answers_is_silent_not_answering`): bound, the
 /// connect succeeds off the kernel backlog, and nothing is ever written
 /// back — reached on the `Live` route when the capability probe confirmed

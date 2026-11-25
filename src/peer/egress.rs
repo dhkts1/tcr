@@ -107,7 +107,7 @@ use crate::peer::tunnel::{self, NoiseStream};
 /// The ONLY origins a gateway will carry. Deny by default: a host absent from
 /// this list is refused, not tunnelled.
 ///
-/// Independent of [`crate::mitm::ALLOWED_HOSTS`]: a local interception capability
+/// Independent of [`crate::tls::ALLOWED_HOSTS`]: a local interception capability
 /// must not grant a peer gateway permission to dial another origin.
 pub const PEER_EGRESS_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com"];
 
@@ -1649,7 +1649,7 @@ async fn record_the_hold_the_ladder_would(
         return;
     }
     let rejections = crate::quota::quota_rejections(headers);
-    let retry_after_raw = crate::proxy::parse_retry_after(headers);
+    let retry_after_raw = crate::http_client::parse_retry_after(headers);
     let retry_after = retry_after_raw.unwrap_or(60);
     if rejections.is_empty() {
         // No unified rejection: a transient limit, and the hold is the one the

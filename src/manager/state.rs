@@ -172,8 +172,8 @@ impl Manager {
 
     /// The two proxy secrets a client may present, neither of which is a client
     /// identity or a credential for any host but this one.
-    pub fn proxy_secrets(&self) -> crate::proxy::ProxySecrets<'_> {
-        crate::proxy::ProxySecrets {
+    pub fn proxy_secrets(&self) -> crate::request_key::ProxySecrets<'_> {
+        crate::request_key::ProxySecrets {
             api_key: self.proxy_api_key(),
             request_key: self.request_key(),
         }

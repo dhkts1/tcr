@@ -127,7 +127,7 @@ pub(super) struct DecodedDay {
 /// checked decoder, independently of account resolution, and the day's hours marked
 /// covered only when the file was present, complete and clean.
 pub(super) fn history_day(
-    history: &mut crate::forecast::History,
+    history: &mut super::demand_history::History,
     day: &DecodedDay,
     date: Date,
     now_ms: i64,

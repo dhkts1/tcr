@@ -34,7 +34,7 @@
 //! `tcr import` alone reads files and Keychain items and prints. It never refreshes a token,
 //! never fetches a profile, never writes the config and never talks to a running proxy. A login
 //! is "already in tcr" by the identity its source stores ([`StoredClaudeIdentity::existing_row`],
-//! [`crate::oauth::existing_codex_row`]), never by asking anyone.
+//! [`crate::login::existing_codex_row`]), never by asking anyone.
 //!
 //! # What `--yes` costs
 //!
@@ -191,7 +191,7 @@ pub fn verdict(found: &Found, config: &Config) -> Verdict {
                 Verdict::New
             }
         }
-        Holding::Codex(login) => crate::oauth::existing_codex_row(config, login)
+        Holding::Codex(login) => crate::login::existing_codex_row(config, login)
             .map_or(Verdict::New, |row| Verdict::Already(row.name.clone())),
     }
 }
@@ -600,7 +600,7 @@ fn claude_swap_credentials(
         .join(format!(".creds-{n}-{email}.enc"));
     match std::fs::read_to_string(&enc) {
         Ok(encoded) => {
-            return crate::codex_oauth::base64_standard_decode(encoded.trim())
+            return crate::oauth::codex::base64_standard_decode(encoded.trim())
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .ok_or_else(|| "its .enc file is not base64 text".to_string());
         }
@@ -903,7 +903,7 @@ pub async fn run(config_path: &Path, yes: bool) -> anyhow::Result<()> {
             let logins = if new == 1 { "login" } else { "logins" };
             println!(
                 "run `{}` to import the {new} new {logins}",
-                crate::oauth::IMPORT_COMMAND
+                crate::login::IMPORT_COMMAND
             );
         }
         return Ok(());
@@ -1026,30 +1026,30 @@ async fn import_claude(
             subscription_type: login.subscription_type,
         };
     }
-    let imported = crate::oauth::import_claude_login(
+    let imported = crate::login::import_claude_login(
         config_path,
-        crate::oauth::ImportInto::NewRowOnly,
+        crate::login::ImportInto::NewRowOnly,
         false,
         None,
         None,
         login,
         Some(identity),
-        crate::oauth::LoginCommand::Import,
-        crate::oauth::LoginUi::Machine,
+        crate::login::LoginCommand::Import,
+        crate::login::LoginUi::Machine,
     )
     .await?;
     match imported {
-        crate::oauth::ClaudeImported::Saved(name) => {
+        crate::login::ClaudeImported::Saved(name) => {
             if source == Source::ClaudeCode {
                 eprintln!(
                     "[tcr] Claude Code: {}",
-                    crate::oauth::CLAUDE_CODE_IMPORT_CONSEQUENCE
+                    crate::login::CLAUDE_CODE_IMPORT_CONSEQUENCE
                 );
             }
             Ok(Imported::Saved(name))
         }
-        crate::oauth::ClaudeImported::AlreadyAs(name) => Ok(Imported::Already(name)),
-        crate::oauth::ClaudeImported::FleetNotEmpty => {
+        crate::login::ClaudeImported::AlreadyAs(name) => Ok(Imported::Already(name)),
+        crate::login::ClaudeImported::FleetNotEmpty => {
             anyhow::bail!("the import refused a config that already has accounts")
         }
     }
@@ -1063,26 +1063,26 @@ async fn import_codex(
     // Checked against the config this write is based on: an earlier import in this run may have
     // added this login from another source, and the write would update that row.
     let config = read_config(config_path)?;
-    if let Some(row) = crate::oauth::existing_codex_row(&config, &login) {
+    if let Some(row) = crate::login::existing_codex_row(&config, &login) {
         return Ok(Imported::Already(row.name.clone()));
     }
     if source == Source::CodexCli {
-        let saved = crate::oauth::login_from_codex(
+        let saved = crate::login::login_from_codex(
             config_path,
             false,
             None,
             None,
             None,
-            crate::oauth::LoginUi::Terminal,
+            crate::login::LoginUi::Terminal,
         )
         .await?;
         return Ok(Imported::Saved(saved));
     }
     if needs_refresh(login.expires_at_ms, crate::now_ms()) {
-        let tokens = crate::codex_oauth::refresh_access_token_at(
+        let tokens = crate::oauth::codex::refresh_access_token_at(
             &refresh_client()?,
             &login.refresh_token,
-            crate::codex_oauth::TOKEN_ENDPOINT,
+            crate::oauth::codex::TOKEN_ENDPOINT,
         )
         .await
         .map_err(|err| refresh_failure(&err))?;
@@ -1096,8 +1096,8 @@ async fn import_codex(
         fresh.plan_type = fresh.plan_type.or(login.plan_type);
         login = fresh;
     }
-    let saved = crate::oauth::import_codex_login_as(
-        crate::oauth::LoginCommand::Import,
+    let saved = crate::login::import_codex_login_as(
+        crate::login::LoginCommand::Import,
         config_path,
         false,
         None,

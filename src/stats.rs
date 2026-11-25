@@ -155,6 +155,63 @@ pub enum GateReason {
     Parked,
 }
 
+/// What a gate means, in words a person reads after an account count or after "out".
+pub(crate) const fn gate_phrase(reason: GateReason) -> &'static str {
+    match reason {
+        GateReason::Ok => "in rotation",
+        GateReason::Hold => "on an upstream hold",
+        GateReason::Refused => "refused upstream (403)",
+        GateReason::FiveHour => "in the 5-hour window",
+        GateReason::SevenDay => "in the weekly window",
+        GateReason::FableWeekly => "in the Fable weekly window",
+        GateReason::Standard => "at a token limit",
+        GateReason::Login => "needing re-login",
+        GateReason::Rejected => "rejected upstream",
+        GateReason::Disabled => "disabled",
+        GateReason::Reserved => "reserved for another group",
+        GateReason::Parked => "in a parked group",
+    }
+}
+
+/// `: 3 in the 5-hour window, 1 on an upstream hold` — or empty when nothing is
+/// gated, so the message never ends in a dangling colon.
+pub fn describe_gates(gated: &std::collections::BTreeMap<GateReason, usize>) -> String {
+    describe_gates_with(gated, gate_phrase)
+}
+
+fn describe_gates_with(
+    gated: &std::collections::BTreeMap<GateReason, usize>,
+    phrase: fn(GateReason) -> &'static str,
+) -> String {
+    let parts: Vec<String> = gated
+        .iter()
+        .map(|(reason, n)| format!("{n} {}", phrase(*reason)))
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", parts.join(", "))
+    }
+}
+
+/// What a gate means for a Codex account: [`gate_phrase`]'s words, except where a Codex
+/// account's gate means something else. ChatGPT's own refusal is no Claude "rejected", and a
+/// Codex account in a reserved group is unreachable, because a Codex request carries no group
+/// that could reach it.
+const fn codex_gate_phrase(reason: GateReason) -> &'static str {
+    match reason {
+        GateReason::Rejected => "refused by ChatGPT",
+        GateReason::Reserved => "unreachable in a reserved group",
+        other => gate_phrase(other),
+    }
+}
+
+/// [`describe_gates`] in [`codex_gate_phrase`]'s words, for a tally of Codex accounts:
+/// `: 1 in the weekly window, 1 needing re-login`, or empty when nothing is gated.
+pub fn describe_codex_gates(gated: &std::collections::BTreeMap<GateReason, usize>) -> String {
+    describe_gates_with(gated, codex_gate_phrase)
+}
+
 /// A single account's live-computed view.
 #[derive(Debug, Clone)]
 pub struct AccountSnapshot {
@@ -810,5 +867,24 @@ mod tests {
             None,
             "an Anthropic row has no Codex login to explain"
         );
+    }
+
+    #[test]
+    fn gate_descriptions_keep_empty_and_provider_specific_phrases() {
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(describe_gates(&empty), "");
+        assert_eq!(describe_codex_gates(&empty), "");
+        let rejected = std::collections::BTreeMap::from([(GateReason::Rejected, 2)]);
+        assert_eq!(describe_gates(&rejected), ": 2 rejected upstream");
+        assert_eq!(describe_codex_gates(&rejected), ": 2 refused by ChatGPT");
+        let reserved = std::collections::BTreeMap::from([(GateReason::Reserved, 1)]);
+        assert_eq!(describe_gates(&reserved), ": 1 reserved for another group");
+        assert_eq!(
+            describe_codex_gates(&reserved),
+            ": 1 unreachable in a reserved group"
+        );
+        let common = std::collections::BTreeMap::from([(GateReason::Hold, 3)]);
+        assert_eq!(describe_gates(&common), ": 3 on an upstream hold");
+        assert_eq!(describe_codex_gates(&common), ": 3 on an upstream hold");
     }
 }

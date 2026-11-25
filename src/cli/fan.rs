@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use anyhow::bail;
 
-use super::live_client::{
-    ControlRoute, LiveControlError, LiveStatusError, call_route, fetch_live_status,
-};
 use super::load_config_with_creation;
 use crate::config::Config;
+use crate::live_client::{
+    ControlRoute, LiveControlError, LiveStatusError, call_route, fetch_live_status,
+};
 
 /// [`crate::proxy::FAN_PATH`]. 400 is a refused mode, 503 a server with no fan controller.
 const FAN_ROUTE: ControlRoute = ControlRoute {

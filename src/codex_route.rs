@@ -23,7 +23,7 @@ use std::path::Path;
 
 use tcr_status_wire::CodexRoute;
 
-use crate::cli::LiveStatusError;
+use crate::live_client::LiveStatusError;
 use crate::status::{MitmStatus, StatusPayload};
 
 /// The extra-CA file a launched Codex reads. Preserve the caller's complete bundle;
@@ -35,7 +35,7 @@ pub fn codex_ca_for_launch(
     for variable in ["CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"] {
         if let Some(bundle) = inherited(variable).filter(|value| !value.is_empty()) {
             let bundle = std::path::PathBuf::from(bundle);
-            return if crate::mitm::ca_bundle_contains(&bundle, ca) {
+            return if crate::tls::ca_bundle_contains(&bundle, ca) {
                 Ok(bundle)
             } else {
                 Err(format!(
@@ -65,7 +65,7 @@ pub const LEAF_MISSING_HOST: &str = "leaf-missing-host";
 pub const UNKNOWN_LEAF: &str = "unknown-leaf";
 
 /// Can the proxy listening on `port` pool codex, read from its status document (`status`, one
-/// read: [`crate::cli::fetch_live_status`]), the CA at `ca` (`ca_readable`) and how many Codex
+/// read: [`crate::live_client::fetch_live_status`]), the CA at `ca` (`ca_readable`) and how many Codex
 /// accounts its pool holds (`codex_accounts`, the payload's Codex rows in any state).
 ///
 /// `upstream` is the payload's `codex_upstream`: the proxy names its Codex upstream only when it
@@ -237,7 +237,7 @@ mod tests {
         Path::new("/tmp/tcr-run-test/tcr-ca.pem")
     }
 
-    /// The running proxy's status as `cli::fetch_live_status` hands it over: parsed from the
+    /// The running proxy's status as `live_client::fetch_live_status` hands it over: parsed from the
     /// wire, so the `mitm` key is read the way a real answer is. `None` leaves the key out, as a
     /// server older than it does. The pool lists `codex_rows` Codex accounts.
     fn payload(

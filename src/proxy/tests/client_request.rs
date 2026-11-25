@@ -995,50 +995,6 @@ async fn loopback_client_is_exempt() {
     );
 }
 
-/// `key_matches` behaviour is preserved after the length side-channel fix:
-/// equal ⇔ true, and any mismatch (byte or length) ⇔ false.
-#[test]
-fn key_matches_equal_keys_true() {
-    assert!(key_matches(Some("sk-proxy-secret"), "sk-proxy-secret"));
-}
-
-#[test]
-fn key_matches_unequal_same_length_false() {
-    // Same length, one byte differs.
-    assert!(!key_matches(Some("sk-proxy-secreu"), "sk-proxy-secret"));
-}
-
-#[test]
-fn key_matches_different_length_false() {
-    // Shorter and longer than the configured key, incl. a matching prefix.
-    assert!(!key_matches(Some("sk-proxy"), "sk-proxy-secret"));
-    assert!(!key_matches(
-        Some("sk-proxy-secret-extra"),
-        "sk-proxy-secret"
-    ));
-    assert!(!key_matches(Some("sk-proxy-secret"), "sk-proxy"));
-}
-
-#[test]
-fn key_matches_edge_cases() {
-    assert!(
-        !key_matches(None, "sk-proxy-secret"),
-        "absent key never matches"
-    );
-    assert!(
-        key_matches(Some(""), ""),
-        "empty ⇔ empty (degenerate config)"
-    );
-    assert!(
-        !key_matches(Some("x"), ""),
-        "non-empty vs empty configured key"
-    );
-    assert!(
-        !key_matches(Some(""), "x"),
-        "empty vs non-empty configured key"
-    );
-}
-
 /// The response-body cap rejects an over-cap stream (`BAD_GATEWAY` path) while
 /// buffering a within-cap body verbatim and surfacing transport errors.
 #[tokio::test]

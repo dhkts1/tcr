@@ -2,9 +2,9 @@
 
 use std::path::Path;
 
-use tcr::cli;
+use tcr::live_client;
 use tcr::proxy::GROUP_HEADER_NAME;
-use tcr::{mitm, status};
+use tcr::{request_key, status};
 
 /// `--group`'s header-composition half (steps c/d): the new value for
 /// `ANTHROPIC_CUSTOM_HEADERS`, merging with whatever this process already
@@ -103,11 +103,11 @@ pub(super) enum LaunchKey {
 
 impl LaunchKey {
     /// `config_key` is the loaded config's `proxy.requestKey`; `status` is the
-    /// launch's one read of the running server ([`cli::fetch_live_status`]).
+    /// launch's one read of the running server ([`live_client::fetch_live_status`]).
     /// `tcr run` never writes a key: only the server generates one.
     pub(super) fn decide(
         config_key: Option<&str>,
-        status: &Result<status::StatusPayload, cli::LiveStatusError>,
+        status: &Result<status::StatusPayload, live_client::LiveStatusError>,
     ) -> Self {
         let Some(raw) = config_key.filter(|key| !key.is_empty()) else {
             return Self::NoKeyInConfig;
@@ -155,7 +155,7 @@ impl LaunchKey {
 }
 
 /// The username a keyed proxy URL carries when it marks nothing. Any name but
-/// [`tcr::mitm::CODEX_PROXY_USERNAME`] means Claude to the server.
+/// [`tcr::request_key::CODEX_PROXY_USERNAME`] means Claude to the server.
 const PLAIN_PROXY_USERNAME: &str = "tcr";
 
 /// A loopback proxy URL for `port`, as the child's environment gets it (`env`)
@@ -262,7 +262,7 @@ pub(super) fn apply_codex_see_through_env(
     caller_ca_exported: bool,
     key: &LaunchKey,
 ) -> Vec<String> {
-    let proxy = loopback_proxy_url(Some(mitm::CODEX_PROXY_USERNAME), key.key(), port);
+    let proxy = loopback_proxy_url(Some(request_key::CODEX_PROXY_USERNAME), key.key(), port);
     cmd.env("HTTPS_PROXY", &proxy.env);
     cmd.env("https_proxy", &proxy.env);
     // Codex reads its extra CA from this variable (`openai/codex` http-client/src/custom_ca.rs:61);
@@ -333,7 +333,7 @@ pub(super) fn apply_base_url_env(
         let current = custom_headers_for(cmd);
         cmd.env(
             "ANTHROPIC_CUSTOM_HEADERS",
-            compose_custom_header(current.as_deref(), tcr::request_key::HEADER, key.as_str()),
+            compose_custom_header(current.as_deref(), request_key::HEADER, key.as_str()),
         );
     }
     // Here we speak plain HTTP on loopback and present NO leaf. An ambient
