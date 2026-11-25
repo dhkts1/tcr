@@ -332,8 +332,8 @@ pub(super) async fn boot_peer_listener(
     // boot decision and `keep_drops_published`'s own re-read make, so a Mac
     // that flips the switch off mid-boot stops publishing at the next tick
     // without needing a second gate here.
-    if file.dead_drop.is_live() {
-        match file.dead_drop.open_store() {
+    if file.drop_is_live() {
+        match file.open_drop_store() {
             Ok(store) => {
                 spawn_dead_drop_publisher(peers_path, store, key.id(), local, shutdown, background);
             }

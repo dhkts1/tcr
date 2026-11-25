@@ -15,7 +15,7 @@ pub(super) fn run_peer_drop(a: peer_cli::PeerDropArgs) -> anyhow::Result<()> {
     // what to run first and change nothing, rather than writing a
     // switch that starts no task because `DeadDropConfig::is_live`
     // needs a store too.
-    if on && file.dead_drop.store.is_none() {
+    if !file.switch_drop(on) {
         println!(
             "peer.drop: not turned on, no store is configured yet; run \
              `tcr peer drop-store set <url>` first, or `tcr peer drop-store set \
@@ -23,7 +23,6 @@ pub(super) fn run_peer_drop(a: peer_cli::PeerDropArgs) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    file.dead_drop.enabled = on;
     peer::config::save(&peers_path, &file)?;
     println!("peer.drop: {}", if on { "on" } else { "off" });
     if on {
@@ -42,21 +41,11 @@ pub(super) fn run_peer_drop_store(a: peer_cli::PeerDropStoreArgs) -> anyhow::Res
     let (_lock, mut file) = lock_peers_file(&peers_path)?;
     match a.action {
         peer_cli::PeerDropStoreAction::Show => {
-            match &file.dead_drop.store {
-                Some(peer::config::StoreConfig::Https { url, token }) => println!(
-                    "peer drop-store: https {url} token={}",
-                    if token.is_some() { "set" } else { "not-set" }
-                ),
-                Some(peer::config::StoreConfig::Gist { gist_id, .. }) => println!(
-                    "peer drop-store: gist {gist_id} (this build does not ship a gist \
-                     backend; `tcr peer drop on` refuses with not-configured)"
-                ),
-                None => println!("peer drop-store: not-set"),
-            }
+            println!("{}", file.drop_store_line());
             Ok(())
         }
         peer_cli::PeerDropStoreAction::Clear => {
-            let had = file.dead_drop.store.take().is_some();
+            let had = file.clear_drop_store();
             peer::config::save(&peers_path, &file)?;
             println!(
                 "peer drop-store: {}",
@@ -101,20 +90,14 @@ pub(super) fn run_peer_drop_store(a: peer_cli::PeerDropStoreArgs) -> anyhow::Res
                     Some(trimmed)
                 }
             };
-            // The construction itself is the refusal for a template
-            // with no `{name}` placeholder: `DeadDropConfig::open_store`'s
-            // own doc says this verb should have refused it first, and
-            // building the real client here is one value read by every
-            // consumer rather than a second, divergent check.
-            peer::config::drop::HttpsTemplateStore::new(&value, token.as_deref())
+            // The construction itself is the refusal for a template with no
+            // `{name}` placeholder (see `DeadDropConfig::point_at_https`).
+            let already_on = file
+                .point_drop_at_https(&value, token)
                 .map_err(|err| anyhow::anyhow!("peer drop-store set: {err}"))?;
-            file.dead_drop.store = Some(peer::config::StoreConfig::Https {
-                url: value.clone(),
-                token,
-            });
             peer::config::save(&peers_path, &file)?;
             println!("peer drop-store: set https {value}");
-            if file.dead_drop.enabled {
+            if already_on {
                 println!(
                     "peer drop-store: peer.drop is already on, this Mac starts \
                      publishing to it the next time the proxy starts"

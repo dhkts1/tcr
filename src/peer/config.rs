@@ -952,6 +952,73 @@ impl PeerFile {
         self.listen_port()
     }
 
+    /// The office network key's raw bytes, the Noise `psk0` a knock and an
+    /// enrolment mix in, or `None` when this Mac has no key set.
+    pub fn network_psk(&self) -> Option<&[u8; 32]> {
+        self.network_key.as_ref().map(NetworkKey::as_bytes)
+    }
+
+    /// Take `key` as this Mac's network key (`tcr peer network-key set|join`,
+    /// a join link). A key already here is not overwritten unless the operator
+    /// passed `--replace`, because every Mac still holding it goes dark to this
+    /// one: the refusal answers how many pinned peers that is, for the verb's
+    /// own words. Answers whether a key was replaced.
+    pub fn set_network_key(&mut self, key: NetworkKey, replace: bool) -> Result<bool, usize> {
+        let replaced = self.network_key.is_some();
+        if replaced && !replace {
+            return Err(self.peers.len());
+        }
+        self.network_key = Some(key);
+        Ok(replaced)
+    }
+
+    /// Drop this Mac's network key (`tcr peer network-key clear`). Answers
+    /// whether there was one to drop.
+    pub fn clear_network_key(&mut self) -> bool {
+        self.network_key.take().is_some()
+    }
+
+    /// Whether this Mac's dead drop publishes and fetches at all. See
+    /// [`DeadDropConfig::is_live`].
+    pub const fn drop_is_live(&self) -> bool {
+        self.dead_drop.is_live()
+    }
+
+    /// Build the dead drop's configured backend. See
+    /// [`DeadDropConfig::open_store`].
+    pub fn open_drop_store(
+        &self,
+    ) -> std::result::Result<drop::HttpsTemplateStore, drop::StoreRefusal> {
+        self.dead_drop.open_store()
+    }
+
+    /// How long one drop name is valid on this Mac, in seconds.
+    pub const fn drop_slot_seconds(&self) -> u64 {
+        self.dead_drop.slot_seconds
+    }
+
+    /// Turn the dead drop on or off. See [`DeadDropConfig::switch`].
+    pub fn switch_drop(&mut self, on: bool) -> bool {
+        self.dead_drop.switch(on)
+    }
+
+    /// The dead drop's surface, as `tcr peer drop-store show` prints it. See
+    /// [`DeadDropConfig::store_line`].
+    pub fn drop_store_line(&self) -> String {
+        self.dead_drop.store_line()
+    }
+
+    /// Forget the dead drop's surface. See [`DeadDropConfig::clear_store`].
+    pub fn clear_drop_store(&mut self) -> bool {
+        self.dead_drop.clear_store()
+    }
+
+    /// Point the dead drop at an HTTPS template. See
+    /// [`DeadDropConfig::point_at_https`].
+    pub fn point_drop_at_https(&mut self, url: &str, token: Option<String>) -> Result<bool> {
+        self.dead_drop.point_at_https(url, token)
+    }
+
     /// The port this Mac's peer listener binds, or `None` when the feature is
     /// off: the honest answer rather than the default port, because a Mac with
     /// the feature off is not listening on it.
@@ -1919,6 +1986,57 @@ impl DeadDropConfig {
             }
             Some(StoreConfig::Gist { .. }) | None => Err(drop::StoreRefusal::NotConfigured),
         }
+    }
+
+    /// Turn the switch (`tcr peer drop on|off`). Turning it on with no store
+    /// configured is refused and changes nothing, rather than writing a switch
+    /// that starts no task because [`Self::is_live`] needs a store too.
+    /// Answers whether the switch was written.
+    pub fn switch(&mut self, on: bool) -> bool {
+        if on && self.store.is_none() {
+            return false;
+        }
+        self.enabled = on;
+        true
+    }
+
+    /// What `tcr peer drop-store show` prints: the surface, and whether a token
+    /// is set, never the token.
+    pub fn store_line(&self) -> String {
+        match &self.store {
+            Some(StoreConfig::Https { url, token }) => format!(
+                "peer drop-store: https {url} token={}",
+                if token.is_some() { "set" } else { "not-set" }
+            ),
+            Some(StoreConfig::Gist { gist_id, .. }) => format!(
+                "peer drop-store: gist {gist_id} (this build does not ship a gist \
+                 backend; `tcr peer drop on` refuses with not-configured)"
+            ),
+            None => "peer drop-store: not-set".to_string(),
+        }
+    }
+
+    /// Forget the surface (`tcr peer drop-store clear`). Answers whether there
+    /// was one.
+    pub fn clear_store(&mut self) -> bool {
+        self.store.take().is_some()
+    }
+
+    /// Point the dead drop at an HTTPS template (`tcr peer drop-store set`),
+    /// and answer whether the switch is already on.
+    ///
+    /// Building the real client is the refusal for a template with no `{name}`
+    /// placeholder: [`Self::open_store`]'s own doc says this verb should have
+    /// refused it first, and building it here is one value read by every
+    /// consumer rather than a second, divergent check. A refused template
+    /// changes nothing.
+    pub fn point_at_https(&mut self, url: &str, token: Option<String>) -> Result<bool> {
+        drop::HttpsTemplateStore::new(url, token.as_deref())?;
+        self.store = Some(StoreConfig::Https {
+            url: url.to_string(),
+            token,
+        });
+        Ok(self.enabled)
     }
 }
 
@@ -3328,5 +3446,46 @@ mod tests {
             written.get("tailnet").is_none(),
             "off is the default: {written}"
         );
+    }
+
+    /// The dead drop's verbs, through the owner: on with no store is refused,
+    /// a template with no `{name}` is refused, and `show` names the surface
+    /// and whether a token is set, never the token.
+    #[test]
+    fn the_dead_drop_refuses_a_switch_with_no_store_and_never_prints_its_token() {
+        let mut drop = DeadDropConfig::default();
+        assert_eq!(drop.store_line(), "peer drop-store: not-set");
+        assert!(!drop.switch(true), "on with no store is refused");
+        assert!(!drop.is_live());
+        assert!(
+            drop.point_at_https("https://paste.example/fixed", None)
+                .is_err(),
+            "a template with no placeholder is refused"
+        );
+        assert_eq!(drop.store_line(), "peer drop-store: not-set");
+
+        let already_on = drop
+            .point_at_https("https://paste.example/{name}", Some("s3cret".to_string()))
+            .expect("a template with a placeholder is taken");
+        assert!(!already_on);
+        assert_eq!(
+            drop.store_line(),
+            "peer drop-store: https https://paste.example/{name} token=set"
+        );
+        assert!(drop.switch(true), "on with a store is written");
+        assert!(drop.is_live());
+
+        drop.store = Some(StoreConfig::Gist {
+            gist_id: "abc123".to_string(),
+            token: "s3cret".to_string(),
+        });
+        assert_eq!(
+            drop.store_line(),
+            "peer drop-store: gist abc123 (this build does not ship a gist backend; `tcr peer \
+             drop on` refuses with not-configured)"
+        );
+        assert!(drop.clear_store());
+        assert!(!drop.clear_store(), "a second clear finds nothing");
+        assert!(!drop.is_live());
     }
 }

@@ -268,9 +268,9 @@ pub(super) fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()
             "slotSeconds": reach::SLOT_SECONDS,
             "peers": peers,
             "deadDrop": {
-                "on": file.dead_drop.is_live(),
+                "on": file.drop_is_live(),
                 "slot": drop_slot,
-                "slotSeconds": file.dead_drop.slot_seconds,
+                "slotSeconds": file.drop_slot_seconds(),
                 "peers": drop_peers,
             },
         });
@@ -334,10 +334,10 @@ pub(super) fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()
             reach::reach_punch_line(&masked_label(&row.label), &row.node, &row.endpoints)
         );
     }
-    if file.dead_drop.is_live() {
+    if file.drop_is_live() {
         println!(
             "reach: dead-drop: on, slot {drop_slot} ({}s each)",
-            file.dead_drop.slot_seconds
+            file.drop_slot_seconds()
         );
         if drop_rows.is_empty() {
             println!(

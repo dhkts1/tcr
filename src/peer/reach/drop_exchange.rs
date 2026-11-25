@@ -274,7 +274,7 @@ pub async fn keep_drops_published<S: DeadDropStore + Sync>(
                 continue;
             }
         };
-        if !file.dead_drop.is_live() {
+        if !file.drop_is_live() {
             continue;
         }
 

@@ -73,7 +73,7 @@ fn a_join_link_does_not_replace_a_network_key_without_replace() {
         .status
         .success()
     );
-    let before = mine.file().network_key.expect("this Mac has a key");
+    let before = *mine.file().network_psk().expect("this Mac has a key");
 
     let refused = tcr(&[
         "peer",
@@ -93,7 +93,7 @@ fn a_join_link_does_not_replace_a_network_key_without_replace() {
         "the refusal names the flag that means it: {text}"
     );
     assert_eq!(
-        mine.file().network_key.expect("the key is still there"),
+        *mine.file().network_psk().expect("the key is still there"),
         before,
         "a refusal changes nothing on disk"
     );
@@ -113,7 +113,7 @@ fn a_join_link_does_not_replace_a_network_key_without_replace() {
         String::from_utf8_lossy(&taken.stderr)
     );
     assert_ne!(
-        mine.file().network_key.expect("a key is set"),
+        *mine.file().network_psk().expect("a key is set"),
         before,
         "the link's key replaced this Mac's own"
     );
@@ -144,9 +144,9 @@ fn a_join_link_with_both_keys_still_reads_the_join_token_when_the_network_key_is
     // This Mac already has a network key.
     let (_out, _err, ok) = run_tcr(&peers, &["network-key", "set"]);
     assert!(ok, "this Mac mints its own key first");
-    let before = config::read_or_default(&peers)
+    let before = *config::read_or_default(&peers)
         .expect("the peers file reads")
-        .network_key
+        .network_psk()
         .expect("this Mac has a key");
 
     // A link from elsewhere, carrying a DIFFERENT network key and a join
@@ -179,8 +179,8 @@ fn a_join_link_with_both_keys_still_reads_the_join_token_when_the_network_key_is
 
     let file = config::read_or_default(&peers).expect("the peers file reads");
     assert_eq!(
-        file.network_key,
-        Some(before),
+        file.network_psk(),
+        Some(&before),
         "a refused network key must not land on disk"
     );
 }

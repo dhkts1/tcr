@@ -338,7 +338,9 @@ fn the_network_key_is_printed_once_and_never_again() {
     // It is on disk, at 0600.
     let file = config::read_or_default(&peers).expect("the peers file reads");
     assert_eq!(
-        file.network_key.map(|key| key.to_paste_string()).as_deref(),
+        file.network_psk()
+            .map(|bytes| NetworkKey::from_bytes(*bytes).to_paste_string())
+            .as_deref(),
         Some(printed.as_str()),
         "what was printed must be what was stored"
     );
@@ -431,7 +433,9 @@ fn network_key_set_over_an_existing_key_requires_replace() {
     );
     let file = config::read_or_default(&peers).expect("the peers file reads");
     assert_eq!(
-        file.network_key.map(|key| key.to_paste_string()).as_deref(),
+        file.network_psk()
+            .map(|bytes| NetworkKey::from_bytes(*bytes).to_paste_string())
+            .as_deref(),
         Some(first_key.as_str()),
         "a refused `set` must not have touched the stored key"
     );
@@ -451,7 +455,9 @@ fn network_key_set_over_an_existing_key_requires_replace() {
     );
     let file = config::read_or_default(&peers).expect("the peers file reads");
     assert_eq!(
-        file.network_key.map(|key| key.to_paste_string()).as_deref(),
+        file.network_psk()
+            .map(|bytes| NetworkKey::from_bytes(*bytes).to_paste_string())
+            .as_deref(),
         Some(second_key.as_str()),
         "the replaced key must be what is stored"
     );

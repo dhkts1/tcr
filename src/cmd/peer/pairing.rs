@@ -364,28 +364,28 @@ pub(super) async fn run_peer_join(a: peer_cli::PeerJoinArgs) -> anyhow::Result<(
     if let Some(network_key) = input.network_key() {
         let _lock = tcr::peer::config::FileLock::acquire(&path)?;
         let mut file = tcr::peer::config::read_or_default(&path)?;
-        let replaced = file.network_key.is_some();
         // The same refusal `tcr peer network-key join` gives, in the
         // same words. This arm used to overwrite in silence, which made
         // one clicked link enough to cut a Mac off from the mesh it was
         // already on, and the documented promise that the key is not
         // replaced without asking was true of one command out of two.
-        if replaced && !a.replace {
-            network_key_refusal = Some(format!(
-                "peer join: a network key is already set on this Mac, and this link \
-                 carries another. Taking it cuts this Mac off from every Mac still \
-                 holding the old one, {} pinned peer(s) here. Pass --replace to mean \
-                 it, or `tcr peer network-key clear` first",
-                file.peers.len()
-            ));
-        } else {
-            file.network_key = Some(network_key);
-            tcr::peer::config::save(&path, &file)?;
-            println!(
-                "peer join: network key {} file={}",
-                if replaced { "replaced" } else { "set" },
-                path.display()
-            );
+        match file.set_network_key(network_key, a.replace) {
+            Err(pinned) => {
+                network_key_refusal = Some(format!(
+                    "peer join: a network key is already set on this Mac, and this link \
+                     carries another. Taking it cuts this Mac off from every Mac still \
+                     holding the old one, {pinned} pinned peer(s) here. Pass --replace to mean \
+                     it, or `tcr peer network-key clear` first"
+                ));
+            }
+            Ok(replaced) => {
+                tcr::peer::config::save(&path, &file)?;
+                println!(
+                    "peer join: network key {} file={}",
+                    if replaced { "replaced" } else { "set" },
+                    path.display()
+                );
+            }
         }
     }
 

@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use tcr_peer_wire::PeerId;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::peer::config::{self as config, NetworkKey, PeerFile};
+use crate::peer::config::{self as config, PeerFile};
 use crate::peer::id::KEY_BYTES;
 use crate::peer::noise::{self, Handshake, PeerSession};
 
@@ -58,7 +58,7 @@ where
     // reach the queue, and a Mac with one cannot knock at a node that has
     // none. Checked here, before `snow` is handed anything, so the refusal
     // names the cause instead of surfacing as a decryption failure.
-    match (file.network_key.as_ref(), pattern) {
+    match (file.network_psk(), pattern) {
         (Some(_), Handshake::Knock) => bail!(
             "peer knock: this Mac has a network key set, so a knock must run {} with it; \
              the one that arrived carries no key and gets nothing",
@@ -121,7 +121,7 @@ where
     // (`finish_responder`, below), so a caller that finds no room is refused
     // before this node answers a byte, and a sibling racing it a moment later
     // sees the reservation rather than the same "there is room" snapshot.
-    let psk = file.network_key.as_ref().map(NetworkKey::as_bytes);
+    let psk = file.network_psk();
     let psks: &[[u8; KEY_BYTES]] = match psk {
         Some(key) => std::slice::from_ref(key),
         None => &[],

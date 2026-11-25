@@ -19,7 +19,8 @@ async fn a_knock_without_the_network_key_gets_zero_bytes() {
     let node = Node::new("netkey-knock");
     let key = NetworkKey::from_bytes([0x5A; 32]);
     let mut file = node.file();
-    file.network_key = Some(key);
+    file.set_network_key(key, false)
+        .expect("a fresh peers file holds no key to refuse over");
     node.write_file(&file);
     let addr = serve(node.context()).await;
 
@@ -74,7 +75,8 @@ async fn a_knock_whose_message_1_does_not_validate_reserves_nothing() {
     let node = Node::new("knock-order");
     let key = NetworkKey::from_bytes([0x7C; 32]);
     let mut file = node.file();
-    file.network_key = Some(key);
+    file.set_network_key(key, false)
+        .expect("a fresh peers file holds no key to refuse over");
     node.write_file(&file);
     let addr = serve(node.context()).await;
 

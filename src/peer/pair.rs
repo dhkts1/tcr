@@ -638,9 +638,7 @@ pub async fn knock(store: &PeerStore, addr: SocketAddr, proposed_name: &str) -> 
             // with the feature off is not listening on it.
             listen_port: file.listen_port(),
         },
-        file.network_key
-            .as_ref()
-            .map(super::config::NetworkKey::as_bytes),
+        file.network_psk(),
     )
     .await
 }

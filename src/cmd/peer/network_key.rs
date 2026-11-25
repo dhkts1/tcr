@@ -25,7 +25,7 @@ pub(super) fn run_peer_network_key(args: peer_cli::PeerNetworkKeyArgs) -> anyhow
             // in every scrollback buffer on the Mac.
             println!(
                 "peer network-key: {}",
-                if file.network_key.is_some() {
+                if file.network_psk().is_some() {
                     "set"
                 } else {
                     "not-set"
@@ -34,21 +34,18 @@ pub(super) fn run_peer_network_key(args: peer_cli::PeerNetworkKeyArgs) -> anyhow
             Ok(())
         }
         peer_cli::PeerNetworkKeyAction::Set => {
-            let replaced = file.network_key.is_some();
+            let key = peer::config::NetworkKey::mint()?;
             // A key already here is not something to overwrite on the strength
             // of one word of argv: every Mac still holding it goes dark to this
             // one, and the refusal names how many that is.
-            if replaced && !args.replace {
-                anyhow::bail!(
+            let replaced = file.set_network_key(key, args.replace).map_err(|pinned| {
+                anyhow::anyhow!(
                     "peer network-key: a key is already set on this Mac, and minting another \
-                     cuts off every Mac still holding the old one, {} pinned peer(s) here, \
+                     cuts off every Mac still holding the old one, {pinned} pinned peer(s) here, \
                      and any Mac whose beacon this one would stop verifying. Pass --replace to \
-                     mean it, or `tcr peer network-key clear` first",
-                    file.peers.len()
-                );
-            }
-            let key = peer::config::NetworkKey::mint()?;
-            file.network_key = Some(key);
+                     mean it, or `tcr peer network-key clear` first"
+                )
+            })?;
             peer::config::save(&peers_path, &file)?;
             println!("{}", key.to_paste_string());
             println!(
@@ -95,19 +92,16 @@ pub(super) fn run_peer_network_key(args: peer_cli::PeerNetworkKeyArgs) -> anyhow
             let key = peer::config::NetworkKey::try_from(raw)
                 .map_err(|refusal| anyhow::anyhow!("{refusal}"))
                 .context("peer network-key join: that is not 32 base32-encoded bytes")?;
-            let replaced = file.network_key.is_some();
             // Same refusal as `set`, and for the same reason: pasting a second
             // office's key over the first is the commonest way a Mac
             // disappears from its own mesh.
-            if replaced && !args.replace {
-                anyhow::bail!(
+            let replaced = file.set_network_key(key, args.replace).map_err(|pinned| {
+                anyhow::anyhow!(
                     "peer network-key: a key is already set on this Mac, and pasting another \
-                     cuts off every Mac still holding the old one, {} pinned peer(s) here. \
-                     Pass --replace to mean it, or `tcr peer network-key clear` first",
-                    file.peers.len()
-                );
-            }
-            file.network_key = Some(key);
+                     cuts off every Mac still holding the old one, {pinned} pinned peer(s) here. \
+                     Pass --replace to mean it, or `tcr peer network-key clear` first"
+                )
+            })?;
             peer::config::save(&peers_path, &file)?;
             println!(
                 "peer network-key: {} file={}",
@@ -117,11 +111,10 @@ pub(super) fn run_peer_network_key(args: peer_cli::PeerNetworkKeyArgs) -> anyhow
             Ok(())
         }
         peer_cli::PeerNetworkKeyAction::Clear => {
-            if file.network_key.is_none() {
+            if !file.clear_network_key() {
                 println!("peer network-key: not-set (nothing to clear)");
                 return Ok(());
             }
-            file.network_key = None;
             peer::config::save(&peers_path, &file)?;
             println!("peer network-key: cleared file={}", peers_path.display());
             println!(

@@ -527,11 +527,11 @@ pub async fn dial_peer_reaching_within(
     // own endpoints and before a punch or a third Mac's carried bytes are
     // spent, on the design's own flowchart.
     let dead_drop_file = store.file();
-    if dead_drop_file.dead_drop.is_live() && row.allow.control.drop {
+    if dead_drop_file.drop_is_live() && row.allow.control.drop {
         let now_s = now_unix_seconds();
         let drop_slot = crate::peer::config::drop::current_slot(now_s);
         if !crate::peer::reach::drop_exchange::fetched_this_slot(&row.node, drop_slot) {
-            match dead_drop_file.dead_drop.open_store() {
+            match dead_drop_file.open_drop_store() {
                 Ok(drop_store) => {
                     match crate::peer::reach::drop_exchange::fetch_for(
                         &drop_store,
