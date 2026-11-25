@@ -5,7 +5,7 @@
 //! out of rotation until re-login), whereas a `5xx`/network failure is transient
 //! (keep the current token and fail this one request over to another account).
 //! A Codex account refreshes against `auth.openai.com` instead
-//! ([`crate::codex_oauth`], dispatched by [`LiveRefresher`]). Every Codex `401` and the
+//! ([`codex`], dispatched by [`LiveRefresher`]). Every Codex `401` and the
 //! `refresh_token_expired`, `refresh_token_reused` and `refresh_token_invalidated` codes at
 //! any error status are permanent, as is `invalid_grant` on a `400`. Other failures are
 //! transient.
@@ -28,8 +28,8 @@ const MAX_RETRIES: u32 = 2;
 const BASE_DELAY_MS: u64 = 500;
 /// The bound on one refresh POST, whichever provider's endpoint it goes to: the manager holds an
 /// account's refresh lock across the call, so a POST that never answered would stall every
-/// request on that account. `pub(crate)` so [`crate::codex_oauth`] applies the same bound.
-pub(crate) const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+/// request on that account. [`codex`], a child module, applies the same bound.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Freshly-minted OAuth credentials returned by a refresh.
 #[derive(Debug, Clone)]
@@ -46,7 +46,7 @@ pub struct Tokens {
     /// return `None`, and [`refresh_access_token_at`] falls back to the
     /// refresh token it was just called with when the endpoint omits a
     /// rotated one. See that fallback's doc comment before touching either.
-    /// The Codex refresher, [`crate::codex_oauth::refresh_access_token_at`], is
+    /// The Codex refresher, [`codex::refresh_access_token_at`], is
     /// bound by the same invariant and keeps the old token the same way, an
     /// empty rotated one included.
     pub refresh_token: Option<String>,
@@ -253,11 +253,11 @@ pub trait TokenRefresher: Send + Sync {
 }
 
 /// The production refresher: a real HTTPS call to the OAuth endpoint of the
-/// account's provider — Anthropic's, or Codex's ([`crate::codex_oauth`]).
+/// account's provider — Anthropic's, or Codex's ([`codex`]).
 pub struct LiveRefresher {
     client: reqwest::Client,
     endpoint: String,
-    /// Where Codex refreshes go: [`crate::codex_oauth::TOKEN_ENDPOINT`] unless a
+    /// Where Codex refreshes go: [`codex::TOKEN_ENDPOINT`] unless a
     /// test pointed it elsewhere with [`Self::with_codex_endpoint`].
     codex_endpoint: String,
 }
@@ -285,12 +285,12 @@ impl LiveRefresher {
             // Anthropic's and Codex's alike.
             client,
             endpoint: TOKEN_ENDPOINT.to_string(),
-            codex_endpoint: crate::codex_oauth::TOKEN_ENDPOINT.to_string(),
+            codex_endpoint: codex::TOKEN_ENDPOINT.to_string(),
         }
     }
 
     /// Send Codex refreshes to `endpoint` instead of
-    /// [`crate::codex_oauth::TOKEN_ENDPOINT`]. A test seam: a stub endpoint is
+    /// [`codex::TOKEN_ENDPOINT`]. A test seam: a stub endpoint is
     /// the only way to watch a refresh without spending a real single-use token.
     pub fn with_codex_endpoint(mut self, endpoint: String) -> Self {
         self.codex_endpoint = endpoint;
@@ -317,8 +317,7 @@ impl TokenRefresher for LiveRefresher {
             crate::provider::Provider::Codex => {
                 let endpoint = self.codex_endpoint.clone();
                 Box::pin(async move {
-                    crate::codex_oauth::refresh_access_token_at(&client, &refresh_token, &endpoint)
-                        .await
+                    codex::refresh_access_token_at(&client, &refresh_token, &endpoint).await
                 })
             }
         }
@@ -359,6 +358,7 @@ impl TokenRefresher for NoRefresh {
     }
 }
 
+pub mod codex;
 mod profile;
 #[cfg(test)]
 mod tests;

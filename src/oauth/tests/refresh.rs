@@ -154,7 +154,7 @@ async fn live_refresher_sends_each_provider_to_its_own_token_endpoint() {
             .unwrap_or_else(|| panic!("the {route} endpoint was never called: {seen:?}"));
         body.clone()
     };
-    assert_eq!(body_at("codex")["client_id"], crate::codex_oauth::CLIENT_ID);
+    assert_eq!(body_at("codex")["client_id"], codex::CLIENT_ID);
     assert_eq!(body_at("codex")["refresh_token"], "rt-codex");
     assert_eq!(body_at("anthropic")["client_id"], CLIENT_ID);
     assert_eq!(body_at("anthropic")["refresh_token"], "rt-anthropic");

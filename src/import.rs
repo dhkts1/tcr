@@ -600,7 +600,7 @@ fn claude_swap_credentials(
         .join(format!(".creds-{n}-{email}.enc"));
     match std::fs::read_to_string(&enc) {
         Ok(encoded) => {
-            return crate::codex_oauth::base64_standard_decode(encoded.trim())
+            return crate::oauth::codex::base64_standard_decode(encoded.trim())
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .ok_or_else(|| "its .enc file is not base64 text".to_string());
         }
@@ -1079,10 +1079,10 @@ async fn import_codex(
         return Ok(Imported::Saved(saved));
     }
     if needs_refresh(login.expires_at_ms, crate::now_ms()) {
-        let tokens = crate::codex_oauth::refresh_access_token_at(
+        let tokens = crate::oauth::codex::refresh_access_token_at(
             &refresh_client()?,
             &login.refresh_token,
-            crate::codex_oauth::TOKEN_ENDPOINT,
+            crate::oauth::codex::TOKEN_ENDPOINT,
         )
         .await
         .map_err(|err| refresh_failure(&err))?;

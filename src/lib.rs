@@ -18,7 +18,6 @@ pub mod cli;
 pub mod codex_cli_login;
 pub mod codex_local;
 pub mod codex_login;
-pub mod codex_oauth;
 pub mod codex_probe;
 pub mod codex_route;
 mod codex_token_store;

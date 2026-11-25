@@ -77,7 +77,7 @@ use crate::login::{self, LoginEvent, LoginRefusal, LoginUi};
 pub const CODEX_OPENS_ITS_BROWSER: bool = true;
 
 /// How codex's authorize URL starts: its issuer is `auth.openai.com`, the host of
-/// [`crate::codex_oauth::TOKEN_ENDPOINT`].
+/// [`crate::oauth::codex::TOKEN_ENDPOINT`].
 const AUTHORIZE_URL_PREFIX: &str = "https://auth.openai.com/oauth/authorize";
 
 /// How long a signalled `codex login` and its children get to end before they are killed.

@@ -223,7 +223,7 @@ fn basic_user_password(value: &str) -> Option<(String, String)> {
             other => other,
         })
         .collect();
-    let decoded = String::from_utf8(crate::codex_oauth::base64url_decode(&url_safe)?).ok()?;
+    let decoded = String::from_utf8(crate::oauth::codex::base64url_decode(&url_safe)?).ok()?;
     let (user, password) = decoded.split_once(':')?;
     Some((user.to_string(), password.to_string()))
 }
