@@ -1001,7 +1001,7 @@ pub const ADD_ACCOUNT_ENDPOINT: &str = "accounts-add";
 /// server can store: [`crate::provider::Provider::as_str`] over
 /// [`crate::provider::Provider::ALL`], so `anthropic,codex`. Set by
 /// `stamp` (for `ADD_ACCOUNT_ROUTE`), so it rides on every answer the account-add route
-/// stamps — the blank-probe 400 `oauth::probe_add_route` provokes, a 405, a
+/// stamps — the blank-probe 400 `login::probe_add_route` provokes, a 405, a
 /// 409, a 200 — and never on the unstamped gate refusal, which must not confirm
 /// the route exists to a caller that failed the gate.
 ///
@@ -1012,7 +1012,7 @@ pub const ADD_ACCOUNT_ENDPOINT: &str = "accounts-add";
 /// needs no such proof, and the header's absence changes nothing for one.
 ///
 /// A SECOND header, deliberately, never a new value of [`ENDPOINT_HEADER`]:
-/// `cli::post_add_account` recognises the route by that stamp's exact value, and
+/// `live_client::post_add_account` recognises the route by that stamp's exact value, and
 /// every older CLI (TcrBar's bundled one included) would read a changed stamp as
 /// "no such route" and refuse every Anthropic login.
 pub const PROVIDERS_HEADER: &str = "x-tcr-providers";
@@ -2991,7 +2991,7 @@ struct AddAccountRequest {
     /// The upstream the credential belongs to. Absent is Anthropic: every body
     /// posted before this field existed, and every Anthropic row, which
     /// `config::Account` serializes with no `provider` key. A Codex import
-    /// (`oauth::login_from_codex`) posts `"provider": "codex"`. Without this
+    /// (`login::login_from_codex`) posts `"provider": "codex"`. Without this
     /// field the route dropped it, filed that credential as an Anthropic account
     /// and resolved it onto any Anthropic row sharing its name or id, overwriting
     /// that row's own single-use refresh token.
@@ -3013,11 +3013,11 @@ struct AddAccountRequest {
 /// [`crate::singleton::ProxyHost::Unknown`] — because the `tcr` that
 /// deserializes a reply can be older than the `tcr` that served it. Every
 /// field below carries `#[serde(default)]` so a field a NEWER server has
-/// renamed or dropped does not fail the whole deserialize: `cli::post_add_account`
+/// renamed or dropped does not fail the whole deserialize: `live_client::post_add_account`
 /// maps a deserialize failure on a 2xx to `LiveControlError::Unusable`, and
-/// `oauth::probe_add_route` reads that as `AddCapability::Unusable` — a
+/// `login::probe_add_route` reads that as `AddCapability::Unusable` — a
 /// *successful* live add would then look indistinguishable from a wedged or
-/// route-less proxy, and `oauth::admit_login` REFUSES outright (bridge item D)
+/// route-less proxy, and `login::admit_login` REFUSES outright (bridge item D)
 /// instead of silently falling back to the file beside a server that just
 /// handled the request correctly. Field ADDITIONS are already safe on their
 /// own (an older CLI just ignores a key it doesn't know); this attribute is
@@ -3066,7 +3066,7 @@ pub struct AddAccountResponse {
 
 /// Shown when the submitted account carries no refresh token: it will serve
 /// until its access token expires and then go dead, silently, unless the
-/// operator hears about it now. `pub(crate)` so [`crate::oauth::login_with_token`]
+/// operator hears about it now. `pub(crate)` so [`crate::login::login_with_token`]
 /// can print the same hazard on the offline (file) route too — that path
 /// never goes through this module's `add_account_handler`, so nothing else
 /// would say it.
@@ -3134,11 +3134,11 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
         Ok(parsed) => parsed,
         Err(refusal) => return *refusal,
     };
-    // LOAD-BEARING CAPABILITY SIGNAL: `oauth::probe_add_route` deliberately
+    // LOAD-BEARING CAPABILITY SIGNAL: `login::probe_add_route` deliberately
     // POSTs a blank name to trigger exactly this branch, and reads a STAMPED
     // 400 back as proof this route exists. Changing the status (e.g. to 422),
     // or answering without the route's stamp, silently turns that read into
-    // `AddCapability::Unusable` — `oauth::admit_login` then REFUSES outright (bridge
+    // `AddCapability::Unusable` — `login::admit_login` then REFUSES outright (bridge
     // item D) rather than falling back to the file, so this degrades to a
     // needless refusal beside a server that actually has the route, not the
     // whole-file clobber this feature exists to remove. See the seam test
