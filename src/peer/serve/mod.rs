@@ -70,7 +70,7 @@
 //! none of those, so a borrower-supplied session cookie went out to Anthropic
 //! on the lender's own TLS session, as would any header a borrower invented.
 //!
-//! So the lender forwards [`LENDER_FORWARDED_HEADERS`] and nothing else. An
+//! So the lender forwards [`LENDER_FORWARDED_HEADERS`](crate::peer::serve::LENDER_FORWARDED_HEADERS) and nothing else. An
 //! allowlist rather than a longer denylist, because the two fail in opposite
 //! directions: a name nobody thought of is dropped by the first and forwarded
 //! by the second, and the set of names a borrower can invent is not
@@ -87,7 +87,7 @@
 //! # The lender's per-org bucket, which is not a new mechanism
 //!
 //! A borrowed request counts against the LENDER's GCRA bucket for free, because
-//! [`handle_serve_on`] sends it through the lender's own proxy and therefore
+//! [`handle_serve_on`](crate::peer::serve::handle_serve_on) sends it through the lender's own proxy and therefore
 //! through the lender's own picker and its own
 //! `Manager::throttle_send` call (`src/proxy.rs:2593`), which keys the
 //! per-organization bucket through `Manager::throttle_bucket_key`

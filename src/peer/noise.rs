@@ -27,11 +27,11 @@
 //! and the six digits are what bind that answer to the machine in front of
 //! the operator.
 //!
-//! - [`PATTERN_PAIR`], `XX`, for a first pairing: neither side knows the
+//! - [`PATTERN_PAIR`](crate::peer::noise::PATTERN_PAIR), `XX`, for a first pairing: neither side knows the
 //!   other's key, both learn it inside the handshake, and the operator compares
 //!   six digits on two screens. This is the default path and the one the
 //!   simple surface's Trust button runs.
-//! - [`PATTERN_RETURN`], `IK`, for every returning connection to a PINNED key.
+//! - [`PATTERN_RETURN`](crate::peer::noise::PATTERN_RETURN), `IK`, for every returning connection to a PINNED key.
 //!   Not `KK`: a `KK` responder must be handed the remote public key BEFORE it
 //!   can process message 1, and a multi-peer listener does not know who is
 //!   calling yet, so `KK` forces either a cleartext peer hint on the wire or
@@ -40,7 +40,7 @@
 //!   LAN observer learns no identity, and the responder reads it with
 //!   `get_remote_static()` after message 1, which is exactly where the pin
 //!   check belongs. Two messages, one LAN round trip.
-//! - [`PATTERN_ENROL`], `IKpsk1`, for the ONE case that does begin with a key:
+//! - [`PATTERN_ENROL`](crate::peer::noise::PATTERN_ENROL), `IKpsk1`, for the ONE case that does begin with a key:
 //!   a pasted join token. The token itself carries the registrar's static (the
 //!   `IK` half) and a 32-byte secret proved as the PSK mixed into message 1
 //!   (the `psk1` half), so **a wrong secret fails while the responder is still
@@ -56,7 +56,7 @@
 //! # Enrolment is accepted BEFORE a pinned row exists, and that is the order
 //!
 //! The one ordering question in this design, decided here so nobody
-//! re-derives it: **an [`Handshake::Enrol`] session may send exactly one
+//! re-derives it: **an [`Handshake::Enrol`](crate::peer::noise::Handshake::Enrol) session may send exactly one
 //! `Control::Enroll` and be pinned by it, with no pinned row required
 //! beforehand**, and nothing else. Stated as the rule the listener enforces:
 //!
@@ -103,8 +103,8 @@
 //! # Where the bytes are, and why the two drivers are in this file
 //!
 //! `snow` is a frame API over byte slices: it never touches a socket. So the
-//! two functions that move a handshake over a stream, [`accept_handshake`] and
-//! [`dial_handshake`], live here beside the patterns rather than in
+//! two functions that move a handshake over a stream, [`accept_handshake`](crate::peer::noise::accept_handshake) and
+//! [`dial_handshake`](crate::peer::noise::dial_handshake), live here beside the patterns rather than in
 //! [`crate::peer::listener`]. That placement is the property the whole design
 //! rests on: **the responder's only write happens after the authorization
 //! callback has answered**, and keeping the read, the check and the write in

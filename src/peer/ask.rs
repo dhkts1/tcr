@@ -3,7 +3,7 @@
 //!
 //! # What this is and what it is not
 //!
-//! An [`Ask`] is a one-time public key, pasted into a chat, that names no
+//! An [`Ask`](crate::peer::ask::Ask) is a one-time public key, pasted into a chat, that names no
 //! address and grants nothing. Whoever holds it mints a one-use, ten-minute
 //! join key of their own (the same [`crate::peer::pair::mint_invite`] the
 //! `invite` verb runs) and seals it to the ask; this Mac then joins with that
@@ -11,7 +11,7 @@
 //! peers file, and it is not counted against
 //! [`crate::peer::pair::MAX_OUTSTANDING_INVITES`].
 //!
-//! A [`Reply`] is what comes back: one Mac's freshly minted `JoinToken`
+//! A [`Reply`](crate::peer::ask::Reply) is what comes back: one Mac's freshly minted `JoinToken`
 //! (v3's three fields), sealed under Noise `N`
 //! ([`crate::peer::noise::PATTERN_SEAL`]) to one ask's public key. It opens
 //! against exactly one live row, once. Opening it runs the join on the spot,
@@ -308,7 +308,7 @@ pub struct PendingAsk {
 }
 
 impl std::fmt::Debug for PendingAsk {
-    /// The private key is deliberately not printed, [`MovedKeys`]'s own move
+    /// The private key is deliberately not printed, [`MovedKeys`](crate::peer::config::moved::MovedKeys)'s own move
     /// (`src/peer/moved.rs:148-153`) for the same reason: a `{:?}` in a log
     /// line is how a secret reaches a file that keeps scrollback.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

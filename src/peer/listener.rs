@@ -12,7 +12,7 @@
 //! So: a peer frame must never reach it. The peer listener is its own
 //! `TcpListener`, bound where `tcr-peers.json` says and absent
 //! entirely when it says nothing, and it has its own gate
-//! ([`peer_stream_gate`]). `local_endpoint_gate` is not relaxed by one
+//! ([`peer_stream_gate`](crate::peer::listener::peer_stream_gate)). `local_endpoint_gate` is not relaxed by one
 //! character, and **neither arm of the existing listener is widened**, the
 //! serving socket has two origins, an inherited descriptor
 //! (`src/server.rs:1133-1143`) and the loopback bind below it, and a peer
@@ -36,7 +36,7 @@
 //! answering it would hand this node's static key to whoever asked. It is
 //! answered only inside a pairing window the operator opened
 //! ([`crate::peer::pair::open_pairing_window`]), and the log a refused
-//! connection writes is bounded to one line ([`RefusalLog`]), because a line
+//! connection writes is bounded to one line ([`RefusalLog`](crate::peer::listener::RefusalLog)), because a line
 //! per connection is a disk-filling primitive handed to anyone who can reach
 //! the port.
 //!
@@ -53,13 +53,13 @@
 //!
 //! [`serve_stream`] dispatches `StreamKind::Serve` to
 //! [`crate::peer::serve::handle_serve_on`] and holds the three things a
-//! listener cannot derive ([`LeaseServing`]: the ledger, this node's own proxy
+//! listener cannot derive ([`LeaseServing`](crate::peer::serve::LeaseServing): the ledger, this node's own proxy
 //! base, a reader for its own quota). Every decision about the request, the
 //! path refusal, the method, the lease, the debit, which account serves, is in
 //! `src/peer/serve.rs`, and this file's only contribution is the gate that
 //! already ran above.
 //!
-//! A build with no [`LeaseServing`] REFUSES a SERVE rather than accepting a
+//! A build with no [`LeaseServing`](crate::peer::serve::LeaseServing) REFUSES a SERVE rather than accepting a
 //! stream it cannot answer, which is the same shape every ungranted kind has.
 
 use std::net::SocketAddr;

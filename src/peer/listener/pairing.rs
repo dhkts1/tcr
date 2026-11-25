@@ -29,7 +29,7 @@ pub(super) struct AcceptedSession {
 /// Run the responder's half for a first pairing, a return visit or an
 /// enrolment, from the message 1 the caller already holds.
 ///
-/// Knocks do not come here: they are [`serve_knock`], which shares no code with
+/// Knocks do not come here: they are [`serve_knock`](crate::peer::listener::knock::serve_knock), which shares no code with
 /// this function because it shares no decision either, a knock has no static
 /// key, no pin, no grant and no stream.
 ///

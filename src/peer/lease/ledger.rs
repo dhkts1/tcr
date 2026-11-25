@@ -183,7 +183,7 @@ pub const SERVED_PER_LEASE_CAPACITY: usize = 256;
 /// How many LIVE leases one pinned peer may hold here at once.
 ///
 /// The review's MEDIUM: nothing capped how many leases one peer could mint, and
-/// every mint rewrites the whole state file under the same [`FileLock`] that
+/// every mint rewrites the whole state file under the same [`FileLock`](crate::peer::config::FileLock) that
 /// `tcr peer accept` and `tcr peer block` take with a hard five-second
 /// give-up, so an authenticated peer asking in a loop was both an unbounded
 /// ledger and an operator whose Accept could not get the lock.
@@ -191,7 +191,7 @@ pub const SERVED_PER_LEASE_CAPACITY: usize = 256;
 /// Eight, and per GRANTEE rather than per Mac, because the honest question is
 /// "how many leases does one borrower legitimately need at once" and the answer
 /// is a small number: a lease is asked for per window, held for its ttl and
-/// renewed rather than re-minted ([`PeerLeaseProvider::lease_for`](super::PeerLeaseProvider::lease_for) re-asks only
+/// renewed rather than re-minted ([`PeerLeaseProvider::lease_for`](crate::peer::serve::PeerLeaseProvider::lease_for) re-asks only
 /// when its cached one has expired or the window changed). Two windows and a
 /// couple of retries in flight is inside it; a loop is not.
 ///

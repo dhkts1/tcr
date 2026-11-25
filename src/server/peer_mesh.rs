@@ -84,7 +84,7 @@ pub(super) fn peers_file_beside_config(persist_path: Option<&std::path::Path>) -
 ///
 /// # What is wired, and the one thing that is not
 ///
-/// The accept loop gets a [`crate::peer::listener::LeaseServing`]: a fresh
+/// The accept loop gets a [`crate::peer::serve::LeaseServing`]: a fresh
 /// ledger, THIS process's own proxy base (the whole of "own picker, own Bearer,
 /// own bucket", see `crate::peer::serve::handle_serve_on`) and the manager as
 /// the quota reader. It also gets the owner's headroom noted per window, on a
@@ -518,11 +518,11 @@ fn spawn_beacon(
 /// and the `find` flag re-read off the peers file each wake rather than taken
 /// from the boot snapshot, the same reason [`spawn_beacon`] gives.
 ///
-/// Holds a [`discovery::FoundList`] across wakes: the caps and the ageing
+/// Holds a [`discovery::FoundList`](crate::peer::discovery::FoundList) across wakes: the caps and the ageing
 /// live there, in memory, and this task's whole job after each browse is
 /// dropping this node's own beacon (never by address, only by instance id;
-/// see the module's own refusal) and writing [`discovery::FoundList::shown`]
-/// and [`discovery::FoundList::not_shown`] into `peer-state.json`.
+/// see the module's own refusal) and writing [`discovery::FoundList::shown`](crate::peer::discovery::FoundList::shown)
+/// and [`discovery::FoundList::not_shown`](crate::peer::discovery::FoundList::not_shown) into `peer-state.json`.
 ///
 /// A peers file, or a state file, that does not read or write for a moment
 /// is not the same fact as `find` being off: logged and left as it is until

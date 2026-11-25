@@ -25,12 +25,12 @@
 //! stored value an attacker could not use is a value the registrar could not
 //! use either. The mitigations that actually work are the boring ones: single
 //! use, a short TTL, mode 0600, the row deleted on use,
-//! [`MAX_OUTSTANDING_INVITES`], and an explicit revoke.
+//! [`MAX_OUTSTANDING_INVITES`](crate::peer::pair::MAX_OUTSTANDING_INVITES), and an explicit revoke.
 //!
-//! [`JoinToken::to_token_v3`] does not change any of that. It changes what the
+//! [`JoinToken::to_token_v3`](crate::peer::config::join_key::JoinToken::to_token_v3) does not change any of that. It changes what the
 //! key LOOKS like, an opaque run rather than three plain-text fields, so a
 //! glance over a shoulder learns nothing. It is still exactly as much of a
-//! bearer secret as [`JoinToken::to_token`], and whoever holds either string
+//! bearer secret as [`JoinToken::to_token`](crate::peer::config::join_key::JoinToken::to_token), and whoever holds either string
 //! can spend it. Mode B, the sealed exchange in `src/peer/ask.rs`, is the one
 //! that changes what travels rather than what a string looks like.
 //!
@@ -53,9 +53,9 @@
 //! ([`crate::peer::state::PeerState::accepted_window`],
 //! [`crate::peer::listener::accept_pairing_or_return`]); outside that window
 //! the listener answers an `XX` message 1 with zero bytes, the same silence a
-//! failed pin check gets. [`PairingWindow`] and [`open_pairing_window`] below
+//! failed pin check gets. [`PairingWindow`](crate::peer::pair::PairingWindow) and [`open_pairing_window`](crate::peer::pair::open_pairing_window) below
 //! remain the node-wide TYPE and MINTER (nothing in production reads them),
-//! kept for [`pairing_window`]'s own test coverage rather than deleted, which
+//! kept for [`pairing_window`](crate::peer::pair::pairing_window)'s own test coverage rather than deleted, which
 //! is out of scope here.
 
 use std::net::SocketAddr;

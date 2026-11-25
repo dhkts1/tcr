@@ -11,7 +11,7 @@
 //! rise it measures on its own account. The borrower never debits. A retried or
 //! diamond-delivered relay debits once, keyed on the request id.
 //!
-//! [`MIN_DEBIT`] is charged when the observed rise is zero, because the
+//! [`MIN_DEBIT`](crate::peer::lease::MIN_DEBIT) is charged when the observed rise is zero, because the
 //! granularity of the upstream utilization header is undocumented: "no rise"
 //! and "a rise below the reporting step" are the same bytes, and a lease that
 //! charges nothing for them never ends. **This is the one constant here that is
@@ -21,7 +21,7 @@
 //!
 //! # A lease can never spend the owner's guard
 //!
-//! [`may_relay`] answers in a fixed order, expired, spent, then owner-guard,
+//! [`may_relay`](crate::peer::lease::Ledger::may_relay) answers in a fixed order, expired, spent, then owner-guard,
 //! and **the third fires on its own even with budget left on the lease**. It
 //! inherits the failure mode the main config already records for the same
 //! headers: they lag, upstream is the oracle, and it answers 200s for accounts

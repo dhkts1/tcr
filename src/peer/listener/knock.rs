@@ -319,7 +319,7 @@ where
 /// that writes to the socket: message 2, then the knock frame.
 ///
 /// Pulled out of [`serve_knock`] so its caller has one place to catch a failure
-/// and release the reservation [`PeerState::reserve_knock_slot`] made, rather
+/// and release the reservation [`PeerState::reserve_knock_slot`](crate::peer::state::PeerState::reserve_knock_slot) made, rather
 /// than duplicating that release at every `?`, and one place to put a deadline
 /// on. Message 1's own validation is NOT in here
 /// any more: it writes nothing, so it belongs above the reservation.
@@ -348,7 +348,7 @@ where
     Ok((session, knock))
 }
 
-/// Undo a reservation [`PeerState::reserve_knock_slot`] made for `addr` at
+/// Undo a reservation [`PeerState::reserve_knock_slot`](crate::peer::state::PeerState::reserve_knock_slot) made for `addr` at
 /// `reserved_at_ms`, because the handshake that would have earned it real
 /// details never completed. Logged rather than propagated: the connection is
 /// already being torn down for its own error, and a state-file write failure

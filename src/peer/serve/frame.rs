@@ -49,7 +49,7 @@ pub const MAX_RELAYED_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// cosmetic and cannot be negotiated silently, a borrower that writes the body
 /// before the ack has already made its request unrepeatable, which is the whole
 /// defect the ack exists to fix. So a lender REFUSES any other flow by name
-/// (see [`handle_serve_on`]) rather than guessing at the order, and a borrower
+/// (see [`handle_serve_on`](crate::peer::serve::handle_serve_on)) rather than guessing at the order, and a borrower
 /// that reads a closed stream where the ack should be says the same thing in
 /// its log.
 pub const SERVE_FLOW: u16 = 2;

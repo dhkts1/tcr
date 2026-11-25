@@ -133,7 +133,7 @@ pub const MESSAGE_1_TIMEOUT: Duration = Duration::from_secs(5);
 /// counting it. A replayed `IK` message 1 reaches exactly that state without
 /// the far side having to keep anything alive.
 ///
-/// The same number as [`HANDSHAKE_TIMEOUT`], for the same reason: the header
+/// The same number as [`HANDSHAKE_TIMEOUT`](crate::peer::listener::HANDSHAKE_TIMEOUT), for the same reason: the header
 /// is one frame a caller already has in hand when it dials.
 pub const STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -170,7 +170,7 @@ pub const REFUSAL_LOG_QUIET_MS: i64 = 3_600_000;
 
 /// How many addresses the refusal log remembers. A map a stranger can grow
 /// without bound is a memory bug with a security label, which is the same
-/// sentence [`RequestDedup`] carries: an address that has not been refused
+/// sentence [`RequestDedup`](crate::peer::listener::RequestDedup) carries: an address that has not been refused
 /// within [`REFUSAL_LOG_QUIET_MS`] is dropped, and above this cap the oldest
 /// entry goes so the map cannot outgrow it even inside one hour.
 pub const REFUSAL_LOG_ADDRESSES: usize = 1_024;

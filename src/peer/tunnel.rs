@@ -6,7 +6,7 @@
 //! `src/mitm.rs`'s `tunnel()` is a `copy_bidirectional` splice whose own
 //! doc-comment is the security argument verbatim: TLS is never terminated, the
 //! client's end-to-end encryption to the real host is untouched, and no
-//! credentials are involved. [`splice`] is that body, extracted over two
+//! credentials are involved. [`splice`](crate::peer::tunnel::splice) is that body, extracted over two
 //! generic halves rather than two `TcpStream`s, because neither half of a peer
 //! carry is a bare socket on both ends.
 //!
@@ -14,7 +14,7 @@
 //!
 //! `snow` exposes a FRAME API over byte slices, not a stream, while
 //! `copy_bidirectional` needs `AsyncRead + AsyncWrite + Unpin`. So the splice
-//! needs [`NoiseStream`], an adapter that turns one authenticated Noise session
+//! needs [`NoiseStream`](crate::peer::noise::NoiseStream), an adapter that turns one authenticated Noise session
 //! into a byte stream.
 //!
 //! It is built out of a `tokio::io::duplex` pair plus one pump task rather than
@@ -36,8 +36,8 @@
 //! A TUNNEL's target is an origin or a peer, and the peer form is the reach
 //! story for two Macs that both moved: the requester asks a pinned friend with
 //! a reachable address to splice it onward.
-//! [`handle_forward_on`] is that half, and the three things that keep it from
-//! being an open relay are all in [`authorize_forward`]: the requester holds
+//! [`handle_forward_on`](crate::peer::tunnel::handle_forward_on) is that half, and the three things that keep it from
+//! being an open relay are all in [`authorize_forward`](crate::peer::tunnel::authorize_forward): the requester holds
 //! `allow.relay`, the TARGET is a row in this Mac's own peers file (so no
 //! address a peer chose is ever dialled), and one hop is spent per forward
 //! with zero refused.
@@ -47,13 +47,13 @@
 //! target. The target therefore authenticates the REQUESTER, this node holds
 //! ciphertext, and the meter is the same two byte counts a gateway has.
 //!
-//! [`open_forward_to`] is the REQUESTER's half of the same picture, and it did
+//! [`open_forward_to`](crate::peer::tunnel::dial::open_forward_to) is the REQUESTER's half of the same picture, and it did
 //! not exist for a long time: every gate on the forwarding path was built
 //! and nothing in the tree ever opened a TUNNEL whose target was a peer, so a
 //! peer reachable only through a friend was reachable by nobody.
 //!
 //! Forwarded bytes are charged to the REQUESTER out of the same
-//! [`TunnelBudget`] a carry draws on, through the same [`reserve_for`]: one
+//! [`TunnelBudget`](crate::peer::tunnel::TunnelBudget) a carry draws on, through the same [`reserve_for`]: one
 //! cap, one hour, one peer. That is what makes a transitive forward grant
 //! bounded rather than merely honest, the node two hops out spends the
 //! grantee's hour and never a fresh one.
@@ -61,7 +61,7 @@
 //! # What a blind hop may validate, and the ceiling of that
 //!
 //! A host and a port, and then one thing more: **the first ClientHello's SNI
-//! must equal the CONNECTed host** ([`assert_sni_matches_target`]), so a
+//! must equal the CONNECTed host** ([`assert_sni_matches_target`](crate::peer::tunnel::assert_sni_matches_target)), so a
 //! granted peer cannot domain-front to some other service behind the same
 //! address. A gateway cannot do better than that without terminating TLS, at
 //! which point it is not blind, so this is the ceiling, and the ceiling ships
@@ -72,12 +72,12 @@
 //! Bytes, streams and wall time. **Never quota**, it cannot see a model, a
 //! path, an account or a response header, and a design that let it meter quota
 //! would be admitting it can see. The two counters `copy_bidirectional`
-//! returns are the meter, plus a cap ([`TunnelBudget`]).
+//! returns are the meter, plus a cap ([`TunnelBudget`](crate::peer::tunnel::TunnelBudget)).
 //!
 //! The cap is enforced twice and neither is redundant. At admission, a peer
 //! already over its hour is refused before a socket to the origin is opened
-//! ([`TunnelBudget::admit`]); and during the splice, the peer half is wrapped
-//! in [`Metered`] with this carry's allowance, so one stream that never ends
+//! ([`TunnelBudget::admit`](crate::peer::tunnel::TunnelBudget::admit)); and during the splice, the peer half is wrapped
+//! in [`Metered`](crate::peer::tunnel::Metered) with this carry's allowance, so one stream that never ends
 //! cannot spend an unbounded number of bytes under one admission. An
 //! admission-only cap is a cap on stream count, which is not what the operator
 //! asked for.
@@ -86,7 +86,7 @@
 //! closed.** A reservation is taken at admission and released at the end of the
 //! carry, so `cap` bounds concurrent traffic too: without it, five carries
 //! opened at once were each handed the whole remaining hour and could spend it
-//! five times over. [`MAX_OPEN_CARRIES_PER_PEER`] is the concurrency bound that
+//! five times over. [`MAX_OPEN_CARRIES_PER_PEER`](crate::peer::tunnel::MAX_OPEN_CARRIES_PER_PEER) is the concurrency bound that
 //! falls out of that arithmetic.
 //!
 //! A gateway log line carries the peer, the target host, bytes up, bytes down

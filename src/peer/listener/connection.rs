@@ -40,7 +40,7 @@ use crate::peer::serve::{NodeFacts, hello_for_peer};
 ///    [`crate::peer::noise::MAX_MESSAGE_1_BYTES`] **before the allocation**;
 /// 4. which pattern it is, decided by length in one place
 ///    ([`Handshake::from_message_1_len`]);
-/// 5. the internet gate ([`internet_admission`]), which is the only check
+/// 5. the internet gate ([`internet_admission`](crate::peer::listener::internet_admission)), which is the only check
 ///    here that reads the SOURCE address: a knock or a first pairing from
 ///    outside LAN scope, arriving on a listener bound to a globally routable
 ///    address, ends here, whatever `peer.internet` says;
@@ -291,7 +291,7 @@ where
 /// its own logging, which is why the loop still calls [`serve_connection`]
 /// directly.
 ///
-/// `bind` is the socket [`internet_admission`] gates on, the same way the
+/// `bind` is the socket [`internet_admission`](crate::peer::listener::internet_admission) gates on, the same way the
 /// accept loop reads it off the real `TcpListener`: a caller here can name
 /// `0.0.0.0:7755` without actually binding it, which is how the globally
 /// routable case is exercised without opening a socket this box does not own.

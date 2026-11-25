@@ -6,12 +6,12 @@
 //! time, so a forged mapping or a guessed port buys an attacker a connection
 //! that then fails the pin check.
 //!
-//! **A port on the router.** [`NatPmp`] asks the gateway for one, in the 12
+//! **A port on the router.** [`NatPmp`](crate::peer::reach::NatPmp) asks the gateway for one, in the 12
 //! bytes RFC 6886 defines. Hand-written rather than a crate: the whole protocol
 //! is two request shapes and two response shapes, sent as UDP to one host on
 //! the local link.
 //!
-//! **An address that needs no router at all.** [`global_v6_addresses`]. A
+//! **An address that needs no router at all.** [`global_v6_addresses`](crate::peer::reach::global_v6_addresses). A
 //! global IPv6 address is reachable directly, so two Macs that both have one
 //! need no mapping, no relay and no hole punch.
 //!
@@ -25,13 +25,13 @@
 //!
 //! # The derived port is dial-only today
 //!
-//! [`accepted_ports`] and [`port_is_accepted`] answer "what port would the
+//! [`accepted_ports`](crate::peer::reach::accepted_ports) and [`port_is_accepted`](crate::peer::reach::port_is_accepted) answer "what port would the
 //! other end of a completed handshake accept from us in this slot", which is
 //! exactly the question a DIALLER asks before it tries a rendezvous port a
-//! recorded endpoint stopped answering on ([`rendezvous_ports`], the caller
+//! recorded endpoint stopped answering on ([`rendezvous_ports`](crate::peer::reach::rendezvous_ports), the caller
 //! `tests/peer_reach.rs` exercises). Nothing in this repository BINDS on a
 //! derived port or checks an inbound connection's source port against
-//! [`port_is_accepted`]: [`crate::peer::listener::serve`] binds the one
+//! [`port_is_accepted`](crate::peer::reach::port_is_accepted): [`crate::peer::listener::serve`] binds the one
 //! configured `listen` address, and that is the only socket this node ever
 //! answers on. A reader is not meant to infer a listener side from a
 //! function's mere existence; there is none, and `port_is_accepted` is kept

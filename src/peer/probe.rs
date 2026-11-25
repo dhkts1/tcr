@@ -32,13 +32,13 @@
 //!
 //! # A cooldown is not a failure detector either
 //!
-//! [`PathTable::cool_down`] is the one exception to "nothing here evicts a
+//! [`PathTable::cool_down`](crate::peer::probe::PathTable::cool_down) is the one exception to "nothing here evicts a
 //! row", and it is a narrower thing than that sentence guards against: an
 //! endpoint that just failed to answer a DIAL, not a probe, is skipped by
-//! [`dial_order`] for [`PATH_RETRY_COOLDOWN`], while another endpoint on the
+//! [`dial_order`](crate::peer::probe::dial_order) for [`PATH_RETRY_COOLDOWN`](crate::peer::probe::PATH_RETRY_COOLDOWN), while another endpoint on the
 //! row is not cooling. It never empties a row. When every endpoint is
-//! cooling, [`dial_order`] returns the row whole, on the same rule
-//! [`PathsConfig::max_loss_pct`] already states for loss: a path that is the
+//! cooling, [`dial_order`](crate::peer::probe::dial_order) returns the row whole, on the same rule
+//! [`PathsConfig::max_loss_pct`](crate::peer::config::PathsConfig::max_loss_pct) already states for loss: a path that is the
 //! only path home is still tried. Nothing is declared dead, nothing is
 //! evicted, and no work is rescheduled away from a Mac; a cooling endpoint is
 //! dialled again the moment its window closes or the moment it is the last

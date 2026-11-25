@@ -14,13 +14,13 @@
 //! config gains no new key and no new exception.
 //!
 //! **The split inside this file is the design: the SOCKET is boot-time, the
-//! POLICY is hot.** [`PeerFile::listen`] and [`PeerFile::max_hops`] are read
+//! POLICY is hot.** [`PeerFile::listen`](crate::peer::config::PeerFile::listen) and [`PeerFile::max_hops`](crate::peer::config::PeerFile::max_hops) are read
 //! once at boot, turning a listener on is a restart-worthy act and saying so
-//! is honest. [`PeerFile::discovery`] is not one of them: the server's
+//! is honest. [`PeerFile::discovery`](crate::peer::config::PeerFile::discovery) is not one of them: the server's
 //! announce and browse tasks re-read this file on every 20-second wake
 //! (`spawn_beacon` and `spawn_browse` in `src/server.rs`), so `tcr peer
 //! find on|off` reaches a running server with no restart. Everything under
-//! [`PeerRow::allow`] and [`PeerRow::lend`] is re-read whenever this file's
+//! [`PeerRow::allow`](crate::peer::config::PeerRow::allow) and [`PeerRow::lend`](crate::peer::config::PeerRow::lend) is re-read whenever this file's
 //! mtime moves, exactly the way `Manager::reload_groups_if_changed`
 //! (`src/manager/mod.rs:1990`) already does it for groups. One mechanism, not a
 //! second spelling of it.
@@ -32,7 +32,7 @@
 //!
 //! # Mode 0600, and what an outstanding invite really is
 //!
-//! [`PendingInvite::secret`] is PSK material the registrar must hold to
+//! [`PendingInvite::secret`](crate::peer::config::PendingInvite::secret) is PSK material the registrar must hold to
 //! complete a handshake, so an outstanding invite is join-capable by anything
 //! that can read this file. A stored hash cannot be both unusable by an
 //! attacker and usable by the registrar; pretending otherwise would be the
@@ -1646,7 +1646,7 @@ pub struct PeerRow {
     /// peer on a port neither end ever names.
     ///
     /// **Not the handshake hash, and one keyed hash away from it.** This is
-    /// [`crate::peer::reach::port_secret`]'s output: HKDF-SHA256 over the
+    /// [`crate::peer::noise::port_secret`]'s output: HKDF-SHA256 over the
     /// pair's completed handshake hash under its own domain string, which is
     /// the same value both ends already derive independently and the same one
     /// the process-local register holds. The hash itself is what the six-digit

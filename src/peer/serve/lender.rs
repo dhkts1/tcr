@@ -593,7 +593,7 @@ pub(super) struct ServedResponse {
 /// [`handle_serve_on`] for why that is the whole of the picker, the Bearer and
 /// the bucket.
 ///
-/// **Only [`LENDER_FORWARDED_HEADERS`] are copied onto that request.** This
+/// **Only [`LENDER_FORWARDED_HEADERS`](crate::peer::serve::LENDER_FORWARDED_HEADERS) are copied onto that request.** This
 /// replaced a loop that replayed every borrower-supplied header, which put a
 /// borrower-chosen `cookie` (and any header a borrower invented) on the
 /// lender's own outbound TLS session, `build_upstream_headers` removes

@@ -7,8 +7,8 @@
 //!
 //! Never the node id, never the static public key, never a fingerprint of
 //! either, and no other Noise material. That is a decision, not a default, and
-//! it is why [`advertise`] does not take a `PeerId` at all and why
-//! [`Discovered`] does not carry one: a signature that cannot express the
+//! it is why [`advertise`](crate::peer::discovery::advertise) does not take a `PeerId` at all and why
+//! [`Discovered`](crate::peer::discovery::Discovered) does not carry one: a signature that cannot express the
 //! forbidden thing is stronger than a comment asking nobody to add it.
 //!
 //! The consequence, stated so nobody re-derives it wrongly: **identity is
@@ -23,7 +23,7 @@
 //!
 //! # Two functions, on purpose
 //!
-//! [`advertise`] and [`browse`] are the entire surface. The implementation
+//! [`advertise`](crate::peer::discovery::advertise) and [`browse`](crate::peer::discovery::browse) are the entire surface. The implementation
 //! behind them, `mdns-sd` today, a small UDP beacon in the recorded
 //! alternative, can be swapped without touching trust, because **discovery
 //! grants nothing**: a beacon is a hint about where to dial, identity is proved
@@ -43,7 +43,7 @@
 //! one that matters: a name in an inbound TXT record is text a stranger on
 //! this network chose, and it lands in a panel row, a `tcr peer ls` line and a
 //! log line. [`browse_once`] runs every name it resolves through
-//! [`sanitize_name`], so a control character, an ANSI escape, a newline or a
+//! [`sanitize_name`](crate::peer::discovery::sanitize_name), so a control character, an ANSI escape, a newline or a
 //! Unicode direction override never reaches any of the three.
 //!
 //! # Off by default

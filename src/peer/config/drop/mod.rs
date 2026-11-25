@@ -13,7 +13,7 @@
 //!
 //! One HKDF expand round over [`crate::peer::config::PeerRow::rendezvous_secret`],
 //! under this module's own versioned domain string, exactly the shape
-//! [`crate::peer::reach::port_secret`] uses over the handshake hash. Not from
+//! [`crate::peer::noise::port_secret`] uses over the handshake hash. Not from
 //! the handshake hash itself: that value is memory-only by decision (see
 //! `PeerRow::rendezvous_secret`'s doc, and `reach::port_secret`'s) and a drop
 //! whose key dies on restart is useless in the one case it exists for.
@@ -199,7 +199,7 @@ impl std::fmt::Debug for DropKeys {
 impl DropKeys {
     /// Derive this pair's drop keys from the secret already on its row.
     ///
-    /// `rendezvous_secret` is [`crate::peer::reach::port_secret`]'s output and
+    /// `rendezvous_secret` is [`crate::peer::noise::port_secret`]'s output and
     /// therefore already a pseudorandom key, so one expand round is the whole
     /// ladder: RFC 5869 § 2.3 with `info` this module's own versioned string
     /// and the counter byte the RFC's first round carries. No second extract,

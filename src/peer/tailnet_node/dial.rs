@@ -35,7 +35,7 @@ pub type DialFn = Arc<
 
 /// Where a running node's dialler is published for the rest of the process.
 ///
-/// Set by the [`Supervisor`] when a device is on the tailnet and cleared
+/// Set by the [`Supervisor`](crate::peer::tailnet_node::Supervisor) when a device is on the tailnet and cleared
 /// before it is shut down. The dialler holds the device weakly, so a
 /// published dialler never keeps a device alive past its shutdown.
 #[derive(Clone, Default)]

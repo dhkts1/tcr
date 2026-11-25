@@ -176,7 +176,7 @@ pub(super) fn register_handed_meter(
 /// answers can land out of order, and a baseline moved BACKWARDS by the older
 /// of them turns the next answer's rise into a second charge for quota already
 /// billed. A window that genuinely reset reads as a fall, which is the owner's
-/// windfall exactly as [`Ledger::debit`] says, and never a credit here.
+/// windfall exactly as [`Ledger::debit`](crate::peer::lease::Ledger::debit) says, and never a credit here.
 pub(super) fn note_handed_baseline(lease_id: u128, utilization: f64) {
     if !utilization.is_finite() {
         return;

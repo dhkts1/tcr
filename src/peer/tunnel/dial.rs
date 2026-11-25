@@ -770,7 +770,7 @@ pub fn forwarders_for(target: &PeerId, store: &PeerStore) -> Vec<PeerId> {
 /// Whether this row has ANY way back: its own endpoints, or a Mac this node may
 /// ask to carry to it.
 ///
-/// The question [`crate::peer::serve::PeerLeaseProvider::try_serve`] asks
+/// The question [`crate::fallback::FallbackProvider::try_serve`] asks
 /// before it spends anything on a lender, spelled here beside the dial that
 /// answers it for real: a filter that said "no endpoints, skip" would skip
 /// exactly the peer a forwarder exists for.
