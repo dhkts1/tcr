@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::peer_rows::{PathKind, masked_label, peer_paths};
+use super::rows::{PathKind, masked_label, peer_paths};
 
 /// [`peer_graph`], derived off the two files on disk rather than values a
 /// caller already holds: the same split [`peers_block`] draws from

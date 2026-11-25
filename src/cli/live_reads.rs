@@ -24,7 +24,9 @@ use crate::config::Config;
 ///
 /// So the error is returned rather than turned into an empty list: the caller
 /// exits non-zero, and the panel keeps the file half it already drew.
-pub async fn live_peers(config: &Config) -> Result<Vec<crate::status::PeerStatusRow>, String> {
+pub async fn live_peers(
+    config: &Config,
+) -> Result<Vec<crate::peer::status::rows::PeerStatusRow>, String> {
     match fetch_live_status(config).await {
         Ok(payload) => Ok(payload.peers),
         Err(LiveStatusError::NoServer) => Err(format!(

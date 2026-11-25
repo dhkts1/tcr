@@ -1075,7 +1075,7 @@ impl Ledger {
     /// owner's window, and the number of tokens that share buys is a fact about
     /// upstream's pricing that nothing on this Mac holds. Converting one would
     /// be inventing the figure, which is the distinction
-    /// [`crate::status::PathStatus::tokens_per_hour`] is built on.
+    /// [`crate::peer::status::rows::PathStatus::tokens_per_hour`] is built on.
     fn tokens_of(unit: LeaseUnit, charge: f64) -> Option<u64> {
         let LeaseUnit::Tokens(amount) = unit else {
             return None;

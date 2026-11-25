@@ -1908,7 +1908,7 @@ async fn status_handler(
     // reader who wants this cheaper should make the panel poll less often
     // rather than make the answer older than the question.
     let payload = payload.with_serving_facts(crate::status::ServingFacts {
-        peers: crate::status::peers_block_with_error(
+        peers: crate::peer::status::rows::peers_block_with_error(
             &crate::peer::egress::peers_path(),
             (now.unix_timestamp_nanos() / 1_000_000) as i64,
         ),

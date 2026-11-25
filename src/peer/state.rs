@@ -189,7 +189,7 @@ pub struct PeerState {
     /// more of its own: a row whose `updated_at_ms` is older than the window has
     /// not expired, it has rolled off, and a reader that dropped it could not
     /// tell "this path carried nothing this hour" from "nothing here measures
-    /// this path". [`crate::status::PathStatus::bytes_per_hour`] draws exactly
+    /// this path". [`crate::peer::status::rows::PathStatus::bytes_per_hour`] draws exactly
     /// that distinction, and it needs the row to draw it.
     #[serde(default)]
     pub path_traffic: Vec<PathTraffic>,

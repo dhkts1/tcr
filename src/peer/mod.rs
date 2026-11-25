@@ -174,3 +174,6 @@ pub mod tailnet_find;
 /// and the join and leave orderings. The library itself is compiled only with
 /// the `tailnet-node` feature on Apple silicon; the rest is in every build.
 pub mod tailnet_node;
+
+pub mod network_fact;
+pub mod status;

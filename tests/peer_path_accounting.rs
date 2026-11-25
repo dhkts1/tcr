@@ -7,7 +7,7 @@
 //! Noise sessions to a real target socket, the production ledger
 //! (`lease::Ledger::debit`), the production meter, the production state-file
 //! writer (`state::save_path_traffic`) and the production derivation
-//! `tcr peer status --json` prints (`status::peers_block`).
+//! `tcr peer status --json` prints (`peer::status::rows::peers_block`).
 //!
 //! Stand-ins, each named at its call site: the forwarder's accept loop, which
 //! is `src/peer/listener.rs`'s `StreamKind::Tunnel` arm and is another file's
@@ -83,7 +83,7 @@ fn row_with(peer: &PeerId, label: &str, endpoints: Vec<Endpoint>, relay: bool) -
 }
 
 /// A real peers file in a scratch directory, and the path it was written to,
-/// which is what `status::peers_block` is handed.
+/// which is what `peer::status::rows::peers_block` is handed.
 fn peers_file(tag: &str, rows: Vec<PeerRow>) -> std::path::PathBuf {
     let path = scratch(tag).join("tcr-peers.json");
     config::save(
@@ -228,7 +228,10 @@ async fn carry_one_request(
 }
 
 /// One path out of a status row, by the endpoint string the panel reads.
-fn path_of(peers: &[tcr::status::PathStatus], endpoint: &str) -> tcr::status::PathStatus {
+fn path_of(
+    peers: &[tcr::peer::status::rows::PathStatus],
+    endpoint: &str,
+) -> tcr::peer::status::rows::PathStatus {
     peers
         .iter()
         .find(|path| path.endpoint == endpoint)
@@ -335,7 +338,7 @@ async fn two_carried_requests_land_on_one_path_and_the_other_stays_at_zero() {
     let state_path = state::peer_state_path(&peers_path);
     state::save_path_traffic(&state_path, &rows).expect("write the traffic section");
 
-    let peers = tcr::status::peers_block(&peers_path, now_ms);
+    let peers = tcr::peer::status::rows::peers_block(&peers_path, now_ms);
     // `id` is the WIRE form on a status row, which is the only spelling
     // `PeerId::parse` reads back; `display` beside it is the short form for a
     // person. This lookup matched on the display form, which stopped being
@@ -455,13 +458,13 @@ fn an_hour_old_window_rolls_off_at_the_meter_and_at_the_reader() {
     )
     .expect("write the traffic section");
 
-    let fresh = tcr::status::peers_block(&peers_path, at + BUDGET_WINDOW_MS);
+    let fresh = tcr::peer::status::rows::peers_block(&peers_path, at + BUDGET_WINDOW_MS);
     assert_eq!(
         fresh[0].paths[0].bytes_per_hour,
         Some(4_096),
         "inside the window the written figure stands"
     );
-    let stale = tcr::status::peers_block(&peers_path, at + BUDGET_WINDOW_MS + 1);
+    let stale = tcr::peer::status::rows::peers_block(&peers_path, at + BUDGET_WINDOW_MS + 1);
     assert_eq!(
         stale[0].paths[0].bytes_per_hour,
         Some(0),
@@ -496,7 +499,7 @@ fn a_peer_nothing_has_metered_reports_absence_and_not_zero() {
         )],
     );
 
-    let peers = tcr::status::peers_block(&peers_path, PINNED_AT_MS);
+    let peers = tcr::peer::status::rows::peers_block(&peers_path, PINNED_AT_MS);
     assert_eq!(
         peers[0].paths[0].bytes_per_hour, None,
         "no traffic section, no measurement, and `None` is how that is said"
@@ -524,7 +527,7 @@ fn a_peer_nothing_has_metered_reports_absence_and_not_zero() {
         }],
     )
     .expect("write the traffic section");
-    let measured = tcr::status::peers_block(&peers_path, PINNED_AT_MS);
+    let measured = tcr::peer::status::rows::peers_block(&peers_path, PINNED_AT_MS);
     assert_eq!(
         measured[0].paths[0].bytes_per_hour,
         Some(0),

@@ -40,12 +40,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-pub mod network_fact;
-mod peer_graph;
-mod peer_ls;
-mod peer_rows;
-
 use crate::build_info::BuildInfo;
+use crate::peer::status::rows::PeerStatusRow;
 use crate::probe::ProbeStatus;
 use crate::stats::{AccountSnapshot, CodexFacts, GateReason, QuotaState, StatsSnapshot};
 
@@ -180,7 +176,7 @@ pub struct StatusPayload {
     #[serde(default)]
     pub sessions_summary: tcr_status_wire::SessionsSummary,
     /// One row per pinned Mac, in the vocabulary the panel already decodes,
-    /// see [`PeerStatusRow`], and [`peer_status_rows`] for the derivation.
+    /// see [`PeerStatusRow`], and [`crate::peer::status::rows::peer_status_rows`] for the derivation.
     ///
     /// # Why the peers ride the STATUS payload at all
     ///
@@ -717,7 +713,7 @@ fn from_ms(ms: i64) -> Option<OffsetDateTime> {
 /// of it is in a [`StatsSnapshot`], so [`StatusPayload::from_snapshot`] leaves each of its keys
 /// empty and [`StatusPayload::with_serving_facts`] writes them, each by its own wire rule.
 pub struct ServingFacts<'a> {
-    /// The peers block and why it is empty, as [`peers_block_with_error`] read them.
+    /// The peers block and why it is empty, as [`crate::peer::status::rows::peers_block_with_error`] read them.
     pub peers: (Vec<PeerStatusRow>, Option<String>),
     /// What the MITM listener's policy and loaded leaf allow, MITM off included.
     pub mitm: MitmStatus,
@@ -914,7 +910,7 @@ impl StatusPayload {
             // [`StatsSnapshot`], which is the accounts view and nothing else.
             // Deriving them here would mean this function reading two files off
             // disk on every status request, and it takes no paths. The serving
-            // process assigns [`Self::peers`] from [`peer_status_rows`] after
+            // process assigns [`Self::peers`] from [`crate::peer::status::rows::peer_status_rows`] after
             // this call, through [`Self::with_serving_facts`]; an empty list is the honest answer for every other
             // caller (the CLI's own round-trip tests, `into_snapshot`).
             peers: Vec::new(),
@@ -1134,16 +1130,6 @@ impl QuotaPayload {
         }
     }
 }
-
-pub use peer_graph::{
-    GraphEdge, GraphEdgeDetail, GraphNode, GraphRole, PEER_GRAPH_KIND, PeerGraph, peer_graph,
-    peer_graph_block,
-};
-pub use peer_ls::{PeerCapsJson, PeerExitJson, PeerFoundRow, PeerLsJson, PeerLsPeer, PeerLsRow};
-pub use peer_rows::{
-    PathKind, PathStatus, PeerStatusRow, PeerTailnetStatus, masked_label, peer_status_rows,
-    peers_block, peers_block_with_error,
-};
 
 #[cfg(test)]
 mod tests;

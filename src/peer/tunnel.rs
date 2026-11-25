@@ -899,7 +899,7 @@ struct PathCharge {
 /// for a lease whose serving path was noted. A gateway carry is not charged
 /// here at all: the requester dialled US, the source socket's ephemeral port
 /// is no endpoint of any row, and attributing it by guess is the exact thing
-/// [`crate::status::PathStatus::bytes_per_hour`] refused to do while it was
+/// [`crate::peer::status::rows::PathStatus::bytes_per_hour`] refused to do while it was
 /// `None`.
 ///
 /// # In memory, per process, like the budget
@@ -917,7 +917,7 @@ pub struct PathMeter {
     /// Without it a path that carried nothing THIS hour is indistinguishable
     /// from a path nothing has ever measured, because both hold no charges,
     /// and those are the two answers
-    /// [`crate::status::PathStatus::bytes_per_hour`] exists to keep apart. The
+    /// [`crate::peer::status::rows::PathStatus::bytes_per_hour`] exists to keep apart. The
     /// charge is what rolls; the fact that this Mac meters this path does not.
     ///
     /// Bounded by the operator's own peers file: a key is a row's endpoint, and
