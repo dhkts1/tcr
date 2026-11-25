@@ -38,7 +38,7 @@ pub const RESTART_HINT: &str = concat!(
 /// rest write it and shout. Collapsing them is how a half-applied disable becomes
 /// invisible again.
 ///
-/// `pub(crate)`: [`crate::oauth`]'s live-login half reuses this exact enum for
+/// `pub(crate)`: [`crate::login`]'s live-login half reuses this exact enum for
 /// [`post_add_account`] rather than defining a parallel one — see that
 /// function's doc-comment.
 #[derive(Debug)]
