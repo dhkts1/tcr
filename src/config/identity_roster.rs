@@ -170,13 +170,14 @@ impl Config {
             .collect()
     }
 
-    /// The first row [`crate::identity::same_identity`] calls the same account
-    /// as `probe`. First match, not [`Self::resolve_identity`]: the group reload
-    /// matches its running rows this way.
-    pub fn find_same_identity(&self, probe: &Account) -> Option<&Account> {
+    /// Every row [`crate::identity::same_identity`] calls the same account as
+    /// `probe`, in config order: the candidates a [`Resolved::Many`] could not
+    /// choose between. Not [`Self::resolve_identity`]: the group reload takes
+    /// the first of them to match its running rows.
+    pub fn same_identity_rows<'a>(&'a self, probe: &Account) -> impl Iterator<Item = &'a Account> {
         self.accounts
             .iter()
-            .find(|a| crate::identity::same_identity(probe, a))
+            .filter(|a| crate::identity::same_identity(probe, a))
     }
 
     /// Append every row of `fresh` for which `admit` returns `true`, after

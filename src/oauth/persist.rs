@@ -105,7 +105,10 @@ pub fn upsert_account(
         // predicate, same candidates) — mirrors
         // `Manager::add_or_update_account`'s identical recomputation.
         crate::identity::Resolved::Many => {
-            let candidates = config.same_identity_names(&probe);
+            let candidates: Vec<String> = config
+                .same_identity_rows(&probe)
+                .map(|a| a.name.clone())
+                .collect();
             bail!("{}", config::ambiguous_query_message(name, &candidates));
         }
     }

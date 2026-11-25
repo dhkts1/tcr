@@ -6,17 +6,6 @@ use std::collections::HashSet;
 use super::{Account, Config};
 
 impl Config {
-    /// The names of every row [`crate::identity::same_identity`] calls the
-    /// same account as `probe`, in config order: the candidates a
-    /// [`Resolved::Many`](crate::identity::Resolved::Many) could not choose between.
-    pub fn same_identity_names(&self, probe: &Account) -> Vec<String> {
-        self.accounts
-            .iter()
-            .filter(|a| crate::identity::same_identity(a, probe))
-            .map(|a| a.name.clone())
-            .collect()
-    }
-
     /// Append `account` behind the whole fleet: at one past the highest
     /// priority any row carries, or 0 when none carries one.
     pub fn append_at_next_priority(&mut self, account: Account) {

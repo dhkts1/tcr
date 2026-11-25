@@ -289,7 +289,7 @@ impl Manager {
                     account.org_uuid.clone(),
                     account.org_name.clone(),
                 );
-                let Some(matched) = fresh.find_same_identity(&probe) else {
+                let Some(matched) = fresh.same_identity_rows(&probe).next() else {
                     // The file no longer holds this account: it was deleted.
                     // Parked in memory only (there is no entry left to write
                     // the flag into) and dropped from every snapshot; see
