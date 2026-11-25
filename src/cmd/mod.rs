@@ -11,6 +11,7 @@ pub(crate) mod run;
 pub(crate) mod server;
 #[cfg(test)]
 mod test_support;
+pub(crate) mod tool_env;
 
 /// `--config` on every verb that takes it with the stock help line, resolved
 /// in one place.

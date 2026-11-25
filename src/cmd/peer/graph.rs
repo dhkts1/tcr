@@ -263,4 +263,4 @@ async fn serve_peer_graph(
 /// an unmeasured path is grey, `0` loss is "no loss", and a measured loss is
 /// its own percentage; the three loss bands below are this page's own
 /// addition, since a page has room for colour a text sub-line does not.
-const GRAPH_PAGE_HTML: &str = include_str!("../../peer_graph_page.html");
+const GRAPH_PAGE_HTML: &str = include_str!("peer_graph_page.html");
