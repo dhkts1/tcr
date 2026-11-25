@@ -623,7 +623,7 @@ fn spawn_browse(
                 // process under a deadline, so it goes to a blocking thread,
                 // and it refreshes the reading the peer listener decides an
                 // own-Mac knock on.
-                let mode = file.tailnet.effective();
+                let mode = file.tailnet_mode();
                 let app = match mode {
                     TailnetMode::App => Some(
                         tailnet_find::OWN_MAC_READINGS

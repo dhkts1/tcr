@@ -128,15 +128,9 @@ fn run_peer_tailnet_with(
         }
         let listen_written = {
             let (_lock, mut file) = lock_peers_file(&peers_path)?;
-            file.tailnet = mode.into();
-            // App and node are opt-ins that need a peer port: the server's
-            // browse task, which reads the app and sends the beacon, runs
-            // only beside a peer listener. Off is not an opt-in, so it never
-            // writes `listen` and never removes one.
-            let written = match mode {
-                TailnetMode::App | TailnetMode::Node => file.ensure_listen_for_opt_in(),
-                TailnetMode::Off => None,
-            };
+            // App and node open a peer port when there is none; off never
+            // writes `listen` (see `PeerFile::switch_tailnet`).
+            let written = file.switch_tailnet(mode);
             peer::config::save(&peers_path, &file)?;
             written
         };
@@ -368,7 +362,7 @@ mod peer_tailnet_tests {
     /// found nothing at all.
     ///
     /// Watch it fail by dropping the `ensure_listen_for_opt_in` call from the
-    /// `App | Node` arm in `run_peer_tailnet_with`: the file then has no
+    /// `App | Node` arm in `PeerFile::switch_tailnet`: the file then has no
     /// `listen` after `app`.
     #[test]
     fn app_gives_a_mac_a_peer_port_and_off_never_touches_it() {

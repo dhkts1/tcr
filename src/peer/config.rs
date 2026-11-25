@@ -406,6 +406,14 @@ impl TailnetSetting {
         }
     }
 
+    /// The word as written, when it is one this build does not know.
+    pub fn unknown_word(&self) -> Option<&str> {
+        match self {
+            Self::Known(_) => None,
+            Self::Unknown(word) => Some(word),
+        }
+    }
+
     /// Whether a save leaves the key out: only for a known `off`, the
     /// default. An unknown word is always written back.
     pub fn is_unwritten(&self) -> bool {
@@ -976,6 +984,39 @@ impl PeerFile {
     /// whether there was one to drop.
     pub fn clear_network_key(&mut self) -> bool {
         self.network_key.take().is_some()
+    }
+
+    /// The tailnet mode this Mac acts on. See [`TailnetSetting::effective`].
+    pub const fn tailnet_mode(&self) -> TailnetMode {
+        self.tailnet.effective()
+    }
+
+    /// The tailnet word as written, when this build does not know it. See
+    /// [`TailnetSetting::unknown_word`].
+    pub fn unknown_tailnet_word(&self) -> Option<&str> {
+        self.tailnet.unknown_word()
+    }
+
+    /// Set the tailnet mode (`tcr peer tailnet app|node|off`), and answer the
+    /// peer port written when the mode needed one: app and node are opt-ins
+    /// that need a port, because the server's browse task, which reads the app
+    /// and sends the beacon, runs only beside a peer listener. Off is not an
+    /// opt-in, so it never writes `listen` and never removes one.
+    pub fn switch_tailnet(&mut self, mode: TailnetMode) -> Option<SocketAddr> {
+        self.tailnet = mode.into();
+        match mode {
+            TailnetMode::App | TailnetMode::Node => self.ensure_listen_for_opt_in(),
+            TailnetMode::Off => None,
+        }
+    }
+
+    /// Write `mode` into the peers file at `path`, under the file's lock, and
+    /// nothing else: what joining tcr's own tailnet node and leaving it record.
+    pub fn save_tailnet(path: &Path, mode: TailnetMode) -> Result<()> {
+        let _lock = FileLock::acquire(path)?;
+        let mut file = read_or_default(path)?;
+        file.tailnet = mode.into();
+        save(path, &file)
     }
 
     /// Whether this Mac's dead drop publishes and fetches at all. See

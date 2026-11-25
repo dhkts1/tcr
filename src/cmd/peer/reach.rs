@@ -34,36 +34,40 @@ use super::{lock_peers_file, masked_label, now_unix_secs, peer_state_path, print
 /// The setting wins over the record. A server records nothing while the mode
 /// is off, so a record left from before the mode went off is not read at all:
 /// off is off, and an unknown word is shown as written and treated as off.
+///
+/// `mode` is the mode the file's setting acts on, and `unknown_word` the word
+/// as written when this build does not know it (then `mode` is off).
 fn reach_tailnet_line(
-    setting: &peer::config::TailnetSetting,
+    mode: peer::config::TailnetMode,
+    unknown_word: Option<&str>,
     record: Option<&peer::state::TailnetRecord>,
     now_ms: i64,
 ) -> String {
-    use peer::config::{TailnetMode, TailnetSetting};
+    use peer::config::TailnetMode;
     use peer::state::TailnetState;
 
-    match setting {
-        TailnetSetting::Known(TailnetMode::Off) => return "reach: tailnet: off".to_string(),
-        TailnetSetting::Unknown(word) => {
+    match (mode, unknown_word) {
+        (_, Some(word)) => {
             return format!(
                 "reach: tailnet: off (\"{}\" is a mode this tcr does not know, so it is treated \
                  as off)",
                 masked_label(word)
             );
         }
-        TailnetSetting::Known(TailnetMode::App | TailnetMode::Node) => {}
+        (TailnetMode::Off, None) => return "reach: tailnet: off".to_string(),
+        (TailnetMode::App | TailnetMode::Node, None) => {}
     }
     let Some(record) = record else {
         return format!(
             "reach: tailnet: {}: no serving process has recorded a tailnet reading",
-            setting.as_word()
+            mode.as_str()
         );
     };
     if record.is_stale(now_ms) {
         return format!(
             "reach: tailnet: {}: the serving process last recorded one {}s ago, so it is not \
              running or not reading the tailnet",
-            setting.as_word(),
+            mode.as_str(),
             now_ms.saturating_sub(record.recorded_at_ms).max(0) / 1_000
         );
     }
@@ -161,7 +165,12 @@ pub(super) fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()
     // shown as stale, not dropped, so "the server stopped writing" and "no
     // server ever wrote one" stay two answers.
     let tailnet = state.and_then(|state| state.tailnet);
-    let tailnet_line = reach_tailnet_line(&file.tailnet, tailnet.as_ref(), now_ms);
+    let tailnet_line = reach_tailnet_line(
+        file.tailnet_mode(),
+        file.unknown_tailnet_word(),
+        tailnet.as_ref(),
+        now_ms,
+    );
 
     // Every NAT-PMP outcome is a string, including the failures, because the
     // reader of this verb wants to see WHICH refusal the router gave.
@@ -431,6 +440,12 @@ mod reach_tailnet_line_tests {
     use peer::config::{TailnetMode, TailnetSetting};
     use peer::state::{TailnetRecord, TailnetState};
 
+    /// The line for a setting as the file holds it, read the way
+    /// `run_peer_reach` reads it off `PeerFile`.
+    fn line(setting: &TailnetSetting, record: Option<&TailnetRecord>, now_ms: i64) -> String {
+        reach_tailnet_line(setting.effective(), setting.unknown_word(), record, now_ms)
+    }
+
     fn record(state: TailnetState, detail: Option<&str>) -> TailnetRecord {
         TailnetRecord {
             mode: TailnetMode::App.into(),
@@ -456,21 +471,21 @@ mod reach_tailnet_line_tests {
     fn the_tailnet_line_for_each_case() {
         let off = TailnetSetting::Known(TailnetMode::Off);
         let app = TailnetSetting::Known(TailnetMode::App);
-        assert_eq!(reach_tailnet_line(&off, None, 1_000), "reach: tailnet: off");
-        assert!(reach_tailnet_line(&app, None, 1_000).contains("no serving process has recorded"));
+        assert_eq!(line(&off, None, 1_000), "reach: tailnet: off");
+        assert!(line(&app, None, 1_000).contains("no serving process has recorded"));
         let ready = record(TailnetState::Ready, None);
         assert_eq!(
-            reach_tailnet_line(&app, Some(&ready), 2_000),
+            line(&app, Some(&ready), 2_000),
             "reach: tailnet: app: 100.64.0.7, 2 of your Macs heard over it (recorded by the \
              serving process)"
         );
         assert_eq!(
-            reach_tailnet_line(&off, Some(&ready), 2_000),
+            line(&off, Some(&ready), 2_000),
             "reach: tailnet: off",
             "a fresh record left from app mode does not outrank the setting"
         );
         assert!(
-            reach_tailnet_line(
+            line(
                 &TailnetSetting::Unknown("both".to_string()),
                 Some(&ready),
                 2_000
@@ -478,7 +493,7 @@ mod reach_tailnet_line_tests {
             .contains("\"both\" is a mode this tcr does not know"),
         );
         assert!(
-            reach_tailnet_line(
+            line(
                 &app,
                 Some(&ready),
                 1_001 + peer::state::TAILNET_RECORD_STALE_MS
@@ -491,7 +506,7 @@ mod reach_tailnet_line_tests {
             Some("The Tailscale app is not running on this Mac."),
         );
         assert_eq!(
-            reach_tailnet_line(&app, Some(&failed), 2_000),
+            line(&app, Some(&failed), 2_000),
             "reach: tailnet: app: appNotRunning: The Tailscale app is not running on this Mac."
         );
     }

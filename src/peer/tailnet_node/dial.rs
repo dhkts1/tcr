@@ -445,10 +445,7 @@ pub async fn dial_for_cli(
     addr: SocketAddr,
 ) -> Result<crate::peer::noise::PeerStream> {
     if is_tailnet_ip(addr.ip())
-        && crate::peer::config::read_or_default(peers_path)?
-            .tailnet
-            .effective()
-            == TailnetMode::Node
+        && crate::peer::config::read_or_default(peers_path)?.tailnet_mode() == TailnetMode::Node
     {
         let config_path = crate::config::default_path();
         let config = crate::config::load(&config_path)

@@ -335,7 +335,7 @@ impl<F: DeviceFactory> Supervisor<F> {
         // is not the same fact as the mode being off, so whatever runs is
         // left as it is until the next wake.
         let mode = match crate::peer::config::read_or_default(&self.paths.peers) {
-            Ok(file) => file.tailnet.effective(),
+            Ok(file) => file.tailnet_mode(),
             Err(err) => {
                 tracing::warn!(
                     path = %self.paths.peers.display(),

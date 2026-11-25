@@ -277,14 +277,14 @@ where
     {
         return InternetAdmission::Answer;
     }
-    if !may_be_an_own_mac_knock(file.tailnet.effective(), accepted_on, from, pattern) {
+    if !may_be_an_own_mac_knock(file.tailnet_mode(), accepted_on, from, pattern) {
         return InternetAdmission::Refuse;
     }
     let reading = readings
         .recent(crate::peer::tailnet_find::OWN_MAC_READING_MAX_AGE, read)
         .await;
     own_mac_admission(
-        file.tailnet.effective(),
+        file.tailnet_mode(),
         accepted_on,
         from,
         pattern,
