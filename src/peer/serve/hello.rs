@@ -327,7 +327,7 @@ impl NodeFacts {
         // tcr's own tailnet node, when this process runs one: its address at
         // the peer port. After the configured socket for the same reason the
         // mapping is, and before the mapping, because it needs no router.
-        if let Some(node) = crate::peer::tailnet_node::advertised_listen() {
+        if let Some(node) = crate::peer::reach::tailnet::node::advertised_listen() {
             let node = node.to_string();
             if !facts.addrs.contains(&node) {
                 facts.addrs.push(node);

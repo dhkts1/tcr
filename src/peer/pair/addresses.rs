@@ -87,7 +87,7 @@ pub fn dial_addresses(
     };
 
     // tcr's own tailnet node listens on its address at the same port the
-    // kernel listener does (`crate::peer::tailnet_node::Supervisor`).
+    // kernel listener does (`crate::peer::reach::tailnet::node::Supervisor`).
     if let Some(node) = node {
         push(
             SocketAddr::new(IpAddr::V4(node), port),
@@ -140,7 +140,7 @@ fn host_addresses() -> Vec<HostAddress> {
 /// IS the keeper (the register is non-empty) ever needs the fallback.
 ///
 /// `node` is tcr's own tailnet node's address, read the same way off the state
-/// file ([`crate::peer::tailnet_node::recorded_node_address`]): the minting
+/// file ([`crate::peer::reach::tailnet::node::recorded_node_address`]): the minting
 /// process holds no node of its own.
 pub fn local_dial_addresses(
     listen: SocketAddr,

@@ -2229,7 +2229,7 @@ const PEER_DIAL_ROUTE: LocalRoute = LocalRoute {
 /// TcrBar Trust button spawns that CLI. tcr's own node lives in THIS process,
 /// and a Mac in node mode has no `utun` for the kernel to route a `100.x`
 /// address through. So the CLI asks here; its Noise code is unchanged, and
-/// only where its socket comes from differs. See `crate::peer::tailnet_node`.
+/// only where its socket comes from differs. See `crate::peer::reach::tailnet::node`.
 ///
 /// # What guards it
 ///
@@ -2277,10 +2277,10 @@ async fn peer_dial_handler(State(manager): State<Arc<Manager>>, request: Request
             "The tcr peer dial endpoint needs an HTTP/1.1 connection it can upgrade.",
         );
     };
-    use crate::peer::tailnet_node::RouteDial;
-    let stream = match crate::peer::tailnet_node::dial_for_route(
+    use crate::peer::reach::tailnet::node::RouteDial;
+    let stream = match crate::peer::reach::tailnet::node::dial_for_route(
         target,
-        crate::peer::tailnet_node::DIAL_TIMEOUT,
+        crate::peer::reach::tailnet::node::DIAL_TIMEOUT,
     )
     .await
     {
@@ -2319,7 +2319,7 @@ async fn peer_dial_handler(State(manager): State<Arc<Manager>>, request: Request
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
-                let (up, down) = crate::peer::tailnet_node::splice_until_either_ends(
+                let (up, down) = crate::peer::reach::tailnet::node::splice_until_either_ends(
                     hyper_util::rt::TokioIo::new(upgraded),
                     stream,
                 )

@@ -170,8 +170,8 @@ where
         from.ip(),
         pattern,
         &file,
-        &crate::peer::tailnet_find::OWN_MAC_READINGS,
-        crate::peer::tailnet_find::read_the_app,
+        &crate::peer::reach::tailnet::find::OWN_MAC_READINGS,
+        crate::peer::reach::tailnet::find::read_the_app,
     )
     .await
         == InternetAdmission::Refuse

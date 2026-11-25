@@ -14,12 +14,12 @@
 //!
 //! A Mac can hold two CLIs at different versions (the app's own binary and a
 //! Homebrew one, with Homebrew first on `PATH`). The app's binary is the one
-//! that talks to the app the operator sees, so [`CLI_PATHS`](crate::peer::tailscale_app::CLI_PATHS) puts it first.
+//! that talks to the app the operator sees, so [`CLI_PATHS`](crate::peer::reach::tailnet::app::CLI_PATHS) puts it first.
 //!
 //! # Parsed once, into only what tcr reads
 //!
 //! The status document also carries every peer's owner login and DNS name.
-//! None of that is read, so none of it is held: [`Status`](crate::peer::tailscale_app::Status) keeps the fields
+//! None of that is read, so none of it is held: [`Status`](crate::peer::reach::tailnet::app::Status) keeps the fields
 //! tcr decides on and serde drops the rest unread. Nothing here logs a value.
 
 use std::collections::BTreeMap;

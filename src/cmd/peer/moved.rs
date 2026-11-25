@@ -138,7 +138,7 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
             listen,
             &host,
             external,
-            peer::tailnet_node::recorded_node_address(&peer_state_path(peers_path), now_ms),
+            peer::reach::tailnet::node::recorded_node_address(&peer_state_path(peers_path), now_ms),
         ),
         None => Vec::new(),
     };

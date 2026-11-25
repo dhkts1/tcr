@@ -146,7 +146,7 @@ fn may_be_an_own_mac_knock(
 ///    carrier-grade NAT address falls in `100.64.0.0/10`: its packet comes in
 ///    on Wi-Fi, to this Mac's Wi-Fi address.
 /// 3. The source is an address of one of the operator's own Macs in
-///    `reading` ([`crate::peer::tailscale_app::own_macs`]: online, untagged,
+///    `reading` ([`crate::peer::reach::tailnet::app::own_macs`]: online, untagged,
 ///    not shared in, the same Tailscale user, macOS or no OS). WireGuard drops
 ///    a packet whose source is not the sending peer's own address, so another
 ///    machine on the tailnet cannot borrow it.
@@ -159,7 +159,10 @@ pub fn own_mac_admission(
     accepted_on: Option<IpAddr>,
     from: IpAddr,
     pattern: Handshake,
-    reading: Result<&crate::peer::tailscale_app::Status, crate::peer::tailscale_app::ReadError>,
+    reading: Result<
+        &crate::peer::reach::tailnet::app::Status,
+        crate::peer::reach::tailnet::app::ReadError,
+    >,
 ) -> InternetAdmission {
     if !may_be_an_own_mac_knock(mode, accepted_on, from, pattern) {
         return InternetAdmission::Refuse;
@@ -173,7 +176,7 @@ pub fn own_mac_admission(
         .self_node
         .as_ref()
         .is_some_and(|me| me.tailscale_ips.contains(&accepted_on));
-    let from_my_own_mac = crate::peer::tailscale_app::own_macs(status)
+    let from_my_own_mac = crate::peer::reach::tailnet::app::own_macs(status)
         .iter()
         .any(|mac| mac.tailscale_ips.contains(&from));
     if on_my_tailnet_address && from_my_own_mac {
@@ -244,7 +247,7 @@ pub fn shares_a_global_v6_prefix(from: IpAddr, own_global_v6: &[Ipv6Addr]) -> bo
 /// Then, for what is still refused, [`own_mac_admission`]: a knock from one
 /// of the operator's own Macs over the tailnet in app mode, decided on a
 /// reading of the Tailscale app no older than
-/// [`crate::peer::tailnet_find::OWN_MAC_READING_MAX_AGE`] from `readings`,
+/// [`crate::peer::reach::tailnet::find::OWN_MAC_READING_MAX_AGE`] from `readings`,
 /// re-read with `read` when it is older. The read happens only after
 /// [`may_be_an_own_mac_knock`] says it could matter.
 pub(super) async fn admission_for_this_host<F>(
@@ -253,13 +256,13 @@ pub(super) async fn admission_for_this_host<F>(
     from: IpAddr,
     pattern: Handshake,
     file: &PeerFile,
-    readings: &crate::peer::tailnet_find::ReadingCache,
+    readings: &crate::peer::reach::tailnet::find::ReadingCache,
     read: F,
 ) -> InternetAdmission
 where
     F: FnOnce() -> std::result::Result<
-            crate::peer::tailscale_app::Status,
-            crate::peer::tailscale_app::ReadError,
+            crate::peer::reach::tailnet::app::Status,
+            crate::peer::reach::tailnet::app::ReadError,
         > + Send
         + 'static,
 {
@@ -281,7 +284,10 @@ where
         return InternetAdmission::Refuse;
     }
     let reading = readings
-        .recent(crate::peer::tailnet_find::OWN_MAC_READING_MAX_AGE, read)
+        .recent(
+            crate::peer::reach::tailnet::find::OWN_MAC_READING_MAX_AGE,
+            read,
+        )
         .await;
     own_mac_admission(
         file.tailnet_mode(),
@@ -299,8 +305,8 @@ mod tests {
 
     use super::*;
     use crate::peer::config::{PeerFile, TailnetMode};
-    use crate::peer::tailnet_find::ReadingCache;
-    use crate::peer::tailscale_app::{ReadError, Status};
+    use crate::peer::reach::tailnet::app::{ReadError, Status};
+    use crate::peer::reach::tailnet::find::ReadingCache;
 
     const STATUS: &str = r#"{
       "BackendState": "Running",

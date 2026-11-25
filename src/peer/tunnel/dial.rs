@@ -807,7 +807,9 @@ async fn connect_within(addr: SocketAddr, within: Duration) -> Option<PeerStream
     // through the node: this Mac has no `utun` for it, so the kernel cannot
     // route it. Every other dial, and every dial on a Mac with the Tailscale
     // app, goes through the kernel as before.
-    if let Some(through_node) = crate::peer::tailnet_node::dial_through_node(addr, within).await {
+    if let Some(through_node) =
+        crate::peer::reach::tailnet::node::dial_through_node(addr, within).await
+    {
         return match through_node {
             Ok(stream) => Some(stream),
             Err(err) => {

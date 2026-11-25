@@ -505,7 +505,7 @@ pub enum TailnetState {
     /// App mode read the app, or node mode is on the tailnet.
     Ready,
     /// No Tailscale CLI at any of the paths
-    /// [`crate::peer::tailscale_app::CLI_PATHS`] names.
+    /// [`crate::peer::reach::tailnet::app::CLI_PATHS`] names.
     AppMissing,
     /// The app answered but is not connected (`BackendState` is not
     /// `Running`), or the CLI could not reach it at all.
@@ -521,7 +521,7 @@ pub enum TailnetState {
     NodeUnsupported,
     /// The mode left `node` and the serving process has shut down every
     /// device built from the node's keys. Written once, by tcr's own tailnet
-    /// node's supervisor (`crate::peer::tailnet_node`) and by nothing else, so
+    /// node's supervisor (`crate::peer::reach::tailnet::node`) and by nothing else, so
     /// `tcr peer tailnet leave` can wait for exactly this before it deletes
     /// the key file. `mode` says the mode it left `node` for.
     NodeReleased,
@@ -2194,7 +2194,7 @@ fn holds_exactly(path: &Path, json: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::tailnet_node::TailnetReport;
+    use crate::peer::reach::tailnet::node::TailnetReport;
     use tracing_subscriber::layer::SubscriberExt as _;
 
     /// `tcr peer pending` prints these lines verbatim: mutes first, then bans,
@@ -2456,7 +2456,7 @@ mod tests {
             serde_json::to_value(&report).expect("serialize"),
             serde_json::json!({
                 "mode": "app",
-                "nodeSupported": crate::peer::tailnet_node::SUPPORTED,
+                "nodeSupported": crate::peer::reach::tailnet::node::SUPPORTED,
                 "held": null
             })
         );

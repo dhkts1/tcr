@@ -12,7 +12,7 @@ use super::{listen_written_lines, lock_peers_file, masked_label, print_listen_wr
 /// async verbs (they wait on the tailnet or on the running tcr); everything
 /// else is [`run_peer_tailnet_with`].
 pub(super) async fn run_peer_tailnet(args: peer_cli::PeerTailnetArgs) -> anyhow::Result<()> {
-    use peer::tailnet_node;
+    use peer::reach::tailnet::node;
 
     let peers_path = args.peers.path();
     if args.mode != Some(peer_cli::PeerTailnetMode::Node)
@@ -31,41 +31,41 @@ pub(super) async fn run_peer_tailnet(args: peer_cli::PeerTailnetArgs) -> anyhow:
     }
     match (args.mode, args.auth_key.as_deref()) {
         (Some(peer_cli::PeerTailnetMode::Leave), _) => {
-            let outcome = tailnet_node::leave_with(
+            let outcome = node::leave_with(
                 &peers_path,
-                &tailnet_node::key_path_for_peers(&peers_path),
-                tailnet_node::LEAVE_WAIT,
-                tailnet_node::LEAVE_POLL,
+                &node::key_path_for_peers(&peers_path),
+                node::LEAVE_WAIT,
+                node::LEAVE_POLL,
             )
             .await?;
             println!("peer.tailnet: off");
             match outcome {
-                tailnet_node::LeaveOutcome::Deleted => {
+                node::LeaveOutcome::Deleted => {
                     println!("peer tailnet: the node's key file was deleted");
                 }
-                tailnet_node::LeaveOutcome::NoKeyFile => {
+                node::LeaveOutcome::NoKeyFile => {
                     println!("peer tailnet: there was no node key file to delete");
                 }
             }
-            println!("peer tailnet: {}", tailnet_node::LEAVE_ADMIN_CONSOLE_NOTE);
+            println!("peer tailnet: {}", node::LEAVE_ADMIN_CONSOLE_NOTE);
             Ok(())
         }
         (Some(peer_cli::PeerTailnetMode::Node), Some("-")) => {
-            if !tailnet_node::SUPPORTED {
+            if !node::SUPPORTED {
                 anyhow::bail!(node_unsupported_refusal());
             }
             let mut line = String::new();
             std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
                 .context("peer tailnet: could not read the auth key from standard input")?;
-            let auth_key = tailnet_node::AuthKey::new(&line)?;
+            let auth_key = node::AuthKey::new(&line)?;
             drop(line);
-            let me = tailnet_node::join(&peers_path, args.name, auth_key).await?;
+            let me = node::join(&peers_path, args.name, auth_key).await?;
             println!("peer.tailnet: node");
             println!("tailnet address: {}", me.address);
             println!("tailnet name: {}", me.name);
             println!(
                 "peer tailnet: the running tcr starts the node within {}s",
-                (tailnet_node::TICK * 2).as_secs()
+                (node::TICK * 2).as_secs()
             );
             Ok(())
         }
@@ -74,7 +74,7 @@ pub(super) async fn run_peer_tailnet(args: peer_cli::PeerTailnetArgs) -> anyhow:
             "peer tailnet: --auth-key takes `-` and reads the key from standard input, never \
              the key itself, which would sit in your shell history and in `ps`"
         ),
-        _ => run_peer_tailnet_with(args, &peer::tailscale_app::default_cli_paths()),
+        _ => run_peer_tailnet_with(args, &peer::reach::tailnet::app::default_cli_paths()),
     }
 }
 
@@ -91,7 +91,7 @@ const fn node_unsupported_refusal() -> &'static str {
 /// Setting a mode takes the peers-file lock and saves, the way
 /// [`run_peer_find_with`] writes `discovery`. `node` is refused, with the file
 /// untouched, by a binary that cannot run tcr's own tailnet node
-/// ([`peer::tailnet_node::SUPPORTED`]), and by one that has not joined yet.
+/// ([`peer::reach::tailnet::node::SUPPORTED`]), and by one that has not joined yet.
 ///
 /// With no mode it prints the setting and, in app mode, one live read of the
 /// app. `--json` prints the setting, whether this binary can act on `node`,
@@ -107,7 +107,7 @@ fn run_peer_tailnet_with(
         let Some(mode) = wanted.mode() else {
             anyhow::bail!("peer tailnet: `leave` is run by `run_peer_tailnet`");
         };
-        if mode == TailnetMode::Node && !peer::tailnet_node::SUPPORTED {
+        if mode == TailnetMode::Node && !peer::reach::tailnet::node::SUPPORTED {
             anyhow::bail!(node_unsupported_refusal());
         }
         // `node` with no auth key turns a node that already joined back on.
@@ -115,9 +115,9 @@ fn run_peer_tailnet_with(
         // is refused rather than written as a mode that can only ever say
         // "not joined".
         if mode == TailnetMode::Node
-            && peer::tailnet_node::read_key_file(&peer::tailnet_node::key_path_for_peers(
-                &peers_path,
-            ))?
+            && peer::reach::tailnet::node::read_key_file(
+                &peer::reach::tailnet::node::key_path_for_peers(&peers_path),
+            )?
             .is_none()
         {
             anyhow::bail!(
@@ -150,7 +150,8 @@ fn run_peer_tailnet_with(
         }
     }
 
-    let report = peer::tailnet_node::TailnetReport::read(&peers_path, peer::state::now_ms())?;
+    let report =
+        peer::reach::tailnet::node::TailnetReport::read(&peers_path, peer::state::now_ms())?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -199,15 +200,15 @@ fn run_peer_tailnet_with(
 
 /// One live read of the Tailscale app, as lines for `tcr peer tailnet`.
 fn print_tailscale_app_read(cli_paths: &[PathBuf]) {
-    use peer::tailscale_app::{self, Route};
+    use peer::reach::tailnet::app::{self, Route};
 
-    match tailscale_app::read_status(cli_paths, tailscale_app::STATUS_TIMEOUT) {
+    match app::read_status(cli_paths, app::STATUS_TIMEOUT) {
         Ok(status) => {
             match status.own_ipv4() {
                 Some(address) => println!("tailnet address: {address}"),
                 None => println!("tailnet address: none reported"),
             }
-            let mine = tailscale_app::own_macs(&status);
+            let mine = app::own_macs(&status);
             if mine.is_empty() {
                 println!("your other Macs online: none");
             }
@@ -218,7 +219,7 @@ fn print_tailscale_app_read(cli_paths: &[PathBuf]) {
                     .find(|ip| ip.is_ipv4())
                     .or_else(|| mac.tailscale_ips.first())
                     .map_or_else(|| "no address".to_string(), ToString::to_string);
-                let route = match tailscale_app::route(mac) {
+                let route = match app::route(mac) {
                     Route::Direct => "direct",
                     Route::Relayed => "relayed",
                     Route::Unknown => "route unknown",

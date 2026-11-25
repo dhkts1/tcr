@@ -78,12 +78,12 @@ use crate::peer::id::NodeKey;
 use crate::peer::lease::Ledger;
 use crate::peer::noise::{self, Handshake};
 use crate::peer::reach::is_lan_scope;
-use crate::peer::serve::LeaseServing;
-use crate::peer::state::knock_address;
-use crate::peer::tailnet_node::{
+use crate::peer::reach::tailnet::node::{
     BuiltFactory, DeviceFactory, GatewayFn, NodePaths, ServeFn, Supervisor, TICK, TailnetDevice,
     key_path_for_peers, server_slot,
 };
+use crate::peer::serve::LeaseServing;
+use crate::peer::state::knock_address;
 use crate::peer::tunnel::dial;
 
 mod admission;
@@ -362,7 +362,7 @@ async fn accept_peer_connections(listener: TcpListener, context: SessionContext)
 /// same bounds the accept loop uses.
 ///
 /// What the accept loop spawns per connection, and public so a second accept
-/// loop (tcr's own tailnet node, [`crate::peer::tailnet_node`]) feeds the
+/// loop (tcr's own tailnet node, [`crate::peer::reach::tailnet::node`]) feeds the
 /// same code rather than a copy of it: the same admission, the same bounded
 /// refusal log, with `from`, `bind` and `accepted_on` (the address the
 /// connection was sent to) taken off whatever socket it accepted.

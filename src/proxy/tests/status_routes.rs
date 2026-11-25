@@ -73,7 +73,7 @@ struct ClearSlot;
 
 impl Drop for ClearSlot {
     fn drop(&mut self) {
-        crate::peer::tailnet_node::server_slot().set(None);
+        crate::peer::reach::tailnet::node::server_slot().set(None);
     }
 }
 
@@ -93,7 +93,7 @@ async fn peer_dial_splices_bytes_both_ways_through_the_listener() {
 
     let (far_tx, mut far_rx) =
         tokio::sync::mpsc::unbounded_channel::<(SocketAddr, tokio::io::DuplexStream)>();
-    let dial: crate::peer::tailnet_node::DialFn = Arc::new(move |addr| {
+    let dial: crate::peer::reach::tailnet::node::DialFn = Arc::new(move |addr| {
         let far_tx = far_tx.clone();
         Box::pin(async move {
             let (ours, theirs) = tokio::io::duplex(64 * 1024);
@@ -105,11 +105,13 @@ async fn peer_dial_splices_bytes_both_ways_through_the_listener() {
     });
     let _clear = ClearSlot;
     let peers_dir = tempfile::tempdir().expect("tempdir");
-    crate::peer::tailnet_node::server_slot().set(Some(crate::peer::tailnet_node::Published {
-        dial,
-        listen: "100.64.0.7:7755".parse().expect("addr"),
-        peers: peers_dir.path().join("tcr-peers.json"),
-    }));
+    crate::peer::reach::tailnet::node::server_slot().set(Some(
+        crate::peer::reach::tailnet::node::Published {
+            dial,
+            listen: "100.64.0.7:7755".parse().expect("addr"),
+            peers: peers_dir.path().join("tcr-peers.json"),
+        },
+    ));
 
     let manager = Manager::with_live_refresher(
         dummy_config(Some("secret-proxy-key"), "http://127.0.0.1:1"),
@@ -122,7 +124,7 @@ async fn peer_dial_splices_bytes_both_ways_through_the_listener() {
     tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
     let target: SocketAddr = "100.64.0.9:7755".parse().expect("addr");
-    let mut cli = crate::peer::tailnet_node::dial_through_server(
+    let mut cli = crate::peer::reach::tailnet::node::dial_through_server(
         port,
         Some("secret-proxy-key"),
         target,
@@ -154,7 +156,7 @@ async fn peer_dial_splices_bytes_both_ways_through_the_listener() {
 
     // Gil, 2026-10-20: a port that is not a peer port is refused, as an
     // answer the CLI reads, and the node is never asked to dial it.
-    let refused = crate::peer::tailnet_node::dial_through_server(
+    let refused = crate::peer::reach::tailnet::node::dial_through_server(
         port,
         Some("secret-proxy-key"),
         "100.64.0.9:22".parse().expect("addr"),

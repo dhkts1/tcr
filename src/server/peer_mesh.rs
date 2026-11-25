@@ -533,7 +533,7 @@ fn spawn_beacon(
 /// The same task is the only writer of the found list, because
 /// `state::save_found` replaces the whole section and a second writer would
 /// erase the first one's rows every wake. So it also owns the tailnet beacon
-/// socket ([`crate::peer::tailnet_find`]): between wakes it reads datagrams
+/// socket ([`crate::peer::reach::tailnet::find`]): between wakes it reads datagrams
 /// from the operator's own Macs, and on each wake it reads the Tailscale app
 /// (on a blocking thread, since that runs a process), binds or rebinds the
 /// socket to this Mac's own tailnet IPv4, sends this Mac's beacon to each own
@@ -548,8 +548,8 @@ fn spawn_browse(
 ) {
     use crate::peer::config::TailnetMode;
     use crate::peer::discovery;
+    use crate::peer::reach::tailnet::find::{self, BeaconIntake, BeaconSocket};
     use crate::peer::state::FoundSource;
-    use crate::peer::tailnet_find::{self, BeaconIntake, BeaconSocket};
 
     let peers_path = peers_path.to_path_buf();
     let state_path = state_path.to_path_buf();
@@ -569,7 +569,7 @@ fn spawn_browse(
             // The address a bind last failed on, so the warning is logged
             // once per address rather than every wake.
             let mut bind_failed_on: Option<std::net::Ipv4Addr> = None;
-            let mut buf = [0_u8; tailnet_find::RECEIVE_BUFFER_BYTES];
+            let mut buf = [0_u8; find::RECEIVE_BUFFER_BYTES];
             loop {
                 let received = tokio::select! {
                     _ = ticker.tick() => None,
@@ -625,18 +625,16 @@ fn spawn_browse(
                 // own-Mac knock on.
                 let mode = file.tailnet_mode();
                 let app = match mode {
-                    TailnetMode::App => Some(
-                        tailnet_find::OWN_MAC_READINGS
-                            .refresh(tailnet_find::read_the_app)
-                            .await,
-                    ),
+                    TailnetMode::App => {
+                        Some(find::OWN_MAC_READINGS.refresh(find::read_the_app).await)
+                    }
                     TailnetMode::Off | TailnetMode::Node => None,
                 };
                 let mut scan: Vec<discovery::Discovered> = Vec::new();
                 let mut tailnet_peers = Vec::new();
                 if let Some(Ok(status)) = &app {
                     {
-                        own_macs = tailnet_find::own_mac_addresses(status);
+                        own_macs = find::own_mac_addresses(status);
                         match status.own_ipv4() {
                             Some(own) => match socket.bind_to(own).await {
                                 Ok(()) => bind_failed_on = None,
@@ -663,7 +661,7 @@ fn spawn_browse(
                             discovery::tailnet_beacon(port, name.as_deref(), network_key.as_ref());
                         socket.send(&own_macs, &beacon).await;
                         scan.extend(intake.take(&own_macs));
-                        tailnet_peers = tailnet_find::pinned_peers(status, &file.direct_addrs());
+                        tailnet_peers = find::pinned_peers(status, &file.direct_addrs());
                     }
                 } else {
                     // Off, node, or a read that failed: no reading to trust,
@@ -725,11 +723,11 @@ fn spawn_browse(
                 // `held`, on every wake while the mode is app, so `tcr peer
                 // tailnet --json` and the panel can tell a server acting on
                 // the setting from one that stopped writing. Off and node
-                // write nothing from here: see `tailnet_find::write_held`.
+                // write nothing from here: see `find::write_held`.
                 let reading = app
                     .as_ref()
                     .map(|result| result.as_ref().map(|status| &**status).map_err(|err| *err));
-                if let Err(err) = tailnet_find::write_held(
+                if let Err(err) = find::write_held(
                     &state_path,
                     mode,
                     reading,

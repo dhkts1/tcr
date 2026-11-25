@@ -341,7 +341,7 @@ pub enum DialAddressKind {
     /// on without a router forwarding anything.
     Tailscale,
     /// The address of tcr's own tailnet node, as the serving process
-    /// recorded it (`crate::peer::tailnet_node`): there is no `utun` for it,
+    /// recorded it (`crate::peer::reach::tailnet::node`): there is no `utun` for it,
     /// so it is read off the state file rather than an interface. First, for
     /// the reason [`Self::Tailscale`] is.
     TailnetNode,

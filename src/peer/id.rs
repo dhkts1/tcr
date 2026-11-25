@@ -248,7 +248,7 @@ fn public_from_secret(secret: &[u8; 32]) -> Result<[u8; 32]> {
 /// way [`crate::config::write_atomic`] does for the main config.
 ///
 /// Two callers: the 32-byte Noise static here, and tcr's own tailnet node's
-/// key file (`crate::peer::tailnet_node::write_key_file`), which needs the same
+/// key file (`crate::peer::reach::tailnet::node::write_key_file`), which needs the same
 /// 0600-on-a-fresh-inode, never-overwrite rule and not the library's own
 /// writer (it leaves the process umask, 0644, upstream issue #449).
 ///

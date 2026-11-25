@@ -138,18 +138,4 @@ pub mod reach;
 /// it that names no address either.
 pub mod ask;
 
-/// Reading the Tailscale app already running on this Mac: its CLI, under a
-/// deadline, parsed once. Called by `tcr peer tailnet` and the serving
-/// process's browse task.
-pub mod tailscale_app;
-
-/// Finding the operator's own Macs over the tailnet: the beacon socket, the
-/// intake that bounds what it hears, and the record each tick writes.
-pub mod tailnet_find;
-
-/// tcr's own tailnet node: one supervised `tailscale::Device`, its key file,
-/// and the join and leave orderings. The library itself is compiled only with
-/// the `tailnet-node` feature on Apple silicon; the rest is in every build.
-pub mod tailnet_node;
-
 pub mod status;

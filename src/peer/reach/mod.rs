@@ -546,7 +546,7 @@ fn be_u32(bytes: &[u8], offset: usize) -> Result<u32, ReachError> {
 
 /// This Mac's default gateway, or `None` when it has none or it could not be
 /// read: the network-change signal tcr's own tailnet node
-/// (`crate::peer::tailnet_node`) shares with the mapping keeper. Blocking: it
+/// (`crate::peer::reach::tailnet::node`) shares with the mapping keeper. Blocking: it
 /// runs a route tool on macOS.
 pub fn default_gateway_ipv4() -> Option<Ipv4Addr> {
     default_gateway().ok()
@@ -893,6 +893,9 @@ mod port;
 /// What each path to a peer costs: RTT and loss, measured on a live session.
 pub mod probe;
 mod punch;
+
+/// The tailnet: the Tailscale app on this Mac, the beacon, and tcr's own node.
+pub mod tailnet;
 /// A second router client beside [`NatPmp`], for gateways that speak only
 /// UPnP IGD.
 pub mod upnp;

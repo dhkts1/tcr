@@ -349,7 +349,7 @@ pub enum TailnetMode {
     #[default]
     Off,
     /// Read the Tailscale app already running on this Mac
-    /// ([`crate::peer::tailscale_app`]) to find this operator's own other
+    /// ([`crate::peer::reach::tailnet::app`]) to find this operator's own other
     /// Macs.
     App,
     /// tcr joins a tailnet as its own node. Only a build with the
