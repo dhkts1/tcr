@@ -141,35 +141,15 @@ impl Manager {
         // rolling memory back on failure would lose it for good.
         let (snapshot, placement) = {
             let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
-            // Resolved, never first-match: `same_identity` treats an unknown org as
-            // a match, so with the legacy two-org shape in the file a first-match
-            // search lands THIS account's rotated credential on the OTHER account's
-            // record — overwriting a single-use refresh token that is then dead.
-            // An unbreakable tie writes nothing and says so.
-            let placement = crate::identity::resolve(config.accounts.iter().enumerate(), &probe);
-            if let crate::identity::Resolved::One(position) = placement
-                && let Some(account) = config.accounts.get_mut(position)
-            {
-                account.access_token.clone_from(&tokens.access_token);
-                // THE TRAP: same invariant as `apply_refresh` in
-                // `manager/freshness/refresh.rs` — `tokens.refresh_token` must be
-                // `Some(...)` on every reachable refresh success.
-                account.refresh_token.clone_from(&tokens.refresh_token);
-                account.expires_at = Some(tokens.expires_at_ms);
-                match provider {
-                    crate::provider::Provider::Anthropic => {}
-                    crate::provider::Provider::Codex => match sync_pending {
-                        Some(value) => {
-                            account
-                                .extra
-                                .insert(config::CODEX_SYNC_PENDING_KEY.to_string(), value);
-                        }
-                        None => {
-                            account.extra.remove(config::CODEX_SYNC_PENDING_KEY);
-                        }
-                    },
-                }
-            }
+            // An unbreakable tie writes nothing and says so; why it is resolved
+            // and never first-match is on `Config::stamp_rotated_tokens`.
+            let placement = config.stamp_rotated_tokens(
+                &probe,
+                &tokens.access_token,
+                tokens.refresh_token.as_deref(),
+                tokens.expires_at_ms,
+                sync_pending,
+            );
             (config.clone(), placement)
         };
         // Logged with the config lock released (INV2) — a `warn!` is cheap but the

@@ -26,7 +26,7 @@ use super::live_reads::{
 use super::render::{
     CACHE_SIGNAL_FLOOR_REQUESTS, account_status_rows, account_status_rows_at, claude_resets_token,
     codex_tail, format_reset_clock, format_reset_countdown, held_suffix, render_accounts_json,
-    resolve_thresholds, status_rows_json,
+    status_rows_json,
 };
 use super::status::{
     StatusText, build_fields, codex_traffic_notes, codex_wire_facts, eligible_token,

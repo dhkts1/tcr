@@ -133,8 +133,7 @@ pub async fn login(
     let target = match account {
         Some(query) => {
             let config = oauth::load_or_default(config_path)?;
-            let idx = oauth::codex_relogin_target(&config, query)?;
-            Some(config.accounts[idx].clone())
+            Some(oauth::codex_relogin_target(&config, query)?.clone())
         }
         None => None,
     };

@@ -51,7 +51,7 @@ use std::path::Path;
 use serde::Serialize;
 use time::Date;
 
-use crate::pricing::{PricingOverride, PricingTable, cost_nanos};
+use crate::pricing::{PricingTable, cost_nanos};
 use crate::provider::Provider;
 use crate::usage::{self, LedgerLine};
 
@@ -484,9 +484,7 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
 /// this is a read-only report and must never fail because a config is
 /// missing.
 pub fn pricing_table(config_path: &Path) -> PricingTable {
-    let overrides: BTreeMap<String, PricingOverride> = crate::config::load(config_path)
-        .map_or_default(|config| config.pricing.into_iter().collect());
-    PricingTable::new(overrides)
+    crate::config::load(config_path).map_or_default(|config| config.pricing_table())
 }
 
 fn fmt_pct(change: Option<f64>) -> String {
@@ -660,6 +658,7 @@ pub fn print_report(dir: &Path, config_path: &Path, days: u32, json: bool) -> an
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pricing::PricingOverride;
     use std::fs;
 
     fn write_day(dir: &Path, date: &str, lines: &[&str]) {

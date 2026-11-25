@@ -143,7 +143,7 @@ pub(super) async fn send_loopback_with_redirect_policy(
         .map_err(|e| Unreached::Unbuilt(format!("http client: {e}")))?;
     let url = format!("http://127.0.0.1:{}{path}", config.proxy.port);
     let mut request = build(&client, &url);
-    if let Some(key) = config.proxy.api_key.as_deref() {
+    if let Some(key) = config.loopback_api_key() {
         request = request.header("x-api-key", key);
     }
     request.send().await.map_err(|e| unreached(&e))

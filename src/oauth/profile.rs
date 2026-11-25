@@ -104,14 +104,15 @@ impl StoredClaudeIdentity {
         }
     }
 
-    /// The row of `accounts` this identity already is, by the rule the write resolves its row
+    /// The row of `config` this identity already is, by the rule the write resolves its row
     /// by ([`crate::identity::same_identity`]: account UUID, then the org when both sides know
     /// it), and by email when either side has no account UUID: a Claude row whose name's email
-    /// part ([`crate::identity::email_of`]) is this email, ignoring case.
+    /// part ([`crate::identity::email_of`]) is this email, ignoring case
+    /// ([`Config::stored_claude_row`]).
     ///
     /// Deliberately at least as loose as the write's own resolution, so a login this calls new
     /// can never resolve onto an existing row at write time and replace its token.
-    pub fn existing_row<'a>(&self, accounts: &'a [Account]) -> Option<&'a Account> {
+    pub fn existing_row<'a>(&self, config: &'a Config) -> Option<&'a Account> {
         let probe = crate::identity::probe(
             crate::provider::Provider::Anthropic,
             self.email.as_deref().unwrap_or_default(),
@@ -119,18 +120,7 @@ impl StoredClaudeIdentity {
             self.org_uuid.clone(),
             self.org_name.clone(),
         );
-        accounts
-            .iter()
-            .filter(|row| row.provider == crate::provider::Provider::Anthropic)
-            .find(|row| {
-                if self.account_uuid.is_some() && row.account_uuid.is_some() {
-                    crate::identity::same_identity(row, &probe)
-                } else {
-                    self.email.as_deref().is_some_and(|email| {
-                        crate::identity::email_of(&row.name).eq_ignore_ascii_case(email)
-                    })
-                }
-            })
+        config.stored_claude_row(&probe, self.email.as_deref())
     }
 }
 

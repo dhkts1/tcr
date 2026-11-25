@@ -464,7 +464,7 @@ mod tests {
         }
         assert!(
             read.contains("quotaProbeSeconds"),
-            "positive control: the scan finds the probe cadence read in state.rs"
+            "positive control: the scan finds the probe cadence read in config/extra_keys.rs"
         );
         let registered: BTreeSet<String> = names(KeyKind::ReadFromExtra)
             .into_iter()

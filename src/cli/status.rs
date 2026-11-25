@@ -8,8 +8,7 @@ use time::OffsetDateTime;
 
 use super::live_client::{LiveStatusError, fetch_live_status};
 use super::render::{
-    StatusSource, account_status_rows_at, render_accounts, resolve_thresholds, snapshot_offline,
-    status_rows_json,
+    StatusSource, account_status_rows_at, render_accounts, snapshot_offline, status_rows_json,
 };
 use super::{
     import_claude_code_login_if_empty, load_config, load_config_with_creation, warn_if_no_accounts,
@@ -96,7 +95,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
     // Read-only verb: plain load, no clobber-warning (we never save).
     let (config, created) = load_config_with_creation(config_path)?;
     let config = import_claude_code_login_if_empty(config_path, config).await;
-    let first_empty_config = created && config.accounts.is_empty();
+    let first_empty_config = created && config.holds_no_accounts();
     warn_if_no_accounts(&config);
 
     // Read before the match: the offline arm CONSUMES `config`, and the route
@@ -164,7 +163,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                         config.proxy.port
                     );
                 }
-                let thresholds = resolve_thresholds(&config);
+                let thresholds = config.switch_thresholds();
                 // `config` is consumed by `snapshot_offline` below, so read
                 // `http1_only`/`control_account`/`group_colors` off it first —
                 // this is the config FILE's value, not a running server's
@@ -173,10 +172,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                 // way, so this is the same reading a live server would derive
                 // at boot.
                 let http1_only = config.http1_only;
-                let control = config
-                    .control_account
-                    .as_ref()
-                    .map(|c| c.name().to_string());
+                let control = config.control_account_name().map(str::to_string);
                 let group_colors = config.group_colors();
                 let prober = LiveUsageProber::new().with_codex_base(config.codex_upstream.clone());
                 let snapshot =
@@ -273,10 +269,7 @@ pub(super) fn status_holds_provider(
         Ok(payload) if payload.mitm.is_some() => {
             payload.accounts.iter().any(|row| row.provider == provider)
         }
-        Ok(_) | Err(_) => config
-            .accounts
-            .iter()
-            .any(|account| account.provider == provider),
+        Ok(_) | Err(_) => config.holds_provider(provider),
     }
 }
 

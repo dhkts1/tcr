@@ -162,16 +162,12 @@ impl From<CodexResetOutcome> for AutoResetOutcome {
 }
 
 impl Manager {
-    /// Whether the automatic spend runs, read from the config's unmodelled
-    /// `autoUseExpiringResets` (**default `true`**, Gil, 2026-11-17).
+    /// See [`crate::config::Config::auto_reset_enabled`].
     pub fn auto_reset_enabled(&self) -> bool {
         self.config
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .extra
-            .get("autoUseExpiringResets")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true)
+            .auto_reset_enabled()
     }
 
     /// Spends every reset due at `now_ms` that was not tried before, one at a time, and

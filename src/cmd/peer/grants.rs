@@ -579,13 +579,9 @@ fn refuse_a_lend_scope_naming_codex(
     let Ok(main) = config::load(&path) else {
         return Ok(());
     };
-    for account in &main.accounts {
-        let named =
-            tcr_peer_wire::sanitize_label(&account.name).is_ok_and(|label| labels.contains(&label));
-        if named {
-            tcr::provider_guard::provider_guard(account, tcr::provider_guard::ClaudeOnlyVerb::Lend)
-                .map_err(anyhow::Error::msg)?;
-        }
+    for account in main.accounts_labelled(labels) {
+        tcr::provider_guard::provider_guard(account, tcr::provider_guard::ClaudeOnlyVerb::Lend)
+            .map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }

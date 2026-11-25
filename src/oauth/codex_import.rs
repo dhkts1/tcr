@@ -137,10 +137,7 @@ pub fn no_codex_login_message(path: &Path) -> String {
 /// needing a re-login all count. Read before a Codex save, it decides
 /// [`CODEX_FIRST_ACCOUNT_NOTICE`].
 pub(crate) fn holds_no_codex_row(config_path: &Path) -> anyhow::Result<bool> {
-    Ok(!load_or_default(config_path)?
-        .accounts
-        .iter()
-        .any(|row| row.provider == crate::provider::Provider::Codex))
+    Ok(!load_or_default(config_path)?.holds_provider(crate::provider::Provider::Codex))
 }
 
 /// What a Codex save says when the config held no Codex row before it: whether tcr pools codex
@@ -296,24 +293,18 @@ pub(crate) async fn import_codex_login_as(
     }
     if let Some(wanted) = account {
         let config = load_or_default(config_path)?;
-        let is_this_login = match crate::identity::match_one(&config.accounts, wanted) {
-            crate::identity::Match::One(idx) => {
-                let row = &config.accounts[idx];
-                match row.provider {
-                    crate::provider::Provider::Anthropic => {
-                        return Err(LoginRefusal {
-                            code: LoginRefusal::ACCOUNT_IS_CLAUDE,
-                            reason: claude_account_codex_import_refusal(&row.name),
-                        }
-                        .into());
+        let is_this_login = match config.resolve_account_or_none(wanted)? {
+            Some(row) => match row.provider {
+                crate::provider::Provider::Anthropic => {
+                    return Err(LoginRefusal {
+                        code: LoginRefusal::ACCOUNT_IS_CLAUDE,
+                        reason: claude_account_codex_import_refusal(&row.name),
                     }
-                    crate::provider::Provider::Codex => codex_login_is_row(row, &login),
+                    .into());
                 }
-            }
-            crate::identity::Match::None => login.email.as_deref() == Some(wanted),
-            crate::identity::Match::Ambiguous(names) => {
-                bail!("{}", crate::cli::ambiguous_query_message(wanted, &names))
-            }
+                crate::provider::Provider::Codex => codex_login_is_row(row, &login),
+            },
+            None => login.email.as_deref() == Some(wanted),
         };
         if !is_this_login {
             bail!("the Codex login on this machine is not '{wanted}'; nothing was written.");
@@ -420,10 +411,7 @@ pub(crate) fn existing_codex_row<'a>(
         login.account_id.clone(),
         None,
     );
-    match crate::identity::resolve(config.accounts.iter().enumerate(), &this_login) {
-        crate::identity::Resolved::One(index) => config.accounts.get(index),
-        crate::identity::Resolved::None | crate::identity::Resolved::Many => None,
-    }
+    config.identity_row(&this_login)
 }
 
 /// Whether the credential tcr already stores (`stored`, its `expiresAt`) is
@@ -506,11 +494,7 @@ pub(super) fn mint_codex_login_name(
             workspace_id.map(str::to_string),
             None,
         );
-        config
-            .accounts
-            .iter()
-            .filter(|a| a.name == candidate)
-            .all(|a| crate::identity::same_identity(a, &this_login))
+        config.name_free_for(&this_login)
     };
     if let Some(explicit) = name {
         if !free(explicit) {

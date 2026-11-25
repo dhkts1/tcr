@@ -281,7 +281,6 @@ impl Manager {
                 .accounts
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
-            let fresh_control = fresh.control_account.as_ref().map(|c| c.name().to_string());
             for (idx, account) in accounts.iter_mut().enumerate() {
                 let probe = crate::identity::probe(
                     account.provider,
@@ -290,11 +289,7 @@ impl Manager {
                     account.org_uuid.clone(),
                     account.org_name.clone(),
                 );
-                let Some(matched) = fresh
-                    .accounts
-                    .iter()
-                    .find(|a| crate::identity::same_identity(&probe, a))
-                else {
+                let Some(matched) = fresh.same_identity_rows(&probe).next() else {
                     // The file no longer holds this account: it was deleted.
                     // Parked in memory only (there is no entry left to write
                     // the flag into) and dropped from every snapshot; see
@@ -333,7 +328,7 @@ impl Manager {
                     // entry holds whatever tokens it held, and the next refresh decides.
                     account.codex_home.clone_from(&matched.codex_home);
                     changed.push(format!("{}: back in the config", account.name));
-                    if fresh_control.as_deref() == Some(account.name.as_str()) {
+                    if fresh.control_account_name() == Some(account.name.as_str()) {
                         let mut control = self
                             .control_idx
                             .write()
@@ -374,7 +369,7 @@ impl Manager {
             // out-of-range `idx`, and callers read `None` as "no pin").
             let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
             let http1_only = config.http1_only;
-            for candidate in &fresh.accounts {
+            config.admit_rows_from(fresh, |candidate| {
                 let already_known = accounts.iter().any(|existing| {
                     let probe = crate::identity::probe(
                         existing.provider,
@@ -386,12 +381,12 @@ impl Manager {
                     crate::identity::same_identity(&probe, candidate)
                 });
                 if already_known {
-                    continue;
+                    return false;
                 }
                 changed.push(format!("{}: admitted by reload", candidate.name));
                 accounts.push(AccountRuntime::from_config(candidate, http1_only));
-                config.accounts.push(candidate.clone());
-            }
+                true
+            });
         }
 
         if !changed.is_empty() {

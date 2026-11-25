@@ -55,60 +55,49 @@ pub fn upsert_account(
         org_name.clone(),
     );
 
-    match crate::identity::resolve(config.accounts.iter().enumerate(), &probe) {
-        crate::identity::Resolved::One(index) => {
-            let account = &mut config.accounts[index];
-            account.account_type = config::AccountType::OAuth;
-            account.access_token.clone_from(&tokens.access_token);
-            account.refresh_token.clone_from(&tokens.refresh_token);
-            account.expires_at = Some(tokens.expires_at_ms);
-            // Backfill any identity field the stored entry was missing (e.g. a
-            // legacy pre-org entry newly profiled), without overwriting known
-            // values.
-            if account.account_uuid.is_none() {
-                account.account_uuid = account_uuid;
-            }
-            if account.org_uuid.is_none() {
-                account.org_uuid = org_uuid;
-            }
-            if account.org_name.is_none() {
-                account.org_name = org_name;
-            }
-            // OVERWRITTEN, not backfilled, unlike the identity fields above —
-            // an org upgrades its plan, so the first reading must not be pinned
-            // forever. Same rule `config::merge_account` applies on disk; see
-            // `config::Account::organization_type`. A `None` writes nothing, so
-            // a profile fetch that failed never blanks a known plan.
-            if profile.organization_type.is_some() {
-                account
-                    .organization_type
-                    .clone_from(&profile.organization_type);
-            }
-            if profile.rate_limit_tier.is_some() {
-                account.rate_limit_tier.clone_from(&profile.rate_limit_tier);
-            }
-            if profile.seat_tier.is_some() {
-                account.seat_tier.clone_from(&profile.seat_tier);
-            }
-            if profile.plan_display_name.is_some() {
-                account
-                    .plan_display_name
-                    .clone_from(&profile.plan_display_name);
-            }
-            Ok(())
+    let resolved = config.update_identity_row(&probe, |account| {
+        account.account_type = config::AccountType::OAuth;
+        account.access_token.clone_from(&tokens.access_token);
+        account.refresh_token.clone_from(&tokens.refresh_token);
+        account.expires_at = Some(tokens.expires_at_ms);
+        // Backfill any identity field the stored entry was missing (e.g. a
+        // legacy pre-org entry newly profiled), without overwriting known
+        // values.
+        if account.account_uuid.is_none() {
+            account.account_uuid = account_uuid;
         }
+        if account.org_uuid.is_none() {
+            account.org_uuid = org_uuid;
+        }
+        if account.org_name.is_none() {
+            account.org_name = org_name;
+        }
+        // OVERWRITTEN, not backfilled, unlike the identity fields above —
+        // an org upgrades its plan, so the first reading must not be pinned
+        // forever. Same rule `config::merge_account` applies on disk; see
+        // `config::Account::organization_type`. A `None` writes nothing, so
+        // a profile fetch that failed never blanks a known plan.
+        if profile.organization_type.is_some() {
+            account
+                .organization_type
+                .clone_from(&profile.organization_type);
+        }
+        if profile.rate_limit_tier.is_some() {
+            account.rate_limit_tier.clone_from(&profile.rate_limit_tier);
+        }
+        if profile.seat_tier.is_some() {
+            account.seat_tier.clone_from(&profile.seat_tier);
+        }
+        if profile.plan_display_name.is_some() {
+            account
+                .plan_display_name
+                .clone_from(&profile.plan_display_name);
+        }
+    });
+    match resolved {
+        crate::identity::Resolved::One(_) => Ok(()),
         crate::identity::Resolved::None => {
-            let next_priority = config
-                .accounts
-                .iter()
-                .filter_map(|a| a.priority)
-                .max()
-                .map_or(0, |max| max + 1);
-
-            config.accounts.push(Account {
-                priority: Some(next_priority),
-                ..claude_login_row(name, tokens, profile)
-            });
+            config.append_at_next_priority(claude_login_row(name, tokens, profile));
             Ok(())
         }
         // Recompute the loose set for its names: `Resolved::Many` itself
@@ -117,12 +106,10 @@ pub fn upsert_account(
         // `Manager::add_or_update_account`'s identical recomputation.
         crate::identity::Resolved::Many => {
             let candidates: Vec<String> = config
-                .accounts
-                .iter()
-                .filter(|a| crate::identity::same_identity(a, &probe))
+                .same_identity_rows(&probe)
                 .map(|a| a.name.clone())
                 .collect();
-            bail!("{}", crate::cli::ambiguous_query_message(name, &candidates));
+            bail!("{}", config::ambiguous_query_message(name, &candidates));
         }
     }
 }
@@ -161,9 +148,7 @@ fn persist_via_file(config_path: &Path, account: Account) -> anyhow::Result<Stri
             let name = account.name.clone();
             let mut fresh: Config =
                 serde_json::from_str("{}").context("build a default config after login")?;
-            let mut first_account = account;
-            first_account.priority = Some(0);
-            fresh.accounts.push(first_account);
+            fresh.append_at_next_priority(account);
             config::save(config_path, &fresh).context("save config after login")?;
             prose(format_args!(
                 "Saved account '{name}' to {}",

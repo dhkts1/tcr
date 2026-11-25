@@ -22,7 +22,6 @@ use anyhow::{Context as _, bail};
 
 use crate::config::{self, Config};
 
-mod account_query;
 mod accounts;
 mod fan;
 mod groups;
@@ -35,7 +34,6 @@ mod reset;
 mod settings;
 mod status;
 
-pub use account_query::{ambiguous_query_message, resolve_account};
 pub use accounts::{
     PriorityArg, print_access_token, remove_account, request_key, set_account_egress, set_control,
     set_enabled, set_priority, show_control,
@@ -115,7 +113,7 @@ fn load_config_with_creation(config_path: &Path) -> anyhow::Result<(Config, bool
 /// empty-fleet hint.
 async fn import_claude_code_login_if_empty(config_path: &Path, config: Config) -> Config {
     // A fleet a delete emptied stays empty: see `Config::refuses_claude_code_import`.
-    if !config.accounts.is_empty() || config.refuses_claude_code_import() {
+    if !config.holds_no_accounts() || config.refuses_claude_code_import() {
         return config;
     }
     if crate::oauth::auto_import_claude_code_login(config_path)
@@ -142,7 +140,7 @@ async fn import_claude_code_login_if_empty(config_path: &Path, config: Config) -
 /// ([`crate::codex_local::codex_login_exists`], a `metadata` call that never
 /// opens the file), so a fleet with accounts costs nothing extra.
 fn warn_if_no_accounts(config: &Config) {
-    let codex_login = (config.accounts.is_empty() && crate::codex_local::codex_login_exists())
+    let codex_login = (config.holds_no_accounts() && crate::codex_local::codex_login_exists())
         .then(crate::codex_local::codex_login_path);
     for line in no_accounts_lines(config, codex_login.as_deref()) {
         eprintln!("{line}");
@@ -160,7 +158,7 @@ fn warn_if_no_accounts(config: &Config) {
 /// person's choice. `claudeCodeImport: false` does not stop
 /// the line either, since it stops only the Claude Code import.
 fn no_accounts_lines(config: &Config, codex_login: Option<&Path>) -> Vec<String> {
-    if !config.accounts.is_empty() {
+    if !config.holds_no_accounts() {
         return Vec::new();
     }
     let mut lines = vec!["no accounts configured — run `tcr login` to add one".to_string()];
@@ -206,16 +204,7 @@ fn load_for_edit(config_path: &Path) -> anyhow::Result<Config> {
             config_path.display()
         );
     }
-    if !config.quarantined_accounts.is_empty() {
-        bail!(
-            "config at {} has {} account(s) with no usable credential, so the CLI cannot safely \
-             load-edit-save it: {}. Fix or remove the entry in the file by hand (the server \
-             itself tolerates it and keeps running).",
-            config_path.display(),
-            config.quarantined_accounts.len(),
-            config.quarantined_accounts.join(", ")
-        );
-    }
+    config.refuse_edit_if_quarantined(config_path)?;
     warn_if_server_running(&config);
     Ok(config)
 }
@@ -237,17 +226,15 @@ fn save_after_edit(config_path: &Path, config: &Config) -> anyhow::Result<()> {
 /// Centralizes the load→resolve→save chain (incl. the nonexistent-account error
 /// path) shared by every mutating verb. Resolution happens BEFORE `mutate`, so a
 /// non-matching query returns an error with the file left byte-identical (no
-/// partial write). `mutate` receives the resolved index and the whole config, so
-/// a command that needs the fleet (e.g. relative priority) or must `remove` the
-/// entry can still do so; it returns whatever the caller wants to report.
+/// partial write). `mutate` receives the resolved row and returns whatever the
+/// caller wants to report.
 fn edit_account<T>(
     config_path: &Path,
     query: &str,
-    mutate: impl FnOnce(&mut Config, usize) -> T,
+    mutate: impl FnOnce(&mut config::Account) -> T,
 ) -> anyhow::Result<T> {
     let mut config = load_for_edit(config_path)?;
-    let idx = resolve_account(&config.accounts, query)?;
-    let out = mutate(&mut config, idx);
+    let out = mutate(config.resolve_account_mut(query)?);
     save_after_edit(config_path, &config)?;
     Ok(out)
 }

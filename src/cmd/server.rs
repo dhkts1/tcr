@@ -129,7 +129,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     // that already has accounts (see `auto_import_claude_code_login`), and
     // never fatal: the failure paths all warn and boot with zero accounts,
     // exactly as this line did before.
-    let config = if config.accounts.is_empty() && !config.refuses_claude_code_import() {
+    let config = if config.holds_no_accounts() && !config.refuses_claude_code_import() {
         match oauth::auto_import_claude_code_login(&config_path).await {
             // Re-read: the import wrote the file, and re-reading is what makes
             // the running fleet the one on disk.
@@ -540,7 +540,7 @@ fn migration_persist_target<'a>(
     config: &Config,
     persist_path: &'a Option<PathBuf>,
 ) -> Option<&'a Path> {
-    if config.migrated_legacy_throttle && config.quarantined_accounts.is_empty() {
+    if config.should_save_throttle_migration() {
         persist_path.as_deref()
     } else {
         None

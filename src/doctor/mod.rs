@@ -1149,30 +1149,16 @@ fn codex_rows(
                 limit_reached_type: row.limit_reached_type.clone(),
             })
             .collect(),
-        Ok(_) | Err(_) => {
-            let reserved = config.reserved_group_names();
-            config
-                .accounts
-                .iter()
-                .filter(|account| account.provider == crate::provider::Provider::Codex)
-                .map(|account| {
-                    let mut reserved_groups: Vec<String> = account
-                        .groups
-                        .iter()
-                        .flatten()
-                        .filter(|group| reserved.contains(*group))
-                        .cloned()
-                        .collect();
-                    reserved_groups.sort();
-                    CodexRow {
-                        name: account.name.clone(),
-                        gate: None,
-                        reserved_groups,
-                        limit_reached_type: None,
-                    }
-                })
-                .collect()
-        }
+        Ok(_) | Err(_) => config
+            .codex_reserved_groups()
+            .into_iter()
+            .map(|(name, reserved_groups)| CodexRow {
+                name: name.to_string(),
+                gate: None,
+                reserved_groups,
+                limit_reached_type: None,
+            })
+            .collect(),
     }
 }
 

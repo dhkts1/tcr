@@ -149,7 +149,7 @@ pub(crate) async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         }
         // The same read decides the request key: sent only to a server that
         // reports `requestKeyMode`.
-        let launch_key = LaunchKey::decide(config.proxy.request_key.as_deref(), &live);
+        let launch_key = LaunchKey::decide(config.usable_request_key(), &live);
         for line in apply_codex_launch(
             &mut cmd,
             port,
@@ -227,9 +227,9 @@ pub(crate) async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         {
             eprintln!("{warning}");
         }
-        let launch_key = LaunchKey::decide(config.proxy.request_key.as_deref(), &live);
+        let launch_key = LaunchKey::decide(config.usable_request_key(), &live);
         if let Some(notice) = withheld_api_key_notice(
-            config.proxy.api_key.is_some(),
+            config.loopback_api_key().is_some(),
             std::env::var_os("ANTHROPIC_API_KEY").is_some(),
         ) {
             eprintln!("{notice}");
@@ -467,8 +467,8 @@ fn codex_pool_preflight(
 /// Does `config` hold a Codex account and no Claude account, in any state? Only then does
 /// `tcr run` ask the running proxy whether it holds a Claude account.
 fn holds_only_codex(config: &Config) -> bool {
-    let holds = |provider| config.accounts.iter().any(|a| a.provider == provider);
-    holds(tcr::provider::Provider::Codex) && !holds(tcr::provider::Provider::Anthropic)
+    config.holds_provider(tcr::provider::Provider::Codex)
+        && !config.holds_provider(tcr::provider::Provider::Anthropic)
 }
 
 /// The warning `tcr run` prints for a claude session when the running proxy on `port` holds
@@ -620,13 +620,7 @@ fn validate_group(config: &Config, group: &str) -> anyhow::Result<()> {
         anyhow::bail!("--group {group:?}: invalid group label — {reason}");
     }
 
-    let mut configured: Vec<&str> = config
-        .accounts
-        .iter()
-        .filter_map(|a| a.groups.as_ref())
-        .flatten()
-        .map(String::as_str)
-        .collect();
+    let mut configured: Vec<&str> = config.group_labels().collect();
     for label in &configured {
         if let Err(reason) = validate_group_label_chars(label) {
             anyhow::bail!("config carries an invalid group label {label:?}: {reason}");
@@ -640,9 +634,9 @@ fn validate_group(config: &Config, group: &str) -> anyhow::Result<()> {
         // account can serve one: a group whose every member is a Codex account
         // would route it nowhere. Only a fleet holding a Codex account can have
         // such a group, since a label exists only while some account carries it.
-        let has_claude = config.accounts.iter().any(|account| {
-            account.provider == tcr::provider::Provider::Anthropic && account.in_group(group)
-        });
+        let has_claude = config
+            .group_members(group)
+            .any(|account| account.provider == tcr::provider::Provider::Anthropic);
         if !has_claude {
             anyhow::bail!("{}", tcr::provider_guard::group_has_no_claude(group));
         }

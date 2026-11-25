@@ -207,24 +207,10 @@ impl Manager {
             .config_write
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        {
-            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
-            if let crate::identity::Resolved::One(index) =
-                crate::identity::resolve(config.accounts.iter().enumerate(), &target)
-                && config.accounts[index].refresh_token.as_deref() == Some(refresh.as_str())
-            {
-                match &pending {
-                    Some(record) => {
-                        config.accounts[index]
-                            .extra
-                            .insert(CODEX_SYNC_PENDING_KEY.to_string(), record.clone());
-                    }
-                    None => {
-                        config.accounts[index].extra.remove(CODEX_SYNC_PENDING_KEY);
-                    }
-                }
-            }
-        }
+        self.config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .mark_codex_sync_pending(&target, &refresh, pending.as_ref());
         if config::save_codex_token_sync_pending(path, &target, &refresh, pending.as_ref()).is_err()
         {
             tracing::warn!("could not persist Codex token publication metadata");

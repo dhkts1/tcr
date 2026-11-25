@@ -563,25 +563,15 @@ fn a_name_override_wins_over_the_profile_email() {
 
 // --- the `unnamed` fallback ---------------------------------------------
 
-/// An `Account` carrying nothing but a name — the only field
-/// [`unnamed_fallback`] reads.
-fn named_account(name: &str) -> Account {
-    Account {
-        access_token: "at-placeholder".to_string(),
-        refresh_token: None,
-        expires_at: None,
-        priority: None,
-        ..Account::fixture(name)
-    }
+/// The names already taken, the only thing [`unnamed_fallback`] reads.
+fn taken(names: &[&str]) -> std::collections::HashSet<String> {
+    names.iter().map(|name| (*name).to_string()).collect()
 }
 
 #[test]
 fn unnamed_fallback_is_plain_unnamed_when_free() {
-    assert_eq!(unnamed_fallback(&[]), "unnamed");
-    assert_eq!(
-        unnamed_fallback(&[named_account("alice@example.com")]),
-        "unnamed"
-    );
+    assert_eq!(unnamed_fallback(&taken(&[])), "unnamed");
+    assert_eq!(unnamed_fallback(&taken(&["alice@example.com"])), "unnamed");
 }
 
 /// The collision case, and the reason this function exists at all: an
@@ -591,9 +581,9 @@ fn unnamed_fallback_is_plain_unnamed_when_free() {
 /// adding an account.
 #[test]
 fn unnamed_fallback_skips_taken_names() {
-    assert_eq!(unnamed_fallback(&[named_account("unnamed")]), "unnamed-2");
+    assert_eq!(unnamed_fallback(&taken(&["unnamed"])), "unnamed-2");
     assert_eq!(
-        unnamed_fallback(&[named_account("unnamed"), named_account("unnamed-2")]),
+        unnamed_fallback(&taken(&["unnamed", "unnamed-2"])),
         "unnamed-3"
     );
 }
@@ -604,6 +594,8 @@ fn unnamed_fallback_skips_taken_names() {
 /// with `unnamed-3`. A count-derived fallback gets this wrong.
 #[test]
 fn unnamed_fallback_fills_a_gap_left_by_a_removed_account() {
-    let accounts = [named_account("unnamed"), named_account("unnamed-3")];
-    assert_eq!(unnamed_fallback(&accounts), "unnamed-2");
+    assert_eq!(
+        unnamed_fallback(&taken(&["unnamed", "unnamed-3"])),
+        "unnamed-2"
+    );
 }

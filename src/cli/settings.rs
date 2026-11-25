@@ -33,7 +33,7 @@ pub async fn config_show_document(
     config_path: &Path,
 ) -> anyhow::Result<crate::config_show::ConfigShow> {
     let config = load_config(config_path)?;
-    let saved = crate::config_show::ConfigSettings::from_config(&config, config_path);
+    let saved = config.settings(config_path);
     let running = match fetch_running_settings(&config).await {
         Ok(running) => Some(running),
         Err(LiveControlError::NoServer) => None,

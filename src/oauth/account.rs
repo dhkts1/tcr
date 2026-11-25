@@ -49,14 +49,13 @@ pub fn claude_account_codex_import_refusal(name: &str) -> String {
 }
 
 /// The row `tcr login --codex --account <query>` re-signs: `query` resolved by the rule every
-/// verb's `--account` uses ([`crate::cli::resolve_account`], an exact row name), refused with
+/// verb's `--account` uses ([`Config::resolve_account`], an exact row name), refused with
 /// [`LoginRefusal::ACCOUNT_IS_CLAUDE`] when it names a Claude row. Runs before anything else the
 /// login does, so a refusal spawns nothing and writes nothing.
-pub fn codex_relogin_target(config: &Config, query: &str) -> anyhow::Result<usize> {
-    let idx = crate::cli::resolve_account(&config.accounts, query)?;
-    let row = &config.accounts[idx];
+pub fn codex_relogin_target<'a>(config: &'a Config, query: &str) -> anyhow::Result<&'a Account> {
+    let row = config.resolve_account(query)?;
     match row.provider {
-        crate::provider::Provider::Codex => Ok(idx),
+        crate::provider::Provider::Codex => Ok(row),
         crate::provider::Provider::Anthropic => Err(LoginRefusal {
             code: LoginRefusal::ACCOUNT_IS_CLAUDE,
             reason: claude_account_codex_login_refusal(&row.name),
@@ -136,7 +135,7 @@ pub(super) async fn finish_login_checked(
 }
 
 /// The load-bearing half of `tcr login --account <query>`:
-/// resolve `query` against `config` via [`crate::cli::resolve_account`]
+/// resolve `query` against `config` via [`crate::config::Config::resolve_account`]
 /// — the exact rule `tcr enable`/`tcr disable` and TcrBar's row buttons
 /// already rely on, not a second copy of it — then refuse to proceed unless
 /// the identity that came back from `fetch_profile` resolves, through
@@ -166,8 +165,7 @@ pub(super) fn assert_requested_identity(
     query: &str,
     profile: &Profile,
 ) -> anyhow::Result<()> {
-    let idx = crate::cli::resolve_account(&config.accounts, query)?;
-    let requested = &config.accounts[idx];
+    let requested = config.resolve_account(query)?;
     refuse_a_non_claude_row(requested)?;
 
     if profile.email.is_none() && profile.account_uuid.is_none() {
@@ -197,17 +195,15 @@ pub(super) fn assert_requested_identity(
         profile.org_uuid.clone(),
         profile.org_name.clone(),
     );
-    let resolved = crate::identity::resolve(config.accounts.iter().enumerate(), &probe);
-    let resolved_idx = match resolved {
-        crate::identity::Resolved::One(i) => Some(i),
-        crate::identity::Resolved::None | crate::identity::Resolved::Many => None,
-    };
+    let resolved = config.identity_row(&probe);
 
-    if resolved_idx != Some(idx) {
-        let got = match resolved_idx {
+    // Both rows are borrowed from `config.accounts`, so the same address is the
+    // same row.
+    if !resolved.is_some_and(|row| std::ptr::eq(row, requested)) {
+        let got = match resolved {
             // The identity resolved cleanly, just to a DIFFERENT existing
             // row — name that row, it is the actionable fact.
-            Some(other) => config.accounts[other].name.clone(),
+            Some(other) => other.name.clone(),
             None if requested.account_uuid.is_none() && !requested.name.contains('@') => {
                 // `requested` has no stored account id, and its own display
                 // name isn't email-shaped (e.g. an account named "work"), so

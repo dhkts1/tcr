@@ -15,9 +15,15 @@ mod account_edit;
 mod color;
 mod credential_version;
 mod edit;
+mod extra_keys;
 mod file;
 mod group_edit;
+mod identity_roster;
 mod load;
+mod login_roster;
+mod projections;
+mod roster;
+mod serve_inputs;
 mod tokens;
 
 pub use account_edit::{
@@ -28,7 +34,6 @@ pub(crate) use edit::{CODEX_SYNC_PENDING_KEY, save_codex_token_sync_pending};
 pub use edit::{
     ControlWrite, DisabledWrite, DocEdit, Edit, GroupWrite, PlanWrite, RequestKeyWrite,
     read_request_key, save_control_account, save_disabled, save_group_membership, save_plan,
-    save_request_key,
 };
 pub use file::save;
 pub(crate) use file::{Durability, read_document, write_atomic, write_atomic_with};
@@ -37,6 +42,7 @@ pub use group_edit::{
     save_group_allow_control, save_group_color, save_group_parked, save_group_reserved,
 };
 pub use load::{load, load_or_init};
+pub use roster::ambiguous_query_message;
 pub use tokens::{CredentialScope, save_settings, save_tokens, save_tokens_for};
 
 /// Typed config-layer errors: I/O vs malformed JSON stay distinguishable so a
@@ -287,7 +293,7 @@ pub struct ProxyConfig {
     /// The request key ([`crate::request_key`]): what a caller presents to say
     /// it was launched on purpose. Separate from [`Self::api_key`], which gates
     /// the `/_tcr/` control routes. The server writes one at boot when the file
-    /// has none ([`save_request_key`]); absent, behaviour is exactly as before.
+    /// has none ([`Config::persist_request_key`]); absent, behaviour is exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_key: Option<String>,
     /// Any `proxy.*` keys we do not model, preserved verbatim on save.
@@ -460,7 +466,7 @@ impl Account {
 
     /// A strict peer exit cannot be honoured for Codex. Keep the row readable so
     /// the CLI can clear its pin, but never select it for a pooled request.
-    pub(crate) const fn has_unsupported_strict_peer_exit(&self) -> bool {
+    const fn has_unsupported_strict_peer_exit(&self) -> bool {
         match self.provider {
             crate::provider::Provider::Anthropic => false,
             crate::provider::Provider::Codex => self.egress_strict && self.egress.peer().is_some(),
@@ -912,7 +918,7 @@ pub enum ControlAccountRef {
 
 impl ControlAccountRef {
     /// The account name, present in both shapes.
-    pub fn name(&self) -> &str {
+    fn name(&self) -> &str {
         match self {
             Self::Name(name) => name,
             Self::Identity { name, .. } => name,
@@ -1273,18 +1279,6 @@ impl Config {
             .collect()
     }
 
-    /// Whether `group` currently opts in to `spillToPool`. `false` for a group
-    /// name with no `groupSettings` entry at all — same "absent means false"
-    /// default the field's own doc-comment promises. Callers deciding
-    /// strictness must also check [`Self::is_group_reserved`] — a reserved
-    /// group ignores this and is always strict; see [`GroupSettings::spill_to_pool`]'s
-    /// doc-comment.
-    pub fn group_allows_spill(&self, group: &str) -> bool {
-        self.group_settings
-            .get(group)
-            .is_some_and(|s| s.spill_to_pool)
-    }
-
     /// Every group label that currently has at least one member — the same
     /// "a group exists only while some account carries the label" definition
     /// [`crate::cli::remove_from_group`]'s `--all` arm already uses. A
@@ -1350,19 +1344,6 @@ impl Config {
                     .all(|g| !reserved.contains(g))
             })
             .count()
-    }
-
-    /// Whether any account in this config is a Codex account, in any state
-    /// (disabled, grouped, pinned, or not).
-    ///
-    /// The gate every Codex-aware CLI sentence sits behind: a fleet for which
-    /// this is false is Claude-only, and prints exactly what it printed before
-    /// Codex accounts existed. Reads [`Self::accounts`], so a row the loader set
-    /// aside never counts, and neither does one already deleted from the file.
-    pub fn holds_codex(&self) -> bool {
-        self.accounts
-            .iter()
-            .any(|a| a.provider == crate::provider::Provider::Codex)
     }
 
     /// [`Self::unreserved_enabled_count`], counting only `provider`'s accounts.

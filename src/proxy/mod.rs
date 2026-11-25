@@ -2628,7 +2628,7 @@ async fn set_disabled_handler(State(manager): State<Arc<Manager>>, req: Request)
             &DISABLED_ROUTE,
             StatusCode::CONFLICT,
             ErrorKind::InvalidRequest,
-            &crate::cli::ambiguous_query_message(&query, &names),
+            &config::ambiguous_query_message(&query, &names),
         ),
         SetDisabledOutcome::Applied { name, persist } => json_ok(
             &DISABLED_ROUTE,
@@ -2747,7 +2747,7 @@ async fn set_priority_handler(State(manager): State<Arc<Manager>>, req: Request)
             &PRIORITY_ROUTE,
             StatusCode::CONFLICT,
             ErrorKind::InvalidRequest,
-            &crate::cli::ambiguous_query_message(&query, &names),
+            &config::ambiguous_query_message(&query, &names),
         ),
         SetPriorityOutcome::Applied { name } => {
             json_ok(&PRIORITY_ROUTE, &SetPriorityResponse { name, priority })
@@ -2948,7 +2948,7 @@ async fn set_control_handler(State(manager): State<Arc<Manager>>, req: Request) 
             &CONTROL_ROUTE,
             StatusCode::CONFLICT,
             ErrorKind::InvalidRequest,
-            &crate::cli::ambiguous_query_message(&parsed.query.unwrap_or_default(), &names),
+            &config::ambiguous_query_message(&parsed.query.unwrap_or_default(), &names),
         ),
         // 409, like the tie above: every `tcr control` client reads a stamped 404 or 409
         // from this route as a refusal of the query and writes nothing, where any other
@@ -3152,7 +3152,7 @@ fn add_account_response(
 /// existing account's credentials in place (exactly one matched — a re-login).
 /// See that function's doc-comment for why the two cases use different
 /// resolution anchors for their durable write. An ambiguous match is a 409
-/// naming the candidates, via [`crate::cli::ambiguous_query_message`] — never
+/// naming the candidates, via [`crate::config::ambiguous_query_message`] — never
 /// guessed.
 async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let parsed: AddAccountRequest = match read_command(
@@ -3242,7 +3242,7 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
             &ADD_ACCOUNT_ROUTE,
             StatusCode::CONFLICT,
             ErrorKind::InvalidRequest,
-            &crate::cli::ambiguous_query_message(&query_name, &names),
+            &config::ambiguous_query_message(&query_name, &names),
         ),
         // The provider comes off the stored row, not the request: the echo is the
         // server's account of what it holds, which is what a client checks.
