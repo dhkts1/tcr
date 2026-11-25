@@ -67,7 +67,7 @@ impl Config {
     }
 
     /// Whether the fleet is empty: no usable account row, so a quarantined row does not count.
-    pub fn holds_no_accounts(&self) -> bool {
+    pub const fn holds_no_accounts(&self) -> bool {
         self.accounts.is_empty()
     }
 
@@ -186,7 +186,7 @@ impl Config {
     }
 
     /// Whether the loader set any account aside for holding no usable credential.
-    fn holds_quarantined_accounts(&self) -> bool {
+    const fn holds_quarantined_accounts(&self) -> bool {
         !self.quarantined_accounts.is_empty()
     }
 
@@ -194,7 +194,7 @@ impl Config {
     /// written back: only when it migrated something and no account is
     /// quarantined, since a whole-config save would drop the row the loader set
     /// aside ([`Self::refuse_edit_if_quarantined`], the same hazard).
-    pub fn should_save_throttle_migration(&self) -> bool {
+    pub const fn should_save_throttle_migration(&self) -> bool {
         self.migrated_legacy_throttle && !self.holds_quarantined_accounts()
     }
 

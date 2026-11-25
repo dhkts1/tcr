@@ -714,8 +714,8 @@ pub(super) fn provider_of_entry(entry: &Map<String, Value>) -> Option<crate::pro
 /// [`EntryRefusal`] explaining why there is no single entry to write.
 ///
 /// Matching reuses the [`DiskIdentity`] probe + [`crate::identity::resolve`]
-/// pairing that [`merge_tokens`] uses, so a rotated credential and a disabled flag
-/// can never land on two different entries.
+/// pairing that [`super::Config::merge_tokens`] uses, so a rotated credential
+/// and a disabled flag can never land on two different entries.
 ///
 /// An AMBIGUOUS identity is refused, not resolved to the first match. The old
 /// first-match-wins rested on "the CLI already refuses an ambiguous query", but
