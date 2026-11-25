@@ -466,7 +466,7 @@ impl Account {
 
     /// A strict peer exit cannot be honoured for Codex. Keep the row readable so
     /// the CLI can clear its pin, but never select it for a pooled request.
-    pub(crate) const fn has_unsupported_strict_peer_exit(&self) -> bool {
+    const fn has_unsupported_strict_peer_exit(&self) -> bool {
         match self.provider {
             crate::provider::Provider::Anthropic => false,
             crate::provider::Provider::Codex => self.egress_strict && self.egress.peer().is_some(),
@@ -918,7 +918,7 @@ pub enum ControlAccountRef {
 
 impl ControlAccountRef {
     /// The account name, present in both shapes.
-    pub fn name(&self) -> &str {
+    fn name(&self) -> &str {
         match self {
             Self::Name(name) => name,
             Self::Identity { name, .. } => name,
@@ -1277,18 +1277,6 @@ impl Config {
             .filter(|(_, s)| s.spill_to_pool)
             .map(|(name, _)| name.clone())
             .collect()
-    }
-
-    /// Whether `group` currently opts in to `spillToPool`. `false` for a group
-    /// name with no `groupSettings` entry at all — same "absent means false"
-    /// default the field's own doc-comment promises. Callers deciding
-    /// strictness must also check [`Self::is_group_reserved`] — a reserved
-    /// group ignores this and is always strict; see [`GroupSettings::spill_to_pool`]'s
-    /// doc-comment.
-    pub fn group_allows_spill(&self, group: &str) -> bool {
-        self.group_settings
-            .get(group)
-            .is_some_and(|s| s.spill_to_pool)
     }
 
     /// Every group label that currently has at least one member — the same

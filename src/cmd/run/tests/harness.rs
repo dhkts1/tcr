@@ -325,7 +325,7 @@ fn run_group_refuses_a_codex_only_group_even_when_it_spills_to_the_pool() {
             ..Default::default()
         },
     );
-    assert!(config.group_allows_spill("lab") && !config.is_group_reserved("lab"));
+    assert!(config.spill_group_names().contains("lab") && !config.is_group_reserved("lab"));
     let err =
         validate_group(&config, "lab").expect_err("spilling does not give lab a Claude account");
     assert_eq!(
