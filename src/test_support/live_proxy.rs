@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::Config;
+use crate::base::config::Config;
 use crate::manager::Manager;
 
 /// Serve the proxy for `config` on `listener` for the rest of the test, with `config_path` as
@@ -19,6 +19,6 @@ pub fn serve(
 ) -> Arc<Manager> {
     let manager = Manager::with_live_refresher(config, config_path);
     let served = Arc::clone(&manager);
-    tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+    tokio::spawn(async move { crate::proxy::mitm::serve(listener, served, None).await });
     manager
 }

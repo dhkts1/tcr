@@ -6,7 +6,7 @@
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
 
-use crate::provider::Provider;
+use crate::base::provider::Provider;
 
 use super::{codex_error_response, error_response, quiet_error_response};
 
@@ -205,7 +205,7 @@ mod tests {
         use axum::http::{Method, Request, StatusCode};
         use tower::ServiceExt as _;
 
-        use crate::config::{Account, Config};
+        use crate::base::config::{Account, Config};
         use crate::manager::Manager;
         use crate::proxy::{
             ADD_ACCOUNT_PATH, CONFIG_PATH, CONTROL_PATH, ClientAddr, DISABLED_PATH,
@@ -215,13 +215,17 @@ mod tests {
         use super::super::{ClientError, ErrorKind};
 
         struct NoRefresh;
-        impl crate::oauth::TokenRefresher for NoRefresh {
+        impl crate::clients::oauth::TokenRefresher for NoRefresh {
             fn refresh(
                 &self,
-                _provider: crate::provider::Provider,
+                _provider: crate::base::provider::Provider,
                 _t: String,
-            ) -> crate::oauth::RefreshFuture {
-                Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+            ) -> crate::clients::oauth::RefreshFuture {
+                Box::pin(async {
+                    Err(crate::clients::oauth::OAuthError::Transient(
+                        "unused".into(),
+                    ))
+                })
             }
         }
 
@@ -231,8 +235,8 @@ mod tests {
             Manager::new(
                 config,
                 Arc::new(NoRefresh),
-                Arc::new(crate::probe::LiveUsageProber::new()),
-                Arc::new(crate::warmer::LiveWarmer::new()),
+                Arc::new(crate::records::probe::LiveUsageProber::new()),
+                Arc::new(crate::clients::warmer::LiveWarmer::new()),
                 None,
             )
         }

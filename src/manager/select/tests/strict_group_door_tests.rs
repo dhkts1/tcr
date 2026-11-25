@@ -2,7 +2,7 @@
 
 use super::select_test_support::{live_manager, pin, pin_of};
 use super::*;
-use crate::config::Account;
+use crate::base::config::Account;
 use std::collections::HashSet;
 
 fn account(name: &str, groups: &[&str]) -> Account {
@@ -177,7 +177,7 @@ fn a_sticky_divert_destination_is_refused_outside_a_strict_group() {
 }
 
 /// **`is_group_strict` is `reserved || !spill`**, the one rule, so
-/// `src/proxy.rs`'s refusal terminals scope their answer to the same set
+/// `src/proxy/mod.rs`'s refusal terminals scope their answer to the same set
 /// the picker held the request inside.
 ///
 /// Watched red: make `is_group_strict` call `is_group_reserved` alone and
@@ -274,7 +274,7 @@ fn a_migration_target_is_refused_outside_a_strict_group() {
 ///
 /// Watched red: `:891`'s `continue` fires only for `cand == idx`, so
 /// `at-b`, already in `tried`, either the account a borrowed request's
-/// scope benched (`src/proxy.rs:2249-2256`) or the account a local retry
+/// scope benched (`src/proxy/mod.rs`) or the account a local retry
 /// just failed on, is still the least-loaded candidate and the scan
 /// returns it, migrating the session onto the very account `tried`
 /// exists to rule out. Green once `:891` also `continue`s on
@@ -294,7 +294,7 @@ fn a_migration_target_is_never_an_account_the_request_already_benched() {
     pin(&manager, 11, 0, now_ms);
 
     // What a borrowed request under `x-tcr-accounts: at-a` looks like by
-    // the time it reaches the picker (`src/proxy.rs:2249-2256`), and
+    // the time it reaches the picker (`src/proxy/mod.rs`), and
     // equally what a local retry looks like after `at-b` failed it.
     let mut tried = HashSet::new();
     tried.insert(1);

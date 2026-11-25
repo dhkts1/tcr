@@ -3,7 +3,7 @@ import Foundation
 // "Exits from", on an Accounts-tab card.
 //
 // The on-screen name is the lead's ruling: the account's field is `egress` in
-// `src/config.rs`, and that word never appears on this screen, because the
+// `src/base/config.rs`, and that word never appears on this screen, because the
 // same tab strip already uses it for a different control (routing this Mac's
 // own outbound traffic through a peer). One word naming two switches on one
 // surface is the collision the mockup's own rule S11 had to fix once already.
@@ -11,7 +11,7 @@ import Foundation
 /// Where one account's requests leave from, and whether that is a promise or a
 /// preference.
 ///
-/// Parsed once, here, from the two keys `src/config.rs` already owns
+/// Parsed once, here, from the two keys `src/base/config.rs` already owns
 /// (`egress: "local" | "via <peer id>"` and `egressStrict`), so every consumer
 /// reads one typed value rather than re-matching the string. A route this
 /// build cannot parse keeps its raw words rather than being called local: this

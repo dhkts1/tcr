@@ -4,9 +4,9 @@ use super::select_test_support::{
     account, config_with, live_manager, live_manager_on_file, pin, pin_of,
 };
 use super::*;
-use crate::config::Account;
-use crate::provider::Provider;
-use crate::quota::QuotaWindow;
+use crate::base::config::Account;
+use crate::base::provider::Provider;
+use crate::records::quota::QuotaWindow;
 use std::collections::HashSet;
 use time::Duration;
 
@@ -33,7 +33,7 @@ fn a_loaded_strict_codex_peer_exit_is_skipped_by_every_selection_path() {
     let mut failures = Vec::new();
     for door in ["pool", "affinity", "locked", "revalidation", "bound"] {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(crate::paths::CONFIG_FILE);
+        let path = dir.path().join(crate::base::paths::CONFIG_FILE);
         let mut config = config_with(vec![
             Account {
                 egress: config::Egress::Via(peer),
@@ -400,7 +400,7 @@ fn provider_isolation_unsupported_exit_excludes_only_its_exact_slot() {
 #[test]
 fn provider_isolation_request_reads_do_not_wait_for_a_config_fsync() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(crate::paths::CONFIG_FILE);
+    let path = dir.path().join(crate::base::paths::CONFIG_FILE);
     let mut config = config_with(vec![account("alice@example.com"), codex("bob@example.com")]);
     config.proxy.port = 9;
     config::save(&path, &config).unwrap();
@@ -757,7 +757,7 @@ fn revalidation_diverts_a_pin_on_the_other_providers_account_and_keeps_it() {
 /// (`select_with_group` and `select_revalidation`).
 ///
 /// The model id is a fixture that merely CONTAINS "fable", because that is
-/// all `crate::model::is_fable_model` asks. No Codex account carries a
+/// all `crate::base::model::is_fable_model` asks. No Codex account carries a
 /// `7d_oi` window (tcr reads no model-scoped window from Codex), so one is
 /// set by hand here: it is the only way to observe the gate, and the test
 /// pins the rule rather than a failure seen live.

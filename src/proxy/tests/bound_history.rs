@@ -974,7 +974,7 @@ async fn released_turn_served_by(model: &str, carol_disabled: bool) -> String {
 }
 
 /// Sonnet 5.5 keeps a thinking block only inside the organization that minted it
-/// (`crate::model::thinking_is_org_bound`), so a released conversation goes to the
+/// (`crate::base::model::thinking_is_org_bound`), so a released conversation goes to the
 /// same-organization seat even though the ordinary pick would choose the other organization.
 #[tokio::test]
 async fn a_released_sonnet_5_5_conversation_goes_to_a_same_org_seat() {

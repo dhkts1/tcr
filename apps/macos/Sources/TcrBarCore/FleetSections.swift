@@ -54,7 +54,7 @@ public enum FleetBand: Int, CaseIterable, Equatable, Sendable, Comparable {
     /// **`isParkedByGroup` is in this test on purpose, and it is the one place
     /// this file goes past its brief** (which said the band was `disabled`).
     /// `tcr group park` does not set the account's own `disabled` flag — the
-    /// two are deliberately distinct on the wire (`src/stats.rs:108-115`) — but
+    /// two are deliberately distinct on the wire (`src/records/stats.rs:108-115`) — but
     /// it does block the account for EVERY request at account level
     /// (`Manager::parked_blocks`, `src/manager/mod.rs:8895-8899`). Classifying
     /// on `disabled` alone would file six accounts of a wholly-parked group

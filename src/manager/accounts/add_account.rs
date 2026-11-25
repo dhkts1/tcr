@@ -132,11 +132,11 @@ impl Manager {
     /// is: no caller outside this module needs to know that a rotation index is
     /// what the mutating primitives take.
     ///
-    /// Resolution uses [`crate::identity::resolve`]/[`crate::identity::same_identity`]
+    /// Resolution uses [`crate::base::identity::resolve`]/[`crate::base::identity::same_identity`]
     /// — the SAME rule the durable half ([`config::save_account`]) and `tcr
     /// login` (`login::upsert_account`) already run — never
-    /// [`crate::identity::match_one`]. `match_one` goes through
-    /// [`crate::identity::Queryable`], which exposes only the name: it
+    /// [`crate::base::identity::match_one`]. `match_one` goes through
+    /// [`crate::base::identity::Queryable`], which exposes only the name: it
     /// cannot compare `account_uuid`, so it was structurally unable to tell two
     /// different people sharing a display name apart. Unifying on `resolve`
     /// fixes that (a differing `account_uuid` never matches, so a same-named
@@ -208,7 +208,7 @@ impl Manager {
         // The submission's provider rides on the probe, so a Codex submission never
         // resolves to an Anthropic row that shares its name, live or on disk
         // (`identity::same_identity`): it is added beside it, never stamped onto it.
-        let target = crate::identity::probe(
+        let target = crate::base::identity::probe(
             account.provider,
             &account.name,
             account.account_uuid.clone(),
@@ -269,7 +269,7 @@ impl Manager {
                     .map(|(i, a)| {
                         (
                             i,
-                            crate::identity::probe(
+                            crate::base::identity::probe(
                                 a.provider,
                                 &a.name,
                                 a.account_uuid.clone(),
@@ -280,33 +280,35 @@ impl Manager {
                     })
                     .collect();
 
-                let matched =
-                    match crate::identity::resolve(probes.iter().map(|(i, p)| (*i, p)), &target) {
-                        crate::identity::Resolved::One(idx) => Some(idx),
-                        crate::identity::Resolved::Many => {
-                            // Recompute the loose set for its names: `Resolved::Many`
-                            // itself carries none, and this is exactly the set
-                            // `resolve` drew from (same predicate, same candidates).
-                            let names = accounts
-                                .iter()
-                                .filter(|a| {
-                                    crate::identity::same_identity(
-                                        &target,
-                                        &crate::identity::probe(
-                                            a.provider,
-                                            &a.name,
-                                            a.account_uuid.clone(),
-                                            a.org_uuid.clone(),
-                                            a.org_name.clone(),
-                                        ),
-                                    )
-                                })
-                                .map(|a| a.name.clone())
-                                .collect();
-                            return AddAccountOutcome::Ambiguous(names);
-                        }
-                        crate::identity::Resolved::None => None,
-                    };
+                let matched = match crate::base::identity::resolve(
+                    probes.iter().map(|(i, p)| (*i, p)),
+                    &target,
+                ) {
+                    crate::base::identity::Resolved::One(idx) => Some(idx),
+                    crate::base::identity::Resolved::Many => {
+                        // Recompute the loose set for its names: `Resolved::Many`
+                        // itself carries none, and this is exactly the set
+                        // `resolve` drew from (same predicate, same candidates).
+                        let names = accounts
+                            .iter()
+                            .filter(|a| {
+                                crate::base::identity::same_identity(
+                                    &target,
+                                    &crate::base::identity::probe(
+                                        a.provider,
+                                        &a.name,
+                                        a.account_uuid.clone(),
+                                        a.org_uuid.clone(),
+                                        a.org_name.clone(),
+                                    ),
+                                )
+                            })
+                            .map(|a| a.name.clone())
+                            .collect();
+                        return AddAccountOutcome::Ambiguous(names);
+                    }
+                    crate::base::identity::Resolved::None => None,
+                };
 
                 match matched.and_then(|idx| accounts.get_mut(idx).map(|row| (idx, row))) {
                     Some((idx, row)) => {
@@ -338,8 +340,8 @@ impl Manager {
                         // of tcr's own) is the submission's. Whatever the row's status was, so
                         // neither sits inside the two conditions above.
                         match account.provider {
-                            crate::provider::Provider::Anthropic => {}
-                            crate::provider::Provider::Codex => {
+                            crate::base::provider::Provider::Anthropic => {}
+                            crate::base::provider::Provider::Codex => {
                                 row.login_error = None;
                                 row.codex_home.clone_from(&account.codex_home);
                                 row.pending_codex_writeback = None;
@@ -636,8 +638,8 @@ impl Manager {
         for_disk.refresh_token.clone_from(&fresh.refresh_token);
         for_disk.expires_at = fresh.expires_at;
         match fresh.provider {
-            crate::provider::Provider::Anthropic => {}
-            crate::provider::Provider::Codex => {
+            crate::base::provider::Provider::Anthropic => {}
+            crate::base::provider::Provider::Codex => {
                 for_disk.extra.remove(config::CODEX_SYNC_PENDING_KEY);
             }
         }

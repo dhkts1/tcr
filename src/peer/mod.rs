@@ -11,7 +11,7 @@
 //!   on the allow-list (`tunnel::egress::PEER_EGRESS_HOSTS`). The
 //!   requester never sends a Codex request through a peer in this version (a
 //!   Codex account's exit pin is refused by `pinned_egress`'s Codex arm in
-//!   `src/peer/egress.rs`, and `src/proxy.rs` offers the blind carry to
+//!   `src/peer/tunnel/egress.rs`, and `src/proxy/mod.rs` offers the blind carry to
 //!   Anthropic requests only).
 //! - **quota**: someone else's account serves. This FORCES the lender to see
 //!   plaintext, because substituting a Bearer on ciphertext is not possible.
@@ -38,7 +38,7 @@
 //!    stream that nests end to end, so the borrowed request can leave the
 //!    borrower's own machine. No other type may gain a token field, and the
 //!    gate that holds that line names this one variant and nothing else
-//!    (`tests/peer_wire.rs`).
+//!    (`tests/peer/pairing/peer_wire.rs`).
 //! 2. **Pin before you answer.** `snow` has no pin store: an `IK` responder
 //!    learns the initiator's static key after reading message 1, and if the
 //!    comparison against the pinned set is missing, the handshake completes and
@@ -52,7 +52,7 @@
 //!    grant a reading forwarder could forge.
 //! 4. **This socket is not the local one.** The peer listener is a SECOND
 //!    `TcpListener` with its own gate ([`listener::peer_stream_gate`]).
-//!    `local_endpoint_gate` (`src/proxy.rs:1137`) is not relaxed by one
+//!    `local_endpoint_gate` (`src/proxy/mod.rs`) is not relaxed by one
 //!    character and neither arm of the existing listener is widened, because
 //!    behind that gate sits the one privileged local mutation that adds a live
 //!    credential.
@@ -80,7 +80,7 @@
 //! 1. wire crate and the node key: [`config::id`], `tcr_peer_wire`
 //! 2. Noise, enrolment, the pin check: [`noise`], [`listener`], [`pair`]
 //! 3. discovery: [`discovery`]
-//! 4. the lease and SERVE: [`lease`], [`serve`], `crate::fallback`
+//! 4. the lease and SERVE: [`lease`], [`serve`], `crate::peer::serve::fallback`
 //! 5. the Peers tab (Swift)
 //! 6. blind egress: [`tunnel`], [`tunnel::egress`]
 //! 7. chains, deferred until a third machine exists

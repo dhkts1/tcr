@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{LeaseRefusal, MAX_FRAME_BYTES, PROTO_VERSION};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::fallback::Ask;
 use crate::peer::noise;
+use crate::peer::serve::fallback::Ask;
 
 use super::policy::{
     SERVE_METHOD, lender_forwards_header, scrub_client_credentials, serve_is_allowed_for_path,
@@ -171,7 +171,7 @@ pub fn serve_request_from(
     // the literal `SERVE_METHOD` into the frame whatever the client had sent,
     // which is how a `GET` came to be POSTed on somebody else's account. The
     // seam refuses a non-POST before it builds an `Ask` at all
-    // (`src/proxy.rs`), so this is the second half of that defence and the half
+    // (`src/proxy/mod.rs`), so this is the second half of that defence and the half
     // that holds for a caller written later: the only constructor of a
     // `ServeRequest` cannot produce one whose method the lender will refuse.
     if !ask.method.eq_ignore_ascii_case(SERVE_METHOD) {

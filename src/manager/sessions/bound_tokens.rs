@@ -1,5 +1,5 @@
 //! `Manager` glue for the account-bound-token → minting account map — the live half of
-//! [`crate::bound_tokens`], mirroring `pins.rs`'s split for session affinity.
+//! [`crate::stores::bound_tokens`], mirroring `pins.rs`'s split for session affinity.
 //!
 //! The rule this map serves: **a request whose history carries an account-bound token is served
 //! by the account that minted that token while that account can hold it**, and — when the
@@ -46,11 +46,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::bound_tokens::{
+use crate::base::config::ConfigError;
+use crate::base::identity;
+use crate::stores::bound_tokens::{
     self, BOUND_TOKEN_CAP, BOUND_TOKEN_TTL_MS, BoundTokenKind, LoadReport, StoredAccount,
 };
-use crate::config::ConfigError;
-use crate::identity;
 
 use crate::manager::{Manager, WarmWindow};
 
@@ -398,7 +398,7 @@ impl Manager {
         if elsewhere.is_empty() {
             return 0;
         }
-        let org_bound = model.is_some_and(crate::model::thinking_is_org_bound);
+        let org_bound = model.is_some_and(crate::base::model::thinking_is_org_bound);
         let mut outside_org: HashMap<usize, bool> = HashMap::new();
         let mut moves: Vec<(usize, Minted)> = Vec::with_capacity(elsewhere.len());
         let mut drops: Vec<(usize, usize)> = Vec::new();
@@ -690,7 +690,7 @@ impl Manager {
     pub fn flush_bound_tokens_if_changed(
         &self,
         path: &Path,
-    ) -> Result<crate::save_gate::SaveOutcome, ConfigError> {
+    ) -> Result<crate::stores::save_gate::SaveOutcome, ConfigError> {
         self.bound_tokens_file.save_if_changed(
             || self.bound_tokens_to_save(),
             |prepared| prepared.write(path, crate::now_ms()),
@@ -729,12 +729,12 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
-    use crate::config::Account;
+    use crate::base::config::Account;
     use crate::manager::AccountRuntime;
 
     fn account(name: &str, uuid: &str) -> Account {
         let mut account = identity::probe(
-            crate::provider::Provider::Anthropic,
+            crate::base::provider::Provider::Anthropic,
             name,
             Some(uuid.to_string()),
             Some("org-1".into()),
@@ -780,7 +780,7 @@ mod tests {
     /// written.
     #[test]
     fn a_second_bound_token_save_with_no_change_writes_nothing() {
-        use crate::save_gate::SaveOutcome;
+        use crate::stores::save_gate::SaveOutcome;
         let path = tmp("unchanged");
         let manager = manager_over(&[account("a@example.com", "uuid-a")]);
         let now = crate::now_ms();
@@ -1036,8 +1036,8 @@ mod tests {
             org_uuid: None,
             ..account("alice@example.com", "unused")
         };
-        let anthropic = named(crate::provider::Provider::Anthropic);
-        let codex = named(crate::provider::Provider::Codex);
+        let anthropic = named(crate::base::provider::Provider::Anthropic);
+        let codex = named(crate::base::provider::Provider::Codex);
         let now = crate::now_ms();
 
         let first = manager_over(&[anthropic.clone(), codex.clone()]);
@@ -1188,7 +1188,7 @@ mod tests {
             // minutes, so a rejection can arrive while the stored window still reads
             // half full. At 1.0 the model-class gate would refuse the hold on its own
             // and this test would pass without the terminal check it exists to pin.
-            accounts[0].quota.five_hour = Some(crate::quota::QuotaWindow {
+            accounts[0].quota.five_hour = Some(crate::records::quota::QuotaWindow {
                 utilization: 0.5,
                 reset: Some(now + time::Duration::minutes(4)),
             });

@@ -118,7 +118,7 @@ fn assemble_resolves_control_name() {
 #[test]
 fn assemble_ignores_a_codex_control_account() {
     let codex = Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         ..account("bob@example.com", 0)
     };
     let manager = build_manager(
@@ -615,7 +615,7 @@ fn pooled_control_account_is_held_out_by_the_reserve() {
     let now = OffsetDateTime::now_utc();
     {
         let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
-        accounts[0].quota.five_hour = Some(crate::quota::QuotaWindow {
+        accounts[0].quota.five_hour = Some(crate::records::quota::QuotaWindow {
             utilization: 0.86,
             reset: Some(now + Duration::seconds(300)),
         });
@@ -855,7 +855,7 @@ fn set_control_by_query_resolves_sets_and_clears() {
 #[test]
 fn set_control_by_query_refuses_a_codex_account() {
     let codex = Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         ..account("bob@example.com/codex", 0)
     };
     let manager = manager_of(vec![account("alice@example.com", 0), codex]);

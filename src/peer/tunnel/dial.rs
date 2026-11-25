@@ -769,7 +769,7 @@ pub fn forwarders_for(target: &PeerId, store: &PeerStore) -> Vec<PeerId> {
 /// Whether this row has ANY way back: its own endpoints, or a Mac this node may
 /// ask to carry to it.
 ///
-/// The question [`crate::fallback::FallbackProvider::try_serve`] asks
+/// The question [`crate::peer::serve::fallback::FallbackProvider::try_serve`] asks
 /// before it spends anything on a lender, spelled here beside the dial that
 /// answers it for real: a filter that said "no endpoints, skip" would skip
 /// exactly the peer a forwarder exists for.
@@ -895,10 +895,10 @@ async fn punch_dial(
     // borrow's own and both spent on a punch that a Mac nobody can dial cannot
     // answer. Measured, not reasoned: with the question asked on an empty row,
     // `an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs`
-    // (`tests/peer_e2e.rs`) fails on both platforms of one run with the carrier
+    // (`tests/peer/peer_e2e.rs`) fails on both platforms of one run with the carrier
     // refusing a connection at an allowance of two, and
     // `a_row_with_no_endpoints_is_reached_through_a_carry_grantee`
-    // (`tests/peer_forward.rs`) only passes if its fixture accepts a carried
+    // (`tests/peer/reach/peer_forward.rs`) only passes if its fixture accepts a carried
     // stream the borrow never gets to use.
     //
     // ONE exchange, never a loop. A second ask against a peer that did not

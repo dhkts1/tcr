@@ -2,7 +2,7 @@
 
 use super::*;
 use std::os::unix::fs::PermissionsExt as _;
-use tcr::affinity;
+use tcr::stores::affinity;
 
 /// A unique, test-only log directory keyed by pid + nanosecond timestamp.
 /// Never the real cache directory's `logs/` — tests must not touch the
@@ -34,7 +34,8 @@ fn log_directory_is_created_owner_only() {
     // Goes through the production opener: re-implementing the mode here
     // would assert 0o700 == 0o700 and pass however `open_log_appender`
     // drifts.
-    let _appender = open_log_appender(&dir, tcr::paths::LOG_PREFIX).expect("open temp log dir");
+    let _appender =
+        open_log_appender(&dir, tcr::base::paths::LOG_PREFIX).expect("open temp log dir");
     let dir_mode = std::fs::metadata(&dir)
         .expect("stat temp log dir")
         .permissions()
@@ -70,7 +71,7 @@ fn log_directory_is_re_asserted_owner_only_when_it_already_exists() {
     );
 
     let _appender =
-        open_log_appender(&dir, tcr::paths::LOG_PREFIX).expect("open pre-existing log dir");
+        open_log_appender(&dir, tcr::base::paths::LOG_PREFIX).expect("open pre-existing log dir");
     let dir_mode = std::fs::metadata(&dir)
         .expect("stat temp log dir")
         .permissions()
@@ -118,9 +119,9 @@ fn read_the_one_log_file(dir: &Path, prefix: &str) -> String {
 #[test]
 fn headless_logging_reaches_both_the_file_and_stdout() {
     let dir = unique_log_dir("headless-test");
-    let prefix = tcr::paths::LOG_PREFIX;
+    let prefix = tcr::base::paths::LOG_PREFIX;
     let appender = open_log_appender(&dir, prefix).expect("open temp log dir");
-    let (queue, file_log) = tcr::file_log::start(appender);
+    let (queue, file_log) = tcr::stores::file_log::start(appender);
     let stdout = SharedBuf::default();
     let marker = format!("headless-sink-probe-{}", std::process::id());
 
@@ -246,7 +247,7 @@ fn headless_logging_survives_an_unopenable_log_file() {
 /// Reads this process's real `HOME` to resolve the path, and writes nothing.
 #[test]
 fn the_log_directory_is_the_shared_cache_location() {
-    let cache = tcr::paths::cache_dir();
+    let cache = tcr::base::paths::cache_dir();
     let (dir, prefix) = log_location();
     assert_eq!(dir, cache.root().join("logs"));
     assert_eq!(
@@ -254,7 +255,7 @@ fn the_log_directory_is_the_shared_cache_location() {
         affinity::default_path().parent(),
         "logs and the pin file share one cache directory"
     );
-    assert_eq!(prefix, tcr::paths::LOG_PREFIX);
+    assert_eq!(prefix, tcr::base::paths::LOG_PREFIX);
 }
 
 /// `max_log_files` pruning is real, not merely configured, AND it is the
@@ -285,7 +286,7 @@ fn the_log_directory_is_the_shared_cache_location() {
 /// skipped.
 #[test]
 fn old_log_files_are_pruned_at_max_log_files() {
-    assert_old_log_files_are_pruned(tcr::paths::LOG_PREFIX, "pruning");
+    assert_old_log_files_are_pruned(tcr::base::paths::LOG_PREFIX, "pruning");
 }
 
 fn assert_old_log_files_are_pruned(prefix: &str, tag: &str) {

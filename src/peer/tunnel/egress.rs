@@ -40,14 +40,14 @@
 //! # No ambient proxy variable, ever
 //!
 //! Every outbound client in this tree calls `.no_proxy()`, for the reason
-//! `src/proxy.rs:3529-3530` gives: we ARE the proxy, and an ambient
+//! `src/proxy/mod.rs` gives: we ARE the proxy, and an ambient
 //! `HTTP_PROXY` would loop us through ourselves. The peer egress path is an
 //! explicit, per-origin, allow-listed loopback splice and honours no
 //! environment variable.
 //!
 //! # Where it attaches: ONE hunk that covers both entry points
 //!
-//! `is_offline_error` (`src/proxy.rs:366`) walks the error chain for DNS
+//! `is_offline_error` (`src/proxy/mod.rs`) walks the error chain for DNS
 //! markers and returns true for NOTHING ELSE, and an existing test pins that
 //! false case deliberately, because a refused connection to a reachable host IS
 //! real evidence about a route and must keep taking the rotate arm. So a
@@ -62,7 +62,7 @@
 //! top of `handle`'s transport-failure arm, under
 //! `err.is_connect() || is_offline_error(&err)`. `is_connect()` is exactly the
 //! condition that leaves `unknown_outcome_transport_failure` false (it is set
-//! at `src/proxy.rs:2684` under `!err.is_connect()`), and the resolver arm is
+//! at `src/proxy/mod.rs` under `!err.is_connect()`), and the resolver arm is
 //! reached before its own sleep because the hunk sits above it. One call site
 //! that cannot drift from the other rather than two that can, and the
 //! once-per-request bound is the `peer_egress_tried` flag beside
@@ -108,7 +108,7 @@ use crate::peer::tunnel::PEER_EGRESS_PORT;
 /// The ONLY origins a gateway will carry. Deny by default: a host absent from
 /// this list is refused, not tunnelled.
 ///
-/// Independent of [`crate::tls::ALLOWED_HOSTS`]: a local interception capability
+/// Independent of [`crate::base::tls::ALLOWED_HOSTS`]: a local interception capability
 /// must not grant a peer gateway permission to dial another origin.
 pub const PEER_EGRESS_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com"];
 
@@ -429,7 +429,7 @@ pub struct CarriedRequest<'a> {
 ///   `anthropic-organization-id` are gone, exactly as `build_response` strips
 ///   them on the direct path;
 /// - [`Self::upstream_headers`] is the origin's answer UNTOUCHED, and it exists
-///   for `Manager::update_quota`. `src/proxy.rs`'s `build_response` doc says it
+///   for `Manager::update_quota`. `src/proxy/mod.rs`'s `build_response` doc says it
 ///   in one line, "stripping at ingest would blind the rotation logic while
 ///   looking like it fixed something", so the unstripped map is carried out of
 ///   here rather than re-read off the filtered response, where the very headers
@@ -927,7 +927,7 @@ impl PinnedEgressError {
 /// The answer for a carry that was TAKEN and then failed: the request may have
 /// run at the origin, and nothing on this Mac can tell.
 ///
-/// **502 with `x-should-retry: false`**, which is `src/proxy.rs`'s own shape
+/// **502 with `x-should-retry: false`**, which is `src/proxy/mod.rs`'s own shape
 /// for an attempt that got past connect before failing, for the same reason: a
 /// client that retries could pay for the request twice. The gap's own sentence
 /// is carried inside so an operator still reads which Mac and which account.
@@ -1012,15 +1012,15 @@ pub struct PinnedAttempt<'a> {
     /// The client's session key, for the served counter.
     pub session_key: Option<u64>,
     /// What kind of session it was.
-    pub session_kind: crate::stats::SessionKind,
+    pub session_kind: crate::records::stats::SessionKind,
     /// The wire-session id, when the request carried one.
     pub wire_session_id: Option<&'a str>,
     /// The model the request asked for.
     pub model: Option<String>,
     /// The tool-use events parsed out of the request body.
-    pub tool_uses: &'a [crate::session_wire::ToolUseEvent],
+    pub tool_uses: &'a [crate::records::session_wire::ToolUseEvent],
     /// The tool results parsed out of the request body.
-    pub tool_results: &'a [crate::session_wire::ToolResultEvent],
+    pub tool_results: &'a [crate::records::session_wire::ToolResultEvent],
 }
 
 /// Take the carry for an account that is locked to one exit, BEFORE the direct
@@ -1265,7 +1265,7 @@ async fn pinned_carry(
 /// Everything the ledger needs about a request that went out through a peer.
 ///
 /// The same values the direct path's terminal outcome records
-/// (`src/proxy.rs:3169` and the two calls under it), gathered into one struct
+/// (`src/proxy/mod.rs` and the two calls under it), gathered into one struct
 /// so the seam's hunk is one call rather than three, and so the recording can
 /// be driven by a test without a request having to cross the real internet,
 /// which the origin allow-list means a carry otherwise does.
@@ -1278,7 +1278,7 @@ pub struct CarriedRecord<'a> {
     /// The client's session key, for the served counter.
     pub session_key: Option<u64>,
     /// What kind of session it was.
-    pub session_kind: crate::stats::SessionKind,
+    pub session_kind: crate::records::stats::SessionKind,
     /// The wire-session id, when the request carried one.
     pub wire_session_id: Option<&'a str>,
     /// The model the request asked for.
@@ -1292,21 +1292,21 @@ pub struct CarriedRecord<'a> {
     pub status: u16,
     /// The carried response's headers as the ORIGIN sent them, unfiltered.
     ///
-    /// The same map `src/proxy.rs:2949` hands `Manager::update_quota` on the
+    /// The same map `src/proxy/mod.rs` hands `Manager::update_quota` on the
     /// direct path, and it has to be the unfiltered one: the account-scoped
     /// headers this fleet's rotation model is built from are exactly the ones
     /// [`axum_response_from`] strips before the client sees them.
     pub upstream_headers: &'a HeaderMap,
     /// The tool-use and tool-result events parsed out of the request body.
-    pub tool_uses: &'a [crate::session_wire::ToolUseEvent],
+    pub tool_uses: &'a [crate::records::session_wire::ToolUseEvent],
     /// The tool results parsed out of the request body.
-    pub tool_results: &'a [crate::session_wire::ToolResultEvent],
+    pub tool_results: &'a [crate::records::session_wire::ToolResultEvent],
 }
 
 /// Record a carried request exactly the way a directly-served one is recorded.
 ///
 /// Four calls, same order as the direct path: the quota fold first (the direct
-/// path does it at `src/proxy.rs:2949`, on the response headers, before
+/// path does it at `src/proxy/mod.rs`, on the response headers, before
 /// anything else looks at the response), then the served counter, the
 /// wire-session table and the ring buffer `tcr status` and the TUI read. A
 /// carry that did not count would make all four under-report this fleet's own
@@ -1361,7 +1361,7 @@ pub struct CarriedRecord<'a> {
 /// that the direct path records never happened on a carry.
 ///
 /// A carried **401** neither forced a refresh nor condemned a token-only
-/// account. The direct path (`src/proxy.rs`) does both: an account with no
+/// account. The direct path (`src/proxy/mod.rs`) does both: an account with no
 /// refresh token has a dead credential only a re-login cures, and every other
 /// one gets one forced refresh and is retried on the fresh token. A pinned
 /// account whose token had expired therefore 401'd every request, forever,
@@ -1424,8 +1424,8 @@ async fn record_the_hold_the_ladder_would(
         }
         return;
     }
-    let rejections = crate::quota::quota_rejections(headers);
-    let retry_after_raw = crate::http_client::parse_retry_after(headers);
+    let rejections = crate::records::quota::quota_rejections(headers);
+    let retry_after_raw = crate::base::http_client::parse_retry_after(headers);
     let retry_after = retry_after_raw.unwrap_or(60);
     if rejections.is_empty() {
         // No unified rejection: a transient limit, and the hold is the one the
@@ -1458,13 +1458,15 @@ async fn record_the_hold_the_ladder_would(
         );
         return;
     }
-    if rejections.contains(&crate::quota::UnifiedRejectionKind::FableWeekly) {
+    if rejections.contains(&crate::records::quota::UnifiedRejectionKind::FableWeekly) {
         manager.mark_model_weekly_rejected(idx, headers);
     }
-    if rejections
-        .iter()
-        .any(|kind| !matches!(kind, crate::quota::UnifiedRejectionKind::FableWeekly))
-    {
+    if rejections.iter().any(|kind| {
+        !matches!(
+            kind,
+            crate::records::quota::UnifiedRejectionKind::FableWeekly
+        )
+    }) {
         manager.mark_rate_limited(
             idx,
             crate::proxy::jittered_quota_hold(
@@ -1543,7 +1545,7 @@ async fn send_through(
     host: &str,
     splice_port: u16,
 ) -> Result<reqwest::Response> {
-    let client = crate::http_client::builder()
+    let client = crate::base::http_client::builder()
         .no_proxy()
         .resolve(host, SocketAddr::from(([127, 0, 0, 1], splice_port)))
         .build()
@@ -1572,7 +1574,7 @@ async fn send_through(
 ///
 /// A carried response is served to the same local client, off the same pooled
 /// account, as a directly-served one, so what that client may see is decided by
-/// `src/proxy.rs`'s `build_response` and its two predicates, not by a list
+/// `src/proxy/mod.rs`'s `build_response` and its two predicates, not by a list
 /// kept here. This function used to hold a private eight-name hop-by-hop list,
 /// which was two names short of [`crate::proxy::is_response_skip`]
 /// (`content-length`, `content-encoding`) and had no equivalent of
@@ -1604,7 +1606,7 @@ pub fn axum_response_from(response: reqwest::Response) -> axum::response::Respon
             if crate::proxy::is_account_scoped(name.as_str()) {
                 continue;
             }
-            // `append`, the way `src/proxy.rs` builds the direct path's
+            // `append`, the way `src/proxy/mod.rs` builds the direct path's
             // response. `insert` REPLACES, so a header a response legitimately
             // repeats (`set-cookie` is the everyday one, and `warning` and
             // `link` are the others) arrived at the client as its LAST value
@@ -1628,8 +1630,8 @@ pub fn axum_response_from(response: reqwest::Response) -> axum::response::Respon
 /// Where this process's peers file is, for the one caller that has a request
 /// in its hands and no configuration.
 ///
-/// `src/proxy.rs` knows about accounts, not about peers: the lease seam gets
-/// its path at boot, inside the provider `src/server.rs` installs
+/// `src/proxy/mod.rs` knows about accounts, not about peers: the lease seam gets
+/// its path at boot, inside the provider `src/proxy/server/mod.rs` installs
 /// (`fallback::install_peer_lease_provider`), and a provider cannot be asked
 /// what path it was built from. Rather than widen that trait for a path, this
 /// cell holds the same fact the same way, installed once at boot, read per
@@ -1637,7 +1639,7 @@ pub fn axum_response_from(response: reqwest::Response) -> axum::response::Respon
 ///
 /// Unset it falls back to [`crate::peer::config::default_path`], which is
 /// correct in production and is why `tcr` carries requests today without the
-/// boot path having been changed; `src/server.rs` installs an explicit
+/// boot path having been changed; `src/proxy/server/mod.rs` installs an explicit
 /// `--peers` here at boot.
 static PEERS_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 

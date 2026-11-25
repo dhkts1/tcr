@@ -23,7 +23,7 @@
 //! 1. **Strips its own credentials**, `authorization`, `x-api-key`,
 //!    `proxy-authorization`, `cookie`, plus every hop-by-hop request header,
 //!    from every frame before the frame is written. The hop-by-hop half is
-//!    `src/proxy.rs`'s own predicate, never a second list here.
+//!    `src/proxy/mod.rs`'s own predicate, never a second list here.
 //! 2. **Refuses to open a SERVE at all** for the client-credential paths, and
 //!    falls through to its own local path instead.
 //!
@@ -36,13 +36,13 @@
 //! The scrub cannot be inherited from the existing path, and this is measured
 //! rather than assumed: `build_upstream_headers` is the only code in this tree
 //! that removes a client's own `authorization` and substitutes a pooled token,
-//! its definition is `src/proxy.rs:3455`, its SINGLE call site is `:2526`, and
-//! the seam a SERVE is built at is `:2311`, 215 lines upstream. Nothing
+//! its definition is in `src/proxy/mod.rs`, and the seam a SERVE is built at
+//! sits upstream of its callers. Nothing
 //! between them would stop a client credential going out to another host.
 //!
 //! # The seventh path is the one a coder who reads the array will miss
 //!
-//! Six prefixes live in `CLIENT_CREDENTIAL_PREFIXES` (`src/proxy.rs:820-827`)
+//! Six prefixes live in `CLIENT_CREDENTIAL_PREFIXES` (`src/proxy/mod.rs`)
 //! and the seventh is a SEPARATE constant, `CLIENT_TOKEN_REFRESH_PATH`
 //! (`:839`), `/v1/oauth/token`, whose own doc records the live defect that
 //! omitting it caused: an exact compare let the trailing-slash spelling fall
@@ -52,7 +52,7 @@
 //! `path_is_under` (the whole path or that path plus `/`, never a longer
 //! identifier) rather than `starts_with`.
 //!
-//! Both constants went `pub(crate)` in `src/proxy.rs`, a visibility change in
+//! Both constants went `pub(crate)` in `src/proxy/mod.rs`, a visibility change in
 //! `proxy.rs` and nowhere else, taken rather than the fallback (a peer-side
 //! constant plus an element-for-element contract test), because one list with
 //! two readers cannot drift and two lists with a test can. [`path_is_under`]
@@ -65,7 +65,7 @@
 //! The lender re-sends the relayed request through its own proxy, and it
 //! once replayed **every** header the borrower supplied onto that
 //! request. That is a hole with a measured shape rather than a theoretical one:
-//! `build_upstream_headers` (`src/proxy.rs:3502`) removes `authorization`,
+//! `build_upstream_headers` (`src/proxy/mod.rs`) removes `authorization`,
 //! `x-api-key`, `accept-encoding` and the hop-by-hop names, and `cookie` is
 //! none of those, so a borrower-supplied session cookie went out to Anthropic
 //! on the lender's own TLS session, as would any header a borrower invented.
@@ -78,7 +78,7 @@
 //!
 //! This is the house pattern rather than a new idea, and the precedent is the
 //! closest relative there is: `build_raw_relay_headers`
-//! (`src/proxy.rs:3554`) carries `content-type`, `accept`, `user-agent` "and
+//! (`src/proxy/mod.rs`) carries `content-type`, `accept`, `user-agent` "and
 //! nothing else" for the one other request in this tree built out of a client's
 //! headers for a host whose credential is not the client's. This list is that
 //! one plus `anthropic-version` and `anthropic-beta`, which a `/v1/messages`
@@ -89,17 +89,18 @@
 //! A borrowed request counts against the LENDER's GCRA bucket for free, because
 //! [`handle_serve_on`](crate::peer::serve::handle_serve_on) sends it through the lender's own proxy and therefore
 //! through the lender's own picker and its own
-//! `Manager::throttle_send` call (`src/proxy.rs:2593`), which keys the
+//! `Manager::throttle_send` call (`src/proxy/mod.rs`), which keys the
 //! per-organization bucket through `Manager::throttle_bucket_key`
-//! (`src/manager/throttle.rs:98`) and `bucket_key_for`
-//! (`src/manager/throttle.rs:38`) off the SERVING account's `org_uuid`, the
+//! (`src/manager/serving/throttle.rs`) and `bucket_key_for`
+//! (`src/manager/serving/throttle.rs`) off the SERVING account's `org_uuid`, the
 //! lender's. There is no second bucket, no peer-keyed bucket and nothing to add:
 //! one sender per org is preserved by construction, and the way to break it
 //! would be to serve a relayed request anywhere other than through the lender's
-//! own path. `tests/peer_lease.rs` measures it against a tightened per-org
+//! own path. `tests/peer/lending/peer_lease.rs` measures it against a tightened per-org
 //! bucket rather than asserting it in prose.
 
 mod borrow;
+pub mod fallback;
 mod frame;
 mod hello;
 mod lender;
@@ -377,7 +378,7 @@ mod tests {
     /// path is described as a client-credential path.
     #[test]
     fn refused_path_kind_names_the_codex_refusal_for_a_codex_path() {
-        let codex = crate::provider::CODEX_RESPONSES_PATH;
+        let codex = crate::base::provider::CODEX_RESPONSES_PATH;
         assert!(!serve_is_allowed_for_path(codex), "precondition: refused");
         let kind = refused_path_kind(codex);
         assert!(

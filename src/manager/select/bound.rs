@@ -93,8 +93,8 @@ impl Manager {
             .get(idx)?
             .provider;
         let unsupported_exit = match provider {
-            crate::provider::Provider::Anthropic => false,
-            crate::provider::Provider::Codex => {
+            crate::base::provider::Provider::Anthropic => false,
+            crate::base::provider::Provider::Codex => {
                 self.codex_accounts_with_unsupported_exit().contains(&idx)
             }
         };

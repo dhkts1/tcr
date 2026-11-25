@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
 use serde_json::{Value, json};
-use tcr::bound_tokens::{self, BOUND_TOKEN_CAP, BoundTokenKind, Snapshot, StoredAccount};
-use tcr::paths::{self, Roots};
+use tcr::base::paths::{self, Roots};
+use tcr::stores::bound_tokens::{self, BOUND_TOKEN_CAP, BoundTokenKind, Snapshot, StoredAccount};
 
 /// How many fake accounts the scratch config holds: the size of the fleet the throttle
 /// defaults were tuned on.
@@ -158,7 +158,7 @@ fn scratch_env(
         .env("TMPDIR", home.join("tmp"))
         .env("CODEX_HOME", home.join(".codex"))
         // An override path that does not exist is how a run says "this machine has no
-        // Claude Code or Codex login" (see `tests/headless_sigterm.rs`).
+        // Claude Code or Codex login" (see `tests/proxy/headless_sigterm.rs`).
         .env(
             "TCR_CLAUDE_CODE_CREDENTIALS",
             home.join("no-claude-code-login.json"),
@@ -505,8 +505,7 @@ mod tests {
 
     #[test]
     fn restored_count_is_read_from_the_boot_line() {
-        let log =
-            "INFO tcr::server: bound-token pins restored path=/s/x.json restored=65536 expired=0\n";
+        let log = "INFO tcr::proxy::server: bound-token pins restored path=/s/x.json restored=65536 expired=0\n";
         assert_eq!(restored_bound_tokens(log), Some(65_536));
     }
 
@@ -593,7 +592,7 @@ tcr 1 u 14u IPv4 0x6 0t0 TCP 127.0.0.1:7755 (LISTEN)
         let config_path = dir.path().join("tcr.json");
         fs::write(&config_path, config_json(1, false, now).to_string()).expect("write config");
         // The proxy's own loader, so a quarantined account would show up here as a short list.
-        let config = tcr::config::load(&config_path).expect("the scratch config loads");
+        let config = tcr::base::config::load(&config_path).expect("the scratch config loads");
         assert_eq!(config.accounts.len(), ACCOUNTS);
         let report = bound_tokens::load(
             &path,

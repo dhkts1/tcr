@@ -76,9 +76,9 @@ impl Manager {
             i64::from(config.reset_urgency_tier_hours).saturating_mul(3_600_000);
 
         let control_idx = config.control_account_name().and_then(|name| {
-            match crate::identity::match_one(&accounts[..], name) {
-                crate::identity::Match::One(idx) => Some(idx),
-                crate::identity::Match::None => {
+            match crate::base::identity::match_one(&accounts[..], name) {
+                crate::base::identity::Match::One(idx) => Some(idx),
+                crate::base::identity::Match::None => {
                     let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
                     tracing::error!(
                         control_account = %name, available = ?names,
@@ -91,7 +91,7 @@ impl Manager {
                 // Picking the first one silently, as the old `position(...)`
                 // scan did, risks binding control to a disabled Team-seat row
                 // while the account that resolved it live stays unpinned.
-                crate::identity::Match::Ambiguous(candidates) => {
+                crate::base::identity::Match::Ambiguous(candidates) => {
                     tracing::error!(
                         control_account = %name, candidates = ?candidates,
                         "controlAccount matches more than one account — refusing to guess, running with NO control account"
@@ -107,8 +107,8 @@ impl Manager {
         // so a third provider decides this here instead of inheriting an answer.
         let control_idx = control_idx.filter(|&idx| {
             accounts.get(idx).is_none_or(|account| match account.provider {
-                crate::provider::Provider::Anthropic => true,
-                crate::provider::Provider::Codex => {
+                crate::base::provider::Provider::Anthropic => true,
+                crate::base::provider::Provider::Codex => {
                     tracing::warn!(
                         account = %account.name,
                         "controlAccount names a Codex account; {CODEX_HAS_NO_CONTROL_ACCOUNT}, ignoring it"
@@ -118,20 +118,21 @@ impl Manager {
             })
         });
 
-        let usage = crate::usage::UsageTracker::new(accounts.len(), config.pricing_table());
+        let usage =
+            crate::records::usage::UsageTracker::new(accounts.len(), config.pricing_table());
 
         let manager = Arc::new(Self {
             me: std::sync::OnceLock::new(),
             forecast: Mutex::new(
                 (0..accounts.len())
-                    .map(|_| crate::forecast::Calibration::default())
+                    .map(|_| crate::records::forecast::Calibration::default())
                     .collect(),
             ),
             accounts: Arc::new(RwLock::new(accounts)),
             usage,
             refresher,
             prober,
-            plan_prober: RwLock::new(Arc::new(crate::probe::LivePlanProber)),
+            plan_prober: RwLock::new(Arc::new(crate::records::probe::LivePlanProber)),
             warmer,
             warm_in_flight: AtomicBool::new(false),
             auto_resets: Mutex::new(resets::auto::Ledger::default()),
@@ -141,7 +142,7 @@ impl Manager {
             config_path,
             mutation_released: AtomicBool::new(false),
             usage_gates: Mutex::new(HashMap::new()),
-            wake: crate::wake::WakeDetector::new(),
+            wake: crate::clients::wake::WakeDetector::new(),
             upstream,
             codex_upstream,
             proxy_api_key,
@@ -164,18 +165,18 @@ impl Manager {
             fleet_tat_ms: AsyncMutex::new(HashMap::new()),
             log: Mutex::new(VecDeque::with_capacity(REQUEST_LOG_CAPACITY)),
             current: Mutex::new(None),
-            current_by_provider: Mutex::new(crate::stats::CurrentByProvider::default()),
+            current_by_provider: Mutex::new(crate::records::stats::CurrentByProvider::default()),
             select_seq: AtomicU64::new(1),
             affinity: Mutex::new(CappedMap::new(select::AFFINITY_CAP, |&(_, touch)| touch)),
             affinity_extended: Mutex::new(CappedSet::new(select::AFFINITY_CAP)),
-            affinity_file: crate::cache_file::SavedFile::new(AFFINITY_TOUCH_REFRESH),
+            affinity_file: crate::stores::cache_file::SavedFile::new(AFFINITY_TOUCH_REFRESH),
             bound_tokens: sessions::bound_tokens::ShardedBoundTokens::default(),
-            bound_tokens_file: crate::cache_file::SavedFile::new(std::time::Duration::ZERO),
+            bound_tokens_file: crate::stores::cache_file::SavedFile::new(std::time::Duration::ZERO),
             bound_history_logged: Mutex::new(HashSet::new()),
             bound_switch_warned: Mutex::new(HashMap::new()),
             sessions: Mutex::new(CappedMap::new(snapshot::SESSION_CAP, |s| s.last_seen_ms)),
-            wire_sessions: Mutex::new(crate::session_wire::WireSessionTracker::new()),
-            wire_sessions_file: crate::cache_file::SavedFile::new(WIRE_SESSIONS_REFRESH),
+            wire_sessions: Mutex::new(crate::records::session_wire::WireSessionTracker::new()),
+            wire_sessions_file: crate::stores::cache_file::SavedFile::new(WIRE_SESSIONS_REFRESH),
             session_seq: AtomicU64::new(1),
             next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
             next_codex_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
@@ -186,9 +187,9 @@ impl Manager {
             control_reserve,
             control_pooled,
             control_identity,
-            client_identities: crate::control_identity::ClientIdentityCache::new(),
+            client_identities: crate::clients::control_identity::ClientIdentityCache::new(),
             reset_urgency_tier_ms,
-            routing: Mutex::new(crate::observations::Observations::default()),
+            routing: Mutex::new(crate::records::observations::Observations::default()),
         });
         // Hand the manager its own `Arc` (weakly) now that one exists — see the
         // `me` field. Infallible: this is the only write, on a just-built value.
@@ -220,7 +221,7 @@ impl Manager {
     }
 
     /// Build a manager from pre-seeded runtime rows, for the `tcr demo` dashboard
-    /// (`src/demo.rs`). The live refresher/prober/warmer are held but NEVER invoked
+    /// (`src/verbs/demo.rs`). The live refresher/prober/warmer are held but NEVER invoked
     /// — the demo only ever calls [`Self::snapshot`] and [`Self::set_disabled`], so
     /// no token, probe, or network I/O ever happens. `config_path = None` makes
     /// every persist a no-op, so nothing can be written to disk.

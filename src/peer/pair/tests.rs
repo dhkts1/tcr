@@ -282,7 +282,7 @@ fn a_link_carries_a_key_with_an_ipv6_address_either_way() {
 ///
 /// v4 rather than v3, since v3 is a version this build reads now: the
 /// fixture moved the moment `JoinToken::parse` grew a v3 arm, the change
-/// `tests/peer_noise.rs`'s sibling test moved for too.
+/// `tests/peer/pairing/peer_noise.rs`'s sibling test moved for too.
 #[test]
 fn an_unknown_version_is_refused() {
     let key = format!(

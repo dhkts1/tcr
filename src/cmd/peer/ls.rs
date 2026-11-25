@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use tcr::config;
+use tcr::base::config;
 use tcr::peer;
 use tcr::peer::status::ls::{
     PeerCapsJson, PeerExitJson, PeerFoundRow, PeerLsJson, PeerLsPeer, PeerLsRow,
@@ -147,7 +147,7 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
         // the accounts a `--scope` could name and nothing else. The
         // provider rides along so `lent_to` can leave a Codex account
         // out: no lease draws on one.
-        let accounts: Vec<(String, Vec<String>, tcr::provider::Provider)> = config_accounts
+        let accounts: Vec<(String, Vec<String>, tcr::base::provider::Provider)> = config_accounts
             .iter()
             .map(|account| {
                 (
@@ -313,7 +313,7 @@ fn peer_ls_handed_key_until(
 /// before it refused can still be on the row, though, and it does one of two
 /// things. A pin that is not strict is inert: the exit path warns and sends the
 /// request from here. A strict one is not inert at all: the exit path refuses
-/// every request routed to the account (`src/peer/egress.rs`, its Codex arm),
+/// every request routed to the account (`src/peer/tunnel/egress.rs`, its Codex arm),
 /// so its line says so and names the command that clears it.
 ///
 /// A Claude account's pin is a real one and is not listed here, and nothing is
@@ -322,14 +322,14 @@ fn peer_ls_handed_key_until(
 fn peer_ls_inert_exit_lines(accounts: &[config::Account]) -> Vec<String> {
     accounts
         .iter()
-        .filter(|account| account.provider == tcr::provider::Provider::Codex)
+        .filter(|account| account.provider == tcr::base::provider::Provider::Codex)
         .filter_map(|account| {
             let pin = account.egress_pin();
             let peer = pin.egress.peer()?;
             let why = if pin.strict {
-                tcr::provider_guard::refused_exit_suffix(&account.name)
+                tcr::verbs::provider_guard::refused_exit_suffix(&account.name)
             } else {
-                tcr::provider_guard::INERT_EXIT_SUFFIX.to_string()
+                tcr::verbs::provider_guard::INERT_EXIT_SUFFIX.to_string()
             };
             Some(format!("{}  exits={}{why}", account.name, peer.display()))
         })
@@ -464,7 +464,7 @@ mod tests {
     /// local, get no line.
     #[test]
     fn peer_ls_marks_a_codex_exit_pin_inert() {
-        use tcr::provider::Provider;
+        use tcr::base::provider::Provider;
         let peer = tcr_peer_wire::PeerId([7_u8; 32]);
         let pinned = |name: &str, provider: Provider, strict: bool| config::Account {
             provider,

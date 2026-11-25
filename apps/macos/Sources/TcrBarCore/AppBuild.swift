@@ -12,7 +12,7 @@ import Foundation
 /// the bundle holds an executing image), so an update that appears to have been
 /// installed can leave the old app on screen until it is quit. Every version
 /// key needed to say so was already written into the bundle by
-/// `scripts/build-tcrbar.sh`; nothing read them.
+/// `apps/macos/scripts/build-tcrbar.sh`; nothing read them.
 ///
 /// Every field is `nil` when absent rather than defaulted to a plausible
 /// string, and ``label`` returns `nil` rather than inventing a version. The

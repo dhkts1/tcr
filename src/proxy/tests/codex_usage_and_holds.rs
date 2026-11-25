@@ -39,12 +39,12 @@ async fn a_streamed_codex_turn_with_no_request_model_is_filed_under_the_streams(
     let anthropic = [("content-type", "application/json")];
     for (path, headers, body) in [
         (
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             &codex[..],
             r#"{"input":[]}"#,
         ),
         (
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             &codex[..],
             r#"{"model":"gpt-6-requested","input":[]}"#,
         ),
@@ -127,7 +127,7 @@ async fn codex_usage_records_its_reasoning_tokens() {
     let anthropic = [("content-type", "application/json")];
     for (path, headers, body) in [
         (
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             &codex[..],
             r#"{"input":[]}"#,
         ),
@@ -201,7 +201,7 @@ async fn a_codex_stream_under_another_content_type_is_still_counted() {
         let (status, bytes) = drive(
             Arc::clone(&manager),
             Method::POST,
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             Some(loopback_peer()),
             &[
                 ("authorization", "Bearer client-own"),
@@ -253,7 +253,7 @@ async fn a_non_streamed_codex_turn_books_its_cache_reads_and_writes() {
     let (status, body) = drive(
         Arc::clone(&manager),
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -303,7 +303,7 @@ async fn a_non_streamed_codex_turn_is_filed_under_its_responses_model_and_binds_
     let (status, answer) = drive_bytes(
         Arc::clone(&manager),
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         &[
             ("authorization", "Bearer client-own"),
             ("content-type", "application/json"),
@@ -332,8 +332,12 @@ async fn a_non_streamed_codex_turn_is_filed_under_its_responses_model_and_binds_
     let bound = manager.bound_token_snapshot();
     let output = tempfile::tempdir().unwrap();
     assert_eq!(
-        crate::bound_tokens::save(&output.path().join("bound.json"), bound, crate::now_ms())
-            .unwrap(),
+        crate::stores::bound_tokens::save(
+            &output.path().join("bound.json"),
+            bound,
+            crate::now_ms()
+        )
+        .unwrap(),
         0,
         "a Codex body's resp_ id is not a bound token"
     );
@@ -443,7 +447,7 @@ async fn a_codex_429_holds_its_account_to_the_full_windows_reset_and_rotates() {
         let (status, answer) = drive(
             Arc::clone(&manager),
             Method::POST,
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             Some(loopback_peer()),
             &[
                 ("authorization", "Bearer client-own"),
@@ -533,7 +537,7 @@ async fn a_codex_403_holds_its_account_briefly_and_reads_refused() {
         let (status, answer) = drive(
             Arc::clone(&manager),
             Method::POST,
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             Some(loopback_peer()),
             &[
                 ("authorization", "Bearer client-own"),
@@ -627,7 +631,7 @@ async fn a_codex_429_without_a_reached_type_holds_on_retry_after_not_the_window(
         let (status, answer) = drive(
             Arc::clone(&manager),
             Method::POST,
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             Some(loopback_peer()),
             &[
                 ("authorization", "Bearer client-own"),
@@ -750,7 +754,7 @@ async fn codex_short_burst_retry_keeps_the_same_account_when_a_sibling_is_health
     let (status, _) = drive(
         manager,
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -799,7 +803,7 @@ async fn a_codex_account_held_by_a_short_non_quota_429_serves_the_retry() {
     let (status, answer) = drive(
         Arc::clone(&manager),
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -827,7 +831,7 @@ async fn a_codex_account_held_by_a_short_non_quota_429_serves_the_retry() {
 ///
 /// The fixture names all eleven itself, so each is pinned by what reaches the client,
 /// not by the list's contents: the precondition asks only that the fixture cover every
-/// name in [`crate::quota::CODEX_QUOTA_HEADERS`].
+/// name in [`crate::records::quota::CODEX_QUOTA_HEADERS`].
 ///
 /// Watched red: drop the Codex names from `is_account_scoped` and the pooled response
 /// carries all seven quota headers; strip the whole `x-codex-` prefix instead and it
@@ -849,7 +853,7 @@ async fn codex_quota_headers_are_stripped_from_a_pooled_response_and_kept_on_a_r
         ("x-codex-credits-balance", "12.50".to_string()),
         ("x-codex-promo-message", "fixture promo".to_string()),
     ];
-    for name in crate::quota::CODEX_QUOTA_HEADERS {
+    for name in crate::records::quota::CODEX_QUOTA_HEADERS {
         assert!(
             quota_headers.iter().any(|(sent, _)| *sent == name),
             "precondition: the fixture sends every name in the strip list, {name} included"
@@ -882,7 +886,7 @@ async fn codex_quota_headers_are_stripped_from_a_pooled_response_and_kept_on_a_r
     let pooled = drive_full(
         Arc::clone(&manager),
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -953,7 +957,7 @@ async fn codex_quota_facts_reach_the_snapshot_though_the_client_never_sees_their
         ("x-codex-credits-balance", "12.50".to_string()),
         ("x-codex-promo-message", "fixture promo".to_string()),
     ];
-    for name in crate::quota::CODEX_QUOTA_HEADERS {
+    for name in crate::records::quota::CODEX_QUOTA_HEADERS {
         assert!(
             quota_headers.iter().any(|(sent, _)| *sent == name),
             "precondition: the fixture sends every name in the strip list, {name} included"
@@ -976,7 +980,7 @@ async fn codex_quota_facts_reach_the_snapshot_though_the_client_never_sees_their
     let pooled = drive_full(
         Arc::clone(&manager),
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -1016,7 +1020,7 @@ async fn codex_quota_facts_reach_the_snapshot_though_the_client_never_sees_their
     );
     assert_eq!(
         snapshot.accounts[0].codex,
-        crate::stats::CodexFacts::default(),
+        crate::records::stats::CodexFacts::default(),
         "alice, the Anthropic account, reports none of it"
     );
 }
@@ -1072,7 +1076,7 @@ async fn codex_bound_history_never_holds_a_request_on_the_other_providers_accoun
     let (status, body) = drive(
         Arc::clone(&manager),
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -1111,7 +1115,7 @@ async fn codex_request_never_reads_the_fable_weekly_bucket() {
     let resp = drive_full(
         manager,
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),
@@ -1156,8 +1160,12 @@ async fn codex_bearer_never_reaches_the_anthropic_identity_check() {
     config.control_pooled = true;
     let manager = Manager::with_live_refresher(config, None);
     for (method, path, body) in [
-        (Method::GET, crate::provider::CODEX_USAGE_PATH, ""),
-        (Method::POST, crate::provider::CODEX_RESPONSES_PATH, "{}"),
+        (Method::GET, crate::base::provider::CODEX_USAGE_PATH, ""),
+        (
+            Method::POST,
+            crate::base::provider::CODEX_RESPONSES_PATH,
+            "{}",
+        ),
     ] {
         let (status, answer) = drive(
             Arc::clone(&manager),
@@ -1218,7 +1226,7 @@ async fn codex_bearer_never_reaches_the_anthropic_identity_check() {
 /// the sooner hold answers both clients.
 #[tokio::test]
 async fn codex_exhausted_429s_are_timed_on_the_requests_own_provider() {
-    use crate::provider::Provider;
+    use crate::base::provider::Provider;
     let retry_after = |response: &Response| {
         response
             .headers()
@@ -1288,7 +1296,7 @@ async fn codex_exhausted_429s_are_timed_on_the_requests_own_provider() {
 /// assertion reads null; write it for the fallback too and the fallback's reads a time.
 #[tokio::test]
 async fn codex_exhausted_429_carries_resets_at_and_it_agrees_with_resets_in_seconds() {
-    use crate::provider::Provider;
+    use crate::base::provider::Provider;
     let body_of = |response: Response| async move {
         let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
             .await
@@ -1303,7 +1311,7 @@ async fn codex_exhausted_429_carries_resets_at_and_it_agrees_with_resets_in_seco
     );
     let now = OffsetDateTime::now_utc();
     manager.edit_quota_for_test(1, |quota| {
-        quota.seven_day = Some(crate::quota::QuotaWindow {
+        quota.seven_day = Some(crate::records::quota::QuotaWindow {
             utilization: 1.0,
             reset: Some(now + time::Duration::seconds(300)),
         });
@@ -1402,7 +1410,7 @@ async fn a_fleet_with_no_codex_account_says_so_to_a_codex_client() {
     let resp = drive_full(
         manager,
         Method::POST,
-        crate::provider::CODEX_RESPONSES_PATH,
+        crate::base::provider::CODEX_RESPONSES_PATH,
         Some(loopback_peer()),
         &[
             ("authorization", "Bearer client-own"),

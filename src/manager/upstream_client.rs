@@ -47,7 +47,7 @@ pub(crate) fn build_serving_client(http1_only: bool) -> Arc<reqwest::Client> {
     // proxy — routing our upstream through an ambient proxy (e.g. one on
     // :3456) loops us back through a proxy and every request dies as
     // "upstream unreachable". Always reach Anthropic directly.
-    let mut builder = crate::http_client::builder()
+    let mut builder = crate::base::http_client::builder()
         .no_proxy()
         // Cap only the CONNECT phase. A blackholed route (no RST, no reply)
         // otherwise stalls the attempt until the OS TCP timeout, and with a

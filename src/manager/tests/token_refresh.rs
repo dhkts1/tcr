@@ -23,7 +23,7 @@ struct TransientThenOkRefresher {
 impl TokenRefresher for TransientThenOkRefresher {
     fn refresh(
         &self,
-        _provider: crate::provider::Provider,
+        _provider: crate::base::provider::Provider,
         refresh_token: String,
     ) -> RefreshFuture {
         let calls = Arc::clone(&self.calls);
@@ -111,7 +111,7 @@ async fn permanently_rejected_account_never_recovers_and_its_backoff_grows() {
     impl TokenRefresher for AlwaysRejects {
         fn refresh(
             &self,
-            _provider: crate::provider::Provider,
+            _provider: crate::base::provider::Provider,
             _refresh_token: String,
         ) -> RefreshFuture {
             Box::pin(async {
@@ -230,7 +230,7 @@ struct RejectsOnce {
 impl TokenRefresher for RejectsOnce {
     fn refresh(
         &self,
-        _provider: crate::provider::Provider,
+        _provider: crate::base::provider::Provider,
         _refresh_token: String,
     ) -> RefreshFuture {
         let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
@@ -354,7 +354,7 @@ struct BlockingRefresher {
 impl TokenRefresher for BlockingRefresher {
     fn refresh(
         &self,
-        _provider: crate::provider::Provider,
+        _provider: crate::base::provider::Provider,
         _refresh_token: String,
     ) -> RefreshFuture {
         let started = Arc::clone(&self.started);
@@ -398,7 +398,7 @@ async fn a_cancelled_caller_does_not_abandon_its_refresh() {
     let caller = tokio::spawn(async move { m.ensure_fresh_force(0).await });
     started.notified().await; // the POST is in flight upstream
     caller.abort(); // the client hung up
-    crate::log_err::LogErr::log_debug(caller.await, "joining the aborted caller");
+    crate::base::log_err::LogErr::log_debug(caller.await, "joining the aborted caller");
     release.notify_one(); // upstream answers, as it would have anyway
 
     // The answer must still be applied. Polled, because the refresh now runs on
@@ -465,13 +465,13 @@ async fn concurrent_ensure_fresh_force_coalesces_to_single_refresh() {
 /// A refresher that records the provider each refresh was asked for, then mints a
 /// fresh token so the refresh applies.
 struct ProviderRecordingRefresher {
-    providers: Arc<Mutex<Vec<crate::provider::Provider>>>,
+    providers: Arc<Mutex<Vec<crate::base::provider::Provider>>>,
 }
 
 impl TokenRefresher for ProviderRecordingRefresher {
     fn refresh(
         &self,
-        provider: crate::provider::Provider,
+        provider: crate::base::provider::Provider,
         _refresh_token: String,
     ) -> RefreshFuture {
         self.providers
@@ -497,7 +497,7 @@ impl TokenRefresher for ProviderRecordingRefresher {
 async fn a_refresh_is_requested_for_the_accounts_own_provider() {
     let providers = Arc::new(Mutex::new(Vec::new()));
     let mut codex = account("codex-row", 1);
-    codex.provider = crate::provider::Provider::Codex;
+    codex.provider = crate::base::provider::Provider::Codex;
     let manager = build_manager(
         config_with(vec![account("anthropic-row", 0), codex]),
         Arc::new(ProviderRecordingRefresher {
@@ -517,8 +517,8 @@ async fn a_refresh_is_requested_for_the_accounts_own_provider() {
     assert_eq!(
         *providers.lock().expect("providers lock poisoned"),
         vec![
-            crate::provider::Provider::Codex,
-            crate::provider::Provider::Anthropic
+            crate::base::provider::Provider::Codex,
+            crate::base::provider::Provider::Anthropic
         ],
         "each refresh must be requested under its own account's provider"
     );

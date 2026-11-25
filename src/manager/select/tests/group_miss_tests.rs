@@ -1,7 +1,7 @@
 //! `classify_group_miss` names the constraint that emptied a group.
 
 use super::*;
-use crate::config::{Account, PacingConfig};
+use crate::base::config::{Account, PacingConfig};
 
 fn account(name: &str, groups: &[&str], disabled: bool) -> AccountRuntime {
     AccountRuntime::from_config(
@@ -32,7 +32,7 @@ fn classify(
         now,
         odt_to_ms(now),
         false,
-        crate::provider::Provider::Anthropic,
+        crate::base::provider::Provider::Anthropic,
         group,
         &HashSet::new(),
         &HashSet::new(),
@@ -120,7 +120,7 @@ fn a_healthy_member_inside_the_spacing_window_is_paced() {
 /// `account`, as a Codex account.
 fn codex_account(name: &str, groups: &[&str]) -> AccountRuntime {
     let mut runtime = account(name, groups, false);
-    runtime.provider = crate::provider::Provider::Codex;
+    runtime.provider = crate::base::provider::Provider::Codex;
     runtime
 }
 

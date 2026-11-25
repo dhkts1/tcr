@@ -49,7 +49,7 @@
 # shell, and either one between the two renames leaves a `.TcrBar.install.*`
 # directory behind. Removing it by hand is the recovery.
 #
-# Idempotent: safe to re-run. Uninstall with scripts/uninstall.sh.
+# Idempotent: safe to re-run. Uninstall with apps/macos/scripts/uninstall.sh.
 set -euo pipefail
 
 MACOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

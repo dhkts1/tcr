@@ -11,7 +11,7 @@ import XCTest
 ///
 ///  1. `tcr`'s port singleton declined to replace the incumbent, because that
 ///     incumbent was a proxy hosted inside a `tcr run` process and
-///     `is_proxy_server` deliberately excludes those (`src/singleton.rs:38,62`,
+///     `is_proxy_server` deliberately excludes those (`src/stores/singleton/mod.rs`,
 ///     asserted at `:257`). Killing one would kill the Claude session running
 ///     through it.
 ///  2. The subsequent bind failed: `failed to bind 127.0.0.1:3456`.

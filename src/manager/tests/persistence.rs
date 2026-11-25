@@ -73,7 +73,7 @@ fn a_rotation_persists_only_the_rotated_account() {
         None,
         None,
         None,
-        crate::provider::Provider::Anthropic,
+        crate::base::provider::Provider::Anthropic,
         &Tokens {
             id_token: None,
             access_token: "at-a-rotated".to_string(),
@@ -116,7 +116,7 @@ fn a_rotated_codex_token_persists_onto_the_codex_row_beside_a_same_named_anthrop
     anthropic.access_token = "at-anthropic".to_string();
     anthropic.refresh_token = Some("rt-anthropic".to_string());
     let mut codex = account("alice@example.com", 1);
-    codex.provider = crate::provider::Provider::Codex;
+    codex.provider = crate::base::provider::Provider::Codex;
     codex.access_token = "at-codex".to_string();
     codex.refresh_token = Some("rt-codex".to_string());
     let manager = build_manager_with_path(config_with(vec![anthropic, codex]), path.clone());
@@ -130,7 +130,7 @@ fn a_rotated_codex_token_persists_onto_the_codex_row_beside_a_same_named_anthrop
         None,
         None,
         None,
-        crate::provider::Provider::Codex,
+        crate::base::provider::Provider::Codex,
         &Tokens {
             id_token: None,
             access_token: "at-codex-rotated".to_string(),
@@ -223,7 +223,7 @@ fn concurrent_token_persists_do_not_lose_updates() {
                     None,
                     None,
                     None,
-                    crate::provider::Provider::Anthropic,
+                    crate::base::provider::Provider::Anthropic,
                     &Tokens {
                         id_token: None,
                         access_token: format!("new-at-{i}"),
@@ -332,7 +332,7 @@ fn set_disabled_persists_through_to_the_config_file() {
 #[test]
 fn set_disabled_on_a_codex_account_persists_to_its_codex_row() {
     let codex = Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         ..account("bob@example.com", 0)
     };
     let (manager, path) = build_manager_with_disk(

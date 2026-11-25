@@ -2,7 +2,7 @@
 //!
 //! The serving process's browse task drives this every
 //! [`crate::peer::discovery::BROWSE_INTERVAL`] (`spawn_browse` in
-//! `src/server.rs`): it reads the Tailscale app
+//! `src/proxy/server/peer_mesh.rs`): it reads the Tailscale app
 //! ([`crate::peer::reach::tailnet::app`]), sends this Mac's beacon to each of the
 //! operator's own Macs as one UDP datagram on the peer port, and folds the
 //! beacons it heard since the last wake into the same found list the mDNS

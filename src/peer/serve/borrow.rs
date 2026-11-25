@@ -7,10 +7,10 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use tcr_peer_wire::{Lease, PeerId, StreamHeader, StreamKind};
 
-use crate::fallback::Ask;
 use crate::peer::config::PeerStore;
 use crate::peer::config::id::NodeKey;
 use crate::peer::noise::{self, Handshake, recv_json, send_json};
+use crate::peer::serve::fallback::Ask;
 
 use super::frame::{SERVE_FLOW, ServeAck, ServeReply, recv_body, send_body, serve_request_from};
 use super::policy::serve_is_allowed_for_path;
@@ -35,7 +35,7 @@ use crate::peer::tunnel::dial::dial_peer_reaching;
 ///
 /// # `headers` is the borrower's own, and it is scrubbed here
 ///
-/// [`Ask`] carries none today, and `crate::fallback`'s module doc says why: the
+/// [`Ask`] carries none today, and `crate::peer::serve::fallback`'s module doc says why: the
 /// only code that strips a client credential sits 215 lines downstream of the
 /// seam an [`Ask`] is built at. So the production caller hands in an empty map,
 /// and this parameter exists for the two cases an empty map cannot serve, the
@@ -310,7 +310,7 @@ async fn borrow_once(
 /// Rebuild an HTTP response from what the lender answered.
 ///
 /// Hop-by-hop response headers are the lender's connection's business, not this
-/// one's, so they are dropped here the way `src/proxy.rs` drops them on the way
+/// one's, so they are dropped here the way `src/proxy/mod.rs` drops them on the way
 /// back from upstream.
 fn response_from(status: u16, headers: &[(String, String)], body: Vec<u8>) -> Result<Response> {
     let mut builder = Response::builder().status(

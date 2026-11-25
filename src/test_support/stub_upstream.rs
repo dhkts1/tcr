@@ -61,7 +61,7 @@ use axum::response::{IntoResponse, Response};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tower::ServiceExt as _;
 
-use crate::log_err::LogErr as _;
+use crate::base::log_err::LogErr as _;
 
 /// Where one stub answers. `Display` prints `127.0.0.1:<port>/stub/<id>`, so the
 /// `format!("http://{addr}")` every test already writes for an upstream base still yields the

@@ -20,7 +20,7 @@ use super::policy::{
 /// The message of the lender's one log line per served request.
 ///
 /// A constant rather than a literal in the `info!` because a gate greps for it
-/// ([`handle_serve_on`] emits it, `tests/peer_boot.rs` asserts its field set),
+/// ([`handle_serve_on`] emits it, `tests/peer/peer_boot.rs` asserts its field set),
 /// and a gate keyed on a copy of a message is a gate that goes quiet the day
 /// somebody rewords the message. The FIELDS are the contract as much as the
 /// text: `peer`, `window`, `bytes`, `ms`, and nothing else.
@@ -498,7 +498,7 @@ where
     // because that is what borrowing an account means, and a log file is a copy
     // of them that outlives the request. `SERVED_LINE` is the message a gate
     // greps for, named here so the gate cannot drift from it
-    // (`tests/peer_boot.rs`).
+    // (`tests/peer/peer_boot.rs`).
     //
     // The lease ACCOUNTING (the rise this node measured and what it charged)
     // is one line below at `debug!`, not folded in here. Both are honest
@@ -607,7 +607,7 @@ pub(super) struct ServedResponse {
 /// This doc used to say a borrower's own `x-tcr-group` could not widen the scope
 /// because the lender writes its headers after the allowlist loop. A
 /// measurement found the opposite: `RequestBuilder::header` **appends**, and
-/// `src/proxy.rs` reads the scope with `headers.get(GROUP_HEADER_NAME)`, which
+/// `src/proxy/mod.rs` reads the scope with `headers.get(GROUP_HEADER_NAME)`, which
 /// answers the FIRST value under a name. Writing last is therefore writing
 /// second, and second loses.
 ///
@@ -624,7 +624,7 @@ pub(super) async fn serve_on_own_account(
     restriction: &ScopeRestriction,
     request_key: Option<&str>,
 ) -> Result<ServedResponse> {
-    let client = crate::http_client::builder()
+    let client = crate::base::http_client::builder()
         .no_proxy()
         .build()
         .context("peer serve: could not build the loopback client")?;
@@ -651,7 +651,7 @@ pub(super) async fn serve_on_own_account(
     // Measured on this repository's pinned `url`, with `upstream =
     // "http://127.0.0.1:3456"`, the readings are asserted in
     // `set_path_keeps_the_authority_and_the_under_base_check_is_not_what_refuses`
-    // (`tests/peer_lease.rs`):
+    // (`tests/peer/lending/peer_lease.rs`):
     //
     //   //169.254.169.254/latest/meta-data -> .../169.254.169.254/latest/meta-data
     //   /x/../_tcr/accounts/control        -> ..../_tcr/accounts/control
@@ -808,7 +808,7 @@ pub(super) async fn serve_on_own_account(
 ///
 /// The sentence above was true of the borrower and false of the SDK sitting
 /// behind it. A 502 with no header on it is retryable by default
-/// (`src/proxy.rs` sets this header on every answer it means as final, and
+/// (`src/proxy/mod.rs` sets this header on every answer it means as final, and
 /// `lease.rs`'s and `egress.rs`'s own "may have been billed" answers both carry
 /// it), so the one request this build is certain already ran and was debited
 /// was also the one the client was free to send again. The header travels the

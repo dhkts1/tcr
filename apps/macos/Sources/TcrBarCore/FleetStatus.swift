@@ -3,7 +3,7 @@ import Foundation
 // Decoders for `tcr status --json`.
 //
 // The wire format is a *bare JSON array*, one object per account. Every field
-// name here is the camelCase key the CLI emits (src/cli.rs, the `"quotaState":`
+// name here is the camelCase key the CLI emits (src/verbs/cli/render.rs, the `"quotaState":`
 // block); the Rust side owns that spelling, so this file is the one place that
 // has to track it.
 //
@@ -18,7 +18,7 @@ import Foundation
 //     structural absence must not render as a measured zero.
 //  3. The four quota fractions (`quota`, `fiveHour`, `sevenDay`, `sevenDayOi`)
 //     are null too, on any account nothing has been learned about yet. The Rust
-//     side says so outright: `gating_quota` (src/cli.rs) returns `None` "when
+//     side says so outright: `gating_quota` (src/verbs/cli/render.rs) returns `None` "when
 //     nothing has been learned yet". They were typed non-optional here because
 //     the shape was derived from row `[0]` of a live read, where they happened to
 //     be populated; the first never-probed account in the fleet then failed the
@@ -31,7 +31,7 @@ import Foundation
 //     budget work to say "too little traffic to trust a ratio" — an account
 //     that has taken a handful of requests can compute a real-looking 33% or
 //     100% from one or two samples, and that is not a measurement, it is
-//     noise wearing a percent sign. The Rust side (`src/cli.rs`) owns the
+//     noise wearing a percent sign. The Rust side (`src/verbs/cli/render.rs`) owns the
 //     threshold that decides when there is enough traffic to say anything;
 //     this file's contract is only that whatever it decides is "not enough"
 //     arrives as `null`, same as a genuinely traffic-free account already
@@ -136,7 +136,7 @@ extension QuotaState: Decodable {
 /// Why the server is holding an account out of rotation right now — its own
 /// verdict, not one this app re-derives.
 ///
-/// Rust spells these kebab-case (`src/stats.rs`'s `GateReason`, serialized by
+/// Rust spells these kebab-case (`src/records/stats.rs`'s `GateReason`, serialized by
 /// `gate_reason_token`): `ok`, `hold`, `five-hour`, `seven-day`,
 /// `fable-weekly`, `standard`, `login`, `rejected`, `disabled`, `reserved`,
 /// `parked`, `refused`.
@@ -148,7 +148,7 @@ extension QuotaState: Decodable {
 /// [`Self/rejected`] is the one the panel could not see before this existed,
 /// and it is the reason the type does. Anthropic's own
 /// `anthropic-ratelimit-unified-status: rejected` takes an account out of
-/// selection (`src/manager/select.rs`) while `snapshot.rs` rewrites `status`
+/// selection (`src/manager/select/mod.rs`) while `snapshot.rs` rewrites `status`
 /// only for `Throttled` — so a rejected row still reported `status: "active"`
 /// and the panel drew it as eligible for traffic the router will never send it.
 /// An earlier comment in `FleetView` claimed `tcr status --json` emitted no gate
@@ -231,14 +231,14 @@ extension StatusSource: Decodable {
 
 /// Health of the account's most recent quota probe.
 ///
-/// Rust owns these tokens (`ProbeStatus::as_str`, src/probe.rs): `never`, `ok`,
+/// Rust owns these tokens (`ProbeStatus::as_str`, src/records/probe.rs): `never`, `ok`,
 /// `error`, `timeout`, `rate-limited`. They are enumerated here rather than
 /// pattern-matched as strings so a variant this build has not seen lands in
 /// ``unknown(_:)`` deliberately, instead of being mistaken for a good probe.
 ///
 /// The distinction that matters to the capacity summary is ``never`` versus
 /// everything else. `error`, `timeout` and `rate-limited` all *keep the
-/// last-learned quota bar* — src/probe.rs:252-256 is explicit that a probe 429
+/// last-learned quota bar* — src/records/probe.rs:252-256 is explicit that a probe 429
 /// leaves serving quota untouched — so those rows still carry a real
 /// measurement. `never` means the account has never been probed at all (or is
 /// not an OAuth account), and its `quotaState: "ok"` is a Rust `#[default]`,
@@ -324,7 +324,7 @@ public enum Provider: Equatable, Sendable {
     case anthropic
     case codex
 
-    /// The wire token; `src/provider.rs` serialises the Rust enum lowercase.
+    /// The wire token; `src/base/provider.rs` serialises the Rust enum lowercase.
     public var token: String {
         switch self {
         case .anthropic: return "anthropic"
@@ -668,7 +668,7 @@ public enum QuotaFormat {
     ///
     /// `nil` is `"n/a"` for the reason every formatter in this enum gives:
     /// `costUsd` is `null` on the wire when a bucket served requests and not
-    /// one of them could be priced (`src/usage.rs`'s `to_wire`), and `"$0.00"`
+    /// one of them could be priced (`src/records/usage/mod.rs`'s `to_wire`), and `"$0.00"`
     /// would report "this traffic was free" about traffic nobody could price.
     /// A zero that IS measured still prints `"$0.00"` — that is a real reading.
     ///
@@ -1127,7 +1127,7 @@ public struct UsageTotals: Decodable, Equatable, Sendable {
     /// cost on the API, never a bill; these accounts are subscriptions.
     ///
     /// `null`, and `nil` here, when the bucket served requests and not one of
-    /// them could be priced (`src/usage.rs`'s `to_wire`). A bucket with some
+    /// them could be priced (`src/records/usage/mod.rs`'s `to_wire`). A bucket with some
     /// priced and some unpriced requests reports the partial sum, and
     /// ``unpricedRequests`` is how a reader knows it is partial. Never render
     /// a `nil` as `$0.00` — see ``QuotaFormat/usd(_:)``.
@@ -1200,7 +1200,7 @@ public struct UsageTotals: Decodable, Equatable, Sendable {
 
     /// Two buckets added, for summing rows into a fleet total.
     ///
-    /// Cost follows the server's own rule (`src/usage.rs`'s `Totals::add` and
+    /// Cost follows the server's own rule (`src/records/usage/mod.rs`'s `Totals::add` and
     /// `to_wire`): a priced side plus an unpriced one is the PARTIAL sum, with
     /// ``unpricedRequests`` carrying the caveat, and the result is `nil` only
     /// when neither side had a price at all. Adding a `nil` as `0` would turn
@@ -1257,7 +1257,7 @@ public struct UsageTotals: Decodable, Equatable, Sendable {
     /// request of the new one lands, so every night between midnight and that
     /// request the header read `n/a today` about a fleet that was simply idle.
     ///
-    /// The server now sends `0.0` for that case (`src/usage.rs`, `Totals` with
+    /// The server now sends `0.0` for that case (`src/records/usage/mod.rs`, `Totals` with
     /// no requests), so this is also what keeps an OLDER proxy's `null` from
     /// reading as unpriceable traffic — the same forward-compat contract every
     /// other field here follows.
@@ -1893,7 +1893,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// back to the shared `quotaState` tint for that bar.
     public let fiveHourState: QuotaState?
     public let sevenDayState: QuotaState?
-    /// The FABLE weekly window's own state (`src/cli.rs`'s `sevenDayOiState`),
+    /// The FABLE weekly window's own state (`src/verbs/cli/render.rs`'s `sevenDayOiState`),
     /// the companion to ``sevenDayOi`` that ``sevenDayState`` is to
     /// ``sevenDay``. Same threshold, same three words.
     ///
@@ -1914,10 +1914,10 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// different question). `nil` both when the wire field is absent — an
     /// older `tcr` this newer TcrBar talks to, same forward-compat contract
     /// every other field in this struct follows — and when there is no live
-    /// reset to report (`src/cli.rs`'s `fiveHourResetAtMs`/`sevenDayResetAtMs`).
+    /// reset to report (`src/verbs/cli/render.rs`'s `fiveHourResetAtMs`/`sevenDayResetAtMs`).
     public let fiveHourResetAtMs: Int64?
     public let sevenDayResetAtMs: Int64?
-    /// The Fable weekly window's reset instant (`src/cli.rs`'s
+    /// The Fable weekly window's reset instant (`src/verbs/cli/render.rs`'s
     /// `sevenDayOiResetAtMs`), same unconditional shape as
     /// ``sevenDayResetAtMs``. `nil` when that reset has already elapsed with
     /// nothing learned since, when it was never learned, or when the server
@@ -1928,7 +1928,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
 
     /// Pure serving counters. `null` on the wire — and `nil` here, NEVER `0` —
     /// on `source == .offline`: these four live in the SERVING process
-    /// (`src/cli.rs:1179-1209`), so a fresh offline `Manager` has nothing to
+    /// (`src/verbs/cli/status.rs`), so a fresh offline `Manager` has nothing to
     /// report about them, and `0` would read as "this account served nothing"
     /// rather than "not measured right now". Was `Int`, non-optional, until a
     /// synthesized `Decodable` threw `valueNotFound` on the very first offline
@@ -1954,7 +1954,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let probeError: String?
     public let lastStreamError: String?
     /// Same offline-null idiom as ``requests`` and friends above, and the
-    /// field the repo's own `src/cli.rs` test
+    /// field the repo's own `src/verbs/cli/tests/render.rs` test
     /// (`offline_status_reports_null_not_zero_stream_errors`) was written to
     /// guard: `0` on an ERROR counter is an affirmative all-clear, so an
     /// unmeasured `0` here would publish "no truncated streams" about a
@@ -1967,7 +1967,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let serverSha: String?
     public let serverDirty: Bool?
 
-    /// Group labels (`src/stats.rs`'s `AccountSnapshot::groups`, carried onto
+    /// Group labels (`src/records/stats.rs`'s `AccountSnapshot::groups`, carried onto
     /// the wire as `"groups"`, always an array — `[]` for an unlabelled
     /// account, never `null`). Optional here, deliberately, unlike the wire's
     /// own `[]`-never-`null` rule: an older `tcr` that predates the field
@@ -1980,7 +1980,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let groups: [String]?
 
     /// Which of this account's own `groups` are held out of the general
-    /// pool (`src/stats.rs`'s reserved-group flag, carried onto the wire as
+    /// pool (`src/records/stats.rs`'s reserved-group flag, carried onto the wire as
     /// `"reservedGroups"`, repeated per row exactly the way `"groups"`
     /// itself already is — not a group-scoped lookup). Optional for the same
     /// forward-compat reason `groups` is: a server built before this field
@@ -2430,10 +2430,10 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// Two conditions, and both are load-bearing:
     ///
     ///  - `quota != nil` — the CLI emits `null` "when nothing has been learned
-    ///    yet" (src/cli.rs:258-271), so a nil gating quota is the absence of a
+    ///    yet" (src/verbs/cli/render.rs), so a nil gating quota is the absence of a
     ///    measurement, full stop.
     ///  - the account has been probed at least once. `ProbeStatus::Never` is
-    ///    Rust's `#[default]` (src/probe.rs:243-245), and it arrives paired with
+    ///    Rust's `#[default]` (src/records/probe.rs:243-245), and it arrives paired with
     ///    a `quotaState` of `"ok"` that is the *same* default rather than a
     ///    finding. A failed, timed-out or rate-limited probe still counts here:
     ///    those paths keep the last-learned bar.
@@ -2462,13 +2462,13 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// nothing has ever verified.
     ///
     /// The fourth clause exists for a credential that dies AFTER being
-    /// probed, not before. `probe_account` (`src/manager/probing.rs:128-139`)
+    /// probed, not before. `probe_account` (`src/manager/freshness/probing.rs`)
     /// early-returns on an `Error` row instead of clearing anything, and
     /// `refresh.rs:93-101` only ever sets `status` — so a rejected refresh
     /// token leaves the LAST-LEARNED `quota` and `probeStatus: .ok` sitting
     /// there unchanged. Without this clause `hasQuotaEvidence` stays true,
     /// `quotaState` reads whatever it last measured (often `.ok`), and the
-    /// row reports READY for an account `src/manager/select.rs:931`
+    /// row reports READY for an account `src/manager/select/mod.rs`
     /// hard-excludes and will serve zero requests — the header could then
     /// read "1 of 1 ready · 1 need re-login" in the same frame, the panel
     /// contradicting itself.
@@ -2601,7 +2601,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// window had never reported fell through `fiveHourState ?? quotaState`
     /// to the COMPOSITE (7d-driven) state and painted the empty 5h bar red —
     /// exactly the overclaim two-window tinting exists to prevent, and not
-    /// exotic: `src/quota.rs` populates the two windows independently from
+    /// exotic: `src/records/quota/mod.rs` populates the two windows independently from
     /// separate response headers, so one sitting at `None` while its sibling
     /// accumulates is ordinary. Proven with the `01d-unmeasured-window-proof`
     /// golden scene before the fix landed (the 5h outline rendered red) and
@@ -3457,7 +3457,7 @@ public struct Fleet: Equatable, Sendable {
     /// may never read that key or `~/.config/tcr.json` — see
     /// `CLAUDE.md`'s "No credentials, ever". So the channel is a second
     /// SHELL-OUT, the way every other fact in this app arrives: `tcr sessions
-    /// --json` (`sessions()`, `src/cli.rs`) prints `{"supported", "sessions"}`
+    /// --json` (`sessions()`, `src/verbs/cli/live_reads.rs`) prints `{"supported", "sessions"}`
     /// and ``StatusPoller`` folds it onto the fleet with ``withSessions(_:)``.
     public let sessions: [Session]
     /// Session rows that failed to decode, kept separate from account rows.
@@ -4086,7 +4086,7 @@ public struct Fleet: Equatable, Sendable {
     }
 
     /// Enabled accounts whose refresh token was rejected — dead credentials,
-    /// hard-excluded from selection (`src/manager/select.rs:814`, `:931`).
+    /// hard-excluded from selection (`src/manager/select/mod.rs`).
     /// Reported on the same footing as `unmeasuredCount`: both are reasons an
     /// account is not ready, but they lead to different remedies.
     ///
@@ -4182,7 +4182,7 @@ public struct Fleet: Equatable, Sendable {
         // `health != .needsRelogin` is load-bearing here too, not just on
         // `isReady`: a credential that dies AFTER being probed keeps its
         // LAST-LEARNED `quotaState`, which can be `.near` — Rust never resets
-        // it, `probe_account` (`src/manager/probing.rs:128-139`) early-returns
+        // it, `probe_account` (`src/manager/freshness/probing.rs`) early-returns
         // on an `Error` row and `refresh.rs:93-101` only ever sets `status`.
         // Without the health check, a broken account that used to be close to
         // its threshold would amber the glyph for capacity that has since
@@ -4388,7 +4388,7 @@ public struct Fleet: Equatable, Sendable {
     ///
     /// `nil` when no row was measured at all — the whole line is absent then.
     /// Also `nil` for a shape this build has no words for: an hour with no
-    /// price and no unpriced requests, which `Totals::to_wire` in `src/usage.rs` cannot produce
+    /// price and no unpriced requests, which `Totals::to_wire` in `src/records/usage/mod.rs` cannot produce
     /// (a null cost means `unpriced_requests >= requests > 0`).
     public var burnRateSegment: String? {
         guard hasUsage else { return nil }

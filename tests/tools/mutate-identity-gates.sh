@@ -6,7 +6,7 @@
 # whole set green again. A gate that cannot be shown failing is not a gate.
 #
 # Every probe patches a file this test suite owns directly. The one exception
-# is the peers-file mode probe: its writer (`src/config.rs::write_atomic`)
+# is the peers-file mode probe: its writer (`src/base/config/file.rs::write_atomic`)
 # lives in a file this suite does not own, so that probe patches the TEST to write the file with
 # `std::fs::write` instead of the one writer, which proves the assertion
 # measures the mode on disk rather than the writer's name.
@@ -41,7 +41,7 @@ FILES=(
   "src/peer/config/mod.rs"
   "src/peer/config/join_key.rs"
   "src/peer/discovery.rs"
-  "tests/peer_noise/enrolment_and_files.rs"
+  "tests/peer/pairing/peer_noise/enrolment_and_files.rs"
 )
 for f in "${FILES[@]}"; do
   cp "$ROOT/$f" "$BACKUP_DIR/$(echo "$f" | tr / _)"
@@ -145,7 +145,7 @@ probe enrolment_label_unsanitized --test=it \
 SPEC
 
 probe peers_file_mode --test=it \
-  peer_noise::the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused tests/peer_noise/enrolment_and_files.rs <<'SPEC'
+  peer_noise::the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused tests/peer/pairing/peer_noise/enrolment_and_files.rs <<'SPEC'
     tcr::peer::config::save(path, &file).expect("the peers file is written");
 @@@
     std::fs::write(path, serde_json::to_string(&file).expect("json")).expect("written");
@@ -159,7 +159,7 @@ probe peers_mode_check --test=it \
 SPEC
 
 # SKIPPED probe key_file_follows_symlink (gate a_planted_symlink_does_not_capture_the_node_key):
-# its anchor was `.create_new(true).mode(mode)` in src/peer/id.rs, and `write_key_file` no
+# its anchor was `.create_new(true).mode(mode)` in src/peer/config/id.rs, and `write_key_file` no
 # longer opens the file that way. It stages a tempfile and publishes it with `link(2)`, so the
 # symlink defence has a different shape and this mutation has no counterpart there.
 

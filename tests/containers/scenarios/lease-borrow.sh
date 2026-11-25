@@ -20,14 +20,14 @@
 #      to lend (`LeaseRefusal::OwnerGuard`), not a lab quirk, a real "an
 #      account with zero observed traffic has no fraction to offer" rule.
 #   4. disable node-a2's own account, restart it (the peer-lease provider
-#      installs at boot, from the peers file; `src/fallback.rs`)
-#   5. from node-a2's own namespace (loopback-bound proxy, `src/server.rs`):
+#      installs at boot, from the peers file; `src/peer/serve/fallback.rs`)
+#   5. from node-a2's own namespace (loopback-bound proxy, `src/proxy/server/mod.rs`):
 #      POST /v1/messages
 #
 # Assertions
 #   - node-a2's log carries `provider="peer-lease"` on the line "no local
 #     account could serve this request, served through a fallback provider"
-#     (src/proxy.rs, src/peer/lease.rs)
+#     (src/proxy/mod.rs, src/peer/lease/mod.rs)
 #   - the new row the ledger (`GET /_ledger` on the stub,
 #     tests/containers/upstream-stub.py) gains from this request carries the
 #     LENDER's credential, not the borrower's, a field, never a substring of

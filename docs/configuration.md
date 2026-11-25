@@ -8,7 +8,7 @@ Cache paths below use `~/.cache/tcr/`. `XDG_CACHE_HOME` replaces `~/.cache`
 when set. The usage ledger, session snapshots, peer state and logs follow the same directory.
 
 Every default here was derived from the Rust source, not from a live config file. If you
-want to check one, start from `src/config.rs`.
+want to check one, start from `src/base/config.rs`.
 
 ## The minimum viable config
 
@@ -38,7 +38,7 @@ rather than dropped, but eight of them are also *read*, and are documented in th
 section below. Because a misspelled key is kept and does nothing, `tcr doctor` names every
 top-level key this build does not recognise, with its nearest known spelling, and the server logs
 them once at boot ([`tcr doctor`](cli.md#config-keys-tcr-does-not-recognise)). The list of known
-keys is `src/config_keys.rs`.
+keys is `src/base/config_keys.rs`.
 
 ## Top level
 
@@ -69,7 +69,7 @@ never the shipped value.
 its model's own provider**. The accounts are subscriptions, so nothing here is a bill; it is the only
 unit that compares across accounts, models and days.
 
-Prices come from a table built into the binary (`src/pricing.rs`), matched by longest prefix so a
+Prices come from a table built into the binary (`src/base/pricing.rs`), matched by longest prefix so a
 dated id like `claude-haiku-4-5-20251001` resolves to its family. A model the table has no published
 rate for is reported as `costUsd: null` with `unpricedRequests` counting it — never as `$0.00`, which
 would be a spend nobody measured presented as one. No OpenAI model has a built-in price, so a Codex
@@ -236,7 +236,7 @@ nothing reads them.
 
 **An account with no `refreshToken` is not broken, but it is on a clock.** It serves
 requests normally until `accessToken` expires, then goes dead — there is nothing for the
-refresh loop (`src/manager/refresh.rs`) to mint a new access token from, so it skips the
+refresh loop (`src/manager/freshness/refresh.rs`) to mint a new access token from, so it skips the
 account cleanly rather than erroring, and it stays skipped. The only account shape that
 produces this today is one added via `tcr login --token` (`docs/cli.md` §"`--token`: adding
 a `claude setup-token` credential"): that credential's `user:inference`-only scope means the
@@ -375,7 +375,7 @@ unset `burst` is clamped to `1` (strict spacing), not to the default.
 ### On the 350ms
 
 It is worth knowing that this number is **not measured for the path it governs**. It
-originates as `PROBE_SPACING` (`src/probe.rs`), which was proven against `/api/oauth/usage`
+originates as `PROBE_SPACING` (`src/records/probe.rs`), which was proven against `/api/oauth/usage`
 — the usage-probe endpoint, not `/v1/messages` — and was transplanted onto the serve path as
 a conservative starting value. Nobody has established where `/v1/messages` actually starts
 returning 429s, because finding that limit means crossing it, and a real 429 writes shared
@@ -388,7 +388,7 @@ unchanged from the value already running in production, and only the fleet ceili
 ## Keys read from the unmodelled map
 
 These ten are not fields of `Config`. They land in the flattened `extra` map and are read
-back out by name across the manager (see `src/manager/state.rs` and `src/manager/throttle.rs`).
+back out by name across the manager (see `src/manager/state.rs` and `src/manager/serving/throttle.rs`).
 They are fully live config with a caller in the boot or request path, not compatibility
 leftovers.
 
@@ -396,12 +396,12 @@ leftovers.
 |---|---|---|---|---|
 | `quotaProbeSeconds` | i64 seconds | **`300`** | no | quota probe cadence, the CENTRE of a per-account random draw, not a fleet period; halved for an account held out by its own quota; at most 20 probes per account in any trailing hour; `<= 0` disables probing |
 | `warmupSeconds` | i64 seconds | **`0`** (OFF) | no | keep-warm cadence, drawn the same per-account random way; `<= 0` spawns no warm task |
-| `autoUseExpiringResets` | bool | **`true`** | no | spend a banked limit reset by itself two hours before its use-by, once per reset, through the same claim as the Reset button; `false` spawns no task (`src/manager/auto_reset.rs`) |
+| `autoUseExpiringResets` | bool | **`true`** | no | spend a banked limit reset by itself two hours before its use-by, once per reset, through the same claim as the Reset button; `false` spawns no task (`src/manager/resets/auto.rs`) |
 
 ### Both cadences are random per account, not a fleet sweep
 
 Neither `quotaProbeSeconds` nor `warmupSeconds` is a period the fleet fires on. Each is the
-**centre of an independent random draw per account** (`src/schedule.rs`):
+**centre of an independent random draw per account** (`src/manager/schedule.rs`):
 
 | draw | distribution | at the 300s default |
 |---|---|---|
@@ -814,7 +814,7 @@ A second file, `tcr-peers.json` in the operator's config directory, mode `0600`,
 mesh: who this Mac trusts, what each trusted Mac may do, and the office network key. It is
 never merged into the main account config above; a walkthrough of what the mesh does is in
 [peers.md](peers.md), and this section is the file's key reference, read from
-`src/peer/config.rs`.
+`src/peer/config/mod.rs`.
 
 A missing file is the default: nothing pinned, the listener off. A file that exists but
 cannot be parsed is a named refusal, same rule as the main config. A key this build does

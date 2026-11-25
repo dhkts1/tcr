@@ -1,8 +1,8 @@
 //! Where requests leave from: `tcr peer via` for this Mac, and `tcr peer account` for one account's exit lock.
 
-use tcr::cli;
-use tcr::config;
+use tcr::base::config;
 use tcr::peer;
+use tcr::verbs::cli;
 
 use super::peer_cli;
 

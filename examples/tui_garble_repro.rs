@@ -1,7 +1,7 @@
 //! Repro harness for issue #323 (TUI panes overwrite each other, never recovers).
 //!
 //! Mirrors `tui::run`'s terminal handling exactly: the same alternate-screen entry,
-//! the same panic hook shape (`src/tui.rs:69`), the same repaint loop. Then a
+//! the same panic hook shape (`src/verbs/tui/terminal.rs`), the same repaint loop. Then a
 //! BACKGROUND task panics, as any task in the server may. The screen is captured
 //! before and after by the caller (`scripts/repro-323.sh` under tmux).
 //!
@@ -34,7 +34,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use tcr::log_err::LogErr;
+use tcr::base::log_err::LogErr;
 
 static SCREEN_DIRTIED_BY_PANIC: AtomicBool = AtomicBool::new(false);
 

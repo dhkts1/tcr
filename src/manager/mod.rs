@@ -35,14 +35,14 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use time::OffsetDateTime;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
-use crate::config::{self, Config, PacingConfig, ThrottleConfig};
-use crate::oauth::{self, LiveRefresher, TokenRefresher, Tokens};
-use crate::probe::{LiveUsageProber, PlanProber, ProbeStatus, Usage, UsageProber};
-use crate::quota::Quota;
-use crate::stats::{
+use crate::base::config::{self, Config, PacingConfig, ThrottleConfig};
+use crate::clients::oauth::{self, LiveRefresher, TokenRefresher, Tokens};
+use crate::clients::warmer::{AccountWarmer, LiveWarmer};
+use crate::records::probe::{LiveUsageProber, PlanProber, ProbeStatus, Usage, UsageProber};
+use crate::records::quota::Quota;
+use crate::records::stats::{
     AccountSnapshot, GateReason, RequestLogEntry, SessionKind, SessionSnapshot, StatsSnapshot,
 };
-use crate::warmer::{AccountWarmer, LiveWarmer};
 
 mod groups;
 use groups::GroupPolicy;
@@ -58,6 +58,7 @@ mod peer_lend;
 // `Manager`.
 pub use peer_lend::HandedCredential;
 pub mod resets;
+pub mod schedule;
 mod select;
 mod snapshot;
 mod state;
@@ -195,12 +196,12 @@ const CACHE_WARM_HOLD_SECS: i64 = 300;
 /// value every hold-or-move decision reads (the hard gate's "does this hold outlive
 /// the cache", the soft divert's "does it clear while warm", and the idle-cold
 /// re-key). Built once per request by [`Manager::warm_window`] from what that
-/// session's latest request asked of `cache_control` (see [`crate::cache_ttl`]),
+/// session's latest request asked of `cache_control` (see [`crate::records::cache_ttl`]),
 /// and passed down rather than re-derived, so no two decisions can disagree about
 /// the same session.
 ///
 /// Two values, no third: [`Self::DEFAULT`] is [`CACHE_WARM_HOLD_SECS`], the 5-minute
-/// window; [`Self::EXTENDED`] is [`crate::affinity::EXTENDED_PIN_TTL_MS`], the 55
+/// window; [`Self::EXTENDED`] is [`crate::stores::affinity::EXTENDED_PIN_TTL_MS`], the 55
 /// minutes the pin store already trusts a 1h prefix for (derived there from 52,951
 /// usage records). A caller with no session to ask passes `DEFAULT`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,7 +216,7 @@ impl WarmWindow {
     };
     /// The window of a session whose latest request asked for `"ttl":"1h"`.
     pub const EXTENDED: Self = Self {
-        ms: crate::affinity::EXTENDED_PIN_TTL_MS,
+        ms: crate::stores::affinity::EXTENDED_PIN_TTL_MS,
     };
 
     /// The window in milliseconds.
@@ -270,7 +271,7 @@ const ERROR_REPROBE_CAP_MS: i64 = 30 * 60_000;
 ///
 /// What DID change is the wall clock, and only because the cadence moved. Three
 /// failures are three of this account's own randomly drawn intervals, so at the
-/// default [`crate::probe::DEFAULT_PROBE_SECONDS`] (300s, drawn `+/-30%`) the
+/// default [`crate::base::config::extra_keys::DEFAULT_PROBE_SECONDS`] (300s, drawn `+/-30%`) the
 /// bound is 10.5-19.5 minutes rather than the old ~2.5. That is longer but still
 /// bounded, still a fraction of any sane `warmupSeconds` (3600s is the usual
 /// value), and it is only ever paid when the probe is genuinely broken — a
@@ -306,7 +307,7 @@ const WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT: u32 = 3;
 /// Flat cooldown before a keep-warm-excluded account (see
 /// [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`]) is retried. An hour: two orders of
 /// magnitude cheaper than retrying every probe cycle (probe cadence defaults to
-/// minutes, not hours — see [`crate::probe::DEFAULT_PROBE_SECONDS`]) while still
+/// minutes, not hours — see [`crate::base::config::extra_keys::DEFAULT_PROBE_SECONDS`]) while still
 /// recovering well inside a restart's cost. Deliberately a flat wait, not
 /// exponential backoff like [`AccountRuntime::error_backoff_ms`]: a header-less
 /// warm response is not evidence the account is unhealthy (unlike a rejected
@@ -418,8 +419,8 @@ impl std::fmt::Debug for PendingCodexWriteback {
 impl PendingCodexWriteback {
     pub(in crate::manager) fn from_config(account: &config::Account) -> Option<Self> {
         match account.provider {
-            crate::provider::Provider::Anthropic => return None,
-            crate::provider::Provider::Codex => {}
+            crate::base::provider::Provider::Anthropic => return None,
+            crate::base::provider::Provider::Codex => {}
         }
         account.codex_home.as_ref()?;
         let record = account.extra.get(config::CODEX_SYNC_PENDING_KEY)?;
@@ -473,7 +474,7 @@ pub(in crate::manager) enum RequestClass {
     /// Two opt-ins lift that, both off by default, and both leave
     /// [`Manager::pool_pick_respects_control_reserve`]'s floor in force:
     /// `groupSettings.<g>.allowControlAccount` for one explicit `--group g` ask,
-    /// and [`crate::config::Config::control_pooled`] for the whole pool.
+    /// and [`crate::base::config::Config::control_pooled`] for the whole pool.
     Inference,
     /// `/api/event_logging*`, `/mcp-registry*` — high-volume noise. Follows the
     /// requesting connection ([`Manager::conn_affinity`]) rather than the
@@ -491,20 +492,20 @@ pub(in crate::manager) enum RequestClass {
 // Only a request WITHOUT a client bearer reaches this classifier on a `Noise`
 // or `ControlPreferred` path: with one, `proxy::relay_mode` relays every
 // non-inference path under the client's own credential first, and the
-// `controlIdentity` check (`crate::control_identity`) has already confirmed
+// `controlIdentity` check (`crate::clients::control_identity`) has already confirmed
 // that credential IS the control account. So the control-preferred pick below
 // is the bearer-less fallback, not the identity plane's main road.
 
 /// Classify an unpinned request's path into the three-way split. Inference is
 /// whatever the path's own provider calls inference
-/// ([`crate::provider::Provider::is_inference_path`]): exact matches only,
+/// ([`crate::base::provider::Provider::is_inference_path`]): exact matches only,
 /// which keeps `stable_session_key`'s `/v1/messages/count_tokens must NOT
 /// prefix-match /v1/messages` guard, read from the one list in
-/// `crate::provider` rather than a copy here that could drift from it. Prefix
+/// `crate::base::provider` rather than a copy here that could drift from it. Prefix
 /// match for the two noise paths, matching the bridge's own examples
 /// (`/api/event_logging/v2/batch`, and any `/mcp-registry...` route).
 pub(in crate::manager) fn classify_request(path: &str) -> RequestClass {
-    let provider = crate::provider::Provider::of_path(path);
+    let provider = crate::base::provider::Provider::of_path(path);
     if provider.is_inference_path(path) {
         RequestClass::Inference
     } else if path.starts_with("/api/event_logging") || path.starts_with("/mcp-registry") {
@@ -601,7 +602,7 @@ pub struct Manager {
     ///
     /// A refresh token is SINGLE-USE, so a draining request that reaches
     /// `ensure_fresh` would rotate a token the successor is also holding, and
-    /// invalidate the successor's copy — the token war `crate::singleton`
+    /// invalidate the successor's copy — the token war `crate::stores::singleton`
     /// exists to prevent, arriving from inside one lineage rather than between
     /// two rival proxies.
     ///
@@ -609,7 +610,7 @@ pub struct Manager {
     /// `ServerHandle::shutdown_within` ends by calling [`Self::persist_now`],
     /// so an ungated predecessor writes its now-stale in-memory tokens over the
     /// successor's fresh ones as its LAST act. That is the failure
-    /// `crate::singleton`'s module doc describes — boot-time tokens written
+    /// `crate::stores::singleton`'s module doc describes — boot-time tokens written
     /// back over fresh ones — through a new door.
     ///
     /// Terminal on purpose: nothing clears it. A process that has given away
@@ -619,8 +620,8 @@ pub struct Manager {
     /// Notices that the machine slept between two upstream sends, so
     /// [`Self::enter_in_flight`] can retire every account's pooled connection
     /// before the first post-wake send checks out one the sleep killed. See
-    /// [`crate::wake`] for why the pool's own idle timers cannot.
-    wake: crate::wake::WakeDetector,
+    /// [`crate::clients::wake`] for why the pool's own idle timers cannot.
+    wake: crate::clients::wake::WakeDetector,
     upstream: String,
     /// Where a Codex account's requests go ([`config::Config::codex_upstream`]). Read
     /// through [`Self::upstream_for`]; `upstream` above stays the Anthropic origin.
@@ -635,9 +636,9 @@ pub struct Manager {
     unkeyed: crate::request_key::UnkeyedCounters,
     global_threshold: f64,
     /// Override for the Fable weekly bucket alone — see
-    /// [`crate::config::Config::fable_weekly_threshold`]. `None` means "use
+    /// [`crate::base::config::Config::fable_weekly_threshold`]. `None` means "use
     /// whatever threshold the site would apply anyway", resolved by
-    /// [`crate::config::effective_fable_threshold`] at the two call
+    /// [`crate::base::config::effective_fable_threshold`] at the two call
     /// sites ([`Self::model_blocked`], [`Self::account_gate`]'s `FableWeekly`
     /// push). Snapshotted at construction, same restart-to-take-effect contract
     /// as `global_threshold` above.
@@ -658,11 +659,11 @@ pub struct Manager {
     /// means this process loaded no TLS material, which [`Self::mitm_status`]
     /// reports as MITM off.
     mitm: std::sync::OnceLock<crate::status::MitmStatus>,
-    /// The fan controller's handle ([`crate::fan`]), installed once by the
+    /// The fan controller's handle ([`crate::stores::fan`]), installed once by the
     /// binary after the bind ([`Self::install_fan`]). Unset in a library
     /// caller or a test that did not ask for one: such a process runs no fan
     /// control, its status carries no `fanControl`, and `/_tcr/fan` says so.
-    fan: std::sync::OnceLock<Arc<crate::fan::FanHandle>>,
+    fan: std::sync::OnceLock<Arc<crate::stores::fan::FanHandle>>,
     /// The Codex 429s this process sent itself in the last ten minutes, and the latest one
     /// ([`Self::note_codex_refusal`], [`Self::codex_traffic`]). A leaf lock, never held with
     /// another. In memory only: a restart empties it.
@@ -702,9 +703,9 @@ pub struct Manager {
     /// drops it, and only then records here; `Self::snapshot` holds the accounts
     /// READ lock across its `usage_row` calls, which is safe precisely because
     /// no path ever runs the other way round.
-    usage: crate::usage::UsageTracker,
+    usage: crate::records::usage::UsageTracker,
     /// Runtime-only, cold quota fits indexed by the same stable slots as accounts.
-    forecast: Mutex<Vec<crate::forecast::Calibration>>,
+    forecast: Mutex<Vec<crate::records::forecast::Calibration>>,
     /// Resolved hard-lock target (index of the account named by `config.lockAccount`),
     /// or `None` when unlocked / the name did not match. For its own provider,
     /// [`Self::select`] returns `i` (bypassing rotation/affinity/migration) with
@@ -741,7 +742,7 @@ pub struct Manager {
     /// GCRA theoretical-arrival-times (epoch ms) for each provider's fleet ceiling.
     /// Independent upstreams never spend one another's burst budget. Same discipline
     /// as [`Self::org_tat_ms`]: held only for the O(1) update, released before sleep.
-    fleet_tat_ms: AsyncMutex<HashMap<crate::provider::Provider, i64>>,
+    fleet_tat_ms: AsyncMutex<HashMap<crate::base::provider::Provider, i64>>,
     log: Mutex<VecDeque<RequestLogEntry>>,
     current: Mutex<Option<usize>>,
     /// The slot that most recently served each provider, as [`Self::current`] is for either:
@@ -751,7 +752,7 @@ pub struct Manager {
     /// Lock order: taken alone, after [`Self::current`] is released. `snapshot` reads it while
     /// it holds the accounts lock, so [`Self::set_current`] reads the slot's provider (the
     /// accounts lock, released) BEFORE it takes this or `current`.
-    current_by_provider: Mutex<crate::stats::CurrentByProvider>,
+    current_by_provider: Mutex<crate::records::stats::CurrentByProvider>,
     /// Monotonic counter handed out one tick at a time by [`Manager::select`] to
     /// stamp the account it picks, so the next select prefers a different one
     /// (load spread). Starts at 1 so 0 reads unambiguously as "never selected".
@@ -768,9 +769,9 @@ pub struct Manager {
     /// eligibility) so the two can never deadlock.
     affinity: Mutex<CappedMap<u64, (usize, i64)>>,
     /// Session keys whose MOST RECENT request carried Anthropic's extended
-    /// `"cache_control": {"ttl": "1h"}` (see [`crate::cache_ttl`]), so
+    /// `"cache_control": {"ttl": "1h"}` (see [`crate::records::cache_ttl`]), so
     /// [`Manager::affinity_pin_snapshot`] knows which persisted
-    /// pins get [`crate::affinity::EXTENDED_PIN_TTL_MS`] instead of the
+    /// pins get [`crate::stores::affinity::EXTENDED_PIN_TTL_MS`] instead of the
     /// default at the next restart. Deliberately a side map rather than a third
     /// tuple field on `affinity` itself: nothing on the selection path
     /// (`select/`) needs to read it, only the snapshot/restore bridge does, so
@@ -783,13 +784,13 @@ pub struct Manager {
     /// affinity is off or there is no affinity file.
     affinity_extended: Mutex<CappedSet<u64>>,
     /// The pin file's dirty flag, flusher wake-up and last write (see
-    /// [`Manager::mark_affinity_dirty`] and [`crate::affinity`]). Shape: which session is pinned
+    /// [`Manager::mark_affinity_dirty`] and [`crate::stores::affinity`]). Shape: which session is pinned
     /// to which account; the touch times are written at most once per
     /// [`AFFINITY_TOUCH_REFRESH`].
-    affinity_file: crate::cache_file::SavedFile,
+    affinity_file: crate::stores::cache_file::SavedFile,
     /// Hashed account-bound token → (account index, kind, mint ms): who minted each advisor id,
     /// thinking signature, redacted-thinking payload and message id the fleet has served. See
-    /// [`crate::bound_tokens`] for the rule — a conversation carrying one of these is served by
+    /// [`crate::stores::bound_tokens`] for the rule — a conversation carrying one of these is served by
     /// its minting account or by nobody, because no other account can read it back.
     ///
     /// Keyed by HASH, never the token itself: a thinking signature is several hundred bytes and
@@ -806,7 +807,7 @@ pub struct Manager {
     /// The bound-token file's dirty flag, flusher wake-up and last write. Every change is shape
     /// here (a new token is what a restart needs), so the gate only skips a save whose map is
     /// already on disk.
-    bound_tokens_file: crate::cache_file::SavedFile,
+    bound_tokens_file: crate::stores::cache_file::SavedFile,
     /// Session keys already logged as held to their pin by bound history, so a long
     /// conversation costs one line and not one per turn. Diagnostic only: nothing routes on it.
     bound_history_logged: Mutex<HashSet<u64>>,
@@ -821,14 +822,14 @@ pub struct Manager {
     sessions: Mutex<CappedMap<u64, SessionStat>>,
     /// The Claude Code `session_id`-keyed table with tool-call timing (F1,
     /// `docs/design/panel-tabs.md`), on a different grain from [`Self::sessions`] above — see
-    /// [`crate::session_wire`] for the tracker itself and [`crate::stats::StatsSnapshot::wire_sessions`]
+    /// [`crate::records::session_wire`] for the tracker itself and [`crate::records::stats::StatsSnapshot::wire_sessions`]
     /// for where it surfaces. A separate lock from every other field here: nothing on the
     /// routing path reads it, so it is never held together with `accounts` or `affinity`.
-    wire_sessions: Mutex<crate::session_wire::WireSessionTracker>,
+    wire_sessions: Mutex<crate::records::session_wire::WireSessionTracker>,
     /// The Sessions/Tools cache's dirty flag, flusher wake-up and last write
-    /// ([`crate::session_wire_persist`]). Shape: which sessions the table holds; their counters
+    /// ([`crate::stores::session_wire_persist`]). Shape: which sessions the table holds; their counters
     /// and times are written at most once per [`WIRE_SESSIONS_REFRESH`].
-    wire_sessions_file: crate::cache_file::SavedFile,
+    wire_sessions_file: crate::stores::cache_file::SavedFile,
     /// Monotonic session-key source handed out by [`Manager::next_session_key`],
     /// one per connection. Starts at 1 so the first key is a nonzero, unique u64.
     session_seq: AtomicU64,
@@ -883,20 +884,20 @@ pub struct Manager {
     /// `config.control_pooled`; default `false`, which preserves the rule that
     /// an inference request never selects the control account.
     ///
-    /// Read [`crate::config::Config::control_pooled`] before changing this: the
+    /// Read [`crate::base::config::Config::control_pooled`] before changing this: the
     /// reserve is a floor over LAGGING headers, so `true` accepts that inference
     /// can burn the control account into `rejected` and cost the identity plane
     /// its anchor until the weekly window resets.
     control_pooled: bool,
     /// Boot-time snapshot of `config.control_identity` — see
-    /// [`crate::control_identity`].
+    /// [`crate::clients::control_identity`].
     control_identity: config::ControlIdentityMode,
     /// Client bearers the proxy has resolved to an identity, for the check
     /// [`Self::control_identity`] governs.
-    client_identities: crate::control_identity::ClientIdentityCache,
+    client_identities: crate::clients::control_identity::ClientIdentityCache,
     /// Width in MILLISECONDS of the reset-urgency bucket that rotation ranks by
     /// within a priority tier, resolved once from
-    /// [`crate::config::Config::reset_urgency_tier_hours`] at construction
+    /// [`crate::base::config::Config::reset_urgency_tier_hours`] at construction
     /// (boot-time snapshot — an edit needs a restart). `0` disables the term,
     /// restoring the pre-tier `(priority, last_selected_seq, reset)` ordering.
     ///
@@ -905,9 +906,9 @@ pub struct Manager {
     /// hour-conversion at the top of every selection loop.
     reset_urgency_tier_ms: i64,
     /// The upstream errors and served model ids this boot has seen, per provider, for the
-    /// routing document ([`crate::routing`]). Observability only: no selection reads it.
+    /// routing document ([`crate::proxy::routing`]). Observability only: no selection reads it.
     /// A leaf lock, never held while another is taken.
-    routing: Mutex<crate::observations::Observations>,
+    routing: Mutex<crate::records::observations::Observations>,
 }
 
 const fn odt_to_ms(now: OffsetDateTime) -> i64 {
@@ -969,10 +970,10 @@ impl Manager {
 
     /// The origin a request for `provider` is rewritten to. `upstream()` stays the Anthropic
     /// accessor its existing callers (profile fetch, control identity) mean.
-    pub fn upstream_for(&self, provider: crate::provider::Provider) -> &str {
+    pub fn upstream_for(&self, provider: crate::base::provider::Provider) -> &str {
         match provider {
-            crate::provider::Provider::Anthropic => &self.upstream,
-            crate::provider::Provider::Codex => &self.codex_upstream,
+            crate::base::provider::Provider::Anthropic => &self.upstream,
+            crate::base::provider::Provider::Codex => &self.codex_upstream,
         }
     }
 
@@ -1042,7 +1043,7 @@ impl Manager {
     /// Persist one `tcr config set` setting to the config file, for the
     /// [`crate::proxy::CONFIG_PATH`] route.
     ///
-    /// The FILE only, never `self.config`: see [`crate::config_set`] for why
+    /// The FILE only, never `self.config`: see [`crate::base::config_set`] for why
     /// changing the in-memory copy would switch three of these keys on halfway.
     /// What this process runs keeps being what it booted with, which is what
     /// [`Self::running_settings`] reports, and the difference is what TcrBar
@@ -1054,8 +1055,8 @@ impl Manager {
     /// moment cannot drop this key, nor this write drop its token.
     pub fn persist_setting(
         &self,
-        setting: &crate::config_set::Setting,
-    ) -> Result<crate::config_set::SettingWrite, SettingPersistError> {
+        setting: &crate::base::config_set::Setting,
+    ) -> Result<crate::base::config_set::SettingWrite, SettingPersistError> {
         let Some(path) = &self.config_path else {
             return Err(SettingPersistError::NoConfigFile);
         };
@@ -1063,7 +1064,7 @@ impl Manager {
             .config_write
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        crate::config_set::save_setting(path, setting).map_err(|err| {
+        crate::base::config_set::save_setting(path, setting).map_err(|err| {
             tracing::error!(
                 error = %err,
                 key = %setting.key(),
@@ -1075,13 +1076,13 @@ impl Manager {
     }
 
     /// The rotation and limit settings this process is running: its boot-time
-    /// snapshot, read through the same [`crate::config_show::ConfigSettings`]
+    /// snapshot, read through the same [`crate::base::config_show::ConfigSettings`]
     /// constructor `tcr config show` reads the file with, so a key compares
     /// equal on both sides exactly when the running value is the saved one.
-    pub fn running_settings(&self) -> crate::config_show::ConfigSettings {
+    pub fn running_settings(&self) -> crate::base::config_show::ConfigSettings {
         let path = self.config_path.clone().unwrap_or_default();
         let config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
-        crate::config_show::ConfigSettings::from_config(&config, &path)
+        crate::base::config_show::ConfigSettings::from_config(&config, &path)
     }
 
     /// Record which account actually served the most recent request, and that it is now the

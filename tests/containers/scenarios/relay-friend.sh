@@ -29,7 +29,7 @@
 #   6. disable node-a1's own account and restart it, then drive one request
 #      through its own proxy (lease-borrow.sh:125-163 is the model)
 #   7. node-a1's boot log carries the dialler's own `via=` line
-#      (src/peer/serve.rs:2563-2567), naming node-c1 as the Mac that carried,
+#      (src/peer/serve/mod.rs), naming node-c1 as the Mac that carried,
 #      AND the lease request that rode that stream did not fail
 #
 # There is no `kind=Via` assertion here. Production never constructs
@@ -37,7 +37,7 @@
 # one from a real forward.
 #
 # `via=` alone is not enough either, measured directly below: `open_forward_to`
-# (src/peer/tunnel.rs) returns a stream the instant it has ASKED node-c1 to
+# (src/peer/tunnel/mod.rs) returns a stream the instant it has ASKED node-c1 to
 # carry, before node-c1 has said yes, so `via=` prints whether node-c1
 # authorizes the forward or not. The second assertion is the one that actually
 # depends on the grant: a node-c1 that refuses closes the carried stream
@@ -152,8 +152,8 @@ if [ -z "$c_id_from_a" ] || [ -z "$b_id_from_a" ] || [ -z "$a_id_from_b" ] || [ 
 fi
 pass "every pinned row resolved to exactly one id on each side"
 
-# --- the grant matrix, derived from src/peer/serve.rs:2658 and
-#     src/peer/tunnel.rs:1353 -------------------------------------------------
+# --- the grant matrix, derived from src/peer/serve/mod.rs and
+#     src/peer/tunnel/mod.rs:1353 -------------------------------------------------
 nx node-a1 tcr peer allow "$c_id_from_a" carry on --peers "$PEERS" >/dev/null 2>&1 || true
 nx node-a1 tcr peer allow "$b_id_from_a" disclose on --peers "$PEERS" >/dev/null 2>&1 || true
 nx node-b1 tcr peer allow "$a_id_from_b" inspect on --peers "$PEERS" >/dev/null 2>&1 || true
@@ -237,7 +237,7 @@ echo "relay-friend: node-a1's borrow request: $borrow"
 
 # --- the observable, in two parts ---------------------------------------
 #
-# `open_forward_to` (src/peer/tunnel.rs) never waits for the forwarder's
+# `open_forward_to` (src/peer/tunnel/mod.rs) never waits for the forwarder's
 # answer before returning a stream (its own doc comment: "nothing here waits
 # for an acknowledgement"), so the `via=` line alone fires the instant this
 # Mac finishes asking node-c1 to carry, whether node-c1 actually authorizes
@@ -248,7 +248,7 @@ echo "relay-friend: node-a1's borrow request: $borrow"
 # of dialling node-b1 with it. So the gate is the PAIR: `via=` on its own
 # would have passed the forced red below too.
 wait_for_log node-a1 'via=' 90 >/dev/null || true
-expect_log node-a1 'via=' "node-a1's log carries the dialler's own via= line, naming the Mac that carried (src/peer/serve.rs:2563-2567)"
+expect_log node-a1 'via=' "node-a1's log carries the dialler's own via= line, naming the Mac that carried (src/peer/serve/mod.rs)"
 refute_log node-a1 'peer lease: asking for a lease failed' "the lease request that rode that stream did not fail (a forwarder that refused the carry closes it instead of reaching node-b1, and the request fails right there)"
 
 finish

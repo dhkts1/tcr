@@ -5,7 +5,7 @@ import Foundation
 /// already runs before starting. A colleague's "Start server" was disabled
 /// with no reason at all; this names one.
 ///
-/// `takeover_port` (`src/singleton.rs`) prints one extra stderr line whenever
+/// `takeover_port` (`src/stores/singleton/mod.rs`) prints one extra stderr line whenever
 /// a NON-proxy process holds the port, ahead of the bind failure that
 /// follows it either way: `":{port} is held by a non-proxy process (pid
 /// {pid}): {cmd}"`. `ServerController.classifyExit` folds that stderr,
@@ -51,7 +51,7 @@ extension ServerController.State {
 /// The refusal a `tcr` built before Codex accounts gives when the config it loads holds
 /// one, and the sentence TcrBar says in its place.
 ///
-/// The producer is tcr's config loader (`src/config.rs`): an account whose
+/// The producer is tcr's config loader (`src/base/config.rs`): an account whose
 /// `credentialVersion` is newer than the build understands is refused, with the whole
 /// load, rather than read in a shape it does not know. A Codex account is written at a
 /// newer version than any `tcr` from before Codex accounts understands, so every

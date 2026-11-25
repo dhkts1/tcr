@@ -36,7 +36,7 @@
 //!
 //! This module takes no `tracing` import at all, deliberately: a refusal
 //! never names a Mac, an address or a key, the rule `MovedRefusal` states at
-//! `src/peer/moved.rs:262-270`. A forwarded blob's reader learns nothing more
+//! `src/peer/config/moved.rs`. A forwarded blob's reader learns nothing more
 //! from watching this Mac refuse it than from watching it stay silent.
 //!
 //! # Framing
@@ -45,7 +45,7 @@
 //! bytes outside the seal, then a version byte, then the payload. The length
 //! is checked before any AEAD runs, so a chat client that truncated a paste
 //! is told it was cut short rather than called a forgery
-//! (`src/peer/moved.rs:106`, `:430`).
+//! (`src/peer/config/moved.rs`).
 
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::Crockford;
@@ -235,7 +235,7 @@ pub enum Opened {
 
 /// Why a reply did not open. Never carries a peer, a label, an address or any
 /// part of what was pasted, the rule `MovedRefusal` states at
-/// `src/peer/moved.rs:262-270`.
+/// `src/peer/config/moved.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplyRefusal {
     /// The prefix or the magic did not match: not one of ours.
@@ -309,7 +309,7 @@ pub struct PendingAsk {
 
 impl std::fmt::Debug for PendingAsk {
     /// The private key is deliberately not printed, [`MovedKeys`](crate::peer::config::moved::MovedKeys)'s own move
-    /// (`src/peer/moved.rs:148-153`) for the same reason: a `{:?}` in a log
+    /// (`src/peer/config/moved.rs`) for the same reason: a `{:?}` in a log
     /// line is how a secret reaches a file that keeps scrollback.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingAsk")

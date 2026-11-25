@@ -27,7 +27,7 @@ unused_qualifications = "warn"
 # No `.unwrap()` or `.expect()` outside tests.
 unwrap_used = "deny"
 expect_used = "deny"
-# No `let _ = <must_use expr>`: a dropped `Result` goes through `tcr::log_err::LogErr` instead.
+# No `let _ = <must_use expr>`: a dropped `Result` goes through `tcr::base::log_err::LogErr` instead.
 let_underscore_must_use = "deny"
 
 pedantic = { level = "warn", priority = -1 }
@@ -205,59 +205,59 @@ path = "tests/it/main.rs"
 # Owns MITM's process-global loaded leaf while preparing isolated agent fixtures.
 [[test]]
 name = "tool_proxy_env"
-path = "tests/tool_proxy_env.rs"
+path = "tests/proxy/tool_proxy_env.rs"
 
 [[test]]
 name = "codex_log_lines"
-path = "tests/codex_log_lines.rs"
+path = "tests/codex/codex_log_lines.rs"
 [[test]]
 name = "peer_forward"
-path = "tests/peer_forward.rs"
+path = "tests/peer/reach/peer_forward.rs"
 [[test]]
 name = "peer_refusal_log"
-path = "tests/peer_refusal_log.rs"
+path = "tests/peer/pairing/peer_refusal_log.rs"
 [[test]]
 name = "usage-ledger-write-failure-policy"
-path = "tests/usage-ledger-write-failure-policy.rs"
+path = "tests/proxy/usage-ledger-write-failure-policy.rs"
 # The global subscriber again, and an in-process `server::serve`, which installs the egress
 # peers path, the peer-lease fallback and the probe path table for the whole process:
 [[test]]
 name = "peer_boot"
-path = "tests/peer_boot.rs"
+path = "tests/peer/peer_boot.rs"
 # `server::serve` in process (see `peer_boot`):
 [[test]]
 name = "serve_library_path"
-path = "tests/serve_library_path.rs"
+path = "tests/proxy/serve_library_path.rs"
 [[test]]
 name = "peer_borrow_hot"
-path = "tests/peer_borrow_hot.rs"
+path = "tests/peer/lending/peer_borrow_hot.rs"
 # `fallback::install_provider`, which installs once per process:
 [[test]]
 name = "codex_never_borrowed"
-path = "tests/codex_never_borrowed.rs"
+path = "tests/codex/codex_never_borrowed.rs"
 [[test]]
 name = "peer_lease"
-path = "tests/peer_lease.rs"
+path = "tests/peer/lending/peer_lease.rs"
 # `egress::install_peers_path`, which installs once per process:
 [[test]]
 name = "peer_egress"
-path = "tests/peer_egress.rs"
+path = "tests/peer/reach/peer_egress.rs"
 # The leaf the process loaded last decides which CONNECT hosts `mitm` terminates:
 [[test]]
 name = "intercepted_host"
-path = "tests/intercepted_host.rs"
+path = "tests/proxy/intercepted_host.rs"
 # Both publish router mappings to the process-wide register `reach::external_socket` reads,
 # which the dead-drop and listener paths in other modules advertise:
 [[test]]
 name = "peer_reach"
-path = "tests/peer_reach.rs"
+path = "tests/peer/reach/peer_reach.rs"
 [[test]]
 name = "peer_reach_upnp"
-path = "tests/peer_reach_upnp.rs"
+path = "tests/peer/reach/peer_reach_upnp.rs"
 
 [dependencies]
 # The shared `tcr status --json` wire type (`AccountStatusRow`), consumed by
-# `render_accounts_json` in `src/cli.rs`.
+# `render_accounts_json` in `src/verbs/cli/mod.rs`.
 tcr-status-wire = { path = "crates/tcr-status-wire" }
 # The descriptor transport and peer code-signature check for the socket
 # handoff. A separate crate so the unsafe they require stays out of this one,
@@ -271,15 +271,15 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 # needed to serve the axum router over a raw/TLS stream in MITM mode. Already in
 # the tree transitively (via axum/reqwest); this just pins the glue we call directly.
 # "server-auto" pulls in the auto h1/h2-negotiating connection builder
-# (hyper_util::server::conn::auto::Builder) used in src/mitm.rs so base-URL/MITM
+# (hyper_util::server::conn::auto::Builder) used in src/proxy/mitm/mod.rs so base-URL/MITM
 # clients can negotiate h2 instead of being forced to h1.
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 # `rustls-no-provider`, not `rustls`: the latter compiles aws-lc-rs, a C library, beside the ring
 # provider rustls and tokio-rustls already use here. Every client is built through
-# `tcr::http_client::builder`, which installs ring first (a build without it panics).
+# `tcr::base::http_client::builder`, which installs ring first (a build without it panics).
 reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "rustls-no-provider", "http2"] }
 # The Mozilla root set every client trusts, as DER certificates for reqwest's `tls_certs_only`
-# (`tcr::http_client::builder`). reqwest 0.12's `rustls-tls` compiled this set in through
+# (`tcr::base::http_client::builder`). reqwest 0.12's `rustls-tls` compiled this set in through
 # `webpki-roots`; 0.13 would check against the OS trust store instead, and Gil chose to keep
 # the bundled set on every OS (2026-10-17). Same data, same publisher; `webpki-roots` left
 # the lock with reqwest 0.12.
@@ -298,7 +298,7 @@ serde = { version = "1", features = ["derive"] }
 # borrow the verbatim source bytes of `metadata.user_id` instead of hand-rolling
 # a JSON container-stack state machine to find them.
 serde_json = { version = "1", features = ["raw_value"] }
-# gzip for the usage ledger's closed days (`src/usage.rs`, "Closed days are gzipped"): a day
+# gzip for the usage ledger's closed days (`src/records/usage/mod.rs`, "Closed days are gzipped"): a day
 # of ledger lines is about 20 MB and is kept for `usageRetentionDays`. Default features: the
 # pure-Rust miniz_oxide backend, so no C library comes with it.
 flate2 = "1.1.10"
@@ -398,7 +398,7 @@ snow = { version = "0.10", default-features = false, features = ["use-curve25519
 # socket-pktinfo and spin. The design predicted four and did not name `spin`.
 mdns-sd = "0.21"
 # Walks the real interface list for the Peers tab's "is there a LAN to look
-# on" fact (src/status/network_fact.rs). A route lookup on a documentation
+# on" fact (src/peer/reach/network_fact.rs). A route lookup on a documentation
 # address stood in first, but that needs a default gateway: a Mac with an
 # interface up and addressed and NO gateway (a hotspot with no uplink, an
 # isolated office LAN, two Macs on a link with no router) still finds peers
@@ -409,15 +409,15 @@ if-addrs = "0.15"
 # The peer-mesh wire types, shared by both ends of a peer stream: the same
 # split, and for the same reason, as `tcr-status-wire` above.
 tcr-peer-wire = { path = "crates/tcr-peer-wire" }
-# CPU temperature and fan speeds from AppleSMC (src/heat.rs, `StatusPayload::heat`). A crate
+# CPU temperature and fan speeds from AppleSMC (src/stores/heat.rs, `StatusPayload::heat`). A crate
 # of its own for the reason `tcr-fdpass` is one: IOKit calls are unsafe and this crate is
 # #![forbid(unsafe_code)]. No package of its own: it declares its IOKit calls by hand.
 tcr-smc = { path = "crates/tcr-smc" }
 # The root fan helper's wire contract, both ends' signing identities and the macOS XPC
-# client (`tcr fan probe`, src/fan_probe.rs). A crate of its own for the same reason: libxpc
+# client (`tcr fan probe`, src/verbs/fan_probe.rs). A crate of its own for the same reason: libxpc
 # calls are unsafe. The helper binary itself is `crates/tcr-fan-helper`, never part of tcr.
 tcr-fan = { path = "crates/tcr-fan" }
-# The 128 opaque bits of a lease id (`Ledger::grant`, src/peer/lease.rs). Granted
+# The 128 opaque bits of a lease id (`Ledger::grant`, src/peer/lease/mod.rs). Granted
 # as a DIRECT dependency rather than reached for through `snow`: 0.3.4 is already
 # in `Cargo.lock` (snow's `use-getrandom` resolves it), so this adds one
 # dependency EDGE and no package. A lease id is not Noise material and minting it
@@ -425,7 +425,7 @@ tcr-fan = { path = "crates/tcr-fan" }
 # the source of a number that has nothing to do with a handshake.
 getrandom = "0.4"
 # HMAC-SHA256 for the opt-in network key's announcement tag
-# (`NetworkKey::announcement_tag`, src/peer/config.rs). Granted as a DIRECT
+# (`NetworkKey::announcement_tag`, src/peer/config/mod.rs). Granted as a DIRECT
 # dependency for the same reason `getrandom` above is: 0.10.9 is already in
 # `Cargo.lock` because `snow`'s `use-sha2` feature resolves it, so this adds one
 # dependency EDGE and no package (`cargo tree -i sha2`). The HMAC construction
@@ -433,7 +433,7 @@ getrandom = "0.4"
 # the lock (`cargo tree -i hmac` prints nothing) and would be a genuinely new
 # package; it is verified against RFC 4231's test case 2, not against itself.
 sha2 = "0.11"
-# ChaCha20-Poly1305 for the sealed per-pair record (`peer::drop::seal`).
+# ChaCha20-Poly1305 for the sealed per-pair record (`peer::config::drop::seal`).
 # Granted as a DIRECT dependency for the same reason `getrandom` and `sha2`
 # above are: 0.10.1 is already in `Cargo.lock` because `snow`'s
 # `use-chacha20poly1305` feature resolves it, so this adds one dependency EDGE
@@ -456,7 +456,7 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 #
 # Pinned exactly: the crate is pre-1.0 and 0.5.0 and 0.6.0 each broke its Rust API and its key
 # format. It brings `aws-lc-sys`, the C crypto library this repository otherwise avoids
-# (`src/http_client.rs`), and with both rustls providers compiled in rustls refuses to pick one, so
+# (`src/base/http_client.rs`), and with both rustls providers compiled in rustls refuses to pick one, so
 # `http_client::install_crypto_provider` must run before the first `Device::new`. The one place
 # that calls `Device::new` (`tailnet_node`'s `LibraryFactory::build`) calls it first.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
@@ -464,7 +464,7 @@ tailscale = { version = "=0.6.1", optional = true }
 
 [dev-dependencies]
 # Property tests over the peer-mesh wire's parse/decode boundary
-# (`tests/peer_props.rs`). Gil approved this as a dev-dependency on
+# (`tests/peer/peer_props.rs`). Gil approved this as a dev-dependency on
 # 2026-09-18, and no other new dependency.
 proptest = "1"
 # This crate again, with `test-support` on, so the integration tests under `tests/` reach the

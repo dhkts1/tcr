@@ -204,7 +204,7 @@ fn pending_row_for_readers(mut knock: peer::state::Knock) -> peer::state::Knock 
 /// all say the same thing.
 ///
 /// The second line is the honest half. The peer socket is bound once, at boot,
-/// from the file as it was then (`src/server.rs`, the `file.listen` read before
+/// from the file as it was then (`src/proxy/server/peer_mesh.rs`, the `file.listen` read before
 /// `listener::bind`); `PeerStore::reload_if_changed` re-reads the policy half
 /// of this file whenever its mtime moves but nothing re-binds a socket, so a
 /// port written now is a port that opens at the next start and not before.

@@ -11,8 +11,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, PoisonError};
 
-use crate::config::{self, Config};
-use crate::oauth;
+use crate::base::config::{self, Config};
+use crate::clients::oauth;
 
 use super::{AccountRuntime, Manager};
 
@@ -50,7 +50,7 @@ impl GroupPolicy {
 
     /// Whether an explicit ask for `group` is held strictly inside it:
     /// `reserved || !spill`. A reserved group ignores `spillToPool`; see
-    /// [`crate::config::GroupSettings::spill_to_pool`].
+    /// [`crate::base::config::GroupSettings::spill_to_pool`].
     pub(super) fn is_strict(&self, group: &str) -> bool {
         self.reserved.contains(group) || !self.spill.contains(group)
     }
@@ -262,7 +262,7 @@ impl Manager {
     /// ACROSS them until this reload existed.
     ///
     /// Matches each running [`AccountRuntime`] to `fresh.accounts` by
-    /// [`crate::identity::same_identity`] — the SAME identity rule
+    /// [`crate::base::identity::same_identity`] — the SAME identity rule
     /// [`Self::persist_tokens`] uses — rather than by name, so a config
     /// mid-way through a login churn (a display name changed, an org backfilled)
     /// still reloads the right row instead of silently dropping its groups.
@@ -282,7 +282,7 @@ impl Manager {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
             for (idx, account) in accounts.iter_mut().enumerate() {
-                let probe = crate::identity::probe(
+                let probe = crate::base::identity::probe(
                     account.provider,
                     &account.name,
                     account.account_uuid.clone(),
@@ -371,14 +371,14 @@ impl Manager {
             let http1_only = config.http1_only;
             config.admit_rows_from(fresh, |candidate| {
                 let already_known = accounts.iter().any(|existing| {
-                    let probe = crate::identity::probe(
+                    let probe = crate::base::identity::probe(
                         existing.provider,
                         &existing.name,
                         existing.account_uuid.clone(),
                         existing.org_uuid.clone(),
                         existing.org_name.clone(),
                     );
-                    crate::identity::same_identity(&probe, candidate)
+                    crate::base::identity::same_identity(&probe, candidate)
                 });
                 if already_known {
                     return false;

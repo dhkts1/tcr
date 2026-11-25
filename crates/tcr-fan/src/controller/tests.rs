@@ -1783,7 +1783,7 @@ fn a_new_mode_drops_a_waiting_hand_back() {
 // When a command is acted on: the number it was sent under against the one
 // the snapshot shows.
 
-/// What `tcr fan` (`fan_wait` in the binary's `src/cli.rs`) reads off a
+/// What `tcr fan` (`fan_wait` in the binary's `src/verbs/cli/fan.rs`) reads off a
 /// snapshot for command number `mine`: settled once the controller acted on
 /// it or a later one, and the state is not on its way somewhere.
 fn reads_settled(snapshot: &Snapshot, mine: u64) -> bool {

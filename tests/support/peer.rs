@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tcr::log_err::LogErr as _;
+use tcr::base::log_err::LogErr as _;
 use tcr::peer::config::id::NodeKey;
 use tcr::peer::config::{self as peer_config, PeerFile, PeerRow};
 use tcr::peer::listener::{self, SessionContext};

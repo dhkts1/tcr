@@ -761,7 +761,7 @@ pub(crate) struct PeerPairArgs {
     /// The pairing holds ONE live handshake across both phases and cannot
     /// be split into two invocations, so a panel has to stay attached to
     /// this process, read these lines and answer on its stdin. The lines
-    /// are `crate::peer::pair::PairEvent` and `tests/peer_pairing.rs`
+    /// are `crate::peer::pair::PairEvent` and `tests/peer/pairing/peer_pairing.rs`
     /// pins them.
     #[arg(long)]
     pub json: bool,

@@ -26,7 +26,7 @@ network is its one `extra` entry; the inside network is its primary `lan`.
 `clients` is a separate top-level list, not a host: a client is a process
 inside a node's OWN namespace, not a Mac of its own, because the proxy binds
 loopback and nothing outside that namespace could reach it
-(`src/server.rs:1977-1979`).
+(`src/proxy/server/mod.rs`).
 """
 
 import json

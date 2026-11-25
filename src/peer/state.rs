@@ -34,11 +34,11 @@ pub const FORMAT_VERSION: u32 = 1;
 
 /// `peer-state.json` in the cache directory, mode 0600.
 ///
-/// The same directory as [`crate::affinity::default_path`]
-/// ([`crate::paths::cache_dir`]): a second cache dir would be a second thing
+/// The same directory as [`crate::stores::affinity::default_path`]
+/// ([`crate::base::paths::cache_dir`]): a second cache dir would be a second thing
 /// to prune.
 pub fn default_path() -> PathBuf {
-    crate::paths::cache_dir().peer_state_file()
+    crate::base::paths::cache_dir().peer_state_file()
 }
 
 /// The runtime-state file that belongs with `peers_path`: the pairing window,
@@ -1771,7 +1771,7 @@ pub fn load_with_origin(path: &Path, now_ms: i64) -> Result<(PeerState, StateOri
     // `accepted` is described one screen up as "the whole of the authorization
     // for a first pairing" and `banned` is the block list, so both are security
     // inputs and a file this program did not write must not decide either.
-    // `crate::config::write_atomic` creates it 0600, so the ordinary case never
+    // `crate::base::config::write_atomic` creates it 0600, so the ordinary case never
     // sees this.
     //
     // The consequence of a bad mode is a COLD START and not a refusal, unlike
@@ -2159,7 +2159,7 @@ fn replace_section(
 ///
 /// The skip exists because most saves change nothing: measured 2026-10-15 on a live proxy,
 /// the file was rewritten every 20 s and consecutive versions were byte-identical. Each
-/// rewrite paid two full disk flushes (this file keeps [`crate::config::Durability::Flushed`],
+/// rewrite paid two full disk flushes (this file keeps [`crate::base::config::Durability::Flushed`],
 /// since it holds bans and pairing windows) and moved the mtime that readers re-read on.
 pub fn save(path: &Path, state: &PeerState) -> Result<()> {
     let file = PeerStateFile {
@@ -2170,7 +2170,7 @@ pub fn save(path: &Path, state: &PeerState) -> Result<()> {
     if holds_exactly(path, &json) {
         return Ok(());
     }
-    crate::config::write_atomic(path, &json)?;
+    crate::base::config::write_atomic(path, &json)?;
     Ok(())
 }
 
@@ -2554,7 +2554,7 @@ mod tests {
             "recordedAtMs": 5,
             "aFieldFromLater": true
         });
-        crate::config::write_atomic(&path, &raw.to_string()).expect("write it back");
+        crate::base::config::write_atomic(&path, &raw.to_string()).expect("write it back");
 
         let (state, origin) = load_with_origin(&path, 10).expect("load");
         assert_eq!(
@@ -2573,7 +2573,7 @@ mod tests {
     fn the_report_carries_an_unknown_mode_word_as_written() {
         let dir = tempfile::tempdir().expect("tempdir");
         let peers_path = dir.path().join("tcr-peers.json");
-        crate::config::write_atomic(&peers_path, r#"{"tailnet": "both"}"#).expect("write");
+        crate::base::config::write_atomic(&peers_path, r#"{"tailnet": "both"}"#).expect("write");
         let report = TailnetReport::read(&peers_path, 1_000).expect("read the report");
         assert_eq!(
             serde_json::to_value(&report).expect("serialize")["mode"],
@@ -2591,7 +2591,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("peer-state.json");
         let id = InstanceId([7_u8; tcr_peer_wire::INSTANCE_ID_BYTES]).to_wire();
-        crate::config::write_atomic(
+        crate::base::config::write_atomic(
             &path,
             &format!(
                 r#"{{"version": 1, "found": [{{"addr": "192.168.1.20", "instanceId": "{id}",

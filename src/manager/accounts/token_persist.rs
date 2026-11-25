@@ -74,7 +74,7 @@ impl Manager {
         account_uuid: Option<String>,
         org_uuid: Option<String>,
         org_name: Option<String>,
-        provider: crate::provider::Provider,
+        provider: crate::base::provider::Provider,
         tokens: &Tokens,
     ) {
         // Defence in depth: `refresh_plan` already refuses to produce a refresh
@@ -99,10 +99,10 @@ impl Manager {
         // may share a name, and when either lacks an account UUID the name fallback
         // alone calls them one account — a tie that would refuse to persist this
         // rotation, or a pairing that would stamp it onto the other provider's row.
-        let probe = crate::identity::probe(provider, name, account_uuid, org_uuid, org_name);
+        let probe = crate::base::identity::probe(provider, name, account_uuid, org_uuid, org_name);
         let sync_pending = match provider {
-            crate::provider::Provider::Anthropic => None,
-            crate::provider::Provider::Codex => {
+            crate::base::provider::Provider::Anthropic => None,
+            crate::base::provider::Provider::Codex => {
                 let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                 accounts
                     .iter()
@@ -155,12 +155,12 @@ impl Manager {
         // Logged with the config lock released (INV2) — a `warn!` is cheap but the
         // critical section above is on the per-connection path's lock.
         match placement {
-            crate::identity::Resolved::One(_) => {}
-            crate::identity::Resolved::None => tracing::warn!(
+            crate::base::identity::Resolved::One(_) => {}
+            crate::base::identity::Resolved::None => tracing::warn!(
                 account = %name,
                 "no loaded config account carries this identity; the rotated token is not in the snapshot and will not reach disk"
             ),
-            crate::identity::Resolved::Many => tracing::warn!(
+            crate::base::identity::Resolved::Many => tracing::warn!(
                 account = %name,
                 "more than one loaded config account carries this identity; refusing to guess which one just rotated, so the rotated token will not reach disk and this account may need `tcr login`"
             ),
@@ -177,7 +177,7 @@ impl Manager {
         // reached the snapshot at all (both branches above say exactly that), so
         // there is nothing of ours to persist and the only thing a write could do
         // is stamp stale copies over whatever is on disk. Write nothing.
-        let crate::identity::Resolved::One(position) = placement else {
+        let crate::base::identity::Resolved::One(position) = placement else {
             return;
         };
         if let Err(err) =

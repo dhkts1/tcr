@@ -3,7 +3,7 @@
 //! # Why this is not in `tcr.json`
 //!
 //! Every field of the main config except group membership and `groupSettings`
-//! is a BOOT-TIME SNAPSHOT (`Config`, `src/config.rs:785`), and that rule is
+//! is a BOOT-TIME SNAPSHOT (`Config`, `src/base/config.rs:785`), and that rule is
 //! load-bearing: a whole evening was lost once to edits that applied perfectly
 //! and were simply not visible yet. Peer policy must not inherit it. A grant
 //! (`tcr peer allow`, `tcr peer lend`, `tcr peer share on`) has to take effect
@@ -18,7 +18,7 @@
 //! once at boot, turning a listener on is a restart-worthy act and saying so
 //! is honest. [`PeerFile::discovery`](crate::peer::config::PeerFile::discovery) is not one of them: the server's
 //! announce and browse tasks re-read this file on every 20-second wake
-//! (`spawn_beacon` and `spawn_browse` in `src/server.rs`), so `tcr peer
+//! (`spawn_beacon` and `spawn_browse` in `src/proxy/server/peer_mesh.rs`), so `tcr peer
 //! find on|off` reaches a running server with no restart. Everything under
 //! [`PeerRow::allow`](crate::peer::config::PeerRow::allow) and [`PeerRow::lend`](crate::peer::config::PeerRow::lend) is re-read whenever this file's
 //! mtime moves, exactly the way `Manager::reload_groups_if_changed`
@@ -27,7 +27,7 @@
 //!
 //! (The blueprint's §4 puts the socket fields in a new `peer` key in
 //! `tcr.json` instead. Same two tiers, one fewer file to explain; this
-//! skeleton keeps them here so nothing in `src/config.rs` changes at all, and
+//! skeleton keeps them here so nothing in `src/base/config.rs` changes at all, and
 //! the coder who lands phase 2 can move them with Gil's answer in hand.)
 //!
 //! # Mode 0600, and what an outstanding invite really is
@@ -279,7 +279,7 @@ pub struct PeerFile {
 ///
 /// The other shape available was `0`, letting the kernel pick and persisting
 /// the port once the socket is bound. It loses twice. Nothing writes a chosen
-/// port back: the bind happens in the serving process (`src/server.rs`), the
+/// port back: the bind happens in the serving process (`src/proxy/server/peer_mesh.rs`), the
 /// write happens in a `tcr peer` process that has already exited, and building
 /// that round trip would add a second writer for one number. And the port has
 /// to be SAYABLE: the other Mac is paired with `tcr peer pair <host:port>`,
@@ -1826,7 +1826,7 @@ pub enum Observed {
 /// collapse that batch to one entry regardless of which caller sent it.
 /// Watch that batch shrink to one by adding a same-host dedup pass to this
 /// function: `five_hundred_brief_addresses_write_once_and_never_outrank_the_paired_endpoint`
-/// (`tests/peer_discovery.rs`) reads two endpoints where it must read two
+/// (`tests/peer/pairing/peer_discovery.rs`) reads two endpoints where it must read two
 /// kinds of evidence, not one address. The connection's-own-source-port rule
 /// a hello batch also needs is therefore scoped to the hello call sites, not
 /// here: see [`endpoints_and_connection_from_hello`].
@@ -3120,7 +3120,7 @@ pub fn save(path: &Path, file: &PeerFile) -> Result<()> {
     let mut file = file.clone();
     file.ensure_lease_ids()?;
     let json = serde_json::to_string_pretty(&file)?;
-    crate::config::write_atomic(path, &json)?;
+    crate::base::config::write_atomic(path, &json)?;
     Ok(())
 }
 
@@ -3632,7 +3632,7 @@ mod tests {
     /// this row's own doc comment names the regression: collapsing that
     /// batch to one entry here would break
     /// `five_hundred_brief_addresses_write_once_and_never_outrank_the_paired_endpoint`
-    /// (`tests/peer_discovery.rs`), which is exactly what happened when a
+    /// (`tests/peer/pairing/peer_discovery.rs`), which is exactly what happened when a
     /// same-host dedup was tried at this layer before it moved to
     /// [`endpoints_and_connection_from_hello`].
     #[test]
@@ -3729,7 +3729,7 @@ mod tests {
     fn a_key_this_build_does_not_know_survives_a_load_and_a_save() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tcr-peers.json");
-        crate::config::write_atomic(
+        crate::base::config::write_atomic(
             &path,
             r#"{"discovery": true, "futureSetting": "app", "futureObject": {"n": 3}}"#,
         )
@@ -3773,7 +3773,8 @@ mod tests {
     fn an_unknown_tailnet_word_loads_as_off_and_is_saved_back() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tcr-peers.json");
-        crate::config::write_atomic(&path, r#"{"discovery": true, "tailnet": "both"}"#).unwrap();
+        crate::base::config::write_atomic(&path, r#"{"discovery": true, "tailnet": "both"}"#)
+            .unwrap();
 
         let mut file = read_or_default(&path).unwrap();
         assert_eq!(file.tailnet, TailnetSetting::Unknown("both".to_string()));

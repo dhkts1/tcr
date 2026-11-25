@@ -1,5 +1,5 @@
 //! One line per E2E-MATRIX scenario, printed the same way `step()` in
-//! `tests/peer_e2e.rs` prints one line per driver step.
+//! `tests/peer/peer_e2e.rs` prints one line per driver step.
 //!
 //! `scripts/peer-e2e-local.sh` (owned by the reverse-dial suite) and a human running
 //! `cargo test --test it peer_e2e:: -- --nocapture` read the same stdout, so this

@@ -1,4 +1,4 @@
-//! The borrower's side: asking a lender for a lease. The `crate::fallback`
+//! The borrower's side: asking a lender for a lease. The `crate::peer::serve::fallback`
 //! provider that asks is [`crate::peer::serve::PeerLeaseProvider`].
 
 use anyhow::{Context as _, Result};
@@ -151,7 +151,7 @@ pub fn lenders_in_ask_order(store: &PeerStore) -> Vec<PeerRow> {
 /// The error arrives as an [`anyhow::Error`] with context wrapped round it, so
 /// the chain is walked for the `reqwest::Error` underneath rather than the
 /// string being matched: a connect failure and a resolver failure are the two
-/// shapes where no byte was sent, and they are exactly the two `src/proxy.rs`
+/// shapes where no byte was sent, and they are exactly the two `src/proxy/mod.rs`
 /// separates out on the direct path with the same two predicates. Anything
 /// else, a reply that never arrived, a body that died mid-stream, may have run
 /// upstream and is never offered to another lender.

@@ -671,7 +671,7 @@ fn revalidation_fable_divert_keeps_the_pin() {
 
 /// A rate-limit hold is a TIMER, not a death — and the timers this proxy arms
 /// are mostly SHORT: a no-guidance transient 429 parks 15s + jitter, and a
-/// `retry-after` park is clamped to 300s (`src/proxy.rs`). Anthropic's default
+/// `retry-after` park is clamped to 300s (`src/proxy/mod.rs`). Anthropic's default
 /// ephemeral prompt cache lives 5 minutes, so re-keying on a 15-second park
 /// throws away a prefix that would still be warm 15 seconds later — and the
 /// session never returns to it, because a re-key is durable.
@@ -1016,7 +1016,7 @@ fn rekeys_with_rejection_rolling_in(remaining_ms: i64, extended: bool) -> bool {
     {
         let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
         accounts[home].quota.status = Some("rejected".to_string());
-        accounts[home].quota.five_hour = Some(crate::quota::QuotaWindow {
+        accounts[home].quota.five_hour = Some(crate::records::quota::QuotaWindow {
             utilization: 1.0,
             reset: Some(now + Duration::milliseconds(remaining_ms)),
         });

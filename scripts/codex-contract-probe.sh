@@ -7,7 +7,7 @@
 #      value, and the values of just used_percent, limit_window_seconds, plan_type, allowed and
 #      limit_reached (none held an id, email or token in the payload measured 2026-10-12)
 #   2. the HTTP status the inference path answers a WebSocket upgrade with
-# Run this BEFORE trusting the wham/usage field names src/codex_probe.rs parses and the 426 the
+# Run this BEFORE trusting the wham/usage field names src/records/codex_probe.rs parses and the 426 the
 # proxy answers upgrades with; the source read (openai/codex@f82e365, codex-rs/: the usage payload
 # model codex-backend-openapi-models/src/models/rate_limit_window_snapshot.rs and
 # rate_limit_status_details.rs, fetched by backend-client/src/client/rate_limit_resets.rs; the 426

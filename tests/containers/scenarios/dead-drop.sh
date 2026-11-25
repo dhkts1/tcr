@@ -8,7 +8,7 @@
 # node-b1-overlay (borrower, behind router-b, upnp off), on
 # `two-homes-overlay-drop.json`, `two-homes-overlay.json` with one field
 # changed: router-a's `upnp` is `on`, so node-a1-overlay can hold a real
-# router mapping and `own_endpoints` (src/peer/drop.rs) has something to
+# router mapping and `own_endpoints` (src/peer/reach/drop_exchange.rs) has something to
 # publish. `two-homes-two-routers.json`, the topology the unit list first
 # named, cannot pair at all: `nat-no-mapping.sh` states its own expected
 # outcome as a failed join, and `pair_nodes` is never called on it. Pairing
@@ -16,17 +16,17 @@
 # the drop's key ladder has, so that topology could never reach this
 # scenario's own first step.
 #
-# The publisher (`keep_drops_published`, `src/server.rs`) is boot-time gated
+# The publisher (`keep_drops_published`, `src/proxy/server/peer_mesh.rs`) is boot-time gated
 # on `DeadDropConfig::is_live()`: a Mac that turns the drop on after it has
 # already booted starts no publishing task until it boots again (the fetch
-# gate is hot, the publish gate is not, `src/peer/config.rs`'s own doc on
+# gate is hot, the publish gate is not, `src/peer/config/mod.rs`'s own doc on
 # `DeadDropConfig::enabled` says so). node-a1-overlay is therefore
 # configured and then restarted, the same kill-and-relaunch this harness
 # already uses in `lease-borrow.sh`.
 #
-# `dial_peer_reaching_within` (src/peer/serve.rs), where the drop fetch
+# `dial_peer_reaching_within` (src/peer/serve/mod.rs), where the drop fetch
 # lives, has exactly two production callers in this tree and both are the
-# peer-lease borrow path (`src/peer/lease.rs`, `src/peer/serve.rs`): there is
+# peer-lease borrow path (`src/peer/lease/mod.rs`, `src/peer/serve/mod.rs`): there is
 # no lighter way to make a real dial happen. So this scenario is
 # `lease-borrow.sh`'s own cast and mechanism (lend, the inspect/disclose
 # pair, an account disabled and the borrower restarted) with the dead drop
@@ -64,7 +64,7 @@
 #      it can no longer reach
 #  11. restart node-b1-overlay (the account-disable and the peer-lease
 #      fallback provider are both boot-time)
-#  12. wait out `DEAD_DROP_PUBLISH_INTERVAL` (`src/server.rs`, 300s, fixed):
+#  12. wait out `DEAD_DROP_PUBLISH_INTERVAL` (`src/proxy/server/peer_mesh.rs`, 300s, fixed):
 #      node-a1-overlay's publisher fires its first tick the instant it boots,
 #      before its own internet keeper's UPnP round trip can possibly have
 #      finished, so that first publish carries no address at all. Its SECOND
@@ -216,7 +216,7 @@ case "$internet_out" in
 esac
 
 # The measurement the design calls for before any assertion below is
-# written: what `own_endpoints` (src/peer/drop.rs) actually has to publish
+# written: what `own_endpoints` (src/peer/reach/drop_exchange.rs) actually has to publish
 # for this Mac. `own_endpoints` reads `reach::external_socket()`, a
 # process-local register the SAME running process's own internet keeper
 # fills in (`nat-upnp-mapping.sh`'s own comment on why `reach --map`, a
@@ -291,7 +291,7 @@ nx "$B" ip link set utun0 down
 pass "the overlay is down on both sides"
 
 # --- restart node-b1-overlay: the account disable and the peer-lease -------
-# fallback provider are both boot-time, `src/fallback.rs`.
+# fallback provider are both boot-time, `src/peer/serve/fallback.rs`.
 oldpid="$(cat "$B_HOME/pid" 2>/dev/null || echo)"
 if [ -n "$oldpid" ]; then
   kill "$oldpid" 2>/dev/null || true
@@ -308,7 +308,7 @@ fi
 pass "$B restarted with its own account disabled and the overlay down"
 
 # --- wait out node-a1-overlay's publish interval ----------------------------
-# `DEAD_DROP_PUBLISH_INTERVAL` (`src/server.rs`) is 300s, fixed, and not a
+# `DEAD_DROP_PUBLISH_INTERVAL` (`src/proxy/server/peer_mesh.rs`) is 300s, fixed, and not a
 # peers-file setting: the first tick fired the instant node-a1-overlay
 # rebooted, before its own internet keeper's UPnP round trip could finish, so
 # that first publish carried no address. The steps between the restart above

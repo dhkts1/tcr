@@ -120,7 +120,7 @@ const BROWSE_WINDOW: Duration = Duration::from_millis(1500);
 /// land and dims for exactly one missed scan, which is honest.
 ///
 /// [`FOUND_TTL_MS`] is three of these, so two missed scans cost nothing; see
-/// `found_ttl_covers_three_browses` (`tests/peer_discovery.rs`), which is the
+/// `found_ttl_covers_three_browses` (`tests/peer/pairing/peer_discovery.rs`), which is the
 /// test and not this comment that holds the relation.
 pub const BROWSE_INTERVAL: Duration = Duration::from_secs(20);
 
@@ -129,7 +129,7 @@ pub const BROWSE_INTERVAL: Duration = Duration::from_secs(20);
 ///
 /// `name` is `None` when `peer.announceName` is off, and then the beacon is
 /// presence and a port alone. Built here rather than at the registration call
-/// so that `beacon_carries_no_key_or_id` (`tests/peer_discovery.rs`) has one
+/// so that `beacon_carries_no_key_or_id` (`tests/peer/pairing/peer_discovery.rs`) has one
 /// thing to read: a payload assembled at the call site is a payload no gate can
 /// check.
 pub fn beacon_txt(
@@ -199,7 +199,7 @@ fn now_unix_secs() -> i64 {
 /// visibility to THIS crate, and an integration test under `tests/` is a
 /// SEPARATE crate that links against this one, so `pub(crate)` would still
 /// refuse it. `discovery` is already `pub mod` and other integration tests
-/// already reach into it (`tests/peer_discovery.rs`), so this is the one
+/// already reach into it (`tests/peer/pairing/peer_discovery.rs`), so this is the one
 /// visibility token this test needed and nothing wider.
 pub fn sanitize_name(raw: &str) -> Option<String> {
     let name = tcr_peer_wire::sanitize_label(raw).ok()?;
@@ -721,7 +721,7 @@ async fn browse_off_runtime(
 ///
 /// A beacon carries the ephemeral instance id, the port, the wire version and
 /// optionally a display name. **It carries no key, in any encoding**, and
-/// `beacon_carries_no_key_or_id` (`tests/peer_discovery.rs`) is the gate that
+/// `beacon_carries_no_key_or_id` (`tests/peer/pairing/peer_discovery.rs`) is the gate that
 /// holds it to that. So an announcement can say "something is listening here"
 /// and can never say "and it is the Mac you pinned".
 ///
@@ -1422,7 +1422,7 @@ mod tests {
     //! themselves: those two take `&PeerStore`, and `PeerStore` is only
     //! constructible through `crate::peer::config::PeerStore::open`, which is
     //! `todo!()` at the time this file was written (phase 1/4, in
-    //! `src/peer/config.rs`). The logic under test is identical either
+    //! `src/peer/config/mod.rs`). The logic under test is identical either
     //! way, `advertise`/`browse` are thin wrappers that add nothing but the
     //! `store` parameter this crate does not yet know how to construct in a
     //! test. See the report for the panic this produces if called directly.

@@ -27,7 +27,7 @@ use std::io;
 use std::ops::{Deref, DerefMut};
 use std::process::{Child, ChildStdin, Command, Stdio};
 
-use crate::log_err::LogErr as _;
+use crate::base::log_err::LogErr as _;
 
 /// A spawned child, killed and reaped on drop, and killed by a watchdog if this process dies
 /// first. Derefs to the [`Child`], so a test signals, polls and reads it as before.

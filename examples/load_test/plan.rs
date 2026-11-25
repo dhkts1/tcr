@@ -110,7 +110,7 @@ pub(crate) struct Planned {
     pub kind: Kind,
 }
 
-/// The fleet's five-day average send rate (`src/config.rs`, `default_account_throttle`).
+/// The fleet's five-day average send rate (`src/base/config.rs`, `default_account_throttle`).
 pub(crate) const STEADY_RATE: f64 = 1.5;
 /// The busiest one-second window in the same replay: 36 sends.
 pub(crate) const PEAK_BURST: usize = 36;

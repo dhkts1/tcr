@@ -34,7 +34,7 @@ pub(super) const CONN_AFFINITY_CAP: usize = 256;
 /// pool.
 ///
 /// Exists because the log line at that fallback used to hardcode "under pacing"
-/// for every group miss. Pacing ships OFF ([`crate::config::default_pacing`]), so
+/// for every group miss. Pacing ships OFF ([`crate::base::config::default_pacing`]), so
 /// on a default install that sentence named the one constraint that was NOT in
 /// play and hid the one that was. Measured on the live fleet 2026-08-23: a group
 /// whose only member was the control account fell back on 3 of 3 probes (a
@@ -220,7 +220,7 @@ pub(super) struct PoolAsk<'a> {
     pub(super) now: OffsetDateTime,
     pub(super) now_ms: i64,
     pub(super) is_fable: bool,
-    pub(super) provider: crate::provider::Provider,
+    pub(super) provider: crate::base::provider::Provider,
     /// The request's `--group`, which only [`PoolPass::Paced`] narrows on; every widening
     /// pass drops it.
     pub(super) group: Option<&'a str>,

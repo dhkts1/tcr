@@ -14,7 +14,7 @@ use crate::plan::{Kind, Planned};
 use crate::stub::{Stub, TAG_HEADER};
 
 /// The placeholder key `tcr run` exports: on loopback it is not an identity, so the body's
-/// `user_id` keys the session (`stable_session_key`, `src/proxy.rs`).
+/// `user_id` keys the session (`stable_session_key`, `src/proxy/mod.rs`).
 const CLIENT_KEY: &str = "via-tcr";
 
 /// The `anthropic-beta` flags Claude Code sends on an OAuth session. In this order because
@@ -64,7 +64,7 @@ impl Driver {
         body_kb: usize,
         big_body_bytes: Option<usize>,
     ) -> anyhow::Result<Arc<Self>> {
-        let client = tcr::http_client::builder()
+        let client = tcr::base::http_client::builder()
             // The driver talks to the proxy on loopback and nowhere else; an inherited
             // HTTPS_PROXY must not reroute it.
             .no_proxy()

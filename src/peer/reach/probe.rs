@@ -313,7 +313,7 @@ impl PathTable {
 
 /// The table this process dials against.
 ///
-/// Process-local and never in [`crate::config::Config`], on the same rule the
+/// Process-local and never in [`crate::base::config::Config`], on the same rule the
 /// rest of this feature follows: a measurement is not the operator's intent,
 /// and the intent half, [`PathsConfig`], is in the peers file where an
 /// operator can read it. Installed at boot from that file and the state file,

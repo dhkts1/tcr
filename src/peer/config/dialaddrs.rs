@@ -2,7 +2,7 @@
 //!
 //! `JoinToken::to_token` spells a list of addresses as comma-separated text
 //! (`src/peer/pair.rs`) and `MovedRecord.eps` spells the same shape as JSON
-//! (`src/peer/moved.rs`). A v3 key and a sealed reply both need a third,
+//! (`src/peer/config/moved.rs`). A v3 key and a sealed reply both need a third,
 //! compact spelling, and writing that twice is the one shape that always
 //! drifts. So it lives here once: a count byte, then per address one family
 //! byte, the address bytes, and two port bytes big-endian.

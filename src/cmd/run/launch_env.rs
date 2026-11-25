@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use tcr::live_client;
 use tcr::proxy::GROUP_HEADER_NAME;
+use tcr::proxy::live_client;
 use tcr::{request_key, status};
 
 /// `--group`'s header-composition half (steps c/d): the new value for
@@ -312,7 +312,7 @@ pub(super) fn apply_nested_claude_ca(
 /// The host the MITM leaf must cover for `tcr run --codex` to route `codex`
 /// through the pool.
 pub(super) const fn mitm_codex_host() -> &'static str {
-    tcr::provider::CODEX_HOST
+    tcr::base::provider::CODEX_HOST
 }
 
 /// BASE-URL mode — the fallback, used when see-through material is unavailable.

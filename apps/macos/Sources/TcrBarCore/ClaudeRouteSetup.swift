@@ -2,7 +2,7 @@ import Combine
 import Foundation
 
 /// Which way a typed `claude` goes through tcr, as `tcr setup status --json`
-/// reports it in its `route` key (`src/setup.rs`, `Route`).
+/// reports it in its `route` key (`src/verbs/setup.rs`, `Route`).
 public enum ClaudeRoute: String, Decodable, Equatable, Sendable, CaseIterable {
     /// Neither route is installed.
     case off

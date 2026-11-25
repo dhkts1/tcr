@@ -6,11 +6,11 @@ impl Manager {
     /// The provider-local revalidation deadline, shared by its read and spend paths.
     pub(super) const fn revalidation_valve(
         &self,
-        provider: crate::provider::Provider,
+        provider: crate::base::provider::Provider,
     ) -> &std::sync::atomic::AtomicI64 {
         match provider {
-            crate::provider::Provider::Anthropic => &self.next_revalidation_at_ms,
-            crate::provider::Provider::Codex => &self.next_codex_revalidation_at_ms,
+            crate::base::provider::Provider::Anthropic => &self.next_revalidation_at_ms,
+            crate::base::provider::Provider::Codex => &self.next_codex_revalidation_at_ms,
         }
     }
 
@@ -38,7 +38,7 @@ impl Manager {
     ///    any caller that reaches revalidation directly.
     ///  - **(B) FALLBACK** (no pin, or the pin is rejected/held/tried/model-blocked):
     ///    the least-utilized surviving account wins (lowest
-    ///    [`crate::quota::Quota::max_utilization`]; ties: LRU `last_selected_seq`).
+    ///    [`crate::records::quota::Quota::max_utilization`]; ties: LRU `last_selected_seq`).
     ///    The anti-storm throttle applies HERE ONLY — at most one NEW-account
     ///    revalidation per [`REVALIDATION_MIN_SPACING_MS`]; inside that window return
     ///    `None` (the caller emits the honest 429). The window is spent only once a
@@ -80,12 +80,12 @@ impl Manager {
         let groups = self.groups();
         let now_ms = odt_to_ms(now);
         // Derived exactly as `select_with_group` derives them.
-        let provider = crate::provider::Provider::of_path(path);
+        let provider = crate::base::provider::Provider::of_path(path);
         let filtered_tried = self.exclude_unsupported_codex_exits(tried, provider);
         let tried = filtered_tried.as_ref();
         // The Fable weekly bucket is an Anthropic fact; a Codex request never consults it.
         let is_fable =
-            provider.has_fable_bucket() && model.is_some_and(crate::model::is_fable_model);
+            provider.has_fable_bucket() && model.is_some_and(crate::base::model::is_fable_model);
 
         // HARD-gate predicate shared by both paths: the blocks that even a
         // revalidation serve must honor (soft utilization/pacing deliberately absent).

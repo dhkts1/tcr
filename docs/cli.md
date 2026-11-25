@@ -4,7 +4,7 @@ Every subcommand and flag the `tcr` binary accepts, with the behaviour behind it
 [the README](../README.md); the config file those commands read and write is documented in
 [configuration.md](configuration.md).
 
-All argument parsing lives in one file, `src/main.rs`; `src/cli.rs` is the *implementation*
+All argument parsing lives in one file, `src/main.rs`; `src/verbs/cli/` is the *implementation*
 of the account subcommands, not the definitions. No flag has a single-dash short form, an
 alias, an environment-variable binding or a clap-level default value; every default below is
 either a Rust default (`false`, `None`, empty vector) or a fallback applied after parsing,

@@ -52,7 +52,7 @@ impl Manager {
     /// Give EVERY account a fresh HTTP client after the machine slept for
     /// `slept`, not just the one about to send: the sleep outlasted every
     /// pooled connection's idle life on the server side, and none of the pools
-    /// can tell (see [`crate::wake`]). Each account's next send then opens a
+    /// can tell (see [`crate::clients::wake`]). Each account's next send then opens a
     /// new connection instead of failing once on a dead one and retrying.
     ///
     /// Same rules as [`Self::recycle_client`]: in-flight requests keep their

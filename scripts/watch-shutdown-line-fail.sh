@@ -82,7 +82,7 @@ run_break "servingstopped-silent" \
   'Self::ServingStopped => "serving stopped on its own; shutting down",::=Self::ServingStopped => "",'
 
 # 2. Two triggers share a line, which would let the SIGTERM assertion in
-#    tests/headless_sigterm.rs pass for the wrong trigger.
+#    tests/proxy/headless_sigterm.rs pass for the wrong trigger.
 run_break "duplicate-line" \
   'Self::ServingStopped => "serving stopped on its own; shutting down",::=Self::ServingStopped => "SIGTERM received; shutting down",'
 

@@ -11,7 +11,7 @@ final class StartServerReasonTests: XCTestCase {
 
     private let em = "\u{2014}"
 
-    /// The real shape `takeover_port` (`src/singleton.rs`) prints ahead of the
+    /// The real shape `takeover_port` (`src/stores/singleton/mod.rs`) prints ahead of the
     /// bind failure: the non-proxy holder line, then the failed-bind line
     /// `ServerController.classifyExit` matches on to reach `.incumbentHoldsPort`
     /// in the first place.
@@ -98,7 +98,7 @@ final class StartServerReasonTests: XCTestCase {
         XCTAssertEqual(PredatesCodexRefusal.displayed("connection refused"), "connection refused")
 
         let loader = try String(
-            contentsOf: repoRoot().appendingPathComponent("src/config/load.rs"), encoding: .utf8)
+            contentsOf: repoRoot().appendingPathComponent("src/base/config/load.rs"), encoding: .utf8)
         for words in [
             "carries credentialVersion {v}, which this build", "only understands up to {understood}",
         ] {

@@ -1,8 +1,8 @@
 //! Tests for the proxy handler, one file per subject; the helpers more than one file uses live here.
 
 use super::*;
-use crate::config::{Account, Config, ProxyConfig};
-use crate::log_err::LogErr;
+use crate::base::config::{Account, Config, ProxyConfig};
+use crate::base::log_err::LogErr;
 use crate::test_support::stub_upstream::{self as stub, StubAddr};
 
 mod add_route;
@@ -203,7 +203,7 @@ fn thinking_turn_body(user_id: &str, signatures: &[&str]) -> String {
 }
 
 /// [`thinking_turn_body`] for `model`, for a test whose model decides where thinking
-/// survives ([`crate::model::thinking_is_org_bound`]).
+/// survives ([`crate::base::model::thinking_is_org_bound`]).
 fn thinking_turn_body_for(model: &str, user_id: &str, signatures: &[&str]) -> String {
     let mut messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
     for signature in signatures {
@@ -391,9 +391,13 @@ fn fleet_configured(
     configure: impl FnOnce(&mut Config),
 ) -> Arc<Manager> {
     struct NoRefresh;
-    impl crate::oauth::TokenRefresher for NoRefresh {
-        fn refresh(&self, _provider: Provider, _t: String) -> crate::oauth::RefreshFuture {
-            Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+    impl crate::clients::oauth::TokenRefresher for NoRefresh {
+        fn refresh(&self, _provider: Provider, _t: String) -> crate::clients::oauth::RefreshFuture {
+            Box::pin(async {
+                Err(crate::clients::oauth::OAuthError::Transient(
+                    "unused".into(),
+                ))
+            })
         }
     }
     let mut config = dummy_config(None, &format!("http://{upstream}"));
@@ -407,8 +411,8 @@ fn fleet_configured(
     Manager::new(
         config,
         Arc::new(NoRefresh),
-        Arc::new(crate::probe::LiveUsageProber::new()),
-        Arc::new(crate::warmer::LiveWarmer::new()),
+        Arc::new(crate::records::probe::LiveUsageProber::new()),
+        Arc::new(crate::clients::warmer::LiveWarmer::new()),
         None,
     )
 }

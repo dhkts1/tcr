@@ -14,7 +14,7 @@ struct RetryAfterProber {
 }
 
 impl UsageProber for RetryAfterProber {
-    fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, _credential: crate::records::probe::ProbeCredential) -> ProbeFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {
             Err(ProbeError {
@@ -26,12 +26,12 @@ impl UsageProber for RetryAfterProber {
     }
 }
 impl UsageProber for FirstOkThen429Prober {
-    fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, _credential: crate::records::probe::ProbeCredential) -> ProbeFuture {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             if n == 0 {
                 Ok(Usage {
-                    five_hour: crate::probe::WindowReading::Read(UsageBucket {
+                    five_hour: crate::records::probe::WindowReading::Read(UsageBucket {
                         utilization: Some(0.25),
                         reset_at_ms: Some(crate::now_ms() + 3_600_000),
                     }),
@@ -97,7 +97,7 @@ async fn probing_backfills_a_missing_plan_once_and_persists_it() {
 
     let calls = count_plan_fetches(
         &manager,
-        crate::probe::Plan {
+        crate::records::probe::Plan {
             organization_type: Some("claude_team".to_string()),
             rate_limit_tier: Some("default_raven".to_string()),
             seat_tier: Some("team_standard".to_string()),
@@ -152,7 +152,7 @@ async fn probing_asks_a_profiled_row_once_for_its_display_name() {
     let manager = manager_on_file(&path, Arc::new(NoProber));
     let calls = count_plan_fetches(
         &manager,
-        crate::probe::Plan {
+        crate::records::probe::Plan {
             organization_type: Some("claude_max".to_string()),
             rate_limit_tier: Some("default_claude_max_20x".to_string()),
             seat_tier: None,
@@ -186,11 +186,11 @@ struct CodexPlanProber {
 }
 
 impl UsageProber for CodexPlanProber {
-    fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, _credential: crate::records::probe::ProbeCredential) -> ProbeFuture {
         let plan = self.plan;
         Box::pin(async move {
             Ok(Usage {
-                codex: Some(crate::codex_probe::CodexProbeFacts {
+                codex: Some(crate::records::codex_probe::CodexProbeFacts {
                     plan_type: Some(plan.into()),
                     ..Default::default()
                 }),
@@ -215,7 +215,7 @@ async fn a_plus_to_pro_probe_updates_the_plan_and_saves_only_that_key() {
     let manager = manager_on_file(&path, Arc::new(CodexPlanProber { plan: "pro" }));
     // The Anthropic profile endpoint is never this plan's source: a Codex row skips the
     // backfill, and the counting fake keeps the live endpoint out should that ever break.
-    let profile_calls = count_plan_fetches(&manager, crate::probe::Plan::default());
+    let profile_calls = count_plan_fetches(&manager, crate::records::probe::Plan::default());
 
     manager.probe_account(0).await;
 
@@ -325,7 +325,7 @@ fn a_codex_plan_write_waits_for_the_config_write_lock() {
     )
     .unwrap();
     let manager = manager_on_file(&path, Arc::new(CodexPlanProber { plan: "pro" }));
-    count_plan_fetches(&manager, crate::probe::Plan::default());
+    count_plan_fetches(&manager, crate::records::probe::Plan::default());
 
     assert_the_plan_write_waits_for_the_write_lock(&manager, &path, "pro");
     std::fs::remove_file(&path).ok();
@@ -341,7 +341,7 @@ fn a_backfilled_plan_write_waits_for_the_config_write_lock() {
     let manager = manager_on_file(&path, Arc::new(NoProber));
     count_plan_fetches(
         &manager,
-        crate::probe::Plan {
+        crate::records::probe::Plan {
             organization_type: Some("claude_team".to_string()),
             rate_limit_tier: None,
             seat_tier: None,
@@ -359,8 +359,8 @@ struct CodexPayloadProber {
 }
 
 impl UsageProber for CodexPayloadProber {
-    fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
-        let usage = crate::codex_probe::usage_from_payload(&self.payload);
+    fn probe(&self, _credential: crate::records::probe::ProbeCredential) -> ProbeFuture {
+        let usage = crate::records::codex_probe::usage_from_payload(&self.payload);
         Box::pin(async move { Ok(usage) })
     }
 }
@@ -381,7 +381,7 @@ async fn a_probe_with_an_empty_plan_type_leaves_the_plan_as_it_was() {
                 payload: serde_json::json!({ "plan_type": plan_type, "rate_limit": null }),
             }),
         );
-        count_plan_fetches(&manager, crate::probe::Plan::default());
+        count_plan_fetches(&manager, crate::records::probe::Plan::default());
 
         manager.probe_account(0).await;
 
@@ -420,7 +420,7 @@ async fn a_failed_plan_fetch_records_nothing_and_never_fails_the_probe() {
 
     // An all-`None` reading is exactly what `fetch_profile` returns on
     // any failure — network, non-2xx, or a malformed body.
-    let calls = count_plan_fetches(&manager, crate::probe::Plan::default());
+    let calls = count_plan_fetches(&manager, crate::records::probe::Plan::default());
 
     manager.probe_account(0).await;
 
@@ -468,7 +468,7 @@ async fn an_account_that_already_has_a_plan_is_never_re_fetched() {
         "the plan is read from config at boot, not only learned by probing"
     );
 
-    let calls = count_plan_fetches(&manager, crate::probe::Plan::default());
+    let calls = count_plan_fetches(&manager, crate::records::probe::Plan::default());
 
     manager.probe_account(0).await;
     assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -485,7 +485,9 @@ fn alice_with_an_account_uuid() -> Account {
 
 /// Probe each of `accounts` once, in order, and answer the credentials the probes carried.
 /// The plan backfill gets a counting fake, so no row asks the live profile endpoint.
-async fn probe_credentials_of(accounts: Vec<Account>) -> Vec<crate::probe::ProbeCredential> {
+async fn probe_credentials_of(
+    accounts: Vec<Account>,
+) -> Vec<crate::records::probe::ProbeCredential> {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let count = accounts.len();
     let manager = build_manager_with_prober(
@@ -495,7 +497,7 @@ async fn probe_credentials_of(accounts: Vec<Account>) -> Vec<crate::probe::Probe
             seen: Arc::clone(&seen),
         }),
     );
-    count_plan_fetches(&manager, crate::probe::Plan::default());
+    count_plan_fetches(&manager, crate::records::probe::Plan::default());
     for idx in 0..count {
         manager.probe_account(idx).await;
     }
@@ -513,7 +515,7 @@ async fn probe_credentials_of(accounts: Vec<Account>) -> Vec<crate::probe::Probe
 #[tokio::test]
 async fn a_probe_credential_names_the_accounts_provider_and_account_uuid() {
     let codex = Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
         ..account("bob@example.com", 1)
     };
@@ -526,12 +528,12 @@ async fn a_probe_credential_names_the_accounts_provider_and_account_uuid() {
         seen,
         vec![
             (
-                crate::provider::Provider::Anthropic,
+                crate::base::provider::Provider::Anthropic,
                 "at-alice@example.com".to_string(),
                 Some("11111111-1111-4111-8111-111111111111".to_string()),
             ),
             (
-                crate::provider::Provider::Codex,
+                crate::base::provider::Provider::Codex,
                 "at-bob@example.com".to_string(),
                 Some("22222222-2222-4222-8222-222222222222".to_string()),
             ),
@@ -549,13 +551,13 @@ async fn a_probe_credential_names_the_accounts_provider_and_account_uuid() {
 #[tokio::test]
 async fn a_codex_probe_names_the_workspace_and_falls_back_to_the_account_uuid() {
     let codex = Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         account_uuid: Some("55555555-5555-4555-8555-555555555555".to_string()),
         org_uuid: Some("66666666-6666-4666-8666-666666666666".to_string()),
         ..account("bob@example.com", 1)
     };
     let older = Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         account_uuid: Some("77777777-7777-4777-8777-777777777777".to_string()),
         ..account("carol@example.com", 2)
     };
@@ -568,15 +570,15 @@ async fn a_codex_probe_names_the_workspace_and_falls_back_to_the_account_uuid() 
         seen,
         vec![
             (
-                crate::provider::Provider::Anthropic,
+                crate::base::provider::Provider::Anthropic,
                 Some("11111111-1111-4111-8111-111111111111".to_string()),
             ),
             (
-                crate::provider::Provider::Codex,
+                crate::base::provider::Provider::Codex,
                 Some("66666666-6666-4666-8666-666666666666".to_string()),
             ),
             (
-                crate::provider::Provider::Codex,
+                crate::base::provider::Provider::Codex,
                 Some("77777777-7777-4777-8777-777777777777".to_string()),
             ),
         ]
@@ -595,7 +597,7 @@ async fn a_codex_probe_names_the_workspace_and_falls_back_to_the_account_uuid() 
 #[test]
 fn a_row_that_is_gone_yields_no_probe_credential() {
     let codex = Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
         ..account("bob@example.com", 0)
     };
@@ -608,7 +610,7 @@ fn a_row_that_is_gone_yields_no_probe_credential() {
     let control = manager
         .probe_credential(0, "at-bob@example.com".to_string())
         .expect("control: the row that is there yields its credential");
-    assert_eq!(control.provider, crate::provider::Provider::Codex);
+    assert_eq!(control.provider, crate::base::provider::Provider::Codex);
     assert_eq!(
         control.account_id.as_deref(),
         Some("22222222-2222-4222-8222-222222222222")
@@ -881,7 +883,7 @@ struct AlwaysStatusProber {
     status: u16,
 }
 impl UsageProber for AlwaysStatusProber {
-    fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, _credential: crate::records::probe::ProbeCredential) -> ProbeFuture {
         let status = self.status;
         Box::pin(async move {
             Err(ProbeError {
@@ -980,7 +982,7 @@ async fn a_success_between_5xx_runs_resets_the_sustained_count() {
         state: Arc<Mutex<usize>>,
     }
     impl UsageProber for FlakyProber {
-        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
+        fn probe(&self, _credential: crate::records::probe::ProbeCredential) -> ProbeFuture {
             let mut n = self.state.lock().expect("lock poisoned");
             *n += 1;
             // 5xx, 5xx, OK, 5xx, 5xx — never THREE in a row.
@@ -996,7 +998,7 @@ async fn a_success_between_5xx_runs_resets_the_sustained_count() {
                     })
                 } else {
                     Ok(Usage {
-                        five_hour: crate::probe::WindowReading::Read(UsageBucket {
+                        five_hour: crate::records::probe::WindowReading::Read(UsageBucket {
                             utilization: Some(0.1),
                             reset_at_ms: Some(crate::now_ms() + 3_600_000),
                         }),
@@ -1078,7 +1080,7 @@ fn probe_retry_after_has_a_seven_day_safety_cap() {
 async fn probe_transport_failure_is_visible_error() {
     struct NetFailProber;
     impl UsageProber for NetFailProber {
-        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
+        fn probe(&self, _credential: crate::records::probe::ProbeCredential) -> ProbeFuture {
             Box::pin(async {
                 Err(ProbeError {
                     status: None,

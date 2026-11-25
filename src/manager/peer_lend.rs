@@ -5,7 +5,7 @@
 //! The guard-band arithmetic a lease must respect is
 //! `effective_threshold(threshold, reserve, allow_reserve)`
 //! (`src/manager/select/mod.rs:238`), and it is **`pub(super)`**, so
-//! `src/peer/lease.rs` cannot call it, and cannot name its result either. The
+//! `src/peer/lease/mod.rs` cannot call it, and cannot name its result either. The
 //! two wrong answers are widening that function's visibility and copying its
 //! arithmetic; both put the fleet's guard band in two places, and the house
 //! pattern ten lines below it says why that is the failure to avoid: it calls
@@ -79,7 +79,7 @@ impl config::EgressPin {
 impl config::Account {
     /// Whether this account's exit lock forbids handing its bearer over.
     ///
-    /// The whole rule is in [`crate::config::EgressPin::forbids_handoff`]; this
+    /// The whole rule is in [`crate::base::config::EgressPin::forbids_handoff`]; this
     /// is the form the two callers that hold a config account want, so neither
     /// of them re-derives the pin.
     pub const fn cannot_be_handed(&self) -> bool {
@@ -227,7 +227,7 @@ impl Manager {
             .iter()
             .enumerate()
             // Lending a Codex account over the mesh is unmeasured (the borrower's proxy would need the chatgpt-account-id swap too), so this version never lends one.
-            .filter(|(_, account)| account.provider == crate::provider::Provider::Anthropic)
+            .filter(|(_, account)| account.provider == crate::base::provider::Provider::Anthropic)
             .filter(|(_, account)| !account.disabled && account.status != AccountStatus::Error)
             .filter(|(_, account)| {
                 // An account whose own name is not a label (an email, a uuid)
@@ -312,7 +312,7 @@ impl Manager {
     /// gate in `eligible` is a pure function of a LOCAL account's runtime. A
     /// remote candidate has no index and no runtime, so there is no honest way
     /// to put one in there, which is why the fallback seam lives at the
-    /// picker's `None` arm (`crate::fallback`) instead.
+    /// picker's `None` arm (`crate::peer::serve::fallback`) instead.
     ///
     /// # The answer is the BEST SINGLE ACCOUNT's headroom, not the fleet's sum
     ///
@@ -336,7 +336,7 @@ impl Manager {
     ///
     /// # An unmeasured window lends nothing
     ///
-    /// An absent [`crate::quota::QuotaWindow`] means "never read", not "empty".
+    /// An absent [`crate::records::quota::QuotaWindow`] means "never read", not "empty".
     /// It contributes `0.0`, so a fleet that has not been probed lends nothing
     /// at all. Guessing in the other direction gives away the owner's quota on
     /// no evidence, and the owner is not the one who benefits from the guess.
@@ -539,7 +539,7 @@ impl crate::peer::lease::WindowUtilization for Manager {
             accounts
                 .iter()
                 // Lending a Codex account over the mesh is unmeasured (the borrower's proxy would need the chatgpt-account-id swap too), so this version never lends one.
-                .filter(|account| account.provider == crate::provider::Provider::Anthropic)
+                .filter(|account| account.provider == crate::base::provider::Provider::Anthropic)
                 .filter(|account| !account.disabled && account.status != AccountStatus::Error)
                 .filter(|account| {
                     let label = tcr_peer_wire::sanitize_label(&account.name).unwrap_or_default();
@@ -660,7 +660,7 @@ impl crate::peer::lease::WindowUtilization for Manager {
 /// no measurement of it.
 ///
 /// The three arms are the wire's name for the three separately named
-/// `Option<QuotaWindow>` fields in `src/quota.rs`, there is no enum on that
+/// `Option<QuotaWindow>` fields in `src/records/quota/mod.rs`, there is no enum on that
 /// side, which is why the mapping is written once, here, and not at each caller.
 /// [`QuotaWindow::effective`] is what reads it, so a window past its reset is a
 /// fresh window rather than the stale last value.
@@ -687,11 +687,11 @@ mod tests {
     use time::Duration;
 
     use super::*;
-    use crate::quota::QuotaWindow;
+    use crate::records::quota::QuotaWindow;
 
     /// `0.95 - 0.05`, the default `switchThreshold` minus the default
     /// `controlReserve`, which is the guard band every figure below is measured
-    /// against. Read off `config::default_switch_threshold` (`src/config.rs:33`)
+    /// against. Read off `config::default_switch_threshold` (`src/base/config.rs:33`)
     /// and `config::default_control_reserve` (`:39`); `Manager::from_runtimes`
     /// builds its config from `{}`, so both defaults are what apply here.
     ///
@@ -745,7 +745,7 @@ mod tests {
         );
     }
 
-    /// The figure the guard-band gate in `tests/peer_lease.rs` is written
+    /// The figure the guard-band gate in `tests/peer/lending/peer_lease.rs` is written
     /// against: at 0.89 against a 0.90 guard there is still something to lend,
     /// and one step over the guard there is exactly nothing.
     ///
@@ -926,7 +926,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
 
         let mut codex = account("alice-fake");
-        codex.provider = crate::provider::Provider::Codex;
+        codex.provider = crate::base::provider::Provider::Codex;
         codex.quota.seven_day = measured(0.10, now);
         let manager = Manager::from_runtimes(vec![codex]);
         assert_eq!(

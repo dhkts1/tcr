@@ -33,8 +33,8 @@ die() { printf 'attach-compat-installer: error: %s\n' "$*" >&2; exit 1; }
 note() { printf '    %s\n' "$*"; }
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# The asset name every v1.1.21-or-older CLI fetches (src/update.rs INSTALLER_ASSET
-# at v1.1.21). Kept here, not in src/legacy_names.rs: no Rust code reads it.
+# The asset name every v1.1.21-or-older CLI fetches (INSTALLER_ASSET in the update code
+# at v1.1.21). Kept here, not in Rust: no Rust code reads it.
 compat_name="teamclaude-rs-installer.sh"
 installer_name="tcr-installer.sh"
 

@@ -10,8 +10,8 @@ impl Manager {
     /// happens once, in [`Manager::record_served`].
     ///
     /// The account's PROVIDER picks the parser, never the headers: Anthropic's
-    /// [`crate::quota::Quota::update_from_headers`] or Codex's
-    /// [`crate::quota::Quota::update_from_codex_refusal_at`]. A `match`, so a third provider
+    /// [`crate::records::quota::Quota::update_from_headers`] or Codex's
+    /// [`crate::records::quota::Quota::update_from_codex_refusal_at`]. A `match`, so a third provider
     /// decides here instead of inheriting either. `status` is the response's HTTP status,
     /// which the Codex parser reads in place of Anthropic's `unified-status` header (a 2xx
     /// is `allowed`, a refusal 429 `rejected`); the Anthropic parser ignores it.
@@ -55,7 +55,7 @@ impl Manager {
         now: OffsetDateTime,
     ) -> bool {
         let refusal = (status == 429)
-            .then(|| crate::quota::CodexQuotaRefusal::parse(headers, &[], now))
+            .then(|| crate::records::quota::CodexQuotaRefusal::parse(headers, &[], now))
             .flatten();
         self.update_quota_with_codex_refusal_at(idx, headers, status, refusal.as_ref(), now, 0)
     }
@@ -86,7 +86,7 @@ impl Manager {
         now: OffsetDateTime,
     ) -> bool {
         let refusal = (status == 429)
-            .then(|| crate::quota::CodexQuotaRefusal::parse(headers, &[], now))
+            .then(|| crate::records::quota::CodexQuotaRefusal::parse(headers, &[], now))
             .flatten();
         self.update_quota_with_codex_refusal_at(
             serving.idx,
@@ -103,7 +103,7 @@ impl Manager {
         idx: usize,
         headers: &reqwest::header::HeaderMap,
         status: u16,
-        refusal: Option<&crate::quota::CodexQuotaRefusal>,
+        refusal: Option<&crate::records::quota::CodexQuotaRefusal>,
     ) -> bool {
         self.update_quota_with_codex_refusal_at(
             idx,
@@ -122,7 +122,7 @@ impl Manager {
         serving: &InFlightGuard,
         headers: &reqwest::header::HeaderMap,
         status: u16,
-        refusal: Option<&crate::quota::CodexQuotaRefusal>,
+        refusal: Option<&crate::records::quota::CodexQuotaRefusal>,
     ) -> bool {
         self.update_quota_with_codex_refusal_at(
             serving.idx,
@@ -142,7 +142,7 @@ impl Manager {
         idx: usize,
         headers: &reqwest::header::HeaderMap,
         status: u16,
-        refusal: Option<&crate::quota::CodexQuotaRefusal>,
+        refusal: Option<&crate::records::quota::CodexQuotaRefusal>,
         now: OffsetDateTime,
         own: u32,
     ) -> bool {
@@ -154,10 +154,10 @@ impl Manager {
             match accounts.get_mut(idx) {
                 Some(account) => {
                     let read_five_hour = match account.provider {
-                        crate::provider::Provider::Anthropic => {
+                        crate::base::provider::Provider::Anthropic => {
                             account.quota.update_from_headers_at(headers, now)
                         }
-                        crate::provider::Provider::Codex => account
+                        crate::base::provider::Provider::Codex => account
                             .quota
                             .update_from_codex_refusal_at(headers, status, refusal, now),
                     };
@@ -165,10 +165,14 @@ impl Manager {
                     // are not built (they are header parses under this write lock).
                     let unfinished = account.in_flight > own;
                     let ticks = if unfinished {
-                        crate::forecast::carries_ticks(account.provider, headers)
+                        crate::records::forecast::carries_ticks(account.provider, headers)
                             .then_some([None; 3])
                     } else {
-                        crate::forecast::header_ticks(account.provider, headers, &account.quota)
+                        crate::records::forecast::header_ticks(
+                            account.provider,
+                            headers,
+                            &account.quota,
+                        )
                     };
                     if let Some(ticks) = ticks {
                         self.with_forecast_slot(idx, |fit| {
@@ -224,11 +228,11 @@ impl Manager {
         // VERBATIM as the quota figure — `account.input_tokens` grows by
         // exactly what was passed, as it always has — and only the base input
         // used for PRICING is derived from it; see
-        // [`crate::usage::UsageRecord::from_quota_input`] for what happens when
+        // [`crate::records::usage::UsageRecord::from_quota_input`] for what happens when
         // a caller's components exceed its own total.
         self.record_usage(
             idx,
-            crate::usage::UsageRecord::from_quota_input(
+            crate::records::usage::UsageRecord::from_quota_input(
                 crate::now_ms(),
                 None,
                 None,
@@ -250,7 +254,7 @@ impl Manager {
     /// 1. Adds to the cumulative per-account counters, whose meanings are
     ///    UNCHANGED by this function existing — `input_tokens` is still the
     ///    quota counter with cache creation and cache reads folded in
-    ///    ([`crate::usage::UsageRecord::input_total`] reproduces it exactly),
+    ///    ([`crate::records::usage::UsageRecord::input_total`] reproduces it exactly),
     ///    and `cache_creation_tokens` is still both TTLs together. `status.rs`
     ///    explains why an existing wire field may never quietly change meaning.
     /// 2. Records the same request in the usage tracker, which is where the
@@ -263,7 +267,7 @@ impl Manager {
     /// Deliberately does NOT touch the request counter: a client request retried
     /// across accounts reaches this once per upstream RESPONSE, and counting
     /// requests here is bug #4. That count happens in [`Manager::record_served`].
-    pub fn record_usage(&self, idx: usize, mut record: crate::usage::UsageRecord) {
+    pub fn record_usage(&self, idx: usize, mut record: crate::records::usage::UsageRecord) {
         let (name, (uuid, org)) = {
             let mut accounts = self
                 .accounts
@@ -292,9 +296,9 @@ impl Manager {
                     // identity resolves onto the wrong account when it lands.
                     let identity = if self.usage.is_attached() {
                         (
-                            crate::identity::uuid_key_of(account.account_uuid.as_deref())
+                            crate::base::identity::uuid_key_of(account.account_uuid.as_deref())
                                 .map(str::to_string),
-                            crate::identity::org_key_of(
+                            crate::base::identity::org_key_of(
                                 account.org_uuid.as_deref(),
                                 account.org_name.as_deref(),
                             )
@@ -320,7 +324,7 @@ impl Manager {
     /// A request-only model and a response that names no model add no catalogue id.
     pub(crate) fn record_response_model(
         &self,
-        provider: crate::provider::Provider,
+        provider: crate::base::provider::Provider,
         model: Option<&str>,
     ) {
         if let Some(model) = model {
@@ -332,12 +336,12 @@ impl Manager {
     }
 
     /// Note an upstream error of `kind` on `provider` now, for the routing document's
-    /// `lastError` ([`crate::routing`]). Observability only: nothing in selection reads it,
+    /// `lastError` ([`crate::proxy::routing`]). Observability only: nothing in selection reads it,
     /// and no retry, hold or gate follows from it.
     pub fn record_upstream_error(
         &self,
-        provider: crate::provider::Provider,
-        kind: crate::observations::ErrorKind,
+        provider: crate::base::provider::Provider,
+        kind: crate::records::observations::ErrorKind,
     ) {
         self.record_upstream_error_at(provider, kind, OffsetDateTime::now_utc());
     }
@@ -345,8 +349,8 @@ impl Manager {
     /// Record an upstream error on the caller's observation clock.
     pub fn record_upstream_error_at(
         &self,
-        provider: crate::provider::Provider,
-        kind: crate::observations::ErrorKind,
+        provider: crate::base::provider::Provider,
+        kind: crate::records::observations::ErrorKind,
         now: OffsetDateTime,
     ) {
         self.routing
@@ -360,10 +364,10 @@ impl Manager {
     /// model id it served this boot.
     pub fn routing_observed(
         &self,
-        provider: crate::provider::Provider,
+        provider: crate::base::provider::Provider,
         now_ms: i64,
     ) -> (
-        Option<(crate::observations::ErrorKind, i64, u32)>,
+        Option<(crate::records::observations::ErrorKind, i64, u32)>,
         std::collections::BTreeSet<String>,
     ) {
         let seen = self.routing.lock().unwrap_or_else(PoisonError::into_inner);
@@ -383,26 +387,26 @@ impl Manager {
         &self,
         dir: PathBuf,
         retention_days: u32,
-    ) -> crate::usage::ReplayReport {
+    ) -> crate::records::usage::ReplayReport {
         let accounts = self.ledger_accounts();
         self.usage
             .attach_ledger(dir, retention_days, &accounts, crate::now_ms())
     }
 
     /// Replace today's usage totals with a fresh replay of the ledger files —
-    /// see [`crate::usage::UsageTracker::rebuild_from_ledger`]. Called once a
+    /// see [`crate::records::usage::UsageTracker::rebuild_from_ledger`]. Called once a
     /// listener handoff's predecessor has finished writing to them. Blocks on
     /// file I/O and holds up recording while it runs: call it off the async
     /// workers.
     pub fn rebuild_usage_from_ledger(
         &self,
-    ) -> Result<crate::usage::ReplayReport, crate::usage::RebuildSkipped> {
+    ) -> Result<crate::records::usage::ReplayReport, crate::records::usage::RebuildSkipped> {
         let accounts = self.ledger_accounts();
         self.usage.rebuild_from_ledger(&accounts, crate::now_ms())
     }
 
     /// Every account as the ledger resolves lines to it, in rotation order.
-    fn ledger_accounts(&self) -> Vec<crate::usage::LedgerAccount> {
+    fn ledger_accounts(&self) -> Vec<crate::records::usage::LedgerAccount> {
         // The whole identity, not the name: the same email in two orgs is two
         // accounts (`identity.rs`) and a name alone cannot tell them apart,
         // while the org key alone moves under a re-login's backfill and strands
@@ -411,18 +415,22 @@ impl Manager {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .map(|a| crate::usage::LedgerAccount {
+            .map(|a| crate::records::usage::LedgerAccount {
                 name: a.name.clone(),
-                uuid: crate::identity::uuid_key_of(a.account_uuid.as_deref()).map(str::to_string),
-                org: crate::identity::org_key_of(a.org_uuid.as_deref(), a.org_name.as_deref())
+                uuid: crate::base::identity::uuid_key_of(a.account_uuid.as_deref())
                     .map(str::to_string),
+                org: crate::base::identity::org_key_of(
+                    a.org_uuid.as_deref(),
+                    a.org_name.as_deref(),
+                )
+                .map(str::to_string),
                 org_name: a.org_name.clone().filter(|s| !s.is_empty()),
                 provider: a.provider,
             })
             .collect()
     }
 
-    /// This account's usage row as of `now_ms` (see [`crate::usage::UsageTracker::row`]), plus a
+    /// This account's usage row as of `now_ms` (see [`crate::records::usage::UsageTracker::row`]), plus a
     /// Codex row's weekly window. `seven_day` is the weekly reset and the window's length, both
     /// in milliseconds, and `None` leaves `seven_day_window` absent.
     pub(in crate::manager) fn usage_row(
@@ -441,7 +449,7 @@ impl Manager {
     }
 
     /// The configured usage-ledger retention, in days
-    /// ([`crate::config::Config::usage_retention_days`]). Read from the config
+    /// ([`crate::base::config::Config::usage_retention_days`]). Read from the config
     /// this manager booted with, like every other boot-time knob.
     pub fn usage_retention_days(&self) -> u32 {
         self.config
@@ -465,20 +473,20 @@ impl Manager {
 
     /// Drain the usage ledger and stop its writer, inside `budget`, so the day
     /// file holds every request this process served — see
-    /// [`crate::usage::UsageTracker::shutdown_ledger`]. Called once, from
+    /// [`crate::records::usage::UsageTracker::shutdown_ledger`]. Called once, from
     /// `ServerHandle::shutdown_within`; a restart is the routine event here
     /// (every TcrBar update forces one), so the lines still in the queue at that
     /// moment are the ones a restart used to lose.
     pub fn shutdown_usage_ledger(
         &self,
         budget: std::time::Duration,
-    ) -> crate::usage::LedgerShutdown {
+    ) -> crate::records::usage::LedgerShutdown {
         self.usage.shutdown_ledger(budget)
     }
 
     /// Test-only: stall the usage-ledger writer, so a shutdown through this
     /// manager takes its whole budget — see
-    /// [`crate::usage::UsageTracker::wedge_writer_for_test`]. Dropping the
+    /// [`crate::records::usage::UsageTracker::wedge_writer_for_test`]. Dropping the
     /// returned receiver frees the writer.
     #[cfg(test)]
     pub(crate) fn wedge_usage_writer_for_test(&self) -> std::sync::mpsc::Receiver<()> {
@@ -525,8 +533,8 @@ impl Manager {
             match accounts.get_mut(idx) {
                 Some(account) => {
                     let was_codex_refused = match account.provider {
-                        crate::provider::Provider::Anthropic => false,
-                        crate::provider::Provider::Codex => {
+                        crate::base::provider::Provider::Anthropic => false,
+                        crate::base::provider::Provider::Codex => {
                             account.quota.status.as_deref() == Some("rejected")
                         }
                     };
@@ -574,10 +582,10 @@ impl Manager {
         // reads it off real traffic for free. `-1` is "not reported", never a
         // fabricated zero. Logged with the accounts lock released.
         let name = self.account_name(idx).unwrap_or_default();
-        let util = |bucket: Option<crate::probe::UsageBucket>| {
+        let util = |bucket: Option<crate::records::probe::UsageBucket>| {
             bucket.and_then(|b| b.utilization).unwrap_or(-1.0)
         };
-        let reset = |bucket: Option<crate::probe::UsageBucket>| {
+        let reset = |bucket: Option<crate::records::probe::UsageBucket>| {
             bucket.and_then(|b| b.reset_at_ms).unwrap_or(-1)
         };
         tracing::info!(
@@ -604,10 +612,10 @@ impl Manager {
     /// that this is not an account-level hold at all: it writes the rejection
     /// into the learned `seven_day_oi` window, which is the durable-exhaustion
     /// channel the doc-comment above names, and which the selector already reads
-    /// for exactly this model class ([`crate::quota::Quota::model_weekly_exhausted`],
+    /// for exactly this model class ([`crate::records::quota::Quota::model_weekly_exhausted`],
     /// `Manager::model_blocked`). So the account keeps serving every other model,
     /// and the rejection frees at its own reset with no second deadline to
-    /// reconcile. See [`crate::quota::Quota::reject_model_weekly`].
+    /// reconcile. See [`crate::records::quota::Quota::reject_model_weekly`].
     pub fn mark_model_weekly_rejected(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
         self.mark_model_weekly_rejected_at(idx, headers, OffsetDateTime::now_utc());
     }
@@ -667,10 +675,11 @@ impl Manager {
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             let hold = match account.quota.codex_refusal_deadline(now) {
-                crate::quota::RefusalDeadline::Ahead(reset) => {
+                crate::records::quota::RefusalDeadline::Ahead(reset) => {
                     reset.unix_timestamp().saturating_sub(now.unix_timestamp())
                 }
-                crate::quota::RefusalDeadline::Unnamed | crate::quota::RefusalDeadline::Passed => {
+                crate::records::quota::RefusalDeadline::Unnamed
+                | crate::records::quota::RefusalDeadline::Passed => {
                     seconds.clamp(1, MAX_RATE_LIMIT_HOLD_SECONDS)
                 }
             };
@@ -710,7 +719,7 @@ impl Manager {
             );
             account.provider
         };
-        self.record_upstream_error_at(provider, crate::observations::ErrorKind::Auth, now);
+        self.record_upstream_error_at(provider, crate::records::observations::ErrorKind::Auth, now);
     }
 
     /// Clear a hold after live proof it no longer binds (any non-429): a
@@ -744,7 +753,7 @@ impl Manager {
     /// `select.rs`'s `eligible`/`hard_ok`/`account_terminal_gate` reads the
     /// counter this writes — wiring it into routing is a separate, later,
     /// premortem'd change. The kind it names, if any
-    /// ([`crate::observations::ErrorKind::of_stream`]), becomes the provider's last error in the
+    /// ([`crate::records::observations::ErrorKind::of_stream`]), becomes the provider's last error in the
     /// routing document, which is observability too.
     pub fn record_stream_error(&self, idx: usize, kind: &str) {
         self.record_stream_error_at(idx, kind, OffsetDateTime::now_utc());
@@ -772,7 +781,7 @@ impl Manager {
             account.last_stream_error = Some(kind.to_string());
             account.provider
         };
-        if let Some(error) = crate::observations::ErrorKind::of_stream(kind) {
+        if let Some(error) = crate::records::observations::ErrorKind::of_stream(kind) {
             self.record_upstream_error_at(provider, error, now);
         }
     }
@@ -782,11 +791,11 @@ impl Manager {
     fn with_forecast_slot(
         &self,
         idx: usize,
-        update: impl FnOnce(&mut crate::forecast::Calibration),
+        update: impl FnOnce(&mut crate::records::forecast::Calibration),
     ) {
         let mut fits = self.forecast.lock().unwrap_or_else(PoisonError::into_inner);
         if fits.len() <= idx {
-            fits.resize_with(idx + 1, crate::forecast::Calibration::default);
+            fits.resize_with(idx + 1, crate::records::forecast::Calibration::default);
         }
         update(&mut fits[idx]);
     }
@@ -857,9 +866,9 @@ mod routing_observation_tests {
     //! What the routing document reports per provider is written where a served request,
     //! a failed stream and a refused credential are already recorded.
     use super::*;
-    use crate::config::Account;
-    use crate::observations::ErrorKind;
-    use crate::provider::Provider;
+    use crate::base::config::Account;
+    use crate::base::provider::Provider;
+    use crate::records::observations::ErrorKind;
     use std::collections::BTreeSet;
 
     /// One `anthropic` account (slot 0) and one `codex` account (slot 1).
@@ -892,7 +901,7 @@ mod routing_observation_tests {
     fn a_served_model_is_seen_under_its_serving_accounts_provider() {
         let manager = manager();
         let record = |model: &str| {
-            crate::usage::UsageRecord::from_quota_input(
+            crate::records::usage::UsageRecord::from_quota_input(
                 crate::now_ms(),
                 Some(model.to_string()),
                 None,

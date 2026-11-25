@@ -121,7 +121,7 @@ async fn peer_dial_splices_bytes_both_ways_through_the_listener() {
         .await
         .expect("bind");
     let port = listener.local_addr().expect("addr").port();
-    tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+    tokio::spawn(async move { mitm::serve(listener, manager, None).await });
 
     let target: SocketAddr = "100.64.0.9:7755".parse().expect("addr");
     let mut cli = crate::peer::reach::tailnet::node::dial_through_server(
@@ -216,7 +216,7 @@ async fn status_endpoint_always_reports_what_the_listener_intercepts() {
 ///
 /// The process's heat cache is shared with every other status test in this
 /// binary, and a request that finds a read in flight answers without one
-/// (`crate::heat`), so the first request may carry none. It asks for up to
+/// (`crate::stores::heat`), so the first request may carry none. It asks for up to
 /// two seconds before concluding there is no heat.
 #[tokio::test]
 async fn status_endpoint_carries_heat_where_there_is_an_smc() {

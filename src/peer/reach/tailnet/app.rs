@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Deserializer};
 
-use crate::log_err::LogErr as _;
+use crate::base::log_err::LogErr as _;
 use crate::peer::state::TailnetState;
 
 /// Where the Tailscale CLI is looked for, in order. The first that exists is

@@ -1,0 +1,1051 @@
+//! The Claude launch contract, using executable fixtures and real shells.
+//! Actual installed-client routing is exercised by test-agent-proxy-isolation.py.
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::Command;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
+use tcr::base::log_err::LogErr as _;
+
+struct StatusStub {
+    listener: TcpListener,
+    stop: Arc<AtomicBool>,
+    task: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StatusStub {
+    fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let serving = listener.try_clone().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let task = std::thread::spawn(move || {
+            let body = serde_json::json!({
+                "kind": "tcr.status.v1", "mitm": {"interceptedHosts": ["api.anthropic.com", "chatgpt.com"], "leaf": "minted"},
+                "requestKeyMode": "log",
+                "accounts": [{"name": "bob@example.com", "provider": "codex", "priority": 0,
+                    "status": "active", "disabled": false, "requests": 0, "inputTokens": 0,
+                    "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0,
+                    "probeStatus": "never", "quotaState": "normal", "gate": "ok", "threshold": 0.9}]
+            }).to_string();
+            while !stopping.load(Ordering::Relaxed) {
+                let (mut stream, _) = match serving.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("status stub: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut head = Vec::new();
+                let mut buf = [0; 1024];
+                while head.len() < 16_384 && !head.windows(4).any(|v| v == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                if head.is_empty() {
+                    continue;
+                }
+                assert!(head.starts_with(b"GET /_tcr/status "));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).log_debug("fixture client disconnected");
+            }
+        });
+        Self {
+            listener,
+            stop,
+            task: Some(task),
+        }
+    }
+}
+
+impl Drop for StatusStub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.task.take().unwrap().join().unwrap();
+    }
+}
+
+fn script(path: &Path, body: &str) {
+    std::fs::write(path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn claude_shells_go_direct_and_nested_codex_regains_the_pool() {
+    // Spaces and quotes exercise generated shell paths, without accessing any login.
+    let scratch = tempfile::Builder::new()
+        .prefix("tcr tools ' ")
+        .tempdir()
+        .unwrap();
+    let home = scratch.path();
+    let status = StatusStub::new();
+    let port = status.listener.local_addr().unwrap().port();
+    std::fs::write(
+        home.join("config.json"),
+        format!(
+            r#"{{
+        "proxy": {{"port": {port}}}, "claudeCodeImport": false,
+        "accounts": [{{"name": "alice@example.com", "accessToken": "fixture-claude"}},
+                     {{"name": "bob@example.com", "provider": "codex", "accessToken": "fixture-codex"}}]
+    }}"#
+        ),
+    )
+    .unwrap();
+    // The client now reads existing CA material; only server startup may mint it.
+    let tls_dir = home.join(".config");
+    std::fs::create_dir_all(&tls_dir).unwrap();
+    std::fs::create_dir(home.join("codex-home")).unwrap();
+    tcr::base::tls::load_tls_in(&tls_dir).unwrap();
+    let claude = home.join("real claude");
+    let codex = home.join("real codex");
+    script(
+        &codex,
+        r#"
+test "$HTTPS_PROXY" = "$EXPECTED_PROXY"
+test "$https_proxy" = "$EXPECTED_PROXY"
+test -f "$CODEX_CA_CERTIFICATE"
+printf 'nested-codex-pooled\n'
+"#,
+    );
+    script(
+        &home.join("caller prefix"),
+        r#"
+test -z "${HTTPS_PROXY:-}" || { printf "shell still inherited HTTPS_PROXY\n" >&2; exit 77; }
+printf 'caller-prefix-preserved\n'
+exec /bin/bash -c "$1"
+"#,
+    );
+    // The caller's env file applies its own network values after cleanup.
+    std::fs::write(
+        home.join("caller env"),
+        "
+export CALLER_SENTINEL=kept
+export HTTPS_PROXY=http://env-file.example:8124
+",
+    )
+    .unwrap();
+    script(
+        &claude,
+        r#"
+test "$ANTHROPIC_BASE_URL" = https://api.anthropic.com
+test "$HTTPS_PROXY" = "$EXPECTED_AGENT_PROXY"
+test "$https_proxy" = "$EXPECTED_AGENT_PROXY"
+test -f "$NODE_EXTRA_CA_CERTS"
+command='. "$CLAUDE_ENV_FILE"; test "$CALLER_SENTINEL" = kept; test "$HTTPS_PROXY" = http://env-file.example:8124; test -z "${https_proxy:-}"; test -z "${HTTP_PROXY:-}"; test -z "${http_proxy:-}"; test "$ALL_PROXY" = http://proxy.example:3999; test "$all_proxy" = http://proxy.example:3999; test -z "${NODE_EXTRA_CA_CERTS:-}"; test -z "${CODEX_CA_CERTIFICATE:-}"; codex; printf "shell-direct\n"'
+exec "$CLAUDE_CODE_SHELL_PREFIX" "set -eu; $command"
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_tcr"))
+        .args(["run", "--config"])
+        .arg(home.join("config.json"))
+        .env_clear()
+        .env("HOME", home)
+        .env("CODEX_HOME", home.join("codex-home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("SHELL", "/bin/bash")
+        .env("TCR_CLAUDE_BIN", &claude)
+        .env("TCR_CODEX_BIN", &codex)
+        .env("TCR_CLAUDE_CODE_CREDENTIALS", home.join("absent"))
+        .env("CLAUDE_CODE_SHELL_PREFIX", home.join("caller prefix"))
+        .env("CLAUDE_ENV_FILE", home.join("caller env"))
+        .env(
+            "EXPECTED_PROXY",
+            format!("http://tcr-codex@127.0.0.1:{port}"),
+        )
+        .env("EXPECTED_AGENT_PROXY", format!("http://127.0.0.1:{port}"))
+        .env("ALL_PROXY", "http://proxy.example:3999")
+        .env("all_proxy", "http://proxy.example:3999")
+        .current_dir(home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "caller-prefix-preserved",
+        "nested-codex-pooled",
+        "shell-direct",
+    ] {
+        assert!(out.contains(expected), "missing {expected}: {out}");
+    }
+}
+
+struct AgentFixture {
+    home: tempfile::TempDir,
+    _status: StatusStub,
+}
+impl AgentFixture {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("codex-home")).unwrap();
+        let status = StatusStub::new();
+        let port = status.listener.local_addr().unwrap().port();
+        std::fs::write(home.path().join("config.json"), format!(r#"{{"proxy":{{"port":{port},"requestKey":"fixture-key-one"}},"claudeCodeImport":false,"accounts":[{{"name":"alice@example.com","accessToken":"fixture"}}]}}"#)).unwrap();
+        std::fs::create_dir_all(home.path().join(".config")).unwrap();
+        tcr::base::tls::load_tls_in(&home.path().join(".config")).unwrap();
+        Self {
+            home,
+            _status: status,
+        }
+    }
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        cmd.args(["run", "--config"])
+            .arg(self.home.path().join("config.json"))
+            .env_clear()
+            .env("HOME", self.home.path())
+            .env("CODEX_HOME", self.home.path().join("codex-home"))
+            .env(
+                "PATH",
+                self.home.path().join("bin").to_string_lossy().to_string() + ":/usr/bin:/bin",
+            )
+            .env("TCR_TEST_BIN", env!("CARGO_BIN_EXE_tcr"))
+            .env("SHELL", "/bin/bash")
+            .env("TCR_CLAUDE_BIN", self.home.path().join("real-claude"))
+            .env("TCR_CODEX_BIN", self.home.path().join("real-codex"));
+        cmd
+    }
+    fn run(&self, body: &str) -> std::process::Output {
+        script(&self.home.path().join("real-claude"), body);
+        let output = self.command().output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+}
+
+#[test]
+fn nested_claude_preserves_explicit_overrides() {
+    let fixture = AgentFixture::new();
+    fixture.run(r#"
+if [ "${NESTED:-}" = yes ]; then
+    test "$ANTHROPIC_BASE_URL" = http://127.0.0.1:4000
+    test "$HTTPS_PROXY" = http://proxy.example:3999
+    test "$NODE_EXTRA_CA_CERTS" = /caller/ca.pem
+    printf 'overrides-kept\n'
+    exit
+fi
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'NESTED=yes ANTHROPIC_BASE_URL=http://127.0.0.1:4000 HTTPS_PROXY=http://proxy.example:3999 NODE_EXTRA_CA_CERTS=/caller/ca.pem claude'
+"#);
+}
+
+/// The client runs as tcr's own pid, and launches with the same setup share one helper directory.
+#[test]
+fn the_client_replaces_tcr_and_one_setup_shares_one_helper_directory() {
+    let fixture = AgentFixture::new();
+    let parent = fixture.home.path().join(".cache/tcr/tool-env");
+    let launches = || -> Vec<std::path::PathBuf> {
+        let mut dirs: Vec<_> = std::fs::read_dir(&parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        dirs.sort();
+        dirs
+    };
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"printf '%s\n' "$$""#,
+    );
+    let child = fixture
+        .command()
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let tcr_pid = child.id();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{tcr_pid}\n"),
+        "the client must run as tcr's own pid"
+    );
+    let first = launches();
+    assert_eq!(first.len(), 1);
+
+    assert!(fixture.command().output().unwrap().status.success());
+    assert_eq!(launches(), first, "the same setup reuses its directory");
+
+    let env_file = fixture.home.path().join("caller env");
+    std::fs::write(&env_file, "").unwrap();
+    let output = fixture
+        .command()
+        .env("CLAUDE_ENV_FILE", &env_file)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        launches().len(),
+        2,
+        "a different setup gets its own directory"
+    );
+}
+
+#[test]
+fn a_setup_directory_others_can_open_is_refused() {
+    let fixture = AgentFixture::new();
+    fixture.run("true");
+    let parent = fixture.home.path().join(".cache/tcr/tool-env");
+    let setup = std::fs::read_dir(&parent)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = fixture.command().output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mode 0700"));
+}
+
+/// tcr starts without the `CLAUDE_CODE_SHELL` that Claude reads from `settings.json`,
+/// so the prefix must take it from the command's own environment, and fall back
+/// to the launch-time shell when it is unset or names no runnable bash/zsh.
+#[test]
+fn shell_prefix_runs_the_shell_claude_names_at_command_time() {
+    if !Path::new("/bin/zsh").exists() {
+        eprintln!("no /bin/zsh on this machine; skipping the shell-choice check");
+        return;
+    }
+    let fixture = AgentFixture::new();
+    let output = fixture.run(
+        r#"
+probe='printf "%s\n" "${ZSH_VERSION:+zsh}${BASH_VERSION:+bash}"'
+printf 'set=%s\n' "$(CLAUDE_CODE_SHELL=/bin/zsh "$CLAUDE_CODE_SHELL_PREFIX" "$probe")"
+printf 'unset=%s\n' "$(env -u CLAUDE_CODE_SHELL "$CLAUDE_CODE_SHELL_PREFIX" "$probe")"
+printf 'bogus=%s\n' "$(CLAUDE_CODE_SHELL=/nonexistent/zsh "$CLAUDE_CODE_SHELL_PREFIX" "$probe")"
+"#,
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    for expected in ["set=zsh", "unset=bash", "bogus=bash"] {
+        assert!(out.contains(expected), "missing {expected}: {out}");
+    }
+}
+
+#[test]
+fn nested_claude_from_codex_has_a_plain_marker_and_claudes_ca() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"
+case "$HTTPS_PROXY" in *tcr-codex*) exit 72;; esac
+test "$NODE_EXTRA_CA_CERTS" = "$HOME/.config/tcr-ca.pem"
+printf 'plain-claude\n'
+"#,
+    );
+    script(
+        &fixture.home.path().join("real-codex"),
+        r#"
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'claude'
+"#,
+    );
+    let output = fixture.command().arg("--codex").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("plain-claude"));
+}
+
+#[test]
+fn a_prefix_with_flags_is_refused_before_starting_the_client() {
+    let fixture = AgentFixture::new();
+    script(&fixture.home.path().join("real-claude"), "exit 79");
+    let output = fixture
+        .command()
+        .env(
+            "CLAUDE_CODE_SHELL_PREFIX",
+            "/usr/local/bin/audit-wrap --log",
+        )
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("executable wrapper script"));
+}
+
+#[test]
+fn a_callers_codex_bin_overrides_the_nested_launcher_default() {
+    let fixture = AgentFixture::new();
+    script(&fixture.home.path().join("real-codex"), "exit 78");
+    script(
+        &fixture.home.path().join("override-codex"),
+        "printf 'override-codex\\n'",
+    );
+    fixture.run(
+        r#"
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'CODEX_BIN="$HOME/override-codex" codex'
+"#,
+    );
+}
+
+#[test]
+fn nested_tcr_commands_skip_the_path_launchers() {
+    let fixture = AgentFixture::new();
+    std::fs::create_dir(fixture.home.path().join("bin")).unwrap();
+    script(
+        &fixture.home.path().join("bin/claude"),
+        "printf 'real-client\\n'",
+    );
+    let output = fixture.run(r#"
+if [ "${INNER:-}" = yes ]; then exit 73; fi
+# Remove explicit binary overrides, forcing the inner tcr to search PATH.
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'unset TCR_CLAUDE_BIN; INNER=yes "$TCR_TEST_BIN" run --config "$HOME/config.json"'
+"#);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("real-client"));
+}
+
+#[test]
+fn relative_cache_roots_produce_absolute_helpers_and_insecure_roots_are_refused() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"
+case "$CLAUDE_CODE_SHELL_PREFIX" in /*) ;; *) exit 74;; esac
+"#,
+    );
+    let output = fixture
+        .command()
+        .env("XDG_CACHE_HOME", "relative-cache")
+        .current_dir(fixture.home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let root = fixture.home.path().join("relative-cache/tcr/tool-env");
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let output = fixture
+        .command()
+        .env("XDG_CACHE_HOME", "relative-cache")
+        .current_dir(fixture.home.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mode 0700"));
+}
+
+#[test]
+fn nested_tcr_codex_run_uses_its_own_config_and_real_binary() {
+    let fixture = AgentFixture::new();
+    let inner = StatusStub::new();
+    let inner_port = inner.listener.local_addr().unwrap().port();
+    std::fs::write(
+        fixture.home.path().join("other.json"),
+        format!(r#"{{"proxy":{{"port":{inner_port}}},"accounts":[],"claudeCodeImport":false}}"#),
+    )
+    .unwrap();
+    std::fs::create_dir(fixture.home.path().join("bin")).unwrap();
+    script(
+        &fixture.home.path().join("bin/codex"),
+        &format!(
+            "test \"$HTTPS_PROXY\" = 'http://tcr-codex@127.0.0.1:{inner_port}'\nprintf 'inner-config-kept\\n'"
+        ),
+    );
+    script(&fixture.home.path().join("real-codex"), "exit 75");
+    let output = fixture.run(r#"
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'unset TCR_CODEX_BIN; "$TCR_TEST_BIN" run --codex --config "$HOME/other.json"'
+"#);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("inner-config-kept"));
+}
+
+#[test]
+fn helper_files_never_contain_the_runtime_request_key() {
+    let fixture = AgentFixture::new();
+    fixture.run(
+        r#"
+root=$(dirname "$CLAUDE_CODE_SHELL_PREFIX")
+for helper in "$root"/*; do
+    if /usr/bin/grep -q fixture-key-one "$helper"; then exit 71; fi
+done
+"#,
+    );
+}
+
+/// Fail unless `output` succeeded, naming `what` broke and carrying both streams.
+fn assert_ran(output: &std::process::Output, what: &str) {
+    assert!(
+        output.status.success(),
+        "{what}: {}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The model URL a nested `claude` reaches the pool through: this fixture's port,
+/// with the request key as the password.
+fn pooled_model_url(fixture: &AgentFixture) -> String {
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.home.path().join("config.json")).unwrap())
+            .unwrap();
+    let port = config["proxy"]["port"].as_u64().unwrap();
+    format!("http://tcr:fixture-key-one@127.0.0.1:{port}/")
+}
+
+/// A `claude` that, started again from its own shell tool as `INNER=yes claude`,
+/// checks it reached the pool with tcr's CA.
+const NESTED_CLAUDE_EXPECTS_THE_POOL: &str = r#"
+if [ "${INNER:-}" = yes ]; then
+    test "$HTTPS_PROXY" = "$EXPECTED_MODEL"
+    test "$NODE_EXTRA_CA_CERTS" = "$HOME/.config/tcr-ca.pem"
+    printf 'nested-pooled\n'; exit
+fi
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'INNER=yes claude'
+"#;
+
+#[test]
+fn a_callers_proxy_and_ca_do_not_take_a_nested_claude_off_the_pool() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-claude"),
+        NESTED_CLAUDE_EXPECTS_THE_POOL,
+    );
+    let output = fixture
+        .command()
+        .env("HTTPS_PROXY", "http://corporate.example:8123")
+        .env("NODE_EXTRA_CA_CERTS", "/caller/ca.pem")
+        .env("EXPECTED_MODEL", pooled_model_url(&fixture))
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "the caller's restored proxy and CA took a nested claude off the pool",
+    );
+}
+
+#[test]
+fn a_callers_ca_alone_does_not_break_a_nested_claudes_trust() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-claude"),
+        NESTED_CLAUDE_EXPECTS_THE_POOL,
+    );
+    let output = fixture
+        .command()
+        .env("NODE_EXTRA_CA_CERTS", "/caller/ca.pem")
+        .env("EXPECTED_MODEL", pooled_model_url(&fixture))
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "the caller's restored CA replaced tcr's CA for a nested claude",
+    );
+}
+
+#[test]
+fn the_callers_env_file_values_survive_the_shell_cleanup() {
+    let fixture = AgentFixture::new();
+    std::fs::write(
+        fixture.home.path().join("caller.env"),
+        "export HTTPS_PROXY=http://env-file.example:8124\nexport NODE_EXTRA_CA_CERTS=/env/ca.pem\n",
+    )
+    .unwrap();
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"exec "$CLAUDE_CODE_SHELL_PREFIX" '. "$CLAUDE_ENV_FILE"; test "$HTTPS_PROXY" = http://env-file.example:8124; test "$NODE_EXTRA_CA_CERTS" = /env/ca.pem'"#,
+    );
+    let output = fixture
+        .command()
+        .env("CLAUDE_ENV_FILE", fixture.home.path().join("caller.env"))
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "the caller's env file values were lost after the cleanup sourced it",
+    );
+}
+
+#[test]
+fn a_codex_launch_ignores_a_claude_prefix_with_flags() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-codex"),
+        "printf 'codex-ok\\n'",
+    );
+    let output = fixture
+        .command()
+        .arg("--codex")
+        .env("CLAUDE_CODE_SHELL_PREFIX", "/audit --flag")
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "a codex launch refused a Claude-only prefix with flags",
+    );
+}
+
+#[test]
+fn a_codex_launch_prints_the_shell_routing_notice_once() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-codex"),
+        "printf 'codex-ok\\n'",
+    );
+    let output = fixture.command().arg("--codex").output().unwrap();
+    assert_ran(&output, "the codex launch failed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let notices = stderr.matches("shell tools use the caller's").count();
+    assert_eq!(
+        notices, 1,
+        "the shell routing notice must print once; stderr={stderr}"
+    );
+}
+
+#[test]
+fn a_prefix_wrapper_whose_path_contains_space_dash_is_accepted() {
+    let fixture = AgentFixture::new();
+    let wrap = fixture.home.path().join("audit -wrapper");
+    script(&wrap, "exec /bin/bash -c \"$1\"");
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"exec "$CLAUDE_CODE_SHELL_PREFIX" 'printf wrapper-ok'"#,
+    );
+    let output = fixture
+        .command()
+        .env("CLAUDE_CODE_SHELL_PREFIX", &wrap)
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "an executable wrapper whose path contains \" -\" was refused as a prefix with flags",
+    );
+}
+
+#[test]
+fn a_prefix_left_by_a_removed_helper_directory_is_dropped() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"exec "$CLAUDE_CODE_SHELL_PREFIX" 'printf prefix-ok'"#,
+    );
+    let stale = fixture
+        .home
+        .path()
+        .join(".cache/tcr/tool-env/launch-gone/shell-prefix");
+    let output = fixture
+        .command()
+        .env("CLAUDE_CODE_SHELL_PREFIX", stale)
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "a prefix from a removed helper directory was run as the caller's wrapper",
+    );
+}
+
+#[test]
+fn a_tcr_run_alias_does_not_double_run_for_a_nested_codex() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-codex"),
+        "printf 'codex-ok\\n'",
+    );
+    let alias = fixture.home.path().join("tcr-run");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_tcr"), &alias).unwrap();
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"if [ "${ALIAS_STAGE:-}" = nested ]; then exit 76; fi; export ALIAS_STAGE=nested; exec "$CLAUDE_CODE_SHELL_PREFIX" 'codex'"#,
+    );
+    let cmd = fixture.command();
+    // Reuse the complete synthetic environment, but enter through the alias.
+    let mut aliased = Command::new(alias);
+    aliased
+        .arg("--config")
+        .arg(fixture.home.path().join("config.json"));
+    aliased.env_clear();
+    for (k, v) in cmd.get_envs() {
+        if let Some(v) = v {
+            aliased.env(k, v);
+        }
+    }
+    let output = aliased.output().unwrap();
+    assert_ran(
+        &output,
+        "a nested codex started under the tcr-run alias got a doubled run argv",
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("codex-ok"),
+        "the nested codex did not run; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The caller's env file sets proxy and CA values for shell tools such as `git`.
+/// Sourcing it is not a choice to leave the pool, so a nested `claude` that
+/// inherits exactly those values still reaches the pool with tcr's CA.
+#[test]
+fn an_env_file_proxy_keeps_a_nested_claude_on_the_pool() {
+    let fixture = AgentFixture::new();
+    std::fs::write(
+        fixture.home.path().join("caller.env"),
+        "export HTTPS_PROXY=http://env-file.example:8124\nexport NODE_EXTRA_CA_CERTS=/env/ca.pem\n",
+    )
+    .unwrap();
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"
+if [ "${INNER:-}" = yes ]; then
+    test "$HTTPS_PROXY" = "$EXPECTED_MODEL" || { printf 'nested HTTPS_PROXY=%s\n' "$HTTPS_PROXY" >&2; exit 81; }
+    test "$NODE_EXTRA_CA_CERTS" = "$HOME/.config/tcr-ca.pem" || { printf 'nested NODE_EXTRA_CA_CERTS=%s\n' "$NODE_EXTRA_CA_CERTS" >&2; exit 82; }
+    exit
+fi
+exec "$CLAUDE_CODE_SHELL_PREFIX" '. "$CLAUDE_ENV_FILE"; test "$HTTPS_PROXY" = http://env-file.example:8124; INNER=yes claude'
+"#,
+    );
+    let output = fixture
+        .command()
+        .env("CLAUDE_ENV_FILE", fixture.home.path().join("caller.env"))
+        .env("EXPECTED_MODEL", pooled_model_url(&fixture))
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "a proxy exported by the caller's env file took a nested claude off the pool",
+    );
+}
+
+/// A proxy set on the nested `claude` command itself is an explicit override,
+/// even when the caller's env file exported a different one.
+#[test]
+fn a_command_proxy_overrides_the_pool_for_a_nested_claude() {
+    let fixture = AgentFixture::new();
+    std::fs::write(
+        fixture.home.path().join("caller.env"),
+        "export HTTPS_PROXY=http://env-file.example:8124\n",
+    )
+    .unwrap();
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"
+if [ "${INNER:-}" = yes ]; then
+    test "$HTTPS_PROXY" = http://command.example:9000 || { printf 'nested HTTPS_PROXY=%s\n' "$HTTPS_PROXY" >&2; exit 83; }
+    exit
+fi
+exec "$CLAUDE_CODE_SHELL_PREFIX" '. "$CLAUDE_ENV_FILE"; INNER=yes HTTPS_PROXY=http://command.example:9000 claude'
+"#,
+    );
+    let output = fixture
+        .command()
+        .env("CLAUDE_ENV_FILE", fixture.home.path().join("caller.env"))
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "a proxy set on the nested claude command was not kept as an override",
+    );
+}
+
+/// Every variable the shell helpers reset, in the order [`show_proxies`] prints them.
+const RESET_KEYS: [&str; 8] = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "CODEX_CA_CERTIFICATE",
+];
+
+/// A script at `<home>/show-proxies` that prints `<stage> KEY=value` for each of
+/// [`RESET_KEYS`], `<unset>` for one that is not set.
+fn show_proxies(fixture: &AgentFixture) {
+    script(
+        &fixture.home.path().join("show-proxies"),
+        &format!(
+            "for k in {}; do printf '%s %s=%s\\n' \"$1\" \"$k\" \"$(printenv \"$k\" || printf '<unset>')\"; done",
+            RESET_KEYS.join(" ")
+        ),
+    );
+}
+
+/// The `KEY=value` lines `stage` printed, in [`RESET_KEYS`] order.
+fn stage(stdout: &str, stage: &str) -> Vec<String> {
+    let prefix = format!("{stage} ");
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix).map(str::to_string))
+        .collect()
+}
+
+/// Claude Code's Bash sandbox gives each command its own proxy, on a loopback port
+/// that is not tcr's, through the same variables. A value the helpers did not get
+/// from `tcr run` is not theirs to change: both the prefix and the env file keep it.
+#[test]
+fn a_sandbox_proxy_set_per_command_survives_both_helpers() {
+    let fixture = AgentFixture::new();
+    show_proxies(&fixture);
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"
+export HTTPS_PROXY=http://u:p@127.0.0.1:50337 https_proxy=http://u:p@127.0.0.1:50337
+export HTTP_PROXY=http://u:p@127.0.0.1:50337 http_proxy=http://u:p@127.0.0.1:50337
+export ALL_PROXY=socks5h://127.0.0.1:50338 all_proxy=socks5h://127.0.0.1:50338
+export NODE_EXTRA_CA_CERTS=/sandbox/ca.pem CODEX_CA_CERTIFICATE=/sandbox/codex-ca.pem
+"$CLAUDE_CODE_SHELL_PREFIX" '"$HOME/show-proxies" prefix'
+/bin/sh -c '. "$CLAUDE_ENV_FILE"; "$HOME/show-proxies" env-file'
+"#,
+    );
+    // A caller value for one key, so the restoring branch is checked as well as `unset`.
+    let output = fixture
+        .command()
+        .env("ALL_PROXY", "http://proxy.example:3999")
+        .output()
+        .unwrap();
+    assert_ran(&output, "the sandbox fixture failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let want: Vec<String> = [
+        "HTTPS_PROXY=http://u:p@127.0.0.1:50337",
+        "https_proxy=http://u:p@127.0.0.1:50337",
+        "HTTP_PROXY=http://u:p@127.0.0.1:50337",
+        "http_proxy=http://u:p@127.0.0.1:50337",
+        "ALL_PROXY=socks5h://127.0.0.1:50338",
+        "all_proxy=socks5h://127.0.0.1:50338",
+        "NODE_EXTRA_CA_CERTS=/sandbox/ca.pem",
+        "CODEX_CA_CERTIFICATE=/sandbox/codex-ca.pem",
+    ]
+    .map(String::from)
+    .to_vec();
+    for helper in ["prefix", "env-file"] {
+        assert_eq!(
+            stage(&stdout, helper),
+            want,
+            "the {helper} helper changed a sandbox's per-command value"
+        );
+    }
+}
+
+/// What `tcr run` gave claude never reaches a shell tool: the caller's value comes
+/// back or the variable is unset, in both spellings. The nested `claude` launcher's
+/// form of tcr's proxy and CA counts as tcr's too, so its shells go direct as well.
+#[test]
+fn tcrs_own_proxy_and_ca_are_replaced_by_the_callers_or_unset() {
+    let fixture = AgentFixture::new();
+    show_proxies(&fixture);
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"
+for helper in prefix env-file; do
+    case "$helper" in
+        prefix) run() { "$CLAUDE_CODE_SHELL_PREFIX" "\"\$HOME/show-proxies\" $1"; } ;;
+        env-file) run() { /bin/sh -c ". \"\$CLAUDE_ENV_FILE\"; \"\$HOME/show-proxies\" $1"; } ;;
+    esac
+    run "launch-$helper"
+    HTTPS_PROXY=$TCR_TOOL_CLAUDE_PROXY https_proxy=$TCR_TOOL_CLAUDE_PROXY NODE_EXTRA_CA_CERTS=$TCR_TOOL_CLAUDE_CA run "nested-$helper"
+done
+"#,
+    );
+    let output = fixture
+        .command()
+        .env("HTTPS_PROXY", "http://corporate.example:8123")
+        .env("ALL_PROXY", "http://proxy.example:3999")
+        .output()
+        .unwrap();
+    assert_ran(&output, "the tcr-values fixture failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let want: Vec<String> = [
+        "HTTPS_PROXY=http://corporate.example:8123",
+        "https_proxy=<unset>",
+        "HTTP_PROXY=<unset>",
+        "http_proxy=<unset>",
+        "ALL_PROXY=http://proxy.example:3999",
+        "all_proxy=<unset>",
+        "NODE_EXTRA_CA_CERTS=<unset>",
+        "CODEX_CA_CERTIFICATE=<unset>",
+    ]
+    .map(String::from)
+    .to_vec();
+    assert_eq!(want.len(), RESET_KEYS.len());
+    for name in [
+        "launch-prefix",
+        "nested-prefix",
+        "launch-env-file",
+        "nested-env-file",
+    ] {
+        assert_eq!(
+            stage(&stdout, name),
+            want,
+            "{name}: tcr's own value reached a shell tool"
+        );
+    }
+}
+
+/// cmux's per-pane shim and wrapper in one: run the next `name` on `PATH` past its own
+/// directory, as cmux's wrapper does. It counts its runs, so a loop fails fast.
+fn cmux_shim_dir(fixture: &AgentFixture, name: &str) -> std::path::PathBuf {
+    let dir = fixture.home.path().join("T/cmux-cli-shims/11111111-AAAA");
+    std::fs::create_dir_all(&dir).unwrap();
+    script(
+        &dir.join(name),
+        &format!(
+            r#"
+hops=$(( ${{SHIM_HOPS:-0}} + 1 )); export SHIM_HOPS=$hops
+if [ "$hops" -gt 3 ]; then printf 'the cmux shim looped\n' >&2; exit 79; fi
+self=$(dirname "$0"); IFS=:
+for d in $PATH; do
+    if [ "$d" != "$self" ] && [ -x "$d/{name}" ]; then exec "$d/{name}" "$@"; fi
+done
+exit 127
+"#
+        ),
+    );
+    dir
+}
+
+/// A real `name` in `<home>/bin` that prints how many cmux shim runs preceded it, and a
+/// `PATH` with the cmux shim directory ahead of it.
+fn behind_a_cmux_shim(fixture: &AgentFixture, name: &str) -> String {
+    let shims = cmux_shim_dir(fixture, name);
+    let bin = fixture.home.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    script(
+        &bin.join(name),
+        &format!("printf 'real-{name} hops=%s\\n' \"${{SHIM_HOPS:-0}}\""),
+    );
+    format!("{}:{}:/usr/bin:/bin", shims.display(), bin.display())
+}
+
+/// The agent still starts through a cmux shim first on `PATH`, but the launcher that shim's
+/// wrapper finds next execs the real `claude`, not the shim again.
+#[test]
+fn a_cmux_shim_on_path_runs_once_before_the_real_claude() {
+    let fixture = AgentFixture::new();
+    let path = behind_a_cmux_shim(&fixture, "claude");
+    let output = fixture
+        .command()
+        .env_remove("TCR_CLAUDE_BIN")
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert_ran(&output, "tcr run behind a cmux claude shim");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("real-claude hops=1"), "stdout={stdout}");
+}
+
+/// [`a_cmux_shim_on_path_runs_once_before_the_real_claude`] for `tcr run --codex`, whose
+/// `codex` launcher pins `TCR_CODEX_BIN` for the `tcr run --codex` it starts.
+#[test]
+fn a_cmux_shim_on_path_runs_once_before_the_real_codex() {
+    let fixture = AgentFixture::new();
+    let path = behind_a_cmux_shim(&fixture, "codex");
+    let output = fixture
+        .command()
+        .arg("--codex")
+        .env_remove("TCR_CODEX_BIN")
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert_ran(&output, "tcr run --codex behind a cmux codex shim");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("real-codex hops=1"), "stdout={stdout}");
+}
+
+/// cmux's custom binary path setting: the shim is the only `name` on `PATH`, and it
+/// runs the binary that `$CMUX_CUSTOM_BIN` names. Returns that `PATH`.
+fn only_a_cmux_shim(fixture: &AgentFixture, name: &str) -> String {
+    let dir = fixture.home.path().join("T/cmux-cli-shims/22222222-BBBB");
+    std::fs::create_dir_all(&dir).unwrap();
+    script(
+        &dir.join(name),
+        r#"
+hops=$(( ${SHIM_HOPS:-0} + 1 )); export SHIM_HOPS=$hops
+if [ "$hops" -gt 3 ]; then printf 'the cmux shim looped\n' >&2; exit 79; fi
+exec "$CMUX_CUSTOM_BIN" "$@"
+"#,
+    );
+    format!("{}:/usr/bin:/bin", dir.display())
+}
+
+/// When the cmux shim is the only `claude` on `PATH`, the launcher pins the shim, so a
+/// nested `claude` still reaches the pool rather than going direct.
+#[test]
+fn a_nested_claude_behind_the_only_cmux_shim_stays_on_the_pool() {
+    let fixture = AgentFixture::new();
+    let real = fixture.home.path().join("custom-claude");
+    script(
+        &real,
+        r#"
+if [ "${INNER:-}" = yes ]; then
+    test "${HTTPS_PROXY:-}" = "$EXPECTED_MODEL" || { printf 'nested HTTPS_PROXY=%s\n' "${HTTPS_PROXY:-}" >&2; exit 81; }
+    printf 'nested-pooled\n'; exit
+fi
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'INNER=yes claude'
+"#,
+    );
+    let output = fixture
+        .command()
+        .env_remove("TCR_CLAUDE_BIN")
+        .env("PATH", only_a_cmux_shim(&fixture, "claude"))
+        .env("CMUX_CUSTOM_BIN", &real)
+        .env("EXPECTED_MODEL", pooled_model_url(&fixture))
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "a nested claude behind the only cmux shim left the pool",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("nested-pooled"), "stdout={stdout}");
+}
+
+/// [`a_nested_claude_behind_the_only_cmux_shim_stays_on_the_pool`] for a nested `codex`.
+#[test]
+fn a_nested_codex_behind_the_only_cmux_shim_stays_on_the_pool() {
+    let fixture = AgentFixture::new();
+    let real = fixture.home.path().join("custom-codex");
+    script(
+        &real,
+        r#"
+case "${HTTPS_PROXY:-}" in *tcr-codex*) ;; *) printf 'nested codex HTTPS_PROXY=%s\n' "${HTTPS_PROXY:-}" >&2; exit 84;; esac
+printf 'nested-codex-pooled\n'
+"#,
+    );
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"exec "$CLAUDE_CODE_SHELL_PREFIX" 'codex'"#,
+    );
+    let output = fixture
+        .command()
+        .env_remove("TCR_CODEX_BIN")
+        .env("PATH", only_a_cmux_shim(&fixture, "codex"))
+        .env("CMUX_CUSTOM_BIN", &real)
+        .output()
+        .unwrap();
+    assert_ran(
+        &output,
+        "a nested codex behind the only cmux shim left the pool",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("nested-codex-pooled"), "stdout={stdout}");
+}

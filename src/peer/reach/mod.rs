@@ -29,7 +29,7 @@
 //! other end of a completed handshake accept from us in this slot", which is
 //! exactly the question a DIALLER asks before it tries a rendezvous port a
 //! recorded endpoint stopped answering on ([`rendezvous_ports`](crate::peer::reach::rendezvous_ports), the caller
-//! `tests/peer_reach.rs` exercises). Nothing in this repository BINDS on a
+//! `tests/peer/reach/peer_reach.rs` exercises). Nothing in this repository BINDS on a
 //! derived port or checks an inbound connection's source port against
 //! [`port_is_accepted`](crate::peer::reach::port_is_accepted): [`crate::peer::listener::serve`] binds the one
 //! configured `listen` address, and that is the only socket this node ever

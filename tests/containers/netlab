@@ -282,7 +282,7 @@ wait_listener() {
 # `bind`+`listen`, which measurably is not the same instant a bridged peer
 # elsewhere in the lab can complete a TCP handshake to it. Under load this
 # gap was measured past 4.5s, and the proxy's own transport-failure backoff
-# (`retry_after`, `src/proxy.rs`) then holds a 503 for a further ~5s once the
+# (`retry_after`, `src/proxy/mod.rs`) then holds a 503 for a further ~5s once the
 # FIRST attempt fails, so the fix is upstream of that: never let a client's
 # first request BE the first attempt.
 wait_reachable() {

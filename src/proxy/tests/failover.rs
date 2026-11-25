@@ -194,13 +194,17 @@ async fn suppressed_force_401_keeps_account_active_and_rotates() {
     // A refresher that always fails transiently → apply_refresh never runs, so
     // ensure_fresh_force returns false (identical to a cooldown-suppressed force).
     struct AlwaysTransient;
-    impl crate::oauth::TokenRefresher for AlwaysTransient {
+    impl crate::clients::oauth::TokenRefresher for AlwaysTransient {
         fn refresh(
             &self,
             _provider: Provider,
             _refresh_token: String,
-        ) -> crate::oauth::RefreshFuture {
-            Box::pin(async { Err(crate::oauth::OAuthError::Transient("simulated blip".into())) })
+        ) -> crate::clients::oauth::RefreshFuture {
+            Box::pin(async {
+                Err(crate::clients::oauth::OAuthError::Transient(
+                    "simulated blip".into(),
+                ))
+            })
         }
     }
 
@@ -211,8 +215,8 @@ async fn suppressed_force_401_keeps_account_active_and_rotates() {
     let manager = Manager::new(
         dummy_config(None, &format!("http://{up_addr}")),
         Arc::new(AlwaysTransient),
-        Arc::new(crate::probe::LiveUsageProber::new()),
-        Arc::new(crate::warmer::LiveWarmer::new()),
+        Arc::new(crate::records::probe::LiveUsageProber::new()),
+        Arc::new(crate::clients::warmer::LiveWarmer::new()),
         None,
     );
 
@@ -240,12 +244,12 @@ async fn suppressed_force_401_keeps_account_active_and_rotates() {
 #[tokio::test]
 async fn single_401_on_account_without_refresh_token_marks_error() {
     struct NeverCalled;
-    impl crate::oauth::TokenRefresher for NeverCalled {
+    impl crate::clients::oauth::TokenRefresher for NeverCalled {
         fn refresh(
             &self,
             _provider: Provider,
             _refresh_token: String,
-        ) -> crate::oauth::RefreshFuture {
+        ) -> crate::clients::oauth::RefreshFuture {
             Box::pin(async {
                 panic!("a refresh must never be attempted for an account with no refresh token")
             })
@@ -259,8 +263,8 @@ async fn single_401_on_account_without_refresh_token_marks_error() {
     let manager = Manager::new(
         config,
         Arc::new(NeverCalled),
-        Arc::new(crate::probe::LiveUsageProber::new()),
-        Arc::new(crate::warmer::LiveWarmer::new()),
+        Arc::new(crate::records::probe::LiveUsageProber::new()),
+        Arc::new(crate::clients::warmer::LiveWarmer::new()),
         None,
     );
 
@@ -294,14 +298,14 @@ async fn second_401_does_not_condemn_account_to_terminal_error() {
     // retries the SAME account, the canned upstream 401s again, and we land on
     // the 2nd-401 path under test.
     struct AlwaysRefreshes;
-    impl crate::oauth::TokenRefresher for AlwaysRefreshes {
+    impl crate::clients::oauth::TokenRefresher for AlwaysRefreshes {
         fn refresh(
             &self,
             _provider: Provider,
             _refresh_token: String,
-        ) -> crate::oauth::RefreshFuture {
+        ) -> crate::clients::oauth::RefreshFuture {
             Box::pin(async {
-                Ok(crate::oauth::Tokens {
+                Ok(crate::clients::oauth::Tokens {
                     id_token: None,
                     access_token: "fresh-access".into(),
                     refresh_token: Some("fresh-refresh".into()),
@@ -317,8 +321,8 @@ async fn second_401_does_not_condemn_account_to_terminal_error() {
     let manager = Manager::new(
         dummy_config(None, &format!("http://{up_addr}")),
         Arc::new(AlwaysRefreshes),
-        Arc::new(crate::probe::LiveUsageProber::new()),
-        Arc::new(crate::warmer::LiveWarmer::new()),
+        Arc::new(crate::records::probe::LiveUsageProber::new()),
+        Arc::new(crate::clients::warmer::LiveWarmer::new()),
         None,
     );
 
@@ -1040,14 +1044,14 @@ async fn overloaded_529_failover_is_bounded() {
 /// per-request `tried` set must not shade into benching it for everyone else.
 /// After a completed failover, no account carries a rate-limit hold and none is
 /// held out of rotation for any other reason either (an upstream `rejected` mark
-/// included) — [`crate::stats::GateReason::Ok`] is exactly that claim, read from
+/// included) — [`crate::records::stats::GateReason::Ok`] is exactly that claim, read from
 /// the same `account_gate` the selector's hard gates come from.
 ///
 /// The sibling of `overloaded_529_never_arms_a_hold_or_benches_the_account`, which
 /// asserts the same thing on the give-up path where no failover happens at all.
 #[tokio::test]
 async fn overloaded_529_failover_arms_no_hold() {
-    use crate::stats::GateReason;
+    use crate::records::stats::GateReason;
     let up_addr = spawn_scripted_upstream(vec![
         Some(raw_529()),
         Some(raw_529()),
@@ -1292,16 +1296,20 @@ async fn the_terminal_verdict_reads_every_arm_off_the_tallies() {
     use super::ladder::Tally;
 
     struct NoRefresh;
-    impl crate::oauth::TokenRefresher for NoRefresh {
-        fn refresh(&self, _provider: Provider, _t: String) -> crate::oauth::RefreshFuture {
-            Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+    impl crate::clients::oauth::TokenRefresher for NoRefresh {
+        fn refresh(&self, _provider: Provider, _t: String) -> crate::clients::oauth::RefreshFuture {
+            Box::pin(async {
+                Err(crate::clients::oauth::OAuthError::Transient(
+                    "unused".into(),
+                ))
+            })
         }
     }
     let manager = Manager::new(
         dummy_config(None, "http://127.0.0.1:9"),
         Arc::new(NoRefresh),
-        Arc::new(crate::probe::LiveUsageProber::new()),
-        Arc::new(crate::warmer::LiveWarmer::new()),
+        Arc::new(crate::records::probe::LiveUsageProber::new()),
+        Arc::new(crate::clients::warmer::LiveWarmer::new()),
         None,
     );
     let now = OffsetDateTime::now_utc();

@@ -271,7 +271,7 @@ fi
 # on every macOS checkout while working in CI on glibc, so a local scan came
 # back clean and the same tree failed the moment it reached Linux. That is how
 # a tree scan shipped and turned main red on its first run, and how two real
-# citations sat unnoticed in src/cli.rs.
+# citations sat unnoticed in src/verbs/cli/.
 #
 # Asserting through `git grep` specifically is the point: `grep -E` on this
 # machine is GNU and would pass either way, which is exactly the false comfort

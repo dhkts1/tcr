@@ -1,6 +1,6 @@
 //! `Manager` OAuth token-refresh methods, split verbatim from `mod.rs`.
 
-use crate::log_err::LogErr as _;
+use crate::base::log_err::LogErr as _;
 use crate::manager::*;
 
 impl Manager {
@@ -124,7 +124,7 @@ impl Manager {
                 return;
             };
             (
-                crate::identity::probe(
+                crate::base::identity::probe(
                     account.provider,
                     &account.name,
                     account.account_uuid.clone(),
@@ -162,8 +162,8 @@ impl Manager {
                 return None;
             }
             match account.provider {
-                crate::provider::Provider::Anthropic => return None,
-                crate::provider::Provider::Codex => {}
+                crate::base::provider::Provider::Anthropic => return None,
+                crate::base::provider::Provider::Codex => {}
             }
             (
                 account.codex_home.clone()?,
@@ -174,7 +174,7 @@ impl Manager {
         if self.mutation_is_released() {
             return None;
         }
-        let result = crate::codex_token_store::write_back_async(
+        let result = crate::clients::codex_token_store::write_back_async(
             std::path::Path::new(&home),
             &pending.expected_refresh,
             &pending.tokens,
@@ -185,7 +185,7 @@ impl Manager {
             Ok(true) => true,
             Ok(false) => {
                 if let Ok(auth) =
-                    crate::codex_token_store::read_async(std::path::Path::new(&home)).await
+                    crate::clients::codex_token_store::read_async(std::path::Path::new(&home)).await
                 {
                     if auth.login.refresh_token
                         == pending.tokens.refresh_token.as_deref().unwrap_or("")
@@ -350,11 +350,13 @@ impl Manager {
         };
 
         let imported_home = match provider {
-            crate::provider::Provider::Anthropic => None,
-            crate::provider::Provider::Codex => codex_home.map(PathBuf::from),
+            crate::base::provider::Provider::Anthropic => None,
+            crate::base::provider::Provider::Codex => codex_home.map(PathBuf::from),
         };
         let file_before = match imported_home.as_deref() {
-            Some(home) => crate::codex_token_store::read_async(home).await.ok(),
+            Some(home) => crate::clients::codex_token_store::read_async(home)
+                .await
+                .ok(),
             None => None,
         };
         let loaded_refresh_ms = file_before
@@ -369,7 +371,7 @@ impl Manager {
             let account_uuid = account_uuid.clone();
             async move {
                 let home = home?;
-                crate::codex_token_store::read_async(&home)
+                crate::clients::codex_token_store::read_async(&home)
                     .await
                     .ok()
                     .and_then(|auth| {
@@ -456,7 +458,7 @@ impl Manager {
                                     })
                                     .map_or_else(
                                         || {
-                                            crate::codex_token_store::refresh_digest(
+                                            crate::clients::codex_token_store::refresh_digest(
                                                 &posted_refresh,
                                             )
                                         },
@@ -551,8 +553,8 @@ impl Manager {
                     // rejection named one, else the status it came back with. An Anthropic row
                     // keeps none, so its wire row gains no key.
                     match a.provider {
-                        crate::provider::Provider::Anthropic => {}
-                        crate::provider::Provider::Codex => {
+                        crate::base::provider::Provider::Anthropic => {}
+                        crate::base::provider::Provider::Codex => {
                             a.pending_codex_writeback = None;
                             a.login_error =
                                 Some(code.map_or_else(|| format!("http_{status}"), str::to_string));
@@ -560,8 +562,8 @@ impl Manager {
                     }
                 }
                 match provider {
-                    crate::provider::Provider::Anthropic => {}
-                    crate::provider::Provider::Codex => {
+                    crate::base::provider::Provider::Anthropic => {}
+                    crate::base::provider::Provider::Codex => {
                         if let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) {
                             tokio::task::spawn_blocking(move || {
                                 me.persist_codex_writeback_record(idx);
@@ -614,7 +616,7 @@ impl Manager {
         // A refresh token is single-use. Once this process has handed its
         // listening socket to a successor, the successor holds the same tokens
         // and is the one entitled to rotate them: rotating here would invalidate
-        // its copy, which is the token war `crate::singleton` exists to prevent
+        // its copy, which is the token war `crate::stores::singleton` exists to prevent
         // arriving from inside one lineage instead of between two rival proxies.
         //
         // Gated at `refresh_plan` rather than in `ensure_fresh_inner` because
@@ -697,7 +699,7 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CODEX_SYNC_PENDING_KEY;
+    use crate::base::config::CODEX_SYNC_PENDING_KEY;
     use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -767,10 +769,10 @@ mod tests {
     impl TokenRefresher for TestRefresh {
         fn refresh(
             &self,
-            provider: crate::provider::Provider,
+            provider: crate::base::provider::Provider,
             token: String,
         ) -> oauth::RefreshFuture {
-            assert_eq!(provider, crate::provider::Provider::Codex);
+            assert_eq!(provider, crate::base::provider::Provider::Codex);
             assert_eq!(token, "rt-old");
             let home = self.home.clone();
             let replacement = self.replacement.clone();
@@ -804,12 +806,15 @@ mod tests {
 
     struct NoNetwork;
     impl UsageProber for NoNetwork {
-        fn probe(&self, _: crate::probe::ProbeCredential) -> crate::probe::ProbeFuture {
+        fn probe(
+            &self,
+            _: crate::records::probe::ProbeCredential,
+        ) -> crate::records::probe::ProbeFuture {
             panic!("refresh tests never probe");
         }
     }
     impl AccountWarmer for NoNetwork {
-        fn warm(&self, _: String, _: String) -> crate::warmer::WarmFuture {
+        fn warm(&self, _: String, _: String) -> crate::clients::warmer::WarmFuture {
             panic!("refresh tests never warm");
         }
     }
@@ -1140,7 +1145,11 @@ mod tests {
 
         struct RotatingRefresh(Arc<Mutex<Vec<String>>>);
         impl TokenRefresher for RotatingRefresh {
-            fn refresh(&self, _: crate::provider::Provider, token: String) -> oauth::RefreshFuture {
+            fn refresh(
+                &self,
+                _: crate::base::provider::Provider,
+                token: String,
+            ) -> oauth::RefreshFuture {
                 let mut calls = self.0.lock().unwrap();
                 calls.push(token);
                 let generation = calls.len();
@@ -1253,7 +1262,7 @@ mod tests {
         let (original, _) = imported_manager(home.path(), None, false);
         let mut config = original.config.lock().unwrap().clone();
         config.accounts[0].codex_home = None;
-        let path = home.path().join(crate::paths::CONFIG_FILE);
+        let path = home.path().join(crate::base::paths::CONFIG_FILE);
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         let manager = Manager::new(
             config,
@@ -1289,7 +1298,11 @@ mod tests {
             calls: Arc<Mutex<Vec<String>>>,
         }
         impl TokenRefresher for RefreshFileToken {
-            fn refresh(&self, _: crate::provider::Provider, token: String) -> oauth::RefreshFuture {
+            fn refresh(
+                &self,
+                _: crate::base::provider::Provider,
+                token: String,
+            ) -> oauth::RefreshFuture {
                 self.calls.lock().unwrap().push(token.clone());
                 let home = self.home.clone();
                 let changed_during_post = self.changed_during_post;
@@ -1363,7 +1376,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         struct Rotate(Arc<AtomicUsize>);
         impl TokenRefresher for Rotate {
-            fn refresh(&self, _: crate::provider::Provider, _: String) -> oauth::RefreshFuture {
+            fn refresh(
+                &self,
+                _: crate::base::provider::Provider,
+                _: String,
+            ) -> oauth::RefreshFuture {
                 let generation = self.0.fetch_add(1, Ordering::SeqCst) + 1;
                 Box::pin(async move {
                     Ok(Tokens {
@@ -1458,7 +1475,7 @@ mod tests {
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         tokio::time::sleep(Duration::from_secs(6)).await;
         let file_lock =
-            std::fs::File::create(crate::paths::codex_auth_lock_file(home.path())).unwrap();
+            std::fs::File::create(crate::base::paths::codex_auth_lock_file(home.path())).unwrap();
         file_lock.lock().unwrap();
         let lock = Arc::clone(&manager.accounts.read().unwrap()[0].refresh_lock);
         let serving = Arc::clone(&manager);
@@ -1495,7 +1512,7 @@ mod tests {
         impl TokenRefresher for RotateFromFile {
             fn refresh(
                 &self,
-                _: crate::provider::Provider,
+                _: crate::base::provider::Provider,
                 refresh: String,
             ) -> oauth::RefreshFuture {
                 let home = self.0.clone();
@@ -1629,7 +1646,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         struct RotateThenReject(AtomicUsize);
         impl TokenRefresher for RotateThenReject {
-            fn refresh(&self, _: crate::provider::Provider, _: String) -> oauth::RefreshFuture {
+            fn refresh(
+                &self,
+                _: crate::base::provider::Provider,
+                _: String,
+            ) -> oauth::RefreshFuture {
                 let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
                 Box::pin(async move {
                     if first {

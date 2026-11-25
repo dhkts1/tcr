@@ -680,7 +680,7 @@ fn add_or_update_account_backfills_identity_and_corrects_a_stale_account_type() 
 #[test]
 fn re_adding_a_codex_account_updates_its_row_and_appends_no_anthropic_duplicate() {
     let stored = Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
         access_token: "at-old".to_string(),
         refresh_token: Some("rt-old".to_string()),

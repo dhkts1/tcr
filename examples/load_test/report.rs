@@ -135,7 +135,7 @@ impl PhaseResult {
                 self.live_path_mentions
             ));
         }
-        if self.bound_tokens_restored != Some(tcr::bound_tokens::BOUND_TOKEN_CAP) {
+        if self.bound_tokens_restored != Some(tcr::stores::bound_tokens::BOUND_TOKEN_CAP) {
             out.push(format!(
                 "the bound-token map did not boot at its cap ({:?} restored)",
                 self.bound_tokens_restored
@@ -196,7 +196,7 @@ fn fmt_load(l: [f64; 3]) -> String {
 /// The phase's throttle line, with its denominator named. `throttle_ms` comes from the proxy's
 /// `request usage` lines, one per served `/v1/messages` request; `count_tokens` logs none, so
 /// the count is smaller than `served`. With the throttles off, `throttle_send` takes no lock
-/// and never sleeps (`src/manager/throttle.rs`), yet `src/proxy.rs` still times the call, so a
+/// and never sleeps (`src/manager/serving/throttle.rs`), yet `src/proxy/mod.rs` still times the call, so a
 /// nonzero value there is the call itself being descheduled, not a wait.
 pub(crate) fn throttle_line(r: &PhaseResult) -> String {
     let nonzero = r.throttled_requests;
@@ -481,7 +481,7 @@ mod tests {
             upstream_requests: 1,
             upstream_max_per_s: 1,
             fleet_ceiling_per_s: Some(42),
-            bound_tokens_restored: Some(tcr::bound_tokens::BOUND_TOKEN_CAP),
+            bound_tokens_restored: Some(tcr::stores::bound_tokens::BOUND_TOKEN_CAP),
             unexpected_upstream_paths: BTreeMap::new(),
             untagged_upstream_requests: 0,
             refused_connects: 0,

@@ -383,7 +383,7 @@ public struct PeerLendGrant: Decodable, Equatable, Identifiable, Sendable {
     public var ended: Bool
     /// How this grant's requests leave (decision row 15). Absent on the wire
     /// is ``LendMode/serve``, which is what every grant written before modes
-    /// existed already meant, and what `src/peer/config.rs` skips writing.
+    /// existed already meant, and what `src/peer/config/mod.rs` skips writing.
     public var mode: LendMode
     /// When the key this grant last handed the borrower stops working, unix
     /// SECONDS, or `nil` when the producer said nothing about one.
@@ -441,7 +441,7 @@ public struct PeerLendGrant: Decodable, Equatable, Identifiable, Sendable {
             try c.decodeIfPresent(PeerLeaseWindow.self, forKey: .window) ?? .week
         self.fraction = try c.decodeIfPresent(Double.self, forKey: .fraction) ?? 0
         // `ttl` OR `ttlS`, because the producer spells it the second way
-        // today (`src/peer/config.rs:422`, `ttl_s` under
+        // today (`src/peer/config/mod.rs:422`, `ttl_s` under
         // `rename_all = "camelCase"`), and this decoder also accepts `ttl`.
         // Accepting both is not a fallback: it is one field with two
         // spellings, and the alternative is a decoder that quietly shows the

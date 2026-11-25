@@ -17,7 +17,7 @@ use crate::manager::*;
 /// written down before this comment.
 ///
 /// The other reason this is named: `classify_request` now drives TWO
-/// independent policies — account selection (`src/manager/select.rs`) and
+/// independent policies — account selection (`src/manager/select/mod.rs`) and
 /// throttling (here). Changing its `Noise` arm for a selection reason (e.g.
 /// widening or narrowing the `/api/event_logging*` / `/mcp-registry*` prefix
 /// match) silently changes which traffic this predicate exempts too. There is
@@ -30,19 +30,19 @@ fn throttle_exempt(class: RequestClass) -> bool {
 /// so both branches are unit-testable without building a `Manager` (same pattern
 /// as [`throttle_slot`]). The full key also includes the account's provider.
 ///
-/// Prefers the ORG identity via [`crate::identity::org_key_of`] (uuid, else name),
+/// Prefers the ORG identity via [`crate::base::identity::org_key_of`] (uuid, else name),
 /// falling back to the account index when neither is known. Both arms are
 /// namespaced so an org literally named `acct:3` cannot collide with account 3's
 /// fallback key.
 fn bucket_key_for(org_uuid: Option<&str>, org_name: Option<&str>, idx: usize) -> String {
-    match crate::identity::org_key_of(org_uuid, org_name) {
+    match crate::base::identity::org_key_of(org_uuid, org_name) {
         Some(key) => format!("org:{key}"),
         None => format!("acct:{idx}"),
     }
 }
 
 impl Manager {
-    /// See [`crate::config::Config::throttle_exempt_noise_enabled`].
+    /// See [`crate::base::config::Config::throttle_exempt_noise_enabled`].
     pub fn throttle_exempt_noise_enabled(&self) -> bool {
         self.config
             .lock()

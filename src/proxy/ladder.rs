@@ -12,8 +12,8 @@ use serde_json::Value;
 use tcr_status_wire::CodexRefusalKind;
 use time::OffsetDateTime;
 
+use crate::base::provider::Provider;
 use crate::manager::Manager;
-use crate::provider::Provider;
 
 use super::client_error::{ClientError, ErrorKind};
 use super::{
@@ -276,7 +276,7 @@ pub(super) struct Ladder {
     /// It sits beside `Tally::unknown_outcome_transport_failure` because it is the same fact
     /// read the other way round: a carry is only ever offered while that flag is still false,
     /// nothing this request sent has left this box, so a resend down another path cannot
-    /// double-send a POST. `src/peer/egress.rs` documents the seam; the offer itself is in the
+    /// double-send a POST. `src/peer/tunnel/egress.rs` documents the seam; the offer itself is in the
     /// transport-failure arm, above both the resolver arm's sleep and the exhausted-transport
     /// terminal, so both entry points the design names are one call site rather than two
     /// that can drift.

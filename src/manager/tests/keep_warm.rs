@@ -10,10 +10,10 @@ use super::*;
 /// `five_hour.is_some()` would leave such an account warm-INELIGIBLE forever.
 struct ColdOkProber;
 impl UsageProber for ColdOkProber {
-    fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, _credential: crate::records::probe::ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Ok(Usage {
-                five_hour: crate::probe::WindowReading::Unread,
+                five_hour: crate::records::probe::WindowReading::Unread,
                 seven_day: Some(UsageBucket {
                     utilization: Some(0.10),
                     reset_at_ms: Some(crate::now_ms() + 86_400_000),
@@ -232,7 +232,7 @@ fn warm_targets_skips_near_threshold_account() {
 async fn warm_targets_never_lists_a_codex_account() {
     let warmed = Arc::new(Mutex::new(Vec::new()));
     let codex = Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         ..account("bob@example.com", 0)
     };
     let manager = build_manager_with_warmer(
@@ -441,7 +441,7 @@ fn a_plan_with_no_five_hour_window_is_not_a_warm_target() {
     manager.apply_usage(
         0,
         &Usage {
-            five_hour: crate::probe::WindowReading::PlanHasNone,
+            five_hour: crate::records::probe::WindowReading::PlanHasNone,
             ..Usage::default()
         },
     );
@@ -473,7 +473,7 @@ async fn repeated_probe_cycles_do_not_reopen_a_warm_exclusion() {
     );
 
     let headerless_probe = Usage {
-        five_hour: crate::probe::WindowReading::Unread,
+        five_hour: crate::records::probe::WindowReading::Unread,
         seven_day: None,
         seven_day_oi: None,
         extra_usage_usd: None,

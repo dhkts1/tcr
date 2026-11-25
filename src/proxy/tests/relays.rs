@@ -494,9 +494,13 @@ async fn control_identity_refuses_a_client_signed_in_as_another_account() {
     const BOB_UUID: &str = "22222222-2222-2222-2222-222222222222";
 
     struct NoRefresh;
-    impl crate::oauth::TokenRefresher for NoRefresh {
-        fn refresh(&self, _provider: Provider, _t: String) -> crate::oauth::RefreshFuture {
-            Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+    impl crate::clients::oauth::TokenRefresher for NoRefresh {
+        fn refresh(&self, _provider: Provider, _t: String) -> crate::clients::oauth::RefreshFuture {
+            Box::pin(async {
+                Err(crate::clients::oauth::OAuthError::Transient(
+                    "unused".into(),
+                ))
+            })
         }
     }
 
@@ -559,8 +563,8 @@ async fn control_identity_refuses_a_client_signed_in_as_another_account() {
         Manager::new(
             config,
             Arc::new(NoRefresh),
-            Arc::new(crate::probe::LiveUsageProber::new()),
-            Arc::new(crate::warmer::LiveWarmer::new()),
+            Arc::new(crate::records::probe::LiveUsageProber::new()),
+            Arc::new(crate::clients::warmer::LiveWarmer::new()),
             None,
         )
     };
@@ -1213,7 +1217,7 @@ async fn the_config_route_answers_locally_and_stamps_every_answer() {
     let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
         .await
         .expect("read body");
-    let running: crate::config_show::ConfigSettings =
+    let running: crate::base::config_show::ConfigSettings =
         serde_json::from_slice(&body).expect("the running settings");
     assert_eq!(running, manager.running_settings());
 
@@ -1280,7 +1284,7 @@ async fn fan_route_takes_the_contract_bodies_and_answers_locally() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(stamp_of(&response).as_deref(), Some(FAN_ENDPOINT));
 
-    manager.install_fan(crate::fan::start_inert());
+    manager.install_fan(crate::stores::fan::start_inert());
 
     let response = drive_full(
         Arc::clone(&manager),

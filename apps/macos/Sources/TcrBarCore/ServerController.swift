@@ -14,7 +14,7 @@ import Foundation
 /// this system.
 ///
 /// So `tcr`'s default is to stand down, and the kill lives behind an explicit
-/// `--replace` (`src/singleton.rs`). This controller signals **only** a child it
+/// `--replace` (`src/stores/singleton/mod.rs`). This controller signals **only** a child it
 /// spawned itself. An incumbent server it merely observed is never touched, and
 /// failing to start because one already holds the port is reported as "already
 /// running" — a success, not an error.
@@ -183,7 +183,7 @@ public final class ServerController: ObservableObject {
     ///
     /// Without it `tcr server` runs its ratatui TUI (`src/main.rs:615`, "the TUI
     /// owns the foreground"), which calls `enable_raw_mode()?` on stdout
-    /// (`src/tui.rs:47`). This app spawns with a `Pipe`, so there is no terminal,
+    /// (`src/verbs/tui/terminal.rs`). This app spawns with a `Pipe`, so there is no terminal,
     /// raw mode fails, the `?` propagates and the process exits immediately.
     ///
     /// That was a shipped bug and it was not takeover-specific: every spawn path
@@ -538,7 +538,7 @@ public final class ServerController: ObservableObject {
     ///
     /// The common cause is not transient, so the message says so rather than
     /// inviting a retry: `tcr`'s port singleton deliberately refuses to replace a
-    /// proxy hosted inside a `tcr run` process (`src/singleton.rs:38,62`, asserted
+    /// proxy hosted inside a `tcr run` process (`src/stores/singleton/mod.rs`, asserted
     /// at `:257`), because killing it would kill the Claude session running
     /// through it. No number of clicks will change that outcome.
     ///

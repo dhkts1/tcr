@@ -21,7 +21,7 @@ def _log_path():
 LOG = _log_path()
 CA = os.path.expanduser("~/.config/tcr-ca.pem")
 PROXY = os.environ.get("HTTPS_PROXY") or "http://127.0.0.1:3456"
-USAGE = re.compile(r'^(\S+)Z\s+INFO tcr::proxy: request usage '
+USAGE = re.compile(r'^(\S+)Z\s+INFO tcr::proxy(?:::\w+)*: request usage '
                    r'account="([^"]+)" session=Some\((\d+)\)')
 
 def known_keys():

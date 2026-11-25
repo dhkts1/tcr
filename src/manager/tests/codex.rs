@@ -34,7 +34,7 @@ fn the_snapshot_echoes_codex_home_on_codex_rows_only() {
 #[tokio::test]
 async fn a_relogin_of_a_deleted_codex_row_revives_it_with_its_folder_and_no_login_error() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join(crate::paths::CONFIG_FILE);
+    let path = dir.path().join(crate::base::paths::CONFIG_FILE);
     let alice = account("alice@example.com", 0);
     let bob = Account {
         codex_home: Some("/Users/example/.codex".to_string()),
@@ -111,7 +111,7 @@ async fn a_relogin_of_a_deleted_codex_row_revives_it_with_its_folder_and_no_logi
 #[tokio::test]
 async fn a_codex_account_is_never_asked_the_anthropic_profile_for_its_plan() {
     let codex = Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         ..account("bob@example.com", 1)
     };
     let manager = build_manager_with_prober(
@@ -119,7 +119,7 @@ async fn a_codex_account_is_never_asked_the_anthropic_profile_for_its_plan() {
         counting_refresher(),
         Arc::new(NoProber),
     );
-    let calls = count_plan_fetches(&manager, crate::probe::Plan::default());
+    let calls = count_plan_fetches(&manager, crate::records::probe::Plan::default());
 
     manager.probe_account(1).await;
     assert_eq!(
@@ -137,7 +137,7 @@ async fn a_codex_account_is_never_asked_the_anthropic_profile_for_its_plan() {
 }
 
 /// **A Codex `rejected` is lifted by a probe that sees its window roll**, the path an
-/// Anthropic rejection already takes ([`crate::quota::Quota::apply_usage`]). A Codex
+/// Anthropic rejection already takes ([`crate::records::quota::Quota::apply_usage`]). A Codex
 /// quota refusal, a 429 carrying `x-codex-rate-limit-reached-type`, marks the account
 /// `rejected`; `select()` treats that as terminal, so no served response comes back to
 /// clear it, and before the Codex probe it stood until the process restarted.
@@ -161,7 +161,7 @@ async fn a_codex_rejection_is_lifted_when_a_probe_sees_its_weekly_window_roll() 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&seen);
     let usage_endpoint = axum::Router::new().route(
-        crate::provider::CODEX_USAGE_PATH,
+        crate::base::provider::CODEX_USAGE_PATH,
         axum::routing::get(move |headers: axum::http::HeaderMap| {
             let recorder = Arc::clone(&recorder);
             async move {
@@ -197,14 +197,14 @@ async fn a_codex_rejection_is_lifted_when_a_probe_sees_its_weekly_window_roll() 
         .expect("bind the usage stub");
     let codex_upstream = format!("http://{}", listener.local_addr().expect("stub address"));
     tokio::spawn(async move {
-        crate::log_err::LogErr::log_debug(
+        crate::base::log_err::LogErr::log_debug(
             axum::serve(listener, usage_endpoint).await,
             "serving the usage stub",
         );
     });
 
     let mut config = config_with(vec![Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
         ..account("bob@example.com", 0)
     }]);
@@ -217,14 +217,14 @@ async fn a_codex_rejection_is_lifted_when_a_probe_sees_its_weekly_window_roll() 
     );
     // The backfill skips a Codex row; should that ever break, this keeps the live
     // profile endpoint out of the test.
-    count_plan_fetches(&manager, crate::probe::Plan::default());
+    count_plan_fetches(&manager, crate::records::probe::Plan::default());
     let codex_request = || {
         manager.select(
             &HashSet::new(),
             OffsetDateTime::now_utc(),
             None,
             None,
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             None,
         )
     };
@@ -238,7 +238,7 @@ async fn a_codex_rejection_is_lifted_when_a_probe_sees_its_weekly_window_roll() 
         (now + 3600).to_string().parse().unwrap(),
     );
     refusal.insert(
-        crate::quota::CODEX_REACHED_TYPE_HEADER,
+        crate::records::quota::CODEX_REACHED_TYPE_HEADER,
         "primary".parse().unwrap(),
     );
     manager.update_quota(0, &refusal, 429);
@@ -292,7 +292,7 @@ async fn a_codex_rejection_is_lifted_when_a_probe_sees_its_weekly_window_roll() 
 /// `<name>@example.com/codex` per name, at priorities 1, 2, and on.
 fn alice_then_codex_rows(names: &[&str]) -> Arc<Manager> {
     let codex = names.iter().zip(1..).map(|(name, priority)| Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         ..account(&format!("{name}@example.com/codex"), priority)
     });
     manager_of(
@@ -328,7 +328,7 @@ fn codex_weekly(used: &str) -> reqwest::header::HeaderMap {
 #[tokio::test]
 async fn a_codex_rows_quota_updated_at_comes_from_its_own_readings() {
     let codex = Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
         ..account("bob@example.com/codex", 1)
     };
@@ -394,14 +394,14 @@ async fn a_codex_rows_quota_updated_at_comes_from_its_own_readings() {
 /// carol lose the shorter cadence.
 #[test]
 fn a_held_codex_account_gets_the_near_limit_probe_cadence() {
-    use crate::schedule::ProbeUrgency;
+    use crate::manager::schedule::ProbeUrgency;
     let manager = alice_then_codex_rows(&["bob", "carol", "dave"]);
     // bob: at its weekly limit, read from a served 200.
     manager.update_quota(1, &codex_weekly("97"), 200);
     // carol: a Codex quota refusal at half its weekly window.
     let mut refusal = codex_weekly("50");
     refusal.insert(
-        crate::quota::CODEX_REACHED_TYPE_HEADER,
+        crate::records::quota::CODEX_REACHED_TYPE_HEADER,
         "primary".parse().unwrap(),
     );
     manager.update_quota(2, &refusal, 429);
@@ -425,7 +425,10 @@ fn a_held_codex_account_gets_the_near_limit_probe_cadence() {
     );
     assert_eq!(
         (snap.accounts[2].gate, snap.accounts[2].quota_state),
-        (GateReason::Rejected, crate::stats::QuotaState::Normal),
+        (
+            GateReason::Rejected,
+            crate::records::stats::QuotaState::Normal
+        ),
         "control: carol is held by its refusal, not by its threshold"
     );
 }
@@ -447,12 +450,12 @@ fn a_held_codex_account_gets_the_near_limit_probe_cadence() {
 /// near-limit.
 #[test]
 fn a_codex_refusal_keeps_the_near_limit_cadence_whatever_gate_its_row_reports() {
-    use crate::schedule::ProbeUrgency;
-    use crate::stats::{GateReason, QuotaState};
+    use crate::manager::schedule::ProbeUrgency;
+    use crate::records::stats::{GateReason, QuotaState};
     let manager = alice_then_codex_rows(&["bob", "carol", "dave", "erin", "frank"]);
     let refusal = |mut headers: reqwest::header::HeaderMap| {
         headers.insert(
-            crate::quota::CODEX_REACHED_TYPE_HEADER,
+            crate::records::quota::CODEX_REACHED_TYPE_HEADER,
             "rate_limit_reached".parse().unwrap(),
         );
         headers
@@ -546,11 +549,11 @@ fn a_codex_refusal_keeps_the_near_limit_cadence_whatever_gate_its_row_reports() 
 /// `codex_snapshot_facts`, and the `[]` reads `None`.
 #[test]
 fn the_reached_type_is_present_exactly_while_the_refusal_stands() {
-    use crate::codex_probe::CodexProbeFacts;
+    use crate::records::codex_probe::CodexProbeFacts;
     use tcr_status_wire::CodexCredits;
     let manager = manager_of(vec![
         Account {
-            provider: crate::provider::Provider::Codex,
+            provider: crate::base::provider::Provider::Codex,
             account_uuid: Some("22222222-2222-4222-8222-222222222222".into()),
             ..account("bob@example.com", 0)
         },
@@ -581,7 +584,7 @@ fn the_reached_type_is_present_exactly_while_the_refusal_stands() {
         ("x-codex-primary-window-minutes", "10080".into()),
         ("x-codex-primary-reset-at", (now + 3 * 86_400).to_string()),
         (
-            crate::quota::CODEX_REACHED_TYPE_HEADER,
+            crate::records::quota::CODEX_REACHED_TYPE_HEADER,
             "rate_limit_reached".into(),
         ),
         ("x-codex-credits-has-credits", "true".into()),
@@ -619,7 +622,7 @@ fn the_reached_type_is_present_exactly_while_the_refusal_stands() {
         ("x-codex-primary-window-minutes", "10080".into()),
         ("x-codex-primary-reset-at", (now + 3 * 86_400).to_string()),
         (
-            crate::quota::CODEX_REACHED_TYPE_HEADER,
+            crate::records::quota::CODEX_REACHED_TYPE_HEADER,
             "workspace_credits".into(),
         ),
     ]);
@@ -667,14 +670,14 @@ fn the_reached_type_is_present_exactly_while_the_refusal_stands() {
     // 6. Control: the Anthropic row reports none of it, even with a stray fact.
     let anthropic_ok = headers(&[("anthropic-ratelimit-unified-5h-utilization", "0.20".into())]);
     manager.update_quota(1, &anthropic_ok, 200);
-    assert_eq!(snap(1).codex, crate::stats::CodexFacts::default());
+    assert_eq!(snap(1).codex, crate::records::stats::CodexFacts::default());
     manager.accounts.write().expect("accounts lock poisoned")[1]
         .quota
         .codex
         .credits = Some(CodexCredits::default());
     assert_eq!(
         snap(1).codex,
-        crate::stats::CodexFacts::default(),
+        crate::records::stats::CodexFacts::default(),
         "only a Codex row ever reports these facts"
     );
 }
@@ -696,11 +699,11 @@ fn the_reached_type_is_present_exactly_while_the_refusal_stands() {
 /// the probe carrying one does.
 #[test]
 fn a_codex_refusal_clears_when_a_probe_reads_it_allowed() {
-    use crate::codex_probe::usage_from_payload;
+    use crate::records::codex_probe::usage_from_payload;
     use serde_json::{Value, json};
     let manager = manager_of(vec![
         Account {
-            provider: crate::provider::Provider::Codex,
+            provider: crate::base::provider::Provider::Codex,
             account_uuid: Some("22222222-2222-4222-8222-222222222222".into()),
             ..account("bob@example.com", 0)
         },
@@ -716,7 +719,7 @@ fn a_codex_refusal_clears_when_a_probe_reads_it_allowed() {
             OffsetDateTime::now_utc(),
             None,
             None,
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             None,
         )
     };
@@ -731,7 +734,7 @@ fn a_codex_refusal_clears_when_a_probe_reads_it_allowed() {
             reset_at.to_string().parse().unwrap(),
         );
         h.insert(
-            crate::quota::CODEX_REACHED_TYPE_HEADER,
+            crate::records::quota::CODEX_REACHED_TYPE_HEADER,
             "rate_limit_reached".parse().unwrap(),
         );
         manager.update_quota(0, &h, 429);
@@ -817,7 +820,7 @@ fn a_codex_refusal_clears_when_a_probe_reads_it_allowed() {
     {
         let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
         accounts[1].quota.status = Some("rejected".to_string());
-        accounts[1].quota.seven_day = Some(crate::quota::QuotaWindow {
+        accounts[1].quota.seven_day = Some(crate::records::quota::QuotaWindow {
             utilization: 0.6,
             reset: Some(OffsetDateTime::now_utc() + Duration::days(5)),
         });
@@ -848,11 +851,11 @@ fn upstream_for_routes_each_provider_to_its_own_host() {
     config.codex_upstream = "http://codex.test".to_string();
     let manager = build_manager(config, counting_refresher());
     assert_eq!(
-        manager.upstream_for(crate::provider::Provider::Anthropic),
+        manager.upstream_for(crate::base::provider::Provider::Anthropic),
         "http://anthropic.test"
     );
     assert_eq!(
-        manager.upstream_for(crate::provider::Provider::Codex),
+        manager.upstream_for(crate::base::provider::Provider::Codex),
         "http://codex.test"
     );
     assert_eq!(
@@ -871,15 +874,18 @@ fn upstream_for_routes_each_provider_to_its_own_host() {
 #[test]
 fn provider_reads_each_rows_own_provider() {
     let codex = Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         ..account("bob@example.com", 0)
     };
     let manager = manager_of(vec![account("alice@example.com", 0), codex]);
     assert_eq!(
         manager.provider(0),
-        Some(crate::provider::Provider::Anthropic)
+        Some(crate::base::provider::Provider::Anthropic)
     );
-    assert_eq!(manager.provider(1), Some(crate::provider::Provider::Codex));
+    assert_eq!(
+        manager.provider(1),
+        Some(crate::base::provider::Provider::Codex)
+    );
     assert_eq!(manager.provider(2), None, "an index past the end");
 }
 
@@ -887,7 +893,7 @@ fn provider_reads_each_rows_own_provider() {
 /// user id, unlike [`codex_account`], whose rows all share one login).
 fn codex_account_named(name: &str) -> Account {
     Account {
-        provider: crate::provider::Provider::Codex,
+        provider: crate::base::provider::Provider::Codex,
         ..account(name, 0)
     }
 }
@@ -931,7 +937,7 @@ fn the_serving_account_is_tracked_per_provider() {
     let snapshot = manager.snapshot(OffsetDateTime::now_utc());
     assert_eq!(
         snapshot.current_by_provider,
-        crate::stats::CurrentByProvider {
+        crate::records::stats::CurrentByProvider {
             anthropic: Some(0),
             codex: Some(1),
         }
@@ -962,7 +968,7 @@ fn the_serving_account_survives_a_deleted_row_above_it() {
     assert_eq!(slots(&before), [0, 1, 2]);
     assert_eq!(
         before.current_by_provider,
-        crate::stats::CurrentByProvider {
+        crate::records::stats::CurrentByProvider {
             anthropic: Some(0),
             codex: Some(2),
         }
@@ -978,7 +984,7 @@ fn the_serving_account_survives_a_deleted_row_above_it() {
     assert_eq!(slots(&without_bob), [0, 2]);
     assert_eq!(
         without_bob.current_by_provider,
-        crate::stats::CurrentByProvider {
+        crate::records::stats::CurrentByProvider {
             anthropic: Some(0),
             codex: Some(1),
         }
@@ -989,7 +995,7 @@ fn the_serving_account_survives_a_deleted_row_above_it() {
     assert_eq!(names(&without_carol), ["alice@example.com"]);
     assert_eq!(
         without_carol.current_by_provider,
-        crate::stats::CurrentByProvider {
+        crate::records::stats::CurrentByProvider {
             anthropic: Some(0),
             codex: None,
         }
@@ -1017,10 +1023,10 @@ fn sessions_and_log_entries_carry_their_provider() {
     manager.seed_session(0xB0B, 1, 5, now_ms, SessionKind::Stable);
     pin_session(&manager, 0xB0B, 1);
     for (path, provider) in [
-        ("/v1/messages", crate::provider::Provider::Anthropic),
+        ("/v1/messages", crate::base::provider::Provider::Anthropic),
         (
-            crate::provider::CODEX_RESPONSES_PATH,
-            crate::provider::Provider::Codex,
+            crate::base::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::Provider::Codex,
         ),
     ] {
         manager.push_log(RequestLogEntry {
@@ -1044,13 +1050,13 @@ fn sessions_and_log_entries_carry_their_provider() {
     let snapshot = manager.snapshot(OffsetDateTime::now_utc());
     assert_eq!(
         provider_of(&snapshot, "alice@example.com"),
-        crate::provider::Provider::Anthropic
+        crate::base::provider::Provider::Anthropic
     );
     assert_eq!(
         provider_of(&snapshot, "bob@example.com/codex"),
-        crate::provider::Provider::Codex
+        crate::base::provider::Provider::Codex
     );
-    let logged: Vec<(&str, crate::provider::Provider)> = snapshot
+    let logged: Vec<(&str, crate::base::provider::Provider)> = snapshot
         .recent
         .iter()
         .map(|e| (e.path.as_str(), e.provider))
@@ -1059,10 +1065,10 @@ fn sessions_and_log_entries_carry_their_provider() {
         logged,
         [
             (
-                crate::provider::CODEX_RESPONSES_PATH,
-                crate::provider::Provider::Codex
+                crate::base::provider::CODEX_RESPONSES_PATH,
+                crate::base::provider::Provider::Codex
             ),
-            ("/v1/messages", crate::provider::Provider::Anthropic),
+            ("/v1/messages", crate::base::provider::Provider::Anthropic),
         ]
     );
 
@@ -1070,7 +1076,7 @@ fn sessions_and_log_entries_carry_their_provider() {
     assert_eq!(names(&without_bob), ["alice@example.com"]);
     assert_eq!(
         provider_of(&without_bob, "bob@example.com/codex"),
-        crate::provider::Provider::Codex,
+        crate::base::provider::Provider::Codex,
         "a session pinned to a deleted row keeps its provider"
     );
     std::fs::remove_file(&path).ok();
@@ -1136,18 +1142,18 @@ fn the_codex_duplicate_notice_names_the_codex_remedy() {
     ];
     for disabled in [true, false] {
         assert_eq!(
-            DisablePersist::Ambiguous.warning_for(disabled, crate::provider::Provider::Codex),
+            DisablePersist::Ambiguous.warning_for(disabled, crate::base::provider::Provider::Codex),
             Some(CODEX_DUPLICATE)
         );
         for outcome in outcomes {
             assert_eq!(
-                outcome.warning_for(disabled, crate::provider::Provider::Anthropic),
+                outcome.warning_for(disabled, crate::base::provider::Provider::Anthropic),
                 outcome.warning(disabled),
                 "a Claude row reads {outcome:?} as it always has"
             );
             if outcome != DisablePersist::Ambiguous {
                 assert_eq!(
-                    outcome.warning_for(disabled, crate::provider::Provider::Codex),
+                    outcome.warning_for(disabled, crate::base::provider::Provider::Codex),
                     outcome.warning(disabled),
                     "{outcome:?} says the same about either provider"
                 );
@@ -1156,7 +1162,7 @@ fn the_codex_duplicate_notice_names_the_codex_remedy() {
     }
     assert!(
         DisablePersist::Ambiguous
-            .warning_for(true, crate::provider::Provider::Anthropic)
+            .warning_for(true, crate::base::provider::Provider::Anthropic)
             .is_some_and(|text| text.ends_with("give each its own orgUuid")),
         "the Claude duplicate notice keeps its remedy"
     );

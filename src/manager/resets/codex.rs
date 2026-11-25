@@ -1,7 +1,7 @@
 //! Confirmed named-account redemption. Probes share the row's gate but never call consume.
+use crate::base::provider::Provider;
 use crate::manager::freshness::probing::BoundAccount;
 use crate::manager::*;
-use crate::provider::Provider;
 use std::time::Duration;
 use tokio::time::{Instant, timeout_at};
 
@@ -97,7 +97,7 @@ impl ResetFailure {
     fn transport(reason: CodexResetError, error: reqwest::Error) -> Self {
         Self::because(
             reason,
-            crate::codex_probe::error_chain(&error.without_url()),
+            crate::records::codex_probe::error_chain(&error.without_url()),
         )
     }
 }
@@ -196,13 +196,13 @@ impl Manager {
                 let (idx, identity) = {
                     let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                     let idx = match target.resolve(&accounts) {
-                        crate::identity::Match::None => {
+                        crate::base::identity::Match::None => {
                             return Err(ResetFailure::from(CodexResetError::Missing));
                         }
-                        crate::identity::Match::Ambiguous(_) => {
+                        crate::base::identity::Match::Ambiguous(_) => {
                             return Err(ResetFailure::from(CodexResetError::Ambiguous));
                         }
-                        crate::identity::Match::One(idx) => idx,
+                        crate::base::identity::Match::One(idx) => idx,
                     };
                     *index = Some(idx);
                     let row = &accounts[idx];
@@ -216,7 +216,7 @@ impl Manager {
                 self.check_reset_owner(idx, &identity)?;
                 self.ensure_fresh(idx).await;
                 self.check_reset_owner(idx, &identity)?;
-                let client = crate::http_client::builder()
+                let client = crate::base::http_client::builder()
                     .no_proxy()
                     .redirect(reqwest::redirect::Policy::none())
                     .timeout(Duration::from_secs(10))
@@ -243,7 +243,7 @@ impl Manager {
                         )
                         .json(&body);
                     if let Some(id) = credential.account_id {
-                        request = request.header(crate::provider::CODEX_ACCOUNT_HEADER, id);
+                        request = request.header(crate::base::provider::CODEX_ACCOUNT_HEADER, id);
                     }
                     let response = request.send().await.map_err(|error| {
                         ResetFailure::transport(CodexResetError::Unknown, error)
@@ -316,7 +316,7 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Account;
+    use crate::base::config::Account;
     use crate::test_support::stub_upstream as stub;
     use axum::body::to_bytes;
     use axum::extract::Request;
@@ -390,7 +390,7 @@ mod tests {
                     .map(str::to_owned);
                 let account = req
                     .headers()
-                    .get(crate::provider::CODEX_ACCOUNT_HEADER)
+                    .get(crate::base::provider::CODEX_ACCOUNT_HEADER)
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_owned);
                 let agent_ok = req
@@ -454,7 +454,7 @@ mod tests {
                 }
                 return axum::Json(serde_json::json!({"code":code,"windows_reset":1,"ignored":"fake-secret-sentinel"})).into_response();
             }
-            if req.uri().path() == crate::provider::CODEX_USAGE_PATH {
+            if req.uri().path() == crate::base::provider::CODEX_USAGE_PATH {
                 self.reads.fetch_add(1, Ordering::SeqCst);
                 if self.fail_read.load(Ordering::SeqCst) {
                     return (StatusCode::SERVICE_UNAVAILABLE, "fake-secret-sentinel")
@@ -508,7 +508,7 @@ mod tests {
             OffsetDateTime::now_utc(),
             None,
             None,
-            crate::provider::CODEX_RESPONSES_PATH,
+            crate::base::provider::CODEX_RESPONSES_PATH,
             None,
         )
     }
@@ -658,7 +658,7 @@ mod tests {
         ] {
             let backend = Backend::new(code, StatusCode::OK);
             let manager = manager(&backend);
-            let old = crate::codex_probe::usage_from_payload(
+            let old = crate::records::codex_probe::usage_from_payload(
                 &serde_json::json!({"rate_limit":{"allowed":false,"limit_reached":true,
                 "primary_window":{"used_percent":100,"limit_window_seconds":18000,"reset_at":crate::now_ms()/1000+18000}}}),
             );
@@ -1133,10 +1133,10 @@ mod tests {
         manager.probe_all().await;
         assert_eq!(selected(&manager), Some(0));
         let snapshot = manager.snapshot(OffsetDateTime::now_utc());
-        let urgency = crate::schedule::ProbeUrgency::of(&snapshot.accounts[0]);
-        assert!(crate::schedule::probe_interval_secs(300, urgency, 10) > 0);
-        let mut schedule = crate::schedule::FleetSchedule::capped(1);
-        let mut rng = crate::schedule::Rng::from_clock();
+        let urgency = schedule::ProbeUrgency::of(&snapshot.accounts[0]);
+        assert!(schedule::probe_interval_secs(300, urgency, 10) > 0);
+        let mut schedule = schedule::FleetSchedule::capped(1);
+        let mut rng = schedule::Rng::from_clock();
         schedule.sync(crate::now_ms(), &[0], 300, &mut rng);
         for idx in schedule.due(crate::now_ms() + 600_000) {
             manager.probe_account(idx).await;

@@ -531,7 +531,7 @@ pub struct LentTo {
 /// they lent cannot re-lend it.
 pub fn lent_to(
     store: &PeerStore,
-    accounts: &[(String, Vec<String>, crate::provider::Provider)],
+    accounts: &[(String, Vec<String>, crate::base::provider::Provider)],
 ) -> std::collections::BTreeMap<String, Vec<LentTo>> {
     store.reload_if_changed();
     let mut out: std::collections::BTreeMap<String, Vec<LentTo>> =
@@ -542,8 +542,8 @@ pub fn lent_to(
                 // No lease draws on a Codex account, so none is lent to anyone,
                 // whatever the scope says. See this function's doc.
                 match provider {
-                    crate::provider::Provider::Anthropic => {}
-                    crate::provider::Provider::Codex => continue,
+                    crate::base::provider::Provider::Anthropic => {}
+                    crate::base::provider::Provider::Codex => continue,
                 }
                 // The sanitized label decides membership, the name is the key.
                 // See this function's doc. `unwrap_or_default` gives the

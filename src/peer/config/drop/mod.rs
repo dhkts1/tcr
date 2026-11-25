@@ -65,7 +65,7 @@ use tcr_peer_wire::PeerId;
 /// `cargo tree -i sha2` and `cargo tree -i hmac` (the second prints nothing).
 ///
 /// Verified against RFC 4231's test case 2 rather than against itself:
-/// `hmac_sha256_matches_rfc_4231_case_2` in `tests/peer_pairing.rs`. A
+/// `hmac_sha256_matches_rfc_4231_case_2` in `tests/peer/pairing/peer_pairing.rs`. A
 /// hand-rolled MAC that is only ever compared to its own output is
 /// self-consistent and agrees with nobody, including the next build of this
 /// program, if the construction is ever replaced by the `hmac` crate.
@@ -717,7 +717,7 @@ impl HttpsTemplateStore {
         if !template.contains("{name}") {
             bail!("dead drop: the store template has no {{name}} placeholder: {template}");
         }
-        let client = crate::http_client::builder()
+        let client = crate::base::http_client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10))

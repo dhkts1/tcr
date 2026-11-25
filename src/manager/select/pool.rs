@@ -57,7 +57,7 @@ impl Manager {
     ///    probe it" contract byte-for-byte — the same reason the raw-`reset`
     ///    term below maps `None` to [`i128::MIN`]. It covers both a genuinely
     ///    unmeasured window and one whose reset has already elapsed;
-    ///    [`crate::quota::QuotaWindow::live_reset`] collapses those two into
+    ///    [`crate::records::quota::QuotaWindow::live_reset`] collapses those two into
     ///    `None` and this does not try to tell them apart.
     ///  - **feature disabled (`reset_urgency_tier_ms == 0`) → a constant `0`**,
     ///    which ties for every account and hands the decision straight back to
@@ -195,7 +195,7 @@ impl Manager {
     /// `eligible` and `pick_least_loaded` — does **not** hard-skip on
     /// [`Self::model_blocked`]'s prediction; it excludes only an account
     /// upstream has genuinely rejected on `7d_oi`
-    /// ([`crate::quota::Quota::model_weekly_rejected`]). Ignores `group`
+    /// ([`crate::records::quota::Quota::model_weekly_rejected`]). Ignores `group`
     /// (always `None`, matching the soft fallback's own widening) — this pass
     /// only runs once the whole pool is already being considered.
     ///
@@ -220,7 +220,7 @@ impl Manager {
             }
             let seven_day_oi = account
                 .quota
-                .effective(crate::quota::QuotaBucket::SevenDayOi, now)
+                .effective(crate::records::quota::QuotaBucket::SevenDayOi, now)
                 .unwrap_or(0.0);
             let oi_bucket = (seven_day_oi.max(0.0) * 1_000_000.0) as u64;
             let reset = account

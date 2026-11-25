@@ -79,7 +79,7 @@ final class LoginLauncherTests: XCTestCase {
 
     /// The part that makes the button actually target the row it was clicked
     /// from, not merely narrate it: `login --account <name>` on the exec line.
-    /// `src/main.rs` / `src/oauth.rs`'s `login_hint` refuses to write when the
+    /// `src/main.rs` / `src/verbs/login/browser.rs`'s `login_hint` refuses to write when the
     /// browser hands back a different identity — measured live, a re-login
     /// meant for one account authenticated as a different one signed into the
     /// browser, and this flag is the only reason nothing was overwritten.
@@ -312,7 +312,7 @@ final class LoginLauncherTests: XCTestCase {
         XCTAssertFalse(LoginSession.arguments(account: "alice@example.com").contains("--force"))
     }
 
-    /// Every line `src/oauth.rs`'s `LoginEvent::line` can print, parsed back.
+    /// Every line `src/verbs/login/login_ui.rs`'s `LoginEvent::line` can print, parsed back.
     func testEveryEventLineParses() {
         XCTAssertEqual(
             LoginProgressEvent.parse(#"{"event":"browser","url":"https://claude.ai/oauth/authorize?x=1"}"#),

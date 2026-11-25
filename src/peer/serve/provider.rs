@@ -1,4 +1,4 @@
-//! The borrower's `crate::fallback` provider, [`PeerLeaseProvider`], and the
+//! The borrower's `crate::peer::serve::fallback` provider, [`PeerLeaseProvider`], and the
 //! hand-mode serve it falls to, [`serve_on_handed_bearer`].
 
 use std::collections::HashMap;
@@ -11,13 +11,13 @@ use axum::response::Response;
 use futures::future::BoxFuture;
 use tcr_peer_wire::{Lease, LeaseRequest, LeaseUnit, PeerId, Window};
 
-use crate::fallback::{Ask, FallbackProvider};
 use crate::peer::config::PeerStore;
 use crate::peer::lease::{
     handed_tokens, lenders_in_ask_order, nothing_left_this_mac, report_handed_spend,
     reported_utilization, request_lease,
 };
 use crate::peer::serve;
+use crate::peer::serve::fallback::{Ask, FallbackProvider};
 
 /// The peer-lease implementation of the proxy's fallback seam.
 ///
@@ -127,7 +127,7 @@ impl PeerLeaseProvider {
             // `peer::serve::serve_on_own_account` gives: an environment proxy
             // variable must not silently route a request that is spending
             // somebody else's account through a third host.
-            hand_egress: crate::http_client::builder()
+            hand_egress: crate::base::http_client::builder()
                 .no_proxy()
                 .build()
                 .inspect_err(|err| {
@@ -138,7 +138,7 @@ impl PeerLeaseProvider {
                     );
                 })
                 .ok()
-                .map(|client| (crate::config::default_upstream(), client)),
+                .map(|client| (crate::base::config::default_upstream(), client)),
         }
     }
 
@@ -310,7 +310,7 @@ const DEFAULT_ASK_MAX_INFLIGHT: u8 = 4;
 /// The answer a borrower gives its client when a borrowed request was
 /// delivered and its outcome is unknowable.
 ///
-/// **502 and `x-should-retry: false`**, the shape `src/proxy.rs` already
+/// **502 and `x-should-retry: false`**, the shape `src/proxy/mod.rs` already
 /// answers with when an attempt got past connect before failing: the request
 /// may have run upstream, so a client that retries could pay for it twice. A
 /// 429 would be worse than useless here, Claude Code retries one by design.
@@ -415,7 +415,7 @@ impl FallbackProvider for PeerLeaseProvider {
                         // this Mac could not even reach ended the ladder with
                         // a no-retry 502 over a request that had not left the
                         // box. The direct path separates the two with the same
-                        // predicate (`src/proxy.rs`, `is_connect` plus the
+                        // predicate (`src/proxy/mod.rs`, `is_connect` plus the
                         // resolver check), and this is that predicate.
                         Err(err) if nothing_left_this_mac(&err) => {
                             tracing::warn!(
@@ -504,7 +504,7 @@ impl FallbackProvider for PeerLeaseProvider {
 /// `client` is supplied by the caller rather than built here, because the
 /// caller is the only code that knows which client this node's egress policy
 /// says to use, and because a test points one at a fake origin with
-/// `reqwest::ClientBuilder::resolve` (the escape `src/peer/egress.rs` already
+/// `reqwest::ClientBuilder::resolve` (the escape `src/peer/tunnel/egress.rs` already
 /// documents: it overrides DNS only, so TLS still validates the real hostname).
 ///
 /// `Ok(None)` for "no live handed bearer for this lease", which is not an

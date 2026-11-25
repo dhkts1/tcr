@@ -4,7 +4,7 @@ import XCTest
 
 /// THE OTHER HALF OF THE PEERS CONTRACT PIN.
 ///
-/// `tests/peer_status.rs`'s `the_committed_peers_fixture_matches_what_the_payload
+/// `tests/peer/peer_status.rs`'s `the_committed_peers_fixture_matches_what_the_payload
 /// _renders` proves the Rust side still renders these exact bytes; this proves
 /// this app can still read them. A key renamed on either side turns one of the
 /// two red, and regenerating the fixture to satisfy that one turns the other red
@@ -20,7 +20,7 @@ import XCTest
 /// repository is public.
 final class PeersStatusBlockTests: XCTestCase {
     /// `tests/fixtures/peer-status.json`, at the repo root: the SAME file
-    /// `tests/peer_status.rs`'s own gate renders and compares against, never a
+    /// `tests/peer/peer_status.rs`'s own gate renders and compares against, never a
     /// copy of it. This suite used to read its own `Fixtures/` copy, hand-kept
     /// in step with that one by nothing but a doc comment's word; the two
     /// drifted the moment `status.rs` started writing `id` as the wire form

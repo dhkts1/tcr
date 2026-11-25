@@ -13,8 +13,8 @@ config.json
 config.local.json
 *.local.json
 config/
-# The src/config/ Rust module is source, not a secrets dir.
-!/src/config/
+# The src/base/config/ Rust module is source, not a secrets dir.
+!/src/base/config/
 # The src/peer/config/ Rust module is source, not a secrets dir.
 !/src/peer/config/
 

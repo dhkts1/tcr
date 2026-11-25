@@ -9,7 +9,7 @@ use crate::manager::*;
 ///
 /// The name is resolved, not echoed, so the answer says what was actually
 /// parked. It is NOT a substring or case-insensitive match:
-/// [`crate::identity::match_accounts`] is the account's exact name,
+/// [`crate::base::identity::match_accounts`] is the account's exact name,
 /// byte-for-byte and untrimmed. Do not "fix" resolution to match a looser
 /// description; a widened rule is how a query silently parks an account nobody
 /// named, which is exactly what the `Ambiguous` arm below exists to refuse.
@@ -110,11 +110,11 @@ impl DisablePersist {
     pub const fn warning_for(
         self,
         disabled: bool,
-        provider: crate::provider::Provider,
+        provider: crate::base::provider::Provider,
     ) -> Option<&'static str> {
         match provider {
-            crate::provider::Provider::Anthropic => self.warning(disabled),
-            crate::provider::Provider::Codex => match self {
+            crate::base::provider::Provider::Anthropic => self.warning(disabled),
+            crate::base::provider::Provider::Codex => match self {
                 Self::Ambiguous => Some(
                     "NOT SAVED: two config entries share this Codex login — remove the duplicate \
                      (tcr remove <name>), or re-import it with --name",
@@ -305,7 +305,7 @@ impl Manager {
             // `identity::same_identity` never matches a row of the other provider:
             // a probe built with the wrong provider (Anthropic) addresses no Codex
             // row, so a Codex account's bench would never reach disk.
-            crate::identity::probe(
+            crate::base::identity::probe(
                 account.provider,
                 &account.name,
                 account.account_uuid.clone(),
@@ -334,9 +334,9 @@ impl Manager {
         let (idx, name) = {
             let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
             match match_listed(&accounts[..], query) {
-                crate::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
-                crate::identity::Match::None => return SetDisabledOutcome::NoMatch,
-                crate::identity::Match::Ambiguous(names) => {
+                crate::base::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
+                crate::base::identity::Match::None => return SetDisabledOutcome::NoMatch,
+                crate::base::identity::Match::Ambiguous(names) => {
                     return SetDisabledOutcome::Ambiguous(names);
                 }
             }
@@ -355,7 +355,7 @@ impl Manager {
     /// computes the value from the config file (its `--first`/`--last` are
     /// relative to the file's priorities) and writes the file itself, then
     /// sends the resolved integer here. Resolution is the same
-    /// [`crate::identity::match_one`] over the rotation slots that
+    /// [`crate::base::identity::match_one`] over the rotation slots that
     /// [`Self::set_disabled_by_query`] uses, for the same reason.
     pub fn set_priority_by_query(&self, query: &str, priority: i64) -> SetPriorityOutcome {
         let mut accounts = self
@@ -363,9 +363,9 @@ impl Manager {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         let idx = match match_listed(&accounts[..], query) {
-            crate::identity::Match::One(idx) => idx,
-            crate::identity::Match::None => return SetPriorityOutcome::NoMatch,
-            crate::identity::Match::Ambiguous(names) => {
+            crate::base::identity::Match::One(idx) => idx,
+            crate::base::identity::Match::None => return SetPriorityOutcome::NoMatch,
+            crate::base::identity::Match::Ambiguous(names) => {
                 return SetPriorityOutcome::Ambiguous(names);
             }
         };

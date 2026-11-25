@@ -86,7 +86,7 @@ public enum ControlAccountCommand {
 
     /// Exit 0 has two meanings here too — `tcr` can apply the change to the
     /// file only and warn on stderr that the running proxy was too old for the
-    /// route (`src/cli.rs`'s `set_control`, the `NoRoute` arm) — so this stays a
+    /// route (`src/verbs/cli/accounts.rs`'s `set_control`, the `NoRoute` arm) — so this stays a
     /// three-arm outcome exactly like ``AccountCommand/Outcome``.
     public enum Outcome: Equatable, Sendable {
         case clean
@@ -177,7 +177,7 @@ public final class ControlAccountController: ObservableObject {
     /// then stamped `control: true` on EVERY row whose name equalled it, so the
     /// panel showed both rows as control and matched a server that was itself
     /// confused. `tcr` fixed it below this app by making the name unique
-    /// (`src/config.rs`, `migrate_duplicate_names`), which is why this check can
+    /// (`src/base/config.rs`, `migrate_duplicate_names`), which is why this check can
     /// be the plain equality it looks like.
     public func isControl(_ name: String) -> Bool { !unavailable && current == name }
 

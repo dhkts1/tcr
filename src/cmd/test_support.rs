@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use tcr::config;
+use tcr::base::config;
 
 use crate::cmd::tool_env;
 

@@ -3,8 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
-use tcr::cli::validate_group_label_chars;
-use tcr::{config, tls};
+use tcr::verbs::cli::validate_group_label_chars;
+use tcr::{base::config, base::tls};
 
 use crate::cmd::run::launch_env::{LaunchKey, apply_nested_claude_ca, see_through_ca_notice};
 use crate::cmd::run::{
@@ -291,7 +291,7 @@ fn run_group_with_no_claude_member_is_refused() {
     config.accounts = vec![
         account_with_groups("alice", Some(&["review"])),
         config::Account {
-            provider: tcr::provider::Provider::Codex,
+            provider: tcr::base::provider::Provider::Codex,
             ..account_with_groups("bob-codex", Some(&["lab", "review"]))
         },
     ];
@@ -314,7 +314,7 @@ fn run_group_refuses_a_codex_only_group_even_when_it_spills_to_the_pool() {
     config.accounts = vec![
         account_with_groups("alice", Some(&["review"])),
         config::Account {
-            provider: tcr::provider::Provider::Codex,
+            provider: tcr::base::provider::Provider::Codex,
             ..account_with_groups("bob-codex", Some(&["lab"]))
         },
     ];
@@ -330,7 +330,7 @@ fn run_group_refuses_a_codex_only_group_even_when_it_spills_to_the_pool() {
         validate_group(&config, "lab").expect_err("spilling does not give lab a Claude account");
     assert_eq!(
         err.to_string(),
-        tcr::provider_guard::group_has_no_claude("lab")
+        tcr::verbs::provider_guard::group_has_no_claude("lab")
     );
 }
 

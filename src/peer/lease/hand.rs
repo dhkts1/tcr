@@ -19,7 +19,7 @@ use super::MIN_DEBIT;
 /// not be able to write it down: a restart loses every handed token and the
 /// owner pushes fresh ones, which costs one round trip and is the correct price.
 ///
-/// `rg -n 'HandedTokens' src/config.rs src/manager/mod.rs` is the containment
+/// `rg -n 'HandedTokens' src/base/config.rs src/manager/mod.rs` is the containment
 /// gate, and it needs a positive control beside it: an empty grep with no
 /// control is a claim about the probe, not about the code.
 ///
@@ -40,7 +40,7 @@ impl HandedTokens {
     ///
     /// **A store built here is not the store the request path reads, and a
     /// test that mixes the two reads it as a broken static.**
-    /// [`PeerLeaseProvider::try_serve`](crate::fallback::FallbackProvider::try_serve)'s hand arm can only ask
+    /// [`PeerLeaseProvider::try_serve`](crate::peer::serve::fallback::FallbackProvider::try_serve)'s hand arm can only ask
     /// [`handed_tokens`], the one store this process has, and no seam hands it
     /// another. So a test that puts a bearer into its OWN `HandedTokens` and
     /// then drives the provider sees `len 1` in front of it and an empty store
@@ -50,8 +50,8 @@ impl HandedTokens {
     ///
     /// A test that drives the PATH therefore puts into [`handed_tokens`] and
     /// calls [`Self::forget`] on the way out, so the next test in the same
-    /// binary does not inherit the bearer; `tests/peer_hand.rs` and
-    /// `tests/peer_lease.rs` both do that. A test about the type itself builds
+    /// binary does not inherit the bearer; `tests/peer/lending/peer_hand.rs` and
+    /// `tests/peer/lending/peer_lease.rs` both do that. A test about the type itself builds
     /// one here.
     pub fn new() -> Self {
         Self::default()
@@ -237,7 +237,7 @@ pub(crate) fn report_handed_spend(lease_id: u128, utilization: Option<f64>) {
 /// The utilization one window's rate-limit header reported on a response, or
 /// `None` when this answer said nothing about that window.
 ///
-/// The header names are `src/quota.rs`'s own; read here rather than through
+/// The header names are `src/records/quota/mod.rs`'s own; read here rather than through
 /// `Quota::update_from_headers` because that merges into an account's quota,
 /// and a borrower has no account of the owner's to merge into. It is one
 /// figure, for one window, off one answer.

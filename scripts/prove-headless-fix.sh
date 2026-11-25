@@ -2,7 +2,7 @@
 # Prove that --headless is what keeps a GUI-spawned server alive.
 #
 # The claim under test: without --headless, `tcr server` runs its ratatui TUI
-# (src/main.rs:590), which calls enable_raw_mode()? on stdout (src/tui.rs:47).
+# (src/main.rs:590), which calls enable_raw_mode()? on stdout (src/verbs/tui/terminal.rs).
 # When stdout is a PIPE rather than a terminal — which is how a GUI app spawns a
 # child — raw mode fails, the `?` propagates, and the process dies at once.
 #

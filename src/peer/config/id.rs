@@ -15,7 +15,7 @@
 //!
 //! # A separate file pair from the MITM CA, deliberately
 //!
-//! The CA lives at its own paths (`MintedPaths::in_dir` in `src/mitm.rs`)
+//! The CA lives at its own paths (`MintedPaths::in_dir` in `src/proxy/mitm/mod.rs`)
 //! and regenerating it invalidates every leaf signed by the boot-time CA,
 //! which breaks `claude` processes running right now, a recorded incident.
 //! Keeping the peer keypair in its own files means a peer rotation can never
@@ -144,7 +144,7 @@ pub fn public_key_path(config_dir: &Path) -> PathBuf {
 /// already uses, so one `--config`-shaped override reaches all of it and a test
 /// points the whole peer surface at a temp dir with one argument.
 pub fn default_config_dir() -> PathBuf {
-    crate::config::default_path()
+    crate::base::config::default_path()
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
@@ -245,7 +245,7 @@ fn public_from_secret(secret: &[u8; 32]) -> Result<[u8; 32]> {
 }
 
 /// Write a key file at `mode`, refusing to follow a pre-existing symlink the
-/// way [`crate::config::write_atomic`] does for the main config.
+/// way [`crate::base::config::write_atomic`] does for the main config.
 ///
 /// Two callers: the 32-byte Noise static here, and tcr's own tailnet node's
 /// key file (`crate::peer::reach::tailnet::node::write_key_file`), which needs the same

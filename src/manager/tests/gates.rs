@@ -15,7 +15,7 @@ fn retry_after_hint_uses_seven_day_oi_window() {
     manager.apply_usage(
         0,
         &Usage {
-            five_hour: crate::probe::WindowReading::Unread,
+            five_hour: crate::records::probe::WindowReading::Unread,
             seven_day: None,
             seven_day_oi: Some(UsageBucket {
                 utilization: Some(0.99),
@@ -29,7 +29,7 @@ fn retry_after_hint_uses_seven_day_oi_window() {
     // A FABLE request (`is_fable = true`) is the only one gated by the 7d_oi
     // bucket, so it is what makes that window drive the hint. A non-Fable
     // request ignores 7d_oi entirely and falls through to the 60s default.
-    let hint = manager.retry_after_hint(now, true, crate::provider::Provider::Anthropic);
+    let hint = manager.retry_after_hint(now, true, crate::base::provider::Provider::Anthropic);
     assert!(
         hint > 60,
         "the 7d_oi reset must drive the hint past the 60s default, got {hint}"
@@ -43,15 +43,15 @@ fn retry_after_hint_uses_seven_day_oi_window() {
     // no other gate the hint falls back to the 60s default — proof the
     // `is_fable` scoping is honoured, not hard-coded.
     assert_eq!(
-        manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic),
+        manager.retry_after_hint(now, false, crate::base::provider::Provider::Anthropic),
         60,
         "a non-Fable request ignores the 7d_oi bucket"
     );
 }
 
 /// A quota window at `util`, resetting at `reset` (`None` = unknown reset).
-fn window(util: f64, reset: Option<OffsetDateTime>) -> crate::quota::QuotaWindow {
-    crate::quota::QuotaWindow {
+fn window(util: f64, reset: Option<OffsetDateTime>) -> crate::records::quota::QuotaWindow {
+    crate::records::quota::QuotaWindow {
         utilization: util,
         reset,
     }
@@ -305,7 +305,7 @@ fn account_gate_standard_reset_outlasts_a_short_hold() {
 
     // retry_after_hint must now reflect the real 600s, not the 8s Hold.
     let manager = Manager::from_runtimes(vec![a]);
-    let hint = manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic);
+    let hint = manager.retry_after_hint(now, false, crate::base::provider::Provider::Anthropic);
     let expected = ((odt_to_ms(reset) - now_ms + 999) / 1000).max(1);
     assert_eq!(hint, expected, "hint must be the 600s reset, got {hint}");
     assert!(hint > 500, "must not report the 8s hold, got {hint}");
@@ -421,12 +421,12 @@ fn rejected_account_reports_a_rejected_gate() {
 /// A refused account as the snapshot sees it: `provider`, `rejected`, and the two windows
 /// as (utilization, reset from `now`). Thresholds are the default 0.95.
 fn refused_runtime(
-    provider: crate::provider::Provider,
+    provider: crate::base::provider::Provider,
     now: OffsetDateTime,
     five_hour: Option<(f64, Duration)>,
     seven_day: Option<(f64, Duration)>,
 ) -> AccountRuntime {
-    let window = |(utilization, reset_in): (f64, Duration)| crate::quota::QuotaWindow {
+    let window = |(utilization, reset_in): (f64, Duration)| crate::records::quota::QuotaWindow {
         utilization,
         reset: Some(now + reset_in),
     };
@@ -445,7 +445,7 @@ fn refused_codex_manager(
     seven_day: Option<(f64, Duration)>,
 ) -> Arc<Manager> {
     Manager::from_runtimes(vec![refused_runtime(
-        crate::provider::Provider::Codex,
+        crate::base::provider::Provider::Codex,
         now,
         five_hour,
         seven_day,
@@ -613,7 +613,7 @@ fn a_refusal_with_neither_stays_rejected() {
 fn an_anthropic_rejected_row_is_unchanged() {
     let now = OffsetDateTime::now_utc();
     let manager = Manager::from_runtimes(vec![refused_runtime(
-        crate::provider::Provider::Anthropic,
+        crate::base::provider::Provider::Anthropic,
         now,
         None,
         Some((1.0, Duration::days(3))),
@@ -839,7 +839,7 @@ fn retry_after_hint_skips_error_and_still_gated_accounts() {
     let now = OffsetDateTime::now_utc();
     let at = |secs: i64| now + Duration::seconds(secs);
     let manager = weekly_gated_dead_and_five_hour_gated(now);
-    let hint = manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic);
+    let hint = manager.retry_after_hint(now, false, crate::base::provider::Provider::Anthropic);
 
     // Correct = C's 900s reset. The pre-fix raw-min over every window's reset
     // returned ~100s: it counted B's reset (an Error account that never returns)
@@ -862,7 +862,8 @@ fn exhaustion_hint_names_the_binding_gate_and_counts_every_gated_account() {
     let now = OffsetDateTime::now_utc();
     let at = |secs: i64| now + Duration::seconds(secs);
     let manager = weekly_gated_dead_and_five_hour_gated(now);
-    let hint = manager.exhaustion_hint(now, false, crate::provider::Provider::Anthropic, None);
+    let hint =
+        manager.exhaustion_hint(now, false, crate::base::provider::Provider::Anthropic, None);
     assert_eq!(
         hint.binding,
         Some(GateReason::FiveHour),
@@ -875,7 +876,7 @@ fn exhaustion_hint_names_the_binding_gate_and_counts_every_gated_account() {
     );
     assert_eq!(
         hint.retry_after,
-        manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic),
+        manager.retry_after_hint(now, false, crate::base::provider::Provider::Anthropic),
         "the seconds half is byte-identical to retry_after_hint"
     );
     let counts: Vec<(GateReason, usize)> = hint.gated.iter().map(|(r, n)| (*r, *n)).collect();
@@ -900,14 +901,15 @@ fn exhaustion_hint_reports_an_unknown_reset_as_unknown_not_as_sixty_seconds() {
     a.switch_threshold = Some(0.90);
     a.quota.seven_day = Some(window(0.99, None));
     let manager = Manager::from_runtimes(vec![a]);
-    let hint = manager.exhaustion_hint(now, false, crate::provider::Provider::Anthropic, None);
+    let hint =
+        manager.exhaustion_hint(now, false, crate::base::provider::Provider::Anthropic, None);
     assert_eq!(hint.retry_after, 60);
     assert_eq!(hint.free_at, None);
     assert_eq!(hint.binding, None);
     assert_eq!(hint.gated.get(&GateReason::SevenDay), Some(&1));
 }
 
-/// A request that only account 1 may serve (bound history, see `crate::bound_tokens`) is
+/// A request that only account 1 may serve (bound history, see `crate::stores::bound_tokens`) is
 /// told when account 1 frees — 7 seconds — not when the SOONER account 0 does. The
 /// fleet-wide hint over the same fleet is the control: it answers 2.
 #[test]
@@ -923,7 +925,7 @@ fn a_single_account_hint_times_the_wait_on_that_account_alone() {
     let now = OffsetDateTime::now_utc();
     assert_eq!(
         manager
-            .exhaustion_hint(now, false, crate::provider::Provider::Anthropic, None)
+            .exhaustion_hint(now, false, crate::base::provider::Provider::Anthropic, None)
             .retry_after,
         2,
         "the control: fleet-wide, the sooner account wins"
@@ -952,7 +954,7 @@ fn a_single_account_hint_times_the_wait_on_that_account_alone() {
 /// wins for both providers.
 #[test]
 fn codex_exhaustion_hint_folds_only_the_requests_own_provider() {
-    use crate::provider::Provider;
+    use crate::base::provider::Provider;
     for (anthropic_hold, codex_hold) in [(7, 2), (2, 7)] {
         let mut codex = AccountRuntime::from_config(&account_in_groups("b", 0, &["g"]), false);
         codex.provider = Provider::Codex;
@@ -1003,7 +1005,7 @@ fn codex_exhaustion_hint_folds_only_the_requests_own_provider() {
 /// Anthropic arm given the Codex parser times the Anthropic hint on a Codex window.
 #[test]
 fn codex_headers_time_the_codex_hint_and_never_the_anthropic_one() {
-    use crate::provider::Provider;
+    use crate::base::provider::Provider;
     let mut codex = AccountRuntime::from_config(&account("b", 0), false);
     codex.provider = Provider::Codex;
     let manager = Manager::from_runtimes(vec![
@@ -1064,13 +1066,13 @@ fn codex_headers_time_the_codex_hint_and_never_the_anthropic_one() {
 /// hold over the stored window and the first answers the hour.
 #[test]
 fn an_all_rejected_codex_fleet_is_timed_on_its_stored_windows_then_its_holds() {
-    use crate::provider::Provider;
+    use crate::base::provider::Provider;
     let now = OffsetDateTime::now_utc();
     let rejected = |name: &str, provider: Provider, weekly_reset_in: Option<i64>| {
         let mut account = AccountRuntime::from_config(&account(name, 0), false);
         account.provider = provider;
         account.quota.status = Some("rejected".to_string());
-        account.quota.seven_day = weekly_reset_in.map(|secs| crate::quota::QuotaWindow {
+        account.quota.seven_day = weekly_reset_in.map(|secs| crate::records::quota::QuotaWindow {
             utilization: 1.0,
             reset: Some(now + Duration::seconds(secs)),
         });
