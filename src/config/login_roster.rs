@@ -16,6 +16,49 @@ impl Config {
         }
     }
 
+    /// Apply `update` to the one row `probe` names ([`Self::resolve_identity`]),
+    /// and say how it resolved: on [`Resolved::None`] and [`Resolved::Many`]
+    /// nothing is touched, and the caller decides.
+    pub fn update_identity_row(
+        &mut self,
+        probe: &Account,
+        update: impl FnOnce(&mut Account),
+    ) -> Resolved {
+        let resolved = self.resolve_identity(probe);
+        if let Resolved::One(index) = resolved
+            && let Some(account) = self.accounts.get_mut(index)
+        {
+            update(account);
+        }
+        resolved
+    }
+
+    /// The names of every row [`crate::identity::same_identity`] calls the
+    /// same account as `probe`, in config order: the candidates a
+    /// [`Resolved::Many`] could not choose between.
+    pub fn same_identity_names(&self, probe: &Account) -> Vec<String> {
+        self.accounts
+            .iter()
+            .filter(|a| crate::identity::same_identity(a, probe))
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
+    /// Append `account` behind the whole fleet: at one past the highest
+    /// priority any row carries, or 0 when none carries one.
+    pub fn append_at_next_priority(&mut self, account: Account) {
+        let next_priority = self
+            .accounts
+            .iter()
+            .filter_map(|a| a.priority)
+            .max()
+            .map_or(0, |max| max + 1);
+        self.accounts.push(Account {
+            priority: Some(next_priority),
+            ..account
+        });
+    }
+
     /// The one row `query` names by exact name ([`crate::identity::match_one`]),
     /// `None` when no row does, and [`Config::resolve_account`]'s error when
     /// more than one does.
