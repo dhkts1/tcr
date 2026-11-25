@@ -713,6 +713,31 @@ fn from_ms(ms: i64) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
 }
 
+/// What only the serving process knows, gathered by the status route on every request: none
+/// of it is in a [`StatsSnapshot`], so [`StatusPayload::from_snapshot`] leaves each of its keys
+/// empty and [`StatusPayload::with_serving_facts`] writes them, each by its own wire rule.
+pub struct ServingFacts<'a> {
+    /// The peers block and why it is empty, as [`peers_block_with_error`] read them.
+    pub peers: (Vec<PeerStatusRow>, Option<String>),
+    /// What the MITM listener's policy and loaded leaf allow, MITM off included.
+    pub mitm: MitmStatus,
+    /// The Codex traffic counts of the last ten minutes.
+    pub codex_traffic: tcr_status_wire::CodexTraffic,
+    /// Where Codex requests go, the default included.
+    pub codex_upstream: &'a str,
+    /// The request-key mode with the unkeyed `CONNECT` and request counts, in that order;
+    /// `None` while the server holds no key.
+    pub request_key: Option<(
+        crate::request_key::RequestKeyMode,
+        Vec<UnkeyedCount>,
+        Vec<UnkeyedCount>,
+    )>,
+    /// The machine's heat; `None` where there is no AppleSMC.
+    pub heat: Option<tcr_status_wire::HeatRow>,
+    /// The fan controller's last published state; `None` where none runs.
+    pub fan_control: Option<tcr_status_wire::FanControlRow>,
+}
+
 impl StatusPayload {
     /// Does the serving proxy present a leaf tcr minted that lets it terminate
     /// `host`? `false` when the payload reports no MITM status at all (an older
@@ -890,7 +915,7 @@ impl StatusPayload {
             // Deriving them here would mean this function reading two files off
             // disk on every status request, and it takes no paths. The serving
             // process assigns [`Self::peers`] from [`peer_status_rows`] after
-            // this call; an empty list is the honest answer for every other
+            // this call, through [`Self::with_serving_facts`]; an empty list is the honest answer for every other
             // caller (the CLI's own round-trip tests, `into_snapshot`).
             peers: Vec::new(),
             peers_error: None,
@@ -913,6 +938,39 @@ impl StatusPayload {
             // So is the fan controller, which only the serving process runs.
             fan_control: None,
         }
+    }
+
+    /// This payload with what only the serving process knows written on: the keys
+    /// [`Self::from_snapshot`] leaves empty. Each key's wire rule lives here, beside it.
+    pub fn with_serving_facts(mut self, facts: ServingFacts<'_>) -> Self {
+        let ServingFacts {
+            peers,
+            mitm,
+            codex_traffic,
+            codex_upstream,
+            request_key,
+            heat,
+            fan_control,
+        } = facts;
+        (self.peers, self.peers_error) = peers;
+        // ALWAYS `Some`, MITM off included: on the wire, a missing key is what
+        // marks a server older than this field (see `StatusPayload::mitm`).
+        self.mitm = Some(mitm);
+        // Always `Some` too, for the same reason: absent marks a server older than the counts.
+        self.codex_traffic = Some(codex_traffic);
+        // Named only when it is not the default, so a reader is told only of an upstream they did
+        // not expect.
+        self.codex_upstream = crate::config::non_default_codex_upstream(codex_upstream);
+        // Present only while the server holds a key: its presence is what a launcher
+        // reads as "this server understands keys" (see `StatusPayload::request_key_mode`).
+        if let Some((mode, connects, requests)) = request_key {
+            self.request_key_mode = Some(mode.as_str().to_string());
+            self.unkeyed_connects = Some(connects);
+            self.unkeyed_requests = Some(requests);
+        }
+        self.heat = heat.map(HeatField::Reading);
+        self.fan_control = fan_control.map(FanControlField::Reading);
+        self
     }
 
     /// Rebuild the snapshot the CLI renderers take, plus the server's thresholds.
