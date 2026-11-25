@@ -214,8 +214,10 @@ impl Fleet {
     }
 
     fn from_config(config: Config) -> Self {
-        let account_names = config.accounts.iter().map(|a| a.name.clone()).collect();
         let manager = manager_over(config);
+        let account_names = (0..manager.account_count())
+            .filter_map(|idx| manager.account_name(idx))
+            .collect();
         let mut fleet = Self {
             manager,
             account_names,
