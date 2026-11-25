@@ -760,8 +760,7 @@ pub use observed::{
 };
 pub use port::{
     PORT_CEILING, PORT_FLOOR, SLOT_SECONDS, accepted_ports, current_slot, derived_port,
-    forget_port_secret, port_is_accepted, port_secret, port_secret_for, remember_pair_hash,
-    remember_port_secret, rendezvous_ports, restore_from_peers,
+    forget_port_secret, port_is_accepted, rendezvous_ports, restore_from_peers,
 };
 pub use punch::{
     KernelPunchNet, PUNCH_RETRY, PUNCH_SLOTS, PunchArrival, PunchFailure, PunchNet, PunchSlot,

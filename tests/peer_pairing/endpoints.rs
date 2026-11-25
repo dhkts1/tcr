@@ -341,8 +341,6 @@ async fn a_peer_that_moved_announces_its_new_port_and_is_reached_there() {
 /// constructor and the second assertion reads `None`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_completed_return_visit_registers_the_pairs_rendezvous_secret() {
-    use tcr::peer::reach;
-
     let node = Node::new("rendezvous-secret");
     let (peer_secret, peer_public) = noise::generate_static().expect("a peer keypair");
     let peer_id = PeerId(peer_public);
@@ -365,7 +363,7 @@ async fn a_completed_return_visit_registers_the_pairs_rendezvous_secret() {
     let responder_id = PeerId(responder_public);
 
     assert!(
-        reach::port_secret_for(&responder_id).is_none(),
+        noise::port_secret_for(&responder_id).is_none(),
         "the responder's key was generated for this test, so nothing may hold a secret \
          for it before the handshake runs"
     );
@@ -386,10 +384,10 @@ async fn a_completed_return_visit_registers_the_pairs_rendezvous_secret() {
         "the session carries the hash it ended on, or nothing downstream can derive a port"
     );
     assert_eq!(
-        reach::port_secret_for(&responder_id),
-        Some(reach::port_secret(&session.handshake_hash)),
+        noise::port_secret_for(&responder_id),
+        Some(noise::port_secret(&session.handshake_hash)),
         "the register holds the DERIVED secret for this pair, and it is the one \
-         `reach::port_secret` computes from the session's own hash"
+         `noise::port_secret` computes from the session's own hash"
     );
 }
 

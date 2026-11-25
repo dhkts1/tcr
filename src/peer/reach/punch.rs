@@ -1,4 +1,5 @@
 use super::*;
+use crate::peer::noise::port_secret_for;
 
 // ---------------------------------------------------------------------------
 // The punch: two Macs dialling each other at a moment they both computed

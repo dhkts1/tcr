@@ -1123,7 +1123,7 @@ where
                 let written = on_blocking_thread({
                     let peers_path = context.peers_path.clone();
                     let peer = session.peer;
-                    let secret = crate::peer::reach::port_secret(&session.handshake_hash);
+                    let secret = noise::port_secret(&session.handshake_hash);
                     let briefs = incoming.briefs.clone();
                     move || {
                         Ok(HelloWrites {

@@ -170,7 +170,7 @@ async fn a_relayed_hint_teaches_where_to_aim() {
     // Without a pair secret every `punch_target` below is
     // `NoRendezvousSecret` whatever address is recorded, and the address is
     // what this test is about.
-    reach::remember_port_secret(peer.id(), [0x41_u8; 32]);
+    noise::remember_port_secret(peer.id(), [0x41_u8; 32]);
 
     let exchanged = hint_from(
         &target,

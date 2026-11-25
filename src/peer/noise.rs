@@ -116,8 +116,10 @@
 //! is how "zero bytes written after a refusal" is asserted on the socket rather
 //! than on a log line.
 
+use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
 use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -793,7 +795,7 @@ pub struct PeerSession {
     pub code: String,
     /// The handshake hash this session ended on.
     ///
-    /// Kept because it is the one input `crate::peer::reach::port_secret`
+    /// Kept because it is the one input `port_secret`
     /// takes, and `snow` exposes `get_handshake_hash` on `HandshakeState`
     /// only: once `into_transport` has run, the value is gone and a dialler
     /// has no way to compute the pair's rendezvous ports.
@@ -1569,7 +1571,7 @@ where
         (Some(ours), Some(theirs)) => pairing_code(&handshake_hash, theirs, ours),
         _ => six_digit_code(&state),
     };
-    crate::peer::reach::remember_pair_hash(peer, &handshake_hash);
+    remember_pair_hash(peer, &handshake_hash);
     let mut transport = into_transport(state)?;
 
     // The reveal, and the reason it is a transport frame rather than a fourth
@@ -1843,7 +1845,7 @@ where
     // Read before `into_transport` consumes the handshake state, which is the
     // only thing that can answer for this hash.
     let handshake_hash = state.get_handshake_hash().to_vec();
-    crate::peer::reach::remember_pair_hash(peer, &handshake_hash);
+    remember_pair_hash(peer, &handshake_hash);
     let mut transport = into_transport(state)?;
 
     // The responder's reveal. Checked against the commitment that arrived in
@@ -1882,6 +1884,112 @@ where
         handshake_hash,
         transport,
     })
+}
+
+/// The label that separates this derivation from every other use of the same
+/// handshake hash.
+///
+/// HKDF's `info` field, and the reason it is not empty: the six-digit pairing
+/// code (`noise::six_digit_code`) is also derived from the handshake hash, and
+/// two derivations from one secret with no domain separator are one derivation
+/// whose outputs are related. The version suffix is here so a change to the
+/// scheme changes every port rather than half of them.
+const PORT_INFO: &[u8] = b"tcr peer reach derived-port v1";
+
+/// The per-pair secret the port derivation runs on, from the pair's completed
+/// Noise handshake hash.
+///
+/// HKDF-SHA256 (RFC 5869) over the tree's own `hmac_sha256`
+/// (`src/peer/config.rs`), which is checked against RFC 4231 rather than
+/// against itself. Extract with an all-zero salt, as the RFC says to when
+/// there is none, then one expand round, because 32 bytes is one block and the
+/// counter never reaches two.
+///
+/// # Why a derivation and not the hash itself
+///
+/// The handshake hash is the input to the six-digit compare an operator reads
+/// off two screens. A port computed as a slice of that same hash would leak a
+/// little of a value the operators speak out loud; more importantly it would
+/// tie two unrelated schemes together, so changing either one changes both.
+/// This is the Noise handshake's own key material, re-derived: it is **not** a
+/// second key exchange, and no new one may be invented here.
+///
+/// Takes the hash as bytes rather than a handshake object on purpose: the
+/// handshake type belongs to `snow`, which by this module tree's own rule is
+/// named in `src/peer/noise.rs` and nowhere else.
+pub fn port_secret(handshake_hash: &[u8]) -> [u8; 32] {
+    use crate::peer::drop::hmac_sha256;
+
+    // RFC 5869 § 2.2: with no salt, the salt is HashLen zero bytes.
+    let pseudorandom_key = hmac_sha256(&[0_u8; 32], handshake_hash);
+
+    // RFC 5869 § 2.3, one round: T(1) = HMAC(PRK, info | 0x01).
+    let mut block = Vec::with_capacity(PORT_INFO.len() + 1);
+    block.extend_from_slice(PORT_INFO);
+    block.push(0x01);
+    hmac_sha256(&pseudorandom_key, &block)
+}
+
+/// The port secrets this process has learned, one per pair.
+///
+/// # What is in memory, what is on disk, and what is on neither
+///
+/// The secret is the pair's completed Noise handshake hash run through
+/// [`port_secret`], so it exists only where a handshake has completed. This
+/// register is the hot copy, filled by every session as it completes.
+///
+/// It is ALSO written to `tcr-peers.json`, as
+/// [`crate::peer::config::PeerRow::rendezvous_secret`], and
+/// [`restore_from_peers`](crate::peer::reach::restore_from_peers) reads it back at boot. A decision of 2026-09-18
+/// took that decision and drew the line where this doc used to refuse the file
+/// outright: what the row holds is this derived value and never the handshake
+/// hash it came from. One keyed hash separates them, under `PORT_INFO`'s own
+/// domain string, and the hash is what the six-digit pairing compare is built
+/// from, so it stays in memory only.
+///
+/// Two places it still is not. The wire, because both ends compute it and
+/// telling each other a port is the thing a derived port replaces. And any row
+/// this node does not pin, because a secret for a peer with no row has nothing
+/// to be for.
+///
+/// Before row 17 a restarted node had no secret for any pair until the next
+/// completed session, and a dialler had the recorded endpoints and nothing
+/// else, which is exactly the case a peer that MOVED is not covered by.
+pub(crate) fn port_secrets() -> &'static Mutex<HashMap<PeerId, [u8; 32]>> {
+    static SECRETS: OnceLock<Mutex<HashMap<PeerId, [u8; 32]>>> = OnceLock::new();
+    SECRETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record the port secret a completed handshake with `peer` derived.
+///
+/// Takes the SECRET and not the handshake hash, so the one derivation lives in
+/// [`port_secret`] and a caller cannot accidentally register the hash itself,
+/// which is the value the six-digit compare is also built from.
+pub fn remember_port_secret(peer: PeerId, secret: [u8; 32]) {
+    let mut held = match port_secrets().lock() {
+        Ok(held) => held,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    held.insert(peer, secret);
+}
+
+/// Derive and record the port secret for a completed handshake with `peer`.
+///
+/// The entry point a session driver calls: it takes the handshake hash the
+/// session ended with and runs the one derivation, so no caller outside this
+/// module handles the hash as if it were the secret.
+pub fn remember_pair_hash(peer: PeerId, handshake_hash: &[u8]) {
+    remember_port_secret(peer, port_secret(handshake_hash));
+}
+
+/// The port secret this process holds for `peer`, or [`None`] when no session
+/// with it has completed since boot and the peers file held none either.
+pub fn port_secret_for(peer: &PeerId) -> Option<[u8; 32]> {
+    let held = match port_secrets().lock() {
+        Ok(held) => held,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    held.get(peer).copied()
 }
 
 // ---------------------------------------------------------------------------

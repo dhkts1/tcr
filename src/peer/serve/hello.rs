@@ -62,7 +62,7 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
     if let Err(err) = crate::peer::config::observe_rendezvous_secret(
         store.path(),
         peer,
-        crate::peer::reach::port_secret(&session.handshake_hash),
+        noise::port_secret(&session.handshake_hash),
     ) {
         tracing::warn!(
             peer = %peer.display(),
