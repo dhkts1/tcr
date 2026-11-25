@@ -129,7 +129,7 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
     // live half of `dial_addresses` reads the external socket off a register a
     // keeper thread fills and this process has run none, so the walk is done
     // here and the mapping above is handed in explicitly.
-    let host: Vec<peer::pair::HostAddress> = peer::network_fact::interfaces()
+    let host: Vec<peer::pair::HostAddress> = peer::reach::network_fact::interfaces()
         .into_iter()
         .map(|(interface, addr)| peer::pair::HostAddress { interface, addr })
         .collect();

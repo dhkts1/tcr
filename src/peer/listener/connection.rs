@@ -1285,7 +1285,7 @@ where
             // comparing it to this Mac's clock, or replacing it with this Mac's
             // clock would each turn a round trip into a measurement of how far
             // apart two NTP daemons are. The asker times its own probe against
-            // its own monotonic clock (`crate::peer::probe`).
+            // its own monotonic clock (`crate::peer::reach::probe`).
             //
             // Answered on the same authorization every other frame on this
             // stream has: a pinned static key, re-checked against a re-read row

@@ -759,7 +759,7 @@ pub fn path_meter() -> &'static std::sync::Mutex<PathMeter> {
 ///
 /// This subsystem owns the figure the way
 /// [`crate::peer::discovery::BROWSE_INTERVAL`] and
-/// [`crate::peer::probe::PROBE_INTERVAL`] own theirs; the schedule itself
+/// [`crate::peer::reach::probe::PROBE_INTERVAL`] own theirs; the schedule itself
 /// stays the serving process's act, which is what [`path_meter`]'s own doc
 /// above says.
 pub const PATH_TRAFFIC_SUM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);

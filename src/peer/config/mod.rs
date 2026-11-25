@@ -1547,7 +1547,7 @@ pub enum EndpointSource {
     /// vouched for over an authenticated session, this arrived through a
     /// surface nobody here owns, and a peer this node has since forgotten still
     /// holds the key that seals it. It buys one dial attempt and nothing else:
-    /// see [`crate::peer::probe::order_endpoints`] for where that is enforced.
+    /// see [`crate::peer::reach::probe::order_endpoints`] for where that is enforced.
     Drop,
     /// Off a sealed link one friend sent another after changing networks, read
     /// by [`crate::peer::config::moved::open_link`] and written only when the operator

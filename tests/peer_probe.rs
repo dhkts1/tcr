@@ -4,7 +4,7 @@
 //! # What is real here and what is a stand-in
 //!
 //! Real: the Noise handshake and session, the production stream header, the
-//! production prober (`peer::probe::probe_once` / `probe_session`), the
+//! production prober (`peer::reach::probe::probe_once` / `probe_session`), the
 //! production EWMA, the production comparator, the production dial order
 //! (`peer::serve::dial_order`), and, in
 //! `the_real_listener_echoes_a_probe_with_both_fields_untouched`, the shipped
@@ -36,7 +36,7 @@ use tcr::peer::config::{
 use tcr::peer::id::NodeKey;
 use tcr::peer::listener::{self, SessionContext};
 use tcr::peer::noise::{self, Handshake, PeerSession};
-use tcr::peer::probe::{self, PathTable, ProbeOutcome, ProbeStop};
+use tcr::peer::reach::probe::{self, PathTable, ProbeOutcome, ProbeStop};
 use tcr::peer::serve;
 use tcr::peer::state::PathStat;
 use tcr::peer::tunnel::dial;

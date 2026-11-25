@@ -49,7 +49,7 @@ pub const BORROW_TIMEOUT: Duration = Duration::from_millis(10_000);
 ///
 /// It is the whole of this node's routing policy, and it is worth one thing a
 /// test can call. Four keys decide it and they are stated once, each with its
-/// reason, in [`crate::peer::probe::order_endpoints`]: the kind of path the
+/// reason, in [`crate::peer::reach::probe::order_endpoints`]: the kind of path the
 /// operator asked for, then the loss ceiling, then the measured round trip,
 /// then the newest observation.
 ///
@@ -69,7 +69,7 @@ pub const BORROW_TIMEOUT: Duration = Duration::from_millis(10_000);
 ///   so a hop is what is left when nothing direct answered, never a peer
 ///   chosen because its timestamp happened to be newer.
 pub fn dial_order(row: &PeerRow) -> Vec<Endpoint> {
-    crate::peer::probe::dial_order(row)
+    crate::peer::reach::probe::dial_order(row)
 }
 
 /// Dial the row's endpoints in [`dial_order`] and take the first that answers,
@@ -165,10 +165,10 @@ pub async fn dial_peer_within(
     let bound = Duration::from_millis(borrow_timeout_ms.max(1));
     let race = run_direct_race(row, candidates, &rendezvous, per_attempt, bound).await;
     for endpoint in race.failed {
-        crate::peer::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
+        crate::peer::reach::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
     }
     let (endpoint, reached) = race.won?;
-    crate::peer::probe::clear_cooldown(row.node, endpoint.locator);
+    crate::peer::reach::probe::clear_cooldown(row.node, endpoint.locator);
     Some(reached)
 }
 
@@ -386,7 +386,7 @@ async fn run_direct_race(
 /// signed record from the peer itself is new evidence about where it is NOW,
 /// and new evidence outranks a stale failure. Without this, [`dial_order`]'s
 /// own cooldown filter hides a re-taught address for
-/// [`crate::peer::probe::PATH_RETRY_COOLDOWN`], the common case for a peer
+/// [`crate::peer::reach::probe::PATH_RETRY_COOLDOWN`], the common case for a peer
 /// whose router mapping moved and moved back, and the retry below would look
 /// like it fetched nothing.
 ///
@@ -398,7 +398,7 @@ async fn run_direct_race(
 /// precisely.
 pub(super) fn clear_cooldowns_for_fetch(peer: PeerId, written: &[Endpoint]) {
     for endpoint in written {
-        crate::peer::probe::clear_cooldown(peer, endpoint.locator);
+        crate::peer::reach::probe::clear_cooldown(peer, endpoint.locator);
     }
 }
 
@@ -484,10 +484,10 @@ pub async fn dial_peer_reaching_within(
         )
         .await;
         for endpoint in race.failed {
-            crate::peer::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
+            crate::peer::reach::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
         }
         if let Some((endpoint, (addr, stream))) = race.won {
-            crate::peer::probe::clear_cooldown(row.node, endpoint.locator);
+            crate::peer::reach::probe::clear_cooldown(row.node, endpoint.locator);
             return Some((Reached::Direct(addr), stream));
         }
     }
@@ -498,10 +498,10 @@ pub async fn dial_peer_reaching_within(
                 if let Some((reached, stream)) =
                     try_direct_endpoint(row, addr, &rendezvous, per_attempt).await
                 {
-                    crate::peer::probe::clear_cooldown(row.node, endpoint.locator);
+                    crate::peer::reach::probe::clear_cooldown(row.node, endpoint.locator);
                     return Some((Reached::Direct(reached), stream));
                 }
-                crate::peer::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
+                crate::peer::reach::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
             }
             // Both go out through another Mac and by the same call: a
             // `Reverse` endpoint names the friend holding a carrier for this
@@ -513,10 +513,10 @@ pub async fn dial_peer_reaching_within(
                 if let Some(stream) =
                     forward_through(&node, &row.node, store, borrow_timeout_ms).await
                 {
-                    crate::peer::probe::clear_cooldown(row.node, endpoint.locator);
+                    crate::peer::reach::probe::clear_cooldown(row.node, endpoint.locator);
                     return Some((Reached::Via(node), stream));
                 }
-                crate::peer::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
+                crate::peer::reach::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
             }
         }
     }
@@ -583,14 +583,14 @@ pub async fn dial_peer_reaching_within(
                                             )
                                             .await;
                                             for endpoint in race.failed {
-                                                crate::peer::probe::cool_down(
+                                                crate::peer::reach::probe::cool_down(
                                                     fresh.node,
                                                     endpoint.locator,
                                                     crate::now_ms(),
                                                 );
                                             }
                                             if let Some((endpoint, (addr, stream))) = race.won {
-                                                crate::peer::probe::clear_cooldown(
+                                                crate::peer::reach::probe::clear_cooldown(
                                                     fresh.node,
                                                     endpoint.locator,
                                                 );
@@ -733,12 +733,12 @@ async fn forward_through(
 ///
 /// # The order is PROBE's, when PROBE has measured anything
 ///
-/// [`crate::peer::probe::carrier_key`] is the sort, and its third part is what
+/// [`crate::peer::reach::probe::carrier_key`] is the sort, and its third part is what
 /// makes it safe: a carrier nobody has probed ties at `u32::MAX` and falls
 /// through to most-recently-seen-first, which is the order this would have had
 /// without a path table at all. `paths.viaAllow`, when the operator set one,
 /// sorts a Mac that is not on it behind every Mac that is: behind, and still
-/// tried, the same rule [`crate::peer::probe::order_endpoints`] applies to a
+/// tried, the same rule [`crate::peer::reach::probe::order_endpoints`] applies to a
 /// `Via` endpoint: a path that is the only path is the way home.
 pub fn forwarders_for(target: &PeerId, store: &PeerStore) -> Vec<PeerId> {
     let file = store.file();
@@ -754,14 +754,13 @@ pub fn forwarders_for(target: &PeerId, store: &PeerStore) -> Vec<PeerId> {
             .iter()
             .find(|(peer, _)| *peer == row.node)
             .map(|(_, at)| *at);
-        crate::peer::probe::with_table(|table| table.carrier_rank(&row.node, seen)).unwrap_or_else(
-            |_| {
+        crate::peer::reach::probe::with_table(|table| table.carrier_rank(&row.node, seen))
+            .unwrap_or_else(|_| {
                 (
                     0,
                     (0, u32::MAX, std::cmp::Reverse(seen.unwrap_or(i64::MIN))),
                 )
-            },
-        )
+            })
     };
     chosen.sort_by_key(|row| order(row));
     chosen.into_iter().map(|row| row.node).collect()
@@ -1423,7 +1422,7 @@ mod tests {
     /// handed, and no other.**
     ///
     /// Two locators on one peer, both cooling. Only one is passed as
-    /// `written`. Read back through [`crate::peer::probe::dial_order`], the
+    /// `written`. Read back through [`crate::peer::reach::probe::dial_order`], the
     /// same public function the dead-drop retry calls: if the cleared
     /// locator alone comes back, the clear was scoped; if the untouched
     /// locator ALSO comes back, either nothing was cleared (so
@@ -1447,7 +1446,7 @@ mod tests {
         };
 
         let until_ms = crate::now_ms() + 60_000;
-        crate::peer::probe::with_table(|table| {
+        crate::peer::reach::probe::with_table(|table| {
             table.cool_down(peer, cleared_locator, until_ms);
             table.cool_down(peer, untouched_locator, until_ms);
         })

@@ -194,7 +194,7 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
             peers,
             lent_to,
             internet: file.internet,
-            network: peer::network_fact::network_present(),
+            network: peer::reach::network_fact::network_present(),
             exits,
             pending_count: pending.len(),
             pending,

@@ -26,18 +26,18 @@
 //! [`tcr_peer_wire::Control::Unknown`] and its listener closes the session. That
 //! is not loss and recording it as loss would push a perfectly good direct path
 //! behind a forwarded hop for as long as the state file survives. So
-//! [`crate::peer::probe::ProbeOutcome::NotSupported`] is its own answer, it
-//! records NOTHING, and [`crate::peer::probe::probe_session`] stops probing that
+//! [`crate::peer::reach::probe::ProbeOutcome::NotSupported`] is its own answer, it
+//! records NOTHING, and [`crate::peer::reach::probe::probe_session`] stops probing that
 //! peer for the rest of that session.
 //!
 //! # A cooldown is not a failure detector either
 //!
-//! [`PathTable::cool_down`](crate::peer::probe::PathTable::cool_down) is the one exception to "nothing here evicts a
+//! [`PathTable::cool_down`](crate::peer::reach::probe::PathTable::cool_down) is the one exception to "nothing here evicts a
 //! row", and it is a narrower thing than that sentence guards against: an
 //! endpoint that just failed to answer a DIAL, not a probe, is skipped by
-//! [`dial_order`](crate::peer::probe::dial_order) for [`PATH_RETRY_COOLDOWN`](crate::peer::probe::PATH_RETRY_COOLDOWN), while another endpoint on the
+//! [`dial_order`](crate::peer::reach::probe::dial_order) for [`PATH_RETRY_COOLDOWN`](crate::peer::reach::probe::PATH_RETRY_COOLDOWN), while another endpoint on the
 //! row is not cooling. It never empties a row. When every endpoint is
-//! cooling, [`dial_order`](crate::peer::probe::dial_order) returns the row whole, on the same rule
+//! cooling, [`dial_order`](crate::peer::reach::probe::dial_order) returns the row whole, on the same rule
 //! [`PathsConfig::max_loss_pct`](crate::peer::config::PathsConfig::max_loss_pct) already states for loss: a path that is the
 //! only path home is still tried. Nothing is declared dead, nothing is
 //! evicted, and no work is rescheduled away from a Mac; a cooling endpoint is

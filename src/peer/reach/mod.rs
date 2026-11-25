@@ -886,8 +886,12 @@ const fn is_lan_scope_v6(addr: Ipv6Addr) -> bool {
 /// fetches from each friend's drop.
 pub mod drop_exchange;
 mod mapping;
+pub mod network_fact;
 mod observed;
 mod port;
+
+/// What each path to a peer costs: RTT and loss, measured on a live session.
+pub mod probe;
 mod punch;
 /// A second router client beside [`NatPmp`], for gateways that speak only
 /// UPnP IGD.

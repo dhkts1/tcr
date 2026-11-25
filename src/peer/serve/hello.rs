@@ -9,6 +9,7 @@ use tcr_peer_wire::{
 use crate::peer::config::{ControlGrants, Locator, PeerStore};
 use crate::peer::id::NodeKey;
 use crate::peer::noise::{self, Handshake, recv_control, send_control};
+use crate::peer::reach::probe;
 
 use crate::peer::config::node_key_dir;
 use crate::peer::state::peer_state_path;
@@ -186,15 +187,15 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
     // `std::sync::Mutex` and probing awaits the network between rounds; one
     // round, on the constants the module already declares.
     let locator = Locator::Direct { addr: reached };
-    match crate::peer::probe::with_table(|table| table.clone()) {
+    match probe::with_table(|table| table.clone()) {
         Ok(mut table) => {
-            match crate::peer::probe::probe_session(
+            match probe::probe_session(
                 &mut stream,
                 &mut session,
                 &mut table,
                 locator,
                 1,
-                crate::peer::probe::PROBE_INTERVAL,
+                probe::PROBE_INTERVAL,
             )
             .await
             {
@@ -205,9 +206,7 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
                         stop = ?run.stop,
                         "peer hello: probed this session before it closed",
                     );
-                    if let Err(err) =
-                        crate::peer::probe::with_table(|installed| *installed = table.clone())
-                    {
+                    if let Err(err) = probe::with_table(|installed| *installed = table.clone()) {
                         tracing::warn!(
                             peer = %peer.display(),
                             error = %err,

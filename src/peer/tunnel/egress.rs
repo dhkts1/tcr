@@ -140,9 +140,9 @@ pub struct GatewayCandidate {
 /// Which Macs to ask, in the order to ask them.
 ///
 /// Freshness used to break ties before latency because latency was a guess.
-/// It is measured now: `crate::peer::probe` records a round trip and a loss
+/// It is measured now: `crate::peer::reach::probe` records a round trip and a loss
 /// figure per path on every live session, and
-/// [`crate::peer::probe::carrier_key_installed`] is the order those figures
+/// [`crate::peer::reach::probe::carrier_key_installed`] is the order those figures
 /// put the candidates in. Loss above `paths.maxLossPct` sorts last, measured
 /// round trip sorts next, and **a carrier nobody has probed keeps exactly the
 /// order it had before**: every unmeasured candidate ties at `u32::MAX` and
@@ -161,7 +161,10 @@ pub fn resolve_via(setting: &ViaSetting, candidates: &[GatewayCandidate]) -> Vec
         .collect();
     chosen.retain(|candidate| candidate.row.has_endpoint());
     chosen.sort_by_key(|candidate| {
-        crate::peer::probe::carrier_key_installed(&candidate.row.node, candidate.last_seen_ms)
+        crate::peer::reach::probe::carrier_key_installed(
+            &candidate.row.node,
+            candidate.last_seen_ms,
+        )
     });
     chosen
 }

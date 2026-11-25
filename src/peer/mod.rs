@@ -134,9 +134,6 @@ pub mod state;
 /// global IPv6 address, and a port both ends of a pair can compute.
 pub mod reach;
 
-/// What each path to a peer costs: RTT and loss, measured on a live session.
-pub mod probe;
-
 /// The sealed exchange: an ask that names no address, and a reply sealed to
 /// it that names no address either.
 pub mod ask;
@@ -155,5 +152,4 @@ pub mod tailnet_find;
 /// the `tailnet-node` feature on Apple silicon; the rest is in every build.
 pub mod tailnet_node;
 
-pub mod network_fact;
 pub mod status;

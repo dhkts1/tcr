@@ -598,7 +598,7 @@ fn a_moved_endpoint_never_evicts_one_a_handshake_proved() {
 /// giving it a band of its own (`4`) swaps it with the drop's.
 #[test]
 fn a_moved_endpoint_sorts_behind_a_brief_and_beside_a_drop() {
-    use tcr::peer::probe::{self, PathTable};
+    use tcr::peer::reach::probe::{self, PathTable};
 
     let port_of = |source: EndpointSource| -> u16 {
         match source {

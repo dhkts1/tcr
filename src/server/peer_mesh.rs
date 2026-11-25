@@ -207,8 +207,8 @@ pub(super) async fn boot_peer_listener(
     // past its first sample.
     match crate::peer::state::load(&state_path, crate::now_ms()) {
         Ok(state) => {
-            let table = crate::peer::probe::PathTable::new(file.paths.clone(), state.paths);
-            if let Err(err) = crate::peer::probe::install(table) {
+            let table = crate::peer::reach::probe::PathTable::new(file.paths.clone(), state.paths);
+            if let Err(err) = crate::peer::reach::probe::install(table) {
                 tracing::warn!(
                     error = %err,
                     "peer listener: could not install the path table; this boot starts with \
@@ -1074,7 +1074,7 @@ fn park_reverse_carriers(
             tokio::spawn(supervise("peer-reverse-carrier", async move {
                 let keeper = crate::peer::tunnel::keep_reverse_carrier(
                     friend,
-                    crate::peer::probe::PROBE_INTERVAL,
+                    crate::peer::reach::probe::PROBE_INTERVAL,
                     None,
                     |friend: crate::peer::config::PeerRow| {
                         let context = context.clone();

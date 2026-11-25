@@ -573,7 +573,7 @@ pub fn learn_from_hint(
 /// [`crate::peer::discovery::MAX_BRIEF_ADDRS`], the cap the sibling weak bands
 /// already use for exactly this reason.
 ///
-/// [`crate::peer::probe::collapse_hint`] fills the round trip, and a poisoned
+/// [`crate::peer::reach::probe::collapse_hint`] fills the round trip, and a poisoned
 /// path table costs the figure and nothing else: `0` is what that field's own
 /// doc defines as "no measurement", which is also what every build before the
 /// probe module would have sent.
@@ -594,9 +594,7 @@ pub fn own_collapse_hint(
         }
     }
     let addrs: Vec<String> = addrs.iter().map(SocketAddr::to_string).collect();
-    match crate::peer::probe::with_table(|table| {
-        crate::peer::probe::collapse_hint(own_id, addrs.clone(), table)
-    }) {
+    match probe::with_table(|table| probe::collapse_hint(own_id, addrs.clone(), table)) {
         Ok(hint) => hint,
         Err(err) => {
             tracing::warn!(
@@ -605,11 +603,7 @@ pub fn own_collapse_hint(
                 "peer aim: the path table could not be read, so this hint carries no measured \
                  round trip"
             );
-            crate::peer::probe::collapse_hint(
-                own_id,
-                addrs,
-                &crate::peer::probe::PathTable::default(),
-            )
+            probe::collapse_hint(own_id, addrs, &probe::PathTable::default())
         }
     }
 }
