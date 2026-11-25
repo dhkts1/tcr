@@ -147,7 +147,7 @@ fn persist_via_file(config_path: &Path, account: Account) -> anyhow::Result<Stri
                 serde_json::from_str("{}").context("build a default config after login")?;
             let mut first_account = account;
             first_account.priority = Some(0);
-            fresh.accounts.push(first_account);
+            fresh.append_account(first_account);
             config::save(config_path, &fresh).context("save config after login")?;
             prose(format_args!(
                 "Saved account '{name}' to {}",
