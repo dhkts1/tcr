@@ -1272,7 +1272,7 @@ impl NoiseStream {
     /// removed: the fact it reports exists nowhere else, and a gateway's log
     /// line is the whole record of a stream nobody may read. Both splice
     /// callers in this module now await it before they claim anything.
-    /// [`crate::peer::egress`]'s requester-side splice still drops its stream
+    /// [`crate::peer::tunnel::egress`]'s requester-side splice still drops its stream
     /// and is the remaining site.
     pub async fn finish(self) -> Result<()> {
         // Dropping our half first is what tells the pump to stop; without it a

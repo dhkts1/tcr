@@ -634,7 +634,7 @@ where
                 },
                 peer: accepted_peer,
                 target,
-                hosts: crate::peer::egress::PEER_EGRESS_HOSTS,
+                hosts: crate::peer::tunnel::egress::PEER_EGRESS_HOSTS,
                 cap_bytes: crate::peer::tunnel::DEFAULT_MAX_TUNNEL_BYTES_PER_HOUR,
                 budget: &context.tunnels,
                 now_ms: now_ms(),

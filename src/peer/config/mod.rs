@@ -458,7 +458,7 @@ impl<'de> Deserialize<'de> for TailnetSetting {
 /// One bound over the whole act, not one per hop: from the waiting client's
 /// side a carry is a single answer, and a per-hop bound of five seconds is a
 /// ten-second wait on a request that has already failed its direct attempt.
-/// [`retry_through_peer`](crate::peer::egress::retry_through_peer) turns it into a deadline the moment a candidate is
+/// [`retry_through_peer`](crate::peer::tunnel::egress::retry_through_peer) turns it into a deadline the moment a candidate is
 /// picked.
 ///
 /// Small on purpose. This path runs when the direct one has just failed, so the
@@ -466,7 +466,7 @@ impl<'de> Deserialize<'de> for TailnetSetting {
 /// promptly is worth less than the 503 the caller already has in hand.
 ///
 /// It does NOT bound the response BODY. `send` resolves on the head, so an SSE
-/// answer streams for as long as it streams. See [`axum_response_from`](crate::peer::egress::axum_response_from).
+/// answer streams for as long as it streams. See [`axum_response_from`](crate::peer::tunnel::egress::axum_response_from).
 pub const CARRY_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The operator's answer to "how does this Mac reach the internet", plus the

@@ -521,7 +521,7 @@ pub fn clear_cooldown(peer: PeerId, locator: Locator) {
 }
 
 /// The sort key for one Mac this node could ask to CARRY, as
-/// `peer::egress::resolve_via` orders its candidates.
+/// `peer::tunnel::egress::resolve_via` orders its candidates.
 ///
 /// A key and not a sort, because the candidate type belongs to the carry path
 /// and the measurements belong here: exporting the key lets one set of rules

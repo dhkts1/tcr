@@ -159,7 +159,7 @@ fn forwarder_on(
                 route: OriginRoute::Peer(forwarder.target),
                 peer,
                 target: &target,
-                hosts: tcr::peer::egress::PEER_EGRESS_HOSTS,
+                hosts: tunnel::egress::PEER_EGRESS_HOSTS,
                 cap_bytes: 1024 * 1024,
                 budget: &forwarder.budget,
                 now_ms: forwarder.now_ms,

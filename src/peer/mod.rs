@@ -8,7 +8,7 @@
 //!   own TLS. No lease, no ledger, no plaintext leaving any host. This is also
 //!   the only thing that keeps an offline machine's own tokens alive, because
 //!   `platform.claude.com` (the host Claude Code's OAuth refresh targets) is
-//!   on the allow-list (`egress::PEER_EGRESS_HOSTS`). The
+//!   on the allow-list (`tunnel::egress::PEER_EGRESS_HOSTS`). The
 //!   requester never sends a Codex request through a peer in this version (a
 //!   Codex account's exit pin is refused by `pinned_egress`'s Codex arm in
 //!   `src/peer/egress.rs`, and `src/proxy.rs` offers the blind carry to
@@ -82,7 +82,7 @@
 //! 3. discovery: [`discovery`]
 //! 4. the lease and SERVE: [`lease`], [`serve`], `crate::fallback`
 //! 5. the Peers tab (Swift)
-//! 6. blind egress: [`tunnel`], [`egress`]
+//! 6. blind egress: [`tunnel`], [`tunnel::egress`]
 //! 7. chains, deferred until a third machine exists
 //! 8. `tcr peer move`, out of the mesh
 //!
@@ -92,7 +92,7 @@
 //!
 //! **All eleven are gone, which is what a filled phase looks like.** [`id`],
 //! [`config`], [`noise`], [`listener`], [`pair`], [`discovery`], [`state`],
-//! [`lease`], [`serve`], [`tunnel`] and [`egress`] carry no `todo!()` body any
+//! [`lease`], [`serve`], [`tunnel`] and [`tunnel::egress`] carry no `todo!()` body any
 //! more. The last two outlived their stubs until the markers became
 //! `#[expect]`, which reported them unfulfilled: a suppression that outlives
 //! its reason is a suppression the next reader trusts.
@@ -126,9 +126,6 @@ pub mod serve;
 
 /// Phase 6: the blind splice.
 pub mod tunnel;
-
-/// Phase 6: the loopback egress splice.
-pub mod egress;
 
 /// Phase 1: runtime state, `tcr/peer-state.json` in the cache directory.
 pub mod state;

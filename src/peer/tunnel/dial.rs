@@ -723,7 +723,7 @@ async fn forward_through(
 /// the direction its own doc-comment separates from `gateway` ("this peer may
 /// ask US"). One operator act must not hand out both directions, so this reads
 /// the one that means what it needs, exactly as
-/// [`crate::peer::egress::candidates_from`] does for the carry to an origin.
+/// [`crate::peer::tunnel::egress::candidates_from`] does for the carry to an origin.
 ///
 /// Three exclusions, each one a thing that cannot work rather than a policy:
 /// the target itself (a Mac cannot carry a stream to itself, and

@@ -5,7 +5,7 @@
 //! Locally, a host that is not on the policy list gets blind-tunnelled, and
 //! that is correct there: the surface is loopback and `tunnel()`'s own doc says
 //! so. **The same default on a peer socket is an open proxy on the LAN.** So
-//! this path gets its own constant, [`PEER_EGRESS_HOSTS`](crate::peer::egress::PEER_EGRESS_HOSTS), deny by default, and
+//! this path gets its own constant, [`PEER_EGRESS_HOSTS`](crate::peer::tunnel::egress::PEER_EGRESS_HOSTS), deny by default, and
 //! a test that proves the refusal.
 //!
 //! The list keeps the two Anthropic hosts carried before local Codex pooling:
@@ -58,7 +58,7 @@
 //! `unknown_outcome_transport_failure == false`.
 //!
 //! Both are the SAME predicate read at two places, "nothing this request sent
-//! ever left this box", so [`retry_through_peer`](crate::peer::egress::retry_through_peer) is called from ONE hunk, the
+//! ever left this box", so [`retry_through_peer`](crate::peer::tunnel::egress::retry_through_peer) is called from ONE hunk, the
 //! top of `handle`'s transport-failure arm, under
 //! `err.is_connect() || is_offline_error(&err)`. `is_connect()` is exactly the
 //! condition that leaves `unknown_outcome_transport_failure` false (it is set
@@ -77,11 +77,11 @@
 //!
 //! # A second hunk, which is about an account and not about a failure
 //!
-//! The paragraph above is the whole story for [`retry_through_peer`](crate::peer::egress::retry_through_peer), and it is
+//! The paragraph above is the whole story for [`retry_through_peer`](crate::peer::tunnel::egress::retry_through_peer), and it is
 //! no longer the whole story for this module. The exit lock of decisions row 15
 //! ("we need to be able to lock where accounts go out from which server
 //! sometimes it might be important for saving the same ip") adds
-//! [`pinned_egress`](crate::peer::egress::pinned_egress), called from one more hunk in `proxy.rs`, ABOVE the direct
+//! [`pinned_egress`](crate::peer::tunnel::egress::pinned_egress), called from one more hunk in `proxy.rs`, ABOVE the direct
 //! attempt rather than inside its failure arm. It reads one account's pin and
 //! never asks whether a transport failed, because on that path nothing has been
 //! attempted yet. The two hunks cannot

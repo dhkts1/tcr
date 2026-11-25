@@ -1248,12 +1248,12 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let persist_path_for_peers = persist_path.clone();
     if let Some(peers_path) = peers_file_beside_config(persist_path.as_deref()) {
         // The egress seam reads the peers file per request and cannot be asked
-        // what path it was built from (`crate::peer::egress::peers_path`), so
+        // what path it was built from (`crate::peer::tunnel::egress::peers_path`), so
         // the boot path tells it once. Without this line an explicit
         // `--config` elsewhere carried requests against the default peers
         // file rather than against the file this server was actually started
         // with.
-        if !crate::peer::egress::install_peers_path(peers_path.clone()) {
+        if !crate::peer::tunnel::egress::install_peers_path(peers_path.clone()) {
             tracing::debug!(
                 path = %peers_path.display(),
                 "peer egress: a peers file was already installed for this process; keeping it"

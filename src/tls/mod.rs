@@ -45,7 +45,7 @@ use tokio_rustls::TlsAcceptor;
 /// single-use, so a refresh tcr mishandled would cost the client its login.
 /// Off this list it is blind-tunneled.
 ///
-/// Peer egress has its own narrower list ([`crate::peer::egress::PEER_EGRESS_HOSTS`]);
+/// Peer egress has its own narrower list ([`crate::peer::tunnel::egress::PEER_EGRESS_HOSTS`]);
 /// adding a local interception host grants no LAN gateway access to it.
 pub const ALLOWED_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com", "chatgpt.com"];
 
