@@ -279,7 +279,9 @@ async fn a_peer_that_moved_announces_its_new_port_and_is_reached_there() {
         .find(|row| row.node == b.key.id())
         .expect("A has a row for B");
     assert!(
-        tcr::peer::serve::dial_peer(&stale_row).await.is_none(),
+        tcr::peer::tunnel::dial::dial_peer(&stale_row)
+            .await
+            .is_none(),
         "the control: A's only endpoint for B is a port nobody listens on, so the dial \
          must fail before the Hello, otherwise the last assertion proves nothing"
     );
@@ -316,7 +318,9 @@ async fn a_peer_that_moved_announces_its_new_port_and_is_reached_there() {
          survived"
     );
     assert!(
-        tcr::peer::serve::dial_peer(&refreshed).await.is_some(),
+        tcr::peer::tunnel::dial::dial_peer(&refreshed)
+            .await
+            .is_some(),
         "A dials the port B announced and B answers: {:?}",
         refreshed.endpoints
     );

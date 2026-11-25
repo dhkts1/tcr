@@ -505,8 +505,9 @@ fn a_fifth_headerless_session_from_one_peer_is_refused() {
 /// refusal below becomes the allowed tuple.
 #[test]
 fn a_gateway_carries_an_allow_listed_name_on_one_port_only() {
-    use tcr::peer::egress::{PEER_EGRESS_HOSTS, PEER_EGRESS_PORT};
+    use tcr::peer::egress::PEER_EGRESS_HOSTS;
     use tcr::peer::tunnel;
+    use tcr::peer::tunnel::PEER_EGRESS_PORT;
 
     let peer = PeerId([13_u8; 32]);
     let carried = tcr_peer_wire::TunnelTarget::Origin {

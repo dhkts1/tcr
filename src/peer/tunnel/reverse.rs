@@ -228,7 +228,7 @@ pub fn park_reverse_carry(
 
 /// How a forward got to its target.
 ///
-/// Reported for the same reason [`crate::peer::serve::Reached`] is: the meter
+/// Reported for the same reason [`crate::peer::tunnel::dial::Reached`] is: the meter
 /// and the log line both need to name the path, and a boxed stream cannot be
 /// asked afterwards which one it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,14 +330,14 @@ pub const fn reverse_carry_is_wanted(
 /// The pinned Macs this node may ask to hold a carrier for it, in the order to
 /// ask them.
 ///
-/// [`crate::peer::serve::forwarders_for`] with this node's own id as the
+/// [`crate::peer::tunnel::dial::forwarders_for`] with this node's own id as the
 /// target, and that is not a trick: "who may carry a stream to X" with X set
 /// to self IS "who may carry for me", it already excludes this Mac and any
 /// candidate with no direct address of its own, and its order is the prober's.
 /// A second list here would be a second answer to one question, and the two
 /// would drift the first time `paths.viaAllow` changed.
 pub fn reverse_carriers(store: &PeerStore, node: &PeerId) -> Vec<PeerRow> {
-    crate::peer::serve::forwarders_for(node, store)
+    crate::peer::tunnel::dial::forwarders_for(node, store)
         .into_iter()
         .filter_map(|peer| store.row(&peer))
         .collect()

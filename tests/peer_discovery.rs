@@ -556,7 +556,7 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
         .peers
         .remove(0);
     assert!(
-        tcr::peer::serve::dial_peer(&stale).await.is_none(),
+        tcr::peer::tunnel::dial::dial_peer(&stale).await.is_none(),
         "the control: A's only endpoint for B is a port nobody listens on, so the dial \
          must fail before the beacon, otherwise the last assertion proves nothing"
     );
@@ -623,7 +623,9 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
         "timed by this node's clock and never by anything in the announcement"
     );
     assert!(
-        tcr::peer::serve::dial_peer(&refreshed).await.is_some(),
+        tcr::peer::tunnel::dial::dial_peer(&refreshed)
+            .await
+            .is_some(),
         "A dials the address B announced and gets a connection: {:?}",
         refreshed.endpoints
     );

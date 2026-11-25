@@ -78,12 +78,13 @@ use crate::peer::id::NodeKey;
 use crate::peer::lease::Ledger;
 use crate::peer::noise::{self, Handshake};
 use crate::peer::reach::is_lan_scope;
-use crate::peer::serve::{self, LeaseServing};
+use crate::peer::serve::LeaseServing;
 use crate::peer::state::knock_address;
 use crate::peer::tailnet_node::{
     BuiltFactory, DeviceFactory, GatewayFn, NodePaths, ServeFn, Supervisor, TICK, TailnetDevice,
     key_path_for_peers, server_slot,
 };
+use crate::peer::tunnel::dial;
 
 mod admission;
 mod connection;
@@ -623,7 +624,7 @@ where
 /// and that Mac proves who it is inside its own Noise session, exactly as it
 /// would on a forward the friend dialled.
 pub async fn park_one_carrier(friend: &PeerRow, context: &SessionContext) -> Result<()> {
-    let Some((addr, mut stream)) = serve::dial_peer_with_endpoint(friend).await else {
+    let Some((addr, mut stream)) = dial::dial_peer_with_endpoint(friend).await else {
         bail!(
             "peer reverse: none of {}'s addresses answered, so no carrier could be parked there",
             friend.node.display()

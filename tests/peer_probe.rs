@@ -39,6 +39,7 @@ use tcr::peer::noise::{self, Handshake, PeerSession};
 use tcr::peer::probe::{self, PathTable, ProbeOutcome, ProbeStop};
 use tcr::peer::serve;
 use tcr::peer::state::PathStat;
+use tcr::peer::tunnel::dial;
 use tcr_peer_wire::{Control, PeerId, StreamHeader, StreamKind};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -779,7 +780,7 @@ fn round_trip_orders_two_clean_paths_and_the_policy_orders_the_hop() {
 /// **The shipped dial order delegates to the comparator, and an unmeasured
 /// fleet dials exactly as it did before this change.**
 ///
-/// `serve::dial_order` is what `dial_peer_with_endpoint` calls, so this is the
+/// `dial::dial_order` is what `dial_peer_with_endpoint` calls, so this is the
 /// wiring assertion: with no measurements the answer is still via-last,
 /// newest-first, which is what every build before this one did.
 ///
@@ -800,7 +801,7 @@ fn the_shipped_dial_order_is_the_comparator_and_an_unmeasured_row_is_unchanged()
         ),
     );
 
-    let shipped = serve::dial_order(&row);
+    let shipped = dial::dial_order(&row);
     assert_eq!(
         shipped,
         probe::order_endpoints(&row, &PathTable::default()),

@@ -7,7 +7,7 @@ use tcr_peer_wire::{Control, Lease, LeaseRequest, PeerId, StreamHeader, StreamKi
 use super::hand::read_handed_bearers;
 use crate::peer::config::{PeerRow, PeerStore};
 use crate::peer::id::random_id;
-use crate::peer::serve;
+use crate::peer::tunnel::dial;
 
 /// Ask one lender for a lease, over a CONTROL stream.
 ///
@@ -38,7 +38,7 @@ pub async fn request_lease(
     // SERVE stream does, forwarded hop included: a lender this node can only
     // reach through a friend must be askable, or the borrow stops one frame
     // before the stream that would have worked.
-    let Some(mut stream) = serve::dial_peer_reaching(&row, store).await else {
+    let Some(mut stream) = dial::dial_peer_reaching(&row, store).await else {
         return Ok(None);
     };
     let key = crate::peer::id::NodeKey::load_or_mint(&crate::peer::config::node_key_dir(store))
@@ -116,7 +116,7 @@ pub async fn request_lease(
 ///
 /// Sorting is the whole change and the key is one bit, has this row an address
 /// of its own. A row with none is still asked, last: that is the case
-/// [`serve::has_a_way_back`] exists for, a lender reachable only because a
+/// [`dial::has_a_way_back`] exists for, a lender reachable only because a
 /// mutual friend will carry, and also a lender that parked
 /// a carrier at that friend because nothing can dial it at all
 /// ([`crate::peer::tunnel::ReverseDesk`]). Asking it first would put a
@@ -135,7 +135,7 @@ pub fn lenders_in_ask_order(store: &PeerStore) -> Vec<PeerRow> {
         // `allow.carry` on a Mac that can forward to it, and a filter that
         // read only the row would skip exactly the lender a forwarder exists
         // for.
-        .filter(|row| serve::has_a_way_back(row, store))
+        .filter(|row| dial::has_a_way_back(row, store))
         .collect();
     rows.sort_by_key(|row| u8::from(!row.has_endpoint()));
     rows

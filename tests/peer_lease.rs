@@ -48,6 +48,7 @@ use tcr::peer::config::{
 use tcr::peer::lease::{self, Ledger, RelayRefusal};
 use tcr::peer::serve;
 use tcr::peer::serve::PeerLeaseProvider;
+use tcr::peer::tunnel::dial;
 use tcr::provider::Provider;
 use tcr_peer_wire::{Lease, LeaseRefusal, LeaseRequest, LeaseUnit, PeerId, Window};
 

@@ -102,13 +102,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
+use tcr_peer_wire::{PeerId, TunnelTarget};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::peer::config::{Locator, PeerRow, PeerStore};
 use crate::peer::noise::{self, CHUNK_BYTES, NoiseStream, PeerSession};
 
+/// The dialler: every way this node opens a stream to a pinned peer, direct,
+/// punched, forwarded, through a dead drop or over the tailnet node.
+pub mod dial;
 mod reverse;
 
 use reverse::reach_target;
@@ -880,6 +883,14 @@ impl Drop for CarryReservation<'_> {
     }
 }
 
+/// The only port those origins are carried on.
+///
+/// Part of the allow-list decision rather than a free field, for the reason
+/// [`TunnelTarget::Origin`] gives: host-and-port is the whole of what a blind
+/// hop can enforce, so leaving the port open would hand a granted peer every
+/// service on the same name.
+pub const PEER_EGRESS_PORT: u16 = 443;
+
 /// The origin this gateway will carry to, or the refusal, decided before a
 /// socket to it exists.
 ///
@@ -896,7 +907,7 @@ impl Drop for CarryReservation<'_> {
 /// constant, because that list is what the caller configured this gateway
 /// with. The port is the constant: it is not a field anybody sets, it is the
 /// other half of the same decision, and
-/// [`crate::peer::egress::PEER_EGRESS_PORT`] is where it is written down once.
+/// [`PEER_EGRESS_PORT`] is where it is written down once.
 pub fn allowed_origin<'a>(
     target: &'a TunnelTarget,
     hosts: &[&str],
@@ -920,12 +931,12 @@ pub fn allowed_origin<'a>(
             peer.display()
         );
     }
-    if *port != crate::peer::egress::PEER_EGRESS_PORT {
+    if *port != PEER_EGRESS_PORT {
         bail!(
             "peer tunnel: {} asked for {host}:{port}, and this gateway carries that name on \
              port {} only; refused before anything was dialled",
             peer.display(),
-            crate::peer::egress::PEER_EGRESS_PORT
+            PEER_EGRESS_PORT
         );
     }
     Ok((host, *port))
@@ -1247,7 +1258,7 @@ pub fn authorize_forward(carry: &Carry<'_>, forward: &Forward<'_>) -> Result<For
 
 /// Dial a pinned row's own addresses, and nothing else.
 ///
-/// One function around [`crate::peer::serve::dial_peer`] so that widening
+/// One function around [`dial::dial_peer`] so that widening
 /// that return type, a `TcpStream` today, a boxed
 /// `AsyncRead + AsyncWrite` once endpoints land, is one line of merge here
 /// instead of one per use: an `impl Trait` return already accepts either.
@@ -1260,7 +1271,7 @@ pub fn authorize_forward(carry: &Carry<'_>, forward: &Forward<'_>) -> Result<For
 /// carrier off the desk, and two transports are two types no caller can be
 /// generic over.
 async fn dial_pinned_peer(row: &PeerRow) -> Option<(std::net::SocketAddr, noise::PeerStream)> {
-    crate::peer::serve::dial_peer_with_endpoint(row).await
+    dial::dial_peer_with_endpoint(row).await
 }
 
 /// Forward one TUNNEL stream to a pinned peer: the forwarder's half of reach.
@@ -1419,112 +1430,6 @@ where
         "peer forward: carried"
     );
     Ok((up, down))
-}
-
-// ---------------------------------------------------------------------------
-// The requester's half
-// ---------------------------------------------------------------------------
-
-/// How many hops a client asks a forwarder for.
-///
-/// One. The requester spends it at the forwarder and the target is the far
-/// end, so a second hop is a chain nothing in this build constructs, and a
-/// budget that is not spent is a budget an intermediate could spend on this
-/// node's behalf. [`authorize_forward`] clamps it again by the FORWARDER's own
-/// `maxHops`, so this number can only ever ask for less than the operator
-/// there allows.
-pub const CLIENT_FORWARD_HOPS: u8 = 1;
-
-/// Ask `forwarder` to carry a stream to `target`, and return that stream.
-///
-/// # This is the half that did not exist, and what its absence meant
-///
-/// Everything else on the forwarded path was built and gated
-/// ([`authorize_forward`], [`handle_forward_on`]) and nothing could reach it:
-/// no code anywhere opened a `StreamKind::Tunnel` whose target was a peer, so
-/// a row whose only endpoint was a [`crate::peer::config::Locator::Via`] was
-/// dialled by nobody and `serve.rs`'s dial loop logged it and moved on. This
-/// function is that opening, and [`crate::peer::serve::dial_peer_reaching`] is
-/// the caller that decides when to use it.
-///
-/// # What comes back, and why the caller cannot tell it apart
-///
-/// A [`crate::peer::noise::PeerStream`], exactly what a direct dial returns.
-/// The forwarder splices the onward socket RAW ([`handle_forward_on`]), so
-/// the bytes this stream carries are the target's own socket, and the caller
-/// runs its ordinary handshake over it against the TARGET's pinned key. That
-/// is the whole of the blindness argument from this side: this node holds a
-/// session with the forwarder that carries a second session the forwarder has
-/// no key for.
-///
-/// # Ordering, which is not an accident
-///
-/// The header is written before this returns, so the forwarder is already
-/// waiting on the requester's first bytes ([`handle_forward_on`]'s deadline)
-/// when the caller starts its handshake with the target. A caller that wrote
-/// nothing would be closed by that deadline rather than pinning a task on the
-/// forwarder, which is why nothing here waits for an acknowledgement: a
-/// forward has none to give: the next thing the forwarder does is dial, and
-/// its refusals all happen before any byte of the nested session moves.
-///
-/// The dial to the forwarder is [`crate::peer::serve::dial_peer_within`],
-/// which follows DIRECT endpoints only. That is what bounds this: a forwarder
-/// reached through a forwarder would be a chain this node builds one hop at a
-/// time with no budget of its own, and the hop count is the forwarder's bound,
-/// never the requester's.
-pub async fn open_forward_to(
-    forwarder: &PeerRow,
-    node_secret: &[u8; crate::peer::id::KEY_BYTES],
-    target: &PeerId,
-    via: &[PeerId],
-    borrow_timeout_ms: u64,
-) -> Result<noise::PeerStream> {
-    if forwarder.node == *target {
-        bail!(
-            "peer forward: {} cannot carry a stream to itself; a direct dial is what that \
-             asks for",
-            target.display()
-        );
-    }
-    let (_reached, mut stream) = crate::peer::serve::dial_peer_within(forwarder, borrow_timeout_ms)
-        .await
-        .ok_or_else(|| {
-            anyhow!(
-                "peer forward: none of {}'s own addresses answered, so it cannot carry \
-                     anything to {}",
-                forwarder.label,
-                target.display()
-            )
-        })?;
-    let mut session = noise::dial_handshake(
-        &mut stream,
-        node_secret,
-        noise::Handshake::Return,
-        Some(&forwarder.node.0),
-        None,
-    )
-    .await
-    .context("peer forward: the handshake with the forwarder failed")?;
-
-    let header = StreamHeader {
-        kind: StreamKind::Tunnel,
-        target: Some(TunnelTarget::Peer { node: *target }),
-        via: via.to_vec(),
-        hops_remaining: CLIENT_FORWARD_HOPS,
-        request_id: crate::peer::id::random_id()?,
-    };
-    let bytes = serde_json::to_vec(&header)
-        .context("peer forward: the forwarding header did not serialize")?;
-    noise::send_encrypted(&mut stream, &mut session.transport, &bytes)
-        .await
-        .context("peer forward: the forwarder did not take the stream header")?;
-
-    tracing::debug!(
-        forwarder = %forwarder.node.display(),
-        target = %target.display(),
-        "peer forward: asked a pinned Mac to carry a stream to another pinned Mac"
-    );
-    Ok(Box::new(NoiseStream::start(stream, session)))
 }
 
 #[cfg(test)]

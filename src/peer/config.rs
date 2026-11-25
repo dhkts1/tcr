@@ -203,7 +203,7 @@ pub struct PeerFile {
     pub via: ViaSetting,
     /// How long a borrow through [`crate::peer::serve::open_serve`] may take
     /// before the client is released, the operator's setting for
-    /// [`crate::peer::serve::BORROW_TIMEOUT`], which is now only this field's
+    /// [`crate::peer::tunnel::dial::BORROW_TIMEOUT`], which is now only this field's
     /// default. Hot: `open_serve` reads it per call through the
     /// [`PeerStore`] it is already handed, so lowering it takes effect
     /// without a restart, the same rule every other policy field here
@@ -301,7 +301,7 @@ const fn default_max_hops() -> u8 {
     1
 }
 
-/// Mirrors [`crate::peer::serve::BORROW_TIMEOUT`]: a fresh install behaves
+/// Mirrors [`crate::peer::tunnel::dial::BORROW_TIMEOUT`]: a fresh install behaves
 /// exactly as it did before this field existed.
 const fn default_borrow_timeout_ms() -> u64 {
     10_000

@@ -330,7 +330,7 @@ async fn a_dead_recorded_port_falls_through_to_the_pairs_rendezvous_port() {
 
     let dead = a_closed_loopback_port().await;
     let row = row_at(node, dead);
-    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::tunnel::dial::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
 
@@ -371,7 +371,7 @@ async fn one_slot_of_skew_still_meets() {
 
     let dead = a_closed_loopback_port().await;
     let row = row_at(node, dead);
-    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::tunnel::dial::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
 
@@ -410,7 +410,7 @@ async fn with_no_secret_for_the_pair_nothing_but_the_recorded_endpoint_is_tried(
 
     let dead = a_closed_loopback_port().await;
     let row = row_at(node, dead);
-    let reached = tcr::peer::serve::dial_peer_within(&row, 900)
+    let reached = tcr::peer::tunnel::dial::dial_peer_within(&row, 900)
         .await
         .map(|(addr, _stream)| addr);
 
@@ -500,7 +500,8 @@ async fn two_blackholing_endpoints_leave_a_later_step_time_to_run() {
 
     let deadline_ms: u64 = 10_000;
     let start = Instant::now();
-    let reached = tcr::peer::serve::dial_peer_reaching_within(&dial_row, &store, deadline_ms).await;
+    let reached =
+        tcr::peer::tunnel::dial::dial_peer_reaching_within(&dial_row, &store, deadline_ms).await;
     let elapsed = start.elapsed();
 
     assert!(
@@ -560,7 +561,7 @@ async fn a_dial_that_fails_one_endpoint_cools_it_and_the_next_order_drops_it() {
         peer_config::EndpointSource::Paired,
     ));
 
-    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::tunnel::dial::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
     assert_eq!(
@@ -574,7 +575,7 @@ async fn a_dial_that_fails_one_endpoint_cools_it_and_the_next_order_drops_it() {
         .expect("the accept task")
         .expect("the listener accepted the dial");
 
-    let order = tcr::peer::serve::dial_order(&row);
+    let order = tcr::peer::tunnel::dial::dial_order(&row);
     let remaining: Vec<SocketAddr> = order
         .iter()
         .filter_map(peer_config::Endpoint::direct_addr)
@@ -627,7 +628,7 @@ async fn a_dial_that_races_two_live_endpoints_does_not_cool_the_one_it_did_not_u
         peer_config::EndpointSource::Paired,
     ));
 
-    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::tunnel::dial::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
     assert!(
@@ -635,7 +636,7 @@ async fn a_dial_that_races_two_live_endpoints_does_not_cool_the_one_it_did_not_u
         "one of the two live listeners must answer the race: {reached:?}"
     );
 
-    let order = tcr::peer::serve::dial_order(&row);
+    let order = tcr::peer::tunnel::dial::dial_order(&row);
     let remaining: Vec<SocketAddr> = order
         .iter()
         .filter_map(peer_config::Endpoint::direct_addr)
@@ -810,7 +811,7 @@ async fn a_restart_reaches_a_peer_on_the_derived_port_from_the_peers_file() {
 
     let dead = a_closed_loopback_port().await;
     let row = row_at(node, dead);
-    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::tunnel::dial::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
 

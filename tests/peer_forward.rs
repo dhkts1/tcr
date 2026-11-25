@@ -108,7 +108,7 @@ fn store(tag: &str, max_hops: u8, rows: Vec<PeerRow>) -> PeerStore {
 /// The header the cases in this section write by hand, with no target on it.
 ///
 /// A header with `target: None` is not what a real requester sends any more
-/// ([`tunnel::open_forward_to`] names the Mac, and the client cases at the end
+/// ([`tunnel::dial::open_forward_to`] names the Mac, and the client cases at the end
 /// of this file drive it); it is what these cases want, because each of them
 /// varies `hops_remaining` or `via` against a target [`forwarder_on`] supplies,
 /// so the field under test is the only one that moves.
@@ -1260,13 +1260,13 @@ async fn a_via_endpoint_is_dialled_through_the_forwarder_it_names() {
         ],
     );
     assert!(
-        tcr::peer::serve::forwarders_for(&b.id, &a_store).is_empty(),
+        tunnel::dial::forwarders_for(&b.id, &a_store).is_empty(),
         "no Mac here holds `allow.carry`, so the carry-grantee fallback has nothing to \
          offer and the `Via` endpoint is the only way this dial can succeed"
     );
     let b_row = a_store.row(&b.id).expect("A pinned B");
 
-    let stream = tcr::peer::serve::dial_peer_reaching(&b_row, &a_store)
+    let stream = tunnel::dial::dial_peer_reaching(&b_row, &a_store)
         .await
         .expect("the `Via` endpoint is followed through C");
     speak_to_target(stream, key.secret_bytes(), &b.id).await;
@@ -1312,7 +1312,7 @@ async fn a_via_endpoint_is_dialled_through_the_forwarder_it_names() {
 #[tokio::test]
 async fn the_same_via_row_is_unreachable_to_a_dial_with_no_peers_file() {
     let (b, c) = (node(), node());
-    let dialled = tcr::peer::serve::dial_peer(&via_row(&b.id, "target", c.id)).await;
+    let dialled = tunnel::dial::dial_peer(&via_row(&b.id, "target", c.id)).await;
     assert!(
         dialled.is_none(),
         "`dial_peer` holds no peers file, so it cannot read the forwarder's row or this \
@@ -1358,12 +1358,12 @@ async fn a_row_with_no_endpoints_is_reached_through_a_carry_grantee() {
         "the whole point of this case is a row with nowhere to dial"
     );
     assert!(
-        tcr::peer::serve::has_a_way_back(&b_row, &a_store),
+        tunnel::dial::has_a_way_back(&b_row, &a_store),
         "a row with no endpoint and a reachable carry grantee still has a way back, and a \
          borrow that filtered on `has_endpoint` would skip exactly this lender"
     );
 
-    let stream = tcr::peer::serve::dial_peer_reaching(&b_row, &a_store)
+    let stream = tunnel::dial::dial_peer_reaching(&b_row, &a_store)
         .await
         .expect("the carry grantee is asked once the row itself answers nothing");
     speak_to_target(stream, key.secret_bytes(), &b.id).await;
@@ -1409,7 +1409,7 @@ fn only_a_reachable_carry_grantee_that_is_not_the_target_is_asked() {
         ],
     );
     assert_eq!(
-        tcr::peer::serve::forwarders_for(&b.id, &a_store),
+        tunnel::dial::forwarders_for(&b.id, &a_store),
         vec![c.id],
         "a carrier needs `allow.carry` (not `relay`, which is the other direction), a \
          direct address of its own, and must not be the Mac being reached"
@@ -1422,7 +1422,7 @@ fn only_a_reachable_carry_grantee_that_is_not_the_target_is_asked() {
         vec![row(&b.id, "target", Vec::new(), false)],
     );
     assert!(
-        !tcr::peer::serve::has_a_way_back(&bare.row(&b.id).expect("pinned"), &bare),
+        !tunnel::dial::has_a_way_back(&bare.row(&b.id).expect("pinned"), &bare),
         "no endpoint and no carry grantee is no way back"
     );
 }

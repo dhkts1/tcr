@@ -19,7 +19,7 @@ use super::*;
 /// timestamp.
 ///
 /// Watched red: with `order.sort_by_key(Endpoint::is_via)` deleted from
-/// `serve::dial_order`, this fails with "a forwarded hop is tried last", the
+/// `dial::dial_order`, this fails with "a forwarded hop is tried last", the
 /// `Via` endpoint leads, because it is the newest thing on the row.
 #[test]
 fn a_row_is_dialled_newest_first_and_through_a_peer_last() {
@@ -42,7 +42,7 @@ fn a_row_is_dialled_newest_first_and_through_a_peer_last() {
     // The newest thing on the row, and still the last thing to try.
     row.observe_endpoint(Endpoint::via(forwarder, 3_000, EndpointSource::Hello));
 
-    let order = serve::dial_order(&row);
+    let order = dial::dial_order(&row);
     let addrs: Vec<Option<std::net::SocketAddr>> =
         order.iter().map(Endpoint::direct_addr).collect();
     assert_eq!(

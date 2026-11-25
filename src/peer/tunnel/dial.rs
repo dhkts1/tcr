@@ -3,17 +3,45 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result, anyhow, bail};
 use futures::stream::{FuturesUnordered, StreamExt as _};
-use tcr_peer_wire::{Control, PeerId, StreamHeader, StreamKind};
+use tcr_peer_wire::{Control, PeerId, StreamHeader, StreamKind, TunnelTarget};
 
 use crate::peer::config::{Endpoint, Locator, PeerRow, PeerStore};
 use crate::peer::id::NodeKey;
-use crate::peer::noise::{self, Handshake, PeerStream, recv_control, send_control};
+use crate::peer::noise::{self, Handshake, NoiseStream, PeerStream, recv_control, send_control};
 
-use super::BORROW_TIMEOUT;
 use crate::peer::config::node_key_dir;
 use crate::peer::state::peer_state_path;
+
+/// How long the whole borrow may take before the client is released: the
+/// connect, the handshake, both frames out, the lender's reply and its body.
+///
+/// **One deadline over the whole exchange, not one per hop.** The review's
+/// MEDIUM was that this path had none anywhere, a bare `TcpStream::connect`,
+/// an unbounded `dial_handshake` and an unbounded wait for the reply, on the
+/// answer path of a live client's request, while the listener's own half
+/// ([`crate::peer::listener::HANDSHAKE_TIMEOUT`]) and the blind-egress carry
+/// ([`crate::peer::config::CARRY_SETUP_TIMEOUT`]) each carry one. Per-hop
+/// deadlines would sum to a bound no caller can state; the client is waiting on
+/// the total, so the total is what is bounded.
+///
+/// Ten seconds, and deliberately LONGER than the carry's five: a carry runs
+/// after the direct path has already failed, while a borrow is this request's
+/// first and only attempt at an answer, and a borrow that gave up before a
+/// sleeping laptop's radio woke would spend a lease nobody could use.
+///
+/// # The operator's setting, and this constant's new job
+///
+/// [`crate::peer::config::PeerFile::borrow_timeout_ms`] is now the value
+/// [`open_serve`] reads per call, off the [`PeerStore`](crate::peer::config::PeerStore) it is already handed,
+/// so a lowered timeout takes effect without a restart, exactly like `via`.
+/// This constant is what a fresh install starts at:
+/// `PeerFile::borrow_timeout_ms`'s own serde default mirrors it, so a peers
+/// file with no opinion behaves exactly as it did before that field existed.
+///
+/// [`open_serve`]: crate::peer::serve::open_serve
+pub const BORROW_TIMEOUT: Duration = Duration::from_millis(10_000);
 
 /// The order the endpoints on a row are tried in.
 ///
@@ -666,7 +694,7 @@ async fn forward_through(
     // This node's own id is stamped into `via` so the forwarder refuses a
     // route that comes back here, which is `authorize_forward`'s cycle check
     // reading the one fact only the requester can supply.
-    match crate::peer::tunnel::open_forward_to(
+    match open_forward_to(
         &row,
         key.secret_bytes(),
         target,
@@ -701,7 +729,7 @@ async fn forward_through(
 ///
 /// Three exclusions, each one a thing that cannot work rather than a policy:
 /// the target itself (a Mac cannot carry a stream to itself, and
-/// [`crate::peer::tunnel::open_forward_to`] refuses it again), a candidate with
+/// [`open_forward_to`] refuses it again), a candidate with
 /// no DIRECT endpoint (reaching a forwarder through a forwarder is a chain
 /// nothing here builds), and nothing else.
 ///
@@ -1211,5 +1239,264 @@ async fn exchange_addresses(row: &PeerRow, store: &PeerStore, borrow_timeout_ms:
              node still has nowhere to aim"
         );
         false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The requester's half
+// ---------------------------------------------------------------------------
+
+/// How many hops a client asks a forwarder for.
+///
+/// One. The requester spends it at the forwarder and the target is the far
+/// end, so a second hop is a chain nothing in this build constructs, and a
+/// budget that is not spent is a budget an intermediate could spend on this
+/// node's behalf. [`authorize_forward`] clamps it again by the FORWARDER's own
+/// `maxHops`, so this number can only ever ask for less than the operator
+/// there allows.
+///
+/// [`authorize_forward`]: super::authorize_forward
+pub const CLIENT_FORWARD_HOPS: u8 = 1;
+
+/// Ask `forwarder` to carry a stream to `target`, and return that stream.
+///
+/// # This is the half that did not exist, and what its absence meant
+///
+/// Everything else on the forwarded path was built and gated
+/// ([`authorize_forward`], [`handle_forward_on`]) and nothing could reach it:
+/// no code anywhere opened a `StreamKind::Tunnel` whose target was a peer, so
+/// a row whose only endpoint was a [`crate::peer::config::Locator::Via`] was
+/// dialled by nobody and `serve.rs`'s dial loop logged it and moved on. This
+/// function is that opening, and [`dial_peer_reaching`] is
+/// the caller that decides when to use it.
+///
+/// # What comes back, and why the caller cannot tell it apart
+///
+/// A [`crate::peer::noise::PeerStream`], exactly what a direct dial returns.
+/// The forwarder splices the onward socket RAW ([`handle_forward_on`]), so
+/// the bytes this stream carries are the target's own socket, and the caller
+/// runs its ordinary handshake over it against the TARGET's pinned key. That
+/// is the whole of the blindness argument from this side: this node holds a
+/// session with the forwarder that carries a second session the forwarder has
+/// no key for.
+///
+/// # Ordering, which is not an accident
+///
+/// The header is written before this returns, so the forwarder is already
+/// waiting on the requester's first bytes ([`handle_forward_on`]'s deadline)
+/// when the caller starts its handshake with the target. A caller that wrote
+/// nothing would be closed by that deadline rather than pinning a task on the
+/// forwarder, which is why nothing here waits for an acknowledgement: a
+/// forward has none to give: the next thing the forwarder does is dial, and
+/// its refusals all happen before any byte of the nested session moves.
+///
+/// The dial to the forwarder is [`dial_peer_within`],
+/// which follows DIRECT endpoints only. That is what bounds this: a forwarder
+/// reached through a forwarder would be a chain this node builds one hop at a
+/// time with no budget of its own, and the hop count is the forwarder's bound,
+/// never the requester's.
+///
+/// [`authorize_forward`]: super::authorize_forward
+/// [`handle_forward_on`]: super::handle_forward_on
+pub async fn open_forward_to(
+    forwarder: &PeerRow,
+    node_secret: &[u8; crate::peer::id::KEY_BYTES],
+    target: &PeerId,
+    via: &[PeerId],
+    borrow_timeout_ms: u64,
+) -> Result<PeerStream> {
+    if forwarder.node == *target {
+        bail!(
+            "peer forward: {} cannot carry a stream to itself; a direct dial is what that \
+             asks for",
+            target.display()
+        );
+    }
+    let (_reached, mut stream) = dial_peer_within(forwarder, borrow_timeout_ms)
+        .await
+        .ok_or_else(|| {
+            anyhow!(
+                "peer forward: none of {}'s own addresses answered, so it cannot carry \
+                     anything to {}",
+                forwarder.label,
+                target.display()
+            )
+        })?;
+    let mut session = noise::dial_handshake(
+        &mut stream,
+        node_secret,
+        Handshake::Return,
+        Some(&forwarder.node.0),
+        None,
+    )
+    .await
+    .context("peer forward: the handshake with the forwarder failed")?;
+
+    let header = StreamHeader {
+        kind: StreamKind::Tunnel,
+        target: Some(TunnelTarget::Peer { node: *target }),
+        via: via.to_vec(),
+        hops_remaining: CLIENT_FORWARD_HOPS,
+        request_id: crate::peer::id::random_id()?,
+    };
+    let bytes = serde_json::to_vec(&header)
+        .context("peer forward: the forwarding header did not serialize")?;
+    noise::send_encrypted(&mut stream, &mut session.transport, &bytes)
+        .await
+        .context("peer forward: the forwarder did not take the stream header")?;
+
+    tracing::debug!(
+        forwarder = %forwarder.node.display(),
+        target = %target.display(),
+        "peer forward: asked a pinned Mac to carry a stream to another pinned Mac"
+    );
+    Ok(Box::new(NoiseStream::start(stream, session)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    use tcr_peer_wire::PeerId;
+
+    use super::*;
+    use crate::peer::config::{Endpoint, Locator, PeerRow};
+
+    /// **The stagger, through the private race itself, with no sockets at
+    /// all.**
+    ///
+    /// Two scripted candidates: the first takes 600 ms to answer, the second
+    /// only 5 ms. The second is started [`CONNECTION_ATTEMPT_DELAY`] after
+    /// the first, so at 255 ms it is already ahead of the first candidate's
+    /// own 600 ms clock, and must win. A stagger short enough to let the
+    /// slow candidate finish before the fast one even starts (anything at or
+    /// above 595 ms) would prove nothing but the order of two futures; 600 ms
+    /// leaves headroom above the real 250 ms delay while still failing loudly
+    /// if the delay were ever raised past it.
+    ///
+    /// Watched red: raise [`CONNECTION_ATTEMPT_DELAY`] to 10 seconds. The
+    /// second candidate then starts long after the first's own 600 ms clock
+    /// has already answered, so the first (slow) candidate wins instead:
+    ///
+    /// ```text
+    /// assertion `left == right` failed: the second candidate started
+    /// CONNECTION_ATTEMPT_DELAY after the first and still answers first: it
+    /// must win
+    ///   left: Some(600ms)
+    ///  right: Some(5ms)
+    /// ```
+    #[tokio::test]
+    async fn the_race_starts_its_next_candidate_a_stagger_after_the_previous_one() {
+        let slow = Duration::from_millis(600);
+        let fast = Duration::from_millis(5);
+        let candidates = vec![slow, fast];
+
+        let started = Instant::now();
+        let outcome = race_candidates(
+            candidates,
+            CONNECTION_ATTEMPT_DELAY,
+            |delay: Duration| async move {
+                tokio::time::sleep(delay).await;
+                Some(delay)
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome.won.map(|(_, value)| value),
+            Some(fast),
+            "the second candidate started CONNECTION_ATTEMPT_DELAY after the first and still \
+             answers first: it must win"
+        );
+        assert!(
+            outcome.failed.is_empty(),
+            "the slow candidate was still running when the fast one won; it was cancelled, \
+             not refused, so it must not be in the failed list: {:?}",
+            outcome.failed
+        );
+        assert!(
+            elapsed < slow,
+            "the race must not wait for the cancelled candidate's own clock: took {elapsed:?}"
+        );
+    }
+
+    /// **`clear_cooldowns_for_fetch` clears exactly the locators it is
+    /// handed, and no other.**
+    ///
+    /// Two locators on one peer, both cooling. Only one is passed as
+    /// `written`. Read back through [`crate::peer::probe::dial_order`], the
+    /// same public function the dead-drop retry calls: if the cleared
+    /// locator alone comes back, the clear was scoped; if the untouched
+    /// locator ALSO comes back, either nothing was cleared (so
+    /// `dial_order`'s own "every path is cooling, try them all anyway"
+    /// fallback fired) or the clear was a blanket one.
+    ///
+    /// Watched red: comment out the `clear_cooldown` call inside
+    /// `clear_cooldowns_for_fetch`. The untouched locator's cooldown then
+    /// never lifts, both locators stay cooling, `dial_order`'s fallback
+    /// returns BOTH, and this test's `assert!(!order.iter().any(...))` for
+    /// the untouched locator fails: `left: true` where the assertion
+    /// expects it absent.
+    #[test]
+    fn clear_cooldowns_for_fetch_only_clears_the_locators_it_is_given() {
+        let peer = PeerId([0x60; 32]);
+        let cleared_addr: SocketAddr = "127.0.0.1:1".parse().expect("a socket address");
+        let untouched_addr: SocketAddr = "127.0.0.1:2".parse().expect("a socket address");
+        let cleared_locator = Locator::Direct { addr: cleared_addr };
+        let untouched_locator = Locator::Direct {
+            addr: untouched_addr,
+        };
+
+        let until_ms = crate::now_ms() + 60_000;
+        crate::peer::probe::with_table(|table| {
+            table.cool_down(peer, cleared_locator, until_ms);
+            table.cool_down(peer, untouched_locator, until_ms);
+        })
+        .expect("the process-local path table is not poisoned");
+
+        let written = vec![Endpoint::direct(
+            cleared_addr,
+            crate::now_ms(),
+            crate::peer::config::EndpointSource::Drop,
+        )];
+        clear_cooldowns_for_fetch(peer, &written);
+
+        let mut row = PeerRow {
+            node: peer,
+            label: "clear-cooldowns-for-fetch-test".to_string(),
+            endpoints: Vec::new(),
+            added_at: 0,
+            allow: crate::peer::config::Allow::default(),
+            lend: Vec::new(),
+            rendezvous_secret: None,
+            sees_us_at: None,
+        };
+        row.observe_endpoint(Endpoint::direct(
+            cleared_addr,
+            1_000,
+            crate::peer::config::EndpointSource::Drop,
+        ));
+        row.observe_endpoint(Endpoint::direct(
+            untouched_addr,
+            1_000,
+            crate::peer::config::EndpointSource::Drop,
+        ));
+
+        let order = dial_order(&row);
+        assert!(
+            order
+                .iter()
+                .any(|endpoint| endpoint.locator == cleared_locator),
+            "the locator the fetch wrote must be dialable again: {order:?}"
+        );
+        assert!(
+            !order
+                .iter()
+                .any(|endpoint| endpoint.locator == untouched_locator),
+            "a locator the fetch did NOT write must stay excluded, not swept in by a blanket \
+             clear or by dial_order's own cooling-fallback: {order:?}"
+        );
     }
 }

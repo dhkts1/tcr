@@ -47,7 +47,7 @@ use tcr::peer::config as peer_config;
 use tcr::peer::config::drop::{
     self, DeadDropStore, DropKeys, DropName, DropRecord, HttpsTemplateStore, seal,
 };
-use tcr::peer::serve;
+use tcr::peer::tunnel::dial;
 use tcr_peer_wire::PeerId;
 
 const fn peer_id(fill: u8) -> PeerId {
@@ -251,12 +251,12 @@ async fn a_freshly_fetched_address_is_dialled_in_the_same_call_it_was_learned() 
     let store = peer_config::PeerStore::open(&path).expect("the peer store opens");
     let dial_row = store.row(&friend).expect("the row reads back");
 
-    let reached = serve::dial_peer_reaching_within(&dial_row, &store, 3_000).await;
+    let reached = dial::dial_peer_reaching_within(&dial_row, &store, 3_000).await;
     let outcome = reached.as_ref().map(|(reached, _stream)| *reached);
 
     assert_eq!(
         outcome,
-        Some(serve::Reached::Direct(fresh_addr)),
+        Some(dial::Reached::Direct(fresh_addr)),
         "the dial must land on the address the drop just taught, in the same call it learned \
          it, after the row's own dead endpoint failed"
     );

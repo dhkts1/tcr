@@ -12,11 +12,40 @@ use crate::peer::config::PeerStore;
 use crate::peer::id::NodeKey;
 use crate::peer::noise::{self, Handshake, recv_json, send_json};
 
-use super::dial::dial_peer_reaching;
 use super::frame::{SERVE_FLOW, ServeAck, ServeReply, recv_body, send_body, serve_request_from};
 use super::policy::serve_is_allowed_for_path;
 use crate::peer::config::node_key_dir;
+use crate::peer::tunnel::dial::dial_peer_reaching;
 
+/// Open one SERVE to a lender and return its answer.
+///
+/// Refuses before opening anything when [`serve_is_allowed_for_path`] says no,
+/// and scrubs before writing the first frame. The lease is the borrower's
+/// cached copy; the lender's ledger is what actually decides.
+///
+/// `None` is "not me" in every case a lease could not be spent, no address that
+/// answers, `disclose` not granted here, a refusal frame, because the caller's
+/// next rung is the honest 429 this proxy already has and that is a better
+/// answer than anything invented here. A protocol failure mid-stream IS an
+/// error: it is not the same fact as "this lender said no".
+///
+/// The node key comes from the peers file's own directory, the way
+/// `tcr peer id` resolves it (`src/main.rs:868`), so a test that points
+/// `--peers` at a temp dir points this at the same one.
+///
+/// # `headers` is the borrower's own, and it is scrubbed here
+///
+/// [`Ask`] carries none today, and `crate::fallback`'s module doc says why: the
+/// only code that strips a client credential sits 215 lines downstream of the
+/// seam an [`Ask`] is built at. So the production caller hands in an empty map,
+/// and this parameter exists for the two cases an empty map cannot serve, the
+/// day something at the seam does hold headers, and a test that puts a
+/// credential in scope so [`scrub_client_credentials`]'s removal is a
+/// MEASUREMENT rather than an absence over an empty map. It was
+/// `&HeaderMap::new()` inline, which made the scrub on this path untestable and
+/// therefore unwatched.
+///
+/// [`scrub_client_credentials`]: super::scrub_client_credentials
 pub async fn open_serve(
     lender: &PeerId,
     lease: &Lease,

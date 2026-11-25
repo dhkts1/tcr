@@ -99,10 +99,7 @@
 //! own path. `tests/peer_lease.rs` measures it against a tightened per-org
 //! bucket rather than asserting it in prose.
 
-use std::time::Duration;
-
 mod borrow;
-mod dial;
 mod frame;
 mod hello;
 mod lender;
@@ -110,10 +107,6 @@ mod policy;
 mod provider;
 
 pub use borrow::{Borrowed, open_serve, open_serve_within};
-pub use dial::{
-    Reached, dial_order, dial_peer, dial_peer_reaching, dial_peer_reaching_within,
-    dial_peer_with_endpoint, dial_peer_within, forwarders_for, has_a_way_back,
-};
 pub use frame::{
     MAX_BODY_BYTES, MAX_RELAYED_BODY_BYTES, SERVE_FLOW, ServeAck, ServeReply, ServeRequest,
     serve_request_from,
@@ -128,72 +121,13 @@ pub use policy::{
 };
 pub use provider::{PeerLeaseProvider, serve_on_handed_bearer};
 
-/// Open one SERVE to a lender and return its answer.
-///
-/// Refuses before opening anything when [`serve_is_allowed_for_path`] says no,
-/// and scrubs before writing the first frame. The lease is the borrower's
-/// cached copy; the lender's ledger is what actually decides.
-///
-/// `None` is "not me" in every case a lease could not be spent, no address that
-/// answers, `disclose` not granted here, a refusal frame, because the caller's
-/// next rung is the honest 429 this proxy already has and that is a better
-/// answer than anything invented here. A protocol failure mid-stream IS an
-/// error: it is not the same fact as "this lender said no".
-///
-/// The node key comes from the peers file's own directory, the way
-/// `tcr peer id` resolves it (`src/main.rs:868`), so a test that points
-/// `--peers` at a temp dir points this at the same one.
-///
-/// # `headers` is the borrower's own, and it is scrubbed here
-///
-/// [`Ask`] carries none today, and `crate::fallback`'s module doc says why: the
-/// only code that strips a client credential sits 215 lines downstream of the
-/// seam an [`Ask`] is built at. So the production caller hands in an empty map,
-/// and this parameter exists for the two cases an empty map cannot serve, the
-/// day something at the seam does hold headers, and a test that puts a
-/// credential in scope so [`scrub_client_credentials`]'s removal is a
-/// MEASUREMENT rather than an absence over an empty map. It was
-/// `&HeaderMap::new()` inline, which made the scrub on this path untestable and
-/// therefore unwatched.
-/// How long the whole borrow may take before the client is released: the
-/// connect, the handshake, both frames out, the lender's reply and its body.
-///
-/// **One deadline over the whole exchange, not one per hop.** The review's
-/// MEDIUM was that this path had none anywhere, a bare `TcpStream::connect`,
-/// an unbounded `dial_handshake` and an unbounded wait for the reply, on the
-/// answer path of a live client's request, while the listener's own half
-/// ([`crate::peer::listener::HANDSHAKE_TIMEOUT`]) and the blind-egress carry
-/// ([`crate::peer::config::CARRY_SETUP_TIMEOUT`]) each carry one. Per-hop
-/// deadlines would sum to a bound no caller can state; the client is waiting on
-/// the total, so the total is what is bounded.
-///
-/// Ten seconds, and deliberately LONGER than the carry's five: a carry runs
-/// after the direct path has already failed, while a borrow is this request's
-/// first and only attempt at an answer, and a borrow that gave up before a
-/// sleeping laptop's radio woke would spend a lease nobody could use.
-///
-/// # The operator's setting, and this constant's new job
-///
-/// [`crate::peer::config::PeerFile::borrow_timeout_ms`] is now the value
-/// [`open_serve`] reads per call, off the [`PeerStore`](crate::peer::config::PeerStore) it is already handed,
-/// so a lowered timeout takes effect without a restart, exactly like `via`.
-/// This constant is what a fresh install starts at:
-/// `PeerFile::borrow_timeout_ms`'s own serde default mirrors it, so a peers
-/// file with no opinion behaves exactly as it did before that field existed.
-pub const BORROW_TIMEOUT: Duration = Duration::from_millis(10_000);
-
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
-    use std::time::Instant;
-
     use axum::http::{HeaderMap, HeaderValue};
     use tcr_peer_wire::{PROTO_VERSION, PeerId, Window};
 
-    use super::dial::{CONNECTION_ATTEMPT_DELAY, clear_cooldowns_for_fetch, race_candidates};
     use super::lender::{RelaySlot, serve_on_own_account};
     use super::*;
-    use crate::peer::config::{Endpoint, Locator, PeerRow};
     use crate::peer::lease::{Ledger, ScopeRestriction};
     use tcr_peer_wire::{Lease, LeaseUnit};
 
@@ -431,143 +365,6 @@ mod tests {
             1,
             "the second relay is still in flight: a guard must not give back a slot its \
              caller already returned"
-        );
-    }
-
-    /// **The stagger, through the private race itself, with no sockets at
-    /// all.**
-    ///
-    /// Two scripted candidates: the first takes 600 ms to answer, the second
-    /// only 5 ms. The second is started [`CONNECTION_ATTEMPT_DELAY`] after
-    /// the first, so at 255 ms it is already ahead of the first candidate's
-    /// own 600 ms clock, and must win. A stagger short enough to let the
-    /// slow candidate finish before the fast one even starts (anything at or
-    /// above 595 ms) would prove nothing but the order of two futures; 600 ms
-    /// leaves headroom above the real 250 ms delay while still failing loudly
-    /// if the delay were ever raised past it.
-    ///
-    /// Watched red: raise [`CONNECTION_ATTEMPT_DELAY`] to 10 seconds. The
-    /// second candidate then starts long after the first's own 600 ms clock
-    /// has already answered, so the first (slow) candidate wins instead:
-    ///
-    /// ```text
-    /// assertion `left == right` failed: the second candidate started
-    /// CONNECTION_ATTEMPT_DELAY after the first and still answers first: it
-    /// must win
-    ///   left: Some(600ms)
-    ///  right: Some(5ms)
-    /// ```
-    #[tokio::test]
-    async fn the_race_starts_its_next_candidate_a_stagger_after_the_previous_one() {
-        let slow = Duration::from_millis(600);
-        let fast = Duration::from_millis(5);
-        let candidates = vec![slow, fast];
-
-        let started = Instant::now();
-        let outcome = race_candidates(
-            candidates,
-            CONNECTION_ATTEMPT_DELAY,
-            |delay: Duration| async move {
-                tokio::time::sleep(delay).await;
-                Some(delay)
-            },
-        )
-        .await;
-        let elapsed = started.elapsed();
-
-        assert_eq!(
-            outcome.won.map(|(_, value)| value),
-            Some(fast),
-            "the second candidate started CONNECTION_ATTEMPT_DELAY after the first and still \
-             answers first: it must win"
-        );
-        assert!(
-            outcome.failed.is_empty(),
-            "the slow candidate was still running when the fast one won; it was cancelled, \
-             not refused, so it must not be in the failed list: {:?}",
-            outcome.failed
-        );
-        assert!(
-            elapsed < slow,
-            "the race must not wait for the cancelled candidate's own clock: took {elapsed:?}"
-        );
-    }
-
-    /// **`clear_cooldowns_for_fetch` clears exactly the locators it is
-    /// handed, and no other.**
-    ///
-    /// Two locators on one peer, both cooling. Only one is passed as
-    /// `written`. Read back through [`crate::peer::probe::dial_order`], the
-    /// same public function the dead-drop retry calls: if the cleared
-    /// locator alone comes back, the clear was scoped; if the untouched
-    /// locator ALSO comes back, either nothing was cleared (so
-    /// `dial_order`'s own "every path is cooling, try them all anyway"
-    /// fallback fired) or the clear was a blanket one.
-    ///
-    /// Watched red: comment out the `clear_cooldown` call inside
-    /// `clear_cooldowns_for_fetch`. The untouched locator's cooldown then
-    /// never lifts, both locators stay cooling, `dial_order`'s fallback
-    /// returns BOTH, and this test's `assert!(!order.iter().any(...))` for
-    /// the untouched locator fails: `left: true` where the assertion
-    /// expects it absent.
-    #[test]
-    fn clear_cooldowns_for_fetch_only_clears_the_locators_it_is_given() {
-        let peer = PeerId([0x60; 32]);
-        let cleared_addr: SocketAddr = "127.0.0.1:1".parse().expect("a socket address");
-        let untouched_addr: SocketAddr = "127.0.0.1:2".parse().expect("a socket address");
-        let cleared_locator = Locator::Direct { addr: cleared_addr };
-        let untouched_locator = Locator::Direct {
-            addr: untouched_addr,
-        };
-
-        let until_ms = crate::now_ms() + 60_000;
-        crate::peer::probe::with_table(|table| {
-            table.cool_down(peer, cleared_locator, until_ms);
-            table.cool_down(peer, untouched_locator, until_ms);
-        })
-        .expect("the process-local path table is not poisoned");
-
-        let written = vec![Endpoint::direct(
-            cleared_addr,
-            crate::now_ms(),
-            crate::peer::config::EndpointSource::Drop,
-        )];
-        clear_cooldowns_for_fetch(peer, &written);
-
-        let mut row = PeerRow {
-            node: peer,
-            label: "clear-cooldowns-for-fetch-test".to_string(),
-            endpoints: Vec::new(),
-            added_at: 0,
-            allow: crate::peer::config::Allow::default(),
-            lend: Vec::new(),
-            rendezvous_secret: None,
-            sees_us_at: None,
-        };
-        row.observe_endpoint(Endpoint::direct(
-            cleared_addr,
-            1_000,
-            crate::peer::config::EndpointSource::Drop,
-        ));
-        row.observe_endpoint(Endpoint::direct(
-            untouched_addr,
-            1_000,
-            crate::peer::config::EndpointSource::Drop,
-        ));
-
-        let order = dial_order(&row);
-        assert!(
-            order
-                .iter()
-                .any(|endpoint| endpoint.locator == cleared_locator),
-            "the locator the fetch wrote must be dialable again: {order:?}"
-        );
-        assert!(
-            !order
-                .iter()
-                .any(|endpoint| endpoint.locator == untouched_locator),
-            "a locator the fetch did NOT write must stay excluded, not swept in by a blanket \
-             clear or by dial_order's own cooling-fallback: {order:?}"
         );
     }
 

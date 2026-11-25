@@ -465,7 +465,7 @@ pub fn drop_cooling_endpoints(
 
 /// [`order_endpoints`] against the process-local table, with cooling
 /// endpoints dropped by [`drop_cooling_endpoints`], which is what
-/// [`crate::peer::serve::dial_order`] calls.
+/// [`crate::peer::tunnel::dial::dial_order`] calls.
 ///
 /// A poisoned lock falls back to the policy defaults and SAYS SO: the dial has
 /// to produce an order, the default order is the one every build before this

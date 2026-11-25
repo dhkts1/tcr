@@ -103,6 +103,7 @@ use crate::peer::id::KEY_BYTES;
 use crate::peer::id::NodeKey;
 use crate::peer::noise::{self, Handshake, NoiseStream};
 use crate::peer::tunnel;
+use crate::peer::tunnel::PEER_EGRESS_PORT;
 
 /// The ONLY origins a gateway will carry. Deny by default: a host absent from
 /// this list is refused, not tunnelled.
@@ -110,14 +111,6 @@ use crate::peer::tunnel;
 /// Independent of [`crate::mitm::ALLOWED_HOSTS`]: a local interception capability
 /// must not grant a peer gateway permission to dial another origin.
 pub const PEER_EGRESS_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com"];
-
-/// The only port those origins are carried on.
-///
-/// Part of the allow-list decision rather than a free field, for the reason
-/// [`TunnelTarget::Origin`] gives: host-and-port is the whole of what a blind
-/// hop can enforce, so leaving the port open would hand a granted peer every
-/// service on the same name.
-pub const PEER_EGRESS_PORT: u16 = 443;
 
 /// Whether `host` and `port` are carried at all.
 pub fn host_allowed(host: &str, port: u16) -> bool {
@@ -286,14 +279,12 @@ pub async fn accept_once_splice(
         ));
     }
 
-    let mut stream = crate::peer::serve::dial_peer(gateway)
-        .await
-        .ok_or_else(|| {
-            anyhow!(
-                "peer egress: none of {}'s addresses answered",
-                gateway.label
-            )
-        })?;
+    let mut stream = tunnel::dial::dial_peer(gateway).await.ok_or_else(|| {
+        anyhow!(
+            "peer egress: none of {}'s addresses answered",
+            gateway.label
+        )
+    })?;
     let mut session = noise::dial_handshake(
         &mut stream,
         node_secret,
