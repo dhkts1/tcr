@@ -2553,7 +2553,7 @@ mod quota_replay {
     #[test]
     fn default_suite_guards_frozen_baseline() {
         let expected: serde_json::Value =
-            serde_json::from_str(include_str!("fixtures/quota-replay-baseline.json")).unwrap();
+            serde_json::from_str(include_str!("../fixtures/quota-replay-baseline.json")).unwrap();
         assert_eq!(expected["cases"].as_object().unwrap().len(), 10);
         for mixed in [false, true] {
             let requests = trace(mixed);
@@ -2586,7 +2586,7 @@ mod quota_replay {
     #[ignore = "ten-case replay takes minutes unoptimized; run: cargo test --test it workload_scenarios::quota_replay::frozen_baseline --locked -- --ignored"]
     fn frozen_baseline() {
         let expected: serde_json::Value =
-            serde_json::from_str(include_str!("fixtures/quota-replay-baseline.json")).unwrap();
+            serde_json::from_str(include_str!("../fixtures/quota-replay-baseline.json")).unwrap();
         assert_eq!(
             baseline(),
             expected,

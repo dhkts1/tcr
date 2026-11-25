@@ -7,12 +7,12 @@
 //! address instead of always finding its own.
 
 /// The environment every launch of the built `tcr` starts from.
-#[path = "support/tcr_env.rs"]
+#[path = "../../support/tcr_env.rs"]
 mod tcr_env;
 
 /// The harness pieces the `peer_*` test files share. Its capture layer keeps
 /// each event's level, which is what the quiet-second-answer test reads.
-#[path = "support/peer.rs"]
+#[path = "../../support/peer.rs"]
 mod peer_support;
 
 use peer_support::CaptureLayer;

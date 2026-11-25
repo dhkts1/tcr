@@ -41,7 +41,7 @@ FILES=(
   "src/peer/config.rs"
   "src/peer/config/join_key.rs"
   "src/peer/discovery.rs"
-  "tests/peer_noise/enrolment_and_files.rs"
+  "tests/peer/pairing/peer_noise/enrolment_and_files.rs"
 )
 for f in "${FILES[@]}"; do
   cp "$ROOT/$f" "$BACKUP_DIR/$(echo "$f" | tr / _)"
@@ -145,7 +145,7 @@ probe enrolment_label_unsanitized --test=it \
 SPEC
 
 probe peers_file_mode --test=it \
-  peer_noise::the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused tests/peer_noise/enrolment_and_files.rs <<'SPEC'
+  peer_noise::the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused tests/peer/pairing/peer_noise/enrolment_and_files.rs <<'SPEC'
     tcr::peer::config::save(path, &file).expect("the peers file is written");
 @@@
     std::fs::write(path, serde_json::to_string(&file).expect("json")).expect("written");

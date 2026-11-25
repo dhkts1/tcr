@@ -89,7 +89,7 @@ use axum::response::Response;
 use axum::routing::any;
 
 /// The E2E-MATRIX scenarios' one shared line format. See that module's docs.
-#[path = "tools/e2e/matrix.rs"]
+#[path = "../tools/e2e/matrix.rs"]
 mod matrix;
 
 /// What the real API refuses a request without, shared by every fake upstream

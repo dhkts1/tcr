@@ -22,7 +22,7 @@
 //! binary" and "global for this test" are the same thing.
 
 /// The tracing capture layer the `peer_*` files share.
-#[path = "support/peer.rs"]
+#[path = "../support/peer.rs"]
 mod peer_support;
 
 use peer_support::CaptureLayer;

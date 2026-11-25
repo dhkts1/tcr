@@ -28,11 +28,11 @@
 //! `127.0.0.1:3456`.
 
 /// The environment every launch of the built `tcr` starts from.
-#[path = "support/tcr_env.rs"]
+#[path = "../../support/tcr_env.rs"]
 mod tcr_env;
 
 /// The harness pieces the `peer_*` test files share.
-#[path = "support/peer.rs"]
+#[path = "../../support/peer.rs"]
 mod peer_support;
 
 use peer_support::{Collector, Node, dial_and_open, loopback, node};

@@ -24,7 +24,7 @@ set -uo pipefail
 # and wrong in every other checkout.
 ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 LIB="$ROOT/crates/tcr-peer-wire/src/lib.rs"
-TEST="$ROOT/tests/peer_wire.rs"
+TEST="$ROOT/tests/peer/pairing/peer_wire.rs"
 STAMP="$$-$(date +%s)"
 BACKUP_DIR="/tmp/lan-p2p/mutate-wire-$STAMP"
 LOG_DIR="/tmp/lan-p2p"

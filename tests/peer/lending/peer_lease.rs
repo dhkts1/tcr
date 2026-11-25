@@ -28,11 +28,11 @@
 
 /// What the real API refuses a request without, shared by every fake upstream
 /// in this tree. See that module's docs for why a fake upstream is strict.
-#[path = "tools/api_contract.rs"]
+#[path = "../../tools/api_contract.rs"]
 mod api_contract;
 
 /// The environment every launch of the built `tcr` starts from.
-#[path = "support/tcr_env.rs"]
+#[path = "../../support/tcr_env.rs"]
 mod tcr_env;
 
 use std::path::{Path, PathBuf};

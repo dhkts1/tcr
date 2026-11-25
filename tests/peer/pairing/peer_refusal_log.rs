@@ -16,7 +16,7 @@
 //! config. Nothing here touches the proxy on `127.0.0.1:3456`.
 
 /// The harness pieces the `peer_*` test files share.
-#[path = "support/peer.rs"]
+#[path = "../../support/peer.rs"]
 mod peer_support;
 
 use std::time::Duration;

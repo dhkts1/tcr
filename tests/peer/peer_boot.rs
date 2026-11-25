@@ -20,7 +20,7 @@
 //! Anthropic.
 
 /// The harness pieces the `peer_*` test files share.
-#[path = "support/peer.rs"]
+#[path = "../support/peer.rs"]
 mod peer_support;
 
 use std::time::Duration;

@@ -16,7 +16,7 @@ use tcr::peer::noise;
 use tcr::peer::reach::{self, KernelPunchNet, PunchArrival, PunchFailure, PunchNet, PunchSlot};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-#[path = "tools/nat_sim.rs"]
+#[path = "../../tools/nat_sim.rs"]
 mod nat_sim;
 
 use nat_sim::{Internet, Mapping, Refusal};

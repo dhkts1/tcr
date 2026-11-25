@@ -1,9 +1,11 @@
 //! The integration tests that can share one process, compiled and linked as one crate.
 //!
-//! Each `tests/<name>.rs` is a module here under its own name, so a test that was
+//! Each test file is a module here under its own name, so a test that was
 //! `cargo test --test peer_wire <test>` is now `cargo test --test it peer_wire::<test>`, and
-//! `cargo test --test it peer_wire::` runs the whole file. The files stay where they were, because
-//! code and scripts across the tree cite them by path.
+//! `cargo test --test it peer_wire::` runs the whole file. The files sit in area folders
+//! (`cli/`, `codex/`, `proxy/`, `peer/` and its `pairing/`, `lending/`, `reach/`); a file's stem is
+//! its module name, which is what `--test it <stem>::` filters and `tests/tools/peer-test-path.sh`
+//! key on.
 //!
 //! A file that owns process-wide state (a global `tracing` subscriber, the peer-lease fallback,
 //! the egress peers path, the router-mapping register, the loaded mitm leaf, or an in-process
@@ -28,117 +30,152 @@ mod peer_support;
 #[path = "../tools/api_contract.rs"]
 mod api_contract;
 
-#[path = "../cache_ttl_rewrite.rs"]
+#[path = "../proxy/cache_ttl_rewrite.rs"]
 mod cache_ttl_rewrite;
-#[path = "../claude_code_import.rs"]
+#[path = "../cli/claude_code_import.rs"]
 mod claude_code_import;
-#[path = "../codex_cli_login.rs"]
+#[path = "../codex/codex_cli_login.rs"]
 mod codex_cli_login;
-#[path = "../codex_e2e.rs"]
+#[path = "../codex/codex_e2e.rs"]
 mod codex_e2e;
-#[path = "../codex_import.rs"]
+#[path = "../codex/codex_import.rs"]
 mod codex_import;
-#[path = "../codex_reset.rs"]
+#[path = "../codex/codex_reset.rs"]
 mod codex_reset;
-#[path = "../codex_run.rs"]
+#[path = "../codex/codex_run.rs"]
 mod codex_run;
-#[path = "../config_show.rs"]
+#[path = "../cli/config_show.rs"]
 mod config_show;
-#[path = "../delete_account_live.rs"]
+#[path = "../cli/delete_account_live.rs"]
 mod delete_account_live;
-#[path = "../doctor.rs"]
+#[path = "../cli/doctor.rs"]
 mod doctor;
-#[path = "../first_run_no_config.rs"]
+#[path = "../cli/first_run_no_config.rs"]
 mod first_run_no_config;
-#[path = "../headless_log_file.rs"]
+#[path = "../proxy/headless_log_file.rs"]
 mod headless_log_file;
-#[path = "../headless_sigterm.rs"]
+#[path = "../proxy/headless_sigterm.rs"]
 mod headless_sigterm;
-#[path = "../import.rs"]
+#[path = "../cli/import.rs"]
 mod import;
-#[path = "../legacy_config_shapes.rs"]
+#[path = "../cli/legacy_config_shapes.rs"]
 mod legacy_config_shapes;
-#[path = "../peer_abuse.rs"]
+#[path = "../peer/pairing/peer_abuse.rs"]
 mod peer_abuse;
-#[path = "../peer_aim.rs"]
+#[path = "../peer/reach/peer_aim.rs"]
 mod peer_aim;
-#[path = "../peer_ask.rs"]
+#[path = "../peer/pairing/peer_ask.rs"]
 mod peer_ask;
-#[path = "../peer_carried_control.rs"]
+#[path = "../peer/reach/peer_carried_control.rs"]
 mod peer_carried_control;
-#[path = "../peer_dead_drop_dial.rs"]
+#[path = "../peer/reach/peer_dead_drop_dial.rs"]
 mod peer_dead_drop_dial;
-#[path = "../peer_discovery.rs"]
+#[path = "../peer/pairing/peer_discovery.rs"]
 mod peer_discovery;
-#[path = "../peer_drop.rs"]
+#[path = "../peer/reach/peer_drop.rs"]
 mod peer_drop;
-#[path = "../peer_e2e.rs"]
+#[path = "../peer/peer_e2e.rs"]
 mod peer_e2e;
-#[path = "../peer_graph.rs"]
+#[path = "../peer/peer_graph.rs"]
 mod peer_graph;
-#[path = "../peer_hand.rs"]
+#[path = "../peer/lending/peer_hand.rs"]
 mod peer_hand;
-#[path = "../peer_moved.rs"]
+#[path = "../peer/pairing/peer_moved.rs"]
 mod peer_moved;
-#[path = "../peer_noise.rs"]
+#[path = "../peer/pairing/peer_noise.rs"]
 mod peer_noise;
-#[path = "../peer_pairing.rs"]
+#[path = "../peer/pairing/peer_pairing.rs"]
 mod peer_pairing;
-#[path = "../peer_path_accounting.rs"]
+#[path = "../peer/lending/peer_path_accounting.rs"]
 mod peer_path_accounting;
-#[path = "../peer_probe.rs"]
+#[path = "../peer/reach/peer_probe.rs"]
 mod peer_probe;
-#[path = "../peer_props.rs"]
+#[path = "../peer/peer_props.rs"]
 mod peer_props;
-#[path = "../peer_punch.rs"]
+#[path = "../peer/reach/peer_punch.rs"]
 mod peer_punch;
-#[path = "../peer_status.rs"]
+#[path = "../peer/peer_status.rs"]
 mod peer_status;
-#[path = "../peer_wire.rs"]
+#[path = "../peer/pairing/peer_wire.rs"]
 mod peer_wire;
-#[path = "../peer_wire_saved.rs"]
+#[path = "../peer/pairing/peer_wire_saved.rs"]
 mod peer_wire_saved;
-#[path = "../server_replace.rs"]
+#[path = "../proxy/server_replace.rs"]
 mod server_replace;
-#[path = "../setup_route.rs"]
+#[path = "../cli/setup_route.rs"]
 mod setup_route;
-#[path = "../status_check.rs"]
+#[path = "../cli/status_check.rs"]
 mod status_check;
-#[path = "../tcr_run_alias.rs"]
+#[path = "../cli/tcr_run_alias.rs"]
 mod tcr_run_alias;
-#[path = "../throttle_exempt.rs"]
+#[path = "../proxy/throttle_exempt.rs"]
 mod throttle_exempt;
-#[path = "../workload_scenarios.rs"]
+#[path = "../proxy/workload_scenarios.rs"]
 mod workload_scenarios;
 
-/// **Every `tests/*.rs` is compiled exactly once, as a module here or as its own `[[test]]`.**
+/// The folders under `tests/` whose `.rs` files are shared sources reached by `#[path]`, never a
+/// test root of their own.
+const SHARED_SOURCE_DIRS: [&str; 3] = ["it", "support", "tools"];
+
+/// Every test root under `tests/`, as its path relative to `tests/` with `/` separators. A `.rs`
+/// file is a root unless it lies under a [`SHARED_SOURCE_DIRS`] folder, or one of its folders `d`
+/// has a sibling file `d.rs` (then it is a child module of that root, reached by its `#[path]`).
+fn test_roots(tests: &std::path::Path) -> Vec<String> {
+    fn walk(dir: &std::path::Path, rel: &str, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read a tests/ folder") {
+            let entry = entry.expect("a tests/ entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            let rel_name = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            if path.is_dir() {
+                let shared = rel.is_empty() && SHARED_SOURCE_DIRS.contains(&name.as_str());
+                let child_modules = dir.join(format!("{name}.rs")).is_file();
+                if !shared && !child_modules {
+                    walk(&path, &rel_name, out);
+                }
+            } else if name.ends_with(".rs") {
+                out.push(rel_name);
+            }
+        }
+    }
+    let mut roots = Vec::new();
+    walk(tests, "", &mut roots);
+    roots.sort();
+    roots
+}
+
+/// **Every test file under `tests/` is compiled exactly once, as a module here or as its own
+/// `[[test]]`.**
 ///
 /// `Cargo.toml` sets `autotests = false`, so cargo no longer finds a test file on its own: a
-/// file nobody listed builds nothing, runs nothing, and leaves the suite green. This reads the
-/// directory (untracked files included, which is what a fresh checkout of a branch would carry)
-/// and the two lists, and fails on a file in neither or in both.
+/// file nobody listed builds nothing, runs nothing, and leaves the suite green. This walks
+/// `tests/` and every area folder below it (untracked files included, which is what a fresh
+/// checkout of a branch would carry) and reads the two lists, and fails on a file in neither or in
+/// both.
 #[test]
 fn every_test_file_is_a_module_here_or_its_own_test_target() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let modules =
         std::fs::read_to_string(root.join("tests/it/main.rs")).expect("read tests/it/main.rs");
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
-    let mut files: Vec<String> = std::fs::read_dir(root.join("tests"))
-        .expect("read tests/")
-        .map(|entry| {
-            entry
-                .expect("a tests/ entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .filter(|name| name.ends_with(".rs"))
-        .collect();
-    files.sort();
+    let files = test_roots(&root.join("tests"));
     assert!(
-        files.iter().any(|name| name == "peer_wire.rs")
-            && files.iter().any(|name| name == "peer_lease.rs"),
-        "the listing must see a module file and a separate target, or it checks nothing: {files:?}"
+        files.iter().any(|name| name == "peer/pairing/peer_wire.rs")
+            && files
+                .iter()
+                .any(|name| name == "peer/lending/peer_lease.rs"),
+        "the walk must see a module file and a separate target two folders deep, or it checks \
+         nothing: {files:?}"
+    );
+    assert!(
+        !files
+            .iter()
+            .any(|name| name == "peer/pairing/peer_pairing/caps.rs"),
+        "a child module of a root is not a root of its own: {files:?}"
     );
     let wrong: Vec<String> = files
         .iter()
