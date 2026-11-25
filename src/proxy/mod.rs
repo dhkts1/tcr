@@ -1859,7 +1859,7 @@ async fn status_handler(
     // `StatsSnapshot` is the accounts view and carries no peers file, no peer
     // state file and no ledger. Assigned HERE, in the serving process, which is
     // the only caller that holds the path those files were installed under
-    // (`peer::egress::peers_path`), the CLI's own round-trip tests and
+    // (`peer::tunnel::egress::peers_path`), the CLI's own round-trip tests and
     // `into_snapshot` keep the honest empty list.
     //
     // Two file reads on a status request, and that is the trade this endpoint
@@ -1877,7 +1877,7 @@ async fn status_handler(
     // rather than make the answer older than the question.
     let payload = payload.with_serving_facts(crate::status::ServingFacts {
         peers: crate::peer::status::rows::peers_block_with_error(
-            &crate::peer::egress::peers_path(),
+            &crate::peer::tunnel::egress::peers_path(),
             (now.unix_timestamp_nanos() / 1_000_000) as i64,
         ),
         mitm: manager.mitm_status(),
@@ -2229,7 +2229,7 @@ const PEER_DIAL_ROUTE: LocalRoute = LocalRoute {
 /// TcrBar Trust button spawns that CLI. tcr's own node lives in THIS process,
 /// and a Mac in node mode has no `utun` for the kernel to route a `100.x`
 /// address through. So the CLI asks here; its Noise code is unchanged, and
-/// only where its socket comes from differs. See `crate::peer::tailnet_node`.
+/// only where its socket comes from differs. See `crate::peer::reach::tailnet::node`.
 ///
 /// # What guards it
 ///
@@ -2277,10 +2277,10 @@ async fn peer_dial_handler(State(manager): State<Arc<Manager>>, request: Request
             "The tcr peer dial endpoint needs an HTTP/1.1 connection it can upgrade.",
         );
     };
-    use crate::peer::tailnet_node::RouteDial;
-    let stream = match crate::peer::tailnet_node::dial_for_route(
+    use crate::peer::reach::tailnet::node::RouteDial;
+    let stream = match crate::peer::reach::tailnet::node::dial_for_route(
         target,
-        crate::peer::tailnet_node::DIAL_TIMEOUT,
+        crate::peer::reach::tailnet::node::DIAL_TIMEOUT,
     )
     .await
     {
@@ -2319,7 +2319,7 @@ async fn peer_dial_handler(State(manager): State<Arc<Manager>>, request: Request
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
-                let (up, down) = crate::peer::tailnet_node::splice_until_either_ends(
+                let (up, down) = crate::peer::reach::tailnet::node::splice_until_either_ends(
                     hyper_util::rt::TokioIo::new(upgraded),
                     stream,
                 )
@@ -3312,7 +3312,7 @@ fn ms_between(from: Instant, to: Instant) -> u64 {
 ///   tcr did first: reading the body, choosing an account, waiting out holds,
 ///   earlier failed attempts and the final attempt's own throttle wait.
 /// - `throttle_ms`: total time inside `Manager::throttle_send`, all attempts. Not
-///   the pinned-egress path's own pacing, which happens inside `peer::egress`.
+///   the pinned-egress path's own pacing, which happens inside `peer::tunnel::egress`.
 /// - `upstream_ms`: the final attempt's `send()` until its response headers.
 /// - `first_byte_ms`: arrival until the first body chunk was handed to the client
 ///   side of the tee (streamed), or until the whole body was read (buffered).
@@ -4784,33 +4784,34 @@ async fn handle_request(
         // Inert for every account that is not pinned: one config read answers
         // `TakeTheDirectPath` before a file, a key or a socket is touched. The
         // decision, the refusal and the one fallback log line are all in
-        // `peer::egress`.
-        let already_paced =
-            match crate::peer::egress::pinned_egress(crate::peer::egress::PinnedAttempt {
+        // `peer::tunnel::egress`.
+        let already_paced = match crate::peer::tunnel::egress::pinned_egress(
+            crate::peer::tunnel::egress::PinnedAttempt {
                 manager: &manager,
                 account_idx: idx,
                 method: &method,
                 path_and_query: &path_and_query,
                 headers: upstream_headers.clone(),
                 body: upstream_body.clone(),
-                peers_path: &crate::peer::egress::peers_path(),
+                peers_path: &crate::peer::tunnel::egress::peers_path(),
                 session_key,
                 session_kind,
                 wire_session_id: wire_session_id.as_deref(),
                 model: request_model.clone(),
                 tool_uses: &wire_tool_uses,
                 tool_results: &wire_tool_results,
-            })
-            .await
-            {
-                // `paced` and not a second `throttle_send`: a pin that could not
-                // be honoured has already waited on this account's own bucket
-                // inside the exit lock, and pacing it again below made one client
-                // request spend two slots on the one account an operator had
-                // explicitly asked to shape.
-                crate::peer::egress::PinnedEgress::TakeTheDirectPath { paced } => paced,
-                crate::peer::egress::PinnedEgress::Answered(response) => return response,
-            };
+            },
+        )
+        .await
+        {
+            // `paced` and not a second `throttle_send`: a pin that could not
+            // be honoured has already waited on this account's own bucket
+            // inside the exit lock, and pacing it again below made one client
+            // request spend two slots on the one account an operator had
+            // explicitly asked to shape.
+            crate::peer::tunnel::egress::PinnedEgress::TakeTheDirectPath { paced } => paced,
+            crate::peer::tunnel::egress::PinnedEgress::Answered(response) => return response,
+        };
         // This account's OWN client — fetched INSIDE the loop, keyed on the idx
         // this iteration is actually about to serve. Hoisting this above the
         // loop (as it used to be) reused whichever account was selected FIRST
@@ -4953,9 +4954,9 @@ async fn handle_request(
                         && provider.on_peer_mesh()
                     {
                         ladder.spend_peer_egress();
-                        let peers_path = crate::peer::egress::peers_path();
-                        let carry = crate::peer::egress::retry_through_peer(
-                            crate::peer::egress::CarriedRequest {
+                        let peers_path = crate::peer::tunnel::egress::peers_path();
+                        let carry = crate::peer::tunnel::egress::retry_through_peer(
+                            crate::peer::tunnel::egress::CarriedRequest {
                                 url: &url,
                                 method: &method,
                                 headers: upstream_headers.clone(),
@@ -4974,12 +4975,12 @@ async fn handle_request(
                         // carry never reaches, so the terminal answer was a 503
                         // the client is built to retry. Same typed outcome as the
                         // pinned sibling, same 502 with `x-should-retry: false`.
-                        if let crate::peer::egress::ViaCarry::TakenAndFailed(gap) = &carry {
+                        if let crate::peer::tunnel::egress::ViaCarry::TakenAndFailed(gap) = &carry {
                             break 'attempt Step::Answer(
-                                crate::peer::egress::delivered_unknown_response(gap),
+                                crate::peer::tunnel::egress::delivered_unknown_response(gap),
                             );
                         }
-                        if let crate::peer::egress::ViaCarry::Carried(carried) = carry {
+                        if let crate::peer::tunnel::egress::ViaCarry::Carried(carried) = carry {
                             // A carried request is a served request, and it is
                             // recorded exactly like one, the counter, the
                             // wire-session table and the ring buffer, in the order
@@ -4995,9 +4996,9 @@ async fn handle_request(
                             // alongside the client's response, because the client's
                             // copy no longer has them, `is_account_scoped` strips
                             // them there exactly as `build_response` does here.
-                            crate::peer::egress::record_carried(
+                            crate::peer::tunnel::egress::record_carried(
                                 &manager,
-                                crate::peer::egress::CarriedRecord {
+                                crate::peer::tunnel::egress::CarriedRecord {
                                     account_idx: idx,
                                     account: account_name.clone(),
                                     session_key,
@@ -7058,7 +7059,7 @@ const RESPONSE_SKIP: [&str; 10] = [
 /// path serves a response to the SAME local client off the SAME pooled account,
 /// so a second copy of this rule over there would be a second answer to "what
 /// may the caller see", and it would drift the first time Anthropic adds a
-/// header. The other reader is `crate::peer::egress`'s `axum_response_from`.
+/// header. The other reader is `crate::peer::tunnel::egress`'s `axum_response_from`.
 pub(crate) fn is_account_scoped(name: &str) -> bool {
     name.starts_with("anthropic-ratelimit-")
         || name == "anthropic-organization-id"

@@ -148,8 +148,8 @@ const OWN_MAC_STATUS: &str = r#"{
   }
 }"#;
 
-fn own_mac_status() -> tcr::peer::tailscale_app::Status {
-    tcr::peer::tailscale_app::Status::parse(OWN_MAC_STATUS.as_bytes()).expect("the fixture parses")
+fn own_mac_status() -> reach::tailnet::app::Status {
+    reach::tailnet::app::Status::parse(OWN_MAC_STATUS.as_bytes()).expect("the fixture parses")
 }
 
 fn ip(text: &str) -> std::net::IpAddr {
@@ -214,7 +214,7 @@ fn an_own_mac_on_the_tailnet_address_is_answered_in_app_mode() {
 #[test]
 fn everyone_else_on_the_tailnet_is_refused_a_knock() {
     use tcr::peer::config::TailnetMode;
-    use tcr::peer::tailscale_app::ReadError;
+    use tcr::peer::reach::tailnet::app::ReadError;
     let status = own_mac_status();
     let refused = |mode, accepted_on: Option<&str>, from: &str, reading, why: &str| {
         for pattern in PAIRING_PATTERNS {

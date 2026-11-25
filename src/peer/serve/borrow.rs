@@ -9,7 +9,7 @@ use tcr_peer_wire::{Lease, PeerId, StreamHeader, StreamKind};
 
 use crate::fallback::Ask;
 use crate::peer::config::PeerStore;
-use crate::peer::id::NodeKey;
+use crate::peer::config::id::NodeKey;
 use crate::peer::noise::{self, Handshake, recv_json, send_json};
 
 use super::frame::{SERVE_FLOW, ServeAck, ServeReply, recv_body, send_body, serve_request_from};
@@ -199,7 +199,7 @@ async fn borrow_once(
         return Ok(Borrowed::NotThisLender);
     }
 
-    let request_id = crate::peer::id::random_id()?;
+    let request_id = crate::peer::config::id::random_id()?;
     let request = serve_request_from(ask, headers, lease.lease_id, request_id)?;
 
     let key = NodeKey::load_or_mint(&node_key_dir(store))

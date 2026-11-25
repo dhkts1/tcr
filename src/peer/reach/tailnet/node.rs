@@ -11,7 +11,7 @@
 //! The library supports Apple silicon and Linux, not Intel Macs, and brings a
 //! C crypto library this repository otherwise avoids. Gil, 2026-10-20: source
 //! builds only, behind the `tailnet-node` feature, which no release build
-//! turns on. [`SUPPORTED`](crate::peer::tailnet_node::SUPPORTED) is the one place that decides whether this binary
+//! turns on. [`SUPPORTED`](crate::peer::reach::tailnet::node::SUPPORTED) is the one place that decides whether this binary
 //! can act on the setting; everything here that does not touch the library
 //! itself compiles and is tested in every build, so CI exercises the
 //! supervisor, the key file and the join and leave orderings without the
@@ -19,19 +19,19 @@
 //!
 //! # Who does what
 //!
-//! - **Joining is the CLI's** ([`join_with`](crate::peer::tailnet_node::join_with)). It reads the auth key from
+//! - **Joining is the CLI's** ([`join_with`](crate::peer::reach::tailnet::node::join_with)). It reads the auth key from
 //!   stdin, builds a device in its own process, waits until control says the
 //!   node is authorized, writes the key file, shuts the device down, and only
-//!   then sets the mode. The auth key is held in an [`AuthKey`](crate::peer::tailnet_node::AuthKey), which has no
+//!   then sets the mode. The auth key is held in an [`AuthKey`](crate::peer::reach::tailnet::node::AuthKey), which has no
 //!   `Display` and a redacting `Debug`, and is never written anywhere.
-//! - **Serving is the server's** ([`Supervisor`](crate::peer::tailnet_node::Supervisor)). It starts its device from
+//! - **Serving is the server's** ([`Supervisor`](crate::peer::reach::tailnet::node::Supervisor)). It starts its device from
 //!   the key file alone, listens on the node's address at the peer port, and
 //!   hands every accepted connection to the same
 //!   [`crate::peer::listener::serve_one`] the kernel listener uses. Admission
 //!   needs no change: the source is a tailnet address and the bind is the
 //!   node's, neither LAN nor loopback, so a stranger on the tailnet gets
 //!   return visits and enrolments only (`internet_admission`).
-//! - **Leaving is the CLI's** ([`leave_with`](crate::peer::tailnet_node::leave_with)): mode off, wait until the
+//! - **Leaving is the CLI's** ([`leave_with`](crate::peer::reach::tailnet::node::leave_with)): mode off, wait until the
 //!   serving process has let go, then delete the key file.
 //!
 //! # Why a supervisor
@@ -39,17 +39,17 @@
 //! About a minute without network panics the library's relay and control
 //! tasks, and nothing restarts them (upstream issue #439): the process lives
 //! on with a dead tailnet, which is exactly what a laptop that sleeps does. So
-//! the server checks the device every [`HEALTH_EVERY`](crate::peer::tailnet_node::HEALTH_EVERY) (a `self_node()`
-//! lookup under [`CONTROL_TIMEOUT`](crate::peer::tailnet_node::CONTROL_TIMEOUT)) and whenever the default gateway changes,
-//! and a failed check shuts the device down within [`SHUTDOWN_DEADLINE`](crate::peer::tailnet_node::SHUTDOWN_DEADLINE) and
+//! the server checks the device every [`HEALTH_EVERY`](crate::peer::reach::tailnet::node::HEALTH_EVERY) (a `self_node()`
+//! lookup under [`CONTROL_TIMEOUT`](crate::peer::reach::tailnet::node::CONTROL_TIMEOUT)) and whenever the default gateway changes,
+//! and a failed check shuts the device down within [`SHUTDOWN_DEADLINE`](crate::peer::reach::tailnet::node::SHUTDOWN_DEADLINE) and
 //! builds a new one from the same keys.
 //!
 //! # Every wait on control is bounded
 //!
 //! Before registration, `ipv4_addr`, `self_node` and `is_authorized` wait
 //! until control answers, which with no network is forever. Every such call
-//! here runs under [`CONTROL_TIMEOUT`](crate::peer::tailnet_node::CONTROL_TIMEOUT), and nothing asks for an address before
-//! [`TailnetDevice::authorization`](crate::peer::tailnet_node::TailnetDevice::authorization) has said yes.
+//! here runs under [`CONTROL_TIMEOUT`](crate::peer::reach::tailnet::node::CONTROL_TIMEOUT), and nothing asks for an address before
+//! [`TailnetDevice::authorization`](crate::peer::reach::tailnet::node::TailnetDevice::authorization) has said yes.
 
 use std::path::Path;
 use std::time::Duration;

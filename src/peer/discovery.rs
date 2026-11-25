@@ -269,7 +269,7 @@ fn build_beacon_info(
     network_key: Option<&crate::peer::config::NetworkKey>,
 ) -> Result<ServiceInfo> {
     let txt = beacon_txt(
-        &crate::peer::id::boot_instance_id(),
+        &crate::peer::config::id::boot_instance_id(),
         port,
         name,
         network_key,
@@ -395,7 +395,7 @@ pub fn tailnet_beacon(
     network_key: Option<&crate::peer::config::NetworkKey>,
 ) -> Vec<u8> {
     let txt = beacon_txt(
-        &crate::peer::id::boot_instance_id(),
+        &crate::peer::config::id::boot_instance_id(),
         port,
         name,
         network_key,

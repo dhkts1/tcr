@@ -1248,12 +1248,12 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let persist_path_for_peers = persist_path.clone();
     if let Some(peers_path) = peers_file_beside_config(persist_path.as_deref()) {
         // The egress seam reads the peers file per request and cannot be asked
-        // what path it was built from (`crate::peer::egress::peers_path`), so
+        // what path it was built from (`crate::peer::tunnel::egress::peers_path`), so
         // the boot path tells it once. Without this line an explicit
         // `--config` elsewhere carried requests against the default peers
         // file rather than against the file this server was actually started
         // with.
-        if !crate::peer::egress::install_peers_path(peers_path.clone()) {
+        if !crate::peer::tunnel::egress::install_peers_path(peers_path.clone()) {
             tracing::debug!(
                 path = %peers_path.display(),
                 "peer egress: a peers file was already installed for this process; keeping it"
@@ -1505,14 +1505,14 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     }
 
     // Spend a banked reset two hours before it would expire unused
-    // (`manager::auto_reset`). On unless `"autoUseExpiringResets": false`; the tick reads
+    // (`manager::resets::auto`). On unless `"autoUseExpiringResets": false`; the tick reads
     // memory only, so it costs nothing until a reset is due.
     if manager.auto_reset_enabled() {
         let m = Arc::clone(&manager);
         let mut stop = shutdown_tx.subscribe();
         background.push(tokio::spawn(supervise("reset-expiry", async move {
             tokio::select! {
-                () = crate::manager::auto_reset::run(m) => {}
+                () = crate::manager::resets::auto::run(m) => {}
                 _ = stop.changed() => {}
             }
         })));

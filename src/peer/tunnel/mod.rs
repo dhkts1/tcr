@@ -112,6 +112,9 @@ use crate::peer::noise::{self, CHUNK_BYTES, NoiseStream, PeerSession};
 /// The dialler: every way this node opens a stream to a pinned peer, direct,
 /// punched, forwarded, through a dead drop or over the tailnet node.
 pub mod dial;
+
+/// Phase 6: the loopback egress splice.
+pub mod egress;
 mod reverse;
 
 use reverse::reach_target;
@@ -756,7 +759,7 @@ pub fn path_meter() -> &'static std::sync::Mutex<PathMeter> {
 ///
 /// This subsystem owns the figure the way
 /// [`crate::peer::discovery::BROWSE_INTERVAL`] and
-/// [`crate::peer::probe::PROBE_INTERVAL`] own theirs; the schedule itself
+/// [`crate::peer::reach::probe::PROBE_INTERVAL`] own theirs; the schedule itself
 /// stays the serving process's act, which is what [`path_meter`]'s own doc
 /// above says.
 pub const PATH_TRAFFIC_SUM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -900,7 +903,7 @@ pub const PEER_EGRESS_PORT: u16 = 443;
 /// A blind hop can enforce host-and-port and nothing else: the bytes after the
 /// ClientHello are the requester's. Checking the name alone handed a pinned
 /// peer every service on an allow-listed name, and the port check lived only on
-/// the asking node ([`crate::peer::egress::host_allowed`]), which is the side a
+/// the asking node ([`crate::peer::tunnel::egress::host_allowed`]), which is the side a
 /// peer that wants to reach something else is not running.
 ///
 /// The host is matched against the gateway's own list rather than the

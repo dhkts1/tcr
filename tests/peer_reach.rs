@@ -30,8 +30,8 @@ use tcr::peer::reach::{
 
 use std::path::Path;
 
+use tcr::peer::config::id::NodeKey;
 use tcr::peer::config::{self as peer_config, PeerFile};
-use tcr::peer::id::NodeKey;
 use tcr::peer::listener::{self, InternetAdmission, SessionContext};
 use tcr::peer::noise::Handshake;
 

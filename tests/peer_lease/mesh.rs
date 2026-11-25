@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use tcr::log_err::LogErr as _;
 use tcr::manager::Manager;
 use tcr::peer::config::PeerStore;
-use tcr::peer::id::NodeKey;
+use tcr::peer::config::id::NodeKey;
 use tcr::peer::lease::Ledger;
 use tcr::peer::lease::WindowUtilization;
 use tcr::peer::listener::{self, SessionContext};

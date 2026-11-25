@@ -145,7 +145,7 @@ fn decide(case: &Case) -> anyhow::Result<tunnel::ForwardPlan> {
             route: case.route,
             peer: case.requester,
             target: &case.target,
-            hosts: tcr::peer::egress::PEER_EGRESS_HOSTS,
+            hosts: tunnel::egress::PEER_EGRESS_HOSTS,
             cap_bytes: 1024 * 1024,
             budget: &budget,
             now_ms: NOW_MS,
@@ -466,7 +466,7 @@ async fn forward_one(stream: TcpStream, forwarder: &Forwarder) -> anyhow::Result
             route: OriginRoute::Peer(forwarder.target),
             peer,
             target: &target,
-            hosts: tcr::peer::egress::PEER_EGRESS_HOSTS,
+            hosts: tunnel::egress::PEER_EGRESS_HOSTS,
             cap_bytes: forwarder.cap_bytes,
             budget: &forwarder.budget,
             now_ms: NOW_MS,
@@ -1233,7 +1233,7 @@ async fn speak_to_target(stream: noise::PeerStream, secret: &[u8; 32], target: &
 async fn a_via_endpoint_is_dialled_through_the_forwarder_it_names() {
     let (b, c) = (node(), node());
     let dir = scratch("client-via");
-    let key = tcr::peer::id::NodeKey::load_or_mint(&dir).expect("A mints its keypair");
+    let key = config::id::NodeKey::load_or_mint(&dir).expect("A mints its keypair");
     let (forwarder_addr, forwarding, target) =
         // One carried stream: no Mac here holds `allow.carry`, so the address
         // exchange inside the punch step has no carrier to ask and spends
@@ -1331,7 +1331,7 @@ async fn the_same_via_row_is_unreachable_to_a_dial_with_no_peers_file() {
 async fn a_row_with_no_endpoints_is_reached_through_a_carry_grantee() {
     let (b, c) = (node(), node());
     let dir = scratch("client-carry");
-    let key = tcr::peer::id::NodeKey::load_or_mint(&dir).expect("A mints its keypair");
+    let key = config::id::NodeKey::load_or_mint(&dir).expect("A mints its keypair");
     let (forwarder_addr, forwarding, target) =
         // ONE carried stream, and it is the borrow's own. This row holds
         // nothing at all, which is the state the punch step names

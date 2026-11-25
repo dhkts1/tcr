@@ -5,7 +5,7 @@
 //! Locally, a host that is not on the policy list gets blind-tunnelled, and
 //! that is correct there: the surface is loopback and `tunnel()`'s own doc says
 //! so. **The same default on a peer socket is an open proxy on the LAN.** So
-//! this path gets its own constant, [`PEER_EGRESS_HOSTS`](crate::peer::egress::PEER_EGRESS_HOSTS), deny by default, and
+//! this path gets its own constant, [`PEER_EGRESS_HOSTS`](crate::peer::tunnel::egress::PEER_EGRESS_HOSTS), deny by default, and
 //! a test that proves the refusal.
 //!
 //! The list keeps the two Anthropic hosts carried before local Codex pooling:
@@ -58,7 +58,7 @@
 //! `unknown_outcome_transport_failure == false`.
 //!
 //! Both are the SAME predicate read at two places, "nothing this request sent
-//! ever left this box", so [`retry_through_peer`](crate::peer::egress::retry_through_peer) is called from ONE hunk, the
+//! ever left this box", so [`retry_through_peer`](crate::peer::tunnel::egress::retry_through_peer) is called from ONE hunk, the
 //! top of `handle`'s transport-failure arm, under
 //! `err.is_connect() || is_offline_error(&err)`. `is_connect()` is exactly the
 //! condition that leaves `unknown_outcome_transport_failure` false (it is set
@@ -77,11 +77,11 @@
 //!
 //! # A second hunk, which is about an account and not about a failure
 //!
-//! The paragraph above is the whole story for [`retry_through_peer`](crate::peer::egress::retry_through_peer), and it is
+//! The paragraph above is the whole story for [`retry_through_peer`](crate::peer::tunnel::egress::retry_through_peer), and it is
 //! no longer the whole story for this module. The exit lock of decisions row 15
 //! ("we need to be able to lock where accounts go out from which server
 //! sometimes it might be important for saving the same ip") adds
-//! [`pinned_egress`](crate::peer::egress::pinned_egress), called from one more hunk in `proxy.rs`, ABOVE the direct
+//! [`pinned_egress`](crate::peer::tunnel::egress::pinned_egress), called from one more hunk in `proxy.rs`, ABOVE the direct
 //! attempt rather than inside its failure arm. It reads one account's pin and
 //! never asks whether a transport failed, because on that path nothing has been
 //! attempted yet. The two hunks cannot
@@ -98,9 +98,9 @@ use axum::response::IntoResponse as _;
 use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
 use tokio::net::TcpListener;
 
+use crate::peer::config::id::KEY_BYTES;
+use crate::peer::config::id::NodeKey;
 use crate::peer::config::{CARRY_SETUP_TIMEOUT, PeerFile, PeerRow, ViaSetting};
-use crate::peer::id::KEY_BYTES;
-use crate::peer::id::NodeKey;
 use crate::peer::noise::{self, Handshake, NoiseStream};
 use crate::peer::tunnel;
 use crate::peer::tunnel::PEER_EGRESS_PORT;
@@ -140,9 +140,9 @@ pub struct GatewayCandidate {
 /// Which Macs to ask, in the order to ask them.
 ///
 /// Freshness used to break ties before latency because latency was a guess.
-/// It is measured now: `crate::peer::probe` records a round trip and a loss
+/// It is measured now: `crate::peer::reach::probe` records a round trip and a loss
 /// figure per path on every live session, and
-/// [`crate::peer::probe::carrier_key_installed`] is the order those figures
+/// [`crate::peer::reach::probe::carrier_key_installed`] is the order those figures
 /// put the candidates in. Loss above `paths.maxLossPct` sorts last, measured
 /// round trip sorts next, and **a carrier nobody has probed keeps exactly the
 /// order it had before**: every unmeasured candidate ties at `u32::MAX` and
@@ -161,7 +161,10 @@ pub fn resolve_via(setting: &ViaSetting, candidates: &[GatewayCandidate]) -> Vec
         .collect();
     chosen.retain(|candidate| candidate.row.has_endpoint());
     chosen.sort_by_key(|candidate| {
-        crate::peer::probe::carrier_key_installed(&candidate.row.node, candidate.last_seen_ms)
+        crate::peer::reach::probe::carrier_key_installed(
+            &candidate.row.node,
+            candidate.last_seen_ms,
+        )
     });
     chosen
 }
@@ -298,7 +301,7 @@ pub async fn accept_once_splice(
         }),
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: crate::peer::id::random_id()?,
+        request_id: crate::peer::config::id::random_id()?,
     };
     let bytes = serde_json::to_vec(&header).context("peer egress: the header did not serialize")?;
     noise::send_encrypted(&mut stream, &mut session.transport, &bytes)
@@ -1687,7 +1690,8 @@ fn last_seen_from_state(peers_path: &Path) -> Vec<(PeerId, i64)> {
 /// The same derivation `tcr peer id` uses, so a test pointing `--peers` at a
 /// temp directory points this at the same one.
 fn node_key_dir(peers_path: &Path) -> std::path::PathBuf {
-    peers_path
-        .parent()
-        .map_or_else(crate::peer::id::default_config_dir, Path::to_path_buf)
+    peers_path.parent().map_or_else(
+        crate::peer::config::id::default_config_dir,
+        Path::to_path_buf,
+    )
 }

@@ -1,6 +1,6 @@
 //! Confirmed named-account redemption. Probes share the row's gate but never call consume.
-use super::freshness::probing::BoundAccount;
-use super::*;
+use crate::manager::freshness::probing::BoundAccount;
+use crate::manager::*;
 use crate::provider::Provider;
 use std::time::Duration;
 use tokio::time::{Instant, timeout_at};
@@ -154,8 +154,8 @@ impl Manager {
     }
 
     /// [`Self::reset_codex`] for an account named by a user's query or by its rotation
-    /// slot: the slot is how [`super::auto_reset`] names the account it chose itself.
-    pub(super) async fn reset_codex_at(
+    /// slot: the slot is how [`super::auto`] names the account it chose itself.
+    pub(in crate::manager) async fn reset_codex_at(
         &self,
         target: ResetTarget<'_>,
         key: &str,
@@ -300,7 +300,7 @@ impl Manager {
         })
     }
 
-    pub(super) fn check_reset_owner(
+    pub(in crate::manager) fn check_reset_owner(
         &self,
         idx: usize,
         identity: &BoundAccount,

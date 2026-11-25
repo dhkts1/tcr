@@ -129,7 +129,7 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
     // live half of `dial_addresses` reads the external socket off a register a
     // keeper thread fills and this process has run none, so the walk is done
     // here and the mapping above is handed in explicitly.
-    let host: Vec<peer::pair::HostAddress> = peer::network_fact::interfaces()
+    let host: Vec<peer::pair::HostAddress> = peer::reach::network_fact::interfaces()
         .into_iter()
         .map(|(interface, addr)| peer::pair::HostAddress { interface, addr })
         .collect();
@@ -138,7 +138,7 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
             listen,
             &host,
             external,
-            peer::tailnet_node::recorded_node_address(&peer_state_path(peers_path), now_ms),
+            peer::reach::tailnet::node::recorded_node_address(&peer_state_path(peers_path), now_ms),
         ),
         None => Vec::new(),
     };
@@ -167,8 +167,8 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
 
     let config_dir = peers_path
         .parent()
-        .map_or_else(peer::id::default_config_dir, Path::to_path_buf);
-    let this = peer::id::NodeKey::load_or_mint(&config_dir)?.id();
+        .map_or_else(peer::config::id::default_config_dir, Path::to_path_buf);
+    let this = peer::config::id::NodeKey::load_or_mint(&config_dir)?.id();
 
     let record = peer::config::moved::MovedRecord {
         v: peer::config::moved::MOVED_VERSION,

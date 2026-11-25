@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use tcr::config;
 
-use crate::tool_env;
+use crate::cmd::tool_env;
 
 /// A launch host that reads only `env` (no process environment, no real
 /// `HOME`) and names `/tmp/ca.pem` as tcr's CA.

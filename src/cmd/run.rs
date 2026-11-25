@@ -12,7 +12,7 @@ use tcr::{codex_route, live_client, status, tls};
 
 use super::ConfigFile;
 use super::server::load_config;
-use crate::tool_env;
+use crate::cmd::tool_env;
 
 mod launch_env;
 #[cfg(test)]

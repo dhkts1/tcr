@@ -2,7 +2,7 @@ use super::*;
 use std::time::Duration;
 use tokio::io::DuplexStream;
 
-use crate::peer::id::NodeKey;
+use crate::peer::config::id::NodeKey;
 
 /// A transport whose `poll_shutdown` does nothing, the way the `tailscale`
 /// crate's TCP stream behaves at 0.6.1 (`stream.rs:319-336`): the far end

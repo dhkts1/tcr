@@ -2,8 +2,8 @@ use anyhow::{Result, bail};
 use tcr_peer_wire::PeerId;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::peer::config::id::KEY_BYTES;
 use crate::peer::config::{self as config, PeerFile};
-use crate::peer::id::KEY_BYTES;
 use crate::peer::noise::{self, Handshake, PeerSession};
 
 use super::admission::{
@@ -131,7 +131,7 @@ where
     // builder is an ephemeral throwaway and never this node's identity, the
     // same reasoning [`crate::peer::noise::send_knock`] gives on the dialling
     // side.
-    let throwaway = crate::peer::id::random_secret()?;
+    let throwaway = config::id::random_secret()?;
     let read = noise::read_message_1_matching(&throwaway, pattern, psks, message_1, &mut scratch)?;
 
     // **On a blocking thread, not this runtime's.** `FileLock::acquire` waits

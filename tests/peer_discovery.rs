@@ -912,7 +912,10 @@ async fn five_hundred_brief_addresses_write_once_and_never_outrank_the_paired_en
         row.endpoints
     );
 
-    let order = tcr::peer::probe::order_endpoints(&row, &tcr::peer::probe::PathTable::default());
+    let order = tcr::peer::reach::probe::order_endpoints(
+        &row,
+        &tcr::peer::reach::probe::PathTable::default(),
+    );
     assert_eq!(
         order
             .first()

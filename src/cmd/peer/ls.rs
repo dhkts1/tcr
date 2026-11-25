@@ -17,7 +17,7 @@ pub(super) fn run_peer_id(a: peer_cli::PeerIdArgs) -> anyhow::Result<()> {
     let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
     let config_dir = peers_path
         .parent()
-        .map_or_else(peer::id::default_config_dir, Path::to_path_buf);
+        .map_or_else(peer::config::id::default_config_dir, Path::to_path_buf);
 
     if a.regenerate {
         if !a.yes {
@@ -42,8 +42,8 @@ pub(super) fn run_peer_id(a: peer_cli::PeerIdArgs) -> anyhow::Result<()> {
         }
 
         for path in [
-            peer::id::private_key_path(&config_dir),
-            peer::id::public_key_path(&config_dir),
+            peer::config::id::private_key_path(&config_dir),
+            peer::config::id::public_key_path(&config_dir),
         ] {
             if path.exists() {
                 std::fs::remove_file(&path)
@@ -52,7 +52,7 @@ pub(super) fn run_peer_id(a: peer_cli::PeerIdArgs) -> anyhow::Result<()> {
         }
     }
 
-    let key = peer::id::NodeKey::load_or_mint(&config_dir)?;
+    let key = peer::config::id::NodeKey::load_or_mint(&config_dir)?;
     println!("{}", key.id().display());
     Ok(())
 }
@@ -194,7 +194,7 @@ pub(super) fn run_peer_ls(a: peer_cli::PeerLsArgs) -> anyhow::Result<()> {
             peers,
             lent_to,
             internet: file.internet,
-            network: peer::network_fact::network_present(),
+            network: peer::reach::network_fact::network_present(),
             exits,
             pending_count: pending.len(),
             pending,

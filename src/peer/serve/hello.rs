@@ -6,9 +6,10 @@ use tcr_peer_wire::{
     StreamHeader, StreamKind,
 };
 
+use crate::peer::config::id::NodeKey;
 use crate::peer::config::{ControlGrants, Locator, PeerStore};
-use crate::peer::id::NodeKey;
 use crate::peer::noise::{self, Handshake, recv_control, send_control};
+use crate::peer::reach::probe;
 
 use crate::peer::config::node_key_dir;
 use crate::peer::state::peer_state_path;
@@ -79,7 +80,7 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
         target: None,
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: crate::peer::id::random_id()?,
+        request_id: crate::peer::config::id::random_id()?,
     };
     send_control(&mut stream, &mut session, &header).await?;
 
@@ -186,15 +187,15 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
     // `std::sync::Mutex` and probing awaits the network between rounds; one
     // round, on the constants the module already declares.
     let locator = Locator::Direct { addr: reached };
-    match crate::peer::probe::with_table(|table| table.clone()) {
+    match probe::with_table(|table| table.clone()) {
         Ok(mut table) => {
-            match crate::peer::probe::probe_session(
+            match probe::probe_session(
                 &mut stream,
                 &mut session,
                 &mut table,
                 locator,
                 1,
-                crate::peer::probe::PROBE_INTERVAL,
+                probe::PROBE_INTERVAL,
             )
             .await
             {
@@ -205,9 +206,7 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
                         stop = ?run.stop,
                         "peer hello: probed this session before it closed",
                     );
-                    if let Err(err) =
-                        crate::peer::probe::with_table(|installed| *installed = table.clone())
-                    {
+                    if let Err(err) = probe::with_table(|installed| *installed = table.clone()) {
                         tracing::warn!(
                             peer = %peer.display(),
                             error = %err,
@@ -328,7 +327,7 @@ impl NodeFacts {
         // tcr's own tailnet node, when this process runs one: its address at
         // the peer port. After the configured socket for the same reason the
         // mapping is, and before the mapping, because it needs no router.
-        if let Some(node) = crate::peer::tailnet_node::advertised_listen() {
+        if let Some(node) = crate::peer::reach::tailnet::node::advertised_listen() {
             let node = node.to_string();
             if !facts.addrs.contains(&node) {
                 facts.addrs.push(node);

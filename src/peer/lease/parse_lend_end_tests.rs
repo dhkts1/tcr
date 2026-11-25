@@ -6,7 +6,7 @@ use time::macros::datetime;
 /// happens to run on: 2023-11-14 22:13:20 local. Every clock-time
 /// assertion below goes through [`parse_lend_end_at_local`] rather than
 /// [`parse_lend_end`] for the reason
-/// [`crate::peer::schedule::Schedule::contains_at_local`]'s own tests do
+/// [`crate::peer::config::schedule::Schedule::contains_at_local`]'s own tests do
 /// the same split: `UtcOffset::local_offset_at` is real and
 /// host-dependent, and a test asserting against it would pass or fail
 /// depending on which machine ran the suite rather than on the code.

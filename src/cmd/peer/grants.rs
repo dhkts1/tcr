@@ -228,14 +228,14 @@ pub(super) fn run_peer_lend(a: peer_cli::PeerLendArgs) -> anyhow::Result<()> {
     // schedule that does not work.
     let between = match a.between.as_deref() {
         Some(raw) => Some(
-            raw.parse::<peer::schedule::Between>()
+            raw.parse::<peer::config::schedule::Between>()
                 .map_err(|refusal| anyhow::anyhow!("peer lend --between: {refusal}"))?,
         ),
         None => None,
     };
     let days = match a.days.as_deref() {
         Some(raw) => Some(
-            raw.parse::<peer::schedule::Days>()
+            raw.parse::<peer::config::schedule::Days>()
                 .map_err(|refusal| anyhow::anyhow!("peer lend --days: {refusal}"))?,
         ),
         None => None,

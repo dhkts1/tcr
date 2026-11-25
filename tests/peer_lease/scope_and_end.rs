@@ -795,7 +795,7 @@ fn a_grant_with_an_end_puts_it_on_the_lease_and_a_passed_end_mints_nothing() {
 /// catch: the field was stored, printed, and enforced nowhere.
 #[test]
 fn a_grant_outside_its_window_is_refused_and_inside_it_mints() {
-    use tcr::peer::schedule::Between;
+    use tcr::peer::config::schedule::Between;
 
     let dir = tempfile::tempdir().expect("a temp dir");
     let peers = dir.path().join("tcr-peers.json");
@@ -876,7 +876,7 @@ fn a_grant_outside_its_window_is_refused_and_inside_it_mints() {
 /// schedule is concerned.
 #[test]
 fn a_lease_minted_before_its_window_closes_stops_serving_at_the_close() {
-    use tcr::peer::schedule::Between;
+    use tcr::peer::config::schedule::Between;
 
     let dir = tempfile::tempdir().expect("a temp dir");
     let peers = dir.path().join("tcr-peers.json");

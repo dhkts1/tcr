@@ -163,10 +163,10 @@ pub(super) async fn boot_peer_listener(
     };
 
     let node_dir = peers_path.parent().map_or_else(
-        crate::peer::id::default_config_dir,
+        crate::peer::config::id::default_config_dir,
         std::path::Path::to_path_buf,
     );
-    let key = match crate::peer::id::NodeKey::load_or_mint(&node_dir) {
+    let key = match crate::peer::config::id::NodeKey::load_or_mint(&node_dir) {
         Ok(key) => key,
         Err(err) => {
             tracing::warn!(
@@ -207,8 +207,8 @@ pub(super) async fn boot_peer_listener(
     // past its first sample.
     match crate::peer::state::load(&state_path, crate::now_ms()) {
         Ok(state) => {
-            let table = crate::peer::probe::PathTable::new(file.paths.clone(), state.paths);
-            if let Err(err) = crate::peer::probe::install(table) {
+            let table = crate::peer::reach::probe::PathTable::new(file.paths.clone(), state.paths);
+            if let Err(err) = crate::peer::reach::probe::install(table) {
                 tracing::warn!(
                     error = %err,
                     "peer listener: could not install the path table; this boot starts with \
@@ -268,7 +268,7 @@ pub(super) async fn boot_peer_listener(
         peers_file = %peers_path.display(),
         state_file = %state_path.display(),
         // The SAME per-boot instance id the beacon announces and every knock
-        // this node sends names: one `OnceLock` in `crate::peer::id`
+        // this node sends names: one `OnceLock` in `crate::peer::config::id`
         // (`boot_instance_id`), read by `SessionContext::new` here and by
         // `discovery::build_beacon_info` there. Logged so the two can be
         // compared in a log rather than taken on trust.
@@ -388,7 +388,7 @@ pub(super) async fn boot_peer_listener(
 /// shared daemon empty, and no serving process ever announced anything. The
 /// payload made it worse than a missing row. A beacon carries the announcing
 /// process's per-boot instance id
-/// ([`crate::peer::id::boot_instance_id`]), and the knock a neighbour sends
+/// ([`crate::peer::config::id::boot_instance_id`]), and the knock a neighbour sends
 /// after seeing it names the id it saw: announced from the CLI, that id
 /// belonged to a process that had already exited, so it could never match the
 /// server's own.
@@ -533,7 +533,7 @@ fn spawn_beacon(
 /// The same task is the only writer of the found list, because
 /// `state::save_found` replaces the whole section and a second writer would
 /// erase the first one's rows every wake. So it also owns the tailnet beacon
-/// socket ([`crate::peer::tailnet_find`]): between wakes it reads datagrams
+/// socket ([`crate::peer::reach::tailnet::find`]): between wakes it reads datagrams
 /// from the operator's own Macs, and on each wake it reads the Tailscale app
 /// (on a blocking thread, since that runs a process), binds or rebinds the
 /// socket to this Mac's own tailnet IPv4, sends this Mac's beacon to each own
@@ -548,8 +548,8 @@ fn spawn_browse(
 ) {
     use crate::peer::config::TailnetMode;
     use crate::peer::discovery;
+    use crate::peer::reach::tailnet::find::{self, BeaconIntake, BeaconSocket};
     use crate::peer::state::FoundSource;
-    use crate::peer::tailnet_find::{self, BeaconIntake, BeaconSocket};
 
     let peers_path = peers_path.to_path_buf();
     let state_path = state_path.to_path_buf();
@@ -569,7 +569,7 @@ fn spawn_browse(
             // The address a bind last failed on, so the warning is logged
             // once per address rather than every wake.
             let mut bind_failed_on: Option<std::net::Ipv4Addr> = None;
-            let mut buf = [0_u8; tailnet_find::RECEIVE_BUFFER_BYTES];
+            let mut buf = [0_u8; find::RECEIVE_BUFFER_BYTES];
             loop {
                 let received = tokio::select! {
                     _ = ticker.tick() => None,
@@ -625,18 +625,16 @@ fn spawn_browse(
                 // own-Mac knock on.
                 let mode = file.tailnet_mode();
                 let app = match mode {
-                    TailnetMode::App => Some(
-                        tailnet_find::OWN_MAC_READINGS
-                            .refresh(tailnet_find::read_the_app)
-                            .await,
-                    ),
+                    TailnetMode::App => {
+                        Some(find::OWN_MAC_READINGS.refresh(find::read_the_app).await)
+                    }
                     TailnetMode::Off | TailnetMode::Node => None,
                 };
                 let mut scan: Vec<discovery::Discovered> = Vec::new();
                 let mut tailnet_peers = Vec::new();
                 if let Some(Ok(status)) = &app {
                     {
-                        own_macs = tailnet_find::own_mac_addresses(status);
+                        own_macs = find::own_mac_addresses(status);
                         match status.own_ipv4() {
                             Some(own) => match socket.bind_to(own).await {
                                 Ok(()) => bind_failed_on = None,
@@ -663,7 +661,7 @@ fn spawn_browse(
                             discovery::tailnet_beacon(port, name.as_deref(), network_key.as_ref());
                         socket.send(&own_macs, &beacon).await;
                         scan.extend(intake.take(&own_macs));
-                        tailnet_peers = tailnet_find::pinned_peers(status, &file.direct_addrs());
+                        tailnet_peers = find::pinned_peers(status, &file.direct_addrs());
                     }
                 } else {
                     // Off, node, or a read that failed: no reading to trust,
@@ -702,7 +700,7 @@ fn spawn_browse(
                     // containers share a host. The instance id is the only
                     // sound key for "this is my own beacon", over either
                     // source.
-                    let this_instance = crate::peer::id::boot_instance_id();
+                    let this_instance = crate::peer::config::id::boot_instance_id();
                     scan.retain(|row| row.instance_id != this_instance);
                     found.observe(scan, now_ms);
                     let rows: Vec<crate::peer::state::Found> = found
@@ -725,11 +723,11 @@ fn spawn_browse(
                 // `held`, on every wake while the mode is app, so `tcr peer
                 // tailnet --json` and the panel can tell a server acting on
                 // the setting from one that stopped writing. Off and node
-                // write nothing from here: see `tailnet_find::write_held`.
+                // write nothing from here: see `find::write_held`.
                 let reading = app
                     .as_ref()
                     .map(|result| result.as_ref().map(|status| &**status).map_err(|err| *err));
-                if let Err(err) = tailnet_find::write_held(
+                if let Err(err) = find::write_held(
                     &state_path,
                     mode,
                     reading,
@@ -970,7 +968,7 @@ fn spawn_internet_keeper(
 /// for exactly that reason).
 fn spawn_reverse_carriers(
     peers_path: &std::path::Path,
-    key: &crate::peer::id::NodeKey,
+    key: &crate::peer::config::id::NodeKey,
     context: &crate::peer::listener::SessionContext,
     shutdown: &watch::Sender<bool>,
     background: &mut Vec<JoinHandle<()>>,
@@ -1074,7 +1072,7 @@ fn park_reverse_carriers(
             tokio::spawn(supervise("peer-reverse-carrier", async move {
                 let keeper = crate::peer::tunnel::keep_reverse_carrier(
                     friend,
-                    crate::peer::probe::PROBE_INTERVAL,
+                    crate::peer::reach::probe::PROBE_INTERVAL,
                     None,
                     |friend: crate::peer::config::PeerRow| {
                         let context = context.clone();

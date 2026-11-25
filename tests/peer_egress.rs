@@ -46,9 +46,9 @@ use tcr::config::{Account, Config};
 use tcr::manager::Manager;
 use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
 use tcr::peer::config::{Allow, Endpoint, EndpointSource, PeerFile, PeerRow, ViaSetting};
-use tcr::peer::egress::{self, GatewayCandidate};
 use tcr::peer::listener;
 use tcr::peer::noise;
+use tcr::peer::tunnel::egress::{self, GatewayCandidate};
 use tcr::peer::tunnel::{self, Admission, Carry, OriginRoute, TunnelBudget};
 use tcr::probe::{ProbeError, ProbeFuture, UsageProber};
 use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
@@ -487,8 +487,9 @@ fn tunnel_to_origin(host: &str, request_id: u128) -> StreamHeader {
 async fn real_gateway_pinning(
     dir: &std::path::Path,
     requester: &Node,
-) -> (tcr::peer::id::NodeKey, SocketAddr) {
-    let gateway_key = tcr::peer::id::NodeKey::load_or_mint(dir).expect("the gateway's node key");
+) -> (tcr::peer::config::id::NodeKey, SocketAddr) {
+    let gateway_key =
+        tcr::peer::config::id::NodeKey::load_or_mint(dir).expect("the gateway's node key");
     let peers = dir.join("tcr-peers.json");
     let mut file = PeerFile::default();
     file.pin(row(&requester.id, "requester", Vec::new(), true));

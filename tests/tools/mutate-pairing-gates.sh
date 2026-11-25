@@ -211,7 +211,7 @@ open(p, "w").write(s)
 
 # --- Item 6: announceName defaults off ----------------------------------------
 mutate 'announceName back to default-on, so a fresh config announces a name' \
-  'src/peer/config.rs' peer_discovery a_fresh_config_announces_no_name '
+  'src/peer/config/mod.rs' peer_discovery a_fresh_config_announces_no_name '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
@@ -426,7 +426,7 @@ open(p, "w").write(s)
 '
 
 mutate 'the HMAC truncated to the key only, so the tag stops covering port and minute' \
-  'src/peer/config.rs' peer_discovery the_announcement_tag_covers_the_instance_the_port_and_the_minute '
+  'src/peer/config/mod.rs' peer_discovery the_announcement_tag_covers_the_instance_the_port_and_the_minute '
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()

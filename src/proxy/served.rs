@@ -1,6 +1,6 @@
 //! The bookkeeping of one served request, written once for every path that serves one: the
 //! direct send's terminal outcome, its two usage tails (streamed and buffered), and a request
-//! a peer carried ([`crate::peer::egress::record_carried`]).
+//! a peer carried ([`crate::peer::tunnel::egress::record_carried`]).
 
 use axum::http::StatusCode;
 use time::OffsetDateTime;

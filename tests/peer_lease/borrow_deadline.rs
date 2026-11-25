@@ -114,7 +114,7 @@ async fn a_borrow_that_was_delivered_is_never_offered_to_another_lender() {
 
     let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
-    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::config::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -344,7 +344,7 @@ async fn a_lender_that_refuses_at_its_gate_is_not_this_lender_and_the_next_serve
 
     let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
-    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::config::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 

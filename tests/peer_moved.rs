@@ -598,7 +598,7 @@ fn a_moved_endpoint_never_evicts_one_a_handshake_proved() {
 /// giving it a band of its own (`4`) swaps it with the drop's.
 #[test]
 fn a_moved_endpoint_sorts_behind_a_brief_and_beside_a_drop() {
-    use tcr::peer::probe::{self, PathTable};
+    use tcr::peer::reach::probe::{self, PathTable};
 
     let port_of = |source: EndpointSource| -> u16 {
         match source {
@@ -774,7 +774,7 @@ fn receiver_peers(dir: &std::path::Path, sender: &PeerId) -> std::path::PathBuf 
 /// The id `mint` minted for the Mac that moved, read off the public half it
 /// wrote beside the peers file.
 fn sender_id(dir: &std::path::Path) -> PeerId {
-    let raw = std::fs::read(tcr::peer::id::public_key_path(dir))
+    let raw = std::fs::read(tcr::peer::config::id::public_key_path(dir))
         .expect("mint wrote this Mac's public key beside the peers file");
     let bytes: [u8; 32] = raw
         .try_into()

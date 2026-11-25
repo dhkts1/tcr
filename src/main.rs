@@ -17,7 +17,6 @@ use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
 mod cmd;
-mod tool_env;
 
 use tcr::cli::{self, PriorityArg};
 use tcr::config;

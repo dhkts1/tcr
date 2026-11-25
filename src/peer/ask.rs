@@ -50,8 +50,8 @@
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::Crockford;
 
+use crate::peer::config::id::KEY_BYTES;
 use crate::peer::config::join_key::JoinToken;
-use crate::peer::id::KEY_BYTES;
 use crate::peer::noise;
 
 /// What every ask starts with.

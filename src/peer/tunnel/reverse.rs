@@ -11,7 +11,7 @@ use crate::peer::config::{PeerRow, PeerStore};
 /// How long a parked carrier is treated as usable.
 ///
 /// Five minutes, which is five of the prober's own rounds
-/// ([`crate::peer::probe::PROBE_INTERVAL`]): a keeper that stops opening
+/// ([`crate::peer::reach::probe::PROBE_INTERVAL`]): a keeper that stops opening
 /// carriers loses its desk slot within a few probe windows of going quiet, and
 /// a socket whose far end died without a FIN is dropped rather than spliced
 /// into a requester's stream. It is a ceiling and never a liveness claim: the
@@ -472,7 +472,7 @@ pub struct ReverseKeeperRun {
 /// session. So nothing is sent on a parked carrier at all: it is opened, it
 /// waits, it is spent by one forward, and this loop opens the next. That is
 /// what "keeps it alive" means here, and the probe cadence
-/// ([`crate::peer::probe::PROBE_INTERVAL`]) is the caller's `retry` value, the
+/// ([`crate::peer::reach::probe::PROBE_INTERVAL`]) is the caller's `retry` value, the
 /// spacing between attempts when the friend cannot be reached at all.
 ///
 /// # The seam

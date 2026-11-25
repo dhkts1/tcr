@@ -72,8 +72,8 @@ pub(super) async fn run_peer_graph(args: peer_cli::PeerGraphArgs) -> anyhow::Res
     let peers_path = args.peers.unwrap_or_else(peer::config::default_path);
     let config_dir = peers_path
         .parent()
-        .map_or_else(peer::id::default_config_dir, Path::to_path_buf);
-    let this = peer::id::NodeKey::load_or_mint(&config_dir)?.id();
+        .map_or_else(peer::config::id::default_config_dir, Path::to_path_buf);
+    let this = peer::config::id::NodeKey::load_or_mint(&config_dir)?.id();
     let this_label = peer::config::read_or_default(&peers_path)?.display_name();
 
     if args.serve {
@@ -263,4 +263,4 @@ async fn serve_peer_graph(
 /// an unmeasured path is grey, `0` loss is "no loss", and a measured loss is
 /// its own percentage; the three loss bands below are this page's own
 /// addition, since a page has room for colour a text sub-line does not.
-const GRAPH_PAGE_HTML: &str = include_str!("../../peer_graph_page.html");
+const GRAPH_PAGE_HTML: &str = include_str!("peer_graph_page.html");

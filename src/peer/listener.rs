@@ -72,18 +72,18 @@ use tcr_peer_wire::{InstanceId, PeerId, StreamHeader, StreamKind};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 
+use crate::peer::config::id::KEY_BYTES;
+use crate::peer::config::id::NodeKey;
 use crate::peer::config::{PeerFile, PeerRow, PeerStore};
-use crate::peer::id::KEY_BYTES;
-use crate::peer::id::NodeKey;
 use crate::peer::lease::Ledger;
 use crate::peer::noise::{self, Handshake};
 use crate::peer::reach::is_lan_scope;
-use crate::peer::serve::LeaseServing;
-use crate::peer::state::knock_address;
-use crate::peer::tailnet_node::{
+use crate::peer::reach::tailnet::node::{
     BuiltFactory, DeviceFactory, GatewayFn, NodePaths, ServeFn, Supervisor, TICK, TailnetDevice,
     key_path_for_peers, server_slot,
 };
+use crate::peer::serve::LeaseServing;
+use crate::peer::state::knock_address;
 use crate::peer::tunnel::dial;
 
 mod admission;
@@ -362,7 +362,7 @@ async fn accept_peer_connections(listener: TcpListener, context: SessionContext)
 /// same bounds the accept loop uses.
 ///
 /// What the accept loop spawns per connection, and public so a second accept
-/// loop (tcr's own tailnet node, [`crate::peer::tailnet_node`]) feeds the
+/// loop (tcr's own tailnet node, [`crate::peer::reach::tailnet::node`]) feeds the
 /// same code rather than a copy of it: the same admission, the same bounded
 /// refusal log, with `from`, `bind` and `accepted_on` (the address the
 /// connection was sent to) taken off whatever socket it accepted.
@@ -534,7 +534,7 @@ impl SessionContext {
             node: node.id(),
             peers_path: peers_path.to_path_buf(),
             state_path: state_path.to_path_buf(),
-            instance_id: crate::peer::id::boot_instance_id(),
+            instance_id: crate::peer::config::id::boot_instance_id(),
             admission: Arc::new(Mutex::new(Admission::new())),
             tunnels: Arc::new(Mutex::new(crate::peer::tunnel::TunnelBudget::new())),
             serving: None,
@@ -644,7 +644,7 @@ pub async fn park_one_carrier(friend: &PeerRow, context: &SessionContext) -> Res
         target: None,
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: crate::peer::id::random_id()
+        request_id: crate::peer::config::id::random_id()
             .context("peer reverse: no request id for the carrier")?,
     };
     let bytes =

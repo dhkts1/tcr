@@ -65,6 +65,12 @@ pub mod dialaddrs;
 /// name and the sealed record. Crypto and naming only, called by nothing yet.
 pub mod drop;
 
+/// Phase 1: the node key, `tcr-node.key` in the config directory.
+pub mod id;
+
+/// Phase 4: when a lend grant is open for borrowing.
+pub mod schedule;
+
 /// What one Mac sends one friend after it changed networks: a sealed record
 /// saying where it is now. The seal and the refusals only, called by nothing
 /// yet.
@@ -72,7 +78,7 @@ pub mod moved;
 
 /// `tcr-peers.json` in the config directory, mode 0600.
 pub fn default_path() -> PathBuf {
-    crate::peer::id::default_config_dir().join("tcr-peers.json")
+    id::default_config_dir().join("tcr-peers.json")
 }
 
 /// The peers file's own directory, which is also the node-key directory, the
@@ -82,7 +88,7 @@ pub(crate) fn node_key_dir(store: &PeerStore) -> PathBuf {
     store
         .path()
         .parent()
-        .map_or_else(crate::peer::id::default_config_dir, Path::to_path_buf)
+        .map_or_else(id::default_config_dir, Path::to_path_buf)
 }
 
 /// The whole file.
@@ -349,7 +355,7 @@ pub enum TailnetMode {
     #[default]
     Off,
     /// Read the Tailscale app already running on this Mac
-    /// ([`crate::peer::tailscale_app`]) to find this operator's own other
+    /// ([`crate::peer::reach::tailnet::app`]) to find this operator's own other
     /// Macs.
     App,
     /// tcr joins a tailnet as its own node. Only a build with the
@@ -458,7 +464,7 @@ impl<'de> Deserialize<'de> for TailnetSetting {
 /// One bound over the whole act, not one per hop: from the waiting client's
 /// side a carry is a single answer, and a per-hop bound of five seconds is a
 /// ten-second wait on a request that has already failed its direct attempt.
-/// [`retry_through_peer`](crate::peer::egress::retry_through_peer) turns it into a deadline the moment a candidate is
+/// [`retry_through_peer`](crate::peer::tunnel::egress::retry_through_peer) turns it into a deadline the moment a candidate is
 /// picked.
 ///
 /// Small on purpose. This path runs when the direct one has just failed, so the
@@ -466,7 +472,7 @@ impl<'de> Deserialize<'de> for TailnetSetting {
 /// promptly is worth less than the 503 the caller already has in hand.
 ///
 /// It does NOT bound the response BODY. `send` resolves on the head, so an SSE
-/// answer streams for as long as it streams. See [`axum_response_from`](crate::peer::egress::axum_response_from).
+/// answer streams for as long as it streams. See [`axum_response_from`](crate::peer::tunnel::egress::axum_response_from).
 pub const CARRY_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The operator's answer to "how does this Mac reach the internet", plus the
@@ -753,7 +759,7 @@ impl NetworkKey {
     /// Mint a fresh one through the same CSPRNG every other secret here comes
     /// from.
     pub fn mint() -> Result<Self> {
-        Ok(Self(crate::peer::id::random_secret()?))
+        Ok(Self(id::random_secret()?))
     }
 
     /// Build one from raw bytes, for a share link, which carries the key in
@@ -1547,7 +1553,7 @@ pub enum EndpointSource {
     /// vouched for over an authenticated session, this arrived through a
     /// surface nobody here owns, and a peer this node has since forgotten still
     /// holds the key that seals it. It buys one dial attempt and nothing else:
-    /// see [`crate::peer::probe::order_endpoints`] for where that is enforced.
+    /// see [`crate::peer::reach::probe::order_endpoints`] for where that is enforced.
     Drop,
     /// Off a sealed link one friend sent another after changing networks, read
     /// by [`crate::peer::config::moved::open_link`] and written only when the operator
@@ -2544,12 +2550,12 @@ pub struct LendGrant {
     /// Distinct from [`Self::until`], which ends the lending once: this one
     /// closes and re-opens every day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub between: Option<crate::peer::schedule::Between>,
+    pub between: Option<schedule::Between>,
     /// The days [`Self::between`] may START on, `None` for every day. A window
     /// that crosses midnight is charged to the day it opens, so a Friday
-    /// grant is open into Saturday morning. See [`crate::peer::schedule`].
+    /// grant is open into Saturday morning. See [`crate::peer::config::schedule`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub days: Option<crate::peer::schedule::Days>,
+    pub days: Option<schedule::Days>,
     /// Whether [`Self::until`] has passed, **derived on read and never trusted
     /// from the file**.
     ///
@@ -2733,8 +2739,8 @@ impl LendGrant {
     /// One reader for the two keys, so the CLI's "what did I just grant" line,
     /// the panel and [`crate::peer::lease::Ledger::grant`]'s own refusal
     /// cannot disagree about whether a grant is scheduled at all.
-    pub fn schedule(&self) -> Option<crate::peer::schedule::Schedule> {
-        crate::peer::schedule::Schedule::from_parts(self.between, self.days.as_ref())
+    pub fn schedule(&self) -> Option<schedule::Schedule> {
+        schedule::Schedule::from_parts(self.between, self.days.as_ref())
     }
 
     /// Whether the LENDING has ended at `now_s`. The one answer to that
@@ -2759,7 +2765,7 @@ impl LendGrant {
             return Ok(false);
         }
         self.id = u128::from_be_bytes(
-            crate::peer::id::random_secret()?[..16]
+            id::random_secret()?[..16]
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("a 32-byte secret has 16 bytes in it"))?,
         );
@@ -3326,7 +3332,7 @@ mod tests {
     /// A grant written before schedules existed has neither key, and that is
     /// "open at every hour", not a grant that refuses everything.
     ///
-    /// Watch it fail by making [`crate::peer::schedule::Schedule::from_parts`]
+    /// Watch it fail by making [`crate::peer::config::schedule::Schedule::from_parts`]
     /// answer `Some(Schedule::always())` instead of `None` when a grant names
     /// neither key: the `schedule()` assertion then reads a schedule where
     /// there is none, which is the difference between a grant the refusal path
@@ -3371,8 +3377,8 @@ mod tests {
         assert_eq!(
             schedule.between,
             Some((
-                crate::peer::schedule::Hhmm::new(22, 0).expect("22:00"),
-                crate::peer::schedule::Hhmm::new(8, 0).expect("08:00"),
+                schedule::Hhmm::new(22, 0).expect("22:00"),
+                schedule::Hhmm::new(8, 0).expect("08:00"),
             ))
         );
         assert_eq!(

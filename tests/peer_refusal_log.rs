@@ -22,8 +22,8 @@ mod peer_support;
 use std::time::Duration;
 
 use peer_support::{CaptureLayer, serve_shipped as serve};
+use tcr::peer::config::id::NodeKey;
 use tcr::peer::config::{self, PeerFile};
-use tcr::peer::id::NodeKey;
 use tcr::peer::listener::SessionContext;
 use tcr::peer::noise::{self, Handshake};
 use tcr_peer_wire::PeerId;

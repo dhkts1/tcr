@@ -173,7 +173,7 @@ const fn fraction_budget(unit: LeaseUnit) -> Option<f64> {
 /// asks this before it measures the fleet: a Mac outside its lending hours
 /// has nothing to measure for.
 pub fn schedule_refusal(
-    schedule: Option<&crate::peer::schedule::Schedule>,
+    schedule: Option<&crate::peer::config::schedule::Schedule>,
     now: time::OffsetDateTime,
 ) -> Option<LeaseRefusal> {
     match schedule {
@@ -184,7 +184,7 @@ pub fn schedule_refusal(
 
 /// When the window `schedule` is open inside, at `now`, stops being open,
 /// as unix milliseconds; `None` for a schedule with no intraday edge at all
-/// ([`crate::peer::schedule::Schedule::always`]).
+/// ([`crate::peer::config::schedule::Schedule::always`]).
 ///
 /// **Assumes `now` is already inside `schedule`**
 /// ([`schedule_refusal`] answered `None` for it): the one caller
@@ -195,14 +195,14 @@ pub fn schedule_refusal(
 /// before midnight). `between: None` with a `days` filter closes at the next
 /// local midnight, the one intraday edge a day-only schedule has.
 ///
-/// Built here rather than as a method on [`crate::peer::schedule::Schedule`]:
+/// Built here rather than as a method on [`crate::peer::config::schedule::Schedule`]:
 /// `Hhmm`'s and `Schedule`'s own fields are public, this is the only caller,
 /// and the one thing this fix touches outside `lease.rs`'s own module is a
 /// wire refusal that already existed, so the close-time arithmetic stays
 /// beside the clamp ([`clamp_to_grant`]'s `schedule_close_ms`) it feeds
 /// rather than widening `schedule.rs`, which this unit does not own.
 fn schedule_closes_at_ms(
-    schedule: &crate::peer::schedule::Schedule,
+    schedule: &crate::peer::config::schedule::Schedule,
     now: time::OffsetDateTime,
 ) -> Option<i64> {
     let offset = time::UtcOffset::local_offset_at(now).unwrap_or(time::UtcOffset::UTC);

@@ -87,7 +87,7 @@ pub fn dial_addresses(
     };
 
     // tcr's own tailnet node listens on its address at the same port the
-    // kernel listener does (`crate::peer::tailnet_node::Supervisor`).
+    // kernel listener does (`crate::peer::reach::tailnet::node::Supervisor`).
     if let Some(node) = node {
         push(
             SocketAddr::new(IpAddr::V4(node), port),
@@ -107,7 +107,7 @@ pub fn dial_addresses(
         // The same rule the Peers tab's "is this Mac on a network" fact runs,
         // read from its own module rather than spelled a second time here:
         // loopback, link-local and multicast are addresses no friend can use.
-        if is_tailnet(entry) || !crate::peer::network_fact::is_usable(entry.addr) {
+        if is_tailnet(entry) || !crate::peer::reach::network_fact::is_usable(entry.addr) {
             continue;
         }
         push(SocketAddr::new(entry.addr, port), DialAddressKind::Lan);
@@ -118,12 +118,12 @@ pub fn dial_addresses(
 /// Every address a real, operationally-up interface holds right now, with the
 /// interface's own name.
 ///
-/// The walk is [`crate::peer::network_fact::interfaces`], the one place in
+/// The walk is [`crate::peer::reach::network_fact::interfaces`], the one place in
 /// this tree that calls `if-addrs::get_if_addrs`. An interface whose state
 /// this platform cannot report reads as down, which can only ever make a key
 /// carry FEWER addresses, never a dead one.
 fn host_addresses() -> Vec<HostAddress> {
-    crate::peer::network_fact::interfaces()
+    crate::peer::reach::network_fact::interfaces()
         .into_iter()
         .map(|(interface, addr)| HostAddress { interface, addr })
         .collect()
@@ -140,7 +140,7 @@ fn host_addresses() -> Vec<HostAddress> {
 /// IS the keeper (the register is non-empty) ever needs the fallback.
 ///
 /// `node` is tcr's own tailnet node's address, read the same way off the state
-/// file ([`crate::peer::tailnet_node::recorded_node_address`]): the minting
+/// file ([`crate::peer::reach::tailnet::node::recorded_node_address`]): the minting
 /// process holds no node of its own.
 pub fn local_dial_addresses(
     listen: SocketAddr,

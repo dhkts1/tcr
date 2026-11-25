@@ -678,7 +678,7 @@ async fn a_lender_that_takes_the_carry_and_never_answers_still_releases_the_requ
     let peers = dir.join("tcr-peers.json");
     // The requester's key has to exist BEFORE the carry runs, because the
     // gateway pins it: `retry_through_peer` mints it in this same directory.
-    let requester = tcr::peer::id::NodeKey::load_or_mint(&dir).expect("mint this node");
+    let requester = tcr::peer::config::id::NodeKey::load_or_mint(&dir).expect("mint this node");
     let gateway = node();
 
     // An origin that accepts and then says nothing at all. The TLS handshake

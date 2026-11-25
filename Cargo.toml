@@ -450,7 +450,7 @@ sha2 = "0.11"
 # off, `git diff Cargo.lock` is one line.
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 
-# tcr's own tailnet node (`src/peer/tailnet_node.rs`), behind the `tailnet-node` feature below and
+# tcr's own tailnet node (`src/peer/reach/tailnet/node.rs`), behind the `tailnet-node` feature below and
 # only on Apple silicon, the one Mac target the crate supports (no Intel macOS). Gil approved it on
 # 2026-10-20 for source builds only; no release build turns the feature on.
 #

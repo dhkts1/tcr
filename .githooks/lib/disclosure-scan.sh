@@ -103,9 +103,12 @@ $(printf '%s\n' "$found" | sed 's/^/      /')"
 
   # 2. Absolute home paths — they leak the machine layout and the operator's name.
   #    Obviously-synthetic users are allowed so fixtures and docs still work.
+  #    The allowlist runs BEFORE the cap: capping first let three allowed hits
+  #    hide a real one behind them. `head -n 3` only limits what is printed.
   found="$(printf '%s\n' "$text" \
-           | grep -E -m3 '/(Users|home)/[A-Za-z0-9._-]+/' \
-           | grep -v -i -E '/(Users|home)/(x|y|alice|bob|carol|test|example|runner|user)/' || true)"
+           | grep -E '/(Users|home)/[A-Za-z0-9._-]+/' \
+           | grep -v -i -E '/(Users|home)/(x|y|alice|bob|carol|test|example|runner|user)/' \
+           | head -n 3 || true)"
   [ -n "$found" ] && hits="$hits
   absolute home path in $what:
 $(printf '%s\n' "$found" | sed 's/^/      /')"
@@ -114,8 +117,9 @@ $(printf '%s\n' "$found" | sed 's/^/      /')"
   #    Matched case-insensitively: example.com is RFC 2606 reserved, so
   #    ALICE@EXAMPLE.COM is no more real than the lowercase form.
   found="$(printf '%s\n' "$text" \
-           | grep -E -o -m3 '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
-           | grep -v -i -E '@(example\.(com|org|net)|users\.noreply\.github\.com)$' || true)"
+           | grep -E -o '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
+           | grep -v -i -E '@(example\.(com|org|net)|users\.noreply\.github\.com)$' \
+           | head -n 3 || true)"
   [ -n "$found" ] && hits="$hits
   real-looking email address in $what:
 $(printf '%s\n' "$found" | sed 's/^/      /')"

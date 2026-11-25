@@ -3,7 +3,7 @@
 //! The serving process's browse task drives this every
 //! [`crate::peer::discovery::BROWSE_INTERVAL`] (`spawn_browse` in
 //! `src/server.rs`): it reads the Tailscale app
-//! ([`crate::peer::tailscale_app`]), sends this Mac's beacon to each of the
+//! ([`crate::peer::reach::tailnet::app`]), sends this Mac's beacon to each of the
 //! operator's own Macs as one UDP datagram on the peer port, and folds the
 //! beacons it heard since the last wake into the same found list the mDNS
 //! scan fills. Nothing here writes a file; the browse task is the one writer.
@@ -22,7 +22,7 @@
 //! The receiving socket is bound to this Mac's own tailnet IPv4, never
 //! `0.0.0.0`, so nothing new listens on the LAN or the internet. A datagram
 //! whose source is not one of the operator's own Macs in the latest reading
-//! ([`crate::peer::tailscale_app::own_macs`]) is dropped before it is parsed.
+//! ([`crate::peer::reach::tailnet::app::own_macs`]) is dropped before it is parsed.
 //! WireGuard drops a packet whose source address is not the sending peer's
 //! own, so another tailnet machine cannot borrow one of those addresses.
 
@@ -31,8 +31,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use crate::peer::config::TailnetMode;
 use crate::peer::discovery::{self, Discovered};
+use crate::peer::reach::tailnet::app::{self, ReadError, Route, Status};
 use crate::peer::state::{TailnetPeer, TailnetRecord, TailnetRoute, TailnetState};
-use crate::peer::tailscale_app::{self, ReadError, Route, Status};
 
 /// The least time between two datagrams read from one source. One beacon per
 /// browse interval is what a sender sends; this leaves room for a restart
@@ -140,16 +140,13 @@ pub static OWN_MAC_READINGS: ReadingCache = ReadingCache::new();
 /// Read the Tailscale app at its usual paths, under its deadline: the
 /// reader production hands to [`ReadingCache`].
 pub fn read_the_app() -> Result<Status, ReadError> {
-    tailscale_app::read_status(
-        &tailscale_app::default_cli_paths(),
-        tailscale_app::STATUS_TIMEOUT,
-    )
+    app::read_status(&app::default_cli_paths(), app::STATUS_TIMEOUT)
 }
 
 /// The operator's own Macs' tailnet IPv4 addresses in `status`: where the
 /// beacon goes, and the only sources one is read from.
 pub fn own_mac_addresses(status: &Status) -> Vec<Ipv4Addr> {
-    tailscale_app::own_macs(status)
+    app::own_macs(status)
         .iter()
         .flat_map(|peer| peer.tailscale_ips.iter())
         .filter_map(|ip| match ip {
@@ -309,7 +306,7 @@ pub fn pinned_peers(status: &Status, pinned: &[SocketAddr]) -> Vec<TailnetPeer> 
         .filter(|peer| peer.tailscale_ips.iter().any(|ip| hosts.contains(ip)))
         .map(|peer| TailnetPeer {
             addresses: peer.tailscale_ips.clone(),
-            route: match tailscale_app::route(peer) {
+            route: match app::route(peer) {
                 Route::Direct => Some(TailnetRoute::Direct),
                 Route::Relayed => Some(TailnetRoute::Relayed),
                 Route::Unknown => None,
@@ -550,7 +547,7 @@ mod tests {
         for (err, state) in [
             (ReadError::NotInstalled, TailnetState::AppMissing),
             (
-                ReadError::NotRunning(tailscale_app::NotRunning::CliExited(Some(1))),
+                ReadError::NotRunning(app::NotRunning::CliExited(Some(1))),
                 TailnetState::AppNotRunning,
             ),
             (ReadError::TimedOut, TailnetState::ReadFailed),

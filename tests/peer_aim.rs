@@ -49,7 +49,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::peer_support::DuplexTarget as Target;
-use tcr::peer::id::NodeKey;
+use tcr::peer::config::id::NodeKey;
 use tcr::peer::listener;
 use tcr::peer::noise::{self, Handshake};
 use tcr::peer::reach;

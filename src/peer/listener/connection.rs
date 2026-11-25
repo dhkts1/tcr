@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail};
 use tcr_peer_wire::{Control, PeerId, StreamHeader, StreamKind, TunnelTarget};
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::peer::config::id::KEY_BYTES;
 use crate::peer::config::{self as config, PeerStore};
-use crate::peer::id::KEY_BYTES;
 use crate::peer::noise::{self, Handshake, PeerSession};
 use crate::peer::serve;
 use crate::peer::state::knock_address;
@@ -170,8 +170,8 @@ where
         from.ip(),
         pattern,
         &file,
-        &crate::peer::tailnet_find::OWN_MAC_READINGS,
-        crate::peer::tailnet_find::read_the_app,
+        &crate::peer::reach::tailnet::find::OWN_MAC_READINGS,
+        crate::peer::reach::tailnet::find::read_the_app,
     )
     .await
         == InternetAdmission::Refuse
@@ -634,7 +634,7 @@ where
                 },
                 peer: accepted_peer,
                 target,
-                hosts: crate::peer::egress::PEER_EGRESS_HOSTS,
+                hosts: crate::peer::tunnel::egress::PEER_EGRESS_HOSTS,
                 cap_bytes: crate::peer::tunnel::DEFAULT_MAX_TUNNEL_BYTES_PER_HOUR,
                 budget: &context.tunnels,
                 now_ms: now_ms(),
@@ -1285,7 +1285,7 @@ where
             // comparing it to this Mac's clock, or replacing it with this Mac's
             // clock would each turn a round trip into a measurement of how far
             // apart two NTP daemons are. The asker times its own probe against
-            // its own monotonic clock (`crate::peer::probe`).
+            // its own monotonic clock (`crate::peer::reach::probe`).
             //
             // Answered on the same authorization every other frame on this
             // stream has: a pinned static key, re-checked against a re-read row

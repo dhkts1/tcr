@@ -7,7 +7,7 @@
 //! asking "what does this node accept, and when does it decide?".
 //!
 //! One exemption, granted deliberately rather than discovered:
-//! [`crate::peer::id`] imports `snow::params::DHChoice` and
+//! [`crate::peer::config::id`] imports `snow::params::DHChoice` and
 //! `snow::resolvers::{CryptoResolver, DefaultResolver}` to generate this node's
 //! static keypair. Those two `use` lines are the whole of it, the DH object
 //! itself arrives as the `Box<dyn snow::types::Dh>` that `resolve_dh` returns,
@@ -130,8 +130,8 @@ use tokio::sync::mpsc;
 
 use tcr_peer_wire::{MAX_FRAME_BYTES, PeerId, decode_frame, encode_frame};
 
+use crate::peer::config::id::{KEY_BYTES, NodeKey, random_secret};
 use crate::peer::config::{PeerRow, PeerStore};
-use crate::peer::id::{KEY_BYTES, NodeKey, random_secret};
 
 /// `XX`, a FIRST pairing, where neither side knows the other's key. The
 /// default path: a discovered row carries no key, so there is nothing else to
@@ -1272,7 +1272,7 @@ impl NoiseStream {
     /// removed: the fact it reports exists nowhere else, and a gateway's log
     /// line is the whole record of a stream nobody may read. Both splice
     /// callers in this module now await it before they claim anything.
-    /// [`crate::peer::egress`]'s requester-side splice still drops its stream
+    /// [`crate::peer::tunnel::egress`]'s requester-side splice still drops its stream
     /// and is the remaining site.
     pub async fn finish(self) -> Result<()> {
         // Dropping our half first is what tells the pump to stop; without it a

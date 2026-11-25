@@ -296,7 +296,7 @@ async fn a_default_peers_file_opens_no_peer_port() {
 /// The ask was to "pass the SAME boot instance id
 /// (`SessionContext::instance_id()`) to discovery if the boot path starts it".
 /// It is satisfied by construction rather than by an argument: both sides read
-/// `peer::id::boot_instance_id()`, which is a `OnceLock`, so there is no
+/// `peer::config::id::boot_instance_id()`, which is a `OnceLock`, so there is no
 /// parameter through which they could differ: `SessionContext::new` reads it
 /// (`src/peer/listener.rs`) and `discovery::build_beacon_info` reads it on the
 /// beacon's side. `discovery::advertise` therefore takes no instance argument
@@ -313,14 +313,14 @@ async fn a_default_peers_file_opens_no_peer_port() {
 fn the_listener_and_the_beacon_name_one_boot_instance_id() {
     let dir = tempfile::tempdir().expect("a temp profile directory");
     let peers = dir.path().join("tcr-peers.json");
-    let key = tcr::peer::id::NodeKey::load_or_mint(dir.path()).expect("a node key");
+    let key = tcr::peer::config::id::NodeKey::load_or_mint(dir.path()).expect("a node key");
     let context = tcr::peer::listener::SessionContext::new(
         &key,
         &peers,
         &tcr::peer::state::peer_state_path(&peers),
     );
 
-    let boot = tcr::peer::id::boot_instance_id();
+    let boot = tcr::peer::config::id::boot_instance_id();
     assert_eq!(
         context.instance_id(),
         boot,
@@ -609,10 +609,10 @@ mod lender {
     use axum::routing::any;
     use tcr::fallback::Ask;
     use tcr::log_err::LogErr as _;
+    use tcr::peer::config::id::NodeKey;
     use tcr::peer::config::{
         Allow, ControlGrants, Endpoint, EndpointSource, LendGrant, PeerFile, PeerRow, PeerStore,
     };
-    use tcr::peer::id::NodeKey;
     use tcr::peer::lease::Ledger;
     use tcr::peer::listener::{self, SessionContext};
     use tcr::peer::serve;

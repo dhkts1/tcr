@@ -44,9 +44,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tcr::log_err::LogErr as _;
 
+use tcr::peer::config::id::NodeKey;
 use tcr::peer::config::{self, Allow, Endpoint, EndpointSource, PeerFile, PeerRow};
 use tcr::peer::discovery::{self, Discovered, FoundList};
-use tcr::peer::id::NodeKey;
 use tcr::peer::listener::{self, Admission, SessionContext};
 use tcr::peer::noise;
 use tcr::peer::pair;
@@ -436,7 +436,7 @@ async fn count_written(addr: SocketAddr, message_1: &[u8]) -> usize {
 /// secret exactly as `noise::send_knock` builds its own. No payload: a knock's
 /// payload rides the transport session message 2 establishes.
 fn knock_message_1() -> Vec<u8> {
-    let throwaway = tcr::peer::id::random_secret().expect("a throwaway secret");
+    let throwaway = config::id::random_secret().expect("a throwaway secret");
     let mut state = noise::initiator_with_secret(&throwaway, noise::PATTERN_KNOCK, None, None)
         .expect("a knock initiator");
     let mut scratch = vec![0_u8; 1024];

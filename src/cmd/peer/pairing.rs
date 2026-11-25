@@ -61,7 +61,7 @@ pub(super) async fn run_peer_pair(a: peer_cli::PeerPairArgs) -> anyhow::Result<(
     // pressed Accept.
     let file = tcr::peer::config::read_or_default(&path)?;
     let proposed_name = file.display_name();
-    let instance = tcr::peer::id::boot_instance_id();
+    let instance = tcr::peer::config::id::boot_instance_id();
     if let Err(err) = tcr::peer::pair::knock(&store, addr, &proposed_name).await {
         announce(
             a.json,
@@ -186,7 +186,7 @@ pub(super) async fn run_peer_invite(a: peer_cli::PeerInviteArgs) -> anyhow::Resu
         let (secret, public) = tcr::peer::noise::generate_static()?;
         let now_ms = tcr::peer::state::now_ms();
         let until_ms = now_ms.saturating_add(600_000);
-        let id_bytes = tcr::peer::id::random_secret()?;
+        let id_bytes = tcr::peer::config::id::random_secret()?;
         let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = id_bytes;
         let id = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
         tcr::peer::state::add_ask(

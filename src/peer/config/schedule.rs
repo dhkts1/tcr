@@ -9,7 +9,7 @@
 //! a Friday-only schedule with that window is open Friday 22:00 through
 //! Saturday 08:00, not Saturday night into Sunday. An equal `(start, end)`
 //! pair is a zero-width window and is never open; an operator who wants
-//! "open all day" leaves [`Schedule::between`](crate::peer::schedule::Schedule::between) as `None` rather than writing
+//! "open all day" leaves [`Schedule::between`](crate::peer::config::schedule::Schedule::between) as `None` rather than writing
 //! an equal pair.
 //!
 //! # Local time, not a stored offset
@@ -26,8 +26,8 @@
 //! instead of the one an operator means ("is it currently within the window,
 //! here").
 //!
-//! [`Schedule::contains`](crate::peer::schedule::Schedule::contains) itself is a thin offset-conversion wrapper around
-//! [`Schedule::contains_at_local`](crate::peer::schedule::Schedule::contains_at_local), which does the actual decision and takes
+//! [`Schedule::contains`](crate::peer::config::schedule::Schedule::contains) itself is a thin offset-conversion wrapper around
+//! [`Schedule::contains_at_local`](crate::peer::config::schedule::Schedule::contains_at_local), which does the actual decision and takes
 //! an already-local reading, so every test below (and the property test in
 //! `tests/peer_props.rs`) asserts this module's own arithmetic, never
 //! whichever timezone the machine running the test happens to be in.
