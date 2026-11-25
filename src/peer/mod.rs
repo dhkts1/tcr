@@ -137,10 +137,6 @@ pub mod state;
 /// global IPv6 address, and a port both ends of a pair can compute.
 pub mod reach;
 
-/// A second router client beside [`reach`]'s NAT-PMP one, for gateways that
-/// speak only UPnP IGD.
-pub mod reach_upnp;
-
 /// What each path to a peer costs: RTT and loss, measured on a live session.
 pub mod probe;
 

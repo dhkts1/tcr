@@ -2,7 +2,7 @@
 //! reader that reads it.
 //!
 //! Nothing here reaches a real router and nothing multicasts on a real
-//! interface: [`tcr::peer::reach_upnp::Discoverer::at`] takes a
+//! interface: [`tcr::peer::upnp::Discoverer::at`] takes a
 //! destination, so every test here points it at a fake SSDP responder bound
 //! to `127.0.0.1:0`, exactly as `tests/peer_reach.rs` points
 //! [`tcr::peer::reach::NatPmp::at`] at a fake NAT-PMP gateway.
@@ -19,7 +19,7 @@ use axum::routing::{get, post};
 use proptest::prelude::*;
 
 use tcr::peer::reach::MapProtocol;
-use tcr::peer::reach_upnp::{
+use tcr::peer::reach::upnp::{
     self, DiscoveredGateway, Discoverer, LocationPolicy, MX_SECONDS, SERVICE_TYPES, UpnpClient,
     UpnpError,
 };
@@ -205,7 +205,7 @@ fn spawn_http_server(
 /// answers in, or one of the three hostile variants.
 fn device_description(behaviour: DescriptionBehaviour) -> Response<Body> {
     // Twice the ceiling, so neither leg can pass by rounding.
-    let oversized = reach_upnp::MAX_BODY_BYTES * 2;
+    let oversized = upnp::MAX_BODY_BYTES * 2;
     if matches!(behaviour, DescriptionBehaviour::Oversized) {
         return Response::builder()
             .status(200)
@@ -274,7 +274,7 @@ fn device_description(behaviour: DescriptionBehaviour) -> Response<Body> {
 /// inside the envelope, log it, and answer per `add_behaviour` for
 /// `AddPortMapping`.
 fn soap_control(body: String, calls: CallLog, add_behaviour: AddBehaviour) -> Response<Body> {
-    let root = reach_upnp::parse_xml(&body).expect("the client's own envelope must parse");
+    let root = upnp::parse_xml(&body).expect("the client's own envelope must parse");
     let mut soap_body = Vec::new();
     root.find_all("s:Body", &mut soap_body);
     let action_node = soap_body
@@ -469,7 +469,7 @@ fn a_silent_gateway_yields_a_named_silent_error() {
 // Pure-function coverage: the SSDP response reader
 // ---------------------------------------------------------------------------
 
-/// [`reach_upnp::parse_ssdp_response`] reads `LOCATION` and `ST`, and refuses
+/// [`upnp::parse_ssdp_response`] reads `LOCATION` and `ST`, and refuses
 /// a service type this client does not search for, a gateway's SSDP
 /// responder answers every service it hosts, and a `Layer3Forwarding` row
 /// must not be read as a WANIPConnection gateway.
@@ -480,8 +480,7 @@ fn parse_ssdp_response_reads_the_wan_service_and_rejects_others() {
         SERVICE_TYPES[1]
     );
     let from = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-    let found =
-        reach_upnp::parse_ssdp_response(&text, from).expect("a well-formed response parses");
+    let found = upnp::parse_ssdp_response(&text, from).expect("a well-formed response parses");
     assert_eq!(
         found,
         DiscoveredGateway {
@@ -494,13 +493,13 @@ fn parse_ssdp_response_reads_the_wan_service_and_rejects_others() {
     let other_service = "HTTP/1.1 200 OK\r\nLOCATION: http://192.168.1.1:5000/desc.xml\r\n\
                           ST: urn:schemas-upnp-org:service:Layer3Forwarding:1\r\n\r\n";
     assert_eq!(
-        reach_upnp::parse_ssdp_response(other_service, from),
+        upnp::parse_ssdp_response(other_service, from),
         None,
         "a reply naming a service this client did not search for must not be read as one"
     );
 
     let no_location = format!("HTTP/1.1 200 OK\r\nST: {}\r\n\r\n", SERVICE_TYPES[0]);
-    assert_eq!(reach_upnp::parse_ssdp_response(&no_location, from), None);
+    assert_eq!(upnp::parse_ssdp_response(&no_location, from), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -562,7 +561,7 @@ fn a_description_on_another_host_than_the_responder_is_refused_by_name() {
 #[test]
 fn the_briefed_ssrf_answer_is_refused_by_its_own_rule() {
     let from = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
-    let outcome = reach_upnp::check_location(
+    let outcome = upnp::check_location(
         "http://127.0.0.1:9910/_tcr/description.xml",
         from,
         LocationPolicy::PrivateLan,
@@ -591,7 +590,7 @@ fn a_loopback_description_is_refused_for_a_search_on_the_link() {
         "a search aimed at loopback is the one case loopback is in class"
     );
 
-    let outcome = reach_upnp::check_location(
+    let outcome = upnp::check_location(
         "http://127.0.0.1:5000/desc.xml",
         LOOPBACK,
         LocationPolicy::PrivateLan,
@@ -604,13 +603,13 @@ fn a_loopback_description_is_refused_for_a_search_on_the_link() {
         other => panic!("expected a named UntrustedLocation refusal, got {other:?}"),
     }
 
-    reach_upnp::check_location(
+    upnp::check_location(
         "http://127.0.0.1:5000/desc.xml",
         LOOPBACK,
         LocationPolicy::Loopback,
     )
     .expect("the same answer is in class for a search aimed at loopback");
-    reach_upnp::check_location(
+    upnp::check_location(
         "http://192.168.1.1:5000/desc.xml",
         IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
         LocationPolicy::PrivateLan,
@@ -623,7 +622,7 @@ fn a_loopback_description_is_refused_for_a_search_on_the_link() {
 /// address decision back to whoever chose the name.
 #[test]
 fn check_location_refuses_a_name_host_and_a_foreign_scheme() {
-    let name = reach_upnp::check_location(
+    let name = upnp::check_location(
         "http://router.example/desc.xml",
         LOOPBACK,
         LocationPolicy::Loopback,
@@ -638,8 +637,7 @@ fn check_location_refuses_a_name_host_and_a_foreign_scheme() {
         other => panic!("expected a named refusal for a name host, got {other:?}"),
     }
 
-    let scheme =
-        reach_upnp::check_location("file:///etc/hosts", LOOPBACK, LocationPolicy::Loopback);
+    let scheme = upnp::check_location("file:///etc/hosts", LOOPBACK, LocationPolicy::Loopback);
     match scheme {
         Err(UpnpError::UntrustedLocation { reason, .. }) => {
             assert!(reason.contains("the scheme is"), "got {reason:?}");
@@ -708,8 +706,8 @@ fn locate_control_url_refuses_a_lookalike_authority() {
     </serviceList></device></root>",
         SERVICE_TYPES[0]
     );
-    let root = reach_upnp::parse_xml(&doc).expect("a well-formed description must parse");
-    let outcome = reach_upnp::locate_control_url(&root, "http://192.168.1.1:5000/desc.xml");
+    let root = upnp::parse_xml(&doc).expect("a well-formed description must parse");
+    let outcome = upnp::locate_control_url(&root, "http://192.168.1.1:5000/desc.xml");
     assert!(
         matches!(outcome, Err(UpnpError::ControlUrlElsewhere { .. })),
         "expected a named ControlUrlElsewhere refusal, got {outcome:?}"
@@ -725,9 +723,9 @@ fn locate_control_url_refuses_a_lookalike_authority() {
     </serviceList></device></root>",
         SERVICE_TYPES[0]
     );
-    let root = reach_upnp::parse_xml(&same).expect("a well-formed description must parse");
+    let root = upnp::parse_xml(&same).expect("a well-formed description must parse");
     let (control_url, _service_type) =
-        reach_upnp::locate_control_url(&root, "http://192.168.1.1/desc.xml")
+        upnp::locate_control_url(&root, "http://192.168.1.1/desc.xml")
             .expect("the same authority written with its default port must be accepted");
     assert_eq!(control_url, "http://192.168.1.1/upnp/control");
 }
@@ -737,7 +735,7 @@ fn locate_control_url_refuses_a_lookalike_authority() {
 // ---------------------------------------------------------------------------
 
 /// Comments, a processing instruction, entities and a self-closing tag, all
-/// in one document, every shape [`reach_upnp::parse_xml`] must not choke on.
+/// in one document, every shape [`upnp::parse_xml`] must not choke on.
 #[test]
 fn parse_xml_reads_comments_entities_and_self_closing_tags() {
     let doc = r#"<?xml version="1.0"?>
@@ -747,7 +745,7 @@ fn parse_xml_reads_comments_entities_and_self_closing_tags() {
   <empty/>
   <nested><a>1</a><b>2</b></nested>
 </root>"#;
-    let root = reach_upnp::parse_xml(doc).expect("a well-formed document must parse");
+    let root = upnp::parse_xml(doc).expect("a well-formed document must parse");
     assert_eq!(root.tag, "root");
     assert_eq!(
         root.child("name").map(|n| n.text.as_str()),
@@ -761,7 +759,7 @@ fn parse_xml_reads_comments_entities_and_self_closing_tags() {
     assert_eq!(nested.child("b").map(|n| n.text.as_str()), Some("2"));
 }
 
-/// [`reach_upnp::locate_control_url`] finds the WANIPConnection service among
+/// [`upnp::locate_control_url`] finds the WANIPConnection service among
 /// several siblings and resolves its relative `controlURL` against the
 /// description's own URL.
 #[test]
@@ -779,9 +777,9 @@ fn locate_control_url_finds_the_wan_service_and_resolves_a_relative_url() {
 </root>",
         SERVICE_TYPES[0]
     );
-    let root = reach_upnp::parse_xml(&doc).expect("a well-formed description must parse");
+    let root = upnp::parse_xml(&doc).expect("a well-formed description must parse");
     let (control_url, service_type) =
-        reach_upnp::locate_control_url(&root, "http://192.168.1.1:5000/desc.xml")
+        upnp::locate_control_url(&root, "http://192.168.1.1:5000/desc.xml")
             .expect("the WANIPConnection service must be found");
     assert_eq!(control_url, "http://192.168.1.1:5000/upnp/control");
     assert_eq!(service_type, SERVICE_TYPES[0]);
@@ -795,8 +793,8 @@ fn locate_control_url_names_the_error_when_no_wan_service_is_present() {
       <service><serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType>
         <controlURL>/upnp/l3f</controlURL></service>
     </serviceList></device></root>";
-    let root = reach_upnp::parse_xml(doc).expect("a well-formed description must parse");
-    let outcome = reach_upnp::locate_control_url(&root, "http://192.168.1.1:5000/desc.xml");
+    let root = upnp::parse_xml(doc).expect("a well-formed description must parse");
+    let outcome = upnp::locate_control_url(&root, "http://192.168.1.1:5000/desc.xml");
     assert!(
         matches!(outcome, Err(UpnpError::NoWanService { .. })),
         "expected a named NoWanService error, got {outcome:?}"
@@ -832,7 +830,7 @@ proptest! {
         }
         xml.push_str("</service>");
 
-        let node = reach_upnp::parse_xml(&xml).expect("a shuffled but well-formed document must parse");
+        let node = upnp::parse_xml(&xml).expect("a shuffled but well-formed document must parse");
         for (tag, value) in fields {
             prop_assert_eq!(
                 node.child(tag).map(|c| c.text.as_str()),
@@ -846,7 +844,7 @@ proptest! {
 
     /// The same property one level up: shuffle THREE `<service>` siblings
     /// (the two WANIPConnection versions plus a decoy) and confirm
-    /// [`reach_upnp::locate_control_url`] still finds `SERVICE_TYPES[0]`
+    /// [`upnp::locate_control_url`] still finds `SERVICE_TYPES[0]`
     /// first, regardless of which position it shuffled into.
     #[test]
     fn locate_control_url_is_order_independent_under_shuffle(seed in prop::collection::vec(any::<u8>(), 3)) {
@@ -866,8 +864,8 @@ proptest! {
         }
         xml.push_str("</serviceList></device></root>");
 
-        let root = reach_upnp::parse_xml(&xml).expect("a shuffled but well-formed description must parse");
-        let (control_url, service_type) = reach_upnp::locate_control_url(&root, "http://192.168.1.1/desc.xml")
+        let root = upnp::parse_xml(&xml).expect("a shuffled but well-formed description must parse");
+        let (control_url, service_type) = upnp::locate_control_url(&root, "http://192.168.1.1/desc.xml")
             .expect("the WANIPConnection:1 service must be found regardless of sibling order");
         prop_assert_eq!(control_url, "http://192.168.1.1/upnp/control");
         prop_assert_eq!(service_type, SERVICE_TYPES[0]);
@@ -1217,7 +1215,7 @@ fn a_upnp_mapping_is_published_renewed_and_deleted_over_upnp() {
 }
 
 /// **The gate for the body ceiling**: a device that answers with more than
-/// [`reach_upnp::MAX_BODY_BYTES`] is refused by name, whether it declares the
+/// [`upnp::MAX_BODY_BYTES`] is refused by name, whether it declares the
 /// size or streams it.
 ///
 /// # What the four rules do not cover
@@ -1234,7 +1232,7 @@ fn a_upnp_mapping_is_published_renewed_and_deleted_over_upnp() {
 /// nothing and is sent chunked, which the declaration check cannot see at all:
 /// only the read stops it.
 ///
-/// Watch it fail: delete the chunk-loop ceiling in `reach_upnp::fetch` and the
+/// Watch it fail: delete the chunk-loop ceiling in `upnp::fetch` and the
 /// streamed leg reads 512 KiB into memory and fails on the XML instead, with a
 /// message about a parse rather than a size.
 #[test]
@@ -1264,7 +1262,7 @@ fn a_description_above_the_body_ceiling_is_refused_by_name() {
         assert!(
             refusal
                 .to_string()
-                .contains(&reach_upnp::MAX_BODY_BYTES.to_string()),
+                .contains(&upnp::MAX_BODY_BYTES.to_string()),
             "{behaviour:?}: and it has to say what the ceiling is: {refusal}"
         );
         assert!(
@@ -1284,12 +1282,12 @@ fn a_description_above_the_body_ceiling_is_refused_by_name() {
 ///
 /// The parser recurses once per nesting level and the body it reads is
 /// whatever host on the LAN won the SSDP race, up to
-/// [`reach_upnp::MAX_BODY_BYTES`]. 256 KiB of `<a>` is tens of thousands of
+/// [`upnp::MAX_BODY_BYTES`]. 256 KiB of `<a>` is tens of thousands of
 /// levels, and a stack overflow is an abort: the mapping keeper runs on a
 /// thread with the default stack, so the whole proxy dies, with no error
 /// anywhere for the operator to read.
 ///
-/// Watch it fail: remove the [`reach_upnp::MAX_XML_DEPTH`] check from
+/// Watch it fail: remove the [`upnp::MAX_XML_DEPTH`] check from
 /// `Cursor::parse_element` and this test does not fail with an assertion, it
 /// kills the test process with a stack overflow, which is exactly the
 /// behaviour it exists to rule out.
@@ -1304,7 +1302,7 @@ fn a_description_nested_deeper_than_any_router_is_refused_rather_than_followed()
         doc.push_str("</a>");
     }
 
-    let refusal = reach_upnp::parse_xml(&doc).expect_err(
+    let refusal = upnp::parse_xml(&doc).expect_err(
         "a description nested past the ceiling must be an error, not a followed recursion",
     );
     assert!(
@@ -1314,7 +1312,7 @@ fn a_description_nested_deeper_than_any_router_is_refused_rather_than_followed()
     assert!(
         refusal
             .to_string()
-            .contains(&reach_upnp::MAX_XML_DEPTH.to_string()),
+            .contains(&upnp::MAX_XML_DEPTH.to_string()),
         "and it names the ceiling it hit: {refusal}"
     );
 
@@ -1323,5 +1321,5 @@ fn a_description_nested_deeper_than_any_router_is_refused_rather_than_followed()
     let honest = "<root><device><deviceList><device><serviceList><service>\
                   <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>\
                   </service></serviceList></device></deviceList></device></root>";
-    reach_upnp::parse_xml(honest).expect("a real description is nowhere near the ceiling");
+    upnp::parse_xml(honest).expect("a real description is nowhere near the ceiling");
 }

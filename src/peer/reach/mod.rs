@@ -889,6 +889,9 @@ mod mapping;
 mod observed;
 mod port;
 mod punch;
+/// A second router client beside [`NatPmp`], for gateways that speak only
+/// UPnP IGD.
+pub mod upnp;
 pub use mapping::{
     AnswerVoice, GATEWAY_RECHECK_INTERVAL, INTERNET_POLL_INTERVAL, InternetSwitch, InternetWatch,
     KeeperHandle, KeeperStep, MAPPING_LIFETIME_SECS, MAPPING_RENEW_INTERVAL, MAPPING_RETRY_LADDER,
