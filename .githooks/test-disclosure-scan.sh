@@ -115,6 +115,23 @@ scan "mail me at $MAIL_FIXTURE" \
 scan "alice@example.com and /Users/alice/x and a plain sentence" \
   && ok "the synthetic allowlist still passes (example.com, /Users/alice)" \
   || fail "the allowlist broke: a fixture-safe line was refused"
+# The allowlist must run before the three-match cap: three allowed hits ahead of
+# a real one used to fill the cap and hide it. Assembled at runtime like the
+# fixtures above; every value is invented and not on the allowlist.
+HOME_REAL_LAST="/Users/""zed-fixture/work/file.rs"
+MAIL_REAL_LAST="zed""@fixture-corp.io"
+scan "/Users/alice/a
+/Users/bob/b
+/home/carol/c
+$HOME_REAL_LAST" \
+  && fail "a real home path behind three allowlisted ones was hidden by the cap" \
+  || ok "a real home path after three allowlisted ones is still refused"
+scan "alice@example.com
+bob@example.org
+carol@users.noreply.github.com
+$MAIL_REAL_LAST" \
+  && fail "a real email behind three allowlisted ones was hidden by the cap" \
+  || ok "a real email after three allowlisted ones is still refused"
 scan "" \
   && ok "empty text is clean" \
   || fail "empty text was reported as a disclosure"
@@ -240,7 +257,7 @@ if grep -q 'exec .*pre-commit' .githooks/pre-merge-commit 2>/dev/null; then
 else
   fail ".githooks/pre-merge-commit does not run pre-commit — merges stay blind"
 fi
-if grep -q "grep -E -m3 '/(Users|home)" .githooks/pre-commit; then
+if grep -q -F "grep -E '/(Users|home)/" .githooks/pre-commit; then
   fail "pre-commit carries its own copy of the home-path check — two spellings again"
 else
   ok "pre-commit carries no second copy of the checks"
