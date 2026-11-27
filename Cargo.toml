@@ -396,7 +396,7 @@ snow = { version = "0.10", default-features = false, features = ["use-curve25519
 #
 # Measured in-tree cost: FIVE new lock entries: flume, if-addrs, mdns-sd,
 # socket-pktinfo and spin. The design predicted four and did not name `spin`.
-mdns-sd = "0.21"
+mdns-sd = "0.22"
 # Walks the real interface list for the Peers tab's "is there a LAN to look
 # on" fact (src/peer/reach/network_fact.rs). A route lookup on a documentation
 # address stood in first, but that needs a default gateway: a Mac with an
