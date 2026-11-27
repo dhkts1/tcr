@@ -460,7 +460,7 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 # `http_client::install_crypto_provider` must run before the first `Device::new`. The one place
 # that calls `Device::new` (`tailnet_node`'s `LibraryFactory::build`) calls it first.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-tailscale = { version = "=0.6.1", optional = true }
+tailscale = { version = "=0.7.1", optional = true }
 
 [dev-dependencies]
 # Property tests over the peer-mesh wire's parse/decode boundary
